@@ -31,3 +31,13 @@ hex = "0.4"
 [lib]
 name = "puressh"
 path = "src/lib.rs"
+
+[[bin]]
+name = "ssh"
+path = "src/bin/ssh.rs"
+required-features = ["std", "client"]
+
+[[bin]]
+name = "sshd"
+path = "src/bin/sshd.rs"
+required-features = ["std", "server"]

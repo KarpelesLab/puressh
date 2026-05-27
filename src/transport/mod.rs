@@ -10,11 +10,15 @@
 pub mod kex;
 pub mod kexinit;
 pub mod packet;
+#[cfg(feature = "alloc")]
+pub mod rekey;
 pub mod runner;
 pub mod version;
 
 pub use kex::{KexAlgorithms, Negotiated};
 pub use kexinit::{KexInit, NegotiatedOwned, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS};
 pub use packet::{Packet, PacketCodec, BLOCK_SIZE_DEFAULT, MAX_PACKET_LEN};
+#[cfg(feature = "alloc")]
+pub use rekey::{is_kex_msg, RekeyPolicy};
 pub use runner::{DirKeys, InstalledKeys, KexAdvance, KexRunner, Role};
 pub use version::VersionExchange;

@@ -27,6 +27,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
+use std::time::Instant;
 
 use purecrypto::rng::{CryptoRng, OsRng, RngCore};
 
@@ -39,6 +40,7 @@ use crate::error::{Error, Result};
 use crate::format::Writer;
 use crate::hostkey::HostKey;
 use crate::transport::kex::{defaults, KexAlgorithms};
+use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
 use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
 
 const MAX_BANNER_LINE: usize = 1024;
@@ -81,6 +83,28 @@ pub struct Config {
     pub allowed_auth_methods: Vec<&'static str>,
     /// Command handler invoked on `"exec"` channel requests.
     pub command_handler: Arc<dyn CommandHandler>,
+    /// Thresholds that trigger a re-key (RFC 4253 §9). Defaults to 1 GiB /
+    /// 1 hour / `1u32 << 31` packets per direction.
+    pub rekey_policy: RekeyPolicy,
+}
+
+impl Config {
+    /// Build a minimal `Config` with the three required fields filled in
+    /// and the re-key policy left at its RFC-default thresholds.
+    pub fn new(
+        host_keys: Vec<Box<dyn HostKey + Send + Sync>>,
+        authenticator: Arc<dyn AuthenticatorFactory>,
+        allowed_auth_methods: Vec<&'static str>,
+        command_handler: Arc<dyn CommandHandler>,
+    ) -> Self {
+        Self {
+            host_keys,
+            authenticator,
+            allowed_auth_methods,
+            command_handler,
+            rekey_policy: RekeyPolicy::default(),
+        }
+    }
 }
 
 /// Per-connection authenticator factory.
@@ -158,7 +182,7 @@ fn handle_connection(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     stream.write_all(&VersionExchange::outgoing_bytes())?;
     let v_c = read_peer_version(&mut stream)?;
 
-    let session_id = do_server_kex(
+    let (mut runner, session_id) = do_server_kex(
         &mut stream,
         &mut codec,
         &mut rng,
@@ -167,6 +191,7 @@ fn handle_connection(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
         &v_c,
         &v_s,
     )?;
+    let mut last_kex = Instant::now();
 
     let user = do_server_auth(
         &mut stream,
@@ -177,7 +202,23 @@ fn handle_connection(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
         session_id,
     )?;
 
-    let r = do_connection_phase(&mut stream, &mut codec, &mut rng, &mut inbox, &cfg, &user);
+    // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
+    codec.activate_compress();
+
+    let rekey_policy = cfg.rekey_policy;
+    let r = do_connection_phase(
+        &mut stream,
+        &mut codec,
+        &mut rng,
+        &mut inbox,
+        &cfg,
+        &user,
+        &mut runner,
+        &v_c,
+        &v_s,
+        &mut last_kex,
+        &rekey_policy,
+    );
 
     let _ = send_disconnect(
         &mut stream,
@@ -197,7 +238,7 @@ fn do_server_kex<R: RngCore + CryptoRng>(
     cfg: &Config,
     v_c: &[u8],
     v_s: &[u8],
-) -> Result<Vec<u8>> {
+) -> Result<(KexRunner, Vec<u8>)> {
     let advert = build_server_kexinit(rng, &cfg.host_keys);
     let mut runner = KexRunner::new(Role::Server, advert);
     let initial = runner.start(rng)?;
@@ -205,6 +246,28 @@ fn do_server_kex<R: RngCore + CryptoRng>(
         write_payload(stream, codec, rng, &p)?;
     }
 
+    drive_server_kex(stream, codec, rng, inbox, &mut runner, cfg, v_c, v_s)?;
+
+    let sid = runner
+        .session_id()
+        .ok_or(Error::Protocol("kex: missing session id"))?
+        .to_vec();
+    Ok((runner, sid))
+}
+
+/// Drive a KEX (initial or re-key) to completion. The caller must have
+/// already pushed our own KEXINIT onto the wire via `start()` or `restart()`.
+#[allow(clippy::too_many_arguments)]
+fn drive_server_kex<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    inbox: &mut Vec<u8>,
+    runner: &mut KexRunner,
+    cfg: &Config,
+    v_c: &[u8],
+    v_s: &[u8],
+) -> Result<()> {
     let mut steps = 0usize;
     let mut selected_host_key: Option<&(dyn HostKey + Send + Sync)> = None;
 
@@ -230,14 +293,9 @@ fn do_server_kex<R: RngCore + CryptoRng>(
             write_payload(stream, codec, rng, &p)?;
         }
         if adv.completed {
-            break;
+            return Ok(());
         }
     }
-    let sid = runner
-        .session_id()
-        .ok_or(Error::Protocol("kex: missing session id"))?
-        .to_vec();
-    Ok(sid)
 }
 
 fn do_server_auth<R: RngCore + CryptoRng>(
@@ -270,6 +328,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     Err(Error::Protocol("auth: too many steps"))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_connection_phase<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
     codec: &mut PacketCodec,
@@ -277,10 +336,18 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     inbox: &mut Vec<u8>,
     cfg: &Config,
     user: &str,
+    runner: &mut KexRunner,
+    v_c: &[u8],
+    v_s: &[u8],
+    last_kex: &mut Instant,
+    rekey_policy: &RekeyPolicy,
 ) -> Result<()> {
     let mut conn = ConnectionState::new();
     let mut any_channel_opened = false;
     let mut steps = 0usize;
+    // App packets received while a re-KEX is in flight (RFC 4253 §7.3).
+    // Drained back into the app-layer dispatch as soon as the rekey lands.
+    let mut deferred: Vec<Vec<u8>> = Vec::new();
 
     loop {
         steps += 1;
@@ -288,65 +355,159 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
             return Err(Error::Protocol("connection: step cap exceeded"));
         }
 
-        if any_channel_opened && !conn.channels().any(|c| !c.is_fully_closed()) {
+        // Drain any application packets we couldn't process while re-KEXing.
+        if !runner.is_kexing() && !deferred.is_empty() {
+            let payload = deferred.remove(0);
+            dispatch_app_packet(
+                stream,
+                codec,
+                rng,
+                inbox,
+                &mut conn,
+                cfg,
+                user,
+                &payload,
+                &mut any_channel_opened,
+            )?;
+            continue;
+        }
+
+        if any_channel_opened
+            && !conn.channels().any(|c| !c.is_fully_closed())
+            && deferred.is_empty()
+        {
             return Ok(());
         }
 
-        let payload = read_one_packet(stream, codec, inbox)?;
-        let ev = conn.on_packet(&payload)?;
-        match ev {
-            ChannelEvent::OpenRequest { channel, kind } => match kind {
-                ChannelOpen::Session => {
-                    any_channel_opened = true;
-                    let p = conn.accept_open(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
-                }
-                _ => {
-                    let p = conn.reject_open(
-                        channel,
-                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
-                        "channel type not supported",
-                        "",
-                    )?;
-                    write_payload(stream, codec, rng, &p)?;
-                }
-            },
-            ChannelEvent::Request {
-                channel,
-                request,
-                want_reply,
-            } => {
-                handle_channel_request(
-                    stream, codec, rng, inbox, &mut conn, cfg, user, channel, request, want_reply,
-                )?;
-            }
-            ChannelEvent::Data { channel, data } => {
-                if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
-                    write_payload(stream, codec, rng, &adj)?;
-                }
-            }
-            ChannelEvent::ExtendedData { channel, data, .. } => {
-                if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
-                    write_payload(stream, codec, rng, &adj)?;
-                }
-            }
-            ChannelEvent::Eof { .. } => {}
-            ChannelEvent::Close { channel } => {
-                if let Some(ch) = conn.channel(channel) {
-                    if !ch.local_closed {
-                        let p = conn.send_close(channel)?;
-                        write_payload(stream, codec, rng, &p)?;
-                    }
-                }
-            }
-            ChannelEvent::WindowAdjust { .. } => {}
-            ChannelEvent::GlobalRequest { want_reply, .. } if want_reply => {
-                let p = conn.send_global_failure();
+        // RFC 4253 §9: re-key once we've crossed any threshold. Only initiate
+        // when no KEX is currently in flight (one side starts; the other will
+        // respond when it sees the SSH_MSG_KEXINIT).
+        if !runner.is_kexing() && rekey_policy.should_rekey(codec, *last_kex, Instant::now()) {
+            let advert = build_server_kexinit(rng, &cfg.host_keys);
+            let adv = runner.restart(rng, advert)?;
+            for p in adv.outbound {
                 write_payload(stream, codec, rng, &p)?;
             }
-            _ => {}
         }
+
+        let payload = read_one_packet(stream, codec, inbox)?;
+
+        // RFC 4253 §7.3: KEX messages (20, 21, 30..=49) are routed through
+        // the KEX runner, not the application layer. A peer-initiated re-KEX
+        // is signalled by an inbound SSH_MSG_KEXINIT while we are still in
+        // Phase::Completed — handle that by emitting our own KEXINIT first.
+        let msg = payload.first().copied().unwrap_or(0);
+        if is_kex_msg(msg) {
+            if msg == 20 && !runner.is_kexing() {
+                let advert = build_server_kexinit(rng, &cfg.host_keys);
+                let adv = runner.restart(rng, advert)?;
+                for p in adv.outbound {
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            }
+            let hk_ref: Option<&dyn HostKey> = match runner.negotiated() {
+                Some(neg) => {
+                    pick_host_key(&cfg.host_keys, &neg.host_key).map(|k| k as &dyn HostKey)
+                }
+                None => None,
+            };
+            let adv = runner.on_packet(rng, codec, &payload, hk_ref, None, v_c, v_s)?;
+            for p in adv.outbound {
+                write_payload(stream, codec, rng, &p)?;
+            }
+            if adv.completed {
+                *last_kex = Instant::now();
+            }
+            continue;
+        }
+
+        // Application-layer packet. If we're mid-rekey, RFC §7.3 says we
+        // must NOT respond with channel traffic — buffer for later.
+        if runner.is_kexing() {
+            deferred.push(payload);
+            continue;
+        }
+
+        dispatch_app_packet(
+            stream,
+            codec,
+            rng,
+            inbox,
+            &mut conn,
+            cfg,
+            user,
+            &payload,
+            &mut any_channel_opened,
+        )?;
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_app_packet<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    inbox: &mut Vec<u8>,
+    conn: &mut ConnectionState,
+    cfg: &Config,
+    user: &str,
+    payload: &[u8],
+    any_channel_opened: &mut bool,
+) -> Result<()> {
+    let ev = conn.on_packet(payload)?;
+    match ev {
+        ChannelEvent::OpenRequest { channel, kind } => match kind {
+            ChannelOpen::Session => {
+                *any_channel_opened = true;
+                let p = conn.accept_open(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+            _ => {
+                let p = conn.reject_open(
+                    channel,
+                    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                    "channel type not supported",
+                    "",
+                )?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+        },
+        ChannelEvent::Request {
+            channel,
+            request,
+            want_reply,
+        } => {
+            handle_channel_request(
+                stream, codec, rng, inbox, conn, cfg, user, channel, request, want_reply,
+            )?;
+        }
+        ChannelEvent::Data { channel, data } => {
+            if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
+                write_payload(stream, codec, rng, &adj)?;
+            }
+        }
+        ChannelEvent::ExtendedData { channel, data, .. } => {
+            if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
+                write_payload(stream, codec, rng, &adj)?;
+            }
+        }
+        ChannelEvent::Eof { .. } => {}
+        ChannelEvent::Close { channel } => {
+            if let Some(ch) = conn.channel(channel) {
+                if !ch.local_closed {
+                    let p = conn.send_close(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            }
+        }
+        ChannelEvent::WindowAdjust { .. } => {}
+        ChannelEvent::GlobalRequest { want_reply, .. } if want_reply => {
+            let p = conn.send_global_failure();
+            write_payload(stream, codec, rng, &p)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -502,14 +663,8 @@ fn build_server_kexinit<R: RngCore>(
         have.push("ssh-ed25519");
     }
 
-    let kex_no_gex: Vec<&str> = defaults::KEX
-        .iter()
-        .copied()
-        .filter(|n| *n != "diffie-hellman-group-exchange-sha256")
-        .collect();
-
     let algs = KexAlgorithms {
-        kex: &kex_no_gex,
+        kex: defaults::KEX,
         server_host_key: &have,
         ciphers_c2s: defaults::CIPHERS,
         ciphers_s2c: defaults::CIPHERS,
@@ -703,14 +858,14 @@ mod tests {
             })
         });
 
-        let cfg = Config {
-            host_keys: vec![host_key],
-            authenticator: factory,
-            allowed_auth_methods: vec!["publickey"],
-            command_handler: Arc::new(StaticHandler {
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
                 out: b"loopback-test\n".to_vec(),
             }),
-        };
+        );
 
         let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
         let addr = server.local_addr().expect("local_addr");
@@ -746,6 +901,96 @@ mod tests {
         drop(client);
 
         // Bound the server-thread wait so a regression can't hang the suite.
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn loopback_forces_rekeys_with_tiny_policy() {
+        // A 1-KiB byte threshold makes nearly every CHANNEL_DATA packet (and
+        // certainly the cumulative response below) tip the codec over the
+        // re-KEX line, exercising the full Phase::Completed → restart →
+        // peer answers → KEXINIT exchange → ECDH → NEWKEYS → Completed
+        // cycle in a single connection.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "ssh-test-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        // A response large enough that draining it crosses the 1-KiB byte
+        // threshold several times — three full re-keys is plenty to assert
+        // the codec survives.
+        let payload: Vec<u8> = (0..16_384).map(|i| (i & 0xff) as u8).collect();
+
+        let mut cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: payload.clone(),
+            }),
+        );
+        cfg.rekey_policy = RekeyPolicy {
+            max_bytes: 1024,
+            max_duration: Duration::from_secs(60 * 60),
+            max_seq: 1u32 << 31,
+        };
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+        let session_id_before = client.session_id().to_vec();
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        let out = client.exec("ignored").expect("exec");
+        assert_eq!(out.stdout, payload);
+        assert_eq!(out.exit_status, Some(0));
+
+        // RFC 4253 §7.2: session id is the H of the FIRST KEX — must stay
+        // pinned across every re-key the connection performed.
+        assert_eq!(client.session_id(), session_id_before.as_slice());
+
+        drop(client);
+
         let start = std::time::Instant::now();
         while !*server_done.lock().unwrap() {
             if start.elapsed() > Duration::from_secs(10) {

@@ -13,7 +13,7 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha256};
 use purecrypto::rng::{OsRng, RngCore};
@@ -25,6 +25,7 @@ use crate::channel::{
 use crate::error::{Error, Result};
 use crate::hostkey::{host_key_verify_by_name, HostKey, HostKeyVerify};
 use crate::transport::kex::{defaults, KexAlgorithms};
+use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
 use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
 
 /// Maximum line length when reading the peer's identification banner.
@@ -91,6 +92,23 @@ pub struct Client {
     session_id: Vec<u8>,
     inbox: Vec<u8>,
     rng: OsRng,
+    /// Persistent KEX state machine, kept alive across the connection so
+    /// re-keys (RFC 4253 §9) can drive a fresh handshake without dropping
+    /// the codec.
+    runner: KexRunner,
+    /// Local and remote version strings, recorded at the start so re-keys
+    /// can re-hash them without re-reading the banner.
+    v_c: Vec<u8>,
+    v_s: Vec<u8>,
+    /// Host-key policy retained so re-key replies can be re-verified.
+    host_key_policy: HostKeyPolicy,
+    /// Wall-clock instant the most recent KEX completed.
+    last_kex: Instant,
+    /// Thresholds that trigger a re-KEX.
+    rekey_policy: RekeyPolicy,
+    /// App-layer payloads received while a re-KEX was in flight (RFC 4253
+    /// §7.3). Drained out by `read_one_packet` ahead of new wire reads.
+    deferred: Vec<Vec<u8>>,
 }
 
 impl Client {
@@ -104,15 +122,28 @@ impl Client {
         }
         stream.set_nodelay(true)?;
 
+        // The runner is bootstrapped inside `do_version_and_kex`; we install
+        // a placeholder advert here just so the struct field is initialised
+        // (it's replaced immediately).
+        let mut rng = OsRng;
+        let placeholder_advert = build_default_kexinit(&mut rng);
         let mut me = Self {
             stream,
             codec: PacketCodec::new(),
             conn: ConnectionState::new(),
             session_id: Vec::new(),
             inbox: Vec::new(),
-            rng: OsRng,
+            rng,
+            runner: KexRunner::new(Role::Client, placeholder_advert),
+            v_c: Vec::new(),
+            v_s: Vec::new(),
+            host_key_policy: HostKeyPolicy::AcceptAny,
+            last_kex: Instant::now(),
+            rekey_policy: RekeyPolicy::default(),
+            deferred: Vec::new(),
         };
-        me.do_version_and_kex(cfg.host_key_policy)?;
+        me.host_key_policy = cfg.host_key_policy;
+        me.do_version_and_kex()?;
         Ok(me)
     }
 
@@ -129,7 +160,11 @@ impl Client {
             let payload = self.read_one_packet()?;
             match auth.on_packet(&payload)? {
                 ClientStep::Send(p) => self.write_payload(&p)?,
-                ClientStep::Success => return Ok(()),
+                ClientStep::Success => {
+                    // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
+                    self.codec.activate_compress();
+                    return Ok(());
+                }
                 ClientStep::Failed { .. } => return Err(Error::AuthFailed),
                 ClientStep::Banner { .. } => {}
                 ClientStep::Idle => {}
@@ -141,6 +176,12 @@ impl Client {
     /// Convenience: try password authentication only.
     pub fn authenticate_password(&mut self, user: &str, password: &str) -> Result<()> {
         self.authenticate(user, vec![ClientCredential::Password(password.into())])
+    }
+
+    /// Session identifier for this connection — the exchange hash `H` of the
+    /// *first* key exchange (RFC 4253 §7.2). Stable across re-keys.
+    pub fn session_id(&self) -> &[u8] {
+        &self.session_id
     }
 
     /// Convenience: try publickey authentication only.
@@ -287,57 +328,104 @@ impl Client {
         Ok(out)
     }
 
-    fn do_version_and_kex(&mut self, policy: HostKeyPolicy) -> Result<()> {
+    fn do_version_and_kex(&mut self) -> Result<()> {
         let v_c = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
         self.stream.write_all(&VersionExchange::outgoing_bytes())?;
 
         let v_s = self.read_peer_version()?;
+        self.v_c = v_c;
+        self.v_s = v_s;
 
         let advert = build_default_kexinit(&mut self.rng);
-        let mut runner = KexRunner::new(Role::Client, advert);
-        let initial = runner.start(&mut self.rng)?;
+        self.runner = KexRunner::new(Role::Client, advert);
+        let initial = self.runner.start(&mut self.rng)?;
         for p in initial.outbound {
             self.write_payload(&p)?;
         }
 
+        self.drive_kex_to_completion()?;
+        self.session_id = self
+            .runner
+            .session_id()
+            .ok_or(Error::Protocol("kex: missing session id"))?
+            .to_vec();
+        self.last_kex = Instant::now();
+        Ok(())
+    }
+
+    /// Drive the KEX state machine to `Phase::Completed`. The caller is
+    /// responsible for having already pushed our own KEXINIT — and, if the
+    /// peer already sent theirs, for routing that first inbound message
+    /// before calling this.
+    ///
+    /// Non-KEX packets the peer sent while it hadn't yet seen our KEXINIT
+    /// are buffered into `self.deferred` and replayed by the next
+    /// `read_one_packet` call.
+    fn drive_kex_to_completion(&mut self) -> Result<()> {
         let mut steps = 0usize;
         loop {
             steps += 1;
             if steps > MAX_KEX_STEPS {
                 return Err(Error::Protocol("kex: too many steps"));
             }
-            let payload = self.read_one_packet()?;
-            let msg = *payload.first().ok_or(Error::Format("empty kex payload"))?;
-
-            let verifier_box;
-            let verifier: Option<&dyn HostKeyVerify> = if msg == SSH_MSG_KEX_ECDH_REPLY {
-                verifier_box = Some(build_verifier(&payload, &policy, &runner)?);
-                verifier_box.as_deref()
+            let payload = self.read_one_raw_kex_packet()?;
+            let b = *payload.first().ok_or(Error::Format("empty payload"))?;
+            if is_kex_msg(b) {
+                self.dispatch_kex_packet(&payload)?;
+                if self.runner.is_completed() {
+                    return Ok(());
+                }
             } else {
-                None
-            };
-
-            let adv = runner.on_packet(
-                &mut self.rng,
-                &mut self.codec,
-                &payload,
-                None,
-                verifier,
-                &v_c,
-                &v_s,
-            )?;
-            for p in adv.outbound {
-                self.write_payload(&p)?;
-            }
-            if adv.completed {
-                break;
+                self.deferred.push(payload);
             }
         }
-        self.session_id = runner
-            .session_id()
-            .ok_or(Error::Protocol("kex: missing session id"))?
-            .to_vec();
+    }
+
+    /// Feed one inbound transport packet that we know belongs to the KEX
+    /// stream into the runner, writing any outbound packets it produces.
+    fn dispatch_kex_packet(&mut self, payload: &[u8]) -> Result<()> {
+        let msg = *payload.first().ok_or(Error::Format("empty kex payload"))?;
+        let verifier_box;
+        let verifier: Option<&dyn HostKeyVerify> = if msg == SSH_MSG_KEX_ECDH_REPLY {
+            verifier_box = Some(build_verifier(
+                payload,
+                &self.host_key_policy,
+                &self.runner,
+            )?);
+            verifier_box.as_deref()
+        } else {
+            None
+        };
+
+        let v_c = self.v_c.clone();
+        let v_s = self.v_s.clone();
+        let adv = self.runner.on_packet(
+            &mut self.rng,
+            &mut self.codec,
+            payload,
+            None,
+            verifier,
+            &v_c,
+            &v_s,
+        )?;
+        for p in adv.outbound {
+            self.write_payload(&p)?;
+        }
         Ok(())
+    }
+
+    /// Like `read_one_raw_packet` but additionally drops transport-meta
+    /// (IGNORE/UNIMPLEMENTED/DEBUG) messages so callers always see a KEX or
+    /// app payload next.
+    fn read_one_raw_kex_packet(&mut self) -> Result<Vec<u8>> {
+        loop {
+            let payload = self.read_one_raw_packet()?;
+            match payload.first().copied() {
+                Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
+                Some(2) | Some(3) | Some(4) => continue,
+                _ => return Ok(payload),
+            }
+        }
     }
 
     fn read_peer_version(&mut self) -> Result<Vec<u8>> {
@@ -355,15 +443,66 @@ impl Client {
 
     fn read_one_packet(&mut self) -> Result<Vec<u8>> {
         loop {
+            // Drain any app packets we buffered during a re-KEX before
+            // pulling more bytes off the wire.
+            if !self.runner.is_kexing() && !self.deferred.is_empty() {
+                return Ok(self.deferred.remove(0));
+            }
+
+            // RFC 4253 §9: re-key once we've crossed any threshold. We only
+            // initiate when no KEX is in flight; the peer's KEXINIT (handled
+            // below) will trigger our half if they fire first.
+            if !self.runner.is_kexing()
+                && self
+                    .rekey_policy
+                    .should_rekey(&self.codec, self.last_kex, Instant::now())
+            {
+                self.initiate_rekey()?;
+            }
+
             let payload = self.read_one_raw_packet()?;
             match payload.first().copied() {
                 // SSH_MSG_DISCONNECT — peer initiated.
                 Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
                 // SSH_MSG_IGNORE, SSH_MSG_UNIMPLEMENTED, SSH_MSG_DEBUG — drop.
                 Some(2) | Some(3) | Some(4) => continue,
-                _ => return Ok(payload),
+                // KEX messages route through the runner. A SSH_MSG_KEXINIT
+                // (20) while we're not already KEXing is a peer-initiated
+                // re-KEX — we must answer with our own KEXINIT first.
+                Some(b) if is_kex_msg(b) => {
+                    if b == 20 && !self.runner.is_kexing() {
+                        self.initiate_rekey()?;
+                    }
+                    self.dispatch_kex_packet(&payload)?;
+                    if !self.runner.is_completed() {
+                        self.drive_kex_to_completion()?;
+                    }
+                    self.last_kex = Instant::now();
+                    continue;
+                }
+                _ => {
+                    // RFC 4253 §7.3: app traffic during a re-KEX must be
+                    // buffered until NEWKEYS lands. Keep reading until we
+                    // have a non-KEX, non-rekeying packet to return.
+                    if self.runner.is_kexing() {
+                        self.deferred.push(payload);
+                        continue;
+                    }
+                    return Ok(payload);
+                }
             }
         }
+    }
+
+    /// Send our own SSH_MSG_KEXINIT to start a re-KEX. Caller must ensure
+    /// the runner is currently in `Phase::Completed`.
+    fn initiate_rekey(&mut self) -> Result<()> {
+        let advert = build_default_kexinit(&mut self.rng);
+        let adv = self.runner.restart(&mut self.rng, advert)?;
+        for p in adv.outbound {
+            self.write_payload(&p)?;
+        }
+        Ok(())
     }
 
     fn read_one_raw_packet(&mut self) -> Result<Vec<u8>> {
@@ -392,14 +531,8 @@ impl Client {
 }
 
 fn build_default_kexinit<R: RngCore>(rng: &mut R) -> KexInit {
-    // GEX is in `defaults::KEX` but the runner doesn't wire it up — drop it for now.
-    let kex_no_gex: Vec<&str> = defaults::KEX
-        .iter()
-        .copied()
-        .filter(|n| *n != "diffie-hellman-group-exchange-sha256")
-        .collect();
     let algs = KexAlgorithms {
-        kex: &kex_no_gex,
+        kex: defaults::KEX,
         server_host_key: defaults::HOST_KEY,
         ciphers_c2s: defaults::CIPHERS,
         ciphers_s2c: defaults::CIPHERS,

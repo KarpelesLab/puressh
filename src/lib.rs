@@ -38,7 +38,7 @@ pub mod key;
 pub mod mac;
 pub mod transport;
 
-#[cfg(feature = "compress")]
+#[cfg(feature = "alloc")]
 pub mod compress;
 
 #[cfg(feature = "client")]

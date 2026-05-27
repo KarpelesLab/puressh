@@ -26,6 +26,8 @@ use alloc::vec::Vec;
 use purecrypto::rng::{CryptoRng, RngCore};
 
 use crate::cipher::SshCipher;
+#[cfg(feature = "alloc")]
+use crate::compress::{Compress, Decompress, NoneCompress, NoneDecompress};
 use crate::error::{Error, Result};
 use crate::mac::SshMac;
 
@@ -80,11 +82,21 @@ pub struct PacketCodec {
     pub seq_in: u32,
     /// Outbound sequence counter — increments per packet, wraps at u32::MAX.
     pub seq_out: u32,
+    /// Total on-wire bytes encoded since this codec was created. Counts the
+    /// post-compression, post-encryption framing (length + body + MAC/tag),
+    /// matching what RFC 4253 §9 measures when deciding to re-key.
+    pub bytes_out: u64,
+    /// Total on-wire bytes decoded since this codec was created.
+    pub bytes_in: u64,
     outbound: CipherSlot,
     inbound: CipherSlot,
     /// Cached first decrypted block when peeking at the length field of an
     /// EaM CTR packet that hasn't fully arrived yet.
     pending_first_block: Option<Vec<u8>>,
+    /// Outbound compression channel; defaults to `NoneCompress`.
+    outbound_compress: Box<dyn Compress>,
+    /// Inbound decompression channel; defaults to `NoneDecompress`.
+    inbound_decompress: Box<dyn Decompress>,
 }
 
 #[cfg(feature = "alloc")]
@@ -102,9 +114,13 @@ impl PacketCodec {
         Self {
             seq_in: 0,
             seq_out: 0,
+            bytes_out: 0,
+            bytes_in: 0,
             outbound: CipherSlot::None,
             inbound: CipherSlot::None,
             pending_first_block: None,
+            outbound_compress: Box::new(NoneCompress),
+            inbound_decompress: Box::new(NoneDecompress),
         }
     }
 
@@ -128,23 +144,78 @@ impl PacketCodec {
         self.pending_first_block = None;
     }
 
+    /// Install the outbound compression channel for this direction. The KEX
+    /// runner calls this alongside [`install_outbound`](Self::install_outbound)
+    /// after NEWKEYS. Callers who never invoke this leave the codec on the
+    /// default `"none"` pass-through.
+    ///
+    /// Compression dictionaries are stateful, so re-installing the same
+    /// algorithm after a re-KEX would discard the shared dictionary the peer
+    /// relies on. This method therefore leaves the channel untouched when the
+    /// algorithm name matches the one already installed.
+    pub fn install_outbound_compress(&mut self, c: Box<dyn Compress>) {
+        if self.outbound_compress.name() == c.name() {
+            return;
+        }
+        self.outbound_compress = c;
+    }
+
+    /// Install the inbound decompression channel; counterpart to
+    /// [`install_outbound_compress`](Self::install_outbound_compress).
+    pub fn install_inbound_decompress(&mut self, d: Box<dyn Decompress>) {
+        if self.inbound_decompress.name() == d.name() {
+            return;
+        }
+        self.inbound_decompress = d;
+    }
+
+    /// Activate compression on both sides. For `"zlib"` and `"none"` this is
+    /// a no-op; for `"zlib@openssh.com"` it starts the persistent DEFLATE
+    /// stream after the auth layer reports `SSH_MSG_USERAUTH_SUCCESS`.
+    pub fn activate_compress(&mut self) {
+        self.outbound_compress.activate();
+        self.inbound_decompress.activate();
+    }
+
+    /// Algorithm name currently in use for the outbound compression channel.
+    pub fn outbound_compress_name(&self) -> &'static str {
+        self.outbound_compress.name()
+    }
+
+    /// Algorithm name currently in use for the inbound decompression channel.
+    pub fn inbound_decompress_name(&self) -> &'static str {
+        self.inbound_decompress.name()
+    }
+
     /// Encrypt `payload` into a complete on-wire frame.
     pub fn encode<R: CryptoRng + RngCore>(
         &mut self,
         payload: &[u8],
         rng: &mut R,
     ) -> Result<Vec<u8>> {
+        // Compression runs ahead of the codec: dictionaries persist across
+        // re-KEXes, and the encrypted/MACed bytes we hand back are the
+        // compressed body (RFC 4253 §6.2).
+        let compressed;
+        let to_frame: &[u8] =
+            if self.outbound_compress.active() && self.outbound_compress.name() != "none" {
+                compressed = self.outbound_compress.compress(payload)?;
+                &compressed
+            } else {
+                payload
+            };
         let frame = match &mut self.outbound {
-            CipherSlot::None => encode_cleartext(payload, rng)?,
+            CipherSlot::None => encode_cleartext(to_frame, rng)?,
             CipherSlot::Stream { cipher, mac } => {
-                encode_stream(self.seq_out, payload, rng, cipher, mac.as_ref())?
+                encode_stream(self.seq_out, to_frame, rng, cipher, mac.as_ref())?
             }
-            CipherSlot::Gcm(cipher) => encode_gcm(payload, rng, cipher)?,
+            CipherSlot::Gcm(cipher) => encode_gcm(to_frame, rng, cipher)?,
             CipherSlot::ChaChaPoly(cipher) => {
-                encode_chachapoly(self.seq_out, payload, rng, cipher)?
+                encode_chachapoly(self.seq_out, to_frame, rng, cipher)?
             }
         };
         self.seq_out = self.seq_out.wrapping_add(1);
+        self.bytes_out = self.bytes_out.saturating_add(frame.len() as u64);
         Ok(frame)
     }
 
@@ -164,10 +235,19 @@ impl PacketCodec {
             CipherSlot::Gcm(cipher) => decode_gcm(buf, cipher),
             CipherSlot::ChaChaPoly(cipher) => decode_chachapoly(self.seq_in, buf, cipher),
         }?;
-        if r.is_some() {
+        if let Some((payload, consumed)) = r {
             self.seq_in = self.seq_in.wrapping_add(1);
+            self.bytes_in = self.bytes_in.saturating_add(consumed as u64);
+            let payload =
+                if self.inbound_decompress.active() && self.inbound_decompress.name() != "none" {
+                    self.inbound_decompress.decompress(&payload)?
+                } else {
+                    payload
+                };
+            Ok(Some((payload, consumed)))
+        } else {
+            Ok(None)
         }
-        Ok(r)
     }
 }
 
@@ -748,5 +828,108 @@ mod tests {
         let (got, consumed) = b.decode(&frame).unwrap().expect("full");
         assert_eq!(consumed, frame.len());
         assert_eq!(got, b"some payload");
+    }
+
+    #[test]
+    fn byte_counters_track_wire_size() {
+        let mut a = PacketCodec::new();
+        let mut b = PacketCodec::new();
+        install_ctr(&mut a, &mut b, true);
+        let mut rng = OsRng;
+        let mut wire_total = 0u64;
+        for n in [16usize, 100, 1024] {
+            let payload: Vec<u8> = (0..n).map(|i| (i & 0xff) as u8).collect();
+            let frame = a.encode(&payload, &mut rng).unwrap();
+            wire_total += frame.len() as u64;
+            let (_, consumed) = b.decode(&frame).unwrap().expect("full frame");
+            assert_eq!(consumed, frame.len());
+        }
+        assert_eq!(a.bytes_out, wire_total);
+        assert_eq!(b.bytes_in, wire_total);
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn zlib_roundtrip_through_codec() {
+        use crate::compress::{compress_by_name, decompress_by_name};
+
+        let mut a = PacketCodec::new();
+        let mut b = PacketCodec::new();
+        install_chachapoly(&mut a, &mut b);
+        a.install_outbound_compress(compress_by_name("zlib").unwrap());
+        b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
+
+        let mut rng = OsRng;
+        // A highly-compressible payload to confirm compression really ran.
+        let payload = vec![b'a'; 4096];
+        let frame = a.encode(&payload, &mut rng).unwrap();
+        assert!(
+            frame.len() < payload.len(),
+            "frame {} should be smaller than payload {}",
+            frame.len(),
+            payload.len()
+        );
+        let (got, consumed) = b.decode(&frame).unwrap().expect("full frame");
+        assert_eq!(consumed, frame.len());
+        assert_eq!(got, payload);
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn zlib_openssh_delayed_activation_through_codec() {
+        use crate::compress::{compress_by_name, decompress_by_name};
+
+        let mut a = PacketCodec::new();
+        let mut b = PacketCodec::new();
+        install_chachapoly(&mut a, &mut b);
+        a.install_outbound_compress(compress_by_name("zlib@openssh.com").unwrap());
+        b.install_inbound_decompress(decompress_by_name("zlib@openssh.com").unwrap());
+
+        // Pre-activation: pass-through (matches what the codec must do during
+        // the userauth phase for `zlib@openssh.com`).
+        let mut rng = OsRng;
+        let pre = vec![b'x'; 64];
+        let frame_pre = a.encode(&pre, &mut rng).unwrap();
+        let (got_pre, _) = b.decode(&frame_pre).unwrap().expect("pre");
+        assert_eq!(got_pre, pre);
+
+        // Activate both sides and re-test with a compressible payload.
+        a.activate_compress();
+        b.activate_compress();
+        let post = vec![b'y'; 4096];
+        let frame_post = a.encode(&post, &mut rng).unwrap();
+        assert!(frame_post.len() < post.len());
+        let (got_post, _) = b.decode(&frame_post).unwrap().expect("post");
+        assert_eq!(got_post, post);
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn install_same_compression_keeps_dictionary() {
+        use crate::compress::{compress_by_name, decompress_by_name};
+
+        // After the first KEX installed "zlib", a re-KEX re-installs the same
+        // algorithm — we must NOT discard the dictionary that the peer has
+        // built up. install_outbound_compress is a no-op when the algorithm
+        // name matches; the same goes for the inbound side.
+        let mut a = PacketCodec::new();
+        let mut b = PacketCodec::new();
+        install_chachapoly(&mut a, &mut b);
+        a.install_outbound_compress(compress_by_name("zlib").unwrap());
+        b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
+        let mut rng = OsRng;
+        let payload = vec![b'q'; 4096];
+        let f1 = a.encode(&payload, &mut rng).unwrap();
+        let (got1, _) = b.decode(&f1).unwrap().expect("frame 1");
+        assert_eq!(got1, payload);
+        // Re-install both sides — same name, dictionaries must survive.
+        a.install_outbound_compress(compress_by_name("zlib").unwrap());
+        b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
+        let f2 = a.encode(&payload, &mut rng).unwrap();
+        let (got2, _) = b.decode(&f2).unwrap().expect("frame 2 (dict survived)");
+        assert_eq!(got2, payload);
+        // The shared dictionary means the second frame is at least as small
+        // as the first — the second compression draws on the prior content.
+        assert!(f2.len() <= f1.len());
     }
 }

@@ -297,12 +297,12 @@ fn run() -> Result<i32, String> {
         debug: cli.debug,
     });
 
-    let cfg = Config {
+    let cfg = Config::new(
         host_keys,
-        authenticator: factory,
-        allowed_auth_methods: vec!["publickey"],
-        command_handler: Arc::new(ShellCommandHandler { debug: cli.debug }),
-    };
+        factory,
+        vec!["publickey"],
+        Arc::new(ShellCommandHandler { debug: cli.debug }),
+    );
 
     let addr = format!("127.0.0.1:{}", cli.port);
     let mut server = Server::bind(&addr, cfg).map_err(|e| format!("bind {addr}: {e}"))?;

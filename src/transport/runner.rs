@@ -19,15 +19,17 @@ use purecrypto::hash::{Digest, Sha256, Sha384, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
 
 use crate::cipher::{cipher_by_name, SshCipher};
+use crate::compress::{compress_by_name, decompress_by_name};
 use crate::error::{Error, Result};
 use crate::hostkey::{HostKey, HostKeyVerify};
 use crate::kex::{
     curve25519::Curve25519Sha256,
-    dh::{Group14Sha256, Group16Sha512, Group18Sha512},
+    dh::{GexClientState, GexRequest, GexSha256, Group14Sha256, Group16Sha512, Group18Sha512},
     ecdh::{EcdhSha2Nistp256, EcdhSha2Nistp384, EcdhSha2Nistp521},
     KexContext,
 };
 use crate::mac::{mac_by_name, SshMac};
+use purecrypto::dh::{group14, group16, group18, DhGroup};
 
 use super::kex::Negotiated;
 use super::kexinit::{negotiate, KexInit, NegotiatedOwned, SSH_MSG_NEWKEYS};
@@ -82,6 +84,13 @@ pub struct InstalledKeys {
 
 const SSH_MSG_KEX_ECDH_INIT: u8 = 30;
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+// RFC 4419 §3. Bytes 30 / 31 are also reused as GEX_REQUEST_OLD and
+// GEX_GROUP respectively — disambiguated by `KexBackend::Gex` in the runner.
+const SSH_MSG_KEX_DH_GEX_REQUEST_OLD: u8 = 30;
+const SSH_MSG_KEX_DH_GEX_GROUP: u8 = 31;
+const SSH_MSG_KEX_DH_GEX_INIT: u8 = 32;
+const SSH_MSG_KEX_DH_GEX_REPLY: u8 = 33;
+const SSH_MSG_KEX_DH_GEX_REQUEST: u8 = 34;
 
 /// One of the supported KEX backends. Identifies both the algorithm and the
 /// hash used for `H` / KDF.
@@ -94,6 +103,8 @@ enum KexBackend {
     Dh14,
     Dh16,
     Dh18,
+    /// `diffie-hellman-group-exchange-sha256` — RFC 4419 three-trip.
+    Gex,
 }
 
 impl KexBackend {
@@ -106,8 +117,23 @@ impl KexBackend {
             "diffie-hellman-group14-sha256" => Ok(Self::Dh14),
             "diffie-hellman-group16-sha512" => Ok(Self::Dh16),
             "diffie-hellman-group18-sha512" => Ok(Self::Dh18),
+            "diffie-hellman-group-exchange-sha256" => Ok(Self::Gex),
             _ => Err(Error::Unsupported("KEX algorithm")),
         }
+    }
+}
+
+/// Default GEX group selection (RFC 4419 §3). We map the client's preferred
+/// size to one of the RFC 3526 safe-prime groups we ship — they're known to
+/// be well-formed and stay inside the `[min, max]` range the client requested
+/// (the client's `client_init` rejects mismatches anyway).
+fn default_gex_group(req: GexRequest) -> DhGroup {
+    if req.n <= 2048 {
+        group14()
+    } else if req.n <= 4096 {
+        group16()
+    } else {
+        group18()
     }
 }
 
@@ -116,6 +142,7 @@ enum ClientStateInner {
     Curve(crate::kex::curve25519::ClientState),
     Ecdh(crate::kex::ecdh::ClientState),
     Dh(crate::kex::dh::DhClientState),
+    Gex(GexClientState),
 }
 
 enum Phase {
@@ -128,6 +155,13 @@ enum Phase {
         /// Client-side ephemeral state. `None` on the server.
         client_state: Option<ClientStateInner>,
     },
+    /// GEX-only: client has sent `GEX_REQUEST`, waiting for `GEX_GROUP`.
+    /// Owns the partially-initialised client state until `GEX_INIT` is built.
+    GexClientAwaitGroup { client_state: GexClientState },
+    /// GEX-only: client has sent `GEX_INIT`, waiting for `GEX_REPLY`.
+    GexClientAwaitReply { client_state: GexClientState },
+    /// GEX-only: server has sent `GEX_GROUP`, waiting for `GEX_INIT`.
+    GexServerAwaitInit { request: GexRequest, group: DhGroup },
     /// `(K, H)` computed; awaiting peer NEWKEYS.
     AwaitingPeerNewKeys,
     /// Done.
@@ -175,8 +209,9 @@ impl KexRunner {
         }
     }
 
-    /// Kick the runner off: emit our KEXINIT. Both client and server call this
-    /// once at the start of every (re-)KEX.
+    /// Kick the runner off: emit our KEXINIT. Both client and server call
+    /// this once at the start of the very first key exchange. Re-keys go
+    /// through [`restart`](Self::restart) instead.
     pub fn start<R: RngCore + CryptoRng>(&mut self, _rng: &mut R) -> Result<KexAdvance> {
         match self.phase {
             Phase::Idle => {
@@ -188,6 +223,49 @@ impl KexRunner {
             }
             _ => Err(Error::Protocol("KexRunner::start called twice")),
         }
+    }
+
+    /// Begin a re-key (RFC 4253 §9). Must be called only when the runner is
+    /// in [`Phase::Completed`]. Caches a fresh KEXINIT advert (replacing the
+    /// previous one's cookie) and emits it; the `session_id` from the first
+    /// KEX is preserved across re-keys, but every other transient field is
+    /// reset so the new exchange runs cleanly.
+    pub fn restart<R: RngCore + CryptoRng>(
+        &mut self,
+        _rng: &mut R,
+        advert: KexInit,
+    ) -> Result<KexAdvance> {
+        match self.phase {
+            Phase::Completed => {}
+            _ => return Err(Error::Protocol("KexRunner::restart from non-Completed")),
+        }
+        let bytes = advert.encode();
+        self.our_advert_owned = advert;
+        self.our_advert_bytes = bytes;
+        self.peer_advert_bytes = None;
+        self.negotiated = None;
+        self.backend = None;
+        self.current_h = None;
+        self.current_k = None;
+        self.installed_keys = None;
+        self.sent_newkeys = false;
+        self.peer_newkeys = false;
+        // session_id stays put — it's the H of the FIRST KEX (RFC 4253 §7.2).
+        self.phase = Phase::SentKexInit;
+        Ok(KexAdvance {
+            outbound: vec![self.our_advert_bytes.clone()],
+            completed: false,
+        })
+    }
+
+    /// `true` if a key exchange is in flight (neither idle nor completed).
+    pub fn is_kexing(&self) -> bool {
+        !matches!(self.phase, Phase::Idle | Phase::Completed)
+    }
+
+    /// `true` once a successful KEX has completed at least once.
+    pub fn is_completed(&self) -> bool {
+        matches!(self.phase, Phase::Completed)
     }
 
     /// Feed one decoded inbound payload into the runner.
@@ -215,15 +293,47 @@ impl KexRunner {
             return Err(Error::Format("empty payload"));
         }
         let msg = payload[0];
+        let backend_is_gex = matches!(self.backend, Some(KexBackend::Gex));
         let mut adv = match (&self.phase, msg) {
             (Phase::SentKexInit, super::kexinit::SSH_MSG_KEXINIT) => {
                 self.handle_peer_kexinit(rng, payload, v_c, v_s)?
             }
-            (Phase::Negotiated { .. }, SSH_MSG_KEX_ECDH_INIT) if self.role == Role::Server => {
+            // ECDH and fixed-group DH: bytes 30/31 are INIT/REPLY. For GEX
+            // the same bytes mean GEX_REQUEST_OLD/GEX_GROUP, so the backend
+            // gates which path runs.
+            (Phase::Negotiated { .. }, SSH_MSG_KEX_ECDH_INIT)
+                if self.role == Role::Server && !backend_is_gex =>
+            {
                 self.handle_kex_init_message(rng, codec, payload, host_key, v_c, v_s)?
             }
-            (Phase::Negotiated { .. }, SSH_MSG_KEX_ECDH_REPLY) if self.role == Role::Client => {
+            (Phase::Negotiated { .. }, SSH_MSG_KEX_ECDH_REPLY)
+                if self.role == Role::Client && !backend_is_gex =>
+            {
                 self.handle_kex_reply_message(codec, payload, host_key_verifier, v_c, v_s)?
+            }
+            // GEX server: awaiting initial GEX_REQUEST (new form, byte 34) or
+            // GEX_REQUEST_OLD (byte 30) in Phase::Negotiated.
+            (Phase::Negotiated { .. }, SSH_MSG_KEX_DH_GEX_REQUEST)
+                if self.role == Role::Server && backend_is_gex =>
+            {
+                self.handle_gex_request(payload)?
+            }
+            (Phase::Negotiated { .. }, SSH_MSG_KEX_DH_GEX_REQUEST_OLD)
+                if self.role == Role::Server && backend_is_gex =>
+            {
+                self.handle_gex_request(payload)?
+            }
+            // GEX client: GEX_GROUP arrives, build and send GEX_INIT.
+            (Phase::GexClientAwaitGroup { .. }, SSH_MSG_KEX_DH_GEX_GROUP) => {
+                self.handle_gex_group(rng, payload)?
+            }
+            // GEX server: GEX_INIT arrives, agree, sign, send GEX_REPLY + NEWKEYS.
+            (Phase::GexServerAwaitInit { .. }, SSH_MSG_KEX_DH_GEX_INIT) => {
+                self.handle_gex_init(rng, codec, payload, host_key, v_c, v_s)?
+            }
+            // GEX client: GEX_REPLY arrives, verify, queue NEWKEYS.
+            (Phase::GexClientAwaitReply { .. }, SSH_MSG_KEX_DH_GEX_REPLY) => {
+                self.handle_gex_reply(codec, payload, host_key_verifier, v_c, v_s)?
             }
             (Phase::AwaitingPeerNewKeys, SSH_MSG_NEWKEYS) => self.handle_peer_newkeys(codec)?,
             (Phase::Negotiated { .. }, SSH_MSG_NEWKEYS) => {
@@ -288,7 +398,17 @@ impl KexRunner {
             outbound.push(init_payload);
         }
 
-        self.phase = Phase::Negotiated { client_state };
+        // GEX deviates from the two-trip ECDH flow: the client has just
+        // emitted `GEX_REQUEST` and is now waiting for `GEX_GROUP`; the
+        // server has emitted nothing and is waiting for `GEX_REQUEST`.
+        // Park them in the dedicated intermediate phases.
+        self.phase = match (self.role, self.backend) {
+            (Role::Client, Some(KexBackend::Gex)) => match client_state {
+                Some(ClientStateInner::Gex(s)) => Phase::GexClientAwaitGroup { client_state: s },
+                _ => return Err(Error::Protocol("GEX backend without GEX state")),
+            },
+            _ => Phase::Negotiated { client_state },
+        };
         Ok(KexAdvance {
             outbound,
             completed: false,
@@ -328,6 +448,13 @@ impl KexRunner {
             KexBackend::Dh18 => {
                 let (s, out) = Group18Sha512::client_init(rng);
                 (ClientStateInner::Dh(s), out.payload)
+            }
+            KexBackend::Gex => {
+                // Step 1 of the three-trip: send GEX_REQUEST with our
+                // preferred prime-size range. The actual `e` value is built
+                // later, after the server tells us which group it chose.
+                let (s, out) = GexSha256::client_request(GexRequest::default());
+                (ClientStateInner::Gex(s), out.payload)
             }
         })
     }
@@ -381,6 +508,9 @@ impl KexRunner {
                 let out = Group18Sha512::server_reply(rng, payload, hk, &ctx)?;
                 (out.payload, out.kex.k, out.kex.h)
             }
+            // GEX takes a separate three-trip path via handle_gex_*; this
+            // arm is unreachable thanks to the backend gate in `on_packet`.
+            KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),
         };
 
         self.current_k = Some(k);
@@ -474,10 +604,130 @@ impl KexRunner {
                 };
                 (out.k, out.h)
             }
+            // GEX uses handle_gex_reply, not this path.
+            KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),
         };
 
         self.current_k = Some(k);
         self.current_h = Some(h);
+        if self.session_id.is_none() {
+            self.session_id = self.current_h.clone();
+        }
+        self.derive_keys()?;
+
+        let outbound = vec![vec![SSH_MSG_NEWKEYS]];
+        self.sent_newkeys = true;
+        self.maybe_install(codec)?;
+        self.advance_after_send_newkeys();
+        Ok(KexAdvance {
+            outbound,
+            completed: false,
+        })
+    }
+
+    /// Server side, step 2 of GEX: peer sent `GEX_REQUEST` (or the deprecated
+    /// `_OLD` form). Pick a group with [`default_gex_group`], emit
+    /// `GEX_GROUP`, and park in [`Phase::GexServerAwaitInit`].
+    fn handle_gex_request(&mut self, payload: &[u8]) -> Result<KexAdvance> {
+        let (request, group, out) = GexSha256::server_group(payload, default_gex_group)?;
+        self.phase = Phase::GexServerAwaitInit { request, group };
+        Ok(KexAdvance {
+            outbound: vec![out.payload],
+            completed: false,
+        })
+    }
+
+    /// Client side, step 3 of GEX: peer sent `GEX_GROUP`. Pick `x`, emit
+    /// `GEX_INIT`, and park in [`Phase::GexClientAwaitReply`].
+    fn handle_gex_group<R: RngCore + CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        payload: &[u8],
+    ) -> Result<KexAdvance> {
+        let state = match core::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::GexClientAwaitGroup { client_state } => client_state,
+            _ => return Err(Error::Protocol("GEX_GROUP without prior request")),
+        };
+        let (state, out) = GexSha256::client_init(state, payload, rng)?;
+        self.phase = Phase::GexClientAwaitReply {
+            client_state: state,
+        };
+        Ok(KexAdvance {
+            outbound: vec![out.payload],
+            completed: false,
+        })
+    }
+
+    /// Server side, step 4 of GEX: peer sent `GEX_INIT`. Agree, sign, emit
+    /// `GEX_REPLY` followed by `NEWKEYS`.
+    fn handle_gex_init<R: RngCore + CryptoRng>(
+        &mut self,
+        rng: &mut R,
+        codec: &mut PacketCodec,
+        payload: &[u8],
+        host_key: Option<&dyn HostKey>,
+        v_c: &[u8],
+        v_s: &[u8],
+    ) -> Result<KexAdvance> {
+        let hk = host_key.ok_or(Error::Protocol("server requires host key"))?;
+        let (request, group) = match core::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::GexServerAwaitInit { request, group } => (request, group),
+            _ => return Err(Error::Protocol("GEX_INIT without prior group")),
+        };
+        let i_c = self.peer_advert_bytes.as_deref().unwrap_or_default();
+        let i_s = self.our_advert_bytes.clone();
+        let ctx = KexContext {
+            v_c,
+            v_s,
+            i_c,
+            i_s: &i_s,
+        };
+        let out = GexSha256::server_reply(rng, request, &group, payload, hk, &ctx)?;
+
+        self.current_k = Some(out.kex.k);
+        self.current_h = Some(out.kex.h);
+        if self.session_id.is_none() {
+            self.session_id = self.current_h.clone();
+        }
+        self.derive_keys()?;
+
+        let outbound = vec![out.payload, vec![SSH_MSG_NEWKEYS]];
+        self.sent_newkeys = true;
+        self.maybe_install(codec)?;
+        self.advance_after_send_newkeys();
+        Ok(KexAdvance {
+            outbound,
+            completed: false,
+        })
+    }
+
+    /// Client side, step 5 of GEX: peer sent `GEX_REPLY`. Verify and emit
+    /// `NEWKEYS`.
+    fn handle_gex_reply(
+        &mut self,
+        codec: &mut PacketCodec,
+        payload: &[u8],
+        verifier: Option<&dyn HostKeyVerify>,
+        v_c: &[u8],
+        v_s: &[u8],
+    ) -> Result<KexAdvance> {
+        let verifier_ref = verifier.ok_or(Error::Protocol("client requires host-key verifier"))?;
+        let state = match core::mem::replace(&mut self.phase, Phase::Idle) {
+            Phase::GexClientAwaitReply { client_state } => client_state,
+            _ => return Err(Error::Protocol("GEX_REPLY without prior init")),
+        };
+        let i_c = self.our_advert_bytes.clone();
+        let i_s = self.peer_advert_bytes.clone().unwrap_or_default();
+        let ctx = KexContext {
+            v_c,
+            v_s,
+            i_c: &i_c,
+            i_s: &i_s,
+        };
+        let out = GexSha256::client_finish(state, payload, verifier_ref, &ctx)?;
+
+        self.current_k = Some(out.k);
+        self.current_h = Some(out.h);
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
         }
@@ -529,6 +779,24 @@ impl KexRunner {
         codec.install_outbound(out_cipher, out_mac);
         let (in_cipher, in_mac) = build_cipher_mac(inbound_dir)?;
         codec.install_inbound(in_cipher, in_mac);
+
+        // Wire negotiated compression. The factories return `None` only for
+        // names we don't recognise — by the time we get here the negotiation
+        // step already verified both sides agreed.
+        let neg = self
+            .negotiated
+            .as_ref()
+            .ok_or(Error::Protocol("missing negotiation"))?;
+        let (out_comp_name, in_comp_name) = match self.role {
+            Role::Client => (&neg.comp_c2s, &neg.comp_s2c),
+            Role::Server => (&neg.comp_s2c, &neg.comp_c2s),
+        };
+        let out_comp =
+            compress_by_name(out_comp_name).ok_or(Error::Unsupported("unsupported compression"))?;
+        let in_comp = decompress_by_name(in_comp_name)
+            .ok_or(Error::Unsupported("unsupported compression"))?;
+        codec.install_outbound_compress(out_comp);
+        codec.install_inbound_decompress(in_comp);
         Ok(())
     }
 
@@ -627,7 +895,7 @@ fn derive_for_direction(
 
 fn kdf(backend: KexBackend, k: &[u8], h: &[u8], sid: &[u8], letter: u8, n: usize) -> Vec<u8> {
     match backend {
-        KexBackend::Curve25519 | KexBackend::EcdhP256 | KexBackend::Dh14 => {
+        KexBackend::Curve25519 | KexBackend::EcdhP256 | KexBackend::Dh14 | KexBackend::Gex => {
             derive_with::<Sha256>(k, h, sid, letter, n)
         }
         KexBackend::EcdhP384 => derive_with::<Sha384>(k, h, sid, letter, n),
@@ -652,15 +920,19 @@ mod tests {
     #[test]
     fn every_default_kex_algorithm_maps_to_backend() {
         for &name in defaults::KEX {
-            if name == "diffie-hellman-group-exchange-sha256" {
-                // GEX is not yet wired into the runner.
-                continue;
-            }
             KexBackend::from_name(name).expect(name);
         }
     }
 
     fn make_advert(cipher: &'static str, mac: &'static str) -> KexInit {
+        make_advert_with_comp(cipher, mac, defaults::COMP)
+    }
+
+    fn make_advert_with_comp(
+        cipher: &'static str,
+        mac: &'static str,
+        comp: &'static [&'static str],
+    ) -> KexInit {
         let kex_only: [&str; 1] = ["curve25519-sha256"];
         let hk_only: [&str; 1] = ["ssh-ed25519"];
         let ciphers: [&str; 1] = [cipher];
@@ -672,8 +944,8 @@ mod tests {
             ciphers_s2c: &ciphers,
             macs_c2s: &macs,
             macs_s2c: &macs,
-            comp_c2s: defaults::COMP,
-            comp_s2c: defaults::COMP,
+            comp_c2s: comp,
+            comp_s2c: comp,
             lang_c2s: &[],
             lang_s2c: &[],
         };
@@ -774,5 +1046,318 @@ mod tests {
     #[test]
     fn loopback_curve25519_chachapoly() {
         run_loopback("chacha20-poly1305@openssh.com", "hmac-sha2-256");
+    }
+
+    fn make_advert_with_kex(kex: &'static str, cipher: &'static str, mac: &'static str) -> KexInit {
+        let kex_only: [&str; 1] = [kex];
+        let hk_only: [&str; 1] = ["ssh-ed25519"];
+        let ciphers: [&str; 1] = [cipher];
+        let macs: [&str; 1] = [mac];
+        let algs = KexAlgorithms {
+            kex: &kex_only,
+            server_host_key: &hk_only,
+            ciphers_c2s: &ciphers,
+            ciphers_s2c: &ciphers,
+            macs_c2s: &macs,
+            macs_s2c: &macs,
+            comp_c2s: defaults::COMP,
+            comp_s2c: defaults::COMP,
+            lang_c2s: &[],
+            lang_s2c: &[],
+        };
+        let mut cookie = [0u8; 16];
+        OsRng.fill_bytes(&mut cookie);
+        KexInit::from_algorithms(&algs, cookie)
+    }
+
+    #[test]
+    fn loopback_gex_chachapoly() {
+        let mut rng = OsRng;
+
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let kex = "diffie-hellman-group-exchange-sha256";
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(Role::Client, make_advert_with_kex(kex, cipher, mac));
+        let mut server = KexRunner::new(Role::Server, make_advert_with_kex(kex, cipher, mac));
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+
+        // GEX has an extra round trip (REQUEST/GROUP/INIT/REPLY) compared to
+        // ECDH — give the loop more headroom.
+        let mut steps = 0;
+        while !(matches!(client.phase, Phase::Completed)
+            && matches!(server.phase, Phase::Completed))
+        {
+            steps += 1;
+            assert!(steps < 24, "GEX handshake did not converge");
+            let mut next_from_client = Vec::new();
+            for p in from_server.drain(..) {
+                let adv = client
+                    .on_packet(
+                        &mut rng,
+                        &mut client_codec,
+                        &p,
+                        None,
+                        Some(&client_verifier),
+                        v_c,
+                        v_s,
+                    )
+                    .unwrap();
+                next_from_client.extend(adv.outbound);
+            }
+            let mut next_from_server = Vec::new();
+            for p in from_client.drain(..) {
+                let adv = server
+                    .on_packet(
+                        &mut rng,
+                        &mut server_codec,
+                        &p,
+                        Some(&server_hk),
+                        None,
+                        v_c,
+                        v_s,
+                    )
+                    .unwrap();
+                next_from_server.extend(adv.outbound);
+            }
+            from_client = next_from_client;
+            from_server = next_from_server;
+            if from_client.is_empty() && from_server.is_empty() {
+                break;
+            }
+        }
+
+        assert!(matches!(client.phase, Phase::Completed));
+        assert!(matches!(server.phase, Phase::Completed));
+        assert_eq!(client.session_id().unwrap(), server.session_id().unwrap());
+
+        // Data plane works after a GEX-derived key install.
+        let frame = client_codec.encode(b"gex c2s", &mut rng).unwrap();
+        let (got, _) = server_codec.decode(&frame).unwrap().expect("c2s");
+        assert_eq!(got, b"gex c2s");
+        let frame = server_codec.encode(b"gex s2c", &mut rng).unwrap();
+        let (got, _) = client_codec.decode(&frame).unwrap().expect("s2c");
+        assert_eq!(got, b"gex s2c");
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn loopback_negotiates_zlib_then_round_trips_compressed() {
+        let mut rng = OsRng;
+
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        static ZLIB_ONLY: &[&str] = &["zlib"];
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client =
+            KexRunner::new(Role::Client, make_advert_with_comp(cipher, mac, ZLIB_ONLY));
+        let mut server =
+            KexRunner::new(Role::Server, make_advert_with_comp(cipher, mac, ZLIB_ONLY));
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+
+        let mut steps = 0;
+        while !(matches!(client.phase, Phase::Completed)
+            && matches!(server.phase, Phase::Completed))
+        {
+            steps += 1;
+            assert!(steps < 16, "handshake did not converge");
+            let mut next_from_client = Vec::new();
+            for p in from_server.drain(..) {
+                let adv = client
+                    .on_packet(
+                        &mut rng,
+                        &mut client_codec,
+                        &p,
+                        None,
+                        Some(&client_verifier),
+                        v_c,
+                        v_s,
+                    )
+                    .unwrap();
+                next_from_client.extend(adv.outbound);
+            }
+            let mut next_from_server = Vec::new();
+            for p in from_client.drain(..) {
+                let adv = server
+                    .on_packet(
+                        &mut rng,
+                        &mut server_codec,
+                        &p,
+                        Some(&server_hk),
+                        None,
+                        v_c,
+                        v_s,
+                    )
+                    .unwrap();
+                next_from_server.extend(adv.outbound);
+            }
+            from_client = next_from_client;
+            from_server = next_from_server;
+            if from_client.is_empty() && from_server.is_empty() {
+                break;
+            }
+        }
+
+        // Both codecs should have "zlib" installed — verify via the
+        // accessor and then check that a highly-compressible payload comes
+        // out smaller than it went in.
+        assert_eq!(client_codec.outbound_compress_name(), "zlib");
+        assert_eq!(server_codec.inbound_decompress_name(), "zlib");
+
+        let payload = vec![b'z'; 4096];
+        let frame = client_codec.encode(&payload, &mut rng).unwrap();
+        assert!(
+            frame.len() < payload.len(),
+            "zlib must have shrunk frame; got {} vs {}",
+            frame.len(),
+            payload.len()
+        );
+        let (got, n) = server_codec.decode(&frame).unwrap().expect("decoded");
+        assert_eq!(n, frame.len());
+        assert_eq!(got, payload);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_to_completion(
+        client: &mut KexRunner,
+        server: &mut KexRunner,
+        client_codec: &mut PacketCodec,
+        server_codec: &mut PacketCodec,
+        client_verifier: &dyn HostKeyVerify,
+        server_hk: &dyn HostKey,
+        from_client: &mut Vec<Vec<u8>>,
+        from_server: &mut Vec<Vec<u8>>,
+        v_c: &[u8],
+        v_s: &[u8],
+    ) {
+        let mut rng = OsRng;
+        let mut steps = 0;
+        while !(client.is_completed() && server.is_completed()) {
+            steps += 1;
+            assert!(steps < 24, "handshake did not converge");
+            let mut next_from_client = Vec::new();
+            for p in from_server.drain(..) {
+                let adv = client
+                    .on_packet(
+                        &mut rng,
+                        client_codec,
+                        &p,
+                        None,
+                        Some(client_verifier),
+                        v_c,
+                        v_s,
+                    )
+                    .unwrap();
+                next_from_client.extend(adv.outbound);
+            }
+            let mut next_from_server = Vec::new();
+            for p in from_client.drain(..) {
+                let adv = server
+                    .on_packet(&mut rng, server_codec, &p, Some(server_hk), None, v_c, v_s)
+                    .unwrap();
+                next_from_server.extend(adv.outbound);
+            }
+            *from_client = next_from_client;
+            *from_server = next_from_server;
+            if from_client.is_empty() && from_server.is_empty() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn restart_preserves_session_id_and_rotates_keys() {
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(Role::Client, make_advert(cipher, mac));
+        let mut server = KexRunner::new(Role::Server, make_advert(cipher, mac));
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        let sid_initial = client.session_id().unwrap().to_vec();
+        let keys_initial_c2s = client.installed_keys().unwrap().c2s.key.clone();
+        assert_eq!(sid_initial, server.session_id().unwrap());
+
+        // Re-key — both sides restart, then drive the second handshake.
+        let mut from_client: Vec<Vec<u8>> = client
+            .restart(&mut rng, make_advert(cipher, mac))
+            .unwrap()
+            .outbound;
+        let mut from_server: Vec<Vec<u8>> = server
+            .restart(&mut rng, make_advert(cipher, mac))
+            .unwrap()
+            .outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        // RFC 4253 §7.2: session id (H of FIRST kex) is unchanged.
+        assert_eq!(client.session_id().unwrap(), sid_initial.as_slice());
+        assert_eq!(server.session_id().unwrap(), sid_initial.as_slice());
+        // New keys rotated.
+        assert_ne!(client.installed_keys().unwrap().c2s.key, keys_initial_c2s);
+
+        // Codec still works with the new keys.
+        let frame = client_codec.encode(b"after rekey", &mut rng).unwrap();
+        let (got, _) = server_codec.decode(&frame).unwrap().expect("rekeyed frame");
+        assert_eq!(got, b"after rekey");
     }
 }

@@ -1,5 +1,13 @@
 use super::*;
 
+fn trim_leading_zeros(b: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i < b.len() && b[i] == 0 {
+        i += 1;
+    }
+    &b[i..]
+}
+
 // Generated with:
 //   ssh-keygen -t ed25519 -f /tmp/k -N "" -C "test@puressh"
 const ED25519_PUB_LINE: &str =
@@ -263,6 +271,210 @@ fn into_host_key_rsa_uses_sha512() {
     let verifier =
         crate::hostkey::host_key_verify_by_name("rsa-sha2-512", &hk.public_blob()).unwrap();
     verifier.verify(b"rsa msg", &sig).unwrap();
+}
+
+#[test]
+fn roundtrip_unencrypted_ed25519() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "rt-ed25519@test".to_string());
+    let pem = sk.to_openssh_pem(None).unwrap();
+    let parsed = PrivateKey::parse_openssh_pem(&pem, None).unwrap();
+    match (&sk, &parsed) {
+        (
+            PrivateKey::Ed25519 {
+                seed: s1,
+                public: p1,
+                comment: c1,
+            },
+            PrivateKey::Ed25519 {
+                seed: s2,
+                public: p2,
+                comment: c2,
+            },
+        ) => {
+            assert_eq!(s1, s2);
+            assert_eq!(p1, p2);
+            assert_eq!(c1, c2);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn roundtrip_unencrypted_ecdsa_p256() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ecdsa(
+        &mut rng,
+        crate::key::EcdsaCurve::P256,
+        "rt-ecdsa@test".to_string(),
+    );
+    let pem = sk.to_openssh_pem(None).unwrap();
+    let parsed = PrivateKey::parse_openssh_pem(&pem, None).unwrap();
+    match (&sk, &parsed) {
+        (
+            PrivateKey::EcdsaP256 {
+                d: d1,
+                point: p1,
+                comment: c1,
+            },
+            PrivateKey::EcdsaP256 {
+                d: d2,
+                point: p2,
+                comment: c2,
+            },
+        ) => {
+            assert_eq!(trim_leading_zeros(d1), trim_leading_zeros(d2));
+            assert_eq!(p1, p2);
+            assert_eq!(c1, c2);
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn roundtrip_unencrypted_rsa_2048() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_rsa(&mut rng, 2048, "rt-rsa@test".to_string()).unwrap();
+    let pem = sk.to_openssh_pem(None).unwrap();
+    let parsed = PrivateKey::parse_openssh_pem(&pem, None).unwrap();
+    assert_eq!(sk.public_key().wire_blob(), parsed.public_key().wire_blob());
+    match (&sk, &parsed) {
+        (
+            PrivateKey::Rsa {
+                n: n1,
+                d: d1,
+                p: p1,
+                q: q1,
+                ..
+            },
+            PrivateKey::Rsa {
+                n: n2,
+                d: d2,
+                p: p2,
+                q: q2,
+                ..
+            },
+        ) => {
+            assert_eq!(trim_leading_zeros(n1), trim_leading_zeros(n2));
+            assert_eq!(trim_leading_zeros(d1), trim_leading_zeros(d2));
+            assert_eq!(trim_leading_zeros(p1), trim_leading_zeros(p2));
+            assert_eq!(trim_leading_zeros(q1), trim_leading_zeros(q2));
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn roundtrip_encrypted_ed25519() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "enc-ed25519@test".to_string());
+    let pem = sk.to_openssh_pem(Some(b"test-passphrase")).unwrap();
+    let parsed = PrivateKey::parse_openssh_pem(&pem, Some(b"test-passphrase")).unwrap();
+    assert_eq!(sk.public_key().wire_blob(), parsed.public_key().wire_blob());
+    match (&sk, &parsed) {
+        (PrivateKey::Ed25519 { seed: s1, .. }, PrivateKey::Ed25519 { seed: s2, .. }) => {
+            assert_eq!(s1, s2)
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+#[test]
+fn encrypted_wrong_passphrase_rejected() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "wp@test".to_string());
+    let pem = sk.to_openssh_pem(Some(b"right")).unwrap();
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"wrong")).expect_err("should fail");
+    match err {
+        Error::Crypto(msg) => assert!(msg.contains("passphrase"), "{msg}"),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[test]
+fn fingerprint_matches_openssh_cli() {
+    use std::io::Write;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    if Command::new("ssh-keygen").arg("-V").output().is_err() {
+        return;
+    }
+
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "fp@test".to_string());
+    let pub_line = sk.public_key().to_authorized_keys_line();
+    let expected = sk.public_key().sha256_fingerprint();
+
+    let tmp_dir = std::env::temp_dir();
+    let pid = std::process::id();
+    let path = tmp_dir.join(format!("puressh_fp_test_{pid}.pub"));
+    {
+        let mut f = std::fs::File::create(&path).expect("create temp .pub");
+        f.write_all(pub_line.as_bytes()).unwrap();
+        f.write_all(b"\n").unwrap();
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut child = Command::new("ssh-keygen")
+        .arg("-lf")
+        .arg(&path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn ssh-keygen");
+    let mut waited = false;
+    let mut guard = 0usize;
+    while Instant::now() < deadline {
+        guard += 1;
+        if guard > 200 {
+            break;
+        }
+        match child.try_wait().expect("try_wait") {
+            Some(_) => {
+                waited = true;
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    if !waited {
+        let _ = child.kill();
+        let _ = std::fs::remove_file(&path);
+        panic!("ssh-keygen -lf did not finish in 10s");
+    }
+    let out = child.wait_with_output().expect("wait_with_output");
+    let _ = std::fs::remove_file(&path);
+    assert!(out.status.success(), "ssh-keygen -lf failed: {out:?}");
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        s.contains(&expected),
+        "openssh fingerprint output {s:?} does not contain {expected}"
+    );
+}
+
+#[test]
+fn generated_key_signs_and_verifies() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "sv@test".to_string());
+    let pub_blob = sk.public_key().wire_blob();
+    let hk = sk.into_host_key().unwrap();
+    let sig = hk.sign(b"chain through into_host_key").unwrap();
+    let verifier = crate::hostkey::host_key_verify_by_name("ssh-ed25519", &pub_blob).unwrap();
+    verifier
+        .verify(b"chain through into_host_key", &sig)
+        .unwrap();
+}
+
+#[test]
+fn fingerprint_no_padding() {
+    let pk = PublicKey::Ed25519 {
+        raw: [0xab; 32],
+        comment: String::new(),
+    };
+    let fp = pk.sha256_fingerprint();
+    assert!(fp.starts_with("SHA256:"));
+    assert!(!fp.ends_with('='));
 }
 
 #[test]

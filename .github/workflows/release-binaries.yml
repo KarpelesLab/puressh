@@ -72,7 +72,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build ssh and sshd
+      - name: Build CLI binaries and C library
         shell: bash
         env:
           # Only set the linker env var when the matrix entry asks for one.
@@ -82,19 +82,30 @@ jobs:
         run: |
           cargo build --release --bin ssh  --target ${{ matrix.target }}
           cargo build --release --bin sshd --target ${{ matrix.target }}
+          cargo rustc --lib --release --features ffi --crate-type staticlib --target ${{ matrix.target }}
+          cargo rustc --lib --release --features ffi --crate-type cdylib    --target ${{ matrix.target }}
 
       - name: Stage archive contents
         shell: bash
         run: |
-          mkdir -p staging/bin
+          mkdir -p staging/bin staging/lib staging/include
           cp README.md staging/
+          cp include/puressh.h staging/include/
+          # LICENSE is optional — copy if present.
+          [[ -f LICENSE ]] && cp LICENSE staging/ || true
           td="target/${{ matrix.target }}/release"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "$td/ssh.exe"  staging/bin/
             cp "$td/sshd.exe" staging/bin/
+            cp "$td/puressh.lib"     staging/lib/ 2>/dev/null || true  # static library
+            cp "$td/puressh.dll"     staging/lib/ 2>/dev/null || true  # shared library
+            cp "$td/puressh.dll.lib" staging/lib/ 2>/dev/null || true  # import library for the DLL
           else
             cp "$td/ssh"  staging/bin/
             cp "$td/sshd" staging/bin/
+            cp "$td/libpuressh.a" staging/lib/
+            cp "$td"/libpuressh.so    staging/lib/ 2>/dev/null || true  # Linux
+            cp "$td"/libpuressh.dylib staging/lib/ 2>/dev/null || true  # macOS
           fi
           ls -R staging
 
@@ -133,23 +144,33 @@ jobs:
         with:
           key: macos-universal
 
-      - name: Build both Apple slices for ssh and sshd
+      - name: Build both Apple slices (CLI + C library)
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
             cargo build --release --bin ssh  --target "$t"
             cargo build --release --bin sshd --target "$t"
+            cargo rustc --lib --release --features ffi --crate-type staticlib --target "$t"
+            cargo rustc --lib --release --features ffi --crate-type cdylib    --target "$t"
           done
 
-      - name: Lipo into universal binaries
+      - name: Lipo into universal artifacts
         run: |
-          mkdir -p staging/bin
+          mkdir -p staging/bin staging/lib staging/include
           for bin in ssh sshd; do
             lipo -create -output "staging/bin/$bin" \
               "target/x86_64-apple-darwin/release/$bin" \
               "target/aarch64-apple-darwin/release/$bin"
           done
+          lipo -create -output staging/lib/libpuressh.a \
+            target/x86_64-apple-darwin/release/libpuressh.a \
+            target/aarch64-apple-darwin/release/libpuressh.a
+          lipo -create -output staging/lib/libpuressh.dylib \
+            target/x86_64-apple-darwin/release/libpuressh.dylib \
+            target/aarch64-apple-darwin/release/libpuressh.dylib
+          cp include/puressh.h staging/include/
           cp README.md staging/
-          file staging/bin/ssh staging/bin/sshd
+          [[ -f LICENSE ]] && cp LICENSE staging/ || true
+          file staging/bin/ssh staging/bin/sshd staging/lib/libpuressh.*
 
       - name: Pack archive
         id: pack

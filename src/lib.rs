@@ -1,5 +1,5 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(feature = "ffi"), forbid(unsafe_code))]
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
@@ -46,5 +46,8 @@ pub mod client;
 
 #[cfg(feature = "server")]
 pub mod server;
+
+#[cfg(feature = "ffi")]
+pub mod ffi;
 
 pub use error::{Error, Result};

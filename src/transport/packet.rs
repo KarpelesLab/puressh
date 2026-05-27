@@ -183,8 +183,15 @@ fn padding_for(payload_len: usize, block_size: usize, encrypts_length: bool) -> 
     if pad < 4 {
         pad += bs;
     }
-    while 4 + 1 + payload_len + pad < MIN_TOTAL_LEN {
-        pad += bs;
+    // RFC 4253 §6's "total >= 16" applies only when the length field is part
+    // of the encrypted/aligned block. For AEAD suites (AES-GCM and
+    // chacha20-poly1305@openssh.com) the length sits outside the block and
+    // OpenSSH only requires `body` to be block-aligned — packets as small as
+    // 12 bytes on the wire (length=8) are legal.
+    if encrypts_length {
+        while 4 + 1 + payload_len + pad < MIN_TOTAL_LEN {
+            pad += bs;
+        }
     }
     pad
 }
@@ -394,9 +401,6 @@ fn encode_gcm<R: CryptoRng + RngCore>(
     let block_size = 16usize;
     let pad = padding_for(payload.len(), block_size, false);
     let packet_length = 1 + payload.len() + pad;
-    if packet_length + 4 < MIN_TOTAL_LEN {
-        return Err(Error::Protocol("packet too short"));
-    }
 
     let mut frame = Vec::with_capacity(4 + packet_length + 16);
     frame.extend_from_slice(&(packet_length as u32).to_be_bytes());
@@ -425,7 +429,7 @@ fn decode_gcm(buf: &[u8], cipher: &mut SshCipher) -> Result<Option<(Vec<u8>, usi
     if !body_len.is_multiple_of(16) {
         return Err(Error::Protocol("packet body not block-aligned"));
     }
-    if 4 + body_len < MIN_TOTAL_LEN {
+    if body_len < 16 {
         return Err(Error::Protocol("packet too short"));
     }
     let total = 4 + body_len + 16;
@@ -457,9 +461,6 @@ fn encode_chachapoly<R: CryptoRng + RngCore>(
     let block_size = 8usize;
     let pad = padding_for(payload.len(), block_size, false);
     let packet_length = 1 + payload.len() + pad;
-    if packet_length + 4 < MIN_TOTAL_LEN {
-        return Err(Error::Protocol("packet too short"));
-    }
 
     let seq64 = seq as u64;
     let mut frame = Vec::with_capacity(4 + packet_length + 16);
@@ -498,7 +499,7 @@ fn decode_chachapoly(
     if !body_len.is_multiple_of(8) {
         return Err(Error::Protocol("packet body not block-aligned"));
     }
-    if 4 + body_len < MIN_TOTAL_LEN {
+    if body_len < 8 {
         return Err(Error::Protocol("packet too short"));
     }
     let total = 4 + body_len + 16;

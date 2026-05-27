@@ -327,6 +327,35 @@ impl PrivateKey {
         }
     }
 
+    /// Convert this private key into a boxed `HostKey` signer.
+    ///
+    /// For RSA keys, defaults to `rsa-sha2-512` (modern OpenSSH preference).
+    pub fn into_host_key(self) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send>> {
+        use purecrypto::bignum::BoxedUint;
+        match self {
+            PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::Ed25519HostKey::from_seed(seed),
+            )),
+            PrivateKey::EcdsaP256 { d, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::EcdsaP256HostKey::from_scalar(&d)?,
+            )),
+            PrivateKey::EcdsaP384 { d, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::EcdsaP384HostKey::from_scalar(&d)?,
+            )),
+            PrivateKey::EcdsaP521 { d, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::EcdsaP521HostKey::from_scalar(&d)?,
+            )),
+            PrivateKey::Rsa { n, e, d, .. } => {
+                let n_u = BoxedUint::from_be_bytes(trim_leading_zeros(&n));
+                let e_u = BoxedUint::from_be_bytes(trim_leading_zeros(&e));
+                let d_u = BoxedUint::from_be_bytes(trim_leading_zeros(&d));
+                Ok(alloc::boxed::Box::new(
+                    crate::hostkey::RsaSha2_512HostKey::from_components(n_u, e_u, d_u)?,
+                ))
+            }
+        }
+    }
+
     /// Derive the matching [`PublicKey`] (cloning the public parts).
     pub fn public_key(&self) -> PublicKey {
         match self {

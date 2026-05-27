@@ -233,6 +233,39 @@ fn authorized_keys_line_roundtrip_no_comment() {
 }
 
 #[test]
+fn into_host_key_ed25519_signs_and_verifies() {
+    let priv_key = PrivateKey::parse_openssh_pem(ED25519_PEM_UNENCRYPTED, None).unwrap();
+    let hk = priv_key.into_host_key().unwrap();
+    assert_eq!(hk.algorithm(), "ssh-ed25519");
+    let sig = hk.sign(b"into_host_key test").unwrap();
+    let verifier =
+        crate::hostkey::host_key_verify_by_name("ssh-ed25519", &hk.public_blob()).unwrap();
+    verifier.verify(b"into_host_key test", &sig).unwrap();
+}
+
+#[test]
+fn into_host_key_ecdsa_p256_signs_and_verifies() {
+    let priv_key = PrivateKey::parse_openssh_pem(ECDSA_P256_PEM_UNENCRYPTED, None).unwrap();
+    let hk = priv_key.into_host_key().unwrap();
+    assert_eq!(hk.algorithm(), "ecdsa-sha2-nistp256");
+    let sig = hk.sign(b"ecdsa msg").unwrap();
+    let verifier =
+        crate::hostkey::host_key_verify_by_name("ecdsa-sha2-nistp256", &hk.public_blob()).unwrap();
+    verifier.verify(b"ecdsa msg", &sig).unwrap();
+}
+
+#[test]
+fn into_host_key_rsa_uses_sha512() {
+    let priv_key = PrivateKey::parse_openssh_pem(RSA_PEM_UNENCRYPTED, None).unwrap();
+    let hk = priv_key.into_host_key().unwrap();
+    assert_eq!(hk.algorithm(), "rsa-sha2-512");
+    let sig = hk.sign(b"rsa msg").unwrap();
+    let verifier =
+        crate::hostkey::host_key_verify_by_name("rsa-sha2-512", &hk.public_blob()).unwrap();
+    verifier.verify(b"rsa msg", &sig).unwrap();
+}
+
+#[test]
 fn wire_blob_ed25519_matches_known_layout() {
     let pk = PublicKey::Ed25519 {
         raw: [0xab; 32],

@@ -1,5 +1,10 @@
 # puressh
 
+[![CI](https://github.com/KarpelesLab/puressh/actions/workflows/ci.yml/badge.svg)](https://github.com/KarpelesLab/puressh/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/puressh.svg)](https://crates.io/crates/puressh)
+[![Docs.rs](https://docs.rs/puressh/badge.svg)](https://docs.rs/puressh)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A pure-Rust [SSH](https://datatracker.ietf.org/doc/html/rfc4251) (Secure Shell)
 protocol library in the spirit of [libssh](https://www.libssh.org/), built on
 [`purecrypto`](https://crates.io/crates/purecrypto) for every cryptographic

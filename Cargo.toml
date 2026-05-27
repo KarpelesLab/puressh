@@ -12,16 +12,18 @@ keywords = ["ssh", "ssh2", "crypto", "network", "no-std"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-default = ["std", "client", "server"]
+default = ["std", "client", "server", "compress"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 client = []
 server = []
+compress = ["dep:miniz_oxide"]
 
 [dependencies]
 purecrypto = { version = "0.2", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der",
 ] }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"], optional = true }
 
 [dev-dependencies]
 hex = "0.4"

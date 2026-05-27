@@ -38,6 +38,9 @@ pub mod auth;
 pub mod channel;
 pub mod key;
 
+#[cfg(feature = "compress")]
+pub mod compress;
+
 #[cfg(feature = "client")]
 pub mod client;
 

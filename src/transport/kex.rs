@@ -1,9 +1,7 @@
-//! Algorithm negotiation (RFC 4253 §7) — the `SSH_MSG_KEXINIT` exchange.
-//!
-//! Each side announces ordered preference lists for ten algorithm categories;
-//! both sides independently pick the first algorithm in the client's list that
-//! the server also advertises (per §7.1). The actual KEX message round-trip is
-//! handled by the algorithm-specific module in [`crate::kex`].
+//! Algorithm negotiation (RFC 4253 §7) — the `SSH_MSG_KEXINIT` exchange and
+//! the KEX runner that drives the round-trip to completion.
+
+extern crate alloc;
 
 /// Algorithm preference lists advertised by one side.
 #[derive(Debug, Clone)]
@@ -31,24 +29,27 @@ pub struct KexAlgorithms<'a> {
 }
 
 /// The algorithms agreed by both sides after the KEXINIT exchange.
-#[derive(Debug, Clone, Copy)]
-pub struct Negotiated<'a> {
+///
+/// Carries owned strings so the runner can keep it across the rest of the
+/// KEX round-trip and across re-keys.
+#[derive(Debug, Clone)]
+pub struct Negotiated {
     /// Key-exchange method.
-    pub kex: &'a str,
+    pub kex: alloc::string::String,
     /// Server host-key method.
-    pub host_key: &'a str,
-    /// Client→server cipher.
-    pub cipher_c2s: &'a str,
-    /// Server→client cipher.
-    pub cipher_s2c: &'a str,
-    /// Client→server MAC (or "" when cipher is AEAD).
-    pub mac_c2s: &'a str,
-    /// Server→client MAC (or "" when cipher is AEAD).
-    pub mac_s2c: &'a str,
-    /// Client→server compression.
-    pub comp_c2s: &'a str,
-    /// Server→client compression.
-    pub comp_s2c: &'a str,
+    pub host_key: alloc::string::String,
+    /// Client to server cipher.
+    pub cipher_c2s: alloc::string::String,
+    /// Server to client cipher.
+    pub cipher_s2c: alloc::string::String,
+    /// Client to server MAC (or "" when cipher is AEAD).
+    pub mac_c2s: alloc::string::String,
+    /// Server to client MAC (or "" when cipher is AEAD).
+    pub mac_s2c: alloc::string::String,
+    /// Client to server compression.
+    pub comp_c2s: alloc::string::String,
+    /// Server to client compression.
+    pub comp_s2c: alloc::string::String,
 }
 
 /// Sensible default algorithm lists matching modern OpenSSH.

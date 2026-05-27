@@ -10,7 +10,11 @@
 pub mod packet;
 pub mod version;
 pub mod kex;
+pub mod kexinit;
+pub mod runner;
 
 pub use kex::{KexAlgorithms, Negotiated};
-pub use packet::{Packet, PacketCodec};
+pub use kexinit::{KexInit, NegotiatedOwned, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS};
+pub use packet::{Packet, PacketCodec, BLOCK_SIZE_DEFAULT, MAX_PACKET_LEN};
+pub use runner::{DirKeys, InstalledKeys, KexAdvance, KexRunner, Role};
 pub use version::VersionExchange;

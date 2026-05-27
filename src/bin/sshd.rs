@@ -12,10 +12,20 @@
 //! listener fd so the daemon can be restarted on the same port without
 //! waiting on `SO_REUSEADDR` semantics.
 //!
-//! Interactive shells (`pty-req` + `shell`) are wired through a second
-//! `forkpty()` inside the connection child. The grandchild's exit status
-//! is reaped via `waitpid(WNOHANG)` and forwarded to the client as
-//! `exit-status` / `exit-signal`.
+//! Interactive shells (`pty-req` + `shell`) allocate a PTY with
+//! `openpty()` and fork manually so the slave path is known up-front —
+//! the PAM session is opened with `PAM_TTY = /dev/pts/N` *before* the
+//! grandchild forks off into the user's shell. The grandchild's exit
+//! status is reaped via `waitpid(WNOHANG)` and forwarded to the client
+//! as `exit-status` / `exit-signal`.
+//!
+//! When the `pam` feature is on (default), every successful SSH
+//! authentication is followed by `pam_acct_mgmt` + `pam_open_session`
+//! against service `sshd` — `pam_env` contributions land in the user's
+//! shell environment and `pam_close_session` runs at connection
+//! teardown. Building with `--no-default-features` (or any combination
+//! that omits `pam`) drops the libpam runtime dep entirely; the binary
+//! still works but offers no session management.
 //!
 //! Windows builds compile but `main` prints "not supported" — every line
 //! of the implementation lives behind `#[cfg(unix)]`.
@@ -34,7 +44,9 @@ fn main() -> std::process::ExitCode {
 #[cfg(unix)]
 mod imp {
     use std::collections::HashSet;
+    use std::ffi::OsStr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::process::{Command, ExitCode};
     use std::sync::Arc;
 
@@ -57,6 +69,167 @@ mod imp {
 
     const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
                          [-A authorized_keys_file] [-u allowed_user]...";
+
+    // -------------------------------------------------------------------------
+    // PAM session gate.
+    //
+    // The `pam` feature compiles the real implementation against
+    // `pam-client2`; without the feature, a no-op stub provides the same
+    // surface so the rest of the binary doesn't need feature-gates. Either
+    // way `ensure(user, tty)` is the only entry point handlers use.
+    //
+    // Lifetime model: the `PamGate` is wrapped in `Arc` and shared across
+    // `ShellCommandHandler` + `NixShellHandler`. Because each connection
+    // runs in its own `fork()`ed child, the gate's state (the live PAM
+    // context, the cached env list, the peer address) is COW-isolated per
+    // connection — there's no cross-connection bleed even though the
+    // daemon's parent process never opens any PAM session itself.
+    // -------------------------------------------------------------------------
+    #[cfg(feature = "pam")]
+    mod pam_gate {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::{Arc, Mutex};
+
+        use pam_client2::conv_null::Conversation;
+        use pam_client2::{Context, Flag, SessionToken};
+
+        /// Holds the live PAM `Context` and the leaked session handle.
+        /// Drop order matters: the leaked `Session` must be re-acquired
+        /// (via `unleak_session`) so its own `Drop` calls
+        /// `pam_close_session`, *then* the boxed context drops and calls
+        /// `pam_end`.
+        struct PamHolder {
+            context: Box<Context<Conversation>>,
+            token: Option<SessionToken>,
+        }
+
+        impl Drop for PamHolder {
+            fn drop(&mut self) {
+                if let Some(token) = self.token.take() {
+                    // Re-attach the session to its context; the returned
+                    // `Session` drops in place, closing the PAM session.
+                    let _session = self.context.unleak_session(token);
+                }
+                // Box<Context<…>> drops next: pam_end.
+            }
+        }
+
+        pub struct PamGate {
+            service: &'static str,
+            peer: Mutex<Option<String>>,
+            envs: Mutex<Vec<(CString, CString)>>,
+            inner: Mutex<Option<PamHolder>>,
+            debug: bool,
+        }
+
+        impl PamGate {
+            pub fn new(debug: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    service: "sshd",
+                    peer: Mutex::new(None),
+                    envs: Mutex::new(Vec::new()),
+                    inner: Mutex::new(None),
+                    debug,
+                })
+            }
+
+            /// Stash the peer address (used as `PAM_RHOST`). Should be
+            /// called inside the per-connection child before any handler
+            /// triggers `ensure`.
+            pub fn set_peer(&self, peer: String) {
+                *self.peer.lock().unwrap() = Some(peer);
+            }
+
+            /// Lazily open the PAM session for `user` with PAM_TTY set
+            /// to `tty`. Strict: on failure, returns `Err` — the caller
+            /// is expected to surface that as a CHANNEL_FAILURE or as
+            /// `exit_status = 255`. Idempotent: subsequent calls return
+            /// the same cached env list without re-opening.
+            pub fn ensure(
+                &self,
+                user: &str,
+                tty: &str,
+            ) -> puressh::Result<Vec<(CString, CString)>> {
+                let mut guard = self.inner.lock().unwrap();
+                if guard.is_some() {
+                    return Ok(self.envs.lock().unwrap().clone());
+                }
+
+                let mut ctx = Box::new(
+                    Context::new(self.service, Some(user), Conversation::new())
+                        .map_err(|e| pam_err("pam_start", e))?,
+                );
+                if let Some(rhost) = self.peer.lock().unwrap().clone() {
+                    ctx.set_rhost(Some(&rhost))
+                        .map_err(|e| pam_err("set_rhost", e))?;
+                }
+                ctx.set_tty(Some(tty)).map_err(|e| pam_err("set_tty", e))?;
+                ctx.acct_mgmt(Flag::NONE)
+                    .map_err(|e| pam_err("acct_mgmt", e))?;
+
+                let session = ctx
+                    .open_session(Flag::NONE)
+                    .map_err(|e| pam_err("open_session", e))?;
+
+                // Snapshot the PAM env. `iter_tuples` yields
+                // `(&OsStr, &OsStr)`; we keep `CString`s because the
+                // post-fork shell needs `*const c_char` for `setenv`.
+                let envs: Vec<(CString, CString)> = session
+                    .envlist()
+                    .iter_tuples()
+                    .filter_map(|(k, v)| {
+                        let k = CString::new(k.as_bytes()).ok()?;
+                        let v = CString::new(v.as_bytes()).ok()?;
+                        Some((k, v))
+                    })
+                    .collect();
+
+                let token = session.leak();
+                *self.envs.lock().unwrap() = envs.clone();
+                *guard = Some(PamHolder {
+                    context: ctx,
+                    token: Some(token),
+                });
+                if self.debug {
+                    eprintln!(
+                        "sshd: PAM session opened (user={user}, tty={tty}, envs={})",
+                        envs.len()
+                    );
+                }
+                Ok(envs)
+            }
+        }
+
+        fn pam_err<E: std::fmt::Display>(phase: &'static str, e: E) -> puressh::Error {
+            puressh::Error::Io(std::io::Error::other(format!("PAM {phase}: {e}")))
+        }
+    }
+
+    #[cfg(not(feature = "pam"))]
+    mod pam_gate {
+        use std::ffi::CString;
+        use std::sync::Arc;
+
+        /// Stub gate used when the `pam` feature is off. All operations
+        /// are no-ops so the rest of the binary can ignore the feature
+        /// state.
+        pub struct PamGate;
+
+        impl PamGate {
+            pub fn new(_debug: bool) -> Arc<Self> {
+                Arc::new(PamGate)
+            }
+            pub fn set_peer(&self, _peer: String) {}
+            pub fn ensure(
+                &self,
+                _user: &str,
+                _tty: &str,
+            ) -> puressh::Result<Vec<(CString, CString)>> {
+                Ok(Vec::new())
+            }
+        }
+    }
 
     struct Cli {
         port: u16,
@@ -262,6 +435,7 @@ mod imp {
     }
 
     struct ShellCommandHandler {
+        pam: Arc<pam_gate::PamGate>,
         debug: bool,
     }
 
@@ -270,7 +444,30 @@ mod imp {
             if self.debug {
                 eprintln!("sshd: exec by {user}: {command}");
             }
-            match Command::new("sh").args(["-c", command]).output() {
+            // Open the PAM session before spawning the child. `exec`
+            // requests don't have a real tty, so we use "ssh" — matches
+            // OpenSSH's behaviour for non-PTY channels. `ExecResult`
+            // has no error channel, so PAM failure surfaces as exit
+            // status 255 with the error message on stderr.
+            let envs = match self.pam.ensure(user, "ssh") {
+                Ok(e) => e,
+                Err(e) => {
+                    return ExecResult {
+                        stdout: Vec::new(),
+                        stderr: format!("sshd: PAM session open failed: {e}\n").into_bytes(),
+                        exit_status: 255,
+                    };
+                }
+            };
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", command]).env_clear();
+            for (k, v) in &envs {
+                cmd.env(
+                    OsStr::from_bytes(k.to_bytes()),
+                    OsStr::from_bytes(v.to_bytes()),
+                );
+            }
+            match cmd.output() {
                 Ok(out) => {
                     let code = out.status.code().unwrap_or(255);
                     let code_u32 = if code < 0 { 255u32 } else { code as u32 };
@@ -302,6 +499,7 @@ mod imp {
     // -------------------------------------------------------------------------
 
     struct NixShellHandler {
+        pam: Arc<pam_gate::PamGate>,
         debug: bool,
     }
 
@@ -312,8 +510,8 @@ mod imp {
             pty: Option<PtySpec>,
         ) -> puressh::Result<Box<dyn ShellSession>> {
             match pty {
-                Some(spec) => spawn_pty_shell(user, &spec, self.debug),
-                None => spawn_pipe_shell(user, self.debug),
+                Some(spec) => spawn_pty_shell(&self.pam, user, &spec, self.debug),
+                None => spawn_pipe_shell(&self.pam, user, self.debug),
             }
         }
     }
@@ -326,52 +524,96 @@ mod imp {
     }
 
     fn spawn_pty_shell(
+        pam: &Arc<pam_gate::PamGate>,
         user: &str,
         spec: &PtySpec,
         debug: bool,
     ) -> puressh::Result<Box<dyn ShellSession>> {
-        let _ = user; // Not yet used — would drive setuid/getpwnam in a future revision.
         let ws = nix::pty::Winsize {
             ws_row: clamp_u16(spec.rows),
             ws_col: clamp_u16(spec.cols),
             ws_xpixel: clamp_u16(spec.px_w),
             ws_ypixel: clamp_u16(spec.px_h),
         };
-        // SAFETY: `forkpty` is `unsafe` because the child runs in a
-        // post-fork window where only async-signal-safe ops are guaranteed
-        // safe until exec. We exec immediately in the child branch.
-        let fp = unsafe { nix::pty::forkpty(&ws, None) }.map_err(nix_io)?;
-        match fp {
-            nix::pty::ForkptyResult::Child => {
-                // Restore default signal handlers so the user's shell isn't
-                // born with our SIG_IGN'd SIGCHLD masking its children.
-                // (The connection child already reset SIGCHLD to SIG_DFL
-                // before this point, but be explicit.)
+        // Allocate the master/slave pair *before* forking. PAM_TTY must
+        // be the slave's path on disk so PAM modules (pam_loginuid,
+        // pam_systemd, pam_lastlog, …) can stat it; `forkpty` doesn't
+        // expose that path pre-fork, hence the manual split.
+        let pty = nix::pty::openpty(Some(&ws), None).map_err(nix_io)?;
+        let slave_path = nix::unistd::ttyname(&pty.slave)
+            .map_err(nix_io)?
+            .to_string_lossy()
+            .into_owned();
+
+        // Open the PAM session with the slave path as PAM_TTY. Strict:
+        // failure here propagates as `puressh::Error` and the channel
+        // request is rejected upstream.
+        let pam_envs = pam.ensure(user, &slave_path)?;
+
+        // SAFETY: fork() in single-threaded code is safe; the child
+        // branch performs only async-signal-safe ops (with the known
+        // caveat about setenv, documented inline below) before execvp.
+        let pid = unsafe { fork() }.map_err(nix_io)?;
+        match pid {
+            ForkResult::Child => {
+                // Child does not need the master end — close it so the
+                // pty drains correctly when the user's shell exits.
+                drop(pty.master);
+                // Become a fresh session leader, then claim the slave
+                // as the controlling tty. Without TIOCSCTTY, programs
+                // like `vim` and `top` won't get SIGWINCH on resize.
+                let _ = nix::unistd::setsid();
+                // SAFETY: TIOCSCTTY on a slave pty in a fresh session
+                // is well-defined; dup2 rewires stdio onto it.
+                unsafe {
+                    libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY as _, 0);
+                    libc::dup2(pty.slave.as_raw_fd(), 0);
+                    libc::dup2(pty.slave.as_raw_fd(), 1);
+                    libc::dup2(pty.slave.as_raw_fd(), 2);
+                }
+                drop(pty.slave);
+                // Restore default SIGCHLD so the user's shell can reap
+                // its own children via waitpid(WNOHANG).
                 let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
-                // execvp the user's shell. /bin/sh -l keeps the dependency
-                // surface tiny; a fuller impl would consult getpwnam.
+                // Apply PAM environment. `setenv` isn't strictly
+                // async-signal-safe per POSIX, but our post-fork
+                // process is single-threaded and the env list is
+                // bounded — this is the same approach OpenSSH uses in
+                // `do_setup_env` → `child_set_env`.
+                for (k, v) in &pam_envs {
+                    // SAFETY: k, v are NUL-terminated `CString`s we
+                    // own; the third argument 1 says "overwrite".
+                    unsafe {
+                        libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+                    }
+                }
+                // execvp the user's shell. /bin/sh -l keeps the
+                // dependency surface tiny; a fuller impl would
+                // consult getpwnam(user).pw_shell.
                 let sh = c"/bin/sh";
                 let arg0 = c"sh";
                 let argl = c"-l";
                 let _ = execvp(sh, &[arg0, argl]);
-                // execvp failed (binary missing, ENOEXEC, …). Use _exit
-                // rather than exit so we don't run stdlib atexit handlers
+                // execvp failed (binary missing, ENOEXEC, …). Use
+                // _exit so we don't run stdlib atexit handlers
                 // inherited from the parent.
                 unsafe { libc::_exit(127) };
             }
-            nix::pty::ForkptyResult::Parent { child, master } => {
-                // Make the master non-blocking so `ShellSession::read`/`write`
-                // can return EAGAIN → Ok(0) instead of stalling the per-tick
-                // poll loop.
+            ForkResult::Parent { child } => {
+                // Parent doesn't need the slave — close it so EOF
+                // semantics work when the child exits.
+                drop(pty.slave);
+                let master = pty.master;
                 let raw = master.as_raw_fd();
                 let cur = fcntl(master.as_fd(), FcntlArg::F_GETFL).map_err(nix_io)?;
                 let new = OFlag::from_bits_truncate(cur) | OFlag::O_NONBLOCK;
                 fcntl(master.as_fd(), FcntlArg::F_SETFL(new)).map_err(nix_io)?;
                 if debug {
                     eprintln!(
-                        "sshd: spawned pty shell pid={} master_fd={}",
+                        "sshd: spawned pty shell pid={} master_fd={} pts={}",
                         child.as_raw(),
-                        raw
+                        raw,
+                        slave_path,
                     );
                 }
                 Ok(Box::new(NixShellSession {
@@ -383,10 +625,15 @@ mod imp {
         }
     }
 
-    fn spawn_pipe_shell(_user: &str, _debug: bool) -> puressh::Result<Box<dyn ShellSession>> {
-        // `ssh -T` (no PTY) lands here. We don't implement the pipe path
-        // yet — clients that want a shell without a PTY get a polite
-        // protocol-level failure.
+    fn spawn_pipe_shell(
+        pam: &Arc<pam_gate::PamGate>,
+        user: &str,
+        _debug: bool,
+    ) -> puressh::Result<Box<dyn ShellSession>> {
+        // `ssh -T` (no PTY) lands here. Open the PAM session anyway —
+        // strict mode wants to surface auth/account failures before we
+        // return the user-facing "unsupported" message — then bail.
+        let _ = pam.ensure(user, "ssh")?;
         Err(puressh::Error::Unsupported(
             "shell without pty-req is not yet supported by this sshd",
         ))
@@ -580,14 +827,25 @@ mod imp {
             debug: cli.debug,
         });
 
+        // One PamGate per accept-loop iteration's child. The parent
+        // holds a clone too, but fork's COW gives each connection its
+        // own copy — no cross-connection state bleed.
+        let pam_gate = pam_gate::PamGate::new(cli.debug);
+
         let cfg = Arc::new(
             Config::new(
                 host_keys,
                 factory,
                 vec!["publickey"],
-                Arc::new(ShellCommandHandler { debug: cli.debug }),
+                Arc::new(ShellCommandHandler {
+                    pam: pam_gate.clone(),
+                    debug: cli.debug,
+                }),
             )
-            .with_shell(Arc::new(NixShellHandler { debug: cli.debug })),
+            .with_shell(Arc::new(NixShellHandler {
+                pam: pam_gate.clone(),
+                debug: cli.debug,
+            })),
         );
 
         install_parent_sigchld()?;
@@ -629,11 +887,16 @@ mod imp {
                     // daemon on the same port keeps hitting EADDRINUSE
                     // because the kernel sees an open listener.
                     drop(listener);
-                    // Restore default SIGCHLD so our forkpty grandchildren
+                    // Restore default SIGCHLD so the grandchild shell
                     // can be reaped via waitpid(WNOHANG).
-                    // SAFETY: same justification as the parent — we run in
-                    // a single-threaded process here.
+                    // SAFETY: same justification as the parent — we run
+                    // in a single-threaded process here.
                     let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
+
+                    // Stash the peer address on *this child's* PamGate
+                    // copy — set_peer mutates state behind a Mutex but
+                    // post-fork COW means only this child sees it.
+                    pam_gate.set_peer(peer.to_string());
 
                     let rc = match handle_session(stream, cfg.clone()) {
                         Ok(()) => 0,

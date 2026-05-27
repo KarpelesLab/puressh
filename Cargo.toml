@@ -12,7 +12,7 @@ keywords = ["ssh", "ssh2", "crypto", "network", "no-std"]
 categories = ["cryptography", "network-programming"]
 
 [features]
-default = ["std", "client", "server", "compress"]
+default = ["std", "client", "server", "compress", "pam"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -23,6 +23,11 @@ compress = ["dep:miniz_oxide"]
 # C ABI surface. Requires `std` and the `client` module; produces additional
 # `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
 ffi = ["std", "client"]
+# PAM session integration for the `sshd` binary. Default-on but opt-out:
+# building with `--no-default-features` (or `--features ...` without `pam`)
+# drops the libpam runtime dep entirely. The dep itself is also gated to
+# `cfg(unix)`, so Windows builds stay clean.
+pam = ["dep:pam-client2"]
 
 [dependencies]
 purecrypto = { version = "0.2", default-features = false, features = [
@@ -45,6 +50,10 @@ miniz_oxide = { version = "0.9", default-features = false, features = ["with-all
 nix = { version = "0.30", default-features = false, features = [
     "process", "signal", "term", "fs", "ioctl",
 ] }
+# Pulled in only when the `pam` feature is on (default) AND we're on Unix.
+# `default-features = false` drops the `cli` feature (which would pull in
+# `rpassword`) — the sshd binary is a non-interactive PAM consumer.
+pam-client2 = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]
 hex = "0.4"

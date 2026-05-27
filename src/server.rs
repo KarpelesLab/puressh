@@ -23,11 +23,12 @@
 
 #![cfg(feature = "std")]
 
-use std::io::{Read, Write};
+use std::collections::BTreeMap;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use purecrypto::rng::{CryptoRng, OsRng, RngCore};
 
@@ -72,6 +73,113 @@ pub trait CommandHandler: Send + Sync {
     fn handle(&self, user: &str, command: &str) -> ExecResult;
 }
 
+/// Per-channel state for an interactive shell session, owned by
+/// `do_connection_phase` and threaded into the request handler so each
+/// `pty-req` / `shell` / `window-change` lands on the right channel.
+struct ShellRuntime {
+    /// Captured `pty-req` spec waiting for the matching `shell` request.
+    pending_pty: Option<PtySpec>,
+    /// The live session, populated after `shell` succeeds.
+    session: Option<Box<dyn ShellSession>>,
+    /// Cached exit status once `try_exit` first returns `Some`.
+    exited: Option<ShellExitStatus>,
+    /// Whether we've already sent exit-status / EOF / CLOSE to the client.
+    exit_sent: bool,
+    /// Stdout bytes held over from a previous poll because the remote
+    /// window was full or a re-KEX was in flight.
+    pending_stdout: Vec<u8>,
+}
+
+impl ShellRuntime {
+    fn new() -> Self {
+        Self {
+            pending_pty: None,
+            session: None,
+            exited: None,
+            exit_sent: false,
+            pending_stdout: Vec::new(),
+        }
+    }
+}
+
+/// Pseudo-terminal allocation request captured from `"pty-req"`.
+///
+/// The library never decodes [`modes`] — RFC 4254 §8 mode opcodes are a
+/// backend concern. The concrete `ShellHandler` (e.g. the `nix`-based one
+/// in `sshd`) parses what it can and falls back to kernel defaults for the
+/// rest.
+///
+/// [`modes`]: Self::modes
+#[derive(Debug, Clone)]
+pub struct PtySpec {
+    /// Value for the `TERM` environment variable, e.g. `"xterm-256color"`.
+    pub term: String,
+    /// Terminal width in characters.
+    pub cols: u32,
+    /// Terminal height in characters.
+    pub rows: u32,
+    /// Terminal width in pixels (0 if not specified).
+    pub px_w: u32,
+    /// Terminal height in pixels (0 if not specified).
+    pub px_h: u32,
+    /// Encoded terminal modes — the verbatim `modes` field from `pty-req`.
+    pub modes: Vec<u8>,
+}
+
+/// How a [`ShellSession`]'s child process terminated.
+#[derive(Debug, Clone)]
+pub enum ShellExitStatus {
+    /// Process exited normally with this status code.
+    Exited(u32),
+    /// Process was killed by a signal.
+    Signalled {
+        /// Signal name without the `SIG` prefix (e.g. `"TERM"`).
+        name: String,
+        /// Whether the kernel dumped a core for the process.
+        core_dumped: bool,
+        /// Optional human-readable description.
+        message: String,
+    },
+}
+
+/// Server-side hook called when a client sends `"shell"` (or `"pty-req"`
+/// then `"shell"`). One [`ShellSession`] backs one SSH channel.
+///
+/// The trait is intentionally OS-agnostic: it never names `forkpty`,
+/// `pipe`, or `nix` types. A concrete implementation lives in the `sshd`
+/// binary, where the `unsafe` syscall plumbing is allowed; the library
+/// stays no-std-friendly and keeps `forbid(unsafe_code)`.
+pub trait ShellHandler: Send + Sync {
+    /// Spawn a new shell process on behalf of `user`. If `pty` is `Some`,
+    /// the implementation must allocate a pseudo-terminal and apply the
+    /// requested geometry / modes (best-effort). If `pty` is `None`, the
+    /// implementation may run the shell with bare pipes — that path is
+    /// what `ssh -T` triggers.
+    fn spawn(&self, user: &str, pty: Option<PtySpec>) -> Result<Box<dyn ShellSession>>;
+}
+
+/// One running shell process. All methods are non-blocking; the server
+/// loop polls them with a ~50 ms cadence.
+pub trait ShellSession: Send {
+    /// Read up to `buf.len()` bytes from the shell's stdout / PTY master.
+    ///
+    /// `Ok(0)` means "no bytes available right now" (NOT EOF). True EOF
+    /// is signalled by [`try_exit`] returning `Some(_)`.
+    ///
+    /// [`try_exit`]: Self::try_exit
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize>;
+    /// Write `buf` to the shell's stdin / PTY master. `Ok(0)` on EAGAIN;
+    /// the caller will retry on the next poll tick.
+    fn write(&mut self, buf: &[u8]) -> Result<usize>;
+    /// Signal end-of-input on the shell's stdin. For PTY backends this is
+    /// the EOT character; for pipe backends it closes the write half.
+    fn close_stdin(&mut self) -> Result<()>;
+    /// Apply a new terminal geometry. Best-effort: pipe backends ignore.
+    fn resize(&mut self, cols: u32, rows: u32, px_w: u32, px_h: u32) -> Result<()>;
+    /// Non-blocking exit poll. Returns `Some` once the child has reaped.
+    fn try_exit(&mut self) -> Option<ShellExitStatus>;
+}
+
 /// Server configuration: host keys, authentication, and the exec hook.
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
@@ -83,6 +191,10 @@ pub struct Config {
     pub allowed_auth_methods: Vec<&'static str>,
     /// Command handler invoked on `"exec"` channel requests.
     pub command_handler: Arc<dyn CommandHandler>,
+    /// Optional interactive-shell hook. When `None` (the default),
+    /// `"pty-req"` and `"shell"` are rejected, matching the historical
+    /// behaviour of this server.
+    pub shell_handler: Option<Arc<dyn ShellHandler>>,
     /// Thresholds that trigger a re-key (RFC 4253 §9). Defaults to 1 GiB /
     /// 1 hour / `1u32 << 31` packets per direction.
     pub rekey_policy: RekeyPolicy,
@@ -102,8 +214,18 @@ impl Config {
             authenticator,
             allowed_auth_methods,
             command_handler,
+            shell_handler: None,
             rekey_policy: RekeyPolicy::default(),
         }
+    }
+
+    /// Attach a `ShellHandler` to this config. Without a handler, `"shell"`
+    /// (and `"pty-req"`) channel requests are rejected with
+    /// `CHANNEL_FAILURE`; with one, the server invokes
+    /// [`ShellHandler::spawn`] when the client sends `"shell"`.
+    pub fn with_shell(mut self, handler: Arc<dyn ShellHandler>) -> Self {
+        self.shell_handler = Some(handler);
+        self
     }
 }
 
@@ -156,7 +278,7 @@ impl Server {
     /// until the session closes. Intended for single-connection test harnesses.
     pub fn accept_one(&mut self) -> Result<()> {
         let (stream, _peer) = self.listener.accept()?;
-        handle_connection(stream, self.cfg.clone())
+        handle_session(stream, self.cfg.clone())
     }
 
     /// Accept connections forever, spawning a fresh thread per connection.
@@ -165,13 +287,23 @@ impl Server {
             let (stream, _peer) = self.listener.accept()?;
             let cfg = self.cfg.clone();
             thread::spawn(move || {
-                let _ = handle_connection(stream, cfg);
+                let _ = handle_session(stream, cfg);
             });
         }
     }
 }
 
-fn handle_connection(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
+/// Run one SSH session on `stream` to completion (handshake, auth, channel
+/// loop). Returns when the peer disconnects or an error is fatal.
+///
+/// Exposed primarily for binaries that want their own accept loop — for
+/// example, an `sshd` that `fork()`s before invoking this so the daemon
+/// can be restarted independently of live sessions.
+pub fn handle_session(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
+    handle_connection_inner(stream, cfg)
+}
+
+fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     stream.set_nodelay(true)?;
 
     let mut codec = PacketCodec::new();
@@ -348,6 +480,11 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // App packets received while a re-KEX is in flight (RFC 4253 §7.3).
     // Drained back into the app-layer dispatch as soon as the rekey lands.
     let mut deferred: Vec<Vec<u8>> = Vec::new();
+    // Per-channel interactive-shell state. Empty when no `shell` request
+    // has been served — in that case the loop stays in pure blocking-read
+    // mode and behaves exactly like the historical exec-only path.
+    let mut shells: BTreeMap<u32, ShellRuntime> = BTreeMap::new();
+    let mut polling_active = false;
 
     loop {
         steps += 1;
@@ -368,8 +505,28 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
                 user,
                 &payload,
                 &mut any_channel_opened,
+                &mut shells,
             )?;
             continue;
+        }
+
+        // Shells become "interesting" the moment one is registered: switch
+        // the socket to a 50 ms read timeout so we can interleave shell
+        // I/O with packet reads. Revert when the last shell goes away.
+        let any_shell_alive = shells.values().any(|rt| rt.session.is_some());
+        if any_shell_alive && !polling_active {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+            polling_active = true;
+        } else if !any_shell_alive && polling_active {
+            let _ = stream.set_read_timeout(None);
+            polling_active = false;
+        }
+
+        // Drain shell stdout into CHANNEL_DATA, then send exit/EOF/CLOSE
+        // for any shell that has finished. Only when no KEX is in flight.
+        if polling_active && !runner.is_kexing() {
+            drain_shells(stream, codec, rng, &mut conn, &mut shells)?;
+            finalize_exited_shells(stream, codec, rng, &mut conn, &mut shells)?;
         }
 
         if any_channel_opened
@@ -390,7 +547,14 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
             }
         }
 
-        let payload = read_one_packet(stream, codec, inbox)?;
+        let payload = if polling_active {
+            match read_one_packet_maybe_timeout(stream, codec, inbox)? {
+                Some(p) => p,
+                None => continue, // 50 ms tick; re-enter drain/rekey checks
+            }
+        } else {
+            read_one_packet(stream, codec, inbox)?
+        };
 
         // RFC 4253 §7.3: KEX messages (20, 21, 30..=49) are routed through
         // the KEX runner, not the application layer. A peer-initiated re-KEX
@@ -438,7 +602,154 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
             user,
             &payload,
             &mut any_channel_opened,
+            &mut shells,
         )?;
+    }
+}
+
+/// Per-tick: read non-blocking from each live shell and emit CHANNEL_DATA.
+/// Bytes that can't ship right now (remote window exhausted) stay in the
+/// runtime's `pending_stdout` for the next tick.
+fn drain_shells<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
+) -> Result<()> {
+    let mut buf = [0u8; 8 * 1024];
+    let channels: Vec<u32> = shells.keys().copied().collect();
+    for ch in channels {
+        let Some(rt) = shells.get_mut(&ch) else {
+            continue;
+        };
+        if rt.session.is_none() {
+            continue;
+        }
+        // First flush any leftover stdout, then pull fresh bytes from the
+        // shell (up to ~64 KiB per tick).
+        if !rt.pending_stdout.is_empty() {
+            let leftover = core::mem::take(&mut rt.pending_stdout);
+            emit_channel_data(stream, codec, rng, conn, ch, &leftover, rt)?;
+        }
+        let mut pulled = 0usize;
+        while pulled < 64 * 1024 {
+            if let Some(sess) = rt.session.as_mut() {
+                let n = sess.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                pulled += n;
+                let bytes = buf[..n].to_vec();
+                emit_channel_data(stream, codec, rng, conn, ch, &bytes, rt)?;
+            } else {
+                break;
+            }
+        }
+        // Poll for exit without blocking; cache the status for finalize_*.
+        if rt.exited.is_none() {
+            if let Some(sess) = rt.session.as_mut() {
+                if let Some(status) = sess.try_exit() {
+                    rt.exited = Some(status);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Send as much of `bytes` over `CHANNEL_DATA` as the remote window allows;
+/// stash the remainder on `rt.pending_stdout`.
+fn emit_channel_data<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    channel: u32,
+    bytes: &[u8],
+    rt: &mut ShellRuntime,
+) -> Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let (payload, taken) = conn.send_data(channel, &bytes[off..])?;
+        if taken == 0 {
+            // Remote window is exhausted — buffer the rest for next tick.
+            rt.pending_stdout.extend_from_slice(&bytes[off..]);
+            return Ok(());
+        }
+        write_payload(stream, codec, rng, &payload)?;
+        off += taken;
+    }
+    Ok(())
+}
+
+/// Per-tick: any shell whose `try_exit` returned `Some` and whose stdout
+/// has been flushed gets its `exit-status` / `exit-signal` request, then
+/// EOF and CHANNEL_CLOSE.
+fn finalize_exited_shells<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
+) -> Result<()> {
+    let channels: Vec<u32> = shells.keys().copied().collect();
+    for ch in channels {
+        let Some(rt) = shells.get_mut(&ch) else {
+            continue;
+        };
+        if rt.exit_sent {
+            continue;
+        }
+        if !rt.pending_stdout.is_empty() {
+            // Wait for the remote window to open before announcing exit.
+            continue;
+        }
+        let Some(status) = rt.exited.take() else {
+            continue;
+        };
+        let req = match status {
+            ShellExitStatus::Exited(code) => ChannelRequest::ExitStatus { code },
+            ShellExitStatus::Signalled {
+                name,
+                core_dumped,
+                message,
+            } => ChannelRequest::ExitSignal {
+                name,
+                core_dumped,
+                message,
+                language: String::new(),
+            },
+        };
+        let p = conn.send_request(ch, req, false)?;
+        write_payload(stream, codec, rng, &p)?;
+        let p = conn.send_eof(ch)?;
+        write_payload(stream, codec, rng, &p)?;
+        let p = conn.send_close(ch)?;
+        write_payload(stream, codec, rng, &p)?;
+        rt.exit_sent = true;
+        // Drop the session here so the backend can close fds and reap the
+        // child process immediately, even before the peer's CLOSE arrives.
+        rt.session = None;
+    }
+    Ok(())
+}
+
+/// Like [`read_one_packet`], but returns `Ok(None)` on a 50 ms read
+/// timeout instead of erroring. Other I/O errors propagate.
+fn read_one_packet_maybe_timeout(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    inbox: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>> {
+    match read_one_packet(stream, codec, inbox) {
+        Ok(p) => Ok(Some(p)),
+        Err(Error::Io(e))
+            if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -453,6 +764,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     user: &str,
     payload: &[u8],
     any_channel_opened: &mut bool,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
 ) -> Result<()> {
     let ev = conn.on_packet(payload)?;
     match ev {
@@ -478,10 +790,31 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             want_reply,
         } => {
             handle_channel_request(
-                stream, codec, rng, inbox, conn, cfg, user, channel, request, want_reply,
+                stream, codec, rng, inbox, conn, cfg, user, channel, request, want_reply, shells,
             )?;
         }
         ChannelEvent::Data { channel, data } => {
+            // Forward stdin into the shell, if one is active on this channel.
+            // EAGAIN-equivalent (`Ok(0)`) just drops the byte for this tick;
+            // a well-behaved client retries by sending more stdin later. A
+            // hard write error tears the session down.
+            if let Some(rt) = shells.get_mut(&channel) {
+                if let Some(sess) = rt.session.as_mut() {
+                    let mut off = 0usize;
+                    let mut retries = 0u32;
+                    while off < data.len() {
+                        let n = sess.write(&data[off..])?;
+                        if n == 0 {
+                            retries += 1;
+                            if retries > 4 {
+                                break;
+                            }
+                            continue;
+                        }
+                        off += n;
+                    }
+                }
+            }
             if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
                 write_payload(stream, codec, rng, &adj)?;
             }
@@ -491,7 +824,13 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 write_payload(stream, codec, rng, &adj)?;
             }
         }
-        ChannelEvent::Eof { .. } => {}
+        ChannelEvent::Eof { channel } => {
+            if let Some(rt) = shells.get_mut(&channel) {
+                if let Some(sess) = rt.session.as_mut() {
+                    let _ = sess.close_stdin();
+                }
+            }
+        }
         ChannelEvent::Close { channel } => {
             if let Some(ch) = conn.channel(channel) {
                 if !ch.local_closed {
@@ -499,6 +838,8 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                     write_payload(stream, codec, rng, &p)?;
                 }
             }
+            // Drop the runtime so the backend can reap its child / close fds.
+            shells.remove(&channel);
         }
         ChannelEvent::WindowAdjust { .. } => {}
         ChannelEvent::GlobalRequest { want_reply, .. } if want_reply => {
@@ -522,6 +863,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     channel: u32,
     request: ChannelRequest,
     want_reply: bool,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
 ) -> Result<()> {
     match request {
         ChannelRequest::Exec { command } => {
@@ -563,6 +905,79 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             let p = conn.send_close(channel)?;
             write_payload(stream, codec, rng, &p)?;
         }
+        ChannelRequest::PtyReq {
+            term,
+            cols,
+            rows,
+            px_w,
+            px_h,
+            modes,
+        } => {
+            // RFC 4254 §6.2: pty-req may precede shell/exec. We just stash
+            // the spec on the channel's ShellRuntime; the actual PTY is
+            // allocated when "shell" arrives.
+            if cfg.shell_handler.is_some() {
+                let rt = shells.entry(channel).or_insert_with(ShellRuntime::new);
+                rt.pending_pty = Some(PtySpec {
+                    term,
+                    cols,
+                    rows,
+                    px_w,
+                    px_h,
+                    modes,
+                });
+                if want_reply {
+                    let p = conn.send_request_success(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            } else if want_reply {
+                let p = conn.send_request_failure(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+        }
+        ChannelRequest::Shell => {
+            if let Some(handler) = cfg.shell_handler.clone() {
+                let rt = shells.entry(channel).or_insert_with(ShellRuntime::new);
+                let pty = rt.pending_pty.take();
+                match handler.spawn(user, pty) {
+                    Ok(sess) => {
+                        rt.session = Some(sess);
+                        if want_reply {
+                            let p = conn.send_request_success(channel)?;
+                            write_payload(stream, codec, rng, &p)?;
+                        }
+                    }
+                    Err(_) => {
+                        // Spawn failed — surface as request failure and
+                        // drop the runtime (no PTY allocated).
+                        shells.remove(&channel);
+                        if want_reply {
+                            let p = conn.send_request_failure(channel)?;
+                            write_payload(stream, codec, rng, &p)?;
+                        }
+                    }
+                }
+            } else if want_reply {
+                let p = conn.send_request_failure(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+        }
+        ChannelRequest::WindowChange {
+            cols,
+            rows,
+            px_w,
+            px_h,
+        } => {
+            // window-change is `want_reply = false` per RFC 4254 §6.7, so
+            // we never reply — just propagate to the backend best-effort.
+            if let Some(rt) = shells.get_mut(&channel) {
+                if let Some(sess) = rt.session.as_mut() {
+                    let _ = sess.resize(cols, rows, px_w, px_h);
+                }
+            }
+        }
+        // ChannelRequest::Signal { name } — forwarded as kill(child_pid,
+        // SIG…) in a future revision. Today we silently accept it.
         _ => {
             if want_reply {
                 let p = conn.send_request_failure(channel)?;
@@ -834,6 +1249,230 @@ mod tests {
         let mut s = [0u8; 32];
         OsRng.fill_bytes(&mut s);
         s
+    }
+
+    /// Shared in-memory state behind one [`MemoryShellSession`]. The test
+    /// thread pushes stdout / arms an exit decision; the server thread
+    /// drains stdin and polls for exit. `Arc<Mutex<…>>` keeps both sides
+    /// honest about visibility without any OS plumbing.
+    struct MemoryShellState {
+        /// Bytes the server should ship as CHANNEL_DATA. Drained by
+        /// `MemoryShellSession::read`.
+        stdout: Vec<u8>,
+        /// Bytes the server has received via CHANNEL_DATA. Appended by
+        /// `MemoryShellSession::write`.
+        stdin: Vec<u8>,
+        /// True after the client sent EOF and the server forwarded it via
+        /// `close_stdin`.
+        closed_stdin: bool,
+        /// Captured PTY spec; the test asserts `term`/`cols`/`rows` against it.
+        pty: Option<PtySpec>,
+        /// Captured `(cols, rows, px_w, px_h)` from each `resize` call.
+        resizes: Vec<(u32, u32, u32, u32)>,
+        /// If set, `try_exit` returns this status as soon as either
+        /// `exit_now` is set or `close_stdin` has been called.
+        exit_on_stdin_close: Option<ShellExitStatus>,
+        /// Explicit exit override (takes priority over `exit_on_stdin_close`).
+        exit_now: Option<ShellExitStatus>,
+        /// Latched user name from `ShellHandler::spawn`.
+        user: String,
+    }
+
+    #[derive(Clone)]
+    struct MemoryShell {
+        inner: Arc<Mutex<MemoryShellState>>,
+    }
+
+    impl MemoryShell {
+        fn new() -> Self {
+            Self {
+                inner: Arc::new(Mutex::new(MemoryShellState {
+                    stdout: Vec::new(),
+                    stdin: Vec::new(),
+                    closed_stdin: false,
+                    pty: None,
+                    resizes: Vec::new(),
+                    exit_on_stdin_close: None,
+                    exit_now: None,
+                    user: String::new(),
+                })),
+            }
+        }
+
+        fn push_stdout(&self, bytes: &[u8]) {
+            self.inner.lock().unwrap().stdout.extend_from_slice(bytes);
+        }
+
+        fn arm_exit_on_stdin_close(&self, status: ShellExitStatus) {
+            self.inner.lock().unwrap().exit_on_stdin_close = Some(status);
+        }
+    }
+
+    struct MemoryShellHandler {
+        shell: MemoryShell,
+    }
+
+    impl ShellHandler for MemoryShellHandler {
+        fn spawn(&self, user: &str, pty: Option<PtySpec>) -> Result<Box<dyn ShellSession>> {
+            {
+                let mut st = self.shell.inner.lock().unwrap();
+                st.pty = pty;
+                st.user = user.to_string();
+            }
+            Ok(Box::new(MemoryShellSession {
+                inner: self.shell.inner.clone(),
+            }))
+        }
+    }
+
+    struct MemoryShellSession {
+        inner: Arc<Mutex<MemoryShellState>>,
+    }
+
+    impl ShellSession for MemoryShellSession {
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+            let mut st = self.inner.lock().unwrap();
+            if st.stdout.is_empty() {
+                return Ok(0);
+            }
+            let n = core::cmp::min(buf.len(), st.stdout.len());
+            buf[..n].copy_from_slice(&st.stdout[..n]);
+            st.stdout.drain(..n);
+            Ok(n)
+        }
+
+        fn write(&mut self, data: &[u8]) -> Result<usize> {
+            self.inner.lock().unwrap().stdin.extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn close_stdin(&mut self) -> Result<()> {
+            self.inner.lock().unwrap().closed_stdin = true;
+            Ok(())
+        }
+
+        fn resize(&mut self, cols: u32, rows: u32, px_w: u32, px_h: u32) -> Result<()> {
+            self.inner
+                .lock()
+                .unwrap()
+                .resizes
+                .push((cols, rows, px_w, px_h));
+            Ok(())
+        }
+
+        fn try_exit(&mut self) -> Option<ShellExitStatus> {
+            let mut st = self.inner.lock().unwrap();
+            if let Some(s) = st.exit_now.take() {
+                return Some(s);
+            }
+            if st.closed_stdin && st.stdout.is_empty() {
+                if let Some(s) = st.exit_on_stdin_close.take() {
+                    return Some(s);
+                }
+            }
+            None
+        }
+    }
+
+    #[test]
+    fn loopback_shell_with_pty_and_stdin() {
+        // End-to-end exercise of the lib's interactive-shell wiring:
+        // `pty-req` → `shell` → CHANNEL_DATA in/out → client EOF →
+        // `exit-status` + EOF + CLOSE. The backend is the synchronous
+        // in-memory `MemoryShell` (no nix, no syscalls, no threads from
+        // the handler).
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "shell-test-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        // Seed stdout and arm an exit code that fires the moment the
+        // client closes stdin (after the server forwards it via
+        // `close_stdin`).
+        let memshell = MemoryShell::new();
+        memshell.push_stdout(b"hello from memshell\n");
+        memshell.arm_exit_on_stdin_close(ShellExitStatus::Exited(0));
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused-exec\n".to_vec(),
+            }),
+        )
+        .with_shell(Arc::new(MemoryShellHandler {
+            shell: memshell.clone(),
+        }));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        let out = client
+            .shell_with_stdin("xterm-256color", 132, 43, b"echo back\n")
+            .expect("shell_with_stdin");
+
+        assert_eq!(out.stdout, b"hello from memshell\n");
+        assert_eq!(out.exit_status, Some(0));
+        assert_eq!(out.exit_signal, None);
+
+        // Verify the backend saw the right `pty-req`, stdin, and the user
+        // bound to the spawn call.
+        let st = memshell.inner.lock().unwrap();
+        let pty = st.pty.as_ref().expect("pty-req captured");
+        assert_eq!(pty.term, "xterm-256color");
+        assert_eq!(pty.cols, 132);
+        assert_eq!(pty.rows, 43);
+        assert_eq!(st.stdin, b"echo back\n");
+        assert!(st.closed_stdin, "EOF should reach the backend");
+        assert_eq!(st.user, user);
+        drop(st);
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
     }
 
     #[test]

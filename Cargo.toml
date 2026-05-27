@@ -30,6 +30,22 @@ purecrypto = { version = "0.2", default-features = false, features = [
 ] }
 miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"], optional = true }
 
+# Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
+# set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it
+# stays no-std-friendly. Confined to `cfg(unix)` so Windows builds keep a
+# clean dependency graph.
+#
+# Feature map in nix 0.30:
+#   process — waitpid, fork, execvp
+#   signal  — signal handlers, kill
+#   term    — pty / forkpty / Winsize (the pty module is gated by `term`)
+#   fs      — fcntl flags / O_NONBLOCK
+#   ioctl   — TIOCSWINSZ
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30", default-features = false, features = [
+    "process", "signal", "term", "fs", "ioctl",
+] }
+
 [dev-dependencies]
 hex = "0.4"
 

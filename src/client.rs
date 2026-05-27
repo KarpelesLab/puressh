@@ -328,6 +328,200 @@ impl Client {
         Ok(out)
     }
 
+    /// Open an interactive `"shell"` session with an allocated PTY, push
+    /// `stdin` into the channel once, EOF, and drain the response until
+    /// the server closes the channel.
+    ///
+    /// This is a one-shot helper aimed at scripted tests and simple
+    /// interop checks — a real interactive client would interleave reads
+    /// and writes with the terminal. It exists primarily so the server's
+    /// `pty-req` / `shell` wiring can be exercised end-to-end.
+    pub fn shell_with_stdin(
+        &mut self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+        stdin: &[u8],
+    ) -> Result<ExecOutput> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
+        self.write_payload(&open_payload)?;
+
+        // Wait for OPEN_CONFIRMATION.
+        let mut opened = false;
+        let mut iter_guard = 0usize;
+        while !opened {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("shell: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => {
+                    opened = true;
+                }
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("channel open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        // pty-req with want_reply=true.
+        let pty_req = self.conn.send_request(
+            local_id,
+            ChannelRequest::PtyReq {
+                term: term.into(),
+                cols,
+                rows,
+                px_w: 0,
+                px_h: 0,
+                modes: Vec::new(),
+            },
+            true,
+        )?;
+        self.write_payload(&pty_req)?;
+        self.await_request_reply(local_id, "pty-req")?;
+
+        // shell with want_reply=true.
+        let shell_req = self
+            .conn
+            .send_request(local_id, ChannelRequest::Shell, true)?;
+        self.write_payload(&shell_req)?;
+        self.await_request_reply(local_id, "shell")?;
+
+        // Push stdin (if any), then EOF.
+        if !stdin.is_empty() {
+            let mut off = 0usize;
+            iter_guard = 0;
+            while off < stdin.len() {
+                iter_guard += 1;
+                if iter_guard > MAX_EXEC_ITER {
+                    return Err(Error::Protocol("shell: stdin drain loop did not converge"));
+                }
+                let (payload, taken) = self.conn.send_data(local_id, &stdin[off..])?;
+                if taken == 0 {
+                    // Window full — read until we get a WINDOW_ADJUST.
+                    let pkt = self.read_one_packet()?;
+                    match self.conn.on_packet(&pkt)? {
+                        ChannelEvent::WindowAdjust { channel, .. } if channel == local_id => {}
+                        ChannelEvent::Close { channel } if channel == local_id => {
+                            return Err(Error::Protocol(
+                                "shell: peer closed channel before stdin drain",
+                            ));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                self.write_payload(&payload)?;
+                off += taken;
+            }
+        }
+        let eof = self.conn.send_eof(local_id)?;
+        self.write_payload(&eof)?;
+
+        // Drain until both sides have CLOSEd.
+        let mut out = ExecOutput {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            exit_status: None,
+            exit_signal: None,
+        };
+        let mut local_close_sent = false;
+        let mut remote_close_seen = false;
+
+        for _ in 0..MAX_EXEC_ITER {
+            if remote_close_seen && local_close_sent {
+                break;
+            }
+            let payload = self.read_one_packet()?;
+            let ev = self.conn.on_packet(&payload)?;
+            match ev {
+                ChannelEvent::Data { channel, data } if channel == local_id => {
+                    if out.stdout.len() + out.stderr.len() + data.len() > MAX_EXEC_OUTPUT {
+                        return Err(Error::Protocol("shell output too large"));
+                    }
+                    let n = data.len() as u32;
+                    out.stdout.extend_from_slice(&data);
+                    if let Some(adj) = self.conn.replenish_window(local_id, n)? {
+                        self.write_payload(&adj)?;
+                    }
+                }
+                ChannelEvent::ExtendedData {
+                    channel,
+                    code,
+                    data,
+                } if channel == local_id => {
+                    if out.stdout.len() + out.stderr.len() + data.len() > MAX_EXEC_OUTPUT {
+                        return Err(Error::Protocol("shell output too large"));
+                    }
+                    let n = data.len() as u32;
+                    if code == SSH_EXTENDED_DATA_STDERR {
+                        out.stderr.extend_from_slice(&data);
+                    } else {
+                        out.stdout.extend_from_slice(&data);
+                    }
+                    if let Some(adj) = self.conn.replenish_window(local_id, n)? {
+                        self.write_payload(&adj)?;
+                    }
+                }
+                ChannelEvent::Request {
+                    channel,
+                    request,
+                    want_reply,
+                } if channel == local_id => {
+                    match request {
+                        ChannelRequest::ExitStatus { code } => out.exit_status = Some(code),
+                        ChannelRequest::ExitSignal { name, .. } => out.exit_signal = Some(name),
+                        _ => {}
+                    }
+                    if want_reply {
+                        let p = self.conn.send_request_failure(local_id)?;
+                        self.write_payload(&p)?;
+                    }
+                }
+                ChannelEvent::Eof { channel } if channel == local_id => {}
+                ChannelEvent::Close { channel } if channel == local_id => {
+                    remote_close_seen = true;
+                    if !local_close_sent {
+                        let p = self.conn.send_close(local_id)?;
+                        self.write_payload(&p)?;
+                        local_close_sent = true;
+                    }
+                }
+                ChannelEvent::WindowAdjust { .. } => {}
+                _ => {}
+            }
+        }
+
+        if !(remote_close_seen && local_close_sent) {
+            return Err(Error::Protocol("shell: drain loop exceeded iteration cap"));
+        }
+        Ok(out)
+    }
+
+    /// Block until the peer answers a single `CHANNEL_REQUEST` we sent
+    /// with `want_reply = true`. Used by [`shell_with_stdin`] to gate the
+    /// pty-req → shell handoff.
+    ///
+    /// [`shell_with_stdin`]: Self::shell_with_stdin
+    fn await_request_reply(&mut self, channel: u32, what: &'static str) -> Result<()> {
+        for _ in 0..MAX_EXEC_ITER {
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::Success { channel: c } if c == channel => return Ok(()),
+                ChannelEvent::Failure { channel: c } if c == channel => {
+                    let _ = what; // for future tracing
+                    return Err(Error::Protocol("shell: channel request denied"));
+                }
+                _ => {}
+            }
+        }
+        Err(Error::Protocol(
+            "shell: request-reply loop did not converge",
+        ))
+    }
+
     fn do_version_and_kex(&mut self) -> Result<()> {
         let v_c = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
         self.stream.write_all(&VersionExchange::outgoing_bytes())?;

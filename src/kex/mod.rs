@@ -6,6 +6,7 @@
 
 pub mod curve25519;
 pub mod ecdh;
+pub mod dh;
 
 /// Trait implemented by each KEX algorithm module.
 pub trait Kex {

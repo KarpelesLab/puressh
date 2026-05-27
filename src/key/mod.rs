@@ -3,11 +3,9 @@
 //! Public keys use the single-line `<algorithm> <base64-blob> <comment>` form
 //! (RFC 4716 is the older multi-line variant). Private keys use the OpenSSH
 //! "new" PEM format with magic `b"openssh-key-v1\0"`, optionally encrypted
-//! with `bcrypt_pbkdf` + a symmetric cipher.
+//! with `bcrypt_pbkdf` + a symmetric cipher (typically `aes256-ctr`).
 //!
-//! ⚠️ Decryption of password-protected OpenSSH keys requires `bcrypt_pbkdf`,
-//! which is not in `purecrypto` v0.0.7. Until that lands, only **unencrypted**
-//! OpenSSH private keys can be loaded. See `README.md` § "purecrypto gaps".
+//! Passphrase-protected keys are derived via [`purecrypto::kdf::bcrypt_pbkdf`].
 
 /// A parsed SSH public key — algorithm name and wire-format blob.
 #[derive(Debug, Clone)]

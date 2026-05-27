@@ -19,7 +19,9 @@ client = []
 server = []
 
 [dependencies]
-purecrypto = { version = "0.0.7", default-features = false }
+purecrypto = { version = "0.1", default-features = false, features = [
+    "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der",
+] }
 
 [dev-dependencies]
 hex = "0.4"

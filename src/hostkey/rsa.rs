@@ -4,10 +4,10 @@
 //! - `rsa-sha2-256`  — RSA + SHA-256 (PKCS#1 v1.5)
 //! - `rsa-sha2-512`  — RSA + SHA-512 (PKCS#1 v1.5)
 //!
-//! ⚠️ Implementation status: blocked on upstream — `purecrypto::rsa` (v0.0.7)
-//! exposes only `is_prime` / `random_prime` and the bare key structs; PKCS#1
-//! v1.5 sign/verify and key import/export aren't surfaced yet. See `README.md`
-//! § "purecrypto gaps" for the full list.
+//! Backed by [`purecrypto::rsa::BoxedRsaPrivateKey`] (signing via
+//! `sign_pkcs1v15::<D>`) and [`purecrypto::rsa::BoxedRsaPublicKey`]
+//! (`verify_pkcs1v15::<D>`). Wire-format public key is `(n, e)` as two
+//! `mpint`s; built from `BoxedRsaPublicKey::try_new(BoxedUint, BoxedUint)`.
 
 use super::HostKeyAlgorithm;
 

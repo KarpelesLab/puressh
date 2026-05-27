@@ -397,8 +397,26 @@ fn fingerprint_matches_openssh_cli() {
     use std::process::Command;
     use std::time::{Duration, Instant};
 
-    if Command::new("ssh-keygen").arg("-V").output().is_err() {
-        return;
+    // We need the system OpenSSH `ssh-keygen` here, not our own — they share a
+    // name and on Windows CI cargo puts our test build directory on PATH, so
+    // `Command::new("ssh-keygen")` would otherwise pick up our binary, which
+    // doesn't understand the combined `-lf` flag. Probe `-V`: real OpenSSH
+    // prints something like "OpenSSH_X.Y..." on stderr, ours prints
+    // "puressh ssh-keygen <version>" on stdout. Skip the test unless the
+    // OpenSSH signature is present.
+    {
+        let out = match Command::new("ssh-keygen").arg("-V").output() {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+        let probe = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !probe.to_ascii_lowercase().contains("openssh") {
+            return;
+        }
     }
 
     let mut rng = purecrypto::rng::OsRng;

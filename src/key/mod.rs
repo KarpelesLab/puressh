@@ -18,7 +18,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
-use purecrypto::kdf::bcrypt_pbkdf::bcrypt_pbkdf as derive_bcrypt_pbkdf;
+use purecrypto::kdf::bcrypt_pbkdf;
 
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
@@ -587,7 +587,7 @@ fn decrypt_payload(
         return Err(Error::Format("openssh key: trailing kdfoptions"));
     }
 
-    let derived = derive_bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
+    let derived = bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
         .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?;
 
     if encrypted.len() % 16 != 0 {

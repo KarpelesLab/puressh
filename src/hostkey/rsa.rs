@@ -9,9 +9,8 @@
 //!
 //! Backed by [`purecrypto::rsa::BoxedRsaPrivateKey`] (signing via
 //! `sign_pkcs1v15::<D>`) and [`purecrypto::rsa::BoxedRsaPublicKey`]
-//! (`verify_pkcs1v15::<D>`). Since `BoxedRsaPublicKey` does not expose the
-//! public exponent `e`, the wrappers keep their own copy of `(n, e)` so the
-//! `"ssh-rsa"` public blob can always be re-emitted.
+//! (`verify_pkcs1v15::<D>`); the SSH public blob is built directly from
+//! `BoxedRsaPublicKey::{modulus, exponent}`.
 
 use super::HostKeyAlgorithm;
 
@@ -87,7 +86,7 @@ fn mpint_to_uint(bytes: &[u8]) -> Result<BoxedUint> {
 }
 
 #[cfg(feature = "alloc")]
-fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, BoxedUint, BoxedUint, usize)> {
+fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, usize)> {
     let mut r = Reader::new(blob);
     let name = r.read_string()?;
     if name != SshRsa::NAME.as_bytes() {
@@ -104,13 +103,15 @@ fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, BoxedUint, B
         return Err(Error::Format("rsa: zero modulus"));
     }
     let k = n.bit_len().div_ceil(8);
-    let pk = BoxedRsaPublicKey::try_new(n.clone(), e.clone())
+    let pk = BoxedRsaPublicKey::try_new(n, e)
         .map_err(|_| Error::Format("rsa: modulus out of accepted range"))?;
-    Ok((pk, n, e, k))
+    Ok((pk, k))
 }
 
 #[cfg(feature = "alloc")]
-fn build_rsa_public_blob(n: &BoxedUint, e: &BoxedUint) -> Vec<u8> {
+fn build_rsa_public_blob(pk: &BoxedRsaPublicKey) -> Vec<u8> {
+    let n = pk.modulus();
+    let e = pk.exponent();
     let mut w = Writer::new();
     w.write_string(SshRsa::NAME.as_bytes());
     let nbytes = n.to_be_bytes(n.bit_len().div_ceil(8).max(1));
@@ -170,8 +171,6 @@ macro_rules! rsa_host_key {
         pub struct $name {
             private: Option<BoxedRsaPrivateKey>,
             public: BoxedRsaPublicKey,
-            n: BoxedUint,
-            e: BoxedUint,
             k: usize,
         }
 
@@ -189,28 +188,20 @@ macro_rules! rsa_host_key {
                 let public = BoxedRsaPublicKey::try_new(n.clone(), e.clone())
                     .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
                 let k = n.bit_len().div_ceil(8);
-                let private = BoxedRsaPrivateKey::from_components(n.clone(), e.clone(), d);
+                let private = BoxedRsaPrivateKey::from_components(n, e, d);
                 Ok(Self {
                     private: Some(private),
                     public,
-                    n,
-                    e,
                     k,
                 })
             }
 
             /// Build a verifier-only host key from `(n, e)`.
             pub fn from_public_components(n: BoxedUint, e: BoxedUint) -> Result<Self> {
-                let public = BoxedRsaPublicKey::try_new(n.clone(), e.clone())
-                    .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
                 let k = n.bit_len().div_ceil(8);
-                Ok(Self {
-                    private: None,
-                    public,
-                    n,
-                    e,
-                    k,
-                })
+                let public = BoxedRsaPublicKey::try_new(n, e)
+                    .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
+                Ok(Self { private: None, public, k })
             }
 
             /// The modulus byte length (`k` per PKCS#1).
@@ -226,7 +217,7 @@ macro_rules! rsa_host_key {
             }
 
             fn public_blob(&self) -> Vec<u8> {
-                build_rsa_public_blob(&self.n, &self.e)
+                build_rsa_public_blob(&self.public)
             }
 
             fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
@@ -249,14 +240,8 @@ macro_rules! rsa_host_key {
             }
 
             fn from_public_blob(blob: &[u8]) -> Result<Self> {
-                let (public, n, e, k) = parse_rsa_public_blob(blob)?;
-                Ok(Self {
-                    private: None,
-                    public,
-                    n,
-                    e,
-                    k,
-                })
+                let (public, k) = parse_rsa_public_blob(blob)?;
+                Ok(Self { private: None, public, k })
             }
         }
     };

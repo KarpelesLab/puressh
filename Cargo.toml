@@ -19,7 +19,7 @@ client = []
 server = []
 
 [dependencies]
-purecrypto = { version = "0.1", default-features = false, features = [
+purecrypto = { version = "0.2", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der",
 ] }
 

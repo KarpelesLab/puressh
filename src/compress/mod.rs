@@ -121,7 +121,7 @@ impl ZlibDeflate {
 
     fn step(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         let mut out: Vec<u8> = Vec::with_capacity(input.len() + 64);
-        let mut chunk = vec![0u8; input.len().saturating_add(128).max(256)];
+        let mut chunk = [0u8; 8192];
         let mut in_pos = 0usize;
 
         loop {
@@ -137,13 +137,14 @@ impl ZlibDeflate {
                 }
                 TDEFLStatus::Done => return Ok(out),
                 TDEFLStatus::Okay => {
-                    let output_was_full = co == chunk.len();
-                    if in_pos >= input.len() && !output_was_full {
+                    if co == chunk.len() {
+                        continue;
+                    }
+                    if in_pos >= input.len() {
                         return Ok(out);
                     }
-                    if output_was_full {
-                        let new_len = chunk.len().saturating_mul(2);
-                        chunk = vec![0u8; new_len];
+                    if ci == 0 && co == 0 {
+                        return Err(Error::Crypto("zlib compress stalled"));
                     }
                 }
             }
@@ -194,7 +195,11 @@ impl ZlibInflate {
 
             match status {
                 TINFLStatus::NeedsMoreInput => return Ok(out),
-                TINFLStatus::HasMoreOutput => continue,
+                TINFLStatus::HasMoreOutput => {
+                    if ci == 0 && co == 0 {
+                        return Err(Error::Format("zlib decompress stalled"));
+                    }
+                }
                 TINFLStatus::Done => return Ok(out),
                 _ => return Err(Error::Format("zlib decompress failed")),
             }

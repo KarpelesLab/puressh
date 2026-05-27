@@ -41,3 +41,8 @@ required-features = ["std", "client"]
 name = "sshd"
 path = "src/bin/sshd.rs"
 required-features = ["std", "server"]
+
+[[bin]]
+name = "ssh-keygen"
+path = "src/bin/ssh-keygen.rs"
+required-features = ["std"]

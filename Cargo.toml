@@ -46,9 +46,10 @@ miniz_oxide = { version = "0.9", default-features = false, features = ["with-all
 #   term    — pty / forkpty / Winsize (the pty module is gated by `term`)
 #   fs      — fcntl flags / O_NONBLOCK
 #   ioctl   — TIOCSWINSZ
+#   user    — User::from_name, setuid/setgid/initgroups, geteuid/getegid
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = [
-    "process", "signal", "term", "fs", "ioctl",
+    "process", "signal", "term", "fs", "ioctl", "user",
 ] }
 # Pulled in only when the `pam` feature is on (default) AND we're on Unix.
 # `default-features = false` drops the `cli` feature (which would pull in

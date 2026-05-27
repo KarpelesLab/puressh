@@ -47,6 +47,7 @@ mod imp {
     use std::ffi::OsStr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, ExitCode};
     use std::sync::Arc;
 
@@ -444,12 +445,27 @@ mod imp {
             if self.debug {
                 eprintln!("sshd: exec by {user}: {command}");
             }
+
+            // Resolve the target user in /etc/passwd first — every
+            // subsequent step (PAM open, env layering, setuid) depends
+            // on these values. A missing user is a hard fail.
+            let info = match lookup_user(user) {
+                Ok(i) => i,
+                Err(e) => {
+                    return ExecResult {
+                        stdout: Vec::new(),
+                        stderr: format!("sshd: user lookup failed: {e}\n").into_bytes(),
+                        exit_status: 255,
+                    };
+                }
+            };
+
             // Open the PAM session before spawning the child. `exec`
             // requests don't have a real tty, so we use "ssh" — matches
             // OpenSSH's behaviour for non-PTY channels. `ExecResult`
             // has no error channel, so PAM failure surfaces as exit
             // status 255 with the error message on stderr.
-            let envs = match self.pam.ensure(user, "ssh") {
+            let mut envs = match self.pam.ensure(user, "ssh") {
                 Ok(e) => e,
                 Err(e) => {
                     return ExecResult {
@@ -459,7 +475,11 @@ mod imp {
                     };
                 }
             };
-            let mut cmd = Command::new("sh");
+            apply_login_envs(&mut envs, &info);
+
+            // Run the command via the user's login shell so that
+            // /etc/passwd-configured shells (zsh, fish, …) are honoured.
+            let mut cmd = Command::new(&info.shell_str);
             cmd.args(["-c", command]).env_clear();
             for (k, v) in &envs {
                 cmd.env(
@@ -467,6 +487,41 @@ mod imp {
                     OsStr::from_bytes(v.to_bytes()),
                 );
             }
+
+            // Drop to the user inside the spawned child via pre_exec.
+            // We can't use Command::uid()/.gid()/.current_dir() because
+            // std calls them in the wrong order for `initgroups` — std
+            // does setgid → setgroups([]) → setuid → chdir, blowing
+            // away the supplementary groups we want and forcing chdir
+            // after setuid. Do the whole dance ourselves.
+            if !already_matches(&info) {
+                let uid = info.uid;
+                let gid = info.gid;
+                let name_c = info.name_c.clone();
+                let home_c = info.home_c.clone();
+                // SAFETY: pre_exec runs in the post-fork child between
+                // fork and exec. We only call POSIX-defined functions
+                // (setgid, initgroups, setuid, chdir) — all used in
+                // OpenSSH's drop-to-user path and considered safe in
+                // the single-threaded post-fork window.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        nix::unistd::setgid(gid).map_err(to_io)?;
+                        nix::unistd::initgroups(&name_c, gid).map_err(to_io)?;
+                        nix::unistd::setuid(uid).map_err(to_io)?;
+                        // chdir best-effort: a missing/unreadable home
+                        // shouldn't refuse the exec — fall back to /.
+                        if libc::chdir(home_c.as_ptr()) != 0 {
+                            let _ = libc::chdir(c"/".as_ptr());
+                        }
+                        Ok(())
+                    });
+                }
+            } else {
+                // Same uid → still chdir for clean cwd semantics.
+                cmd.current_dir(&info.home_str);
+            }
+
             match cmd.output() {
                 Ok(out) => {
                     let code = out.status.code().unwrap_or(255);
@@ -479,11 +534,18 @@ mod imp {
                 }
                 Err(e) => ExecResult {
                     stdout: Vec::new(),
-                    stderr: format!("sshd: failed to spawn sh: {e}\n").into_bytes(),
+                    stderr: format!("sshd: failed to spawn {}: {e}\n", info.shell_str).into_bytes(),
                     exit_status: 255,
                 },
             }
         }
+    }
+
+    /// `pre_exec` closures need a closed `io::Error`-returning path; nix
+    /// errnos must be lifted here. Lives at module scope so the closure
+    /// stays `'static`-friendly.
+    fn to_io(e: Errno) -> std::io::Error {
+        std::io::Error::from_raw_os_error(e as i32)
     }
 
     fn current_user() -> Result<String, String> {
@@ -493,9 +555,136 @@ mod imp {
     }
 
     // -------------------------------------------------------------------------
-    // NixShellHandler — backend for `pty-req` + `shell`. Spawns the user's
-    // login shell under `forkpty()`, exposes the master fd as a non-blocking
-    // `ShellSession`.
+    // User lookup + drop-to-user plumbing.
+    //
+    // Authentication only proves the SSH peer holds a private key; it
+    // doesn't switch identity. After PAM session-open succeeds we look
+    // up the target user in `/etc/passwd` and drop our euid/egid before
+    // executing the shell, so the user's processes really run as them
+    // and not as whatever uid the daemon was launched with. Soft-mode:
+    // when the daemon's already running as the target uid (e.g. an
+    // unprivileged smoke test where `-u $USER`), the drop is a no-op.
+    // -------------------------------------------------------------------------
+
+    /// Resolved POSIX identity for a login user. Captured pre-fork so
+    /// every field is already owned and async-signal-safe to consume
+    /// from the post-fork child.
+    #[derive(Clone)]
+    struct UserInfo {
+        name: String,
+        /// `name` as a `CString` — used directly by `initgroups`,
+        /// which only takes `&CStr` and isn't safe to allocate against
+        /// post-fork.
+        name_c: std::ffi::CString,
+        uid: nix::unistd::Uid,
+        gid: nix::unistd::Gid,
+        /// Home directory as a `CString` — fed straight to `chdir`.
+        /// Falls back to `/` if the entry's home is unreadable so the
+        /// shell still has a working cwd.
+        home_c: std::ffi::CString,
+        home_str: String,
+        /// Login shell as a `CString` for `execvp`. Defaults to
+        /// `/bin/sh` if `pw_shell` is empty or non-UTF-8.
+        shell_c: std::ffi::CString,
+        shell_str: String,
+        /// Login-shell argv0 — `"-"` followed by the basename of
+        /// `shell` (bash/zsh/sh treat this as "behave as a login shell"
+        /// and source profile files).
+        argv0_c: std::ffi::CString,
+    }
+
+    fn lookup_user(name: &str) -> puressh::Result<UserInfo> {
+        let user = nix::unistd::User::from_name(name)
+            .map_err(nix_io)?
+            .ok_or_else(|| {
+                puressh::Error::Io(std::io::Error::other(format!("user '{name}' not found")))
+            })?;
+
+        let name_c = std::ffi::CString::new(user.name.clone()).map_err(|_| {
+            puressh::Error::Io(std::io::Error::other("user name contains NUL byte"))
+        })?;
+
+        let home_str = user.dir.to_string_lossy().into_owned();
+        let home_for_c = if home_str.is_empty() { "/" } else { &home_str };
+        let home_c = std::ffi::CString::new(home_for_c.as_bytes()).map_err(|_| {
+            puressh::Error::Io(std::io::Error::other("home directory contains NUL byte"))
+        })?;
+
+        let shell_str = {
+            let s = user.shell.to_string_lossy();
+            if s.is_empty() {
+                "/bin/sh".to_string()
+            } else {
+                s.into_owned()
+            }
+        };
+        let shell_c = std::ffi::CString::new(shell_str.as_bytes()).map_err(|_| {
+            puressh::Error::Io(std::io::Error::other("shell path contains NUL byte"))
+        })?;
+
+        // argv0 = "-" + basename(shell). Login-shell convention.
+        let basename = std::path::Path::new(&shell_str)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("sh");
+        let argv0 = format!("-{basename}");
+        let argv0_c = std::ffi::CString::new(argv0).map_err(|_| {
+            puressh::Error::Io(std::io::Error::other("shell argv0 contains NUL byte"))
+        })?;
+
+        Ok(UserInfo {
+            name: user.name,
+            name_c,
+            uid: user.uid,
+            gid: user.gid,
+            home_c,
+            home_str,
+            shell_c,
+            shell_str,
+            argv0_c,
+        })
+    }
+
+    /// Layer login env vars (HOME/USER/LOGNAME/SHELL) on top of the
+    /// snapshot returned by PAM. Conventional names — pam_env may have
+    /// supplied some of them already; we overwrite with the resolved
+    /// `/etc/passwd` truth.
+    fn apply_login_envs(envs: &mut Vec<(std::ffi::CString, std::ffi::CString)>, info: &UserInfo) {
+        // CString::new can't fail on these (no interior NUL by
+        // construction in lookup_user). Use unwrap_or_default as a
+        // belt-and-braces fallback.
+        let pairs: [(&str, &std::ffi::CString); 4] = [
+            ("HOME", &info.home_c),
+            ("USER", &info.name_c),
+            ("LOGNAME", &info.name_c),
+            ("SHELL", &info.shell_c),
+        ];
+        for (k, v) in pairs {
+            let key = std::ffi::CString::new(k).unwrap_or_default();
+            // Overwrite any pam_env contribution: /etc/passwd wins.
+            if let Some(slot) = envs
+                .iter_mut()
+                .find(|(kk, _)| kk.as_bytes() == k.as_bytes())
+            {
+                slot.1 = v.clone();
+            } else {
+                envs.push((key, v.clone()));
+            }
+        }
+    }
+
+    /// True iff we're already running as `info`'s uid/gid — in which
+    /// case the setuid/setgid/initgroups dance is unnecessary (and
+    /// would in fact fail for non-root daemons).
+    fn already_matches(info: &UserInfo) -> bool {
+        nix::unistd::geteuid() == info.uid && nix::unistd::getegid() == info.gid
+    }
+
+    // -------------------------------------------------------------------------
+    // NixShellHandler — backend for `pty-req` + `shell`. Allocates a PTY
+    // with `openpty()`, forks manually so PAM_TTY can be set pre-fork,
+    // drops to the target user's uid/gid, then `execvp`s their login
+    // shell. Exposes the master fd as a non-blocking `ShellSession`.
     // -------------------------------------------------------------------------
 
     struct NixShellHandler {
@@ -535,6 +724,12 @@ mod imp {
             ws_xpixel: clamp_u16(spec.px_w),
             ws_ypixel: clamp_u16(spec.px_h),
         };
+
+        // Resolve the target user. Must happen pre-fork — getpwnam_r
+        // allocates and isn't safe in the post-fork window.
+        let info = lookup_user(user)?;
+        let drop_privs = !already_matches(&info);
+
         // Allocate the master/slave pair *before* forking. PAM_TTY must
         // be the slave's path on disk so PAM modules (pam_loginuid,
         // pam_systemd, pam_lastlog, …) can stat it; `forkpty` doesn't
@@ -548,7 +743,8 @@ mod imp {
         // Open the PAM session with the slave path as PAM_TTY. Strict:
         // failure here propagates as `puressh::Error` and the channel
         // request is rejected upstream.
-        let pam_envs = pam.ensure(user, &slave_path)?;
+        let mut pam_envs = pam.ensure(user, &slave_path)?;
+        apply_login_envs(&mut pam_envs, &info);
 
         // SAFETY: fork() in single-threaded code is safe; the child
         // branch performs only async-signal-safe ops (with the known
@@ -575,11 +771,38 @@ mod imp {
                 // Restore default SIGCHLD so the user's shell can reap
                 // its own children via waitpid(WNOHANG).
                 let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
-                // Apply PAM environment. `setenv` isn't strictly
-                // async-signal-safe per POSIX, but our post-fork
-                // process is single-threaded and the env list is
-                // bounded — this is the same approach OpenSSH uses in
-                // `do_setup_env` → `child_set_env`.
+
+                // Drop privileges to the target user before applying
+                // env / chdir / exec. Order matters: setgid first
+                // (still root), then initgroups (still root), then
+                // setuid — once setuid runs we can't go back.
+                if drop_privs
+                    && (nix::unistd::setgid(info.gid).is_err()
+                        || nix::unistd::initgroups(&info.name_c, info.gid).is_err()
+                        || nix::unistd::setuid(info.uid).is_err())
+                {
+                    // Any step failing means we can't safely
+                    // continue — refuse rather than running the
+                    // shell with mixed privileges.
+                    unsafe { libc::_exit(126) };
+                }
+
+                // chdir(home). Best-effort: if home is unreadable
+                // post-drop, fall back to / so the shell still runs.
+                // SAFETY: `info.home_c` is a valid NUL-terminated
+                // CString we own.
+                unsafe {
+                    if libc::chdir(info.home_c.as_ptr()) != 0 {
+                        let _ = libc::chdir(c"/".as_ptr());
+                    }
+                }
+
+                // Apply PAM environment (now layered with HOME/USER/
+                // LOGNAME/SHELL via apply_login_envs above). `setenv`
+                // isn't strictly async-signal-safe per POSIX, but
+                // our post-fork process is single-threaded and the
+                // env list is bounded — the same approach OpenSSH
+                // uses in `do_setup_env` → `child_set_env`.
                 for (k, v) in &pam_envs {
                     // SAFETY: k, v are NUL-terminated `CString`s we
                     // own; the third argument 1 says "overwrite".
@@ -587,13 +810,11 @@ mod imp {
                         libc::setenv(k.as_ptr(), v.as_ptr(), 1);
                     }
                 }
-                // execvp the user's shell. /bin/sh -l keeps the
-                // dependency surface tiny; a fuller impl would
-                // consult getpwnam(user).pw_shell.
-                let sh = c"/bin/sh";
-                let arg0 = c"sh";
-                let argl = c"-l";
-                let _ = execvp(sh, &[arg0, argl]);
+
+                // execvp the user's actual login shell from passwd,
+                // with argv0 prefixed by "-" so bash/zsh/sh source
+                // their login profile files.
+                let _ = execvp(&info.shell_c, &[info.argv0_c.as_c_str()]);
                 // execvp failed (binary missing, ENOEXEC, …). Use
                 // _exit so we don't run stdlib atexit handlers
                 // inherited from the parent.
@@ -610,10 +831,12 @@ mod imp {
                 fcntl(master.as_fd(), FcntlArg::F_SETFL(new)).map_err(nix_io)?;
                 if debug {
                     eprintln!(
-                        "sshd: spawned pty shell pid={} master_fd={} pts={}",
+                        "sshd: spawned pty shell pid={} master_fd={} pts={} user={} shell={}",
                         child.as_raw(),
                         raw,
                         slave_path,
+                        info.name,
+                        info.shell_str,
                     );
                 }
                 Ok(Box::new(NixShellSession {

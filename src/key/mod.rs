@@ -21,7 +21,7 @@ use purecrypto::cipher::{Aes128, Aes256, Ctr};
 use purecrypto::kdf::bcrypt_pbkdf;
 
 use crate::error::{Error, Result};
-use crate::format::{Reader, Writer, read_mpint, write_mpint};
+use crate::format::{read_mpint, write_mpint, Reader, Writer};
 
 mod base64;
 
@@ -199,7 +199,7 @@ impl PublicKey {
     /// Format: `<algorithm> <base64(wire_blob)> [comment...]`. Leading
     /// `from=...`/`command=...` option prefixes are not supported.
     pub fn parse_authorized_keys_line(s: &str) -> Result<Self> {
-        let line = s.trim_end_matches(|c| c == '\n' || c == '\r').trim_start();
+        let line = s.trim_end_matches(['\n', '\r']).trim_start();
         let mut it = line.splitn(3, ' ');
         let algo = it
             .next()
@@ -218,9 +218,7 @@ impl PublicKey {
             | PublicKey::Rsa { comment: c, .. } => *c = comment,
         }
         if pk.algorithm() != algo {
-            return Err(Error::Format(
-                "authorized_keys: algorithm tag mismatch",
-            ));
+            return Err(Error::Format("authorized_keys: algorithm tag mismatch"));
         }
         Ok(pk)
     }
@@ -258,15 +256,24 @@ impl PublicKey {
                     comment: String::new(),
                 }
             }
-            b if b == ECDSA_P256.as_bytes() => parse_ecdsa_public(&mut r, NISTP256, |p, c| {
-                PublicKey::EcdsaP256 { point: p, comment: c }
-            })?,
-            b if b == ECDSA_P384.as_bytes() => parse_ecdsa_public(&mut r, NISTP384, |p, c| {
-                PublicKey::EcdsaP384 { point: p, comment: c }
-            })?,
-            b if b == ECDSA_P521.as_bytes() => parse_ecdsa_public(&mut r, NISTP521, |p, c| {
-                PublicKey::EcdsaP521 { point: p, comment: c }
-            })?,
+            b if b == ECDSA_P256.as_bytes() => {
+                parse_ecdsa_public(&mut r, NISTP256, |p, c| PublicKey::EcdsaP256 {
+                    point: p,
+                    comment: c,
+                })?
+            }
+            b if b == ECDSA_P384.as_bytes() => {
+                parse_ecdsa_public(&mut r, NISTP384, |p, c| PublicKey::EcdsaP384 {
+                    point: p,
+                    comment: c,
+                })?
+            }
+            b if b == ECDSA_P521.as_bytes() => {
+                parse_ecdsa_public(&mut r, NISTP521, |p, c| PublicKey::EcdsaP521 {
+                    point: p,
+                    comment: c,
+                })?
+            }
             b if b == RSA.as_bytes() => {
                 let e = read_mpint(&mut r)?.to_vec();
                 let n = read_mpint(&mut r)?.to_vec();
@@ -329,27 +336,19 @@ impl PrivateKey {
                 raw: *public,
                 comment: comment.clone(),
             },
-            PrivateKey::EcdsaP256 {
-                point, comment, ..
-            } => PublicKey::EcdsaP256 {
+            PrivateKey::EcdsaP256 { point, comment, .. } => PublicKey::EcdsaP256 {
                 point: point.clone(),
                 comment: comment.clone(),
             },
-            PrivateKey::EcdsaP384 {
-                point, comment, ..
-            } => PublicKey::EcdsaP384 {
+            PrivateKey::EcdsaP384 { point, comment, .. } => PublicKey::EcdsaP384 {
                 point: point.clone(),
                 comment: comment.clone(),
             },
-            PrivateKey::EcdsaP521 {
-                point, comment, ..
-            } => PublicKey::EcdsaP521 {
+            PrivateKey::EcdsaP521 { point, comment, .. } => PublicKey::EcdsaP521 {
                 point: point.clone(),
                 comment: comment.clone(),
             },
-            PrivateKey::Rsa {
-                e, n, comment, ..
-            } => PublicKey::Rsa {
+            PrivateKey::Rsa { e, n, comment, .. } => PublicKey::Rsa {
                 e: e.clone(),
                 n: n.clone(),
                 comment: comment.clone(),
@@ -441,11 +440,10 @@ fn public_parts_match(a: &PublicKey, b: &PublicKey) -> bool {
         (PublicKey::EcdsaP256 { point: x, .. }, PublicKey::EcdsaP256 { point: y, .. })
         | (PublicKey::EcdsaP384 { point: x, .. }, PublicKey::EcdsaP384 { point: y, .. })
         | (PublicKey::EcdsaP521 { point: x, .. }, PublicKey::EcdsaP521 { point: y, .. }) => x == y,
-        (
-            PublicKey::Rsa { e: e1, n: n1, .. },
-            PublicKey::Rsa { e: e2, n: n2, .. },
-        ) => trim_leading_zeros(e1) == trim_leading_zeros(e2)
-            && trim_leading_zeros(n1) == trim_leading_zeros(n2),
+        (PublicKey::Rsa { e: e1, n: n1, .. }, PublicKey::Rsa { e: e2, n: n2, .. }) => {
+            trim_leading_zeros(e1) == trim_leading_zeros(e2)
+                && trim_leading_zeros(n1) == trim_leading_zeros(n2)
+        }
         _ => false,
     }
 }
@@ -485,27 +483,27 @@ fn parse_private_fields(r: &mut Reader<'_>) -> Result<PrivateKey> {
                 comment: String::new(),
             })
         }
-        b if b == ECDSA_P256.as_bytes() => parse_ecdsa_private(r, NISTP256, |d, point| {
-            PrivateKey::EcdsaP256 {
+        b if b == ECDSA_P256.as_bytes() => {
+            parse_ecdsa_private(r, NISTP256, |d, point| PrivateKey::EcdsaP256 {
                 d,
                 point,
                 comment: String::new(),
-            }
-        }),
-        b if b == ECDSA_P384.as_bytes() => parse_ecdsa_private(r, NISTP384, |d, point| {
-            PrivateKey::EcdsaP384 {
+            })
+        }
+        b if b == ECDSA_P384.as_bytes() => {
+            parse_ecdsa_private(r, NISTP384, |d, point| PrivateKey::EcdsaP384 {
                 d,
                 point,
                 comment: String::new(),
-            }
-        }),
-        b if b == ECDSA_P521.as_bytes() => parse_ecdsa_private(r, NISTP521, |d, point| {
-            PrivateKey::EcdsaP521 {
+            })
+        }
+        b if b == ECDSA_P521.as_bytes() => {
+            parse_ecdsa_private(r, NISTP521, |d, point| PrivateKey::EcdsaP521 {
                 d,
                 point,
                 comment: String::new(),
-            }
-        }),
+            })
+        }
         b if b == RSA.as_bytes() => {
             let n = read_mpint(r)?.to_vec();
             let e = read_mpint(r)?.to_vec();
@@ -563,7 +561,9 @@ fn decrypt_payload(
 ) -> Result<Vec<u8>> {
     if ciphername == b"none" {
         if kdfname != b"none" {
-            return Err(Error::Format("openssh key: cipher 'none' with non-none kdf"));
+            return Err(Error::Format(
+                "openssh key: cipher 'none' with non-none kdf",
+            ));
         }
         return Ok(encrypted.to_vec());
     }
@@ -590,7 +590,7 @@ fn decrypt_payload(
     let derived = bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
         .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?;
 
-    if encrypted.len() % 16 != 0 {
+    if !encrypted.len().is_multiple_of(16) {
         return Err(Error::Format("openssh key: encrypted length not aligned"));
     }
 

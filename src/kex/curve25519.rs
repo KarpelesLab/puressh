@@ -10,8 +10,10 @@ use purecrypto::ec::x25519::X25519PrivateKey;
 use purecrypto::hash::Sha256;
 use purecrypto::rng::{CryptoRng, RngCore};
 
-use super::common::{KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY};
-use super::hash::{ExchangeHash, mpint_bytes};
+use super::common::{
+    KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY,
+};
+use super::hash::{mpint_bytes, ExchangeHash};
 use super::Kex;
 use crate::error::{Error, Result};
 use crate::format::Reader;

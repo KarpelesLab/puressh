@@ -7,11 +7,11 @@
 //! - Key exchange (`SSH_MSG_KEXINIT` + chosen KEX) and key re-exchange
 //! - Negotiated symmetric crypto state for inbound and outbound streams
 
-pub mod packet;
-pub mod version;
 pub mod kex;
 pub mod kexinit;
+pub mod packet;
 pub mod runner;
+pub mod version;
 
 pub use kex::{KexAlgorithms, Negotiated};
 pub use kexinit::{KexInit, NegotiatedOwned, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS};

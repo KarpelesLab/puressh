@@ -40,10 +40,30 @@ pub struct MacSpec {
 
 /// Catalogue of MACs this build supports.
 pub const ALL: &[MacSpec] = &[
-    MacSpec { name: "hmac-sha2-256-etm@openssh.com", key_len: 32, tag_len: 32, etm: true },
-    MacSpec { name: "hmac-sha2-512-etm@openssh.com", key_len: 64, tag_len: 64, etm: true },
-    MacSpec { name: "hmac-sha2-256", key_len: 32, tag_len: 32, etm: false },
-    MacSpec { name: "hmac-sha2-512", key_len: 64, tag_len: 64, etm: false },
+    MacSpec {
+        name: "hmac-sha2-256-etm@openssh.com",
+        key_len: 32,
+        tag_len: 32,
+        etm: true,
+    },
+    MacSpec {
+        name: "hmac-sha2-512-etm@openssh.com",
+        key_len: 64,
+        tag_len: 64,
+        etm: true,
+    },
+    MacSpec {
+        name: "hmac-sha2-256",
+        key_len: 32,
+        tag_len: 32,
+        etm: false,
+    },
+    MacSpec {
+        name: "hmac-sha2-512",
+        key_len: 64,
+        tag_len: 64,
+        etm: false,
+    },
 ];
 
 /// Look up a [`MacSpec`] by SSH name.
@@ -323,7 +343,10 @@ mod tests {
             Err(Error::BadMac)
         ));
 
-        assert!(matches!(mac.verify(seq, msg, &got[..31]), Err(Error::BadMac)));
+        assert!(matches!(
+            mac.verify(seq, msg, &got[..31]),
+            Err(Error::BadMac)
+        ));
     }
 
     #[test]

@@ -10,18 +10,16 @@ use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
 use purecrypto::bignum::BoxedUint;
 #[cfg(feature = "alloc")]
-use purecrypto::ec::{
-    BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId,
-};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, BoxedEcdsaSignature, CurveId};
 #[cfg(feature = "alloc")]
 use purecrypto::hash::{Sha256, Sha384, Sha512};
 
 #[cfg(feature = "alloc")]
+use super::{HostKey, HostKeyVerify};
+#[cfg(feature = "alloc")]
 use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
-use crate::format::{Reader, Writer, read_mpint, write_mpint};
-#[cfg(feature = "alloc")]
-use super::{HostKey, HostKeyVerify};
+use crate::format::{read_mpint, write_mpint, Reader, Writer};
 
 /// `ecdsa-sha2-nistp256`.
 pub struct EcdsaP256;
@@ -110,11 +108,7 @@ fn parse_public_blob(params: &EcdsaParams, blob: &[u8]) -> Result<BoxedEcdsaPubl
 }
 
 #[cfg(feature = "alloc")]
-fn sign_with(
-    params: &EcdsaParams,
-    priv_key: &BoxedEcdsaPrivateKey,
-    msg: &[u8],
-) -> Result<Vec<u8>> {
+fn sign_with(params: &EcdsaParams, priv_key: &BoxedEcdsaPrivateKey, msg: &[u8]) -> Result<Vec<u8>> {
     let sig = match params.hash {
         EcdsaHash::Sha256 => priv_key.sign::<Sha256>(msg),
         EcdsaHash::Sha384 => priv_key.sign::<Sha384>(msg),

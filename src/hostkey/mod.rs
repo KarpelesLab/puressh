@@ -12,14 +12,14 @@ use alloc::boxed::Box;
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
-pub mod ed25519;
 pub mod ecdsa;
+pub mod ed25519;
 pub mod rsa;
 
 #[cfg(feature = "alloc")]
-pub use ed25519::Ed25519HostKey;
-#[cfg(feature = "alloc")]
 pub use ecdsa::{EcdsaP256HostKey, EcdsaP384HostKey, EcdsaP521HostKey};
+#[cfg(feature = "alloc")]
+pub use ed25519::Ed25519HostKey;
 #[cfg(feature = "alloc")]
 pub use rsa::{RsaSha1HostKey, RsaSha2_256HostKey, RsaSha2_512HostKey};
 
@@ -64,10 +64,7 @@ pub trait HostKeyVerify {
 /// public-key blob layout — RFC 8332 §3 — so the same `(n, e)` blob is
 /// reusable across hash choices; only the resulting signature blob differs.
 #[cfg(feature = "alloc")]
-pub fn host_key_verify_by_name(
-    name: &str,
-    blob: &[u8],
-) -> crate::Result<Box<dyn HostKeyVerify>> {
+pub fn host_key_verify_by_name(name: &str, blob: &[u8]) -> crate::Result<Box<dyn HostKeyVerify>> {
     match name {
         "ssh-ed25519" => Ok(Box::new(Ed25519HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp256" => Ok(Box::new(EcdsaP256HostKey::from_public_blob(blob)?)),

@@ -173,11 +173,7 @@ fn parse_unencrypted_rsa_pem() {
 fn parse_unencrypted_ecdsa_p256_pem() {
     let sk = PrivateKey::parse_openssh_pem(ECDSA_P256_PEM_UNENCRYPTED, None).unwrap();
     match &sk {
-        PrivateKey::EcdsaP256 {
-            d,
-            point,
-            comment,
-        } => {
+        PrivateKey::EcdsaP256 { d, point, comment } => {
             assert_eq!(comment, "ecdsa@puressh");
             assert_eq!(point.len(), 65);
             assert!(!d.is_empty());

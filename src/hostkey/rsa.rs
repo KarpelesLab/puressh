@@ -24,11 +24,11 @@ use purecrypto::hash::{Sha1, Sha256, Sha512};
 use purecrypto::rsa::{BoxedRsaPrivateKey, BoxedRsaPublicKey};
 
 #[cfg(feature = "alloc")]
+use super::{HostKey, HostKeyVerify};
+#[cfg(feature = "alloc")]
 use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
-use crate::format::{Reader, Writer, read_mpint, write_mpint};
-#[cfg(feature = "alloc")]
-use super::{HostKey, HostKeyVerify};
+use crate::format::{read_mpint, write_mpint, Reader, Writer};
 
 /// `ssh-rsa` (RSA-SHA1, legacy).
 pub struct SshRsa;
@@ -180,11 +180,7 @@ macro_rules! rsa_host_key {
             ///
             /// Without the prime factors `(p, q)`, base-blinding is disabled
             /// on the private path — see `BoxedRsaPrivateKey::from_components`.
-            pub fn from_components(
-                n: BoxedUint,
-                e: BoxedUint,
-                d: BoxedUint,
-            ) -> Result<Self> {
+            pub fn from_components(n: BoxedUint, e: BoxedUint, d: BoxedUint) -> Result<Self> {
                 let public = BoxedRsaPublicKey::try_new(n.clone(), e.clone())
                     .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
                 let k = n.bit_len().div_ceil(8);
@@ -201,7 +197,11 @@ macro_rules! rsa_host_key {
                 let k = n.bit_len().div_ceil(8);
                 let public = BoxedRsaPublicKey::try_new(n, e)
                     .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
-                Ok(Self { private: None, public, k })
+                Ok(Self {
+                    private: None,
+                    public,
+                    k,
+                })
             }
 
             /// The modulus byte length (`k` per PKCS#1).
@@ -241,7 +241,11 @@ macro_rules! rsa_host_key {
 
             fn from_public_blob(blob: &[u8]) -> Result<Self> {
                 let (public, k) = parse_rsa_public_blob(blob)?;
-                Ok(Self { private: None, public, k })
+                Ok(Self {
+                    private: None,
+                    public,
+                    k,
+                })
             }
         }
     };
@@ -293,7 +297,10 @@ mod tests {
         assert_eq!(name, SshRsa::NAME.as_bytes());
         let e_raw = read_mpint(&mut r).unwrap();
         let n_raw = read_mpint(&mut r).unwrap();
-        assert_eq!(mpint_to_uint(e_raw).unwrap().to_be_bytes(3), e.to_be_bytes(3));
+        assert_eq!(
+            mpint_to_uint(e_raw).unwrap().to_be_bytes(3),
+            e.to_be_bytes(3)
+        );
         assert_eq!(
             mpint_to_uint(n_raw).unwrap().to_be_bytes(256),
             n.to_be_bytes(256)

@@ -121,7 +121,10 @@ impl AuthMethodPayload {
     fn write_tail(&self, w: &mut Writer) {
         match self {
             AuthMethodPayload::None => {}
-            AuthMethodPayload::Password { new_password, password } => {
+            AuthMethodPayload::Password {
+                new_password,
+                password,
+            } => {
                 w.write_bool(new_password.is_some());
                 w.write_string(password.as_bytes());
                 if let Some(np) = new_password {
@@ -145,7 +148,10 @@ impl AuthMethodPayload {
                     }
                 }
             }
-            AuthMethodPayload::KeyboardInteractive { language_tag, submethods } => {
+            AuthMethodPayload::KeyboardInteractive {
+                language_tag,
+                submethods,
+            } => {
                 w.write_string(language_tag.as_bytes());
                 w.write_string(submethods.as_bytes());
             }
@@ -196,7 +202,10 @@ impl UserauthRequest {
                     None
                 };
                 ensure_empty(&r)?;
-                AuthMethodPayload::Password { new_password, password }
+                AuthMethodPayload::Password {
+                    new_password,
+                    password,
+                }
             }
             "publickey" => {
                 let signature_present = r.read_bool()?;
@@ -219,7 +228,10 @@ impl UserauthRequest {
                 let language_tag = read_utf8(&mut r)?;
                 let submethods = read_utf8(&mut r)?;
                 ensure_empty(&r)?;
-                AuthMethodPayload::KeyboardInteractive { language_tag, submethods }
+                AuthMethodPayload::KeyboardInteractive {
+                    language_tag,
+                    submethods,
+                }
             }
             _ => {
                 let tail = r.take(r.remaining())?.to_vec();
@@ -229,7 +241,11 @@ impl UserauthRequest {
                 }
             }
         };
-        Ok(Self { user, service, method })
+        Ok(Self {
+            user,
+            service,
+            method,
+        })
     }
 }
 
@@ -268,11 +284,13 @@ impl UserauthFailure {
             if part.is_empty() {
                 continue;
             }
-            let s = core::str::from_utf8(part)
-                .map_err(|_| Error::Format("auth: invalid utf-8"))?;
+            let s = core::str::from_utf8(part).map_err(|_| Error::Format("auth: invalid utf-8"))?;
             continuations.push(s.into());
         }
-        Ok(Self { continuations, partial_success })
+        Ok(Self {
+            continuations,
+            partial_success,
+        })
     }
 }
 
@@ -339,7 +357,10 @@ impl UserauthPkOk {
         let algorithm = read_utf8(&mut r)?;
         let public_blob = r.read_string()?.to_vec();
         ensure_empty(&r)?;
-        Ok(Self { algorithm, public_blob })
+        Ok(Self {
+            algorithm,
+            public_blob,
+        })
     }
 }
 
@@ -385,7 +406,12 @@ impl UserauthInfoRequest {
             prompts.push((prompt, echo));
         }
         ensure_empty(&r)?;
-        Ok(Self { name, instruction, language, prompts })
+        Ok(Self {
+            name,
+            instruction,
+            language,
+            prompts,
+        })
     }
 }
 
@@ -461,7 +487,9 @@ mod tests {
 
     #[test]
     fn service_request_roundtrip() {
-        let msg = ServiceRequest { service: "ssh-userauth".into() };
+        let msg = ServiceRequest {
+            service: "ssh-userauth".into(),
+        };
         let enc = msg.encode();
         assert_eq!(enc[0], SSH_MSG_SERVICE_REQUEST);
         let dec = ServiceRequest::decode(&enc).unwrap();
@@ -470,7 +498,9 @@ mod tests {
 
     #[test]
     fn service_accept_roundtrip() {
-        let msg = ServiceAccept { service: "ssh-userauth".into() };
+        let msg = ServiceAccept {
+            service: "ssh-userauth".into(),
+        };
         let dec = ServiceAccept::decode(&msg.encode()).unwrap();
         assert_eq!(dec, msg);
     }

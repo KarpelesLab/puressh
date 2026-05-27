@@ -152,7 +152,9 @@ impl ServerAuth {
                     return Err(Error::Protocol("auth: unknown service requested"));
                 }
                 self.state = State::AwaitingRequest;
-                let accept = ServiceAccept { service: "ssh-userauth".into() };
+                let accept = ServiceAccept {
+                    service: "ssh-userauth".into(),
+                };
                 Ok(ServerStep::Send(accept.encode()))
             }
             State::AwaitingRequest => {
@@ -189,7 +191,10 @@ impl ServerAuth {
                 let decision = self.auth.evaluate(AuthAttempt::None { user: user.clone() });
                 self.apply_decision(decision, &user)
             }
-            AuthMethodPayload::Password { password, new_password: _ } => {
+            AuthMethodPayload::Password {
+                password,
+                new_password: _,
+            } => {
                 let decision = self.auth.evaluate(AuthAttempt::Password {
                     user: user.clone(),
                     password,
@@ -202,7 +207,10 @@ impl ServerAuth {
                 public_blob,
                 signature,
             } => self.handle_publickey(user, signature_present, algorithm, public_blob, signature),
-            AuthMethodPayload::KeyboardInteractive { language_tag: _, submethods: _ } => {
+            AuthMethodPayload::KeyboardInteractive {
+                language_tag: _,
+                submethods: _,
+            } => {
                 let decision = self
                     .auth
                     .evaluate(AuthAttempt::KeyboardInteractive { user: user.clone() });
@@ -230,7 +238,10 @@ impl ServerAuth {
             });
             return match decision {
                 AuthDecision::Accept | AuthDecision::PartialAccept { .. } => {
-                    let pk_ok = UserauthPkOk { algorithm, public_blob };
+                    let pk_ok = UserauthPkOk {
+                        algorithm,
+                        public_blob,
+                    };
                     Ok(ServerStep::Send(pk_ok.encode()))
                 }
                 AuthDecision::Reject => self.emit_failure(),
@@ -245,8 +256,7 @@ impl ServerAuth {
             None => return Err(Error::Format("auth: missing signature")),
         };
 
-        let verifier: Box<dyn HostKeyVerify> =
-            host_key_verify_by_name(&algorithm, &public_blob)?;
+        let verifier: Box<dyn HostKeyVerify> = host_key_verify_by_name(&algorithm, &public_blob)?;
         let signed = super::message::publickey_signed_data(
             &self.session_id,
             &user,
@@ -285,7 +295,11 @@ impl ServerAuth {
                 Ok(ServerStep::Send(failure.encode()))
             }
             AuthDecision::Reject => self.emit_failure(),
-            AuthDecision::InteractiveRequest { name, instruction, prompts } => {
+            AuthDecision::InteractiveRequest {
+                name,
+                instruction,
+                prompts,
+            } => {
                 let req = UserauthInfoRequest {
                     name,
                     instruction,

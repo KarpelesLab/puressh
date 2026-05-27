@@ -11,8 +11,10 @@ use purecrypto::ec::curves::CurveId;
 use purecrypto::hash::{Digest, Sha256, Sha384, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
 
-use super::common::{KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY};
-use super::hash::{ExchangeHash, mpint_bytes};
+use super::common::{
+    KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY,
+};
+use super::hash::{mpint_bytes, ExchangeHash};
 use super::Kex;
 use crate::error::{Error, Result};
 use crate::format::Reader;
@@ -74,14 +76,7 @@ fn client_init<R: RngCore + CryptoRng>(curve: CurveId, rng: &mut R) -> (ClientSt
     payload.push(SSH_MSG_KEX_ECDH_INIT);
     payload.extend_from_slice(&(q_c.len() as u32).to_be_bytes());
     payload.extend_from_slice(&q_c);
-    (
-        ClientState {
-            curve,
-            secret,
-            q_c,
-        },
-        KexInitOut { payload },
-    )
+    (ClientState { curve, secret, q_c }, KexInitOut { payload })
 }
 
 fn server_reply_inner<D, R, S>(
@@ -197,9 +192,7 @@ macro_rules! ecdh_impl {
 
             /// Generate the client ephemeral and produce
             /// `SSH_MSG_KEX_ECDH_INIT`.
-            pub fn client_init<R: RngCore + CryptoRng>(
-                rng: &mut R,
-            ) -> (ClientState, KexInitOut) {
+            pub fn client_init<R: RngCore + CryptoRng>(rng: &mut R) -> (ClientState, KexInitOut) {
                 client_init($curve, rng)
             }
 

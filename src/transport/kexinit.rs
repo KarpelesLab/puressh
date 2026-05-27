@@ -172,8 +172,8 @@ fn read_name_list(r: &mut Reader<'_>) -> Result<Vec<String>> {
     let nl = NameList::read(r)?;
     let mut out = Vec::new();
     for entry in nl.iter() {
-        let s = core::str::from_utf8(entry)
-            .map_err(|_| Error::Format("non-UTF8 name in name-list"))?;
+        let s =
+            core::str::from_utf8(entry).map_err(|_| Error::Format("non-UTF8 name in name-list"))?;
         out.push(s.to_string());
     }
     Ok(out)
@@ -225,12 +225,20 @@ fn pick<'a>(category: &'static str, client: &'a [String], server: &[String]) -> 
 /// `first_kex_packet_follows_wrong_guess` flag captures exactly that.
 pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> {
     let kex = pick("kex algorithm", &client.kex, &server.kex)?;
-    let host_key = pick("host-key algorithm", &client.server_host_key, &server.server_host_key)?;
+    let host_key = pick(
+        "host-key algorithm",
+        &client.server_host_key,
+        &server.server_host_key,
+    )?;
     let cipher_c2s = pick("cipher c2s", &client.ciphers_c2s, &server.ciphers_c2s)?;
     let cipher_s2c = pick("cipher s2c", &client.ciphers_s2c, &server.ciphers_s2c)?;
 
-    let c_aead = crate::cipher::by_name(cipher_c2s).map(|s| s.aead).unwrap_or(false);
-    let s_aead = crate::cipher::by_name(cipher_s2c).map(|s| s.aead).unwrap_or(false);
+    let c_aead = crate::cipher::by_name(cipher_c2s)
+        .map(|s| s.aead)
+        .unwrap_or(false);
+    let s_aead = crate::cipher::by_name(cipher_s2c)
+        .map(|s| s.aead)
+        .unwrap_or(false);
 
     let mac_c2s = if c_aead {
         ""

@@ -106,7 +106,14 @@ impl ChannelRequest {
     /// Encode just the request-type-specific tail (everything after `want_reply`).
     pub fn encode(&self, w: &mut Writer) {
         match self {
-            ChannelRequest::PtyReq { term, cols, rows, px_w, px_h, modes } => {
+            ChannelRequest::PtyReq {
+                term,
+                cols,
+                rows,
+                px_w,
+                px_h,
+                modes,
+            } => {
                 w.write_string(term.as_bytes());
                 w.write_u32(*cols);
                 w.write_u32(*rows);
@@ -125,7 +132,12 @@ impl ChannelRequest {
                 w.write_string(name.as_bytes());
                 w.write_string(value.as_bytes());
             }
-            ChannelRequest::WindowChange { cols, rows, px_w, px_h } => {
+            ChannelRequest::WindowChange {
+                cols,
+                rows,
+                px_w,
+                px_h,
+            } => {
                 w.write_u32(*cols);
                 w.write_u32(*rows);
                 w.write_u32(*px_w);
@@ -137,7 +149,12 @@ impl ChannelRequest {
             ChannelRequest::ExitStatus { code } => {
                 w.write_u32(*code);
             }
-            ChannelRequest::ExitSignal { name, core_dumped, message, language } => {
+            ChannelRequest::ExitSignal {
+                name,
+                core_dumped,
+                message,
+                language,
+            } => {
                 w.write_string(name.as_bytes());
                 w.write_bool(*core_dumped);
                 w.write_string(message.as_bytes());
@@ -161,11 +178,22 @@ impl ChannelRequest {
                 let px_w = r.read_u32()?;
                 let px_h = r.read_u32()?;
                 let modes = r.read_string()?.to_vec();
-                Ok(ChannelRequest::PtyReq { term, cols, rows, px_w, px_h, modes })
+                Ok(ChannelRequest::PtyReq {
+                    term,
+                    cols,
+                    rows,
+                    px_w,
+                    px_h,
+                    modes,
+                })
             }
             "shell" => Ok(ChannelRequest::Shell),
-            "exec" => Ok(ChannelRequest::Exec { command: read_utf8(&mut r)? }),
-            "subsystem" => Ok(ChannelRequest::Subsystem { name: read_utf8(&mut r)? }),
+            "exec" => Ok(ChannelRequest::Exec {
+                command: read_utf8(&mut r)?,
+            }),
+            "subsystem" => Ok(ChannelRequest::Subsystem {
+                name: read_utf8(&mut r)?,
+            }),
             "env" => {
                 let name = read_utf8(&mut r)?;
                 let value = read_utf8(&mut r)?;
@@ -176,16 +204,30 @@ impl ChannelRequest {
                 let rows = r.read_u32()?;
                 let px_w = r.read_u32()?;
                 let px_h = r.read_u32()?;
-                Ok(ChannelRequest::WindowChange { cols, rows, px_w, px_h })
+                Ok(ChannelRequest::WindowChange {
+                    cols,
+                    rows,
+                    px_w,
+                    px_h,
+                })
             }
-            "signal" => Ok(ChannelRequest::Signal { name: read_utf8(&mut r)? }),
-            "exit-status" => Ok(ChannelRequest::ExitStatus { code: r.read_u32()? }),
+            "signal" => Ok(ChannelRequest::Signal {
+                name: read_utf8(&mut r)?,
+            }),
+            "exit-status" => Ok(ChannelRequest::ExitStatus {
+                code: r.read_u32()?,
+            }),
             "exit-signal" => {
                 let name = read_utf8(&mut r)?;
                 let core_dumped = r.read_bool()?;
                 let message = read_utf8(&mut r)?;
                 let language = read_utf8(&mut r)?;
-                Ok(ChannelRequest::ExitSignal { name, core_dumped, message, language })
+                Ok(ChannelRequest::ExitSignal {
+                    name,
+                    core_dumped,
+                    message,
+                    language,
+                })
             }
             other => Ok(ChannelRequest::Other {
                 name: other.to_string(),

@@ -24,11 +24,11 @@ use alloc::vec::Vec;
 use purecrypto::ec::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 
 #[cfg(feature = "alloc")]
+use super::{HostKey, HostKeyVerify};
+#[cfg(feature = "alloc")]
 use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
 use crate::format::{Reader, Writer};
-#[cfg(feature = "alloc")]
-use super::{HostKey, HostKeyVerify};
 
 /// Marker for the `ssh-ed25519` algorithm.
 pub struct SshEd25519;

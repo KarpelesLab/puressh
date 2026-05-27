@@ -9,12 +9,10 @@ use crate::hostkey::{Ed25519HostKey, HostKey};
 
 use super::client::{ClientAuth, ClientCredential, ClientStep, KeyboardInteractiveResponder};
 use super::message::{
-    encode_success, ServiceAccept, UserauthBanner, UserauthFailure, UserauthInfoRequest,
-    UserauthPkOk, UserauthRequest, AuthMethodPayload,
+    encode_success, AuthMethodPayload, ServiceAccept, UserauthBanner, UserauthFailure,
+    UserauthInfoRequest, UserauthPkOk, UserauthRequest,
 };
-use super::server::{
-    AuthAttempt, AuthDecision, Authenticator, ServerAuth, ServerStep,
-};
+use super::server::{AuthAttempt, AuthDecision, Authenticator, ServerAuth, ServerStep};
 
 const TEST_SEED: [u8; 32] = [7u8; 32];
 const TEST_SID: &[u8] = b"test-session-id-32-bytes--------";
@@ -77,7 +75,12 @@ impl KeyboardInteractiveResponder for StaticKbdResponder {
     ) -> Vec<String> {
         prompts
             .iter()
-            .zip(self.answers.iter().cloned().chain(core::iter::repeat(String::new())))
+            .zip(
+                self.answers
+                    .iter()
+                    .cloned()
+                    .chain(core::iter::repeat(String::new())),
+            )
             .map(|(_, a)| a)
             .collect()
     }
@@ -99,7 +102,10 @@ fn client_none_then_password_fallback() {
     c.add_credential(ClientCredential::Password("hunter2".into()));
 
     let _ = c.start();
-    let accept = ServiceAccept { service: "ssh-userauth".into() }.encode();
+    let accept = ServiceAccept {
+        service: "ssh-userauth".into(),
+    }
+    .encode();
     let step = c.on_packet(&accept).unwrap();
     let none_req = match step {
         ClientStep::Send(p) => p,
@@ -130,8 +136,13 @@ fn client_failed_when_credentials_exhausted() {
     let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
     c.add_credential(ClientCredential::Password("a".into()));
     let _ = c.start();
-    c.on_packet(&ServiceAccept { service: "ssh-userauth".into() }.encode())
-        .unwrap();
+    c.on_packet(
+        &ServiceAccept {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    )
+    .unwrap();
     let step = c
         .on_packet(
             &UserauthFailure {
@@ -154,8 +165,13 @@ fn banner_does_not_change_state() {
     let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
     c.add_credential(ClientCredential::Password("a".into()));
     let _ = c.start();
-    c.on_packet(&ServiceAccept { service: "ssh-userauth".into() }.encode())
-        .unwrap();
+    c.on_packet(
+        &ServiceAccept {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    )
+    .unwrap();
 
     let banner = UserauthBanner {
         message: "welcome".into(),
@@ -183,8 +199,13 @@ fn client_publickey_probe_then_signed() {
     )));
 
     let _ = c.start();
-    c.on_packet(&ServiceAccept { service: "ssh-userauth".into() }.encode())
-        .unwrap();
+    c.on_packet(
+        &ServiceAccept {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    )
+    .unwrap();
 
     let pk_ok = UserauthPkOk {
         algorithm: "ssh-ed25519".into(),
@@ -203,7 +224,9 @@ fn client_publickey_probe_then_signed() {
     let parsed = UserauthRequest::decode(&signed).unwrap();
     match parsed.method {
         AuthMethodPayload::PublicKey {
-            signature_present, signature, ..
+            signature_present,
+            signature,
+            ..
         } => {
             assert!(signature_present);
             assert!(signature.is_some());
@@ -220,7 +243,9 @@ fn client_publickey_probe_then_signed() {
         &public_blob,
     );
     let sig = match UserauthRequest::decode(&signed).unwrap().method {
-        AuthMethodPayload::PublicKey { signature: Some(s), .. } => s,
+        AuthMethodPayload::PublicKey {
+            signature: Some(s), ..
+        } => s,
         _ => panic!(),
     };
     use crate::hostkey::HostKeyVerify;
@@ -229,14 +254,13 @@ fn client_publickey_probe_then_signed() {
 
 #[test]
 fn server_service_accept_flow() {
-    let server = ServerAuth::new(
-        TEST_SID.to_vec(),
-        vec!["password"],
-        Box::new(AlwaysReject),
-    );
+    let server = ServerAuth::new(TEST_SID.to_vec(), vec!["password"], Box::new(AlwaysReject));
     let mut s = server;
 
-    let sreq = super::message::ServiceRequest { service: "ssh-userauth".into() }.encode();
+    let sreq = super::message::ServiceRequest {
+        service: "ssh-userauth".into(),
+    }
+    .encode();
     let step = s.on_packet(&sreq).unwrap();
     match step {
         ServerStep::Send(p) => {
@@ -252,11 +276,17 @@ fn server_password_accept() {
     let mut s = ServerAuth::new(
         TEST_SID.to_vec(),
         vec!["password"],
-        Box::new(OnlyPassword { user: "alice", pw: "hunter2" }),
+        Box::new(OnlyPassword {
+            user: "alice",
+            pw: "hunter2",
+        }),
     );
 
     let _ = s.on_packet(
-        &super::message::ServiceRequest { service: "ssh-userauth".into() }.encode(),
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
     );
     let req = UserauthRequest {
         user: "alice".into(),
@@ -282,10 +312,16 @@ fn server_password_reject() {
     let mut s = ServerAuth::new(
         TEST_SID.to_vec(),
         vec!["password"],
-        Box::new(OnlyPassword { user: "alice", pw: "hunter2" }),
+        Box::new(OnlyPassword {
+            user: "alice",
+            pw: "hunter2",
+        }),
     );
     let _ = s.on_packet(
-        &super::message::ServiceRequest { service: "ssh-userauth".into() }.encode(),
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
     );
     let req = UserauthRequest {
         user: "alice".into(),
@@ -331,7 +367,10 @@ fn server_publickey_bad_signature_emits_failure() {
         Box::new(OnlyPublicKey),
     );
     let _ = s.on_packet(
-        &super::message::ServiceRequest { service: "ssh-userauth".into() }.encode(),
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
     );
     let req = UserauthRequest {
         user: "alice".into(),
@@ -372,7 +411,10 @@ fn server_publickey_good_signature_emits_success() {
         Box::new(OnlyPublicKey),
     );
     let _ = s.on_packet(
-        &super::message::ServiceRequest { service: "ssh-userauth".into() }.encode(),
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
     );
     let req = UserauthRequest {
         user: "alice".into(),
@@ -403,7 +445,10 @@ fn server_publickey_probe_replies_pk_ok() {
         Box::new(OnlyPublicKey),
     );
     let _ = s.on_packet(
-        &super::message::ServiceRequest { service: "ssh-userauth".into() }.encode(),
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
     );
     let req = UserauthRequest {
         user: "alice".into(),
@@ -435,7 +480,10 @@ fn end_to_end_password_loopback() {
     let mut s = ServerAuth::new(
         TEST_SID.to_vec(),
         vec!["password"],
-        Box::new(OnlyPassword { user: "alice", pw: "hunter2" }),
+        Box::new(OnlyPassword {
+            user: "alice",
+            pw: "hunter2",
+        }),
     );
 
     let sreq = c.start();
@@ -510,11 +558,7 @@ fn end_to_end_kbdint_loopback() {
                 _ => AuthDecision::Reject,
             }
         }
-        fn evaluate_interactive(
-            &mut self,
-            _user: &str,
-            responses: Vec<String>,
-        ) -> AuthDecision {
+        fn evaluate_interactive(&mut self, _user: &str, responses: Vec<String>) -> AuthDecision {
             if responses.first().map(|s| s.as_str()) == Some("hunter2") {
                 AuthDecision::Accept
             } else {
@@ -525,7 +569,9 @@ fn end_to_end_kbdint_loopback() {
 
     let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
     c.add_credential(ClientCredential::KeyboardInteractive(Box::new(
-        StaticKbdResponder { answers: vec!["hunter2".into()] },
+        StaticKbdResponder {
+            answers: vec!["hunter2".into()],
+        },
     )));
 
     let mut s = ServerAuth::new(

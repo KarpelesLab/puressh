@@ -49,8 +49,14 @@ impl GlobalRequest {
     /// Encode just the request-name-specific tail (everything after `want_reply`).
     pub fn encode(&self, w: &mut Writer) {
         match self {
-            GlobalRequest::TcpipForward { bind_address, bind_port }
-            | GlobalRequest::CancelTcpipForward { bind_address, bind_port } => {
+            GlobalRequest::TcpipForward {
+                bind_address,
+                bind_port,
+            }
+            | GlobalRequest::CancelTcpipForward {
+                bind_address,
+                bind_port,
+            } => {
                 w.write_string(bind_address.as_bytes());
                 w.write_u32(*bind_port);
             }
@@ -68,12 +74,18 @@ impl GlobalRequest {
             "tcpip-forward" => {
                 let bind_address = read_utf8(&mut r)?;
                 let bind_port = r.read_u32()?;
-                Ok(GlobalRequest::TcpipForward { bind_address, bind_port })
+                Ok(GlobalRequest::TcpipForward {
+                    bind_address,
+                    bind_port,
+                })
             }
             "cancel-tcpip-forward" => {
                 let bind_address = read_utf8(&mut r)?;
                 let bind_port = r.read_u32()?;
-                Ok(GlobalRequest::CancelTcpipForward { bind_address, bind_port })
+                Ok(GlobalRequest::CancelTcpipForward {
+                    bind_address,
+                    bind_port,
+                })
             }
             "keepalive@openssh.com" => Ok(GlobalRequest::Keepalive),
             other => Ok(GlobalRequest::Other {

@@ -7,9 +7,9 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer};
 
+use super::global::GlobalRequest;
 use super::msg::*;
 use super::request::ChannelRequest;
-use super::global::GlobalRequest;
 use super::{DEFAULT_MAX_PACKET, DEFAULT_WINDOW};
 
 /// One channel's bookkeeping.
@@ -105,8 +105,18 @@ impl ChannelOpen {
     fn encode_tail(&self, w: &mut Writer) {
         match self {
             ChannelOpen::Session => {}
-            ChannelOpen::DirectTcpip { dest_host, dest_port, orig_host, orig_port }
-            | ChannelOpen::ForwardedTcpip { dest_host, dest_port, orig_host, orig_port } => {
+            ChannelOpen::DirectTcpip {
+                dest_host,
+                dest_port,
+                orig_host,
+                orig_port,
+            }
+            | ChannelOpen::ForwardedTcpip {
+                dest_host,
+                dest_port,
+                orig_host,
+                orig_port,
+            } => {
                 w.write_string(dest_host.as_bytes());
                 w.write_u32(*dest_port);
                 w.write_string(orig_host.as_bytes());
@@ -127,14 +137,24 @@ impl ChannelOpen {
                 let dest_port = r.read_u32()?;
                 let orig_host = read_utf8(&mut r)?;
                 let orig_port = r.read_u32()?;
-                Ok(ChannelOpen::DirectTcpip { dest_host, dest_port, orig_host, orig_port })
+                Ok(ChannelOpen::DirectTcpip {
+                    dest_host,
+                    dest_port,
+                    orig_host,
+                    orig_port,
+                })
             }
             "forwarded-tcpip" => {
                 let dest_host = read_utf8(&mut r)?;
                 let dest_port = r.read_u32()?;
                 let orig_host = read_utf8(&mut r)?;
                 let orig_port = r.read_u32()?;
-                Ok(ChannelOpen::ForwardedTcpip { dest_host, dest_port, orig_host, orig_port })
+                Ok(ChannelOpen::ForwardedTcpip {
+                    dest_host,
+                    dest_port,
+                    orig_host,
+                    orig_port,
+                })
             }
             other => Ok(ChannelOpen::Other {
                 kind: other.to_string(),
@@ -369,7 +389,10 @@ impl ConnectionState {
         description: &str,
         language: &str,
     ) -> Result<Vec<u8>> {
-        let ch = self.channels.remove(&local_id).ok_or(Error::BadChannelState)?;
+        let ch = self
+            .channels
+            .remove(&local_id)
+            .ok_or(Error::BadChannelState)?;
         if ch.open_confirmed {
             self.channels.insert(local_id, ch);
             return Err(Error::BadChannelState);
@@ -598,7 +621,10 @@ impl ConnectionState {
         let n = r.remaining();
         let tail = r.take(n)?;
         let request = GlobalRequest::decode(name, tail)?;
-        Ok(ChannelEvent::GlobalRequest { request, want_reply })
+        Ok(ChannelEvent::GlobalRequest {
+            request,
+            want_reply,
+        })
     }
 
     fn on_channel_open(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
@@ -631,7 +657,10 @@ impl ConnectionState {
             open_confirmed: false,
         };
         self.channels.insert(local_id, state);
-        Ok(ChannelEvent::OpenRequest { channel: local_id, kind })
+        Ok(ChannelEvent::OpenRequest {
+            channel: local_id,
+            kind,
+        })
     }
 
     fn on_open_confirmation(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
@@ -639,7 +668,10 @@ impl ConnectionState {
         let remote_id = r.read_u32()?;
         let initial_window = r.read_u32()?;
         let max_packet = r.read_u32()?;
-        let ch = self.channels.get_mut(&local_id).ok_or(Error::Protocol("open-confirm for unknown channel"))?;
+        let ch = self
+            .channels
+            .get_mut(&local_id)
+            .ok_or(Error::Protocol("open-confirm for unknown channel"))?;
         if ch.open_confirmed {
             return Err(Error::Protocol("double open-confirm"));
         }
@@ -661,7 +693,11 @@ impl ConnectionState {
         self.channels
             .remove(&local_id)
             .ok_or(Error::Protocol("open-failure for unknown channel"))?;
-        Ok(ChannelEvent::OpenFailed { channel: local_id, reason, description })
+        Ok(ChannelEvent::OpenFailed {
+            channel: local_id,
+            reason,
+            description,
+        })
     }
 
     fn on_window_adjust(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
@@ -669,7 +705,10 @@ impl ConnectionState {
         let added = r.read_u32()?;
         let ch = self.get_mut(local_id)?;
         ch.remote_window = ch.remote_window.saturating_add(added);
-        Ok(ChannelEvent::WindowAdjust { channel: local_id, added })
+        Ok(ChannelEvent::WindowAdjust {
+            channel: local_id,
+            added,
+        })
     }
 
     fn on_channel_data(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
@@ -687,7 +726,10 @@ impl ConnectionState {
             return Err(Error::Protocol("peer exceeded max packet"));
         }
         ch.local_window -= len;
-        Ok(ChannelEvent::Data { channel: local_id, data })
+        Ok(ChannelEvent::Data {
+            channel: local_id,
+            data,
+        })
     }
 
     fn on_extended_data(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
@@ -706,7 +748,11 @@ impl ConnectionState {
             return Err(Error::Protocol("peer exceeded max packet"));
         }
         ch.local_window -= len;
-        Ok(ChannelEvent::ExtendedData { channel: local_id, code, data })
+        Ok(ChannelEvent::ExtendedData {
+            channel: local_id,
+            code,
+            data,
+        })
     }
 
     fn on_channel_eof(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
@@ -737,7 +783,11 @@ impl ConnectionState {
         if !self.channels.contains_key(&local_id) {
             return Err(Error::BadChannelState);
         }
-        Ok(ChannelEvent::Request { channel: local_id, request, want_reply })
+        Ok(ChannelEvent::Request {
+            channel: local_id,
+            request,
+            want_reply,
+        })
     }
 
     fn on_channel_success(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {

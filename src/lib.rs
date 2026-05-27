@@ -10,7 +10,7 @@
 //!
 //! The crate is split along the layers of RFC 4251–4254:
 //!
-//! - [`format`] — SSH wire format primitives (`mpint`, `string`, `name-list`).
+//! - [`mod@format`] — SSH wire format primitives (`mpint`, `string`, `name-list`).
 //! - [`transport`] — binary packet protocol, version exchange, KEX state machine.
 //! - [`kex`]      — key-exchange algorithms (`curve25519-sha256`, `ecdh-sha2-nistp*`).
 //! - [`cipher`]   — symmetric ciphers (`aes*-ctr`, `aes*-gcm`, `chacha20-poly1305`).
@@ -27,16 +27,16 @@
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
-pub mod error;
-pub mod format;
-pub mod transport;
-pub mod kex;
-pub mod cipher;
-pub mod mac;
-pub mod hostkey;
 pub mod auth;
 pub mod channel;
+pub mod cipher;
+pub mod error;
+pub mod format;
+pub mod hostkey;
+pub mod kex;
 pub mod key;
+pub mod mac;
+pub mod transport;
 
 #[cfg(feature = "compress")]
 pub mod compress;

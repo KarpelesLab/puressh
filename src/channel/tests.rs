@@ -1,8 +1,8 @@
 use alloc::string::ToString;
 use alloc::vec;
 
-use super::*;
 use super::msg::*;
+use super::*;
 
 fn pair() -> (ConnectionState, ConnectionState) {
     (ConnectionState::new(), ConnectionState::new())
@@ -50,13 +50,22 @@ fn open_failure_drops_channel() {
         _ => unreachable!(),
     };
     let reject = server
-        .reject_open(server_local, SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, "nope", "en")
+        .reject_open(
+            server_local,
+            SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+            "nope",
+            "en",
+        )
         .unwrap();
     assert!(server.channel(server_local).is_none());
 
     let ev = client.on_packet(&reject).unwrap();
     match ev {
-        ChannelEvent::OpenFailed { channel, reason, description } => {
+        ChannelEvent::OpenFailed {
+            channel,
+            reason,
+            description,
+        } => {
             assert_eq!(channel, client_local);
             assert_eq!(reason, SSH_OPEN_ADMINISTRATIVELY_PROHIBITED);
             assert_eq!(description, "nope");
@@ -198,11 +207,19 @@ fn channel_request_exec_round_trip() {
     let (mut client, mut server) = pair();
     let (client_local, server_local) = fully_open(&mut client, &mut server);
 
-    let req = ChannelRequest::Exec { command: "ls -la".to_string() };
-    let payload = client.send_request(client_local, req.clone(), true).unwrap();
+    let req = ChannelRequest::Exec {
+        command: "ls -la".to_string(),
+    };
+    let payload = client
+        .send_request(client_local, req.clone(), true)
+        .unwrap();
     let ev = server.on_packet(&payload).unwrap();
     match ev {
-        ChannelEvent::Request { channel, request, want_reply } => {
+        ChannelEvent::Request {
+            channel,
+            request,
+            want_reply,
+        } => {
             assert_eq!(channel, server_local);
             assert!(want_reply);
             assert_eq!(request, req);
@@ -228,10 +245,16 @@ fn channel_request_pty_round_trip() {
         px_h: 688,
         modes: vec![0x01, 0x00, 0x00, 0x00, 0x03, 0x00],
     };
-    let payload = client.send_request(client_local, req.clone(), false).unwrap();
+    let payload = client
+        .send_request(client_local, req.clone(), false)
+        .unwrap();
     let ev = server.on_packet(&payload).unwrap();
     match ev {
-        ChannelEvent::Request { channel, request, want_reply } => {
+        ChannelEvent::Request {
+            channel,
+            request,
+            want_reply,
+        } => {
             assert_eq!(channel, server_local);
             assert!(!want_reply);
             assert_eq!(request, req);
@@ -244,8 +267,12 @@ fn channel_request_pty_round_trip() {
 fn channel_request_subsystem_round_trip() {
     let (mut client, mut server) = pair();
     let (client_local, _) = fully_open(&mut client, &mut server);
-    let req = ChannelRequest::Subsystem { name: "sftp".to_string() };
-    let payload = client.send_request(client_local, req.clone(), true).unwrap();
+    let req = ChannelRequest::Subsystem {
+        name: "sftp".to_string(),
+    };
+    let payload = client
+        .send_request(client_local, req.clone(), true)
+        .unwrap();
     let ev = server.on_packet(&payload).unwrap();
     match ev {
         ChannelEvent::Request { request, .. } => assert_eq!(request, req),
@@ -310,10 +337,16 @@ fn exit_status_request() {
     let (mut client, mut server) = pair();
     let (_, server_local) = fully_open(&mut client, &mut server);
     let req = ChannelRequest::ExitStatus { code: 42 };
-    let payload = server.send_request(server_local, req.clone(), false).unwrap();
+    let payload = server
+        .send_request(server_local, req.clone(), false)
+        .unwrap();
     let ev = client.on_packet(&payload).unwrap();
     match ev {
-        ChannelEvent::Request { request, want_reply, .. } => {
+        ChannelEvent::Request {
+            request,
+            want_reply,
+            ..
+        } => {
             assert!(!want_reply);
             assert_eq!(request, req);
         }
@@ -337,7 +370,10 @@ fn exit_signal_request_round_trip() {
 
 #[test]
 fn env_request_round_trip() {
-    let req = ChannelRequest::Env { name: "LANG".to_string(), value: "C.UTF-8".to_string() };
+    let req = ChannelRequest::Env {
+        name: "LANG".to_string(),
+        value: "C.UTF-8".to_string(),
+    };
     let mut w = crate::format::Writer::new();
     req.encode(&mut w);
     let decoded = ChannelRequest::decode("env", w.as_slice()).unwrap();
@@ -346,7 +382,12 @@ fn env_request_round_trip() {
 
 #[test]
 fn window_change_request_round_trip() {
-    let req = ChannelRequest::WindowChange { cols: 80, rows: 24, px_w: 640, px_h: 384 };
+    let req = ChannelRequest::WindowChange {
+        cols: 80,
+        rows: 24,
+        px_w: 640,
+        px_h: 384,
+    };
     let mut w = crate::format::Writer::new();
     req.encode(&mut w);
     let decoded = ChannelRequest::decode("window-change", w.as_slice()).unwrap();
@@ -355,7 +396,9 @@ fn window_change_request_round_trip() {
 
 #[test]
 fn signal_request_round_trip() {
-    let req = ChannelRequest::Signal { name: "INT".to_string() };
+    let req = ChannelRequest::Signal {
+        name: "INT".to_string(),
+    };
     let mut w = crate::format::Writer::new();
     req.encode(&mut w);
     let decoded = ChannelRequest::decode("signal", w.as_slice()).unwrap();
@@ -387,7 +430,10 @@ fn global_request_tcpip_forward_round_trip() {
     let mut peer = ConnectionState::new();
     let ev = peer.on_packet(&payload).unwrap();
     match ev {
-        ChannelEvent::GlobalRequest { request, want_reply } => {
+        ChannelEvent::GlobalRequest {
+            request,
+            want_reply,
+        } => {
             assert!(want_reply);
             assert_eq!(request, req);
         }
@@ -403,7 +449,10 @@ fn global_request_keepalive_replies_failure() {
     let mut peer = ConnectionState::new();
     let ev = peer.on_packet(&payload).unwrap();
     let want_reply = match ev {
-        ChannelEvent::GlobalRequest { request, want_reply } => {
+        ChannelEvent::GlobalRequest {
+            request,
+            want_reply,
+        } => {
             assert_eq!(request, GlobalRequest::Keepalive);
             want_reply
         }

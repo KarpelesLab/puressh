@@ -19,7 +19,9 @@ impl Writer {
 
     /// Create a writer with the given capacity hint.
     pub fn with_capacity(cap: usize) -> Self {
-        Self { buf: Vec::with_capacity(cap) }
+        Self {
+            buf: Vec::with_capacity(cap),
+        }
     }
 
     /// Append raw bytes (no length prefix).

@@ -17,12 +17,8 @@ use super::message::{
 /// Callback hook for keyboard-interactive (RFC 4256).
 pub trait KeyboardInteractiveResponder: Send {
     /// Produce one response per prompt in `prompts`.
-    fn respond(
-        &mut self,
-        name: &str,
-        instruction: &str,
-        prompts: &[(String, bool)],
-    ) -> Vec<String>;
+    fn respond(&mut self, name: &str, instruction: &str, prompts: &[(String, bool)])
+        -> Vec<String>;
 }
 
 /// A credential the client offers in turn.
@@ -120,7 +116,10 @@ impl ClientAuth {
     /// Build the very first outbound payload: SERVICE_REQUEST("ssh-userauth").
     pub fn start(&mut self) -> Vec<u8> {
         self.state = State::AwaitingServiceAccept;
-        ServiceRequest { service: "ssh-userauth".into() }.encode()
+        ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode()
     }
 
     /// Process an inbound payload.
@@ -239,7 +238,9 @@ impl ClientAuth {
             self.current = None;
             Ok(ClientStep::Success)
         } else {
-            Err(Error::Protocol("auth: unexpected packet after publickey probe"))
+            Err(Error::Protocol(
+                "auth: unexpected packet after publickey probe",
+            ))
         }
     }
 
@@ -326,8 +327,7 @@ impl ClientAuth {
                     ClientCredential::KeyboardInteractive(r) => r,
                     _ => return Err(Error::Protocol("auth: kbdint reply on wrong credential")),
                 };
-                let responses =
-                    responder.respond(&info.name, &info.instruction, &info.prompts);
+                let responses = responder.respond(&info.name, &info.instruction, &info.prompts);
                 if responses.len() != info.prompts.len() {
                     return Err(Error::Protocol("auth: wrong number of kbdint responses"));
                 }
@@ -338,4 +338,3 @@ impl ClientAuth {
         }
     }
 }
-

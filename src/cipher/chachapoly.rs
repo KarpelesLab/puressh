@@ -106,12 +106,10 @@ mod tests {
     // matching this same byte layout — so we feed the bytes verbatim.
     #[test]
     fn openssh_worked_example() {
-        let key = h(
-            "8b bf f6 85  5f c1 02 33  8c 37 3e 73  aa c0 c9 14
+        let key = h("8b bf f6 85  5f c1 02 33  8c 37 3e 73  aa c0 c9 14
              f0 76 a9 05  b2 44 4a 32  ee ca ff ea  e2 2b ec c5
              e9 b7 a7 a5  82 5a 82 49  34 6e c1 c2  83 01 cf 39
-             45 43 fc 75  69 88 7d 76  e1 68 f3 75  62 ac 07 40",
-        );
+             45 43 fc 75  69 88 7d 76  e1 68 f3 75  62 ac 07 40");
         let cp = ChaChaPoly::new(&key).unwrap();
         let seq = 7u64;
 
@@ -120,22 +118,18 @@ mod tests {
         cp.xor_length(seq, &mut len_buf);
         assert_eq!(len_buf, [0x2c, 0x3e, 0xcc, 0xe4]);
 
-        let plaintext = h(
-            "06 5e 00 00  00 00 00 00  00 38 4c 6f
+        let plaintext = h("06 5e 00 00  00 00 00 00  00 38 4c 6f
              72 65 6d 20  69 70 73 75  6d 20 64 6f  6c 6f 72 20
              73 69 74 20  61 6d 65 74  2c 20 63 6f  6e 73 65 63
              74 65 74 75  72 20 61 64  69 70 69 73  69 63 69 6e
-             67 20 65 6c  69 74 4e 43  e8 04 dc 6c",
-        );
+             67 20 65 6c  69 74 4e 43  e8 04 dc 6c");
         let mut payload = plaintext.clone();
         cp.xor_payload(seq, &mut payload);
-        let expected_ct = h(
-            "a5 bc 05 89  5b f0 7a 7b  a9 56 b6 c6  88 29 ac 7c
+        let expected_ct = h("a5 bc 05 89  5b f0 7a 7b  a9 56 b6 c6  88 29 ac 7c
              83 b7 80 b7  00 0e cd e7  45 af c7 05  bb c3 78 ce
              03 a2 80 23  6b 87 b5 3b  ed 58 39 66  23 02 b1 64
              b6 28 6a 48  cd 1e 09 71  38 e3 cb 90  9b 8b 2b 82
-             9d d1 8d 2a  35 ff 82 d9",
-        );
+             9d d1 8d 2a  35 ff 82 d9");
         assert_eq!(payload, expected_ct);
 
         let tag = cp.tag(seq, &len_buf, &payload);
@@ -151,12 +145,10 @@ mod tests {
 
     #[test]
     fn bad_tag_rejected() {
-        let key = h(
-            "8b bf f6 85  5f c1 02 33  8c 37 3e 73  aa c0 c9 14
+        let key = h("8b bf f6 85  5f c1 02 33  8c 37 3e 73  aa c0 c9 14
              f0 76 a9 05  b2 44 4a 32  ee ca ff ea  e2 2b ec c5
              e9 b7 a7 a5  82 5a 82 49  34 6e c1 c2  83 01 cf 39
-             45 43 fc 75  69 88 7d 76  e1 68 f3 75  62 ac 07 40",
-        );
+             45 43 fc 75  69 88 7d 76  e1 68 f3 75  62 ac 07 40");
         let cp = ChaChaPoly::new(&key).unwrap();
         let len = [0x2c, 0x3e, 0xcc, 0xe4];
         let payload = [0u8; 16];
@@ -169,9 +161,6 @@ mod tests {
 
     #[test]
     fn bad_key_length_is_format_error() {
-        assert!(matches!(
-            ChaChaPoly::new(&[0u8; 63]),
-            Err(Error::Format(_))
-        ));
+        assert!(matches!(ChaChaPoly::new(&[0u8; 63]), Err(Error::Format(_))));
     }
 }

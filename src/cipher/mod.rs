@@ -319,10 +319,7 @@ mod tests {
     #[test]
     fn cross_kind_ops_return_unsupported() {
         let mut g = SshCipher::new("aes128-gcm@openssh.com", &[0u8; 16], &[0u8; 12]).unwrap();
-        assert!(matches!(
-            g.stream(&mut []),
-            Err(Error::Unsupported(_))
-        ));
+        assert!(matches!(g.stream(&mut []), Err(Error::Unsupported(_))));
         let mut c = SshCipher::new("aes128-ctr", &[0u8; 16], &[0u8; 16]).unwrap();
         assert!(matches!(
             c.aead_seal_len_aad(&[], &mut []),

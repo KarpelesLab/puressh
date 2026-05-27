@@ -5,8 +5,8 @@
 //! big-endian integer and incremented by one after every packet. The packet
 //! length field is transmitted in cleartext but bound to the tag as AAD.
 
-use purecrypto::cipher::{Aes128Gcm, Aes256Gcm, Gcm, TagMismatch};
 use purecrypto::cipher::{Aes128, Aes256};
+use purecrypto::cipher::{Aes128Gcm, Aes256Gcm, Gcm, TagMismatch};
 
 use crate::error::{Error, Result};
 
@@ -25,7 +25,9 @@ pub struct GcmState {
 
 impl GcmState {
     pub(crate) fn new_128(key: &[u8], iv: &[u8]) -> Result<Self> {
-        let k: &[u8; 16] = key.try_into().map_err(|_| Error::Format("aes128-gcm key len"))?;
+        let k: &[u8; 16] = key
+            .try_into()
+            .map_err(|_| Error::Format("aes128-gcm key len"))?;
         let (fixed, invocation) = split_iv(iv)?;
         Ok(GcmState {
             cipher: AesGcm::Aes128(Aes128Gcm::new(Aes128::new(k))),
@@ -35,7 +37,9 @@ impl GcmState {
     }
 
     pub(crate) fn new_256(key: &[u8], iv: &[u8]) -> Result<Self> {
-        let k: &[u8; 32] = key.try_into().map_err(|_| Error::Format("aes256-gcm key len"))?;
+        let k: &[u8; 32] = key
+            .try_into()
+            .map_err(|_| Error::Format("aes256-gcm key len"))?;
         let (fixed, invocation) = split_iv(iv)?;
         Ok(GcmState {
             cipher: AesGcm::Aes256(Aes256Gcm::new(Aes256::new(k))),
@@ -70,7 +74,9 @@ impl GcmState {
     /// Verifies `tag` and decrypts `payload` in place on success. The buffer
     /// is left as ciphertext on tag mismatch.
     pub(crate) fn open(&mut self, aad: &[u8], payload: &mut [u8], tag: &[u8]) -> Result<()> {
-        let t: &[u8; 16] = tag.try_into().map_err(|_| Error::Format("aes-gcm tag len"))?;
+        let t: &[u8; 16] = tag
+            .try_into()
+            .map_err(|_| Error::Format("aes-gcm tag len"))?;
         let nonce = self.nonce();
         let r = match &self.cipher {
             AesGcm::Aes128(g) => g.decrypt(&nonce, aad, payload, t),

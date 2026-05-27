@@ -289,7 +289,10 @@ impl KexRunner {
         }
 
         self.phase = Phase::Negotiated { client_state };
-        Ok(KexAdvance { outbound, completed: false })
+        Ok(KexAdvance {
+            outbound,
+            completed: false,
+        })
     }
 
     fn build_client_init<R: RngCore + CryptoRng>(
@@ -342,7 +345,12 @@ impl KexRunner {
         let backend = self.backend.ok_or(Error::Protocol("backend unset"))?;
         let i_c = self.peer_advert_bytes.as_deref().unwrap_or_default();
         let i_s = self.our_advert_bytes.clone();
-        let ctx = KexContext { v_c, v_s, i_c, i_s: &i_s };
+        let ctx = KexContext {
+            v_c,
+            v_s,
+            i_c,
+            i_s: &i_s,
+        };
 
         let (reply_payload, k, h) = match backend {
             KexBackend::Curve25519 => {
@@ -386,7 +394,10 @@ impl KexRunner {
         self.sent_newkeys = true;
         self.maybe_install(codec)?;
         self.advance_after_send_newkeys();
-        Ok(KexAdvance { outbound, completed: false })
+        Ok(KexAdvance {
+            outbound,
+            completed: false,
+        })
     }
 
     fn handle_kex_reply_message(
@@ -400,10 +411,17 @@ impl KexRunner {
         let backend = self.backend.ok_or(Error::Protocol("backend unset"))?;
         let i_c = self.our_advert_bytes.clone();
         let i_s = self.peer_advert_bytes.clone().unwrap_or_default();
-        let ctx = KexContext { v_c, v_s, i_c: &i_c, i_s: &i_s };
+        let ctx = KexContext {
+            v_c,
+            v_s,
+            i_c: &i_c,
+            i_s: &i_s,
+        };
 
         let state = match core::mem::replace(&mut self.phase, Phase::Idle) {
-            Phase::Negotiated { client_state: Some(s) } => s,
+            Phase::Negotiated {
+                client_state: Some(s),
+            } => s,
             _ => return Err(Error::Protocol("no client state for KEX reply")),
         };
 
@@ -443,9 +461,15 @@ impl KexRunner {
                     _ => return Err(Error::Protocol("client state type mismatch")),
                 };
                 let out = match backend {
-                    KexBackend::Dh14 => Group14Sha256::client_finish(st, payload, verifier_ref, &ctx)?,
-                    KexBackend::Dh16 => Group16Sha512::client_finish(st, payload, verifier_ref, &ctx)?,
-                    KexBackend::Dh18 => Group18Sha512::client_finish(st, payload, verifier_ref, &ctx)?,
+                    KexBackend::Dh14 => {
+                        Group14Sha256::client_finish(st, payload, verifier_ref, &ctx)?
+                    }
+                    KexBackend::Dh16 => {
+                        Group16Sha512::client_finish(st, payload, verifier_ref, &ctx)?
+                    }
+                    KexBackend::Dh18 => {
+                        Group18Sha512::client_finish(st, payload, verifier_ref, &ctx)?
+                    }
                     _ => unreachable!(),
                 };
                 (out.k, out.h)
@@ -463,7 +487,10 @@ impl KexRunner {
         self.sent_newkeys = true;
         self.maybe_install(codec)?;
         self.advance_after_send_newkeys();
-        Ok(KexAdvance { outbound, completed: false })
+        Ok(KexAdvance {
+            outbound,
+            completed: false,
+        })
     }
 
     fn advance_after_send_newkeys(&mut self) {
@@ -511,9 +538,18 @@ impl KexRunner {
             .as_ref()
             .ok_or(Error::Protocol("missing negotiation"))?;
         let backend = self.backend.ok_or(Error::Protocol("missing backend"))?;
-        let k = self.current_k.as_deref().ok_or(Error::Protocol("missing K"))?;
-        let h = self.current_h.as_deref().ok_or(Error::Protocol("missing H"))?;
-        let sid = self.session_id.as_deref().ok_or(Error::Protocol("missing session id"))?;
+        let k = self
+            .current_k
+            .as_deref()
+            .ok_or(Error::Protocol("missing K"))?;
+        let h = self
+            .current_h
+            .as_deref()
+            .ok_or(Error::Protocol("missing H"))?;
+        let sid = self
+            .session_id
+            .as_deref()
+            .ok_or(Error::Protocol("missing session id"))?;
 
         let c2s = derive_for_direction(
             backend,
@@ -549,10 +585,7 @@ fn build_cipher_mac(dir: &DirKeys) -> Result<(SshCipher, Option<Box<dyn SshMac +
     let mac = if dir.mac.is_empty() {
         None
     } else {
-        Some(
-            mac_by_name(&dir.mac, &dir.mac_key)
-                .ok_or(Error::Unsupported("MAC name"))?,
-        )
+        Some(mac_by_name(&dir.mac, &dir.mac_key).ok_or(Error::Unsupported("MAC name"))?)
     };
     Ok((cipher, mac))
 }
@@ -569,8 +602,8 @@ fn derive_for_direction(
     cipher: &str,
     mac: &str,
 ) -> Result<DirKeys> {
-    let cipher_spec = crate::cipher::by_name(cipher)
-        .ok_or(Error::Unsupported("cipher in negotiation"))?;
+    let cipher_spec =
+        crate::cipher::by_name(cipher).ok_or(Error::Unsupported("cipher in negotiation"))?;
 
     let iv = kdf(backend, k, h, sid, iv_letter, cipher_spec.iv_len);
     let key = kdf(backend, k, h, sid, key_letter, cipher_spec.key_len);
@@ -578,8 +611,7 @@ fn derive_for_direction(
     let (mac_name, mac_key) = if cipher_spec.aead {
         (String::new(), Vec::new())
     } else {
-        let mac_spec = crate::mac::by_name(mac)
-            .ok_or(Error::Unsupported("MAC in negotiation"))?;
+        let mac_spec = crate::mac::by_name(mac).ok_or(Error::Unsupported("MAC in negotiation"))?;
         let mk = kdf(backend, k, h, sid, mac_letter, mac_spec.key_len);
         (mac.to_string(), mk)
     };
@@ -595,9 +627,9 @@ fn derive_for_direction(
 
 fn kdf(backend: KexBackend, k: &[u8], h: &[u8], sid: &[u8], letter: u8, n: usize) -> Vec<u8> {
     match backend {
-        KexBackend::Curve25519
-        | KexBackend::EcdhP256
-        | KexBackend::Dh14 => derive_with::<Sha256>(k, h, sid, letter, n),
+        KexBackend::Curve25519 | KexBackend::EcdhP256 | KexBackend::Dh14 => {
+            derive_with::<Sha256>(k, h, sid, letter, n)
+        }
         KexBackend::EcdhP384 => derive_with::<Sha384>(k, h, sid, letter, n),
         KexBackend::EcdhP521 | KexBackend::Dh16 | KexBackend::Dh18 => {
             derive_with::<Sha512>(k, h, sid, letter, n)
@@ -673,7 +705,8 @@ mod tests {
         let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
 
         let mut steps = 0;
-        while !(matches!(client.phase, Phase::Completed) && matches!(server.phase, Phase::Completed))
+        while !(matches!(client.phase, Phase::Completed)
+            && matches!(server.phase, Phase::Completed))
         {
             steps += 1;
             assert!(steps < 16, "handshake did not converge in time");

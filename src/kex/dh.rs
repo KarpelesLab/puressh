@@ -8,7 +8,7 @@
 use alloc::vec::Vec;
 
 use purecrypto::bignum::BoxedUint;
-use purecrypto::dh::{DhGroup, DhPrivateKey, DhPublicKey, group14, group16, group18};
+use purecrypto::dh::{group14, group16, group18, DhGroup, DhPrivateKey, DhPublicKey};
 use purecrypto::hash::{Digest, Sha256, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
 
@@ -17,10 +17,10 @@ use super::common::{
     SSH_MSG_KEX_DH_GEX_REPLY, SSH_MSG_KEX_DH_GEX_REQUEST, SSH_MSG_KEX_ECDH_INIT,
     SSH_MSG_KEX_ECDH_REPLY,
 };
-use super::hash::{ExchangeHash, mpint_bytes};
+use super::hash::{mpint_bytes, ExchangeHash};
 use super::Kex;
 use crate::error::{Error, Result};
-use crate::format::{Reader, read_mpint};
+use crate::format::{read_mpint, Reader};
 use crate::hostkey::HostKeyVerify;
 
 /// `diffie-hellman-group14-sha256` — RFC 3526 2048-bit group, SHA-256.
@@ -84,7 +84,14 @@ fn dh_client_init<R: RngCore + CryptoRng>(
     let mut payload = Vec::with_capacity(1 + 4 + e_mag.len() + 1);
     payload.push(SSH_MSG_KEX_ECDH_INIT);
     encode_mpint_into(&mut payload, &e_mag);
-    (DhClientState { group, secret, e_mag }, KexInitOut { payload })
+    (
+        DhClientState {
+            group,
+            secret,
+            e_mag,
+        },
+        KexInitOut { payload },
+    )
 }
 
 fn encode_mpint_into(buf: &mut Vec<u8>, magnitude: &[u8]) {
@@ -121,8 +128,8 @@ where
         return Err(Error::Protocol("expected SSH_MSG_KEXDH_INIT"));
     }
     let e_raw = read_mpint(&mut r)?;
-    let peer = DhPublicKey::from_bytes(group.clone(), e_raw)
-        .map_err(|_| Error::Format("invalid DH e"))?;
+    let peer =
+        DhPublicKey::from_bytes(group.clone(), e_raw).map_err(|_| Error::Format("invalid DH e"))?;
 
     let secret = DhPrivateKey::generate(group.clone(), rng);
     let f_pub = secret.public_key();
@@ -211,9 +218,7 @@ macro_rules! dh_fixed_group_impl {
 
             /// Client side: generate `x`, compute `e = g^x mod p`, build the
             /// `SSH_MSG_KEXDH_INIT` payload.
-            pub fn client_init<R: RngCore + CryptoRng>(
-                rng: &mut R,
-            ) -> (DhClientState, KexInitOut) {
+            pub fn client_init<R: RngCore + CryptoRng>(rng: &mut R) -> (DhClientState, KexInitOut) {
                 dh_client_init($group(), rng)
             }
 
@@ -266,7 +271,11 @@ pub struct GexRequest {
 impl Default for GexRequest {
     fn default() -> Self {
         // OpenSSH defaults: 2048..=8192, preferring 8192.
-        GexRequest { min: 2048, n: 8192, max: 8192 }
+        GexRequest {
+            min: 2048,
+            n: 8192,
+            max: 8192,
+        }
     }
 }
 
@@ -366,7 +375,7 @@ impl GexSha256 {
         if bits < state.request.min as usize || bits > state.request.max as usize {
             return Err(Error::Crypto("GEX group out of requested range"));
         }
-        let priv_bits = bits.min(512).max(160);
+        let priv_bits = bits.clamp(160, 512);
         let group = DhGroup::from_custom(p, g, priv_bits)
             .map_err(|_| Error::Format("invalid GEX group"))?;
         let secret = DhPrivateKey::generate(group.clone(), rng);
@@ -527,7 +536,11 @@ mod tests {
 
     #[test]
     fn gex_request_payload_layout() {
-        let req = GexRequest { min: 1024, n: 2048, max: 8192 };
+        let req = GexRequest {
+            min: 1024,
+            n: 2048,
+            max: 8192,
+        };
         let (_state, out) = GexSha256::client_request(req);
         assert_eq!(out.payload[0], SSH_MSG_KEX_DH_GEX_REQUEST);
         assert_eq!(&out.payload[1..5], &1024u32.to_be_bytes());

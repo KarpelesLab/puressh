@@ -140,7 +140,9 @@ impl PacketCodec {
                 encode_stream(self.seq_out, payload, rng, cipher, mac.as_ref())?
             }
             CipherSlot::Gcm(cipher) => encode_gcm(payload, rng, cipher)?,
-            CipherSlot::ChaChaPoly(cipher) => encode_chachapoly(self.seq_out, payload, rng, cipher)?,
+            CipherSlot::ChaChaPoly(cipher) => {
+                encode_chachapoly(self.seq_out, payload, rng, cipher)?
+            }
         };
         self.seq_out = self.seq_out.wrapping_add(1);
         Ok(frame)
@@ -221,14 +223,14 @@ fn decode_cleartext(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     if total < MIN_TOTAL_LEN {
         return Err(Error::Protocol("packet too short"));
     }
-    if (packet_length + 4) % BLOCK_SIZE_DEFAULT as u32 != 0 {
+    if !(packet_length + 4).is_multiple_of(BLOCK_SIZE_DEFAULT as u32) {
         return Err(Error::Protocol("packet length not block-aligned"));
     }
     if buf.len() < total {
         return Ok(None);
     }
     let pad_len = buf[4] as usize;
-    if pad_len < 4 || pad_len > 255 {
+    if !(4..=255).contains(&pad_len) {
         return Err(Error::BadPadding);
     }
     let payload_end = 4 + packet_length as usize - pad_len;
@@ -302,7 +304,7 @@ fn decode_stream(
             return Err(Error::Protocol("packet length exceeds limit"));
         }
         let body_len = packet_length as usize;
-        if (body_len) % block_size != 0 {
+        if !(body_len).is_multiple_of(block_size) {
             return Err(Error::Protocol("packet body not block-aligned"));
         }
         let total = 4 + body_len + tag_len;
@@ -318,7 +320,7 @@ fn decode_stream(
         let mut body = buf[4..4 + body_len].to_vec();
         cipher.stream(&mut body)?;
         let pad_len = body[0] as usize;
-        if pad_len < 4 || pad_len > 255 {
+        if !(4..=255).contains(&pad_len) {
             return Err(Error::BadPadding);
         }
         if pad_len + 1 > body.len() {
@@ -339,13 +341,17 @@ fn decode_stream(
             b
         }
     };
-    let packet_length =
-        u32::from_be_bytes([first_block[0], first_block[1], first_block[2], first_block[3]]);
+    let packet_length = u32::from_be_bytes([
+        first_block[0],
+        first_block[1],
+        first_block[2],
+        first_block[3],
+    ]);
     if packet_length > MAX_PACKET_LEN {
         return Err(Error::Protocol("packet length exceeds limit"));
     }
     let body_len = packet_length as usize;
-    if (4 + body_len) % block_size != 0 {
+    if !(4 + body_len).is_multiple_of(block_size) {
         return Err(Error::Protocol("packet not block-aligned"));
     }
     if 4 + body_len < MIN_TOTAL_LEN {
@@ -369,7 +375,7 @@ fn decode_stream(
     mac.verify(seq, &plain, tag)?;
 
     let pad_len = plain[4] as usize;
-    if pad_len < 4 || pad_len > 255 {
+    if !(4..=255).contains(&pad_len) {
         return Err(Error::BadPadding);
     }
     if 5 + pad_len > plain.len() {
@@ -416,7 +422,7 @@ fn decode_gcm(buf: &[u8], cipher: &mut SshCipher) -> Result<Option<(Vec<u8>, usi
         return Err(Error::Protocol("packet length exceeds limit"));
     }
     let body_len = packet_length as usize;
-    if body_len % 16 != 0 {
+    if !body_len.is_multiple_of(16) {
         return Err(Error::Protocol("packet body not block-aligned"));
     }
     if 4 + body_len < MIN_TOTAL_LEN {
@@ -431,7 +437,7 @@ fn decode_gcm(buf: &[u8], cipher: &mut SshCipher) -> Result<Option<(Vec<u8>, usi
     let tag = &buf[4 + body_len..total];
     cipher.aead_open_len_aad(&length_field, &mut body, tag)?;
     let pad_len = body[0] as usize;
-    if pad_len < 4 || pad_len > 255 {
+    if !(4..=255).contains(&pad_len) {
         return Err(Error::BadPadding);
     }
     if pad_len + 1 > body.len() {
@@ -489,7 +495,7 @@ fn decode_chachapoly(
         return Err(Error::Protocol("packet length exceeds limit"));
     }
     let body_len = packet_length as usize;
-    if body_len % 8 != 0 {
+    if !body_len.is_multiple_of(8) {
         return Err(Error::Protocol("packet body not block-aligned"));
     }
     if 4 + body_len < MIN_TOTAL_LEN {
@@ -506,7 +512,7 @@ fn decode_chachapoly(
     let mut body = enc_payload.to_vec();
     cipher.cp_xor_payload(seq64, &mut body)?;
     let pad_len = body[0] as usize;
-    if pad_len < 4 || pad_len > 255 {
+    if !(4..=255).contains(&pad_len) {
         return Err(Error::BadPadding);
     }
     if pad_len + 1 > body.len() {

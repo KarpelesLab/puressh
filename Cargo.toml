@@ -1,0 +1,29 @@
+[package]
+name = "puressh"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+description = "A pure-Rust SSH (Secure Shell) protocol library, in the spirit of libssh, built on purecrypto."
+repository = "https://github.com/KarpelesLab/puressh"
+documentation = "https://docs.rs/puressh"
+readme = "README.md"
+keywords = ["ssh", "ssh2", "crypto", "network", "no-std"]
+categories = ["cryptography", "network-programming"]
+
+[features]
+default = ["std", "client", "server"]
+std = ["purecrypto/std", "alloc"]
+alloc = ["purecrypto/alloc"]
+client = []
+server = []
+
+[dependencies]
+purecrypto = { version = "0.0.7", default-features = false }
+
+[dev-dependencies]
+hex = "0.4"
+
+[lib]
+name = "puressh"
+path = "src/lib.rs"

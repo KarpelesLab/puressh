@@ -13,7 +13,9 @@ use purecrypto::der::Reader as DerReader;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::hash::{Digest, Sha256};
 use purecrypto::kdf::bcrypt_pbkdf;
-use purecrypto::rng::{CryptoRng, OsRng, RngCore};
+#[cfg(feature = "std")]
+use purecrypto::rng::OsRng;
+use purecrypto::rng::{CryptoRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 
 use super::{base64, PrivateKey, PublicKey, MAGIC};
@@ -142,20 +144,38 @@ impl PrivateKey {
         })
     }
 
-    /// Encode this key as an openssh-key-v1 PEM document. Pass `None` for an
-    /// unencrypted key; pass a non-empty passphrase to encrypt with
-    /// `aes256-ctr` keyed by `bcrypt_pbkdf`.
+    /// Encode this key as an openssh-key-v1 PEM document, using the host
+    /// `OsRng` for the checkint and (if encrypting) the bcrypt salt. Pass
+    /// `None` for an unencrypted key; pass a non-empty passphrase to encrypt
+    /// with `aes256-ctr` keyed by `bcrypt_pbkdf`.
+    ///
+    /// Available only with the `std` feature; in `no_std` builds call
+    /// [`PrivateKey::to_openssh_pem_with_rng`] and supply a `CryptoRng` of
+    /// your choice.
+    #[cfg(feature = "std")]
     pub fn to_openssh_pem(&self, passphrase: Option<&[u8]>) -> Result<String> {
+        let mut rng = OsRng;
+        self.to_openssh_pem_with_rng(&mut rng, passphrase)
+    }
+
+    /// `to_openssh_pem` variant that takes the entropy source explicitly. The
+    /// RNG drives the openssh-key-v1 checkint and, if `passphrase` is set, the
+    /// 16-byte bcrypt salt — both quantities must be unpredictable, so pass a
+    /// real `CryptoRng`.
+    pub fn to_openssh_pem_with_rng<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        passphrase: Option<&[u8]>,
+    ) -> Result<String> {
         let encrypt = matches!(passphrase, Some(p) if !p.is_empty());
         let block = if encrypt { 16 } else { 8 };
 
-        let inner = encode_inner_block(self, block);
+        let inner = encode_inner_block(rng, self, block);
         let pub_blob = self.public_key().wire_blob();
 
         let (ciphername, kdfname, kdfoptions, payload) = if encrypt {
             let pass = passphrase.expect("checked above");
             let mut salt = [0u8; SALT_LEN];
-            let mut rng = OsRng;
             rng.fill_bytes(&mut salt);
             let derived = bcrypt_pbkdf(pass, &salt, BCRYPT_ROUNDS, KEY_LEN + IV_LEN)
                 .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?;
@@ -189,8 +209,11 @@ impl PrivateKey {
     }
 }
 
-fn encode_inner_block(pk: &PrivateKey, block: usize) -> Vec<u8> {
-    let mut rng = OsRng;
+fn encode_inner_block<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    pk: &PrivateKey,
+    block: usize,
+) -> Vec<u8> {
     let mut check = [0u8; 4];
     rng.fill_bytes(&mut check);
     let checkint = u32::from_be_bytes(check);

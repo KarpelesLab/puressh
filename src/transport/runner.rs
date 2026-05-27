@@ -226,10 +226,11 @@ impl KexRunner {
     }
 
     /// Begin a re-key (RFC 4253 §9). Must be called only when the runner is
-    /// in [`Phase::Completed`]. Caches a fresh KEXINIT advert (replacing the
-    /// previous one's cookie) and emits it; the `session_id` from the first
-    /// KEX is preserved across re-keys, but every other transient field is
-    /// reset so the new exchange runs cleanly.
+    /// in the `Completed` phase (see [`KexRunner::is_completed`]). Caches a
+    /// fresh KEXINIT advert (replacing the previous one's cookie) and emits
+    /// it; the `session_id` from the first KEX is preserved across re-keys,
+    /// but every other transient field is reset so the new exchange runs
+    /// cleanly.
     pub fn restart<R: RngCore + CryptoRng>(
         &mut self,
         _rng: &mut R,

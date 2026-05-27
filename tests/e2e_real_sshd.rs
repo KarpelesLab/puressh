@@ -10,6 +10,11 @@
 //! 4. Drives puressh::client::Client through KEX → publickey auth →
 //!    `exec("echo hello-from-puressh")` and asserts the exit status and stdout.
 //! 5. Kills sshd on the way out.
+//!
+//! The whole module is `cfg(unix)`-only — the test relies on `sshd`,
+//! `ssh-keygen`, and `setsid`, none of which are available on Windows.
+
+#![cfg(unix)]
 
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;

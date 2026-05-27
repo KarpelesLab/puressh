@@ -9,9 +9,23 @@
 
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::ExitCode;
+
+/// Open a file with `create_new` semantics, applying the requested Unix mode
+/// when available. On non-Unix targets the mode is silently ignored (the
+/// filesystem lacks the bits anyway).
+fn open_create_new(path: &str, _mode: u32) -> std::io::Result<fs::File> {
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        opts.mode(_mode);
+    }
+    opts.open(path)
+}
 
 use purecrypto::rng::OsRng;
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
@@ -108,12 +122,7 @@ fn write_private(path: &str, contents: &str) -> Result<(), String> {
     if p.exists() {
         return Err(format!("{path} already exists"));
     }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| format!("open {path}: {e}"))?;
+    let mut f = open_create_new(path, 0o600).map_err(|e| format!("open {path}: {e}"))?;
     f.write_all(contents.as_bytes())
         .map_err(|e| format!("write {path}: {e}"))?;
     Ok(())
@@ -123,12 +132,7 @@ fn write_public(path: &str, contents: &str) -> Result<(), String> {
     if Path::new(path).exists() {
         return Err(format!("{path} already exists"));
     }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(path)
-        .map_err(|e| format!("open {path}: {e}"))?;
+    let mut f = open_create_new(path, 0o644).map_err(|e| format!("open {path}: {e}"))?;
     f.write_all(contents.as_bytes())
         .map_err(|e| format!("write {path}: {e}"))?;
     Ok(())
@@ -333,12 +337,7 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
         let _ = fs::remove_file(&tmp);
     }
     {
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)
-            .map_err(|e| format!("open {tmp}: {e}"))?;
+        let mut f = open_create_new(&tmp, 0o600).map_err(|e| format!("open {tmp}: {e}"))?;
         f.write_all(pem.as_bytes())
             .map_err(|e| format!("write {tmp}: {e}"))?;
     }

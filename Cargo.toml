@@ -15,8 +15,10 @@ categories = ["cryptography", "network-programming"]
 default = ["std", "client", "server", "compress"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
-client = []
-server = []
+# High-level client and server APIs depend on `std::net` / `std::io` /
+# `std::thread`, so they require the `std` feature.
+client = ["std"]
+server = ["std"]
 compress = ["dep:miniz_oxide"]
 # C ABI surface. Requires `std` and the `client` module; produces additional
 # `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
@@ -34,7 +36,13 @@ hex = "0.4"
 [lib]
 name = "puressh"
 path = "src/lib.rs"
-crate-type = ["lib", "staticlib", "cdylib"]
+# Default builds emit only the rlib. The C ABI surface (staticlib / cdylib)
+# is built explicitly via `cargo rustc --crate-type` — see the `c_abi` and
+# `release-binaries` workflows — so it isn't tied to every `cargo build`.
+# Keeping the default set to just `["lib"]` lets `cargo build` succeed in
+# no_std + alloc mode, where the C ABI artefacts would otherwise require
+# a #[panic_handler] and #[global_allocator] the library doesn't provide.
+crate-type = ["lib"]
 
 [[bin]]
 name = "ssh"

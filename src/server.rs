@@ -213,8 +213,10 @@ pub enum ChannelEgress {
 /// - On drop the stream sends `CHANNEL_EOF` followed by `CHANNEL_CLOSE`
 ///   (best-effort — silently ignored if the channel is already gone).
 pub struct ChannelStream {
-    rx: Receiver<Option<Vec<u8>>>,
-    tx: SyncSender<ChannelEgress>,
+    /// `None` after [`Self::into_raw`] has moved it out. The matching `tx`
+    /// will also be `None`, so [`Self::drop`] is a no-op.
+    rx: Option<Receiver<Option<Vec<u8>>>>,
+    tx: Option<SyncSender<ChannelEgress>>,
     buf: Vec<u8>,
     rx_eof: bool,
 }
@@ -223,8 +225,8 @@ impl ChannelStream {
     /// Used by the server dispatcher; not for user code.
     pub(crate) fn new(rx: Receiver<Option<Vec<u8>>>, tx: SyncSender<ChannelEgress>) -> Self {
         Self {
-            rx,
-            tx,
+            rx: Some(rx),
+            tx: Some(tx),
             buf: Vec::new(),
             rx_eof: false,
         }
@@ -234,9 +236,39 @@ impl ChannelStream {
     /// RFC 4254 EOF is one-directional). Most handlers don't need this —
     /// EOF and Close are sent automatically when the stream drops.
     pub fn send_eof(&mut self) -> std::io::Result<()> {
-        self.tx
-            .send(ChannelEgress::Eof)
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))?;
+        tx.send(ChannelEgress::Eof)
             .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))
+    }
+
+    /// Decompose the stream into raw mpsc handles so callers can drive
+    /// each direction from a separate thread.
+    ///
+    /// - The first return is the **ingress** receiver: bytes from the peer
+    ///   arrive as `Some(chunk)`, EOF arrives as `None`, and the dispatcher
+    ///   tearing the channel down closes the channel (returning `Err`).
+    /// - The second return is the **egress** sender. Send `Data(_)` to
+    ///   ship `CHANNEL_DATA`, then `Eof` and `Close` to tear the channel
+    ///   down cleanly.
+    ///
+    /// Unlike [`Read`]/[`Write`] on `ChannelStream`, the auto-EOF + auto-
+    /// Close on drop is **suppressed** — the caller takes responsibility
+    /// for sending those markers (typically once both copy loops finish).
+    /// This is the right primitive for splice-style proxying like
+    /// [`crate::forwarding::direct::DefaultDirectTcpipHandler`].
+    pub fn into_raw(mut self) -> (Receiver<Option<Vec<u8>>>, SyncSender<ChannelEgress>) {
+        let rx = self
+            .rx
+            .take()
+            .expect("ChannelStream::into_raw called twice");
+        let tx = self
+            .tx
+            .take()
+            .expect("ChannelStream::into_raw called twice");
+        (rx, tx)
     }
 }
 
@@ -251,7 +283,11 @@ impl Read for ChannelStream {
         if self.rx_eof {
             return Ok(0);
         }
-        match self.rx.recv() {
+        let rx = self
+            .rx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
+        match rx.recv() {
             Ok(Some(chunk)) => {
                 self.buf = chunk;
                 self.read(out)
@@ -266,12 +302,15 @@ impl Read for ChannelStream {
 
 impl Write for ChannelStream {
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let tx = self
+            .tx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
         // Cap chunks to keep per-packet payloads sane; the dispatcher will
         // split further if the remote channel-max-packet is smaller.
         let take = data.len().min(32 * 1024);
         let chunk = data[..take].to_vec();
-        self.tx
-            .send(ChannelEgress::Data(chunk))
+        tx.send(ChannelEgress::Data(chunk))
             .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))?;
         Ok(take)
     }
@@ -284,8 +323,11 @@ impl Write for ChannelStream {
 impl Drop for ChannelStream {
     fn drop(&mut self) {
         // Best-effort: ignore failures if the channel was already torn down.
-        let _ = self.tx.send(ChannelEgress::Eof);
-        let _ = self.tx.send(ChannelEgress::Close);
+        // After `into_raw` both `tx` and `rx` are None and this is a no-op.
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(ChannelEgress::Eof);
+            let _ = tx.send(ChannelEgress::Close);
+        }
     }
 }
 
@@ -327,6 +369,47 @@ pub trait SubsystemHandler: Send + Sync {
     fn handle(&self, user: &str, name: &str, stream: ChannelStream) -> Result<()>;
 }
 
+/// Decoded `direct-tcpip` channel-open request (RFC 4254 §7.2).
+///
+/// The wire fields are `string dest_host, uint32 dest_port,
+/// string orig_host, uint32 orig_port`. We deliberately surface them
+/// borrowed (`&str`) so handlers don't need to take ownership.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectTcpipRequest<'a> {
+    /// Destination hostname/IP the client wants the server to dial.
+    pub dest_host: &'a str,
+    /// Destination TCP port (carried as `u32` on the wire; in practice
+    /// always 1–65535).
+    pub dest_port: u32,
+    /// Client-supplied originating address; informational only.
+    pub orig_host: &'a str,
+    /// Client-supplied originating port.
+    pub orig_port: u32,
+}
+
+/// Server-side hook called when a client opens a `direct-tcpip` channel
+/// (used by `ssh -L LPORT:rhost:rport`).
+///
+/// The handler runs on a dedicated thread per channel. Return `Ok(())` to
+/// close the channel gracefully — the dispatcher emits EOF + Close when
+/// the stream drops, unless the handler has explicitly torn it down via
+/// [`ChannelStream::into_raw`].
+///
+/// Without a handler attached to [`Config::direct_tcpip_handler`] every
+/// `direct-tcpip` open is rejected with
+/// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`.
+pub trait DirectTcpipHandler: Send + Sync {
+    /// Bridge `request` to whatever transport the implementation wants.
+    /// The default in [`crate::forwarding::direct::DefaultDirectTcpipHandler`]
+    /// connects via TCP and splices.
+    fn handle(
+        &self,
+        user: &str,
+        request: DirectTcpipRequest<'_>,
+        stream: ChannelStream,
+    ) -> Result<()>;
+}
+
 /// Server configuration: host keys, authentication, and the exec hook.
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
@@ -347,6 +430,13 @@ pub struct Config {
     /// A typical implementation dispatches by `name` (`"sftp"`, …) and
     /// runs the protocol on the supplied [`ChannelStream`].
     pub subsystem_handler: Option<Arc<dyn SubsystemHandler>>,
+    /// Optional `direct-tcpip` hook. When `None` (the default), every
+    /// `direct-tcpip` channel open is rejected with
+    /// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`. Set this to
+    /// [`crate::forwarding::direct::DefaultDirectTcpipHandler`] (or your
+    /// own filter) to enable client-side `ssh -L` forwarding through this
+    /// server.
+    pub direct_tcpip_handler: Option<Arc<dyn DirectTcpipHandler>>,
     /// Optional callback invoked once per connection, after authentication
     /// has succeeded but before any channel request is processed. Returning
     /// `Err` aborts the connection. Typical use: drop privileges (setgid /
@@ -374,6 +464,7 @@ impl Config {
             command_handler,
             shell_handler: None,
             subsystem_handler: None,
+            direct_tcpip_handler: None,
             on_session_open: None,
             rekey_policy: RekeyPolicy::default(),
         }
@@ -392,6 +483,14 @@ impl Config {
     /// `"subsystem"` channel request is rejected.
     pub fn with_subsystem(mut self, handler: Arc<dyn SubsystemHandler>) -> Self {
         self.subsystem_handler = Some(handler);
+        self
+    }
+
+    /// Attach a `DirectTcpipHandler`. Without one, all `direct-tcpip`
+    /// channel opens (i.e. `ssh -L`) are rejected with
+    /// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`.
+    pub fn with_direct_tcpip(mut self, handler: Arc<dyn DirectTcpipHandler>) -> Self {
+        self.direct_tcpip_handler = Some(handler);
         self
     }
 
@@ -1074,6 +1173,55 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 *any_channel_opened = true;
                 let p = conn.accept_open(channel)?;
                 write_payload(stream, codec, rng, &p)?;
+            }
+            ChannelOpen::DirectTcpip {
+                dest_host,
+                dest_port,
+                orig_host,
+                orig_port,
+            } => {
+                if let Some(handler) = cfg.direct_tcpip_handler.clone() {
+                    // Accept first, then hand off to the handler thread. The
+                    // dispatcher routes subsequent Data/Eof/Close into the
+                    // SubsystemRuntime mpsc just like for subsystems.
+                    let p = conn.accept_open(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    let user_owned = user.to_string();
+                    thread::spawn(move || {
+                        let req = DirectTcpipRequest {
+                            dest_host: &dest_host,
+                            dest_port,
+                            orig_host: &orig_host,
+                            orig_port,
+                        };
+                        let _ = handler.handle(&user_owned, req, cs);
+                    });
+                    subsystems.insert(
+                        channel,
+                        SubsystemRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                } else {
+                    let p = conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "direct-tcpip not enabled",
+                        "",
+                    )?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
             }
             _ => {
                 let p = conn.reject_open(

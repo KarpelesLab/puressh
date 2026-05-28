@@ -56,6 +56,9 @@ pub mod known_hosts;
 #[cfg(all(feature = "std", unix))]
 pub mod agent;
 
+#[cfg(all(feature = "std", feature = "server"))]
+pub mod forwarding;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 

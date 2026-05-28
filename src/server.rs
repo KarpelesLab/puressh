@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -186,150 +186,7 @@ pub trait ShellSession: Send {
     fn try_exit(&mut self) -> Option<ShellExitStatus>;
 }
 
-/// Outbound message a [`SubsystemHandler`] sends through its [`ChannelStream`].
-///
-/// The connection dispatcher serializes these onto the wire as
-/// `CHANNEL_DATA` / `CHANNEL_EOF` / `CHANNEL_CLOSE` packets. Handlers don't
-/// emit `ChannelEgress` directly — they just use `Read`/`Write` on the
-/// stream, and the EOF / Close pair is sent automatically when the stream
-/// drops.
-pub enum ChannelEgress {
-    /// Bytes destined for `CHANNEL_DATA`.
-    Data(Vec<u8>),
-    /// `CHANNEL_EOF`.
-    Eof,
-    /// `CHANNEL_CLOSE`.
-    Close,
-}
-
-/// Bidirectional view of an SSH channel for use by [`SubsystemHandler`]s.
-///
-/// Behaviour:
-/// - [`Read::read`] blocks until the peer sends `CHANNEL_DATA` or `EOF`
-///   (returns `Ok(0)`).
-/// - [`Write::write`] enqueues data for the dispatcher to ship; backpressure
-///   comes from a bounded mpsc — if the remote window is full the dispatcher
-///   stops draining and the next write blocks the handler thread.
-/// - On drop the stream sends `CHANNEL_EOF` followed by `CHANNEL_CLOSE`
-///   (best-effort — silently ignored if the channel is already gone).
-pub struct ChannelStream {
-    /// `None` after [`Self::into_raw`] has moved it out. The matching `tx`
-    /// will also be `None`, so [`Self::drop`] is a no-op.
-    rx: Option<Receiver<Option<Vec<u8>>>>,
-    tx: Option<SyncSender<ChannelEgress>>,
-    buf: Vec<u8>,
-    rx_eof: bool,
-}
-
-impl ChannelStream {
-    /// Used by the server dispatcher; not for user code.
-    pub(crate) fn new(rx: Receiver<Option<Vec<u8>>>, tx: SyncSender<ChannelEgress>) -> Self {
-        Self {
-            rx: Some(rx),
-            tx: Some(tx),
-            buf: Vec::new(),
-            rx_eof: false,
-        }
-    }
-
-    /// Send an explicit EOF marker. Subsequent writes still succeed (per
-    /// RFC 4254 EOF is one-directional). Most handlers don't need this —
-    /// EOF and Close are sent automatically when the stream drops.
-    pub fn send_eof(&mut self) -> std::io::Result<()> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))?;
-        tx.send(ChannelEgress::Eof)
-            .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))
-    }
-
-    /// Decompose the stream into raw mpsc handles so callers can drive
-    /// each direction from a separate thread.
-    ///
-    /// - The first return is the **ingress** receiver: bytes from the peer
-    ///   arrive as `Some(chunk)`, EOF arrives as `None`, and the dispatcher
-    ///   tearing the channel down closes the channel (returning `Err`).
-    /// - The second return is the **egress** sender. Send `Data(_)` to
-    ///   ship `CHANNEL_DATA`, then `Eof` and `Close` to tear the channel
-    ///   down cleanly.
-    ///
-    /// Unlike [`Read`]/[`Write`] on `ChannelStream`, the auto-EOF + auto-
-    /// Close on drop is **suppressed** — the caller takes responsibility
-    /// for sending those markers (typically once both copy loops finish).
-    /// This is the right primitive for splice-style proxying like
-    /// [`crate::forwarding::direct::DefaultDirectTcpipHandler`].
-    pub fn into_raw(mut self) -> (Receiver<Option<Vec<u8>>>, SyncSender<ChannelEgress>) {
-        let rx = self
-            .rx
-            .take()
-            .expect("ChannelStream::into_raw called twice");
-        let tx = self
-            .tx
-            .take()
-            .expect("ChannelStream::into_raw called twice");
-        (rx, tx)
-    }
-}
-
-impl Read for ChannelStream {
-    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if !self.buf.is_empty() {
-            let n = out.len().min(self.buf.len());
-            out[..n].copy_from_slice(&self.buf[..n]);
-            self.buf.drain(..n);
-            return Ok(n);
-        }
-        if self.rx_eof {
-            return Ok(0);
-        }
-        let rx = self
-            .rx
-            .as_ref()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
-        match rx.recv() {
-            Ok(Some(chunk)) => {
-                self.buf = chunk;
-                self.read(out)
-            }
-            Ok(None) | Err(_) => {
-                self.rx_eof = true;
-                Ok(0)
-            }
-        }
-    }
-}
-
-impl Write for ChannelStream {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        let tx = self
-            .tx
-            .as_ref()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
-        // Cap chunks to keep per-packet payloads sane; the dispatcher will
-        // split further if the remote channel-max-packet is smaller.
-        let take = data.len().min(32 * 1024);
-        let chunk = data[..take].to_vec();
-        tx.send(ChannelEgress::Data(chunk))
-            .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))?;
-        Ok(take)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for ChannelStream {
-    fn drop(&mut self) {
-        // Best-effort: ignore failures if the channel was already torn down.
-        // After `into_raw` both `tx` and `rx` are None and this is a no-op.
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(ChannelEgress::Eof);
-            let _ = tx.send(ChannelEgress::Close);
-        }
-    }
-}
+pub use crate::stream::{ChannelEgress, ChannelStream};
 
 /// Per-channel state for an in-process subsystem (e.g. SFTP) — parallel to
 /// [`ShellRuntime`], owned by `do_connection_phase`.
@@ -410,16 +267,104 @@ pub trait DirectTcpipHandler: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Per-binding handle a [`TcpipForwardHandler`] uses to ask the per-connection
+/// server loop to open a `forwarded-tcpip` channel back to the client
+/// (RFC 4254 §7.2; the wire side of `ssh -R`).
+///
+/// One instance is supplied to each successful call to
+/// [`TcpipForwardHandler::bind`]; it stays valid for the lifetime of that
+/// binding (i.e. until [`TcpipForwardHandler::unbind`] or the connection
+/// closes). The handler's accept-loop calls
+/// [`ForwardContext::open_forwarded_tcpip`] for every accepted TCP
+/// connection on the bound port. The call blocks until the client confirms
+/// (returns a [`ChannelStream`] wired to the new channel) or rejects
+/// (returns `Err`). After that the handler is free to splice between the
+/// `TcpStream` and the `ChannelStream` until either side hangs up.
+#[derive(Clone)]
+pub struct ForwardContext {
+    /// Sender into the per-connection forward-open mpsc queue. The loop on
+    /// the receiver end translates each request into a wire-level
+    /// `SSH_MSG_CHANNEL_OPEN forwarded-tcpip` and parks a reply slot until
+    /// the matching `OPEN_CONFIRMATION` / `OPEN_FAILURE` lands.
+    req_tx: Sender<ForwardOpenRequest>,
+}
+
+/// One pending server-initiated `forwarded-tcpip` open. Carries the wire
+/// arguments and a reply slot for the resulting [`ChannelStream`].
+pub(crate) struct ForwardOpenRequest {
+    /// Address that was being listened on (per RFC 4254 §7.2 echoed back).
+    bound_address: String,
+    /// Port that was being listened on (always a u16 in practice).
+    bound_port: u32,
+    /// Originator's address (the peer of the TCP listener).
+    orig_address: String,
+    /// Originator's port.
+    orig_port: u32,
+    /// One-shot reply slot. `Ok(stream)` after `OPEN_CONFIRMATION`,
+    /// `Err(_)` after `OPEN_FAILURE` or connection teardown.
+    reply: std::sync::mpsc::SyncSender<Result<ChannelStream>>,
+}
+
+impl ForwardContext {
+    /// Used by the connection loop; not for user code.
+    pub(crate) fn new(req_tx: Sender<ForwardOpenRequest>) -> Self {
+        Self { req_tx }
+    }
+
+    /// Build a [`ForwardContext`] whose [`Self::open_forwarded_tcpip`]
+    /// calls always fail (the request mpsc has no receiver). Useful for
+    /// unit tests that only exercise `bind` / `unbind` and never dial the
+    /// listener — the accept-loop never actually has to issue an open.
+    #[doc(hidden)]
+    pub fn for_test_no_opens() -> Self {
+        // Drop the receiver immediately; the sender becomes a perpetual
+        // "send fails" sink, which `open_forwarded_tcpip` turns into
+        // `Error::Protocol`.
+        let (tx, _rx) = mpsc::channel();
+        drop(_rx);
+        Self { req_tx: tx }
+    }
+
+    /// Ask the connection loop to open a `forwarded-tcpip` channel toward
+    /// the client. Blocks until the client confirms or rejects the open.
+    ///
+    /// On success returns a [`ChannelStream`] connected to the new channel.
+    /// Drop the stream (or send EOF/Close via [`ChannelStream::into_raw`])
+    /// when the TCP side hangs up.
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the underlying SSH connection
+    /// has gone away or the client rejected the open.
+    pub fn open_forwarded_tcpip(
+        &self,
+        bound_address: &str,
+        bound_port: u16,
+        orig_address: &str,
+        orig_port: u16,
+    ) -> Result<ChannelStream> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.req_tx
+            .send(ForwardOpenRequest {
+                bound_address: bound_address.to_string(),
+                bound_port: bound_port as u32,
+                orig_address: orig_address.to_string(),
+                orig_port: orig_port as u32,
+                reply: tx,
+            })
+            .map_err(|_| Error::Protocol("forwarded-tcpip: connection closed"))?;
+        rx.recv()
+            .map_err(|_| Error::Protocol("forwarded-tcpip: reply dropped"))?
+    }
+}
+
 /// Server-side hook for `tcpip-forward` and `cancel-tcpip-forward` global
 /// requests (RFC 4254 §7.1; the inbound bookend of `ssh -R`).
 ///
-/// **Surface only in this commit.** The default implementation in
+/// The default implementation in
 /// [`crate::forwarding::reverse::DefaultTcpipForwardHandler`] binds a real
-/// TCP listener and tracks it per-connection so cancel actually unbinds.
-/// Server-initiated `forwarded-tcpip` channel-opens (one per accepted
-/// connection on the bound port) land in a follow-up commit alongside the
-/// matching client-side multi-channel dispatcher; until then connections
-/// to the bound port are accepted-and-immediately-dropped.
+/// TCP listener, tracks it per-connection so cancel actually unbinds, and
+/// — via the [`ForwardContext`] passed to `bind` — opens a server-initiated
+/// `forwarded-tcpip` channel back to the client for every accepted TCP
+/// connection.
 ///
 /// When `bind_port == 0` the handler must pick a free port and return it
 /// in `bind`; the server echoes the value back to the client as part of
@@ -427,7 +372,17 @@ pub trait DirectTcpipHandler: Send + Sync {
 pub trait TcpipForwardHandler: Send + Sync {
     /// Bind `bind_address:bind_port`. Return the actually-bound port. An
     /// `Err` causes the server to reply `REQUEST_FAILURE`.
-    fn bind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<u16>;
+    ///
+    /// `ctx` is a per-binding handle the implementation typically clones
+    /// into its accept-loop thread so it can request `forwarded-tcpip`
+    /// channel-opens back toward the client.
+    fn bind(
+        &self,
+        user: &str,
+        bind_address: &str,
+        bind_port: u16,
+        ctx: ForwardContext,
+    ) -> Result<u16>;
     /// Tear down a previously-bound listener. `Err` causes the server to
     /// reply `REQUEST_FAILURE`.
     fn unbind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<()>;
@@ -785,6 +740,63 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     Err(Error::Protocol("auth: too many steps"))
 }
 
+/// Per-connection state for server-initiated `forwarded-tcpip` channel
+/// opens (i.e. `ssh -R` traffic). The accept-loops inside
+/// [`TcpipForwardHandler`] implementations push [`ForwardOpenRequest`]s
+/// here; the connection loop drains them, emits `SSH_MSG_CHANNEL_OPEN`,
+/// and parks the reply slot in `pending_opens` until the client confirms
+/// or rejects.
+struct ForwardConn {
+    req_tx: Sender<ForwardOpenRequest>,
+    req_rx: Receiver<ForwardOpenRequest>,
+    /// Local channel id -> reply slot for that open.
+    pending_opens: BTreeMap<u32, std::sync::mpsc::SyncSender<Result<ChannelStream>>>,
+    /// `(bind_address, bind_port)` pairs we've handed to the handler, so
+    /// we can unbind them on connection teardown.
+    owned_bindings: Vec<(String, u16)>,
+}
+
+impl ForwardConn {
+    fn new() -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        Self {
+            req_tx,
+            req_rx,
+            pending_opens: BTreeMap::new(),
+            owned_bindings: Vec::new(),
+        }
+    }
+
+    /// Emit one `SSH_MSG_CHANNEL_OPEN forwarded-tcpip` per queued request,
+    /// returning early on a hard write error. Pending-reply entries land
+    /// in `self.pending_opens` keyed by the freshly-allocated local id.
+    fn drain_pending<R: RngCore + CryptoRng>(
+        &mut self,
+        stream: &mut TcpStream,
+        codec: &mut PacketCodec,
+        rng: &mut R,
+        conn: &mut ConnectionState,
+    ) -> Result<()> {
+        loop {
+            match self.req_rx.try_recv() {
+                Ok(req) => {
+                    let kind = ChannelOpen::ForwardedTcpip {
+                        dest_host: req.bound_address.clone(),
+                        dest_port: req.bound_port,
+                        orig_host: req.orig_address.clone(),
+                        orig_port: req.orig_port,
+                    };
+                    let (local_id, payload) = conn.open(kind)?;
+                    write_payload(stream, codec, rng, &payload)?;
+                    self.pending_opens.insert(local_id, req.reply);
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_connection_phase<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
@@ -813,11 +825,90 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // `shells`: same polling cadence, same dispatch routing for Data /
     // EOF / Close.
     let mut subsystems: BTreeMap<u32, SubsystemRuntime> = BTreeMap::new();
+    let mut forward = ForwardConn::new();
     let mut polling_active = false;
+    let result = do_connection_loop(
+        stream,
+        codec,
+        rng,
+        inbox,
+        cfg,
+        user,
+        runner,
+        v_c,
+        v_s,
+        last_kex,
+        rekey_policy,
+        &mut conn,
+        &mut any_channel_opened,
+        &mut steps,
+        &mut deferred,
+        &mut shells,
+        &mut subsystems,
+        &mut forward,
+        &mut polling_active,
+    );
+    // On teardown — successful or otherwise — release every binding so the
+    // TCP listener threads inside the handler exit cleanly.
+    if let Some(handler) = cfg.tcpip_forward_handler.clone() {
+        for (addr, port) in forward.owned_bindings.drain(..) {
+            let _ = handler.unbind(user, &addr, port);
+        }
+    }
+    // Cancel any in-flight forward opens.
+    for (_id, reply) in forward.pending_opens.drain_filter_compat() {
+        let _ = reply.send(Err(Error::Protocol(
+            "forwarded-tcpip: connection torn down",
+        )));
+    }
+    result
+}
 
+/// Helper trait to drain a `BTreeMap` in-place without using the unstable
+/// `BTreeMap::drain_filter` API. Yields `(key, value)` pairs in key order
+/// and empties the map.
+trait DrainFilterCompat<K, V> {
+    fn drain_filter_compat(&mut self) -> alloc::vec::IntoIter<(K, V)>;
+}
+
+impl<K: Ord + Clone, V> DrainFilterCompat<K, V> for BTreeMap<K, V> {
+    fn drain_filter_compat(&mut self) -> alloc::vec::IntoIter<(K, V)> {
+        let keys: Vec<K> = self.keys().cloned().collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(v) = self.remove(&k) {
+                out.push((k, v));
+            }
+        }
+        out.into_iter()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn do_connection_loop<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    inbox: &mut Vec<u8>,
+    cfg: &Config,
+    user: &str,
+    runner: &mut KexRunner,
+    v_c: &[u8],
+    v_s: &[u8],
+    last_kex: &mut Instant,
+    rekey_policy: &RekeyPolicy,
+    conn: &mut ConnectionState,
+    any_channel_opened: &mut bool,
+    steps: &mut usize,
+    deferred: &mut Vec<Vec<u8>>,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    forward: &mut ForwardConn,
+    polling_active: &mut bool,
+) -> Result<()> {
     loop {
-        steps += 1;
-        if steps > MAX_CONNECTION_STEPS {
+        *steps += 1;
+        if *steps > MAX_CONNECTION_STEPS {
             return Err(Error::Protocol("connection: step cap exceeded"));
         }
 
@@ -829,43 +920,48 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
                 codec,
                 rng,
                 inbox,
-                &mut conn,
+                conn,
                 cfg,
                 user,
                 &payload,
-                &mut any_channel_opened,
-                &mut shells,
-                &mut subsystems,
+                any_channel_opened,
+                shells,
+                subsystems,
+                forward,
             )?;
             continue;
         }
 
-        // Shells and subsystems become "interesting" the moment one is
-        // registered: switch the socket to a 50 ms read timeout so we can
-        // interleave their I/O with packet reads. Revert when both maps
-        // go quiet.
+        // Shells, subsystems, and live `tcpip-forward` bindings all need
+        // the loop to spin: switch the socket to a 50 ms read timeout so
+        // we can interleave their I/O with packet reads. Revert when
+        // everything goes quiet.
         let any_shell_alive = shells.values().any(|rt| rt.session.is_some());
         let any_subsystem_alive = !subsystems.is_empty();
-        let want_polling = any_shell_alive || any_subsystem_alive;
-        if want_polling && !polling_active {
+        let any_forward_alive = !forward.owned_bindings.is_empty();
+        let want_polling = any_shell_alive || any_subsystem_alive || any_forward_alive;
+        if want_polling && !*polling_active {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-            polling_active = true;
-        } else if !want_polling && polling_active {
+            *polling_active = true;
+        } else if !want_polling && *polling_active {
             let _ = stream.set_read_timeout(None);
-            polling_active = false;
+            *polling_active = false;
         }
 
-        // Drain shell stdout into CHANNEL_DATA, then send exit/EOF/CLOSE
-        // for any shell that has finished. Only when no KEX is in flight.
-        if polling_active && !runner.is_kexing() {
-            drain_shells(stream, codec, rng, &mut conn, &mut shells)?;
-            finalize_exited_shells(stream, codec, rng, &mut conn, &mut shells)?;
-            drain_subsystems(stream, codec, rng, &mut conn, &mut subsystems)?;
+        // Per-tick I/O: shell drains, subsystem egress, and any server-
+        // initiated `forwarded-tcpip` opens queued by `TcpipForwardHandler`
+        // accept-loops. Only when no KEX is in flight.
+        if *polling_active && !runner.is_kexing() {
+            drain_shells(stream, codec, rng, conn, shells)?;
+            finalize_exited_shells(stream, codec, rng, conn, shells)?;
+            drain_subsystems(stream, codec, rng, conn, subsystems)?;
+            forward.drain_pending(stream, codec, rng, conn)?;
         }
 
-        if any_channel_opened
+        if *any_channel_opened
             && !conn.channels().any(|c| !c.is_fully_closed())
             && deferred.is_empty()
+            && !any_forward_alive
         {
             return Ok(());
         }
@@ -881,7 +977,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
             }
         }
 
-        let payload = if polling_active {
+        let payload = if *polling_active {
             match read_one_packet_maybe_timeout(stream, codec, inbox)? {
                 Some(p) => p,
                 None => continue, // 50 ms tick; re-enter drain/rekey checks
@@ -931,13 +1027,14 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
             codec,
             rng,
             inbox,
-            &mut conn,
+            conn,
             cfg,
             user,
             &payload,
-            &mut any_channel_opened,
-            &mut shells,
-            &mut subsystems,
+            any_channel_opened,
+            shells,
+            subsystems,
+            forward,
         )?;
     }
 }
@@ -1205,9 +1302,52 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     any_channel_opened: &mut bool,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    forward: &mut ForwardConn,
 ) -> Result<()> {
     let ev = conn.on_packet(payload)?;
     match ev {
+        ChannelEvent::OpenConfirmed { channel } => {
+            // Server-initiated `forwarded-tcpip` open landing back. Build
+            // a fresh SubsystemRuntime + ChannelStream pair, register the
+            // runtime in `subsystems` so the existing dispatch routes
+            // Data/Eof/Close, and hand the stream to the handler thread
+            // via the reply slot. Anything else we initiated is silently
+            // ignored (no other open paths exist on the server yet).
+            if let Some(reply) = forward.pending_opens.remove(&channel) {
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                let cs = ChannelStream::new(ingress_rx, egress_tx);
+                subsystems.insert(
+                    channel,
+                    SubsystemRuntime {
+                        ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+                // Best-effort: if the requester has gone away by now,
+                // we already mapped the channel into `subsystems`; the
+                // dispatcher will tear it down when egress goes
+                // disconnected.
+                let _ = reply.send(Ok(cs));
+            }
+        }
+        ChannelEvent::OpenFailed {
+            channel,
+            reason: _reason,
+            description: _description,
+        } => {
+            if let Some(reply) = forward.pending_opens.remove(&channel) {
+                let _ = reply.send(Err(Error::Protocol(
+                    "forwarded-tcpip: open rejected by peer",
+                )));
+            }
+        }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
             ChannelOpen::Session => {
                 *any_channel_opened = true;
@@ -1351,7 +1491,9 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             request,
             want_reply,
         } => {
-            handle_global_request(stream, codec, rng, conn, cfg, user, request, want_reply)?;
+            handle_global_request(
+                stream, codec, rng, conn, cfg, user, request, want_reply, forward,
+            )?;
         }
         _ => {}
     }
@@ -1368,6 +1510,7 @@ fn handle_global_request<R: RngCore + CryptoRng>(
     user: &str,
     request: crate::channel::GlobalRequest,
     want_reply: bool,
+    forward: &mut ForwardConn,
 ) -> Result<()> {
     use crate::channel::GlobalRequest;
     use crate::format::Writer;
@@ -1381,15 +1524,22 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             let bound = if bind_port > u16::MAX as u32 {
                 None
             } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
-                handler.bind(user, &bind_address, bind_port as u16).ok()
+                let ctx = ForwardContext::new(forward.req_tx.clone());
+                handler
+                    .bind(user, &bind_address, bind_port as u16, ctx)
+                    .ok()
             } else {
                 None
             };
             if !want_reply {
+                if let Some(port) = bound {
+                    forward.owned_bindings.push((bind_address, port));
+                }
                 return Ok(());
             }
             match bound {
                 Some(port) => {
+                    forward.owned_bindings.push((bind_address, port));
                     // When the client asked for port 0 the spec requires us
                     // to echo back the assigned port as a `uint32` tail.
                     let tail = if bind_port == 0 {
@@ -1415,9 +1565,15 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             let ok = if bind_port > u16::MAX as u32 {
                 false
             } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
-                handler
+                let r = handler
                     .unbind(user, &bind_address, bind_port as u16)
-                    .is_ok()
+                    .is_ok();
+                if r {
+                    forward
+                        .owned_bindings
+                        .retain(|(a, p)| !(a == &bind_address && *p == bind_port as u16));
+                }
+                r
             } else {
                 false
             };
@@ -2929,11 +3085,16 @@ mod tests {
 
     #[test]
     fn loopback_tcpip_forward_round_trip() {
-        // Exercise the global-request bookend: client requests
-        // tcpip-forward with port=0, the server's DefaultTcpipForwardHandler
-        // binds a real listener, the assigned port comes back, the client
-        // confirms it's bindable from outside, then cancels.
+        // End-to-end exercise of the full ssh -R path:
+        //   client issues tcpip-forward → server binds a real TCP listener →
+        //   test thread dials the bound port → server opens forwarded-tcpip
+        //   back to the client → client.serve()'s on_forwarded_tcpip handler
+        //   echoes data → bytes flow both ways → handler exits → next dial
+        //   round-trips again → client cancel-tcpip-forward & stop.
+        use crate::client::{ClientHandlers, ForwardedTcpipOrigin};
+        use std::io::{Read as _, Write as _};
         use std::net::TcpStream;
+        use std::sync::atomic::Ordering;
 
         let host_seed = fresh_seed();
         let client_seed = fresh_seed();
@@ -2958,7 +3119,7 @@ mod tests {
             factory,
             vec!["publickey"],
             Arc::new(StaticHandler {
-                out: b"unused\n".to_vec(),
+                out: b"unused-exec\n".to_vec(),
             }),
         )
         .with_tcpip_forward(Arc::new(
@@ -2990,43 +3151,89 @@ mod tests {
             .authenticate_publickey(&user, client_hk)
             .expect("authenticate");
 
-        // Request port=0; server picks one and echoes it back.
-        let bound = client
+        // Ask the server to bind a kernel-assigned port on loopback.
+        let bound_port = client
             .request_tcpip_forward("127.0.0.1", 0)
-            .expect("tcpip-forward");
-        assert!(bound > 0, "server must return a real port for port=0");
+            .expect("request_tcpip_forward");
+        assert!(bound_port > 0);
 
-        // The kernel really owns that port now: a fresh client can
-        // connect to it. The stub accept-and-drop handler closes
-        // immediately, which is observable as Read returning Ok(0).
-        let mut tcp = TcpStream::connect(("127.0.0.1", bound)).expect("connect to forwarded port");
-        tcp.set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("set timeout");
-        let mut buf = [0u8; 4];
-        let n = std::io::Read::read(&mut tcp, &mut buf).expect("read");
-        assert_eq!(n, 0, "stub forward must close the accepted socket");
+        // Latch the (origin) the handler sees so the test can assert the
+        // server is echoing the right address/port back.
+        let origin_seen: Arc<Mutex<Option<ForwardedTcpipOrigin>>> = Arc::new(Mutex::new(None));
+        let origin_clone = origin_seen.clone();
 
-        // Cancel the binding. After this, a fresh connect should fail.
-        client
-            .cancel_tcpip_forward("127.0.0.1", bound)
-            .expect("cancel-tcpip-forward");
+        // Forwarded-tcpip handler: read until EOF, write back uppercased.
+        // Implemented inline so we can latch the origin too.
+        let cb: Arc<crate::client::ForwardedTcpipCallback> =
+            Arc::new(move |origin: ForwardedTcpipOrigin, mut s: ChannelStream| {
+                *origin_clone.lock().unwrap() = Some(origin);
+                let mut acc = Vec::new();
+                let mut tmp = [0u8; 256];
+                loop {
+                    match Read::read(&mut s, &mut tmp) {
+                        Ok(0) => break,
+                        Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                        Err(_) => break,
+                    }
+                }
+                for b in acc.iter_mut() {
+                    b.make_ascii_uppercase();
+                }
+                let _ = Write::write_all(&mut s, &acc);
+                // Dropping `s` sends EOF + CLOSE.
+            });
 
-        // Give the kernel a moment to actually release the port —
-        // unbind is synchronous from our side (Drop joins the worker),
-        // but TIME_WAIT-style states can linger.
-        for _ in 0..50 {
-            if TcpStream::connect_timeout(
-                &format!("127.0.0.1:{bound}").parse().unwrap(),
-                Duration::from_millis(50),
-            )
-            .is_err()
-            {
-                break;
+        let handlers = ClientHandlers::new().with_forwarded_tcpip(cb);
+        let stop = handlers.stop.clone();
+
+        // Drive `serve` in its own thread; mainline test thread plays the
+        // role of the external app dialing the forwarded port.
+        let serve_thread = thread::spawn(move || -> std::result::Result<Client, Error> {
+            // Take Client by move; this consumes our handle until serve returns.
+            client.serve(handlers)?;
+            Ok(client)
+        });
+
+        // Round-trip one connection through the forwarded port.
+        let mut s = TcpStream::connect(("127.0.0.1", bound_port)).expect("dial forwarded port");
+        s.write_all(b"hello").expect("write");
+        // Half-close so the handler's read returns Ok(0) and it writes back.
+        s.shutdown(std::net::Shutdown::Write)
+            .expect("shutdown write");
+        let mut got = Vec::new();
+        s.read_to_end(&mut got).expect("read echo");
+        assert_eq!(got, b"HELLO");
+        drop(s);
+
+        // Wait briefly for handler thread to settle / runtime to clean up.
+        thread::sleep(Duration::from_millis(100));
+
+        // Now ask serve to stop. cancel_tcpip_forward needs the client
+        // back; we just set stop and tear down by dropping the client
+        // socket from within the serve loop instead.
+        stop.store(true, Ordering::SeqCst);
+
+        // Give serve a chance to observe `stop` and exit.
+        let start = std::time::Instant::now();
+        while !serve_thread.is_finished() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("serve loop did not stop in time");
             }
             thread::sleep(Duration::from_millis(20));
         }
+        let client_back = serve_thread
+            .join()
+            .expect("serve join")
+            .expect("serve result");
 
-        drop(client);
+        // Origin assertions: the handler ran at least once with our bind addr
+        // and a non-zero originator port (the loopback connect()).
+        let captured = origin_seen.lock().unwrap().clone().expect("origin latched");
+        assert_eq!(captured.bound_address, "127.0.0.1");
+        assert_eq!(captured.bound_port, bound_port);
+        assert!(captured.orig_port > 0);
+
+        drop(client_back);
 
         let start = std::time::Instant::now();
         while !*server_done.lock().unwrap() {

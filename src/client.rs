@@ -11,10 +11,14 @@
 
 #![cfg(feature = "std")]
 
-use std::io::{Read, Write};
+use std::collections::BTreeMap;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha256};
@@ -23,11 +27,13 @@ use purecrypto::rng::{OsRng, RngCore};
 use crate::auth::{ClientAuth, ClientCredential, ClientStep};
 use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
+    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
 };
 use crate::error::{Error, Result};
 use crate::hostkey::{host_key_verify_by_name, HostKey, HostKeyVerify};
 use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
+pub use crate::stream::{ChannelEgress, ChannelStream};
 use crate::transport::kex::{defaults, KexAlgorithms};
 use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
 use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
@@ -46,6 +52,17 @@ const MAX_KEX_STEPS: usize = 32;
 const MAX_AUTH_STEPS: usize = 64;
 /// Maximum iterations for the exec drain loop.
 const MAX_EXEC_ITER: usize = 1_000_000;
+/// Cap on the per-channel egress mpsc inside [`Client::serve`]. Mirrors the
+/// server's `SUBSYSTEM_EGRESS_BACKLOG`: small enough to bound memory, large
+/// enough to absorb a few full-window writes before the handler thread has
+/// to block on its `Write::write`.
+const SERVE_EGRESS_BACKLOG: usize = 32;
+/// Outer-loop step cap for [`Client::serve`] — generous because each step is
+/// either one packet or one 50 ms timeout tick.
+const MAX_SERVE_STEPS: usize = 100_000_000;
+/// Read timeout the serve loop installs on the socket while it has at least
+/// one live channel runtime to drain. Reverts to blocking when idle.
+const SERVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 
@@ -130,6 +147,98 @@ pub struct ExecOutput {
     pub exit_status: Option<u32>,
     /// Signal name (no `SIG` prefix), if the server sent `exit-signal`.
     pub exit_signal: Option<String>,
+}
+
+/// Origin info accompanying a server-initiated `forwarded-tcpip` channel
+/// (RFC 4254 §7.2). Passed to [`ClientHandlers::on_forwarded_tcpip`] so the
+/// callback can decide which local destination to splice the channel to.
+///
+/// The `bound_*` fields echo the address+port the server is listening on
+/// (per a previous `tcpip-forward` global request); `orig_*` are the
+/// remote-side socket coordinates of the peer that just connected to it.
+#[derive(Debug, Clone)]
+pub struct ForwardedTcpipOrigin {
+    /// Address the server is listening on (typically what the client passed
+    /// to [`Client::request_tcpip_forward`]).
+    pub bound_address: String,
+    /// Port the server is listening on.
+    pub bound_port: u16,
+    /// Originating peer's address (the side that just connected to the
+    /// server's listener).
+    pub orig_address: String,
+    /// Originating peer's port.
+    pub orig_port: u16,
+}
+
+/// Type alias for the [`ClientHandlers::on_forwarded_tcpip`] callback.
+///
+/// The handler takes ownership of a fresh [`ChannelStream`] wired to the
+/// incoming channel. When it returns (or the stream drops), the channel is
+/// torn down by the serve loop. Implementations typically spawn their own
+/// thread or splice the stream against a local TCP destination — see
+/// [`crate::forwarding::reverse`] for the server-side counterpart.
+pub type ForwardedTcpipCallback =
+    dyn Fn(ForwardedTcpipOrigin, ChannelStream) + Send + Sync + 'static;
+
+/// Set of callbacks driving [`Client::serve`].
+///
+/// Each `on_*` field accepts a peer-initiated channel-open of the matching
+/// type; unset callbacks make the serve loop reject opens of that type with
+/// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`. Setting [`Self::stop`] to `true`
+/// asks the loop to exit at its next opportunity, after waiting for any
+/// channels still active to drain naturally.
+pub struct ClientHandlers {
+    /// Callback for `"forwarded-tcpip"` channel opens (RFC 4254 §7.2, the
+    /// inbound bookend of `ssh -R`). `None` ⇒ reject.
+    pub on_forwarded_tcpip: Option<Arc<ForwardedTcpipCallback>>,
+    /// Cooperative stop signal. The loop polls this flag once per tick and
+    /// returns `Ok(())` as soon as it's `true` AND no channels are open.
+    pub stop: Arc<AtomicBool>,
+}
+
+impl Default for ClientHandlers {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClientHandlers {
+    /// Build an empty handler set with all callbacks unset.
+    pub fn new() -> Self {
+        Self {
+            on_forwarded_tcpip: None,
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Install a `forwarded-tcpip` handler (`ssh -R` server-initiated opens).
+    pub fn with_forwarded_tcpip(mut self, cb: Arc<ForwardedTcpipCallback>) -> Self {
+        self.on_forwarded_tcpip = Some(cb);
+        self
+    }
+}
+
+/// Per-channel state for an in-process handler running underneath
+/// [`Client::serve`]. Parallel to the server's `SubsystemRuntime` —
+/// dispatcher-side mailbox for one open channel.
+struct ServeRuntime {
+    /// Push peer-sent bytes (or `None` for EOF) to the handler thread.
+    /// Unbounded so the dispatcher never blocks on its own dispatch path —
+    /// memory is bounded by the SSH receive window.
+    ingress_tx: Sender<Option<Vec<u8>>>,
+    /// Drain bytes the handler wants to ship out.
+    egress_rx: Receiver<ChannelEgress>,
+    /// Egress data that didn't fit in the remote window on the last tick;
+    /// re-tried before pulling more from `egress_rx`.
+    pending_data: Vec<u8>,
+    /// EOF has been pulled from the handler but not yet emitted on the wire.
+    pending_eof: bool,
+    /// Close has been pulled from the handler but not yet emitted on the wire.
+    pending_close: bool,
+    /// Whether we've already sent `CHANNEL_EOF` on the wire.
+    eof_sent: bool,
+    /// Whether we've already sent `CHANNEL_CLOSE` on the wire.
+    close_sent: bool,
 }
 
 /// A blocking SSH client.
@@ -889,6 +998,112 @@ impl Client {
         Ok(())
     }
 
+    /// Multi-channel event loop. Run after a [`Self::request_tcpip_forward`]
+    /// so server-initiated `forwarded-tcpip` channel opens land in
+    /// [`ClientHandlers::on_forwarded_tcpip`].
+    ///
+    /// The loop polls the socket with a small read timeout
+    /// (`SERVE_POLL_INTERVAL`, currently 50ms) so it can interleave wire reads
+    /// with per-channel egress draining. Returns:
+    ///
+    /// - `Ok(())` once `handlers.stop` has been set AND every accepted
+    ///   channel has been torn down (matching the server's
+    ///   `do_connection_loop` exit condition).
+    /// - `Err(Error::Protocol(_))` on protocol violation.
+    /// - `Err(Error::Io(_))` if the peer hangs up the socket.
+    ///
+    /// Channel opens whose handler is unset are rejected with
+    /// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`; unrelated channel-events
+    /// (e.g. for `direct-tcpip` channels the user opened via
+    /// [`Self::open_direct_tcpip`] before calling `serve`) are NOT
+    /// dispatched — those types own their own
+    /// [`ClientChannelStream`] which would also try to drain the socket.
+    /// In other words: while `serve` is running, no other Client method
+    /// may be used on this client.
+    pub fn serve(&mut self, handlers: ClientHandlers) -> Result<()> {
+        let mut runtimes: BTreeMap<u32, ServeRuntime> = BTreeMap::new();
+        // Always poll with a small read timeout so the loop responds to
+        // `handlers.stop` even when no channels are open (e.g. between
+        // forwarded connections). Reverted on return.
+        let _ = self.stream.set_read_timeout(Some(SERVE_POLL_INTERVAL));
+        let mut steps = 0usize;
+        let result = loop {
+            steps += 1;
+            if steps > MAX_SERVE_STEPS {
+                break Err(Error::Protocol("serve: step cap exceeded"));
+            }
+
+            // Drain deferred app payloads first (collected while a re-KEX
+            // was in flight).
+            if !self.runner.is_kexing() && !self.deferred.is_empty() {
+                let payload = self.deferred.remove(0);
+                if let Err(e) = serve_dispatch_packet(self, &handlers, &mut runtimes, &payload) {
+                    break Err(e);
+                }
+                continue;
+            }
+
+            // Per-tick: ship pending egress from each runtime onto the wire,
+            // then reap any runtime whose close has been fully emitted.
+            if !self.runner.is_kexing() {
+                if let Err(e) = serve_drain_runtimes(self, &mut runtimes) {
+                    break Err(e);
+                }
+                runtimes.retain(|_, rt| !rt.close_sent);
+            }
+
+            // Exit when caller asked us to stop AND every channel has been
+            // torn down. Without this guard a `stop` mid-handshake would
+            // leave the channel in a half-closed state on the peer.
+            if handlers.stop.load(Ordering::SeqCst) && runtimes.is_empty() {
+                break Ok(());
+            }
+
+            // RFC 4253 §9: opportunistic re-KEX. Same logic as the
+            // single-channel path; only initiate when not already KEXing.
+            if !self.runner.is_kexing()
+                && self
+                    .rekey_policy
+                    .should_rekey(&self.codec, self.last_kex, Instant::now())
+            {
+                if let Err(e) = self.initiate_rekey() {
+                    break Err(e);
+                }
+            }
+
+            let payload = match self.read_one_packet_maybe_timeout() {
+                Ok(Some(p)) => p,
+                Ok(None) => continue, // tick; re-enter drain/stop checks
+                Err(e) => break Err(e),
+            };
+            if let Err(e) = serve_dispatch_packet(self, &handlers, &mut runtimes, &payload) {
+                break Err(e);
+            }
+        };
+
+        // Cleanup: drop any remaining runtimes (closes their ingress mpsc so
+        // handler threads see EOF and exit), revert the socket timeout.
+        runtimes.clear();
+        let _ = self.stream.set_read_timeout(None);
+        result
+    }
+
+    /// Like [`Self::read_one_packet`] but returns `Ok(None)` on a read
+    /// timeout (the socket's `set_read_timeout` having elapsed) instead of
+    /// erroring. Used by [`Self::serve`] to interleave wire reads with
+    /// per-channel egress draining.
+    fn read_one_packet_maybe_timeout(&mut self) -> Result<Option<Vec<u8>>> {
+        match self.read_one_packet() {
+            Ok(p) => Ok(Some(p)),
+            Err(Error::Io(e))
+                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Block until the server answers a `GLOBAL_REQUEST` with
     /// `want_reply = true`. Returns the request-specific tail bytes
     /// (empty for requests without a payload).
@@ -1388,6 +1603,224 @@ fn build_verifier(
     }
 
     host_key_verify_by_name(&neg.host_key, k_s)
+}
+
+/// Per-tick: ship any pending egress from each [`ServeRuntime`] onto the
+/// wire. Mirror of the server's `drain_subsystems` — same window-blocking
+/// + pending-data discipline.
+fn serve_drain_runtimes(
+    client: &mut Client,
+    runtimes: &mut BTreeMap<u32, ServeRuntime>,
+) -> Result<()> {
+    let channels: Vec<u32> = runtimes.keys().copied().collect();
+    for ch in channels {
+        let Some(rt) = runtimes.get_mut(&ch) else {
+            continue;
+        };
+        if rt.close_sent {
+            continue;
+        }
+
+        // 1) Re-attempt any leftover bytes from last tick.
+        if !rt.pending_data.is_empty() {
+            let leftover = core::mem::take(&mut rt.pending_data);
+            emit_serve_data(client, ch, &leftover, rt)?;
+            if !rt.pending_data.is_empty() {
+                // Still window-blocked; skip this tick's drain entirely.
+                continue;
+            }
+        }
+
+        // 2) Pull as many egress messages as we can without blocking.
+        loop {
+            if !rt.pending_data.is_empty() {
+                break;
+            }
+            match rt.egress_rx.try_recv() {
+                Ok(ChannelEgress::Data(bytes)) => {
+                    emit_serve_data(client, ch, &bytes, rt)?;
+                }
+                Ok(ChannelEgress::Eof) => {
+                    rt.pending_eof = true;
+                    break;
+                }
+                Ok(ChannelEgress::Close) => {
+                    rt.pending_close = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Handler thread vanished without an explicit Close;
+                    // synthesise one so the channel still tears down cleanly.
+                    rt.pending_close = true;
+                    break;
+                }
+            }
+        }
+
+        // 3) Emit EOF / Close if we have them pending and all data shipped.
+        if rt.pending_data.is_empty() {
+            if rt.pending_eof && !rt.eof_sent {
+                let p = client.conn.send_eof(ch)?;
+                client.write_payload(&p)?;
+                rt.eof_sent = true;
+            }
+            if rt.pending_close && !rt.close_sent {
+                if !rt.eof_sent {
+                    let p = client.conn.send_eof(ch)?;
+                    client.write_payload(&p)?;
+                    rt.eof_sent = true;
+                }
+                let p = client.conn.send_close(ch)?;
+                client.write_payload(&p)?;
+                rt.close_sent = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ship `bytes` over `CHANNEL_DATA`, stashing anything the remote window
+/// can't accept onto `rt.pending_data` for next tick.
+fn emit_serve_data(
+    client: &mut Client,
+    channel: u32,
+    bytes: &[u8],
+    rt: &mut ServeRuntime,
+) -> Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let (payload, taken) = client.conn.send_data(channel, &bytes[off..])?;
+        if taken == 0 {
+            rt.pending_data.extend_from_slice(&bytes[off..]);
+            return Ok(());
+        }
+        client.write_payload(&payload)?;
+        off += taken;
+    }
+    Ok(())
+}
+
+/// Process one inbound app-layer packet for [`Client::serve`].
+///
+/// Mirrors the server-side `dispatch_app_packet`: routes peer-initiated
+/// channel opens to the matching [`ClientHandlers`] callback (or rejects),
+/// fans Data/Eof/Close into the matching runtime, replenishes the SSH
+/// receive window, and emits our half-close in response to peer Close.
+fn serve_dispatch_packet(
+    client: &mut Client,
+    handlers: &ClientHandlers,
+    runtimes: &mut BTreeMap<u32, ServeRuntime>,
+    payload: &[u8],
+) -> Result<()> {
+    let ev = client.conn.on_packet(payload)?;
+    match ev {
+        ChannelEvent::OpenRequest { channel, kind } => match kind {
+            ChannelOpen::ForwardedTcpip {
+                dest_host,
+                dest_port,
+                orig_host,
+                orig_port,
+            } => {
+                if let Some(cb) = handlers.on_forwarded_tcpip.clone() {
+                    let p = client.conn.accept_open(channel)?;
+                    client.write_payload(&p)?;
+
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    let origin = ForwardedTcpipOrigin {
+                        bound_address: dest_host,
+                        bound_port: clamp_u16(dest_port),
+                        orig_address: orig_host,
+                        orig_port: clamp_u16(orig_port),
+                    };
+                    thread::spawn(move || {
+                        cb(origin, cs);
+                    });
+                    runtimes.insert(
+                        channel,
+                        ServeRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                } else {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "forwarded-tcpip not enabled",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                }
+            }
+            _ => {
+                let p = client.conn.reject_open(
+                    channel,
+                    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                    "channel type not supported",
+                    "",
+                )?;
+                client.write_payload(&p)?;
+            }
+        },
+        ChannelEvent::Data { channel, data } => {
+            if let Some(rt) = runtimes.get_mut(&channel) {
+                let _ = rt.ingress_tx.send(Some(data.clone()));
+            }
+            if let Some(adj) = client.conn.replenish_window(channel, data.len() as u32)? {
+                client.write_payload(&adj)?;
+            }
+        }
+        ChannelEvent::ExtendedData { channel, data, .. } => {
+            // forwarded-tcpip channels shouldn't carry extended-data, but if
+            // we get any, just credit the window and drop the bytes.
+            if let Some(adj) = client.conn.replenish_window(channel, data.len() as u32)? {
+                client.write_payload(&adj)?;
+            }
+        }
+        ChannelEvent::Eof { channel } => {
+            if let Some(rt) = runtimes.get_mut(&channel) {
+                // None = EOF marker; the handler's `Read::read` returns
+                // `Ok(0)` next time it drains its buffer.
+                let _ = rt.ingress_tx.send(None);
+            }
+        }
+        ChannelEvent::Close { channel } => {
+            if let Some(ch) = client.conn.channel(channel) {
+                if !ch.local_closed {
+                    let p = client.conn.send_close(channel)?;
+                    client.write_payload(&p)?;
+                }
+            }
+            // Dropping the runtime closes `ingress_tx`; the handler thread's
+            // next `Read` returns `Ok(0)` and the thread exits.
+            runtimes.remove(&channel);
+        }
+        // Other events (OpenConfirmed/Failed for opens *we* initiated,
+        // Request, etc.) aren't expected on a connection that's only
+        // accepting forwarded-tcpip. Silently drop.
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Saturating cast from the wire-format u32 port to a u16. The SSH spec
+/// allows u32 but only 0..=65535 are meaningful; clamp rather than failing
+/// so the handler still gets called with a sensible value.
+fn clamp_u16(v: u32) -> u16 {
+    if v > u16::MAX as u32 {
+        u16::MAX
+    } else {
+        v as u16
+    }
 }
 
 fn read_line<S: Read>(stream: &mut S, buf: &mut Vec<u8>, max_len: usize) -> Result<()> {

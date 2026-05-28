@@ -1,5 +1,6 @@
 //! Server-side glue for `tcpip-forward` / `cancel-tcpip-forward`
-//! (RFC 4254 §7.1).
+//! (RFC 4254 §7.1) and the matching `forwarded-tcpip` channel-opens
+//! (RFC 4254 §7.2).
 //!
 //! Implements [`DefaultTcpipForwardHandler`], the in-process backing for
 //! the [`crate::server::TcpipForwardHandler`] trait. The handler:
@@ -8,31 +9,26 @@
 //!   address and port (`port == 0` picks any free port), and returns the
 //!   actually-assigned port back to the server, which echoes it to the
 //!   client per the RFC.
-//! - Spawns one *accept-and-drop* worker thread per binding. Connections
-//!   to the bound port are accepted and immediately torn down. **Bytes
-//!   are not yet proxied** — that requires server-initiated
-//!   `forwarded-tcpip` channel-opens back to the client, which lands in a
-//!   follow-up commit alongside the matching client-side multi-channel
-//!   dispatcher.
+//! - Spawns one worker thread per binding. For each accepted TCP
+//!   connection on the bound port the worker calls
+//!   [`crate::server::ForwardContext::open_forwarded_tcpip`] to ask the
+//!   per-connection server loop to open a `forwarded-tcpip` channel back
+//!   toward the client, then splices the TCP socket against the resulting
+//!   [`crate::server::ChannelStream`] in both directions until either
+//!   side hangs up.
 //! - On `unbind`, signals the worker thread to stop and drops the
 //!   listener.
-//!
-//! The accept-and-drop semantics are not a security risk on their own —
-//! the user's TCP stack would behave identically without the listener,
-//! except connections would `ECONNREFUSED` immediately. With the
-//! listener present, the kernel completes the three-way handshake and we
-//! close the socket without writing anything.
 
 use std::collections::BTreeMap;
-use std::io::ErrorKind;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+use std::io::{ErrorKind, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::server::TcpipForwardHandler;
+use crate::server::{ChannelEgress, ForwardContext, TcpipForwardHandler};
 
 /// How often the accept-loop polls the non-blocking listener while
 /// waiting for either a connection or the stop flag.
@@ -91,6 +87,75 @@ impl DefaultTcpipForwardHandler {
     }
 }
 
+/// Bridge a TCP socket against a server-side `ChannelStream`. Each
+/// direction runs on its own thread so a slow peer in one direction can't
+/// stall the other; when one direction closes we forward EOF/Close on the
+/// SSH side and shut down the TCP socket so the other thread unblocks and
+/// exits.
+fn spawn_splice(tcp: TcpStream, stream: crate::server::ChannelStream) {
+    // Peel the channel down to its raw mpsc handles so each direction can
+    // be driven independently. This also suppresses the auto-EOF/Close on
+    // drop — we emit those explicitly once the TCP→channel direction has
+    // finished, which is the canonical splice teardown.
+    let (chan_rx, chan_tx) = stream.into_raw();
+    let Ok(tcp_in) = tcp.try_clone() else {
+        // try_clone shouldn't fail on a freshly-accepted socket; if it
+        // does, give up rather than half-spliced.
+        let _ = chan_tx.send(ChannelEgress::Eof);
+        let _ = chan_tx.send(ChannelEgress::Close);
+        return;
+    };
+    let tcp_out = tcp;
+
+    // Direction A: TCP → channel.
+    let chan_tx_a = chan_tx.clone();
+    let mut tcp_in_a = tcp_in;
+    let a = thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match tcp_in_a.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if chan_tx_a
+                        .send(ChannelEgress::Data(buf[..n].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        // Local TCP side hit EOF or error — signal half-close on the SSH
+        // side. Don't send Close yet; the channel-side reader may still
+        // have bytes flowing the other way.
+        let _ = chan_tx_a.send(ChannelEgress::Eof);
+    });
+
+    // Direction B: channel → TCP.
+    let mut tcp_out_b = tcp_out;
+    let b = thread::spawn(move || {
+        while let Ok(Some(chunk)) = chan_rx.recv() {
+            if tcp_out_b.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        // Channel-side returned None (EOF) or an Err (channel torn down).
+        // Stop reading on the local TCP side so the other thread's `read`
+        // returns Ok(0) and exits.
+        let _ = tcp_out_b.shutdown(std::net::Shutdown::Read);
+    });
+
+    // Reaper: when both directions have finished, send Close to drop the
+    // channel cleanly.
+    thread::spawn(move || {
+        let _ = a.join();
+        let _ = b.join();
+        let _ = chan_tx.send(ChannelEgress::Close);
+    });
+}
+
 fn resolve_bind(bind_address: &str, port: u16) -> Result<SocketAddr> {
     // RFC 4254 §7.1: "" / "0.0.0.0" → all interfaces; "localhost" →
     // loopback; anything else must parse as a literal IP. We deliberately
@@ -115,7 +180,13 @@ fn resolve_bind(bind_address: &str, port: u16) -> Result<SocketAddr> {
 }
 
 impl TcpipForwardHandler for DefaultTcpipForwardHandler {
-    fn bind(&self, _user: &str, bind_address: &str, bind_port: u16) -> Result<u16> {
+    fn bind(
+        &self,
+        _user: &str,
+        bind_address: &str,
+        bind_port: u16,
+        ctx: ForwardContext,
+    ) -> Result<u16> {
         let addr = resolve_bind(bind_address, bind_port)?;
         let listener = TcpListener::bind(addr)?;
         let actual_port = listener.local_addr()?.port();
@@ -123,16 +194,35 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
+        let bind_address_owned = bind_address.to_string();
         let handle = thread::spawn(move || {
-            // Accept-and-drop loop. Real `forwarded-tcpip` channel-opens
-            // back to the client are deferred to a follow-up phase.
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((conn, _peer)) => {
-                        // We have nowhere to forward bytes yet. Close
-                        // cleanly so the client observes ECONNRESET
-                        // rather than a hung connection.
-                        let _ = conn.shutdown(std::net::Shutdown::Both);
+                    Ok((conn, peer)) => {
+                        // Ask the per-connection server loop to open a
+                        // `forwarded-tcpip` channel back to the client.
+                        // Blocks until OPEN_CONFIRMATION / OPEN_FAILURE
+                        // lands. If the client refuses (or the SSH
+                        // connection is gone), drop the TCP socket — the
+                        // user's app sees ECONNRESET, which matches
+                        // OpenSSH's behaviour when no listener answers.
+                        let (orig_host, orig_port) = match peer {
+                            SocketAddr::V4(a) => (a.ip().to_string(), a.port()),
+                            SocketAddr::V6(a) => (a.ip().to_string(), a.port()),
+                        };
+                        match ctx.open_forwarded_tcpip(
+                            &bind_address_owned,
+                            actual_port,
+                            &orig_host,
+                            orig_port,
+                        ) {
+                            Ok(channel_stream) => {
+                                spawn_splice(conn, channel_stream);
+                            }
+                            Err(_) => {
+                                let _ = conn.shutdown(std::net::Shutdown::Both);
+                            }
+                        }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(ACCEPT_POLL_INTERVAL);
@@ -184,15 +274,14 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::net::TcpStream;
-    use std::time::Duration;
-
     use super::*;
 
     #[test]
     fn bind_port_zero_picks_and_returns_a_port() {
         let h = DefaultTcpipForwardHandler::new();
-        let port = h.bind("u", "127.0.0.1", 0).expect("bind");
+        let port = h
+            .bind("u", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+            .expect("bind");
         assert!(port > 0, "kernel-assigned port should be non-zero");
         assert_eq!(h.binding_count(), 1);
         h.unbind("u", "127.0.0.1", port).expect("unbind");
@@ -200,27 +289,15 @@ mod tests {
     }
 
     #[test]
-    fn accepted_connection_is_immediately_closed() {
-        let h = DefaultTcpipForwardHandler::new();
-        let port = h.bind("u", "127.0.0.1", 0).expect("bind");
-        let mut tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        tcp.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
-        let mut buf = [0u8; 4];
-        // Read returns Ok(0) on a graceful peer close; that's what we
-        // expect from the accept-and-drop stub.
-        let n = std::io::Read::read(&mut tcp, &mut buf).expect("read");
-        assert_eq!(n, 0, "stub accept-and-drop should close the peer end");
-        h.unbind("u", "127.0.0.1", port).expect("unbind");
-    }
-
-    #[test]
     fn unbind_releases_the_listener_so_a_fresh_bind_succeeds() {
         let h = DefaultTcpipForwardHandler::new();
-        let port = h.bind("u", "127.0.0.1", 0).expect("first bind");
+        let port = h
+            .bind("u", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+            .expect("first bind");
         h.unbind("u", "127.0.0.1", port).expect("unbind");
         // Re-binding the *same* port (now released) must succeed.
         let again = h
-            .bind("u", "127.0.0.1", port)
+            .bind("u", "127.0.0.1", port, ForwardContext::for_test_no_opens())
             .expect("rebind released port");
         assert_eq!(again, port);
         h.unbind("u", "127.0.0.1", port).expect("final unbind");
@@ -238,6 +315,13 @@ mod tests {
         // Names that aren't literal IPs (or the documented shortcuts) get
         // refused without ever touching the network. The server then
         // turns that into REQUEST_FAILURE.
-        assert!(h.bind("u", "not-an-ip-or-name", 0).is_err());
+        assert!(h
+            .bind(
+                "u",
+                "not-an-ip-or-name",
+                0,
+                ForwardContext::for_test_no_opens(),
+            )
+            .is_err());
     }
 }

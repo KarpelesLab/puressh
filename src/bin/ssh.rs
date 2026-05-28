@@ -6,17 +6,24 @@
 //!     [-o UserKnownHostsFile=PATH]
 //!     [-o HashKnownHosts={yes,no}]
 //!     [-o IdentitiesOnly={yes,no}]
+//!     [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT]
+//!     [-N]
 //!     [user@]host [command...]
 //! ```
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use puressh::agent::{Agent, AgentHostKey};
 use puressh::auth::ClientCredential;
-use puressh::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
+use puressh::client::{
+    ChannelStream, Client, ClientHandlers, Config, ForwardedTcpipCallback, ForwardedTcpipOrigin,
+    HostKeyPolicy, KnownHostsPolicy, TofuAction,
+};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 
@@ -26,6 +33,8 @@ const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
+                     [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] \
+                     [-N] \
                      [user@]host [command...]";
 
 /// Maps `StrictHostKeyChecking` modes to TOFU behaviour.
@@ -41,6 +50,39 @@ enum StrictMode {
     Ask,
 }
 
+/// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
+/// each accepted connection becomes a `direct-tcpip` channel to the server
+/// targeting `RHOST:RPORT`.
+///
+/// Fields are currently unread because the ssh binary rejects `-L` at runtime
+/// (see `run()`): the lib's [`puressh::client::Client::open_direct_tcpip`] is
+/// single-channel-borrowing, so multi-channel `-L` from the binary needs an
+/// outbound-request side channel inside [`puressh::client::Client::serve`]. The
+/// parser is kept so command lines stay forward-compatible.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+struct LocalForward {
+    /// Local port to bind on `127.0.0.1`.
+    listen_port: u16,
+    /// Destination hostname/IP the server is asked to dial.
+    remote_host: String,
+    /// Destination TCP port.
+    remote_port: u16,
+}
+
+/// Parsed `-R RPORT:LHOST:LPORT` spec — client asks the server to bind
+/// `RPORT`; each incoming connection arrives as a `forwarded-tcpip` open
+/// which the client splices to a fresh TCP connection on `LHOST:LPORT`.
+#[derive(Clone, Debug)]
+struct RemoteForward {
+    /// Remote port the server is asked to bind on `127.0.0.1`.
+    remote_port: u16,
+    /// Local destination the client dials per accepted forward.
+    local_host: String,
+    /// Local destination TCP port.
+    local_port: u16,
+}
+
 struct Cli {
     port: u16,
     identities: Vec<String>,
@@ -49,9 +91,59 @@ struct Cli {
     known_hosts_path: Option<PathBuf>,
     hash_known_hosts: bool,
     identities_only: bool,
+    locals: Vec<LocalForward>,
+    remotes: Vec<RemoteForward>,
+    no_command: bool,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
+}
+
+/// Parse one `-L` arg value: `LPORT:RHOST:RPORT`. `RHOST` may be a bare IPv4
+/// or hostname; bracketed IPv6 (`[::1]:80`) is NOT yet supported.
+fn parse_local_forward(s: &str) -> Result<LocalForward, String> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(format!("-L expects LPORT:RHOST:RPORT, got {s:?}"));
+    }
+    let listen_port: u16 = parts[0]
+        .parse()
+        .map_err(|_| format!("-L: invalid LPORT {:?}", parts[0]))?;
+    let remote_host = parts[1].to_string();
+    if remote_host.is_empty() {
+        return Err("-L: RHOST cannot be empty".into());
+    }
+    let remote_port: u16 = parts[2]
+        .parse()
+        .map_err(|_| format!("-L: invalid RPORT {:?}", parts[2]))?;
+    Ok(LocalForward {
+        listen_port,
+        remote_host,
+        remote_port,
+    })
+}
+
+/// Parse one `-R` arg value: `RPORT:LHOST:LPORT`.
+fn parse_remote_forward(s: &str) -> Result<RemoteForward, String> {
+    let parts: Vec<&str> = s.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return Err(format!("-R expects RPORT:LHOST:LPORT, got {s:?}"));
+    }
+    let remote_port: u16 = parts[0]
+        .parse()
+        .map_err(|_| format!("-R: invalid RPORT {:?}", parts[0]))?;
+    let local_host = parts[1].to_string();
+    if local_host.is_empty() {
+        return Err("-R: LHOST cannot be empty".into());
+    }
+    let local_port: u16 = parts[2]
+        .parse()
+        .map_err(|_| format!("-R: invalid LPORT {:?}", parts[2]))?;
+    Ok(RemoteForward {
+        remote_port,
+        local_host,
+        local_port,
+    })
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -62,6 +154,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut known_hosts_path: Option<PathBuf> = None;
     let mut hash_known_hosts = false;
     let mut identities_only = false;
+    let mut locals: Vec<LocalForward> = Vec::new();
+    let mut remotes: Vec<RemoteForward> = Vec::new();
+    let mut no_command = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -86,6 +181,19 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 i += 1;
                 let v = args.get(i).ok_or("-l requires a value")?.clone();
                 cli_user = Some(v);
+            }
+            "-L" => {
+                i += 1;
+                let v = args.get(i).ok_or("-L requires a value")?;
+                locals.push(parse_local_forward(v)?);
+            }
+            "-R" => {
+                i += 1;
+                let v = args.get(i).ok_or("-R requires a value")?;
+                remotes.push(parse_remote_forward(v)?);
+            }
+            "-N" => {
+                no_command = true;
             }
             "-o" => {
                 i += 1;
@@ -151,6 +259,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         known_hosts_path,
         hash_known_hosts,
         identities_only,
+        locals,
+        remotes,
+        no_command,
         host,
         user_in_host,
         command,
@@ -402,6 +513,33 @@ fn run() -> Result<i32, String> {
             .map_err(|e| format!("Auth failed: {e}"))?;
     }
 
+    // If any port-forwarding was requested, switch over to the multi-channel
+    // serve loop instead of the single-shot exec/shell path. Mixing exec with
+    // forwarding on the same client is a follow-up — it needs an outbound-
+    // request side channel inside `Client::serve`.
+    let want_forwarding = cli.no_command || !cli.remotes.is_empty() || !cli.locals.is_empty();
+    if want_forwarding {
+        if cli.command.is_some() {
+            return Err(
+                "running a command alongside -L/-R/-N is not yet supported; \
+                        invoke ssh twice or wire the forward without a command"
+                    .into(),
+            );
+        }
+        if !cli.locals.is_empty() {
+            return Err(
+                "-L is parsed but not yet executed by the ssh binary; the lib API \
+                        Client::open_direct_tcpip works for single-channel direct-tcpip \
+                        from custom code"
+                    .into(),
+            );
+        }
+        if cli.remotes.is_empty() && cli.no_command {
+            return Err("-N requires at least one -R (or -L when wired)".into());
+        }
+        return run_forwarding(client, &cli);
+    }
+
     let command = cli
         .command
         .ok_or_else(|| "interactive shell not yet implemented".to_string())?;
@@ -410,6 +548,133 @@ fn run() -> Result<i32, String> {
     let _ = std::io::stdout().write_all(&out.stdout);
     let _ = std::io::stderr().write_all(&out.stderr);
     Ok(out.exit_status.map(|s| s as i32).unwrap_or(255))
+}
+
+/// Splice a `forwarded-tcpip` channel against a fresh outbound `TcpStream`
+/// (the local destination the user nominated with `-R RPORT:LHOST:LPORT`).
+/// Each direction runs on its own thread; when one side finishes we emit
+/// EOF/Close on the channel and `shutdown(Read)` on the TCP socket so the
+/// other thread unblocks and exits. Mirrors `forwarding::reverse::spawn_splice`
+/// but for the client side.
+fn spawn_splice_to_tcp(stream: ChannelStream, tcp: TcpStream) {
+    use puressh::client::ChannelEgress;
+    let (chan_rx, chan_tx) = stream.into_raw();
+    let tcp_in = match tcp.try_clone() {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = chan_tx.send(ChannelEgress::Eof);
+            let _ = chan_tx.send(ChannelEgress::Close);
+            return;
+        }
+    };
+    let tcp_out = tcp;
+
+    // TCP → channel.
+    let chan_tx_a = chan_tx.clone();
+    let mut tcp_in_a = tcp_in;
+    let a = thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match tcp_in_a.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if chan_tx_a
+                        .send(ChannelEgress::Data(buf[..n].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = chan_tx_a.send(ChannelEgress::Eof);
+    });
+
+    // Channel → TCP.
+    let mut tcp_out_b = tcp_out;
+    let b = thread::spawn(move || {
+        while let Ok(Some(chunk)) = chan_rx.recv() {
+            if tcp_out_b.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let _ = tcp_out_b.shutdown(std::net::Shutdown::Read);
+    });
+
+    // Reaper: emit Close once both halves are done.
+    thread::spawn(move || {
+        let _ = a.join();
+        let _ = b.join();
+        let _ = chan_tx.send(ChannelEgress::Close);
+    });
+}
+
+/// Drive the multi-channel forwarding loop: register every `-R` binding on the
+/// server, install an `on_forwarded_tcpip` callback that dials the user's
+/// local destination per accepted connection, then enter
+/// [`Client::serve`] until either the peer hangs up or the process is killed.
+///
+/// Returns an exit code matching OpenSSH's `-N -R` behaviour: 0 on a clean
+/// peer disconnect, 255 on protocol error.
+fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
+    // Map "(bound_address, bound_port) → (local_host, local_port)" so the
+    // callback can look up the right local destination for each incoming
+    // forward. The bound address echoed by the server is "127.0.0.1" since
+    // that's what we ask for below.
+    let mut routes: std::collections::BTreeMap<(String, u16), (String, u16)> =
+        std::collections::BTreeMap::new();
+    for r in &cli.remotes {
+        let bound_port = client
+            .request_tcpip_forward("127.0.0.1", r.remote_port)
+            .map_err(|e| format!("tcpip-forward 127.0.0.1:{}: {e}", r.remote_port))?;
+        eprintln!(
+            "ssh: -R 127.0.0.1:{}:{}:{} active",
+            bound_port, r.local_host, r.local_port,
+        );
+        routes.insert(
+            ("127.0.0.1".to_string(), bound_port),
+            (r.local_host.clone(), r.local_port),
+        );
+    }
+
+    let routes = Arc::new(Mutex::new(routes));
+    let routes_for_cb = Arc::clone(&routes);
+    let cb: Arc<ForwardedTcpipCallback> =
+        Arc::new(move |origin: ForwardedTcpipOrigin, stream: ChannelStream| {
+            let target = {
+                let map = match routes_for_cb.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                map.get(&(origin.bound_address.clone(), origin.bound_port))
+                    .cloned()
+            };
+            let (local_host, local_port) = match target {
+                Some(t) => t,
+                None => {
+                    eprintln!(
+                        "ssh: forwarded-tcpip for unknown binding {}:{}; dropping",
+                        origin.bound_address, origin.bound_port
+                    );
+                    return;
+                }
+            };
+            match TcpStream::connect((local_host.as_str(), local_port)) {
+                Ok(tcp) => spawn_splice_to_tcp(stream, tcp),
+                Err(e) => eprintln!(
+                    "ssh: dial {}:{} for forwarded-tcpip from {}:{}: {e}",
+                    local_host, local_port, origin.orig_address, origin.orig_port
+                ),
+            }
+        });
+
+    let handlers = ClientHandlers::new().with_forwarded_tcpip(cb);
+    match client.serve(handlers) {
+        Ok(()) => Ok(0),
+        Err(e) => Err(format!("serve: {e}")),
+    }
 }
 
 fn main() -> ExitCode {

@@ -5,6 +5,7 @@
 //!     [-o StrictHostKeyChecking={yes,no,accept-new,ask}]
 //!     [-o UserKnownHostsFile=PATH]
 //!     [-o HashKnownHosts={yes,no}]
+//!     [-o IdentitiesOnly={yes,no}]
 //!     [user@]host [command...]
 //! ```
 
@@ -13,6 +14,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
+use puressh::agent::{Agent, AgentHostKey};
 use puressh::auth::ClientCredential;
 use puressh::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
@@ -23,6 +25,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
+                     [-o IdentitiesOnly={yes,no}] \
                      [user@]host [command...]";
 
 /// Maps `StrictHostKeyChecking` modes to TOFU behaviour.
@@ -45,6 +48,7 @@ struct Cli {
     strict: StrictMode,
     known_hosts_path: Option<PathBuf>,
     hash_known_hosts: bool,
+    identities_only: bool,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -57,6 +61,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut strict = StrictMode::Ask;
     let mut known_hosts_path: Option<PathBuf> = None;
     let mut hash_known_hosts = false;
+    let mut identities_only = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -105,6 +110,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         hash_known_hosts =
                             matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
                     }
+                    "identitiesonly" => {
+                        identities_only = matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                    }
                     other => {
                         return Err(format!("unsupported -o option: {other}={val}"));
                     }
@@ -142,6 +150,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         strict,
         known_hosts_path,
         hash_known_hosts,
+        identities_only,
         host,
         user_in_host,
         command,
@@ -187,6 +196,35 @@ fn load_identity(path: &str) -> Result<PrivateKey, String> {
     let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     PrivateKey::parse_openssh_pem(&pem, None)
         .map_err(|e| format!("parse {path}: {e} (passphrase-protected keys not supported here)"))
+}
+
+/// Connect to `$SSH_AUTH_SOCK` (if set), list identities, and wrap each as a
+/// publickey credential backed by [`AgentHostKey`]. Returns `Ok(empty)` when
+/// no agent is reachable — that's an expected "no agent" state, not an
+/// error.
+fn connect_agent_credentials() -> Result<Vec<ClientCredential>, String> {
+    let agent = match Agent::connect_env().map_err(|e| format!("connect: {e}"))? {
+        Some(a) => a,
+        None => return Ok(Vec::new()),
+    };
+    let agent = Arc::new(Mutex::new(agent));
+    let identities = {
+        let mut a = agent
+            .lock()
+            .map_err(|_| "agent mutex poisoned".to_string())?;
+        a.identities().map_err(|e| format!("identities: {e}"))?
+    };
+    let mut creds: Vec<ClientCredential> = Vec::with_capacity(identities.len());
+    for ident in identities {
+        match AgentHostKey::from_identity(Arc::clone(&agent), ident.key_blob.clone()) {
+            Ok(hk) => creds.push(ClientCredential::PublicKey(Box::new(hk))),
+            Err(e) => eprintln!(
+                "warning: agent identity {:?}: skipping: {e}",
+                ident.comment()
+            ),
+        }
+    }
+    Ok(creds)
 }
 
 /// Compute the user's default known_hosts path: `$HOME/.ssh/known_hosts`.
@@ -319,34 +357,41 @@ fn run() -> Result<i32, String> {
     let mut client = Client::connect_to_host(cli.host.as_str(), cli.port, cfg)
         .map_err(|e| format!("connect: {e}"))?;
 
-    let mut authed = false;
-    if !cli.identities.is_empty() {
-        for id_path in &cli.identities {
-            let pk = match load_identity(id_path) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("warning: {e}");
-                    continue;
-                }
-            };
-            let hk = match pk.into_host_key() {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("warning: identity {id_path}: {e}");
-                    continue;
-                }
-            };
-            match client.authenticate(&user, vec![ClientCredential::PublicKey(hk)]) {
-                Ok(()) => {
-                    authed = true;
-                    break;
-                }
-                Err(e) => {
-                    eprintln!("publickey auth with {id_path}: {e}");
-                }
-            }
+    // Collect publickey credentials. Per OpenSSH default, agent identities
+    // are tried first (when `$SSH_AUTH_SOCK` is set and `IdentitiesOnly=no`),
+    // then `-i` identity files in command-line order.
+    let mut credentials: Vec<ClientCredential> = Vec::new();
+    if !cli.identities_only {
+        match connect_agent_credentials() {
+            Ok(mut from_agent) => credentials.append(&mut from_agent),
+            Err(e) => eprintln!("warning: agent: {e}"),
         }
     }
+    for id_path in &cli.identities {
+        let pk = match load_identity(id_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
+        match pk.into_host_key() {
+            Ok(hk) => credentials.push(ClientCredential::PublicKey(hk)),
+            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
+        }
+    }
+
+    let authed = if !credentials.is_empty() {
+        match client.authenticate(&user, credentials) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("publickey auth: {e}");
+                false
+            }
+        }
+    } else {
+        false
+    };
 
     if !authed {
         // v0 limitation: password input is echoed to the terminal — there is no

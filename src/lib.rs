@@ -53,6 +53,9 @@ pub mod sftp;
 #[cfg(feature = "std")]
 pub mod known_hosts;
 
+#[cfg(all(feature = "std", unix))]
+pub mod agent;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 

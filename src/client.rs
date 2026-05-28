@@ -729,7 +729,7 @@ impl Client {
     ///
     /// The returned client serialises one request/response at a time. When
     /// it's dropped, the channel is closed.
-    pub fn sftp(&mut self) -> Result<SftpClient<ClientSftpStream<'_>>> {
+    pub fn sftp(&mut self) -> Result<SftpClient<ClientChannelStream<'_>>> {
         let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
         self.write_payload(&open_payload)?;
 
@@ -760,7 +760,7 @@ impl Client {
         self.write_payload(&sub_req)?;
         self.await_request_reply(local_id, "subsystem")?;
 
-        let stream = ClientSftpStream {
+        let stream = ClientChannelStream {
             client: self,
             channel: local_id,
             read_buf: Vec::new(),
@@ -776,6 +776,59 @@ impl Client {
                 _ => "sftp: handshake failed",
             })),
         }
+    }
+
+    /// Open a `direct-tcpip` channel (RFC 4254 §7.2) that asks the server to
+    /// connect to `dest_host:dest_port` and proxy bytes. Returns a
+    /// `Read + Write` stream borrowing the client for the channel's
+    /// lifetime; dropping it closes the channel.
+    ///
+    /// `orig_host`/`orig_port` are informational (the server logs them but
+    /// makes no routing decision on them); pass `("127.0.0.1", 0)` if you
+    /// don't have a meaningful source.
+    ///
+    /// Like [`Client::sftp`] / [`Client::exec`], this is a single-channel
+    /// helper: while the returned stream is alive, the client cannot be
+    /// used for anything else. Multi-channel multiplexing comes later via
+    /// the `Client::serve` event loop.
+    pub fn open_direct_tcpip(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<ClientChannelStream<'_>> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::DirectTcpip {
+            dest_host: dest_host.to_string(),
+            dest_port: dest_port as u32,
+            orig_host: orig_host.to_string(),
+            orig_port: orig_port as u32,
+        })?;
+        self.write_payload(&open_payload)?;
+
+        let mut iter_guard = 0usize;
+        loop {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("direct-tcpip: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("direct-tcpip: open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ClientChannelStream {
+            client: self,
+            channel: local_id,
+            read_buf: Vec::new(),
+            remote_eof: false,
+            local_close_sent: false,
+        })
     }
 
     /// Block until the peer answers a single `CHANNEL_REQUEST` we sent
@@ -1006,11 +1059,13 @@ impl Client {
 
 /// Read+Write adapter wrapping a single open channel on a [`Client`],
 /// driving the underlying SSH packet loop on every `read` / `write`. Used
-/// by [`Client::sftp`] to feed [`SftpClient`] a synchronous transport.
+/// by [`Client::sftp`] to feed [`SftpClient`] a synchronous transport,
+/// and by [`Client::open_direct_tcpip`] to expose the channel as a plain
+/// byte stream.
 ///
 /// On `Drop` the channel is closed (CHANNEL_CLOSE is sent; the matching
 /// peer CLOSE is best-effort drained).
-pub struct ClientSftpStream<'a> {
+pub struct ClientChannelStream<'a> {
     client: &'a mut Client,
     channel: u32,
     read_buf: Vec<u8>,
@@ -1018,7 +1073,7 @@ pub struct ClientSftpStream<'a> {
     local_close_sent: bool,
 }
 
-impl ClientSftpStream<'_> {
+impl ClientChannelStream<'_> {
     /// Drive the SSH packet loop until either `read_buf` has bytes available
     /// or the peer closes the channel. Window-adjust packets are handled
     /// transparently; extended-data is treated as stdout (subsystems
@@ -1071,7 +1126,7 @@ impl ClientSftpStream<'_> {
     }
 }
 
-impl Read for ClientSftpStream<'_> {
+impl Read for ClientChannelStream<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1090,7 +1145,7 @@ impl Read for ClientSftpStream<'_> {
     }
 }
 
-impl Write for ClientSftpStream<'_> {
+impl Write for ClientChannelStream<'_> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -1114,7 +1169,7 @@ impl Write for ClientSftpStream<'_> {
             if self.remote_eof {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
-                    "sftp: channel closed by peer mid-write",
+                    "channel closed by peer mid-write",
                 ));
             }
             self.pump_one()?;
@@ -1127,7 +1182,7 @@ impl Write for ClientSftpStream<'_> {
     }
 }
 
-impl Drop for ClientSftpStream<'_> {
+impl Drop for ClientChannelStream<'_> {
     fn drop(&mut self) {
         // Best-effort tear-down: send EOF + CLOSE, then drain a few packets
         // so the peer's matching CLOSE doesn't get stranded in the inbox.

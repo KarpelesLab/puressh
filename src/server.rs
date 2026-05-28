@@ -2608,4 +2608,197 @@ mod tests {
         }
         let _ = server_thread.join();
     }
+
+    #[test]
+    fn loopback_direct_tcpip_round_trip() {
+        // End-to-end exercise of the direct-tcpip server-side path:
+        //   client opens direct-tcpip channel → server connects to a local
+        //   TCP echo server via DefaultDirectTcpipHandler → bytes flow both
+        //   ways → client drops the stream which closes the channel.
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        // 1) Local TCP echo server — the "destination" the SSH client wants
+        //    the server to dial.
+        let echo_listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
+        let echo_addr = echo_listener.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            if let Ok((mut s, _)) = echo_listener.accept() {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2) SSH server with DefaultDirectTcpipHandler attached.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "direct-tcpip-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused-exec\n".to_vec(),
+            }),
+        )
+        .with_direct_tcpip(Arc::new(
+            crate::forwarding::direct::DefaultDirectTcpipHandler::new(),
+        ));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
+        let ssh_addr = server.local_addr().expect("ssh addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        // 3) SSH client opens direct-tcpip and round-trips bytes through it.
+        let mut client = Client::connect(
+            ssh_addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        {
+            let mut s = client
+                .open_direct_tcpip(
+                    &echo_addr.ip().to_string(),
+                    echo_addr.port(),
+                    "127.0.0.1",
+                    0,
+                )
+                .expect("open direct-tcpip");
+            s.write_all(b"ping").expect("write");
+            let mut got = [0u8; 4];
+            s.read_exact(&mut got).expect("read echo");
+            assert_eq!(&got, b"ping");
+            // Dropping `s` closes the channel.
+        }
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+        let _ = echo_thread.join();
+    }
+
+    #[test]
+    fn loopback_direct_tcpip_unconfigured_refused() {
+        // Without a direct_tcpip_handler attached the channel-open must be
+        // rejected with SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, surfaced to
+        // the client as a protocol error.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "direct-tcpip-reject-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused\n".to_vec(),
+            }),
+        );
+        // Deliberately do NOT call with_direct_tcpip.
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        // `ClientChannelStream` isn't `Debug`, so we can't use `expect_err`
+        // — branch on the result manually.
+        match client.open_direct_tcpip("127.0.0.1", 1, "127.0.0.1", 0) {
+            Ok(_) => panic!("expected direct-tcpip open to be refused"),
+            Err(Error::Protocol(_)) => {}
+            Err(other) => panic!("expected Error::Protocol, got {:?}", other),
+        }
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
 }

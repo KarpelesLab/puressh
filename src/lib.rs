@@ -47,6 +47,9 @@ pub mod client;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(feature = "std")]
+pub mod sftp;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 

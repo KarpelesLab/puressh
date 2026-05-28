@@ -12,7 +12,7 @@
 //! ```
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -21,6 +21,7 @@ use std::thread;
 use puressh::auth::ClientCredential;
 use puressh::client::{
     ChannelStream, Client, ClientHandlers, Config, ForwardedTcpipCallback, ForwardedTcpipOrigin,
+    ServeContext,
 };
 
 #[path = "common.rs"]
@@ -42,15 +43,9 @@ const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
 
 /// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
 /// each accepted connection becomes a `direct-tcpip` channel to the server
-/// targeting `RHOST:RPORT`.
-///
-/// Fields are currently unread because the ssh binary rejects `-L` at runtime
-/// (see `run()`): the lib's [`puressh::client::Client::open_direct_tcpip`] is
-/// single-channel-borrowing, so multi-channel `-L` from the binary needs an
-/// outbound-request side channel inside [`puressh::client::Client::serve`]. The
-/// parser is kept so command lines stay forward-compatible.
+/// targeting `RHOST:RPORT`. Each forward gets a dedicated accept thread
+/// that drives [`ServeContext::open_direct_tcpip`] per connection.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 struct LocalForward {
     /// Local port to bind on `127.0.0.1`.
     listen_port: u16,
@@ -336,8 +331,8 @@ fn run() -> Result<i32, String> {
 
     // If any port-forwarding was requested, switch over to the multi-channel
     // serve loop instead of the single-shot exec/shell path. Mixing exec with
-    // forwarding on the same client is a follow-up — it needs an outbound-
-    // request side channel inside `Client::serve`.
+    // forwarding on the same client is a follow-up — it needs the serve loop
+    // to also drive a session channel concurrently.
     let want_forwarding = cli.no_command || !cli.remotes.is_empty() || !cli.locals.is_empty();
     if want_forwarding {
         if cli.command.is_some() {
@@ -347,16 +342,8 @@ fn run() -> Result<i32, String> {
                     .into(),
             );
         }
-        if !cli.locals.is_empty() {
-            return Err(
-                "-L is parsed but not yet executed by the ssh binary; the lib API \
-                        Client::open_direct_tcpip works for single-channel direct-tcpip \
-                        from custom code"
-                    .into(),
-            );
-        }
-        if cli.remotes.is_empty() && cli.no_command {
-            return Err("-N requires at least one -R (or -L when wired)".into());
+        if cli.no_command && cli.remotes.is_empty() && cli.locals.is_empty() {
+            return Err("-N requires at least one -L or -R".into());
         }
         return run_forwarding(client, &cli);
     }
@@ -491,11 +478,74 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
             }
         });
 
-    let handlers = ClientHandlers::new().with_forwarded_tcpip(cb);
-    match client.serve(handlers) {
+    let mut handlers = ClientHandlers::new().with_forwarded_tcpip(cb);
+
+    // -L: bind every configured local-forward listener and hand each one a
+    // clone of the ServeContext so its accept thread can open `direct-tcpip`
+    // through the running serve loop.
+    let ctx_opt: Option<ServeContext> = if cli.locals.is_empty() {
+        None
+    } else {
+        let (h, ctx) = handlers.with_serve_context();
+        handlers = h;
+        for l in &cli.locals {
+            let listener = TcpListener::bind(("127.0.0.1", l.listen_port))
+                .map_err(|e| format!("-L bind 127.0.0.1:{}: {e}", l.listen_port))?;
+            eprintln!(
+                "ssh: -L 127.0.0.1:{}:{}:{} active",
+                l.listen_port, l.remote_host, l.remote_port,
+            );
+            spawn_local_forward_listener(listener, l.clone(), ctx.clone());
+        }
+        Some(ctx)
+    };
+
+    let result = match client.serve(handlers) {
         Ok(()) => Ok(0),
         Err(e) => Err(format!("serve: {e}")),
-    }
+    };
+    // Hold the original ctx until serve returns so cmd_tx isn't dropped
+    // (the listener threads keep their clones, so this is belt-and-braces).
+    drop(ctx_opt);
+    result
+}
+
+/// Per-`-L` accept loop. Each accepted TCP connection becomes one
+/// `direct-tcpip` channel via the serve loop; we then splice the channel
+/// stream against the TCP socket in both directions until either side
+/// closes.
+///
+/// Mirrors [`spawn_splice_to_tcp`] but for the outbound side: there's no
+/// `forwarded-tcpip` channel; instead we wait for [`ServeContext::open_direct_tcpip`]
+/// to return the freshly-opened [`ChannelStream`] before splicing.
+fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: ServeContext) {
+    thread::spawn(move || {
+        for accept in listener.incoming() {
+            let tcp = match accept {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ssh: -L accept on 127.0.0.1:{}: {e}", spec.listen_port);
+                    continue;
+                }
+            };
+            let orig = tcp
+                .peer_addr()
+                .map(|a| (a.ip().to_string(), a.port()))
+                .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
+            let stream =
+                match ctx.open_direct_tcpip(&spec.remote_host, spec.remote_port, &orig.0, orig.1) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!(
+                            "ssh: -L direct-tcpip {}:{}: {e}",
+                            spec.remote_host, spec.remote_port
+                        );
+                        continue;
+                    }
+                };
+            spawn_splice_to_tcp(stream, tcp);
+        }
+    });
 }
 
 fn main() -> ExitCode {

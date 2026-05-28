@@ -3415,4 +3415,145 @@ mod tests {
         }
         let _ = server_thread.join();
     }
+
+    #[test]
+    fn loopback_serve_context_direct_tcpip_round_trip() {
+        // End-to-end exercise of the outbound side of the multi-channel
+        // serve loop (the path that backs `ssh -L`):
+        //   client.serve() runs in a thread → test thread asks ServeContext
+        //   for a direct-tcpip → server's DefaultDirectTcpipHandler dials a
+        //   local echo server → bytes round-trip → stream drop tears the
+        //   channel down → stop flag set → serve returns.
+        use crate::client::ClientHandlers;
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::Ordering;
+
+        // 1) Echo destination.
+        let echo_listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
+        let echo_addr = echo_listener.local_addr().expect("echo addr");
+        let echo_thread = thread::spawn(move || {
+            if let Ok((mut s, _)) = echo_listener.accept() {
+                let mut buf = [0u8; 1024];
+                loop {
+                    match s.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if s.write_all(&buf[..n]).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // 2) SSH server with direct-tcpip enabled.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "serve-ctx-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused\n".to_vec(),
+            }),
+        )
+        .with_direct_tcpip(Arc::new(
+            crate::forwarding::direct::DefaultDirectTcpipHandler::new(),
+        ));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
+        let ssh_addr = server.local_addr().expect("ssh addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        // 3) SSH client connects + auths.
+        let mut client = Client::connect(
+            ssh_addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        // 4) Build handlers with a ServeContext + drive serve() in a thread.
+        let (handlers, ctx) = ClientHandlers::new().with_serve_context();
+        let stop = handlers.stop.clone();
+        let serve_thread = thread::spawn(move || -> std::result::Result<Client, Error> {
+            client.serve(handlers)?;
+            Ok(client)
+        });
+
+        // 5) Open a direct-tcpip via the context and round-trip bytes.
+        let mut s = ctx
+            .open_direct_tcpip(
+                &echo_addr.ip().to_string(),
+                echo_addr.port(),
+                "127.0.0.1",
+                0,
+            )
+            .expect("open_direct_tcpip via ServeContext");
+        s.write_all(b"ping").expect("write ping");
+        let mut got = [0u8; 4];
+        s.read_exact(&mut got).expect("read echo");
+        assert_eq!(&got, b"ping");
+        drop(s);
+
+        // Wait for the channel teardown to settle.
+        thread::sleep(Duration::from_millis(100));
+
+        // 6) Ask serve to stop. The ServeContext drop releases the cmd_tx.
+        drop(ctx);
+        stop.store(true, Ordering::SeqCst);
+
+        let start = std::time::Instant::now();
+        while !serve_thread.is_finished() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("serve loop did not stop in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let client_back = serve_thread
+            .join()
+            .expect("serve join")
+            .expect("serve result");
+        drop(client_back);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+        let _ = echo_thread.join();
+    }
 }

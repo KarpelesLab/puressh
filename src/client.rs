@@ -194,6 +194,11 @@ pub struct ClientHandlers {
     /// Cooperative stop signal. The loop polls this flag once per tick and
     /// returns `Ok(())` as soon as it's `true` AND no channels are open.
     pub stop: Arc<AtomicBool>,
+    /// Inbound command channel — external threads (e.g. an `ssh -L`
+    /// listener) push [`ServeCommand`]s here to ask the serve loop to open
+    /// outbound channels. `None` when the loop has no associated
+    /// [`ServeContext`]; the loop simply doesn't poll for outbound opens.
+    cmd_rx: Option<Receiver<ServeCommand>>,
 }
 
 impl Default for ClientHandlers {
@@ -208,6 +213,7 @@ impl ClientHandlers {
         Self {
             on_forwarded_tcpip: None,
             stop: Arc::new(AtomicBool::new(false)),
+            cmd_rx: None,
         }
     }
 
@@ -216,6 +222,100 @@ impl ClientHandlers {
         self.on_forwarded_tcpip = Some(cb);
         self
     }
+
+    /// Attach an outbound-command receiver and hand back a paired
+    /// [`ServeContext`] that external threads can clone to request
+    /// `direct-tcpip` opens against the running serve loop. Used by
+    /// `ssh -L`'s per-listener accept thread.
+    pub fn with_serve_context(mut self) -> (Self, ServeContext) {
+        let (tx, rx) = mpsc::channel();
+        self.cmd_rx = Some(rx);
+        (self, ServeContext { cmd_tx: tx })
+    }
+}
+
+/// Command an external thread sends to [`Client::serve`] via a
+/// [`ServeContext`]. Currently the only variant is outbound `direct-tcpip`
+/// open; future ones (e.g. agent-channel open for Phase 8) plug in the same
+/// way.
+pub enum ServeCommand {
+    /// Open a `direct-tcpip` channel; on confirmation, send the resulting
+    /// [`ChannelStream`] back through `reply`. On peer rejection, send
+    /// `Err`.
+    OpenDirectTcpip {
+        /// Where the *server* should connect to (the `dest_host:dest_port`
+        /// pair on the wire). For `ssh -L LPORT:RHOST:RPORT`, this is
+        /// `RHOST:RPORT`.
+        dest_host: String,
+        /// Destination port the server should dial.
+        dest_port: u16,
+        /// Informational source-address echoed in the open. For
+        /// `ssh -L`-style use, the client's accept address (e.g.
+        /// `127.0.0.1`).
+        orig_host: String,
+        /// Informational source-port echoed in the open.
+        orig_port: u16,
+        /// Where to deliver the open's outcome — `Ok(stream)` on
+        /// `OpenConfirmed`, `Err` on `OpenFailed` or loop teardown.
+        reply: mpsc::SyncSender<Result<ChannelStream>>,
+    },
+}
+
+/// Handle external threads use to drive the running [`Client::serve`] loop.
+///
+/// Returned by [`ClientHandlers::with_serve_context`] and cloned freely
+/// across the listener / accept threads that need to open outbound
+/// `direct-tcpip` channels (`ssh -L`).
+#[derive(Clone)]
+pub struct ServeContext {
+    cmd_tx: Sender<ServeCommand>,
+}
+
+impl ServeContext {
+    /// Request a `direct-tcpip` channel from inside a running serve loop
+    /// and block until the peer either confirms or rejects. Mirrors
+    /// [`Client::open_direct_tcpip`] but works while `serve` is driving
+    /// the socket — there's no other way to interleave the open with
+    /// inbound traffic on the same client.
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the serve loop has already
+    /// returned (the receiver hung up).
+    pub fn open_direct_tcpip(
+        &self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<ChannelStream> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<ChannelStream>>(1);
+        self.cmd_tx
+            .send(ServeCommand::OpenDirectTcpip {
+                dest_host: dest_host.to_string(),
+                dest_port,
+                orig_host: orig_host.to_string(),
+                orig_port,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::Protocol("serve loop terminated"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| Error::Protocol("serve loop terminated"))?
+    }
+}
+
+/// Per-channel state for an outbound channel open we've asked the serve
+/// loop to drive: waiting for `OpenConfirmed` / `OpenFailed`.
+struct PendingOutboundOpen {
+    /// Pre-built stream handed to the caller on `OpenConfirmed`.
+    stream: Option<ChannelStream>,
+    /// Pre-built ingress sender; moves into the [`ServeRuntime`] on
+    /// `OpenConfirmed`.
+    ingress_tx: Sender<Option<Vec<u8>>>,
+    /// Pre-built egress receiver; moves into the [`ServeRuntime`] on
+    /// `OpenConfirmed`.
+    egress_rx: Option<Receiver<ChannelEgress>>,
+    /// Where to deliver the final result.
+    reply: mpsc::SyncSender<Result<ChannelStream>>,
 }
 
 /// Per-channel state for an in-process handler running underneath
@@ -1168,6 +1268,7 @@ impl Client {
     /// may be used on this client.
     pub fn serve(&mut self, handlers: ClientHandlers) -> Result<()> {
         let mut runtimes: BTreeMap<u32, ServeRuntime> = BTreeMap::new();
+        let mut pending_opens: BTreeMap<u32, PendingOutboundOpen> = BTreeMap::new();
         // Always poll with a small read timeout so the loop responds to
         // `handlers.stop` even when no channels are open (e.g. between
         // forwarded connections). Reverted on return.
@@ -1183,10 +1284,26 @@ impl Client {
             // was in flight).
             if !self.runner.is_kexing() && !self.deferred.is_empty() {
                 let payload = self.deferred.remove(0);
-                if let Err(e) = serve_dispatch_packet(self, &handlers, &mut runtimes, &payload) {
+                if let Err(e) = serve_dispatch_packet(
+                    self,
+                    &handlers,
+                    &mut runtimes,
+                    &mut pending_opens,
+                    &payload,
+                ) {
                     break Err(e);
                 }
                 continue;
+            }
+
+            // Per-tick: process any outbound open requests from external
+            // threads (ssh -L listener accepts, etc.).
+            if !self.runner.is_kexing() {
+                if let Some(rx) = handlers.cmd_rx.as_ref() {
+                    if let Err(e) = serve_drain_commands(self, rx, &mut pending_opens) {
+                        break Err(e);
+                    }
+                }
             }
 
             // Per-tick: ship pending egress from each runtime onto the wire,
@@ -1201,7 +1318,10 @@ impl Client {
             // Exit when caller asked us to stop AND every channel has been
             // torn down. Without this guard a `stop` mid-handshake would
             // leave the channel in a half-closed state on the peer.
-            if handlers.stop.load(Ordering::SeqCst) && runtimes.is_empty() {
+            if handlers.stop.load(Ordering::SeqCst)
+                && runtimes.is_empty()
+                && pending_opens.is_empty()
+            {
                 break Ok(());
             }
 
@@ -1222,13 +1342,20 @@ impl Client {
                 Ok(None) => continue, // tick; re-enter drain/stop checks
                 Err(e) => break Err(e),
             };
-            if let Err(e) = serve_dispatch_packet(self, &handlers, &mut runtimes, &payload) {
+            if let Err(e) =
+                serve_dispatch_packet(self, &handlers, &mut runtimes, &mut pending_opens, &payload)
+            {
                 break Err(e);
             }
         };
 
         // Cleanup: drop any remaining runtimes (closes their ingress mpsc so
         // handler threads see EOF and exit), revert the socket timeout.
+        // Pending outbound opens get an Err reply so callers don't hang.
+        let stale_opens = core::mem::take(&mut pending_opens);
+        for (_ch, po) in stale_opens {
+            let _ = po.reply.send(Err(Error::Protocol("serve loop terminated")));
+        }
         runtimes.clear();
         let _ = self.stream.set_read_timeout(None);
         result
@@ -1840,9 +1967,55 @@ fn build_verifier(
     host_key_verify_by_name(&neg.host_key, k_s)
 }
 
-/// Per-tick: ship any pending egress from each [`ServeRuntime`] onto the
-/// wire. Mirror of the server's `drain_subsystems` — same window-blocking
-/// + pending-data discipline.
+/// Pull every queued [`ServeCommand`] from `cmd_rx` (non-blocking) and
+/// kick off the matching outbound open. The serve loop then waits for
+/// `OpenConfirmed` / `OpenFailed` in [`serve_dispatch_packet`].
+///
+/// Errors here propagate out of [`Client::serve`] — they indicate a
+/// failure to encode/transmit a CHANNEL_OPEN, not a peer rejection
+/// (which arrives as a normal `OpenFailed` event).
+fn serve_drain_commands(
+    client: &mut Client,
+    cmd_rx: &Receiver<ServeCommand>,
+    pending_opens: &mut BTreeMap<u32, PendingOutboundOpen>,
+) -> Result<()> {
+    loop {
+        match cmd_rx.try_recv() {
+            Ok(ServeCommand::OpenDirectTcpip {
+                dest_host,
+                dest_port,
+                orig_host,
+                orig_port,
+                reply,
+            }) => {
+                let (local_id, open_payload) = client.conn.open(ChannelOpen::DirectTcpip {
+                    dest_host,
+                    dest_port: dest_port as u32,
+                    orig_host,
+                    orig_port: orig_port as u32,
+                })?;
+                client.write_payload(&open_payload)?;
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
+                let stream = ChannelStream::new(ingress_rx, egress_tx);
+                pending_opens.insert(
+                    local_id,
+                    PendingOutboundOpen {
+                        stream: Some(stream),
+                        ingress_tx,
+                        egress_rx: Some(egress_rx),
+                        reply,
+                    },
+                );
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => break,
+        }
+    }
+    Ok(())
+}
+
 fn serve_drain_runtimes(
     client: &mut Client,
     runtimes: &mut BTreeMap<u32, ServeRuntime>,
@@ -1946,10 +2119,50 @@ fn serve_dispatch_packet(
     client: &mut Client,
     handlers: &ClientHandlers,
     runtimes: &mut BTreeMap<u32, ServeRuntime>,
+    pending_opens: &mut BTreeMap<u32, PendingOutboundOpen>,
     payload: &[u8],
 ) -> Result<()> {
     let ev = client.conn.on_packet(payload)?;
     match ev {
+        ChannelEvent::OpenConfirmed { channel } => {
+            // Caller-initiated open succeeded: hand the pre-built stream
+            // to the requester, and promote bookkeeping to a ServeRuntime.
+            if let Some(mut po) = pending_opens.remove(&channel) {
+                let stream = po
+                    .stream
+                    .take()
+                    .ok_or(Error::Protocol("pending open: stream taken twice"))?;
+                let egress_rx = po
+                    .egress_rx
+                    .take()
+                    .ok_or(Error::Protocol("pending open: egress taken twice"))?;
+                // If the caller hung up before we got here, just close.
+                if po.reply.send(Ok(stream)).is_err() {
+                    let p = client.conn.send_close(channel)?;
+                    client.write_payload(&p)?;
+                    return Ok(());
+                }
+                runtimes.insert(
+                    channel,
+                    ServeRuntime {
+                        ingress_tx: po.ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+            }
+        }
+        ChannelEvent::OpenFailed { channel, .. } => {
+            if let Some(po) = pending_opens.remove(&channel) {
+                let _ = po
+                    .reply
+                    .send(Err(Error::Protocol("direct-tcpip: open failed")));
+            }
+        }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
             ChannelOpen::ForwardedTcpip {
                 dest_host,

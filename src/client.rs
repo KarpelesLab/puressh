@@ -831,6 +831,84 @@ impl Client {
         })
     }
 
+    /// Send a `tcpip-forward` global request (RFC 4254 §7.1; the
+    /// outbound bookend of `ssh -R`) and block until the server replies.
+    ///
+    /// `bind_port == 0` asks the server to pick a port; the actual port
+    /// is returned. Any other value asks the server to bind that exact
+    /// port and is returned verbatim on success.
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the server replies
+    /// `REQUEST_FAILURE` or if the reply tail is malformed.
+    ///
+    /// Note: at the time of writing the server side is bind-and-drop —
+    /// connections accepted on the bound port are closed immediately.
+    /// End-to-end byte forwarding (server-initiated `forwarded-tcpip`
+    /// channel-opens back to the client) lands in a follow-up commit.
+    pub fn request_tcpip_forward(&mut self, bind_address: &str, bind_port: u16) -> Result<u16> {
+        use crate::channel::GlobalRequest;
+        let payload = self.conn.send_global_request(
+            GlobalRequest::TcpipForward {
+                bind_address: bind_address.to_string(),
+                bind_port: bind_port as u32,
+            },
+            true,
+        );
+        self.write_payload(&payload)?;
+        let data = self.await_global_reply("tcpip-forward")?;
+        if bind_port == 0 {
+            let mut r = crate::format::Reader::new(&data);
+            let p = r
+                .read_u32()
+                .map_err(|_| Error::Protocol("tcpip-forward: server omitted assigned-port tail"))?;
+            if p > u16::MAX as u32 {
+                return Err(Error::Protocol(
+                    "tcpip-forward: server returned out-of-range port",
+                ));
+            }
+            Ok(p as u16)
+        } else {
+            Ok(bind_port)
+        }
+    }
+
+    /// Send a `cancel-tcpip-forward` global request (RFC 4254 §7.1) and
+    /// block until the server replies. The `(bind_address, bind_port)`
+    /// pair must match a previous successful `request_tcpip_forward`.
+    pub fn cancel_tcpip_forward(&mut self, bind_address: &str, bind_port: u16) -> Result<()> {
+        use crate::channel::GlobalRequest;
+        let payload = self.conn.send_global_request(
+            GlobalRequest::CancelTcpipForward {
+                bind_address: bind_address.to_string(),
+                bind_port: bind_port as u32,
+            },
+            true,
+        );
+        self.write_payload(&payload)?;
+        let _ = self.await_global_reply("cancel-tcpip-forward")?;
+        Ok(())
+    }
+
+    /// Block until the server answers a `GLOBAL_REQUEST` with
+    /// `want_reply = true`. Returns the request-specific tail bytes
+    /// (empty for requests without a payload).
+    fn await_global_reply(&mut self, what: &'static str) -> Result<Vec<u8>> {
+        for _ in 0..MAX_EXEC_ITER {
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::GlobalSuccess { data } => return Ok(data),
+                ChannelEvent::GlobalFailure => {
+                    let _ = what; // for future tracing
+                    return Err(Error::Protocol("global request denied"));
+                }
+                _ => {}
+            }
+        }
+        Err(Error::Protocol(
+            "global request: reply loop did not converge",
+        ))
+    }
+
     /// Block until the peer answers a single `CHANNEL_REQUEST` we sent
     /// with `want_reply = true`. Used by [`shell_with_stdin`] to gate the
     /// pty-req → shell handoff.

@@ -410,6 +410,29 @@ pub trait DirectTcpipHandler: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Server-side hook for `tcpip-forward` and `cancel-tcpip-forward` global
+/// requests (RFC 4254 §7.1; the inbound bookend of `ssh -R`).
+///
+/// **Surface only in this commit.** The default implementation in
+/// [`crate::forwarding::reverse::DefaultTcpipForwardHandler`] binds a real
+/// TCP listener and tracks it per-connection so cancel actually unbinds.
+/// Server-initiated `forwarded-tcpip` channel-opens (one per accepted
+/// connection on the bound port) land in a follow-up commit alongside the
+/// matching client-side multi-channel dispatcher; until then connections
+/// to the bound port are accepted-and-immediately-dropped.
+///
+/// When `bind_port == 0` the handler must pick a free port and return it
+/// in `bind`; the server echoes the value back to the client as part of
+/// `REQUEST_SUCCESS` (per RFC 4254 §7.1).
+pub trait TcpipForwardHandler: Send + Sync {
+    /// Bind `bind_address:bind_port`. Return the actually-bound port. An
+    /// `Err` causes the server to reply `REQUEST_FAILURE`.
+    fn bind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<u16>;
+    /// Tear down a previously-bound listener. `Err` causes the server to
+    /// reply `REQUEST_FAILURE`.
+    fn unbind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<()>;
+}
+
 /// Server configuration: host keys, authentication, and the exec hook.
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
@@ -437,6 +460,14 @@ pub struct Config {
     /// own filter) to enable client-side `ssh -L` forwarding through this
     /// server.
     pub direct_tcpip_handler: Option<Arc<dyn DirectTcpipHandler>>,
+    /// Optional `tcpip-forward` / `cancel-tcpip-forward` global-request
+    /// hook (i.e. the server side of `ssh -R`). When `None` (the
+    /// default), both requests reply `REQUEST_FAILURE`. Set this to
+    /// [`crate::forwarding::reverse::DefaultTcpipForwardHandler`] to
+    /// have the server bind a real listener; until the matching
+    /// server-initiated `forwarded-tcpip` channel-open lands in a
+    /// follow-up phase, accepted connections are dropped.
+    pub tcpip_forward_handler: Option<Arc<dyn TcpipForwardHandler>>,
     /// Optional callback invoked once per connection, after authentication
     /// has succeeded but before any channel request is processed. Returning
     /// `Err` aborts the connection. Typical use: drop privileges (setgid /
@@ -465,6 +496,7 @@ impl Config {
             shell_handler: None,
             subsystem_handler: None,
             direct_tcpip_handler: None,
+            tcpip_forward_handler: None,
             on_session_open: None,
             rekey_policy: RekeyPolicy::default(),
         }
@@ -491,6 +523,14 @@ impl Config {
     /// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`.
     pub fn with_direct_tcpip(mut self, handler: Arc<dyn DirectTcpipHandler>) -> Self {
         self.direct_tcpip_handler = Some(handler);
+        self
+    }
+
+    /// Attach a `TcpipForwardHandler`. Without one, every
+    /// `tcpip-forward` / `cancel-tcpip-forward` global request (i.e.
+    /// `ssh -R`) is answered with `REQUEST_FAILURE`.
+    pub fn with_tcpip_forward(mut self, handler: Arc<dyn TcpipForwardHandler>) -> Self {
+        self.tcpip_forward_handler = Some(handler);
         self
     }
 
@@ -1307,11 +1347,96 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             subsystems.remove(&channel);
         }
         ChannelEvent::WindowAdjust { .. } => {}
-        ChannelEvent::GlobalRequest { want_reply, .. } if want_reply => {
-            let p = conn.send_global_failure();
-            write_payload(stream, codec, rng, &p)?;
+        ChannelEvent::GlobalRequest {
+            request,
+            want_reply,
+        } => {
+            handle_global_request(stream, codec, rng, conn, cfg, user, request, want_reply)?;
         }
         _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_global_request<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    cfg: &Config,
+    user: &str,
+    request: crate::channel::GlobalRequest,
+    want_reply: bool,
+) -> Result<()> {
+    use crate::channel::GlobalRequest;
+    use crate::format::Writer;
+    match request {
+        GlobalRequest::TcpipForward {
+            bind_address,
+            bind_port,
+        } => {
+            // Refuse non-uint16 ports up front (the spec allows uint32 on the
+            // wire but only 0..=65535 are meaningful).
+            let bound = if bind_port > u16::MAX as u32 {
+                None
+            } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
+                handler.bind(user, &bind_address, bind_port as u16).ok()
+            } else {
+                None
+            };
+            if !want_reply {
+                return Ok(());
+            }
+            match bound {
+                Some(port) => {
+                    // When the client asked for port 0 the spec requires us
+                    // to echo back the assigned port as a `uint32` tail.
+                    let tail = if bind_port == 0 {
+                        let mut w = Writer::new();
+                        w.write_u32(port as u32);
+                        w.into_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let p = conn.send_global_success(&tail);
+                    write_payload(stream, codec, rng, &p)?;
+                }
+                None => {
+                    let p = conn.send_global_failure();
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            }
+        }
+        GlobalRequest::CancelTcpipForward {
+            bind_address,
+            bind_port,
+        } => {
+            let ok = if bind_port > u16::MAX as u32 {
+                false
+            } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
+                handler
+                    .unbind(user, &bind_address, bind_port as u16)
+                    .is_ok()
+            } else {
+                false
+            };
+            if !want_reply {
+                return Ok(());
+            }
+            let p = if ok {
+                conn.send_global_success(&[])
+            } else {
+                conn.send_global_failure()
+            };
+            write_payload(stream, codec, rng, &p)?;
+        }
+        GlobalRequest::Keepalive | GlobalRequest::Other { .. } => {
+            if want_reply {
+                let p = conn.send_global_failure();
+                write_payload(stream, codec, rng, &p)?;
+            }
+        }
     }
     Ok(())
 }
@@ -2786,6 +2911,193 @@ mod tests {
         // — branch on the result manually.
         match client.open_direct_tcpip("127.0.0.1", 1, "127.0.0.1", 0) {
             Ok(_) => panic!("expected direct-tcpip open to be refused"),
+            Err(Error::Protocol(_)) => {}
+            Err(other) => panic!("expected Error::Protocol, got {:?}", other),
+        }
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn loopback_tcpip_forward_round_trip() {
+        // Exercise the global-request bookend: client requests
+        // tcpip-forward with port=0, the server's DefaultTcpipForwardHandler
+        // binds a real listener, the assigned port comes back, the client
+        // confirms it's bindable from outside, then cancels.
+        use std::net::TcpStream;
+
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "tcpip-forward-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused\n".to_vec(),
+            }),
+        )
+        .with_tcpip_forward(Arc::new(
+            crate::forwarding::reverse::DefaultTcpipForwardHandler::new(),
+        ));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
+        let ssh_addr = server.local_addr().expect("ssh addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            ssh_addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        // Request port=0; server picks one and echoes it back.
+        let bound = client
+            .request_tcpip_forward("127.0.0.1", 0)
+            .expect("tcpip-forward");
+        assert!(bound > 0, "server must return a real port for port=0");
+
+        // The kernel really owns that port now: a fresh client can
+        // connect to it. The stub accept-and-drop handler closes
+        // immediately, which is observable as Read returning Ok(0).
+        let mut tcp = TcpStream::connect(("127.0.0.1", bound)).expect("connect to forwarded port");
+        tcp.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("set timeout");
+        let mut buf = [0u8; 4];
+        let n = std::io::Read::read(&mut tcp, &mut buf).expect("read");
+        assert_eq!(n, 0, "stub forward must close the accepted socket");
+
+        // Cancel the binding. After this, a fresh connect should fail.
+        client
+            .cancel_tcpip_forward("127.0.0.1", bound)
+            .expect("cancel-tcpip-forward");
+
+        // Give the kernel a moment to actually release the port —
+        // unbind is synchronous from our side (Drop joins the worker),
+        // but TIME_WAIT-style states can linger.
+        for _ in 0..50 {
+            if TcpStream::connect_timeout(
+                &format!("127.0.0.1:{bound}").parse().unwrap(),
+                Duration::from_millis(50),
+            )
+            .is_err()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn loopback_tcpip_forward_unconfigured_refused() {
+        // Without a tcpip_forward_handler attached the global request
+        // must be answered REQUEST_FAILURE; the client surfaces that
+        // as Error::Protocol.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "tcpip-forward-reject-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused\n".to_vec(),
+            }),
+        );
+        // Deliberately no .with_tcpip_forward.
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
+        let ssh_addr = server.local_addr().expect("ssh addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            ssh_addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        match client.request_tcpip_forward("127.0.0.1", 0) {
+            Ok(_) => panic!("expected tcpip-forward to be refused"),
             Err(Error::Protocol(_)) => {}
             Err(other) => panic!("expected Error::Protocol, got {:?}", other),
         }

@@ -76,7 +76,7 @@ mod imp {
     const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
                          [-A authorized_keys_file] [-u allowed_user]... \
                          [--no-sftp] [--sftp-read-only] [--sftp-root PATH] \
-                         [--no-scp] [--no-agent-forward]";
+                         [--no-scp] [--no-agent-forward] [--no-x11-forward]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -259,6 +259,9 @@ mod imp {
         /// it. When off, any client `auth-agent-req@openssh.com` is
         /// refused.
         agent_forward: bool,
+        /// X11 forwarding on by default; `--no-x11-forward` disables it.
+        /// When off, any client `x11-req` is refused.
+        x11_forward: bool,
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -272,6 +275,7 @@ mod imp {
         let mut sftp_root: Option<String> = None;
         let mut scp = true;
         let mut agent_forward = true;
+        let mut x11_forward = true;
 
         let mut i = 0;
         while i < args.len() {
@@ -307,6 +311,7 @@ mod imp {
                 }
                 "--no-scp" => scp = false,
                 "--no-agent-forward" => agent_forward = false,
+                "--no-x11-forward" => x11_forward = false,
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -329,6 +334,7 @@ mod imp {
             sftp_root,
             scp,
             agent_forward,
+            x11_forward,
         })
     }
 
@@ -1526,6 +1532,11 @@ mod imp {
         if cli.agent_forward {
             use puressh::forwarding::agent::DefaultAgentForwardHandler;
             config = config.with_agent_forward(Arc::new(DefaultAgentForwardHandler::new()));
+        }
+
+        if cli.x11_forward {
+            use puressh::forwarding::x11::DefaultX11ForwardHandler;
+            config = config.with_x11_forward(Arc::new(DefaultX11ForwardHandler::new()));
         }
 
         // Drop privileges to the authenticated user *once per connection*

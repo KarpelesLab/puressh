@@ -87,6 +87,15 @@ pub enum ChannelOpen {
     /// client's local `$SSH_AUTH_SOCK`. RFC pseudo-extension as deployed by
     /// OpenSSH; the open carries no type-specific payload.
     AuthAgent,
+    /// `"x11"` — server-initiated channel that proxies a connection on the
+    /// per-session forwarded X11 display back to the client's local
+    /// `$DISPLAY`. RFC 4254 §6.3.2.
+    X11 {
+        /// Originator's IP address as reported by the X server side.
+        orig_host: String,
+        /// Originator's TCP port.
+        orig_port: u32,
+    },
     /// Unknown / not-yet-supported channel type, raw type-specific bytes preserved.
     Other {
         /// Channel-type name.
@@ -104,6 +113,7 @@ impl ChannelOpen {
             ChannelOpen::DirectTcpip { .. } => "direct-tcpip",
             ChannelOpen::ForwardedTcpip { .. } => "forwarded-tcpip",
             ChannelOpen::AuthAgent => "auth-agent@openssh.com",
+            ChannelOpen::X11 { .. } => "x11",
             ChannelOpen::Other { kind, .. } => kind.as_str(),
         }
     }
@@ -129,6 +139,13 @@ impl ChannelOpen {
                 w.write_u32(*orig_port);
             }
             ChannelOpen::AuthAgent => {}
+            ChannelOpen::X11 {
+                orig_host,
+                orig_port,
+            } => {
+                w.write_string(orig_host.as_bytes());
+                w.write_u32(*orig_port);
+            }
             ChannelOpen::Other { raw, .. } => {
                 w.write_raw(raw);
             }
@@ -164,6 +181,14 @@ impl ChannelOpen {
                 })
             }
             "auth-agent@openssh.com" => Ok(ChannelOpen::AuthAgent),
+            "x11" => {
+                let orig_host = read_utf8(&mut r)?;
+                let orig_port = r.read_u32()?;
+                Ok(ChannelOpen::X11 {
+                    orig_host,
+                    orig_port,
+                })
+            }
             other => Ok(ChannelOpen::Other {
                 kind: other.to_string(),
                 raw: body.to_vec(),

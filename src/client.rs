@@ -188,6 +188,15 @@ pub type ForwardedTcpipCallback =
 /// the agent-forwarding round-trip (OpenSSH's `ssh -A`).
 pub type AuthAgentCallback = dyn Fn(ChannelStream) + Send + Sync + 'static;
 
+/// Type alias for the [`ClientHandlers::on_x11`] callback.
+///
+/// Fires on every server-initiated `x11` channel — one per peer-side X11
+/// client connection that landed on the forwarded display. The handler
+/// typically splices the stream against the local `$DISPLAY` (Unix domain
+/// `/tmp/.X11-unix/X<N>` or TCP `host:6000+N`), completing the X11
+/// forwarding round-trip (OpenSSH's `ssh -X` / `ssh -Y`).
+pub type X11Callback = dyn Fn(ChannelStream) + Send + Sync + 'static;
+
 /// Set of callbacks driving [`Client::serve`].
 ///
 /// Each `on_*` field accepts a peer-initiated channel-open of the matching
@@ -202,6 +211,9 @@ pub struct ClientHandlers {
     /// Callback for `"auth-agent@openssh.com"` channel opens (server-side
     /// half of agent forwarding, `ssh -A`). `None` ⇒ reject.
     pub on_auth_agent: Option<Arc<AuthAgentCallback>>,
+    /// Callback for `"x11"` channel opens (server-side half of X11
+    /// forwarding, `ssh -X` / `ssh -Y`). `None` ⇒ reject.
+    pub on_x11: Option<Arc<X11Callback>>,
     /// Cooperative stop signal. The loop polls this flag once per tick and
     /// returns `Ok(())` as soon as it's `true` AND no channels are open.
     pub stop: Arc<AtomicBool>,
@@ -224,6 +236,7 @@ impl ClientHandlers {
         Self {
             on_forwarded_tcpip: None,
             on_auth_agent: None,
+            on_x11: None,
             stop: Arc::new(AtomicBool::new(false)),
             cmd_rx: None,
         }
@@ -241,6 +254,15 @@ impl ClientHandlers {
     /// [`crate::forwarding::agent::splice_to_local_agent_callback`].
     pub fn with_auth_agent(mut self, cb: Arc<AuthAgentCallback>) -> Self {
         self.on_auth_agent = Some(cb);
+        self
+    }
+
+    /// Install an `x11` handler (`ssh -X` / `ssh -Y` server-initiated opens).
+    /// For the default behaviour (splice each incoming channel against the
+    /// local `$DISPLAY`), see
+    /// [`crate::forwarding::x11::splice_to_local_display_callback`].
+    pub fn with_x11(mut self, cb: Arc<X11Callback>) -> Self {
+        self.on_x11 = Some(cb);
         self
     }
 
@@ -401,6 +423,23 @@ pub struct Client {
     /// before the matching shell/exec/subsystem request. Toggle with
     /// [`Self::set_request_auth_agent_forwarding`].
     request_auth_agent: bool,
+    /// When `Some`, every session-channel helper issues `x11-req`
+    /// immediately after the open and before the matching
+    /// shell/exec/subsystem request. Toggle with
+    /// [`Self::set_request_x11_forwarding`]. Carries the wire arguments —
+    /// `single_connection`, `auth_protocol`, `auth_cookie`, `screen` —
+    /// captured at toggle time.
+    request_x11: Option<X11ReqArgs>,
+}
+
+/// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
+/// emitted as the body of each `x11-req` channel request.
+#[derive(Clone)]
+struct X11ReqArgs {
+    single_connection: bool,
+    auth_protocol: String,
+    auth_cookie: String,
+    screen: u32,
 }
 
 impl Client {
@@ -436,6 +475,7 @@ impl Client {
             target_host: String::new(),
             target_port: 0,
             request_auth_agent: false,
+            request_x11: None,
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -474,6 +514,7 @@ impl Client {
             target_host: host.to_string(),
             target_port: port,
             request_auth_agent: false,
+            request_x11: None,
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -564,6 +605,56 @@ impl Client {
         Ok(local_id)
     }
 
+    /// Open a session channel that exists solely to host an `x11-req`
+    /// request, then send that request and return the channel's local id.
+    /// The caller is expected to keep this channel open for the lifetime
+    /// of any X11-forwarding work ([`Self::serve`] with
+    /// [`ClientHandlers::on_x11`] installed), then tear it down with
+    /// [`Self::close_session`].
+    ///
+    /// On the server side, the matching `x11-req` arms a per-session
+    /// TCP display listener (`127.0.0.1:6000+N`); closing this channel
+    /// stops it. See [`crate::forwarding::x11`] for the server side.
+    pub fn open_session_for_x11_forward(
+        &mut self,
+        single_connection: bool,
+        auth_protocol: &str,
+        auth_cookie: &str,
+        screen: u32,
+    ) -> Result<u32> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
+        self.write_payload(&open_payload)?;
+
+        let mut iter_guard = 0usize;
+        loop {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("x11-forward: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("x11-forward: channel open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        let p = self.conn.send_request(
+            local_id,
+            ChannelRequest::X11Req {
+                single_connection,
+                auth_protocol: auth_protocol.to_string(),
+                auth_cookie: auth_cookie.to_string(),
+                screen,
+            },
+            false,
+        )?;
+        self.write_payload(&p)?;
+        Ok(local_id)
+    }
+
     /// Send `SSH_MSG_CHANNEL_CLOSE` for `channel`. Used to tear down a
     /// session channel opened by
     /// [`Self::open_session_for_agent_forward`] once the matching serve
@@ -607,6 +698,54 @@ impl Client {
         Ok(())
     }
 
+    /// Arm `x11-req` to be emitted on every subsequent session-channel
+    /// helper ([`Self::exec`], [`Self::exec_stream`],
+    /// [`Self::shell_with_stdin`], [`Self::sftp`]) between OpenConfirmed
+    /// and the matching shell/exec/subsystem request.
+    ///
+    /// `single_connection` follows RFC 4254 §6.3.1: `true` accepts exactly
+    /// one X-client connection on the forwarded display, `false` accepts
+    /// any number (the OpenSSH default for both `-X` and `-Y`).
+    ///
+    /// `auth_protocol` is typically `"MIT-MAGIC-COOKIE-1"`; `auth_cookie`
+    /// is the matching cookie as a hex string. The server forwards both
+    /// verbatim into [`crate::server::X11ForwardHandler::setup`] — cookie
+    /// substitution at the X-protocol level is the responsibility of the
+    /// `on_x11` handler. `screen` is the X screen number (0 in nearly all
+    /// uses). Pass `None` to clear the toggle.
+    pub fn set_request_x11_forwarding(&mut self, args: Option<(bool, String, String, u32)>) {
+        self.request_x11 =
+            args.map(
+                |(single_connection, auth_protocol, auth_cookie, screen)| X11ReqArgs {
+                    single_connection,
+                    auth_protocol,
+                    auth_cookie,
+                    screen,
+                },
+            );
+    }
+
+    /// Internal: emit `x11-req` if the toggle is set. Called by every
+    /// session-channel helper between OpenConfirmed and the matching
+    /// shell/exec/subsystem request, right after
+    /// [`Self::maybe_send_auth_agent_req`].
+    fn maybe_send_x11_req(&mut self, channel: u32) -> Result<()> {
+        if let Some(args) = self.request_x11.clone() {
+            let p = self.conn.send_request(
+                channel,
+                ChannelRequest::X11Req {
+                    single_connection: args.single_connection,
+                    auth_protocol: args.auth_protocol,
+                    auth_cookie: args.auth_cookie,
+                    screen: args.screen,
+                },
+                false,
+            )?;
+            self.write_payload(&p)?;
+        }
+        Ok(())
+    }
+
     /// Run a remote command, draining stdout/stderr and capturing the exit
     /// status (or signal). Returns once the server has closed the channel.
     pub fn exec(&mut self, command: &str) -> Result<ExecOutput> {
@@ -633,6 +772,7 @@ impl Client {
         }
 
         self.maybe_send_auth_agent_req(local_id)?;
+        self.maybe_send_x11_req(local_id)?;
 
         let exec_req = self.conn.send_request(
             local_id,
@@ -783,6 +923,7 @@ impl Client {
         }
 
         self.maybe_send_auth_agent_req(local_id)?;
+        self.maybe_send_x11_req(local_id)?;
 
         // pty-req with want_reply=true.
         let pty_req = self.conn.send_request(
@@ -1074,6 +1215,7 @@ impl Client {
         }
 
         self.maybe_send_auth_agent_req(local_id)?;
+        self.maybe_send_x11_req(local_id)?;
 
         let sub_req = self.conn.send_request(
             local_id,
@@ -1138,6 +1280,7 @@ impl Client {
         }
 
         self.maybe_send_auth_agent_req(local_id)?;
+        self.maybe_send_x11_req(local_id)?;
 
         let exec_req = self.conn.send_request(
             local_id,
@@ -2356,6 +2499,43 @@ fn serve_dispatch_packet(
                         channel,
                         SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
                         "auth-agent not enabled",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                }
+            }
+            ChannelOpen::X11 {
+                orig_host: _,
+                orig_port: _,
+            } => {
+                if let Some(cb) = handlers.on_x11.clone() {
+                    let p = client.conn.accept_open(channel)?;
+                    client.write_payload(&p)?;
+
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    thread::spawn(move || {
+                        cb(cs);
+                    });
+                    runtimes.insert(
+                        channel,
+                        ServeRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                } else {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "x11 not enabled",
                         "",
                     )?;
                     client.write_payload(&p)?;

@@ -81,6 +81,20 @@ pub enum ChannelRequest {
     /// authentication-agent forwarding on this session. The request carries
     /// no type-specific payload. RFC pseudo-extension as deployed by OpenSSH.
     AuthAgentReq,
+    /// `"x11-req"` — client asks the server to set up X11 forwarding on this
+    /// session (RFC 4254 §6.3.1). Payload is `single_connection: bool`,
+    /// `auth_protocol: string`, `auth_cookie: string` (hex-encoded), and
+    /// `screen: u32`.
+    X11Req {
+        /// Server should accept only a single X11 connection if `true`.
+        single_connection: bool,
+        /// Authentication protocol name (e.g. `"MIT-MAGIC-COOKIE-1"`).
+        auth_protocol: String,
+        /// Authentication cookie, hex-encoded as per RFC 4254 §6.3.1.
+        auth_cookie: String,
+        /// X11 screen number.
+        screen: u32,
+    },
     /// Any request type we don't recognise; the raw type-specific body is preserved.
     Other {
         /// Request type as advertised on the wire.
@@ -104,6 +118,7 @@ impl ChannelRequest {
             ChannelRequest::ExitStatus { .. } => "exit-status",
             ChannelRequest::ExitSignal { .. } => "exit-signal",
             ChannelRequest::AuthAgentReq => "auth-agent-req@openssh.com",
+            ChannelRequest::X11Req { .. } => "x11-req",
             ChannelRequest::Other { name, .. } => name.as_str(),
         }
     }
@@ -166,6 +181,17 @@ impl ChannelRequest {
                 w.write_string(language.as_bytes());
             }
             ChannelRequest::AuthAgentReq => {}
+            ChannelRequest::X11Req {
+                single_connection,
+                auth_protocol,
+                auth_cookie,
+                screen,
+            } => {
+                w.write_bool(*single_connection);
+                w.write_string(auth_protocol.as_bytes());
+                w.write_string(auth_cookie.as_bytes());
+                w.write_u32(*screen);
+            }
             ChannelRequest::Other { raw, .. } => {
                 w.write_raw(raw);
             }
@@ -236,6 +262,18 @@ impl ChannelRequest {
                 })
             }
             "auth-agent-req@openssh.com" => Ok(ChannelRequest::AuthAgentReq),
+            "x11-req" => {
+                let single_connection = r.read_bool()?;
+                let auth_protocol = read_utf8(&mut r)?;
+                let auth_cookie = read_utf8(&mut r)?;
+                let screen = r.read_u32()?;
+                Ok(ChannelRequest::X11Req {
+                    single_connection,
+                    auth_protocol,
+                    auth_cookie,
+                    screen,
+                })
+            }
             other => Ok(ChannelRequest::Other {
                 name: other.to_string(),
                 raw: body.to_vec(),

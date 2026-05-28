@@ -583,6 +583,125 @@ pub trait AgentForwardHandler: Send + Sync {
     fn setup(&self, user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle>;
 }
 
+/// Per-session-channel handle used by an [`X11ForwardHandler`] to ask the
+/// per-connection server loop to open an `x11` channel back toward the
+/// client (RFC 4254 §6.3).
+///
+/// One instance is supplied to each successful
+/// [`X11ForwardHandler::setup`]; it stays valid for the lifetime of that
+/// session channel (i.e. until the channel closes and the dispatcher drops
+/// the matching [`X11ForwardHandle`]).
+#[derive(Clone)]
+pub struct X11ForwardContext {
+    /// Sender into the per-connection x11-open mpsc queue. The connection
+    /// loop on the receiver end translates each request into an
+    /// `SSH_MSG_CHANNEL_OPEN x11` and parks the reply slot until the
+    /// matching `OPEN_CONFIRMATION` / `OPEN_FAILURE` lands.
+    req_tx: Sender<X11OpenRequest>,
+}
+
+/// One pending server-initiated `x11` open. Carries the originator address
+/// (reported back to the client in the `OPEN` payload) and a one-shot reply
+/// slot.
+pub(crate) struct X11OpenRequest {
+    /// Originator host as advertised to the client.
+    pub orig_host: String,
+    /// Originator TCP port.
+    pub orig_port: u32,
+    /// One-shot reply slot. `Ok(stream)` after `OPEN_CONFIRMATION`,
+    /// `Err(_)` after `OPEN_FAILURE` or connection teardown.
+    pub reply: std::sync::mpsc::SyncSender<Result<ChannelStream>>,
+}
+
+impl X11ForwardContext {
+    /// Used by the connection loop; not for user code.
+    pub(crate) fn new(req_tx: Sender<X11OpenRequest>) -> Self {
+        Self { req_tx }
+    }
+
+    /// Build an [`X11ForwardContext`] whose [`Self::open_x11`] calls always
+    /// fail (the request mpsc has no receiver). Useful for unit tests that
+    /// only exercise `setup` and never accept on the display socket.
+    #[doc(hidden)]
+    pub fn for_test_no_opens() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        drop(_rx);
+        Self { req_tx: tx }
+    }
+
+    /// Ask the connection loop to open an `x11` channel back toward the
+    /// client. Blocks until the client confirms or rejects.
+    ///
+    /// `orig_host` / `orig_port` are advertised to the client as the
+    /// originator of the X11 connection (per RFC 4254 §6.3.2).
+    ///
+    /// On success returns a [`ChannelStream`] connected to the new channel.
+    /// Drop the stream when the local X-client TCP connection hangs up.
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the underlying SSH connection
+    /// has gone away or the client rejected the open.
+    pub fn open_x11(&self, orig_host: String, orig_port: u32) -> Result<ChannelStream> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.req_tx
+            .send(X11OpenRequest {
+                orig_host,
+                orig_port,
+                reply: tx,
+            })
+            .map_err(|_| Error::Protocol("x11: connection closed"))?;
+        rx.recv()
+            .map_err(|_| Error::Protocol("x11: reply dropped"))?
+    }
+}
+
+/// Handle returned by [`X11ForwardHandler::setup`]. The connection loop
+/// inserts the handle into a per-session-channel map and drops it when the
+/// session closes. Dropping the handle must tear down the listener thread
+/// and release the display number.
+pub struct X11ForwardHandle {
+    /// Display string to expose as `DISPLAY` in the environment of programs
+    /// spawned on this session, typically `"localhost:<N>.<screen>"` where
+    /// `N` is `display_number` and `screen` matches the request.
+    pub display_env: String,
+    /// X display number bound by this handle (e.g. `10` → TCP port `6010`).
+    /// Useful for diagnostics; the dispatcher does not consume it.
+    pub display_number: u16,
+    /// Stop guard: any `Send`/`Sync` value whose `Drop` impl terminates the
+    /// accept loop and releases the display. The dispatcher does not look
+    /// inside this box — it just drops it on session close.
+    pub stopper: Box<dyn core::any::Any + Send + Sync>,
+}
+
+/// Server-side hook for `x11-req` (the channel request OpenSSH sends when
+/// the client asked for `-X` / `-Y`).
+///
+/// The default implementation in
+/// [`crate::forwarding::x11::DefaultX11ForwardHandler`] binds a TCP listener
+/// on `127.0.0.1:6000+N` for a fresh display number `N`, and — via the
+/// [`X11ForwardContext`] passed to `setup` — opens a server-initiated
+/// `x11` channel back to the client for every accepted X-client connection.
+///
+/// Implementations must be safe to share across connections. The
+/// `auth_protocol` and `auth_cookie` fields of the original
+/// `x11-req` are passed through so the handler can validate / store the
+/// client's MIT-MAGIC-COOKIE-1 (used for cookie substitution on the wire).
+pub trait X11ForwardHandler: Send + Sync {
+    /// Establish X11 forwarding for a single session channel. Return a
+    /// handle whose `display_env` is injected as `DISPLAY` in the session's
+    /// env, and whose `stopper` is dropped (terminating the listener) when
+    /// the session channel closes. An `Err` causes the server to reply
+    /// `CHANNEL_FAILURE` and leave the env unchanged.
+    fn setup(
+        &self,
+        user: &str,
+        single_connection: bool,
+        auth_protocol: &str,
+        auth_cookie: &str,
+        screen: u32,
+        ctx: X11ForwardContext,
+    ) -> Result<X11ForwardHandle>;
+}
+
 /// Server configuration: host keys, authentication, and the exec hook.
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
@@ -635,6 +754,14 @@ pub struct Config {
     /// per-session Unix socket and proxy connections to the client's local
     /// agent via server-initiated `auth-agent@openssh.com` channel-opens.
     pub agent_forward_handler: Option<Arc<dyn AgentForwardHandler>>,
+    /// Optional `x11-req` channel-request hook (i.e. the server side of
+    /// `ssh -X` / `ssh -Y`). When `None` (the default), every `x11-req`
+    /// request is answered with `CHANNEL_FAILURE` and no display is created.
+    /// Set this to
+    /// [`crate::forwarding::x11::DefaultX11ForwardHandler`] to bind a
+    /// per-session TCP listener on `127.0.0.1:6000+N` and proxy accepted
+    /// connections to the client via server-initiated `x11` channel-opens.
+    pub x11_forward_handler: Option<Arc<dyn X11ForwardHandler>>,
     /// Optional callback invoked once per connection, after authentication
     /// has succeeded but before any channel request is processed. Returning
     /// `Err` aborts the connection. Typical use: drop privileges (setgid /
@@ -666,6 +793,7 @@ impl Config {
             direct_tcpip_handler: None,
             tcpip_forward_handler: None,
             agent_forward_handler: None,
+            x11_forward_handler: None,
             on_session_open: None,
             rekey_policy: RekeyPolicy::default(),
         }
@@ -717,6 +845,14 @@ impl Config {
     /// answered with `CHANNEL_FAILURE` and no agent forwarding is set up.
     pub fn with_agent_forward(mut self, handler: Arc<dyn AgentForwardHandler>) -> Self {
         self.agent_forward_handler = Some(handler);
+        self
+    }
+
+    /// Attach an `X11ForwardHandler`. Without one, every `x11-req` channel
+    /// request (i.e. `ssh -X` / `ssh -Y`) is answered with `CHANNEL_FAILURE`
+    /// and no display is bound.
+    pub fn with_x11_forward(mut self, handler: Arc<dyn X11ForwardHandler>) -> Self {
+        self.x11_forward_handler = Some(handler);
         self
     }
 
@@ -1083,6 +1219,64 @@ impl AgentForwardConn {
     }
 }
 
+/// Per-connection state for server-initiated `x11` channel opens (`ssh -X`
+/// / `ssh -Y` traffic). Mirrors [`AgentForwardConn`] but for the RFC 4254
+/// §6.3 X11 forwarding wire form: the accept loop inside an
+/// [`X11ForwardHandler`] pushes [`X11OpenRequest`]s here; the connection
+/// loop drains them, emits `SSH_MSG_CHANNEL_OPEN`, and parks the reply
+/// slot in `pending_opens` until the client confirms or rejects.
+///
+/// `active` keys [`X11ForwardHandle`]s by **session** channel id; the
+/// handle is the per-session display listener and we drop it when the
+/// session channel closes (one session can pump many `x11` channels).
+struct X11ForwardConn {
+    req_tx: Sender<X11OpenRequest>,
+    req_rx: Receiver<X11OpenRequest>,
+    /// Local channel id of an in-flight x11 channel-open -> reply slot.
+    pending_opens: BTreeMap<u32, std::sync::mpsc::SyncSender<Result<ChannelStream>>>,
+    /// Per-session-channel handles keeping display listener threads alive.
+    active: BTreeMap<u32, X11ForwardHandle>,
+}
+
+impl X11ForwardConn {
+    fn new() -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        Self {
+            req_tx,
+            req_rx,
+            pending_opens: BTreeMap::new(),
+            active: BTreeMap::new(),
+        }
+    }
+
+    /// Emit one `SSH_MSG_CHANNEL_OPEN x11` per queued request. Pending-reply
+    /// entries land in `self.pending_opens` keyed by the freshly-allocated
+    /// local id.
+    fn drain_pending<R: RngCore + CryptoRng>(
+        &mut self,
+        stream: &mut TcpStream,
+        codec: &mut PacketCodec,
+        rng: &mut R,
+        conn: &mut ConnectionState,
+    ) -> Result<()> {
+        loop {
+            match self.req_rx.try_recv() {
+                Ok(req) => {
+                    let kind = ChannelOpen::X11 {
+                        orig_host: req.orig_host.clone(),
+                        orig_port: req.orig_port,
+                    };
+                    let (local_id, payload) = conn.open(kind)?;
+                    write_payload(stream, codec, rng, &payload)?;
+                    self.pending_opens.insert(local_id, req.reply);
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_connection_phase<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
@@ -1120,6 +1314,9 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // Per-connection agent-forward queue + active handles. Empty until at
     // least one session channel requests `auth-agent-req@openssh.com`.
     let mut agent_forward = AgentForwardConn::new();
+    // Per-connection X11-forward queue + active handles. Empty until at
+    // least one session channel requests `x11-req`.
+    let mut x11_forward = X11ForwardConn::new();
     let mut polling_active = false;
     let result = do_connection_loop(
         stream,
@@ -1142,6 +1339,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         &mut envs,
         &mut forward,
         &mut agent_forward,
+        &mut x11_forward,
         &mut polling_active,
     );
     // On teardown — successful or otherwise — release every binding so the
@@ -1163,6 +1361,11 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     agent_forward.active.clear();
     for (_id, reply) in agent_forward.pending_opens.drain_filter_compat() {
         let _ = reply.send(Err(Error::Protocol("auth-agent: connection torn down")));
+    }
+    // Same for X11-forward listeners.
+    x11_forward.active.clear();
+    for (_id, reply) in x11_forward.pending_opens.drain_filter_compat() {
+        let _ = reply.send(Err(Error::Protocol("x11: connection torn down")));
     }
     result
 }
@@ -1209,6 +1412,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
     envs: &mut BTreeMap<u32, SessionEnv>,
     forward: &mut ForwardConn,
     agent_forward: &mut AgentForwardConn,
+    x11_forward: &mut X11ForwardConn,
     polling_active: &mut bool,
 ) -> Result<()> {
     loop {
@@ -1235,6 +1439,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                 envs,
                 forward,
                 agent_forward,
+                x11_forward,
             )?;
             continue;
         }
@@ -1250,8 +1455,15 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // asynchronously from a listener thread; keep the loop polling so
         // its `drain_pending` runs on the same 50 ms tick.
         let any_agent_fwd_alive = !agent_forward.active.is_empty();
-        let want_polling =
-            any_shell_alive || any_subsystem_alive || any_forward_alive || any_agent_fwd_alive;
+        // Same for X11 forwarding: each active display listener spins up
+        // `x11` channel-opens asynchronously and needs the 50 ms polling
+        // tick to flush them.
+        let any_x11_fwd_alive = !x11_forward.active.is_empty();
+        let want_polling = any_shell_alive
+            || any_subsystem_alive
+            || any_forward_alive
+            || any_agent_fwd_alive
+            || any_x11_fwd_alive;
         if want_polling && !*polling_active {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             *polling_active = true;
@@ -1269,6 +1481,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             drain_subsystems(stream, codec, rng, conn, subsystems)?;
             forward.drain_pending(stream, codec, rng, conn)?;
             agent_forward.drain_pending(stream, codec, rng, conn)?;
+            x11_forward.drain_pending(stream, codec, rng, conn)?;
         }
 
         if *any_channel_opened
@@ -1276,6 +1489,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             && deferred.is_empty()
             && !any_forward_alive
             && !any_agent_fwd_alive
+            && !any_x11_fwd_alive
         {
             return Ok(());
         }
@@ -1351,6 +1565,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             envs,
             forward,
             agent_forward,
+            x11_forward,
         )?;
     }
 }
@@ -1621,6 +1836,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     envs: &mut BTreeMap<u32, SessionEnv>,
     forward: &mut ForwardConn,
     agent_forward: &mut AgentForwardConn,
+    x11_forward: &mut X11ForwardConn,
 ) -> Result<()> {
     let ev = conn.on_packet(payload)?;
     match ev {
@@ -1629,9 +1845,9 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             // SubsystemRuntime + ChannelStream pair, register the runtime
             // in `subsystems` so the existing dispatch routes
             // Data/Eof/Close, and hand the stream to the handler thread
-            // via the reply slot. Two open paths feed into this branch:
-            // `forwarded-tcpip` (ssh -R) and `auth-agent@openssh.com`
-            // (ssh -A).
+            // via the reply slot. Three open paths feed into this branch:
+            // `forwarded-tcpip` (ssh -R), `auth-agent@openssh.com`
+            // (ssh -A), and `x11` (ssh -X / -Y).
             if let Some(reply) = forward.pending_opens.remove(&channel) {
                 let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
                 let (egress_tx, egress_rx) =
@@ -1676,6 +1892,25 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                     },
                 );
                 let _ = reply.send(Ok(cs));
+            } else if let Some(reply) = x11_forward.pending_opens.remove(&channel) {
+                // Symmetric with the agent-forward arm, for `x11`.
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                let cs = ChannelStream::new(ingress_rx, egress_tx);
+                subsystems.insert(
+                    channel,
+                    SubsystemRuntime {
+                        ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+                let _ = reply.send(Ok(cs));
             }
         }
         ChannelEvent::OpenFailed {
@@ -1689,6 +1924,8 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 )));
             } else if let Some(reply) = agent_forward.pending_opens.remove(&channel) {
                 let _ = reply.send(Err(Error::Protocol("auth-agent: open rejected by peer")));
+            } else if let Some(reply) = x11_forward.pending_opens.remove(&channel) {
+                let _ = reply.send(Err(Error::Protocol("x11: open rejected by peer")));
             }
         }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
@@ -1780,6 +2017,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 subsystems,
                 envs,
                 agent_forward,
+                x11_forward,
             )?;
         }
         ChannelEvent::Data { channel, data } => {
@@ -1849,6 +2087,9 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             // channel. The handle's `Drop` impl stops the accept thread and
             // unlinks the on-disk socket.
             agent_forward.active.remove(&channel);
+            // Same for X11: drop the display listener and unlink any
+            // associated state.
+            x11_forward.active.remove(&channel);
         }
         ChannelEvent::WindowAdjust { .. } => {}
         ChannelEvent::GlobalRequest {
@@ -1977,6 +2218,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
     envs: &mut BTreeMap<u32, SessionEnv>,
     agent_forward: &mut AgentForwardConn,
+    x11_forward: &mut X11ForwardConn,
 ) -> Result<()> {
     // Lazily allocate a per-channel env bag for any session-style channel
     // whose Open we somehow missed. Cheap insert; subsequent lookups are
@@ -2206,6 +2448,51 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                             .or_default()
                             .insert("SSH_AUTH_SOCK".to_string(), path_str);
                         agent_forward.active.insert(channel, handle);
+                        if want_reply {
+                            let p = conn.send_request_success(channel)?;
+                            write_payload(stream, codec, rng, &p)?;
+                        }
+                    }
+                    Err(_) => {
+                        if want_reply {
+                            let p = conn.send_request_failure(channel)?;
+                            write_payload(stream, codec, rng, &p)?;
+                        }
+                    }
+                }
+            } else if want_reply {
+                let p = conn.send_request_failure(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+        }
+        ChannelRequest::X11Req {
+            single_connection,
+            auth_protocol,
+            auth_cookie,
+            screen,
+        } => {
+            // RFC 4254 §6.3.1: client asks the server to set up a display
+            // proxy for *this* session channel. The handler binds a TCP
+            // listener on 127.0.0.1:6000+N for some free N; we inject
+            // `DISPLAY=<host>:N.<screen>` into the session's env bag so
+            // child shells / exec see it. The handle stays in
+            // `x11_forward.active` until the channel closes; its `Drop`
+            // impl stops the accept thread.
+            if let Some(handler) = cfg.x11_forward_handler.clone() {
+                let ctx = X11ForwardContext::new(x11_forward.req_tx.clone());
+                match handler.setup(
+                    user,
+                    single_connection,
+                    &auth_protocol,
+                    &auth_cookie,
+                    screen,
+                    ctx,
+                ) {
+                    Ok(handle) => {
+                        envs.entry(channel)
+                            .or_default()
+                            .insert("DISPLAY".to_string(), handle.display_env.clone());
+                        x11_forward.active.insert(channel, handle);
                         if want_reply {
                             let p = conn.send_request_success(channel)?;
                             write_payload(stream, codec, rng, &p)?;

@@ -38,7 +38,7 @@ const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
                      [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] \
-                     [-N] [-A] \
+                     [-N] [-A] [-X] [-Y] \
                      [user@]host [command...]";
 
 /// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
@@ -53,6 +53,18 @@ struct LocalForward {
     remote_host: String,
     /// Destination TCP port.
     remote_port: u16,
+}
+
+/// Parsed `-X` / `-Y` mode. `Untrusted` corresponds to `-X` (untrusted X11
+/// forwarding); `Trusted` to `-Y`. In v0 both modes emit identical wire
+/// arguments (`single_connection=false`, screen 0, generated cookie). The
+/// distinction is retained so a follow-up can split them — minting a fresh
+/// cookie via `xauth` for `-X` and forwarding the real `$XAUTHORITY` cookie
+/// for `-Y`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum X11Forward {
+    Untrusted,
+    Trusted,
 }
 
 /// Parsed `-R RPORT:LHOST:LPORT` spec — client asks the server to bind
@@ -84,6 +96,12 @@ struct Cli {
     /// `auth-agent@openssh.com` channels get spliced against
     /// `$SSH_AUTH_SOCK` via `ClientHandlers::on_auth_agent`.
     agent_forward: bool,
+    /// `-X` (untrusted) / `-Y` (trusted): ask the server to forward X11.
+    /// The lib sends `x11-req` on the session channel; incoming `x11`
+    /// channels get spliced against `$DISPLAY` via
+    /// `ClientHandlers::on_x11`. `None` = no X11; in v0 `-X` and `-Y`
+    /// both set the same wire arguments (no untrusted cookie minting).
+    x11_forward: Option<X11Forward>,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -148,6 +166,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut remotes: Vec<RemoteForward> = Vec::new();
     let mut no_command = false;
     let mut agent_forward = false;
+    let mut x11_forward: Option<X11Forward> = None;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -188,6 +207,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             "-A" => {
                 agent_forward = true;
+            }
+            "-X" => {
+                x11_forward = Some(X11Forward::Untrusted);
+            }
+            "-Y" => {
+                x11_forward = Some(X11Forward::Trusted);
             }
             "-o" => {
                 i += 1;
@@ -257,6 +282,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         remotes,
         no_command,
         agent_forward,
+        x11_forward,
         host,
         user_in_host,
         command,
@@ -348,18 +374,26 @@ fn run() -> Result<i32, String> {
     // session channel open (for the `auth-agent-req@openssh.com` request)
     // plus concurrent handling of incoming `auth-agent@openssh.com` channels,
     // which is exactly the multi-channel shape.
-    let want_forwarding =
-        cli.no_command || !cli.remotes.is_empty() || !cli.locals.is_empty() || cli.agent_forward;
+    let want_forwarding = cli.no_command
+        || !cli.remotes.is_empty()
+        || !cli.locals.is_empty()
+        || cli.agent_forward
+        || cli.x11_forward.is_some();
     if want_forwarding {
         if cli.command.is_some() {
             return Err(
-                "running a command alongside -A/-L/-R/-N is not yet supported; \
+                "running a command alongside -A/-L/-R/-N/-X/-Y is not yet supported; \
                         invoke ssh twice or wire the forward without a command"
                     .into(),
             );
         }
-        if cli.no_command && cli.remotes.is_empty() && cli.locals.is_empty() && !cli.agent_forward {
-            return Err("-N requires at least one of -A, -L, -R".into());
+        if cli.no_command
+            && cli.remotes.is_empty()
+            && cli.locals.is_empty()
+            && !cli.agent_forward
+            && cli.x11_forward.is_none()
+        {
+            return Err("-N requires at least one of -A, -L, -R, -X, -Y".into());
         }
         return run_forwarding(client, &cli);
     }
@@ -517,6 +551,43 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
         None
     };
 
+    // -X / -Y: install an `on_x11` callback that splices each incoming `x11`
+    // channel against the local `$DISPLAY`, then open a session channel up
+    // front so `x11-req` can ride on it. The channel stays open for the
+    // lifetime of the serve loop. We close it at the end so the server
+    // tears down its display listener.
+    //
+    // v0: `-X` and `-Y` are identical on the wire — both send
+    // `single_connection=false`, screen 0, MIT-MAGIC-COOKIE-1, and a fresh
+    // random cookie (we don't yet shell out to `xauth` for the real one).
+    // The server passes the cookie through to the on-server display socket
+    // verbatim; the local `on_x11` callback splices against `$DISPLAY`
+    // without rewriting the X-protocol auth record. Cookie substitution
+    // (untrusted-X11 isolation) is a follow-up.
+    let x11_fwd_channel: Option<u32> = if let Some(mode) = cli.x11_forward {
+        use puressh::forwarding::x11::splice_to_local_display_callback;
+        let cb = splice_to_local_display_callback().ok_or_else(|| {
+            "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial".to_string()
+        })?;
+        handlers = handlers.with_x11(cb);
+        let cookie = mint_x11_cookie();
+        let id = client
+            .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", &cookie, 0)
+            .map_err(|e| format!("x11-forward session: {e}"))?;
+        eprintln!(
+            "ssh: -{} X11 forwarding requested (cookie={} chars)",
+            if mode == X11Forward::Trusted {
+                "Y"
+            } else {
+                "X"
+            },
+            cookie.len(),
+        );
+        Some(id)
+    } else {
+        None
+    };
+
     // -L: bind every configured local-forward listener and hand each one a
     // clone of the ServeContext so its accept thread can open `direct-tcpip`
     // through the running serve loop.
@@ -544,6 +615,10 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
 
     // Tear down the agent-forwarding session channel if we opened one.
     if let Some(id) = agent_fwd_channel {
+        let _ = client.close_session(id);
+    }
+    // Same for the X11-forwarding session channel.
+    if let Some(id) = x11_fwd_channel {
         let _ = client.close_session(id);
     }
     // Hold the original ctx until serve returns so cmd_tx isn't dropped
@@ -588,6 +663,33 @@ fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: 
             spawn_splice_to_tcp(stream, tcp);
         }
     });
+}
+
+/// Mint a fresh MIT-MAGIC-COOKIE-1 value (32 hex chars from 16 random bytes).
+/// OpenSSH normally reads the real cookie out of `$XAUTHORITY` via `xauth
+/// list`; we don't yet, so untrusted (`-X`) and trusted (`-Y`) currently
+/// share the same generated cookie.
+fn mint_x11_cookie() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = std::io::Read::read_exact(&mut f, &mut bytes);
+    }
+    // Mix in PID + nanosecond clock just in case /dev/urandom fell short.
+    // 32 bits per source is plenty here — the cookie is opaque to us.
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    bytes[0] ^= (pid & 0xff) as u8;
+    bytes[1] ^= ((pid >> 8) & 0xff) as u8;
+    bytes[2] ^= (nanos & 0xff) as u8;
+    bytes[3] ^= ((nanos >> 8) & 0xff) as u8;
+    let mut s = String::with_capacity(32);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn main() -> ExitCode {

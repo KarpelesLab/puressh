@@ -25,9 +25,19 @@
 //!   the client proxies to its own local agent. Server-side glue lives
 //!   in [`agent::DefaultAgentForwardHandler`] plus the
 //!   [`crate::server::AgentForwardHandler`] trait.
+//! - **`x11-req`** + **`x11`** (RFC 4254 §6.3, `ssh -X` / `ssh -Y`):
+//!   the client asks the server to set up an X display proxy. The
+//!   server binds `127.0.0.1:6000+N` for some free display number `N`
+//!   and injects `DISPLAY=localhost:N.<screen>` into the session env.
+//!   Each accepted TCP connection on that port triggers an `x11`
+//!   channel-open back toward the client, which the client proxies to
+//!   its own local `$DISPLAY`. Server-side glue lives in
+//!   [`x11::DefaultX11ForwardHandler`] plus the
+//!   [`crate::server::X11ForwardHandler`] trait.
 
 #![cfg(feature = "std")]
 
 pub mod agent;
 pub mod direct;
 pub mod reverse;
+pub mod x11;

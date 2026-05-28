@@ -327,6 +327,36 @@ fn auth_agent_open_round_trip() {
 }
 
 #[test]
+fn x11_open_round_trip() {
+    let (mut client, mut server) = pair();
+    let open = ChannelOpen::X11 {
+        orig_host: "127.0.0.1".to_string(),
+        orig_port: 6010,
+    };
+    let (_, payload) = client.open(open.clone()).unwrap();
+    let ev = server.on_packet(&payload).unwrap();
+    match ev {
+        ChannelEvent::OpenRequest { kind, .. } => assert_eq!(kind, open),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn x11_req_request_round_trip() {
+    let req = ChannelRequest::X11Req {
+        single_connection: false,
+        auth_protocol: "MIT-MAGIC-COOKIE-1".to_string(),
+        auth_cookie: "deadbeefcafef00d".to_string(),
+        screen: 0,
+    };
+    let mut w = crate::format::Writer::new();
+    req.encode(&mut w);
+    let decoded = ChannelRequest::decode("x11-req", w.as_slice()).unwrap();
+    assert_eq!(decoded, req);
+    assert_eq!(req.name(), "x11-req");
+}
+
+#[test]
 fn auth_agent_req_request_round_trip() {
     let req = ChannelRequest::AuthAgentReq;
     let mut w = crate::format::Writer::new();

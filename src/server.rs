@@ -2,11 +2,11 @@
 //!
 //! ```ignore
 //! use std::sync::Arc;
-//! use puressh::server::{Server, Config, CommandHandler, ExecResult};
+//! use puressh::server::{Server, Config, CommandHandler, ExecResult, SessionEnv};
 //!
 //! struct H;
 //! impl CommandHandler for H {
-//!     fn handle(&self, _user: &str, _cmd: &str) -> ExecResult {
+//!     fn handle(&self, _user: &str, _env: &SessionEnv, _cmd: &str) -> ExecResult {
 //!         ExecResult { stdout: b"ok\n".to_vec(), stderr: Vec::new(), exit_status: 0 }
 //!     }
 //! }
@@ -72,11 +72,61 @@ pub struct ExecResult {
     pub exit_status: u32,
 }
 
+/// Per-session environment-variable bag, surfaced to every handler that
+/// spawns or runs anything on behalf of `user`.
+///
+/// Three things populate it: client-sent `"env"` channel requests, the
+/// server's own injection points (currently agent-forwarding's
+/// `SSH_AUTH_SOCK`), and nothing else. Handlers read it via [`Self::get`] or
+/// [`Self::iter`] and apply the variables when they `fork+exec` or spawn an
+/// in-process subsystem. Implementations decide which keys to honour — the
+/// type itself does not filter.
+#[derive(Debug, Default, Clone)]
+pub struct SessionEnv {
+    vars: BTreeMap<String, String>,
+}
+
+impl SessionEnv {
+    /// An empty environment.
+    pub fn new() -> Self {
+        Self {
+            vars: BTreeMap::new(),
+        }
+    }
+
+    /// Insert or overwrite a key. Returns the previous value if any.
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
+        self.vars.insert(key.into(), value.into())
+    }
+
+    /// Borrow a value by key.
+    pub fn get(&self, key: &str) -> Option<&str> {
+        self.vars.get(key).map(|s| s.as_str())
+    }
+
+    /// Iterate over `(key, value)` pairs in key order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.vars.len()
+    }
+
+    /// True when nothing has been set.
+    pub fn is_empty(&self) -> bool {
+        self.vars.is_empty()
+    }
+}
+
 /// Server-side hook called when a client sends a `"exec"` channel request.
 pub trait CommandHandler: Send + Sync {
     /// Run `command` on behalf of `user` and return its full output and exit
-    /// code. Called inside the per-connection thread.
-    fn handle(&self, user: &str, command: &str) -> ExecResult;
+    /// code. Called inside the per-connection thread. `env` carries every
+    /// variable accumulated on this session (client `"env"` requests +
+    /// server-side injections like agent forwarding's `SSH_AUTH_SOCK`).
+    fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult;
 }
 
 /// Per-channel state for an interactive shell session, owned by
@@ -160,8 +210,15 @@ pub trait ShellHandler: Send + Sync {
     /// the implementation must allocate a pseudo-terminal and apply the
     /// requested geometry / modes (best-effort). If `pty` is `None`, the
     /// implementation may run the shell with bare pipes — that path is
-    /// what `ssh -T` triggers.
-    fn spawn(&self, user: &str, pty: Option<PtySpec>) -> Result<Box<dyn ShellSession>>;
+    /// what `ssh -T` triggers. `env` carries every accumulated session
+    /// variable, which the implementation is responsible for forwarding to
+    /// the child process.
+    fn spawn(
+        &self,
+        user: &str,
+        env: &SessionEnv,
+        pty: Option<PtySpec>,
+    ) -> Result<Box<dyn ShellSession>>;
 }
 
 /// One running shell process. All methods are non-blocking; the server
@@ -222,8 +279,13 @@ pub type SessionOpenCallback = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
 /// the connection. Return `Ok(())` to close the channel gracefully — the
 /// dispatcher emits EOF + Close when the stream drops.
 pub trait SubsystemHandler: Send + Sync {
-    /// Run subsystem `name` on behalf of `user` over `stream`.
-    fn handle(&self, user: &str, name: &str, stream: ChannelStream) -> Result<()>;
+    /// Run subsystem `name` on behalf of `user` over `stream`. `env`
+    /// reflects the accumulated session environment at the moment the
+    /// subsystem was requested; it is captured by-value into the handler
+    /// thread so subsequent client `"env"` requests don't race the
+    /// running subsystem.
+    fn handle(&self, user: &str, env: &SessionEnv, name: &str, stream: ChannelStream)
+        -> Result<()>;
 }
 
 /// Server-side hook called when a client sends an `"exec"` channel request,
@@ -256,8 +318,10 @@ pub trait ExecStreamHandler: Send + Sync {
     fn claims(&self, command: &str) -> bool;
     /// Execute the claimed command on a dedicated thread. The handler
     /// owns `stream` until it returns; on return the stream drops,
-    /// emitting `EOF`+`Close` automatically.
-    fn run(&self, user: &str, command: &str, stream: ChannelStream) -> Result<()>;
+    /// emitting `EOF`+`Close` automatically. `env` is a snapshot of the
+    /// session-level environment at the time of the claim.
+    fn run(&self, user: &str, env: &SessionEnv, command: &str, stream: ChannelStream)
+        -> Result<()>;
 }
 
 /// Decoded `direct-tcpip` channel-open request (RFC 4254 §7.2).
@@ -422,6 +486,103 @@ pub trait TcpipForwardHandler: Send + Sync {
     fn unbind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<()>;
 }
 
+/// Per-session-channel handle used by an [`AgentForwardHandler`] to ask the
+/// per-connection server loop to open an `auth-agent@openssh.com` channel
+/// back toward the client (OpenSSH pseudo-extension; same mechanism as
+/// `forwarded-tcpip` but for ssh-agent traffic).
+///
+/// One instance is supplied to each successful
+/// [`AgentForwardHandler::setup`]; it stays valid for the lifetime of that
+/// session channel (i.e. until the channel closes and the dispatcher drops
+/// the matching [`AgentForwardHandle`]).
+#[derive(Clone)]
+pub struct AgentForwardContext {
+    /// Sender into the per-connection agent-open mpsc queue. The connection
+    /// loop on the receiver end translates each request into an
+    /// `SSH_MSG_CHANNEL_OPEN auth-agent@openssh.com` and parks the reply slot
+    /// until the matching `OPEN_CONFIRMATION` / `OPEN_FAILURE` lands.
+    req_tx: Sender<AgentOpenRequest>,
+}
+
+/// One pending server-initiated `auth-agent@openssh.com` open. Carries only
+/// the reply slot — the channel-open itself has no extra payload per the
+/// OpenSSH wire format.
+pub(crate) struct AgentOpenRequest {
+    /// One-shot reply slot. `Ok(stream)` after `OPEN_CONFIRMATION`,
+    /// `Err(_)` after `OPEN_FAILURE` or connection teardown.
+    reply: std::sync::mpsc::SyncSender<Result<ChannelStream>>,
+}
+
+impl AgentForwardContext {
+    /// Used by the connection loop; not for user code.
+    pub(crate) fn new(req_tx: Sender<AgentOpenRequest>) -> Self {
+        Self { req_tx }
+    }
+
+    /// Build an [`AgentForwardContext`] whose [`Self::open_auth_agent`]
+    /// calls always fail (the request mpsc has no receiver). Useful for
+    /// unit tests that only exercise `setup` and never accept on the
+    /// agent socket.
+    #[doc(hidden)]
+    pub fn for_test_no_opens() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        drop(_rx);
+        Self { req_tx: tx }
+    }
+
+    /// Ask the connection loop to open an `auth-agent@openssh.com` channel
+    /// back toward the client. Blocks until the client confirms or rejects.
+    ///
+    /// On success returns a [`ChannelStream`] connected to the new channel.
+    /// Drop the stream when the local Unix socket connection hangs up.
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the underlying SSH connection
+    /// has gone away or the client rejected the open.
+    pub fn open_auth_agent(&self) -> Result<ChannelStream> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.req_tx
+            .send(AgentOpenRequest { reply: tx })
+            .map_err(|_| Error::Protocol("auth-agent: connection closed"))?;
+        rx.recv()
+            .map_err(|_| Error::Protocol("auth-agent: reply dropped"))?
+    }
+}
+
+/// Handle returned by [`AgentForwardHandler::setup`]. The connection loop
+/// inserts the handle into a per-session-channel map and drops it when the
+/// session closes. Dropping the handle must tear down the listener thread
+/// and unlink the on-disk socket.
+pub struct AgentForwardHandle {
+    /// Path that should be exposed as `SSH_AUTH_SOCK` in the environment of
+    /// programs spawned on this session. Typically inside `$XDG_RUNTIME_DIR`
+    /// or `/tmp` with mode 0700.
+    pub auth_sock_path: std::path::PathBuf,
+    /// Stop guard: any `Send`/`Sync` value whose `Drop` impl terminates the
+    /// accept loop and removes the socket. The dispatcher does not look
+    /// inside this box — it just drops it on session close.
+    pub stopper: Box<dyn core::any::Any + Send + Sync>,
+}
+
+/// Server-side hook for `auth-agent-req@openssh.com`
+/// (the channel request OpenSSH sends when the client asked for `-A`).
+///
+/// The default implementation in
+/// [`crate::forwarding::agent::DefaultAgentForwardHandler`] binds a Unix
+/// socket under `$XDG_RUNTIME_DIR` (or `/tmp` fallback) with mode 0600 and
+/// — via the [`AgentForwardContext`] passed to `setup` — opens a
+/// server-initiated `auth-agent@openssh.com` channel back to the client for
+/// every accepted Unix socket connection.
+///
+/// Implementations must be safe to share across connections.
+pub trait AgentForwardHandler: Send + Sync {
+    /// Establish agent forwarding for a single session channel. Return a
+    /// handle whose `auth_sock_path` is injected into the session's
+    /// `SSH_AUTH_SOCK` env, and whose `stopper` is dropped (terminating the
+    /// listener) when the session channel closes. An `Err` causes the
+    /// server to reply `CHANNEL_FAILURE` and leave the env unchanged.
+    fn setup(&self, user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle>;
+}
+
 /// Server configuration: host keys, authentication, and the exec hook.
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
@@ -466,6 +627,14 @@ pub struct Config {
     /// server-initiated `forwarded-tcpip` channel-open lands in a
     /// follow-up phase, accepted connections are dropped.
     pub tcpip_forward_handler: Option<Arc<dyn TcpipForwardHandler>>,
+    /// Optional `auth-agent-req@openssh.com` channel-request hook (i.e. the
+    /// server side of `ssh -A`). When `None` (the default), every
+    /// `auth-agent-req@openssh.com` request is answered with `CHANNEL_FAILURE`
+    /// and no agent socket is created. Set this to
+    /// [`crate::forwarding::agent::DefaultAgentForwardHandler`] to bind a
+    /// per-session Unix socket and proxy connections to the client's local
+    /// agent via server-initiated `auth-agent@openssh.com` channel-opens.
+    pub agent_forward_handler: Option<Arc<dyn AgentForwardHandler>>,
     /// Optional callback invoked once per connection, after authentication
     /// has succeeded but before any channel request is processed. Returning
     /// `Err` aborts the connection. Typical use: drop privileges (setgid /
@@ -496,6 +665,7 @@ impl Config {
             subsystem_handler: None,
             direct_tcpip_handler: None,
             tcpip_forward_handler: None,
+            agent_forward_handler: None,
             on_session_open: None,
             rekey_policy: RekeyPolicy::default(),
         }
@@ -539,6 +709,14 @@ impl Config {
     /// `ssh -R`) is answered with `REQUEST_FAILURE`.
     pub fn with_tcpip_forward(mut self, handler: Arc<dyn TcpipForwardHandler>) -> Self {
         self.tcpip_forward_handler = Some(handler);
+        self
+    }
+
+    /// Attach an `AgentForwardHandler`. Without one, every
+    /// `auth-agent-req@openssh.com` channel request (i.e. `ssh -A`) is
+    /// answered with `CHANNEL_FAILURE` and no agent forwarding is set up.
+    pub fn with_agent_forward(mut self, handler: Arc<dyn AgentForwardHandler>) -> Self {
+        self.agent_forward_handler = Some(handler);
         self
     }
 
@@ -850,6 +1028,61 @@ impl ForwardConn {
     }
 }
 
+/// Per-connection state for server-initiated `auth-agent@openssh.com`
+/// channel opens (`ssh -A` traffic). Mirrors [`ForwardConn`] but for the
+/// payload-free OpenSSH agent extension: the accept loop inside an
+/// [`AgentForwardHandler`] pushes [`AgentOpenRequest`]s here; the connection
+/// loop drains them, emits `SSH_MSG_CHANNEL_OPEN`, and parks the reply slot
+/// in `pending_opens` until the client confirms or rejects.
+///
+/// `active` keys [`AgentForwardHandle`]s by **session** channel id, not by
+/// the agent-channel id — the handle is the per-session listener and we
+/// drop it when the session channel closes (not when an individual agent
+/// channel closes; one session can pump many agent connections).
+struct AgentForwardConn {
+    req_tx: Sender<AgentOpenRequest>,
+    req_rx: Receiver<AgentOpenRequest>,
+    /// Local channel id of an in-flight agent channel-open -> reply slot.
+    pending_opens: BTreeMap<u32, std::sync::mpsc::SyncSender<Result<ChannelStream>>>,
+    /// Per-session-channel handles keeping listener threads alive.
+    active: BTreeMap<u32, AgentForwardHandle>,
+}
+
+impl AgentForwardConn {
+    fn new() -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        Self {
+            req_tx,
+            req_rx,
+            pending_opens: BTreeMap::new(),
+            active: BTreeMap::new(),
+        }
+    }
+
+    /// Emit one `SSH_MSG_CHANNEL_OPEN auth-agent@openssh.com` per queued
+    /// request. Pending-reply entries land in `self.pending_opens` keyed by
+    /// the freshly-allocated local id.
+    fn drain_pending<R: RngCore + CryptoRng>(
+        &mut self,
+        stream: &mut TcpStream,
+        codec: &mut PacketCodec,
+        rng: &mut R,
+        conn: &mut ConnectionState,
+    ) -> Result<()> {
+        loop {
+            match self.req_rx.try_recv() {
+                Ok(req) => {
+                    let (local_id, payload) = conn.open(ChannelOpen::AuthAgent)?;
+                    write_payload(stream, codec, rng, &payload)?;
+                    self.pending_opens.insert(local_id, req.reply);
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn do_connection_phase<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
@@ -878,7 +1111,15 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // `shells`: same polling cadence, same dispatch routing for Data /
     // EOF / Close.
     let mut subsystems: BTreeMap<u32, SubsystemRuntime> = BTreeMap::new();
+    // Per-session-channel environment bag. Populated by client `"env"`
+    // requests; handed by reference to every CommandHandler / ShellHandler /
+    // SubsystemHandler / ExecStreamHandler call. Lives at session-channel
+    // granularity because RFC 4254 §6.4 scopes env to the channel.
+    let mut envs: BTreeMap<u32, SessionEnv> = BTreeMap::new();
     let mut forward = ForwardConn::new();
+    // Per-connection agent-forward queue + active handles. Empty until at
+    // least one session channel requests `auth-agent-req@openssh.com`.
+    let mut agent_forward = AgentForwardConn::new();
     let mut polling_active = false;
     let result = do_connection_loop(
         stream,
@@ -898,7 +1139,9 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         &mut deferred,
         &mut shells,
         &mut subsystems,
+        &mut envs,
         &mut forward,
+        &mut agent_forward,
         &mut polling_active,
     );
     // On teardown — successful or otherwise — release every binding so the
@@ -913,6 +1156,13 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         let _ = reply.send(Err(Error::Protocol(
             "forwarded-tcpip: connection torn down",
         )));
+    }
+    // Tear down every agent-forward listener (their handles' Drop impls do
+    // the actual unlink + thread-stop) and notify in-flight agent opens
+    // that we're gone.
+    agent_forward.active.clear();
+    for (_id, reply) in agent_forward.pending_opens.drain_filter_compat() {
+        let _ = reply.send(Err(Error::Protocol("auth-agent: connection torn down")));
     }
     result
 }
@@ -956,7 +1206,9 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
     deferred: &mut Vec<Vec<u8>>,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    envs: &mut BTreeMap<u32, SessionEnv>,
     forward: &mut ForwardConn,
+    agent_forward: &mut AgentForwardConn,
     polling_active: &mut bool,
 ) -> Result<()> {
     loop {
@@ -980,7 +1232,9 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                 any_channel_opened,
                 shells,
                 subsystems,
+                envs,
                 forward,
+                agent_forward,
             )?;
             continue;
         }
@@ -992,7 +1246,12 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         let any_shell_alive = shells.values().any(|rt| rt.session.is_some());
         let any_subsystem_alive = !subsystems.is_empty();
         let any_forward_alive = !forward.owned_bindings.is_empty();
-        let want_polling = any_shell_alive || any_subsystem_alive || any_forward_alive;
+        // An active agent-forwarder pumps `auth-agent@openssh.com` opens
+        // asynchronously from a listener thread; keep the loop polling so
+        // its `drain_pending` runs on the same 50 ms tick.
+        let any_agent_fwd_alive = !agent_forward.active.is_empty();
+        let want_polling =
+            any_shell_alive || any_subsystem_alive || any_forward_alive || any_agent_fwd_alive;
         if want_polling && !*polling_active {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             *polling_active = true;
@@ -1009,12 +1268,14 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             finalize_exited_shells(stream, codec, rng, conn, shells)?;
             drain_subsystems(stream, codec, rng, conn, subsystems)?;
             forward.drain_pending(stream, codec, rng, conn)?;
+            agent_forward.drain_pending(stream, codec, rng, conn)?;
         }
 
         if *any_channel_opened
             && !conn.channels().any(|c| !c.is_fully_closed())
             && deferred.is_empty()
             && !any_forward_alive
+            && !any_agent_fwd_alive
         {
             return Ok(());
         }
@@ -1087,7 +1348,9 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             any_channel_opened,
             shells,
             subsystems,
+            envs,
             forward,
+            agent_forward,
         )?;
     }
 }
@@ -1355,17 +1618,20 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     any_channel_opened: &mut bool,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    envs: &mut BTreeMap<u32, SessionEnv>,
     forward: &mut ForwardConn,
+    agent_forward: &mut AgentForwardConn,
 ) -> Result<()> {
     let ev = conn.on_packet(payload)?;
     match ev {
         ChannelEvent::OpenConfirmed { channel } => {
-            // Server-initiated `forwarded-tcpip` open landing back. Build
-            // a fresh SubsystemRuntime + ChannelStream pair, register the
-            // runtime in `subsystems` so the existing dispatch routes
+            // Server-initiated open landing back. Build a fresh
+            // SubsystemRuntime + ChannelStream pair, register the runtime
+            // in `subsystems` so the existing dispatch routes
             // Data/Eof/Close, and hand the stream to the handler thread
-            // via the reply slot. Anything else we initiated is silently
-            // ignored (no other open paths exist on the server yet).
+            // via the reply slot. Two open paths feed into this branch:
+            // `forwarded-tcpip` (ssh -R) and `auth-agent@openssh.com`
+            // (ssh -A).
             if let Some(reply) = forward.pending_opens.remove(&channel) {
                 let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
                 let (egress_tx, egress_rx) =
@@ -1388,6 +1654,28 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 // dispatcher will tear it down when egress goes
                 // disconnected.
                 let _ = reply.send(Ok(cs));
+            } else if let Some(reply) = agent_forward.pending_opens.remove(&channel) {
+                // Symmetric with the `forwarded-tcpip` arm: register a
+                // SubsystemRuntime so Data/Eof/Close on the agent channel
+                // ride the same dispatch path, then hand the user-facing
+                // ChannelStream to the waiting accept-loop thread.
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                let cs = ChannelStream::new(ingress_rx, egress_tx);
+                subsystems.insert(
+                    channel,
+                    SubsystemRuntime {
+                        ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+                let _ = reply.send(Ok(cs));
             }
         }
         ChannelEvent::OpenFailed {
@@ -1399,6 +1687,8 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 let _ = reply.send(Err(Error::Protocol(
                     "forwarded-tcpip: open rejected by peer",
                 )));
+            } else if let Some(reply) = agent_forward.pending_opens.remove(&channel) {
+                let _ = reply.send(Err(Error::Protocol("auth-agent: open rejected by peer")));
             }
         }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
@@ -1406,6 +1696,10 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 *any_channel_opened = true;
                 let p = conn.accept_open(channel)?;
                 write_payload(stream, codec, rng, &p)?;
+                // Allocate an empty per-channel env bag. Client `"env"`
+                // requests append to it; handlers read it on `exec` / `shell`
+                // / `subsystem` dispatch.
+                envs.insert(channel, SessionEnv::new());
             }
             ChannelOpen::DirectTcpip {
                 dest_host,
@@ -1472,8 +1766,20 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             want_reply,
         } => {
             handle_channel_request(
-                stream, codec, rng, inbox, conn, cfg, user, channel, request, want_reply, shells,
+                stream,
+                codec,
+                rng,
+                inbox,
+                conn,
+                cfg,
+                user,
+                channel,
+                request,
+                want_reply,
+                shells,
                 subsystems,
+                envs,
+                agent_forward,
             )?;
         }
         ChannelEvent::Data { channel, data } => {
@@ -1538,6 +1844,11 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             // Dropping the SubsystemRuntime closes `ingress_tx`; the handler
             // thread's next `Read` returns `Ok(0)` and the thread exits.
             subsystems.remove(&channel);
+            envs.remove(&channel);
+            // Tear down any agent-forward listener bound to this session
+            // channel. The handle's `Drop` impl stops the accept thread and
+            // unlinks the on-disk socket.
+            agent_forward.active.remove(&channel);
         }
         ChannelEvent::WindowAdjust { .. } => {}
         ChannelEvent::GlobalRequest {
@@ -1664,7 +1975,13 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     want_reply: bool,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    envs: &mut BTreeMap<u32, SessionEnv>,
+    agent_forward: &mut AgentForwardConn,
 ) -> Result<()> {
+    // Lazily allocate a per-channel env bag for any session-style channel
+    // whose Open we somehow missed. Cheap insert; subsequent lookups are
+    // O(log n) on the BTreeMap.
+    let empty_env = SessionEnv::new();
     match request {
         ChannelRequest::Exec { command } => {
             // First-chance overlay: ask the ExecStreamHandler (if any)
@@ -1683,11 +2000,13 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
                     let user_owned = user.to_string();
                     let command_owned = command.clone();
+                    let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
                     let handler_for_thread = handler;
                     thread::spawn(move || {
                         // Errors swallowed: the stream auto-emits
                         // EOF + Close on drop, so the peer sees teardown.
-                        let _ = handler_for_thread.run(&user_owned, &command_owned, cs);
+                        let _ =
+                            handler_for_thread.run(&user_owned, &env_snapshot, &command_owned, cs);
                     });
                     subsystems.insert(
                         channel,
@@ -1709,7 +2028,8 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 }
                 // Not claimed — fall through to the buffered CommandHandler.
             }
-            let result = cfg.command_handler.handle(user, &command);
+            let env_ref = envs.get(&channel).unwrap_or(&empty_env);
+            let result = cfg.command_handler.handle(user, env_ref, &command);
             if want_reply {
                 let p = conn.send_request_success(channel)?;
                 write_payload(stream, codec, rng, &p)?;
@@ -1781,7 +2101,8 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             if let Some(handler) = cfg.shell_handler.clone() {
                 let rt = shells.entry(channel).or_insert_with(ShellRuntime::new);
                 let pty = rt.pending_pty.take();
-                match handler.spawn(user, pty) {
+                let env_ref = envs.get(&channel).unwrap_or(&empty_env);
+                match handler.spawn(user, env_ref, pty) {
                     Ok(sess) => {
                         rt.session = Some(sess);
                         if want_reply {
@@ -1818,6 +2139,18 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 }
             }
         }
+        ChannelRequest::Env { name, value } => {
+            // RFC 4254 §6.4: env is scoped to the session channel. We
+            // accumulate every accepted variable; handlers reading the bag
+            // see them at exec / shell / subsystem dispatch time. No
+            // filtering — the implementation that consumes the env decides
+            // what to honour.
+            envs.entry(channel).or_default().insert(name, value);
+            if want_reply {
+                let p = conn.send_request_success(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+        }
         ChannelRequest::Subsystem { name } => {
             if let Some(handler) = cfg.subsystem_handler.clone() {
                 // Ingress: unbounded — the dispatcher must never block on
@@ -1829,11 +2162,12 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 let cs = ChannelStream::new(ingress_rx, egress_tx);
                 let user_owned = user.to_string();
                 let name_owned = name.clone();
+                let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
                 thread::spawn(move || {
                     // Errors from the handler are swallowed: the stream
                     // drops on return, which auto-emits EOF + Close so the
                     // peer sees a clean teardown.
-                    let _ = handler.handle(&user_owned, &name_owned, cs);
+                    let _ = handler.handle(&user_owned, &env_snapshot, &name_owned, cs);
                 });
                 subsystems.insert(
                     channel,
@@ -1850,6 +2184,39 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 if want_reply {
                     let p = conn.send_request_success(channel)?;
                     write_payload(stream, codec, rng, &p)?;
+                }
+            } else if want_reply {
+                let p = conn.send_request_failure(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+            }
+        }
+        ChannelRequest::AuthAgentReq => {
+            // OpenSSH pseudo-extension: client asks the server to set up an
+            // SSH_AUTH_SOCK proxy for *this* session channel. The handler
+            // binds a Unix socket (path injected into the session's env);
+            // the handle stays in `agent_forward.active` until the channel
+            // closes, at which point its `Drop` impl tears the listener
+            // down and unlinks the socket.
+            if let Some(handler) = cfg.agent_forward_handler.clone() {
+                let ctx = AgentForwardContext::new(agent_forward.req_tx.clone());
+                match handler.setup(user, ctx) {
+                    Ok(handle) => {
+                        let path_str = handle.auth_sock_path.to_string_lossy().into_owned();
+                        envs.entry(channel)
+                            .or_default()
+                            .insert("SSH_AUTH_SOCK".to_string(), path_str);
+                        agent_forward.active.insert(channel, handle);
+                        if want_reply {
+                            let p = conn.send_request_success(channel)?;
+                            write_payload(stream, codec, rng, &p)?;
+                        }
+                    }
+                    Err(_) => {
+                        if want_reply {
+                            let p = conn.send_request_failure(channel)?;
+                            write_payload(stream, codec, rng, &p)?;
+                        }
+                    }
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
@@ -2116,7 +2483,7 @@ mod tests {
     }
 
     impl CommandHandler for StaticHandler {
-        fn handle(&self, _user: &str, _command: &str) -> ExecResult {
+        fn handle(&self, _user: &str, _env: &SessionEnv, _command: &str) -> ExecResult {
             ExecResult {
                 stdout: self.out.clone(),
                 stderr: Vec::new(),
@@ -2193,7 +2560,12 @@ mod tests {
     }
 
     impl ShellHandler for MemoryShellHandler {
-        fn spawn(&self, user: &str, pty: Option<PtySpec>) -> Result<Box<dyn ShellSession>> {
+        fn spawn(
+            &self,
+            user: &str,
+            _env: &SessionEnv,
+            pty: Option<PtySpec>,
+        ) -> Result<Box<dyn ShellSession>> {
             {
                 let mut st = self.shell.inner.lock().unwrap();
                 st.pty = pty;
@@ -2583,7 +2955,13 @@ mod tests {
     }
 
     impl SubsystemHandler for EchoUpperSubsystem {
-        fn handle(&self, user: &str, name: &str, mut stream: ChannelStream) -> Result<()> {
+        fn handle(
+            &self,
+            user: &str,
+            _env: &SessionEnv,
+            name: &str,
+            mut stream: ChannelStream,
+        ) -> Result<()> {
             *self.captured_name.lock().unwrap() = Some(name.to_string());
             *self.captured_user.lock().unwrap() = Some(user.to_string());
 
@@ -2793,7 +3171,13 @@ mod tests {
     }
 
     impl SubsystemHandler for SftpSubsystem {
-        fn handle(&self, _user: &str, name: &str, stream: ChannelStream) -> Result<()> {
+        fn handle(
+            &self,
+            _user: &str,
+            _env: &SessionEnv,
+            name: &str,
+            stream: ChannelStream,
+        ) -> Result<()> {
             if name != "sftp" {
                 return Ok(());
             }

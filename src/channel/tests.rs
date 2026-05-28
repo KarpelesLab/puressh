@@ -315,6 +315,29 @@ fn forwarded_tcpip_open_round_trip() {
 }
 
 #[test]
+fn auth_agent_open_round_trip() {
+    let (mut client, mut server) = pair();
+    let open = ChannelOpen::AuthAgent;
+    let (_, payload) = client.open(open.clone()).unwrap();
+    let ev = server.on_packet(&payload).unwrap();
+    match ev {
+        ChannelEvent::OpenRequest { kind, .. } => assert_eq!(kind, open),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn auth_agent_req_request_round_trip() {
+    let req = ChannelRequest::AuthAgentReq;
+    let mut w = crate::format::Writer::new();
+    req.encode(&mut w);
+    assert!(w.as_slice().is_empty(), "auth-agent-req has empty payload");
+    let decoded = ChannelRequest::decode("auth-agent-req@openssh.com", w.as_slice()).unwrap();
+    assert_eq!(decoded, req);
+    assert_eq!(req.name(), "auth-agent-req@openssh.com");
+}
+
+#[test]
 fn extended_data_stderr_round_trip() {
     let (mut client, mut server) = pair();
     let (client_local, _server_local) = fully_open(&mut client, &mut server);

@@ -38,7 +38,7 @@ const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
                      [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] \
-                     [-N] \
+                     [-N] [-A] \
                      [user@]host [command...]";
 
 /// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
@@ -79,6 +79,11 @@ struct Cli {
     locals: Vec<LocalForward>,
     remotes: Vec<RemoteForward>,
     no_command: bool,
+    /// `-A`: ask the server to forward the local ssh-agent. The lib sends
+    /// `auth-agent-req@openssh.com` on the session channel; incoming
+    /// `auth-agent@openssh.com` channels get spliced against
+    /// `$SSH_AUTH_SOCK` via `ClientHandlers::on_auth_agent`.
+    agent_forward: bool,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -142,6 +147,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut locals: Vec<LocalForward> = Vec::new();
     let mut remotes: Vec<RemoteForward> = Vec::new();
     let mut no_command = false;
+    let mut agent_forward = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -179,6 +185,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             "-N" => {
                 no_command = true;
+            }
+            "-A" => {
+                agent_forward = true;
             }
             "-o" => {
                 i += 1;
@@ -247,6 +256,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         locals,
         remotes,
         no_command,
+        agent_forward,
         host,
         user_in_host,
         command,
@@ -333,17 +343,23 @@ fn run() -> Result<i32, String> {
     // serve loop instead of the single-shot exec/shell path. Mixing exec with
     // forwarding on the same client is a follow-up — it needs the serve loop
     // to also drive a session channel concurrently.
-    let want_forwarding = cli.no_command || !cli.remotes.is_empty() || !cli.locals.is_empty();
+    //
+    // `-A` (agent forwarding) also routes through the serve loop: it needs a
+    // session channel open (for the `auth-agent-req@openssh.com` request)
+    // plus concurrent handling of incoming `auth-agent@openssh.com` channels,
+    // which is exactly the multi-channel shape.
+    let want_forwarding =
+        cli.no_command || !cli.remotes.is_empty() || !cli.locals.is_empty() || cli.agent_forward;
     if want_forwarding {
         if cli.command.is_some() {
             return Err(
-                "running a command alongside -L/-R/-N is not yet supported; \
+                "running a command alongside -A/-L/-R/-N is not yet supported; \
                         invoke ssh twice or wire the forward without a command"
                     .into(),
             );
         }
-        if cli.no_command && cli.remotes.is_empty() && cli.locals.is_empty() {
-            return Err("-N requires at least one -L or -R".into());
+        if cli.no_command && cli.remotes.is_empty() && cli.locals.is_empty() && !cli.agent_forward {
+            return Err("-N requires at least one of -A, -L, -R".into());
         }
         return run_forwarding(client, &cli);
     }
@@ -480,6 +496,27 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
 
     let mut handlers = ClientHandlers::new().with_forwarded_tcpip(cb);
 
+    // -A: install an `on_auth_agent` that splices each incoming
+    // `auth-agent@openssh.com` channel against the local `$SSH_AUTH_SOCK`.
+    // Then open a session channel up front so `auth-agent-req@openssh.com`
+    // can ride on it; the channel stays open for the lifetime of the serve
+    // loop. We close it at the end so the server unlinks its
+    // `SSH_AUTH_SOCK`.
+    let agent_fwd_channel: Option<u32> = if cli.agent_forward {
+        use puressh::forwarding::agent::splice_to_local_agent_callback;
+        let cb = splice_to_local_agent_callback().ok_or_else(|| {
+            "-A: $SSH_AUTH_SOCK is unset or names a socket that doesn't exist".to_string()
+        })?;
+        handlers = handlers.with_auth_agent(cb);
+        let id = client
+            .open_session_for_agent_forward()
+            .map_err(|e| format!("agent-forward session: {e}"))?;
+        eprintln!("ssh: -A agent forwarding requested");
+        Some(id)
+    } else {
+        None
+    };
+
     // -L: bind every configured local-forward listener and hand each one a
     // clone of the ServeContext so its accept thread can open `direct-tcpip`
     // through the running serve loop.
@@ -504,6 +541,11 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
         Ok(()) => Ok(0),
         Err(e) => Err(format!("serve: {e}")),
     };
+
+    // Tear down the agent-forwarding session channel if we opened one.
+    if let Some(id) = agent_fwd_channel {
+        let _ = client.close_session(id);
+    }
     // Hold the original ctx until serve returns so cmd_tx isn't dropped
     // (the listener threads keep their clones, so this is belt-and-braces).
     drop(ctx_opt);

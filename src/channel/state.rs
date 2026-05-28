@@ -82,6 +82,11 @@ pub enum ChannelOpen {
         /// Originator's TCP port.
         orig_port: u32,
     },
+    /// `"auth-agent@openssh.com"` — server-initiated channel that proxies a
+    /// connection on the per-session forwarded agent socket back to the
+    /// client's local `$SSH_AUTH_SOCK`. RFC pseudo-extension as deployed by
+    /// OpenSSH; the open carries no type-specific payload.
+    AuthAgent,
     /// Unknown / not-yet-supported channel type, raw type-specific bytes preserved.
     Other {
         /// Channel-type name.
@@ -98,6 +103,7 @@ impl ChannelOpen {
             ChannelOpen::Session => "session",
             ChannelOpen::DirectTcpip { .. } => "direct-tcpip",
             ChannelOpen::ForwardedTcpip { .. } => "forwarded-tcpip",
+            ChannelOpen::AuthAgent => "auth-agent@openssh.com",
             ChannelOpen::Other { kind, .. } => kind.as_str(),
         }
     }
@@ -122,6 +128,7 @@ impl ChannelOpen {
                 w.write_string(orig_host.as_bytes());
                 w.write_u32(*orig_port);
             }
+            ChannelOpen::AuthAgent => {}
             ChannelOpen::Other { raw, .. } => {
                 w.write_raw(raw);
             }
@@ -156,6 +163,7 @@ impl ChannelOpen {
                     orig_port,
                 })
             }
+            "auth-agent@openssh.com" => Ok(ChannelOpen::AuthAgent),
             other => Ok(ChannelOpen::Other {
                 kind: other.to_string(),
                 raw: body.to_vec(),

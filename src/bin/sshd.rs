@@ -66,7 +66,8 @@ mod imp {
     };
     use puressh::server::{
         handle_session, AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult,
-        ExecStreamHandler, PtySpec, ShellExitStatus, ShellHandler, ShellSession, SubsystemHandler,
+        ExecStreamHandler, PtySpec, SessionEnv, ShellExitStatus, ShellHandler, ShellSession,
+        SubsystemHandler,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -75,7 +76,7 @@ mod imp {
     const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
                          [-A authorized_keys_file] [-u allowed_user]... \
                          [--no-sftp] [--sftp-read-only] [--sftp-root PATH] \
-                         [--no-scp]";
+                         [--no-scp] [--no-agent-forward]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -254,6 +255,10 @@ mod imp {
         /// disables it. With SCP off, an `exec scp …` request falls through
         /// to the buffered command handler — which refuses unknown commands.
         scp: bool,
+        /// Agent forwarding on by default; `--no-agent-forward` disables
+        /// it. When off, any client `auth-agent-req@openssh.com` is
+        /// refused.
+        agent_forward: bool,
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -266,6 +271,7 @@ mod imp {
         let mut sftp_read_only = false;
         let mut sftp_root: Option<String> = None;
         let mut scp = true;
+        let mut agent_forward = true;
 
         let mut i = 0;
         while i < args.len() {
@@ -300,6 +306,7 @@ mod imp {
                     sftp_root = Some(v);
                 }
                 "--no-scp" => scp = false,
+                "--no-agent-forward" => agent_forward = false,
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -321,6 +328,7 @@ mod imp {
             sftp_read_only,
             sftp_root,
             scp,
+            agent_forward,
         })
     }
 
@@ -473,7 +481,7 @@ mod imp {
     }
 
     impl CommandHandler for ShellCommandHandler {
-        fn handle(&self, user: &str, command: &str) -> ExecResult {
+        fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
             if self.debug {
                 eprintln!("sshd: exec by {user}: {command}");
             }
@@ -518,6 +526,13 @@ mod imp {
                     OsStr::from_bytes(k.to_bytes()),
                     OsStr::from_bytes(v.to_bytes()),
                 );
+            }
+            // Layer the per-channel SSH `env` requests *over* PAM env so the
+            // client's LANG / LC_* / TERM / user-supplied variables win.
+            // RFC 4254 §6.4 makes this scope per-session-channel; the
+            // dispatcher already discards the env on channel close.
+            for (k, v) in env.iter() {
+                cmd.env(k, v);
             }
 
             // Drop to the user inside the spawned child via pre_exec.
@@ -728,11 +743,19 @@ mod imp {
         fn spawn(
             &self,
             user: &str,
+            env: &SessionEnv,
             pty: Option<PtySpec>,
         ) -> puressh::Result<Box<dyn ShellSession>> {
+            // Snapshot the per-channel env into an owned vector. spawn_pty_shell
+            // forks and then setenv()s post-fork; the child can't hold a borrow
+            // across that boundary, so we hand it owned (key, value) pairs.
+            let env_pairs: Vec<(String, String)> = env
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
             match pty {
-                Some(spec) => spawn_pty_shell(&self.pam, user, &spec, self.debug),
-                None => spawn_pipe_shell(&self.pam, user, self.debug),
+                Some(spec) => spawn_pty_shell(&self.pam, user, &env_pairs, &spec, self.debug),
+                None => spawn_pipe_shell(&self.pam, user, &env_pairs, self.debug),
             }
         }
     }
@@ -757,7 +780,13 @@ mod imp {
     }
 
     impl SubsystemHandler for SftpSubsystemHandler {
-        fn handle(&self, user: &str, name: &str, stream: ChannelStream) -> puressh::Result<()> {
+        fn handle(
+            &self,
+            user: &str,
+            _env: &SessionEnv,
+            name: &str,
+            stream: ChannelStream,
+        ) -> puressh::Result<()> {
             if name != "sftp" {
                 if self.debug {
                     eprintln!("sshd: refusing unknown subsystem '{name}' for {user}");
@@ -829,7 +858,13 @@ mod imp {
             t.starts_with("scp ") || t == "scp"
         }
 
-        fn run(&self, user: &str, command: &str, stream: ChannelStream) -> puressh::Result<()> {
+        fn run(
+            &self,
+            user: &str,
+            _env: &SessionEnv,
+            command: &str,
+            stream: ChannelStream,
+        ) -> puressh::Result<()> {
             let argv = match tokenize_argv(command) {
                 Ok(a) => a,
                 Err(e) => {
@@ -1091,6 +1126,7 @@ mod imp {
     fn spawn_pty_shell(
         pam: &Arc<pam_gate::PamGate>,
         user: &str,
+        session_env: &[(String, String)],
         spec: &PtySpec,
         debug: bool,
     ) -> puressh::Result<Box<dyn ShellSession>> {
@@ -1121,6 +1157,23 @@ mod imp {
         // request is rejected upstream.
         let mut pam_envs = pam.ensure(user, &slave_path)?;
         apply_login_envs(&mut pam_envs, &info);
+
+        // Convert the per-channel SSH `env` requests into NUL-terminated
+        // bytes pre-fork — CString::new allocates, and we can't allocate
+        // safely between fork and execvp. Reject any pair with interior
+        // NUL bytes (would smuggle past setenv's terminator otherwise);
+        // such pairs cannot reach us through a well-formed SSH peer.
+        let mut channel_envs: Vec<(std::ffi::CString, std::ffi::CString)> =
+            Vec::with_capacity(session_env.len());
+        for (k, v) in session_env {
+            let kc = std::ffi::CString::new(k.as_bytes()).map_err(|_| {
+                puressh::Error::Io(std::io::Error::other("channel env name contains NUL byte"))
+            })?;
+            let vc = std::ffi::CString::new(v.as_bytes()).map_err(|_| {
+                puressh::Error::Io(std::io::Error::other("channel env value contains NUL byte"))
+            })?;
+            channel_envs.push((kc, vc));
+        }
 
         // SAFETY: fork() in single-threaded code is safe; the child
         // branch performs only async-signal-safe ops (with the known
@@ -1186,6 +1239,16 @@ mod imp {
                         libc::setenv(k.as_ptr(), v.as_ptr(), 1);
                     }
                 }
+                // Layer per-channel SSH env (`env` requests) over the
+                // PAM-derived env so the client's LANG / LC_* / user
+                // variables win. Same async-signal-safe caveats as
+                // above; the list is bounded by the channel's request
+                // count and converted to CString pre-fork.
+                for (k, v) in &channel_envs {
+                    unsafe {
+                        libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+                    }
+                }
 
                 // execvp the user's actual login shell from passwd,
                 // with argv0 prefixed by "-" so bash/zsh/sh source
@@ -1227,6 +1290,7 @@ mod imp {
     fn spawn_pipe_shell(
         pam: &Arc<pam_gate::PamGate>,
         user: &str,
+        _session_env: &[(String, String)],
         _debug: bool,
     ) -> puressh::Result<Box<dyn ShellSession>> {
         // `ssh -T` (no PTY) lands here. Open the PAM session anyway —
@@ -1457,6 +1521,11 @@ mod imp {
         if cli.scp {
             let scp = ScpExecHandler { debug: cli.debug };
             config = config.with_exec_stream_handler(Arc::new(scp));
+        }
+
+        if cli.agent_forward {
+            use puressh::forwarding::agent::DefaultAgentForwardHandler;
+            config = config.with_agent_forward(Arc::new(DefaultAgentForwardHandler::new()));
         }
 
         // Drop privileges to the authenticated user *once per connection*

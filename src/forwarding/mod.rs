@@ -17,8 +17,17 @@
 //!   [`crate::server::TcpipForwardHandler`] trait; the back-channel
 //!   opens land in a follow-up commit alongside the matching
 //!   client-side multi-channel dispatcher.
+//! - **`auth-agent-req@openssh.com`** + **`auth-agent@openssh.com`**
+//!   (OpenSSH's ssh-agent forwarding, `ssh -A`): the client asks the
+//!   server to expose a Unix-domain socket inside the session env as
+//!   `SSH_AUTH_SOCK`. Each connection on that socket triggers an
+//!   `auth-agent@openssh.com` channel-open back toward the client, which
+//!   the client proxies to its own local agent. Server-side glue lives
+//!   in [`agent::DefaultAgentForwardHandler`] plus the
+//!   [`crate::server::AgentForwardHandler`] trait.
 
 #![cfg(feature = "std")]
 
+pub mod agent;
 pub mod direct;
 pub mod reverse;

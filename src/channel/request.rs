@@ -77,6 +77,10 @@ pub enum ChannelRequest {
         /// RFC 3066 language tag for `message`.
         language: String,
     },
+    /// `"auth-agent-req@openssh.com"` — client asks the server to set up
+    /// authentication-agent forwarding on this session. The request carries
+    /// no type-specific payload. RFC pseudo-extension as deployed by OpenSSH.
+    AuthAgentReq,
     /// Any request type we don't recognise; the raw type-specific body is preserved.
     Other {
         /// Request type as advertised on the wire.
@@ -99,6 +103,7 @@ impl ChannelRequest {
             ChannelRequest::Signal { .. } => "signal",
             ChannelRequest::ExitStatus { .. } => "exit-status",
             ChannelRequest::ExitSignal { .. } => "exit-signal",
+            ChannelRequest::AuthAgentReq => "auth-agent-req@openssh.com",
             ChannelRequest::Other { name, .. } => name.as_str(),
         }
     }
@@ -160,6 +165,7 @@ impl ChannelRequest {
                 w.write_string(message.as_bytes());
                 w.write_string(language.as_bytes());
             }
+            ChannelRequest::AuthAgentReq => {}
             ChannelRequest::Other { raw, .. } => {
                 w.write_raw(raw);
             }
@@ -229,6 +235,7 @@ impl ChannelRequest {
                     language,
                 })
             }
+            "auth-agent-req@openssh.com" => Ok(ChannelRequest::AuthAgentReq),
             other => Ok(ChannelRequest::Other {
                 name: other.to_string(),
                 raw: body.to_vec(),

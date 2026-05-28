@@ -180,6 +180,14 @@ pub struct ForwardedTcpipOrigin {
 pub type ForwardedTcpipCallback =
     dyn Fn(ForwardedTcpipOrigin, ChannelStream) + Send + Sync + 'static;
 
+/// Type alias for the [`ClientHandlers::on_auth_agent`] callback.
+///
+/// Fires on every server-initiated `auth-agent@openssh.com` channel — one
+/// per peer-side `SSH_AUTH_SOCK` connection. The handler typically splices
+/// the stream against the local `$SSH_AUTH_SOCK` Unix socket, completing
+/// the agent-forwarding round-trip (OpenSSH's `ssh -A`).
+pub type AuthAgentCallback = dyn Fn(ChannelStream) + Send + Sync + 'static;
+
 /// Set of callbacks driving [`Client::serve`].
 ///
 /// Each `on_*` field accepts a peer-initiated channel-open of the matching
@@ -191,6 +199,9 @@ pub struct ClientHandlers {
     /// Callback for `"forwarded-tcpip"` channel opens (RFC 4254 §7.2, the
     /// inbound bookend of `ssh -R`). `None` ⇒ reject.
     pub on_forwarded_tcpip: Option<Arc<ForwardedTcpipCallback>>,
+    /// Callback for `"auth-agent@openssh.com"` channel opens (server-side
+    /// half of agent forwarding, `ssh -A`). `None` ⇒ reject.
+    pub on_auth_agent: Option<Arc<AuthAgentCallback>>,
     /// Cooperative stop signal. The loop polls this flag once per tick and
     /// returns `Ok(())` as soon as it's `true` AND no channels are open.
     pub stop: Arc<AtomicBool>,
@@ -212,6 +223,7 @@ impl ClientHandlers {
     pub fn new() -> Self {
         Self {
             on_forwarded_tcpip: None,
+            on_auth_agent: None,
             stop: Arc::new(AtomicBool::new(false)),
             cmd_rx: None,
         }
@@ -220,6 +232,15 @@ impl ClientHandlers {
     /// Install a `forwarded-tcpip` handler (`ssh -R` server-initiated opens).
     pub fn with_forwarded_tcpip(mut self, cb: Arc<ForwardedTcpipCallback>) -> Self {
         self.on_forwarded_tcpip = Some(cb);
+        self
+    }
+
+    /// Install an `auth-agent@openssh.com` handler (`ssh -A` server-initiated
+    /// opens). For the default behaviour (splice each incoming channel
+    /// against the local `$SSH_AUTH_SOCK`), see
+    /// [`crate::forwarding::agent::splice_to_local_agent_callback`].
+    pub fn with_auth_agent(mut self, cb: Arc<AuthAgentCallback>) -> Self {
+        self.on_auth_agent = Some(cb);
         self
     }
 
@@ -374,6 +395,12 @@ pub struct Client {
     /// Port the user passed to `connect_to_host`. 0 means "not threaded
     /// in"; lookups need a non-zero port to match.
     target_port: u16,
+    /// When `true`, every session-channel helper ([`Self::exec`],
+    /// [`Self::exec_stream`], [`Self::shell_with_stdin`], [`Self::sftp`])
+    /// issues `auth-agent-req@openssh.com` immediately after the open and
+    /// before the matching shell/exec/subsystem request. Toggle with
+    /// [`Self::set_request_auth_agent_forwarding`].
+    request_auth_agent: bool,
 }
 
 impl Client {
@@ -408,6 +435,7 @@ impl Client {
             deferred: Vec::new(),
             target_host: String::new(),
             target_port: 0,
+            request_auth_agent: false,
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -445,6 +473,7 @@ impl Client {
             deferred: Vec::new(),
             target_host: host.to_string(),
             target_port: port,
+            request_auth_agent: false,
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -497,6 +526,87 @@ impl Client {
         self.authenticate(user, vec![ClientCredential::PublicKey(key)])
     }
 
+    /// Open a session channel that exists solely to host an
+    /// `auth-agent-req@openssh.com` request, then send that request and
+    /// return the channel's local id. The caller is expected to keep this
+    /// channel open for the lifetime of any agent-forwarding work
+    /// ([`Self::serve`] with [`ClientHandlers::on_auth_agent`] installed),
+    /// then tear it down with [`Self::close_session`].
+    ///
+    /// On the server side, the matching `auth-agent-req` arms a
+    /// per-session-channel Unix-socket listener; closing this channel
+    /// unlinks the socket and stops accepting agent calls. See
+    /// [`crate::forwarding::agent`] for the server side.
+    pub fn open_session_for_agent_forward(&mut self) -> Result<u32> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
+        self.write_payload(&open_payload)?;
+
+        let mut iter_guard = 0usize;
+        loop {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("agent-forward: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("agent-forward: channel open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        let p = self
+            .conn
+            .send_request(local_id, ChannelRequest::AuthAgentReq, false)?;
+        self.write_payload(&p)?;
+        Ok(local_id)
+    }
+
+    /// Send `SSH_MSG_CHANNEL_CLOSE` for `channel`. Used to tear down a
+    /// session channel opened by
+    /// [`Self::open_session_for_agent_forward`] once the matching serve
+    /// loop has returned. Best-effort: silently swallows codec errors for
+    /// channels already torn down by the peer.
+    pub fn close_session(&mut self, channel: u32) -> Result<()> {
+        let payload = match self.conn.send_close(channel) {
+            Ok(p) => p,
+            Err(_) => return Ok(()),
+        };
+        self.write_payload(&payload)?;
+        Ok(())
+    }
+
+    /// Toggle whether the next session-channel helper ([`Self::exec`],
+    /// [`Self::exec_stream`], [`Self::shell_with_stdin`], [`Self::sftp`])
+    /// prefaces its shell/exec/subsystem request with
+    /// `auth-agent-req@openssh.com` (the channel request that asks the
+    /// server to set up an `SSH_AUTH_SOCK` Unix socket for this session
+    /// channel and call back via `auth-agent@openssh.com` channels —
+    /// OpenSSH's `ssh -A`).
+    ///
+    /// Sticky: stays set until cleared. The agent-req is sent with
+    /// `want_reply = false`, matching OpenSSH; the server's response
+    /// (acceptance / refusal) is observable only via whether a callback
+    /// channel ever lands on a peer-installed [`ClientHandlers::on_auth_agent`].
+    pub fn set_request_auth_agent_forwarding(&mut self, on: bool) {
+        self.request_auth_agent = on;
+    }
+
+    /// Internal: emit `auth-agent-req@openssh.com` if the toggle is set.
+    /// Called by every session-channel helper between OpenConfirmed and
+    /// the matching shell/exec/subsystem request.
+    fn maybe_send_auth_agent_req(&mut self, channel: u32) -> Result<()> {
+        if self.request_auth_agent {
+            let p = self
+                .conn
+                .send_request(channel, ChannelRequest::AuthAgentReq, false)?;
+            self.write_payload(&p)?;
+        }
+        Ok(())
+    }
+
     /// Run a remote command, draining stdout/stderr and capturing the exit
     /// status (or signal). Returns once the server has closed the channel.
     pub fn exec(&mut self, command: &str) -> Result<ExecOutput> {
@@ -521,6 +631,8 @@ impl Client {
                 _ => {}
             }
         }
+
+        self.maybe_send_auth_agent_req(local_id)?;
 
         let exec_req = self.conn.send_request(
             local_id,
@@ -669,6 +781,8 @@ impl Client {
                 _ => {}
             }
         }
+
+        self.maybe_send_auth_agent_req(local_id)?;
 
         // pty-req with want_reply=true.
         let pty_req = self.conn.send_request(
@@ -959,6 +1073,8 @@ impl Client {
             }
         }
 
+        self.maybe_send_auth_agent_req(local_id)?;
+
         let sub_req = self.conn.send_request(
             local_id,
             ChannelRequest::Subsystem {
@@ -1020,6 +1136,8 @@ impl Client {
                 _ => {}
             }
         }
+
+        self.maybe_send_auth_agent_req(local_id)?;
 
         let exec_req = self.conn.send_request(
             local_id,
@@ -2204,6 +2322,40 @@ fn serve_dispatch_packet(
                         channel,
                         SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
                         "forwarded-tcpip not enabled",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                }
+            }
+            ChannelOpen::AuthAgent => {
+                if let Some(cb) = handlers.on_auth_agent.clone() {
+                    let p = client.conn.accept_open(channel)?;
+                    client.write_payload(&p)?;
+
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    thread::spawn(move || {
+                        cb(cs);
+                    });
+                    runtimes.insert(
+                        channel,
+                        ServeRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                } else {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "auth-agent not enabled",
                         "",
                     )?;
                     client.write_payload(&p)?;

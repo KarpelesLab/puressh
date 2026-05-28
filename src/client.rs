@@ -500,6 +500,134 @@ impl Client {
         Ok(out)
     }
 
+    /// One-shot subsystem helper: open a session channel, send a
+    /// `subsystem` request with the given `name`, push `stdin` once, send
+    /// EOF, then drain the response until the peer CLOSEs. Returns the
+    /// accumulated channel data (the stream's stdout half).
+    ///
+    /// This is the subsystem analogue of [`exec`]: it doesn't expose the
+    /// channel for streaming use (a `Client::sftp` streaming wrapper will
+    /// land in a follow-up phase), but it's enough to exercise the
+    /// server's subsystem dispatch end-to-end and to drive small
+    /// request/response protocols.
+    ///
+    /// [`exec`]: Self::exec
+    pub fn subsystem_once(&mut self, name: &str, stdin: &[u8]) -> Result<Vec<u8>> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
+        self.write_payload(&open_payload)?;
+
+        let mut opened = false;
+        let mut iter_guard = 0usize;
+        while !opened {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("subsystem: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => opened = true,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("channel open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        let sub_req = self.conn.send_request(
+            local_id,
+            ChannelRequest::Subsystem { name: name.into() },
+            true,
+        )?;
+        self.write_payload(&sub_req)?;
+        self.await_request_reply(local_id, "subsystem")?;
+
+        // Push stdin (if any), then EOF.
+        if !stdin.is_empty() {
+            let mut off = 0usize;
+            iter_guard = 0;
+            while off < stdin.len() {
+                iter_guard += 1;
+                if iter_guard > MAX_EXEC_ITER {
+                    return Err(Error::Protocol(
+                        "subsystem: stdin drain loop did not converge",
+                    ));
+                }
+                let (payload, taken) = self.conn.send_data(local_id, &stdin[off..])?;
+                if taken == 0 {
+                    let pkt = self.read_one_packet()?;
+                    match self.conn.on_packet(&pkt)? {
+                        ChannelEvent::WindowAdjust { channel, .. } if channel == local_id => {}
+                        ChannelEvent::Close { channel } if channel == local_id => {
+                            return Err(Error::Protocol(
+                                "subsystem: peer closed channel before stdin drain",
+                            ));
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                self.write_payload(&payload)?;
+                off += taken;
+            }
+        }
+        let eof = self.conn.send_eof(local_id)?;
+        self.write_payload(&eof)?;
+
+        let mut out = Vec::<u8>::new();
+        let mut local_close_sent = false;
+        let mut remote_close_seen = false;
+
+        for _ in 0..MAX_EXEC_ITER {
+            if remote_close_seen && local_close_sent {
+                break;
+            }
+            let payload = self.read_one_packet()?;
+            let ev = self.conn.on_packet(&payload)?;
+            match ev {
+                ChannelEvent::Data { channel, data } if channel == local_id => {
+                    if out.len() + data.len() > MAX_EXEC_OUTPUT {
+                        return Err(Error::Protocol("subsystem output too large"));
+                    }
+                    let n = data.len() as u32;
+                    out.extend_from_slice(&data);
+                    if let Some(adj) = self.conn.replenish_window(local_id, n)? {
+                        self.write_payload(&adj)?;
+                    }
+                }
+                ChannelEvent::ExtendedData {
+                    channel,
+                    code: _,
+                    data,
+                } if channel == local_id => {
+                    // Subsystems shouldn't send stderr by RFC convention, but
+                    // if they do, treat it like stdout for window accounting.
+                    let n = data.len() as u32;
+                    if let Some(adj) = self.conn.replenish_window(local_id, n)? {
+                        self.write_payload(&adj)?;
+                    }
+                }
+                ChannelEvent::Eof { channel } if channel == local_id => {}
+                ChannelEvent::Close { channel } if channel == local_id => {
+                    remote_close_seen = true;
+                    if !local_close_sent {
+                        let p = self.conn.send_close(local_id)?;
+                        self.write_payload(&p)?;
+                        local_close_sent = true;
+                    }
+                }
+                ChannelEvent::WindowAdjust { .. } => {}
+                _ => {}
+            }
+        }
+
+        if !(remote_close_seen && local_close_sent) {
+            return Err(Error::Protocol(
+                "subsystem: drain loop exceeded iteration cap",
+            ));
+        }
+        Ok(out)
+    }
+
     /// Block until the peer answers a single `CHANNEL_REQUEST` we sent
     /// with `want_reply = true`. Used by [`shell_with_stdin`] to gate the
     /// pty-req → shell handoff.

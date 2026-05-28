@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -51,6 +52,11 @@ const MAX_KEX_STEPS: usize = 32;
 const MAX_AUTH_STEPS: usize = 64;
 const MAX_CONNECTION_STEPS: usize = 10_000_000;
 const MAX_DRAIN_STEPS: usize = 1_000_000;
+
+/// Bound on the per-subsystem egress queue. Handlers self-throttle when
+/// the dispatcher can't ship `CHANNEL_DATA` fast enough (remote window
+/// exhausted).
+const SUBSYSTEM_EGRESS_BACKLOG: usize = 32;
 
 const SSH_DISCONNECT_BY_APPLICATION: u32 = 11;
 const SSH_DISCONNECT_HOST_NOT_ALLOWED: u32 = 9;
@@ -180,6 +186,147 @@ pub trait ShellSession: Send {
     fn try_exit(&mut self) -> Option<ShellExitStatus>;
 }
 
+/// Outbound message a [`SubsystemHandler`] sends through its [`ChannelStream`].
+///
+/// The connection dispatcher serializes these onto the wire as
+/// `CHANNEL_DATA` / `CHANNEL_EOF` / `CHANNEL_CLOSE` packets. Handlers don't
+/// emit `ChannelEgress` directly — they just use `Read`/`Write` on the
+/// stream, and the EOF / Close pair is sent automatically when the stream
+/// drops.
+pub enum ChannelEgress {
+    /// Bytes destined for `CHANNEL_DATA`.
+    Data(Vec<u8>),
+    /// `CHANNEL_EOF`.
+    Eof,
+    /// `CHANNEL_CLOSE`.
+    Close,
+}
+
+/// Bidirectional view of an SSH channel for use by [`SubsystemHandler`]s.
+///
+/// Behaviour:
+/// - [`Read::read`] blocks until the peer sends `CHANNEL_DATA` or `EOF`
+///   (returns `Ok(0)`).
+/// - [`Write::write`] enqueues data for the dispatcher to ship; backpressure
+///   comes from a bounded mpsc — if the remote window is full the dispatcher
+///   stops draining and the next write blocks the handler thread.
+/// - On drop the stream sends `CHANNEL_EOF` followed by `CHANNEL_CLOSE`
+///   (best-effort — silently ignored if the channel is already gone).
+pub struct ChannelStream {
+    rx: Receiver<Option<Vec<u8>>>,
+    tx: SyncSender<ChannelEgress>,
+    buf: Vec<u8>,
+    rx_eof: bool,
+}
+
+impl ChannelStream {
+    /// Used by the server dispatcher; not for user code.
+    pub(crate) fn new(rx: Receiver<Option<Vec<u8>>>, tx: SyncSender<ChannelEgress>) -> Self {
+        Self {
+            rx,
+            tx,
+            buf: Vec::new(),
+            rx_eof: false,
+        }
+    }
+
+    /// Send an explicit EOF marker. Subsequent writes still succeed (per
+    /// RFC 4254 EOF is one-directional). Most handlers don't need this —
+    /// EOF and Close are sent automatically when the stream drops.
+    pub fn send_eof(&mut self) -> std::io::Result<()> {
+        self.tx
+            .send(ChannelEgress::Eof)
+            .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))
+    }
+}
+
+impl Read for ChannelStream {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if !self.buf.is_empty() {
+            let n = out.len().min(self.buf.len());
+            out[..n].copy_from_slice(&self.buf[..n]);
+            self.buf.drain(..n);
+            return Ok(n);
+        }
+        if self.rx_eof {
+            return Ok(0);
+        }
+        match self.rx.recv() {
+            Ok(Some(chunk)) => {
+                self.buf = chunk;
+                self.read(out)
+            }
+            Ok(None) | Err(_) => {
+                self.rx_eof = true;
+                Ok(0)
+            }
+        }
+    }
+}
+
+impl Write for ChannelStream {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        // Cap chunks to keep per-packet payloads sane; the dispatcher will
+        // split further if the remote channel-max-packet is smaller.
+        let take = data.len().min(32 * 1024);
+        let chunk = data[..take].to_vec();
+        self.tx
+            .send(ChannelEgress::Data(chunk))
+            .map_err(|_| std::io::Error::new(ErrorKind::BrokenPipe, "channel closed"))?;
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ChannelStream {
+    fn drop(&mut self) {
+        // Best-effort: ignore failures if the channel was already torn down.
+        let _ = self.tx.send(ChannelEgress::Eof);
+        let _ = self.tx.send(ChannelEgress::Close);
+    }
+}
+
+/// Per-channel state for an in-process subsystem (e.g. SFTP) — parallel to
+/// [`ShellRuntime`], owned by `do_connection_phase`.
+struct SubsystemRuntime {
+    /// Push peer-sent bytes (or `None` for EOF) to the handler thread.
+    /// Unbounded so the dispatcher never blocks on its own dispatch path —
+    /// memory is bounded by the SSH receive window.
+    ingress_tx: Sender<Option<Vec<u8>>>,
+    /// Drain bytes the handler wants to ship out.
+    egress_rx: Receiver<ChannelEgress>,
+    /// Egress data that didn't fit in the remote window on the last tick;
+    /// re-tried before pulling more from `egress_rx`.
+    pending_data: Vec<u8>,
+    /// EOF has been pulled from the handler but not yet emitted on the wire.
+    pending_eof: bool,
+    /// Close has been pulled from the handler but not yet emitted on the wire.
+    pending_close: bool,
+    /// Whether we've already sent `CHANNEL_EOF` on the wire.
+    eof_sent: bool,
+    /// Whether we've already sent `CHANNEL_CLOSE` on the wire.
+    close_sent: bool,
+}
+
+/// Callback type for [`Config::on_session_open`].
+pub type SessionOpenCallback = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+
+/// Server-side hook called when a client sends a `"subsystem"` channel
+/// request (e.g. `"sftp"`).
+///
+/// Implementations get a [`ChannelStream`] they can treat as a normal
+/// `Read+Write` and run their protocol loop on. The handler runs on a
+/// dedicated thread per channel so blocking reads don't stall the rest of
+/// the connection. Return `Ok(())` to close the channel gracefully — the
+/// dispatcher emits EOF + Close when the stream drops.
+pub trait SubsystemHandler: Send + Sync {
+    /// Run subsystem `name` on behalf of `user` over `stream`.
+    fn handle(&self, user: &str, name: &str, stream: ChannelStream) -> Result<()>;
+}
+
 /// Server configuration: host keys, authentication, and the exec hook.
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
@@ -195,6 +342,17 @@ pub struct Config {
     /// `"pty-req"` and `"shell"` are rejected, matching the historical
     /// behaviour of this server.
     pub shell_handler: Option<Arc<dyn ShellHandler>>,
+    /// Optional `"subsystem"` hook. When `None` (the default), all
+    /// `subsystem` channel requests are rejected with `CHANNEL_FAILURE`.
+    /// A typical implementation dispatches by `name` (`"sftp"`, …) and
+    /// runs the protocol on the supplied [`ChannelStream`].
+    pub subsystem_handler: Option<Arc<dyn SubsystemHandler>>,
+    /// Optional callback invoked once per connection, after authentication
+    /// has succeeded but before any channel request is processed. Returning
+    /// `Err` aborts the connection. Typical use: drop privileges (setgid /
+    /// initgroups / setuid) to `user` so all subsequent shell / exec /
+    /// subsystem code runs as the authenticated user.
+    pub on_session_open: Option<SessionOpenCallback>,
     /// Thresholds that trigger a re-key (RFC 4253 §9). Defaults to 1 GiB /
     /// 1 hour / `1u32 << 31` packets per direction.
     pub rekey_policy: RekeyPolicy,
@@ -215,6 +373,8 @@ impl Config {
             allowed_auth_methods,
             command_handler,
             shell_handler: None,
+            subsystem_handler: None,
+            on_session_open: None,
             rekey_policy: RekeyPolicy::default(),
         }
     }
@@ -225,6 +385,24 @@ impl Config {
     /// [`ShellHandler::spawn`] when the client sends `"shell"`.
     pub fn with_shell(mut self, handler: Arc<dyn ShellHandler>) -> Self {
         self.shell_handler = Some(handler);
+        self
+    }
+
+    /// Attach a `SubsystemHandler` to this config. Without a handler, any
+    /// `"subsystem"` channel request is rejected.
+    pub fn with_subsystem(mut self, handler: Arc<dyn SubsystemHandler>) -> Self {
+        self.subsystem_handler = Some(handler);
+        self
+    }
+
+    /// Register a callback fired once per connection between
+    /// `userauth_success` and the channel loop. Use this to drop privileges
+    /// to the authenticated user. Returning `Err` aborts the connection.
+    pub fn on_session_open<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&str) -> Result<()> + Send + Sync + 'static,
+    {
+        self.on_session_open = Some(Arc::new(f));
         self
     }
 }
@@ -333,6 +511,14 @@ fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()
         &cfg,
         session_id,
     )?;
+
+    // Connection-level hook: drop privileges to the authenticated user
+    // before any shell / exec / subsystem runs. After this call all I/O on
+    // this connection happens as `user`, including the in-process SFTP
+    // subsystem and any forked exec children.
+    if let Some(hook) = cfg.on_session_open.clone() {
+        hook(&user)?;
+    }
 
     // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
     codec.activate_compress();
@@ -484,6 +670,10 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // has been served — in that case the loop stays in pure blocking-read
     // mode and behaves exactly like the historical exec-only path.
     let mut shells: BTreeMap<u32, ShellRuntime> = BTreeMap::new();
+    // Per-channel in-process subsystem state (e.g. SFTP). Parallel to
+    // `shells`: same polling cadence, same dispatch routing for Data /
+    // EOF / Close.
+    let mut subsystems: BTreeMap<u32, SubsystemRuntime> = BTreeMap::new();
     let mut polling_active = false;
 
     loop {
@@ -506,18 +696,22 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
                 &payload,
                 &mut any_channel_opened,
                 &mut shells,
+                &mut subsystems,
             )?;
             continue;
         }
 
-        // Shells become "interesting" the moment one is registered: switch
-        // the socket to a 50 ms read timeout so we can interleave shell
-        // I/O with packet reads. Revert when the last shell goes away.
+        // Shells and subsystems become "interesting" the moment one is
+        // registered: switch the socket to a 50 ms read timeout so we can
+        // interleave their I/O with packet reads. Revert when both maps
+        // go quiet.
         let any_shell_alive = shells.values().any(|rt| rt.session.is_some());
-        if any_shell_alive && !polling_active {
+        let any_subsystem_alive = !subsystems.is_empty();
+        let want_polling = any_shell_alive || any_subsystem_alive;
+        if want_polling && !polling_active {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             polling_active = true;
-        } else if !any_shell_alive && polling_active {
+        } else if !want_polling && polling_active {
             let _ = stream.set_read_timeout(None);
             polling_active = false;
         }
@@ -527,6 +721,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         if polling_active && !runner.is_kexing() {
             drain_shells(stream, codec, rng, &mut conn, &mut shells)?;
             finalize_exited_shells(stream, codec, rng, &mut conn, &mut shells)?;
+            drain_subsystems(stream, codec, rng, &mut conn, &mut subsystems)?;
         }
 
         if any_channel_opened
@@ -603,6 +798,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
             &payload,
             &mut any_channel_opened,
             &mut shells,
+            &mut subsystems,
         )?;
     }
 }
@@ -735,6 +931,110 @@ fn finalize_exited_shells<R: RngCore + CryptoRng>(
     Ok(())
 }
 
+/// Per-tick: ship any pending egress from each subsystem onto the wire.
+/// Pulls `Data` / `Eof` / `Close` from the handler's `egress_rx`, respecting
+/// the remote SSH window — bytes that don't fit go into `pending_data` and
+/// are re-attempted on the next tick.
+fn drain_subsystems<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+) -> Result<()> {
+    let channels: Vec<u32> = subsystems.keys().copied().collect();
+    for ch in channels {
+        let Some(rt) = subsystems.get_mut(&ch) else {
+            continue;
+        };
+        if rt.close_sent {
+            continue;
+        }
+
+        // 1) Re-attempt any leftover bytes from last tick.
+        if !rt.pending_data.is_empty() {
+            let leftover = core::mem::take(&mut rt.pending_data);
+            emit_subsystem_data(stream, codec, rng, conn, ch, &leftover, rt)?;
+            if !rt.pending_data.is_empty() {
+                // Still window-blocked; skip this tick's drain entirely.
+                continue;
+            }
+        }
+
+        // 2) Pull as many egress messages as we can without blocking. Stop
+        // as soon as a write window-blocks (pending_data populated again).
+        loop {
+            if !rt.pending_data.is_empty() {
+                break;
+            }
+            match rt.egress_rx.try_recv() {
+                Ok(ChannelEgress::Data(bytes)) => {
+                    emit_subsystem_data(stream, codec, rng, conn, ch, &bytes, rt)?;
+                }
+                Ok(ChannelEgress::Eof) => {
+                    rt.pending_eof = true;
+                    break;
+                }
+                Ok(ChannelEgress::Close) => {
+                    rt.pending_close = true;
+                    break;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Handler thread vanished without an explicit Close;
+                    // synthesise one so the channel still tears down cleanly.
+                    rt.pending_close = true;
+                    break;
+                }
+            }
+        }
+
+        // 3) Emit EOF / Close if we have them pending and all data shipped.
+        if rt.pending_data.is_empty() {
+            if rt.pending_eof && !rt.eof_sent {
+                let p = conn.send_eof(ch)?;
+                write_payload(stream, codec, rng, &p)?;
+                rt.eof_sent = true;
+            }
+            if rt.pending_close && !rt.close_sent {
+                if !rt.eof_sent {
+                    let p = conn.send_eof(ch)?;
+                    write_payload(stream, codec, rng, &p)?;
+                    rt.eof_sent = true;
+                }
+                let p = conn.send_close(ch)?;
+                write_payload(stream, codec, rng, &p)?;
+                rt.close_sent = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Send `bytes` over `CHANNEL_DATA`, stashing anything the remote window
+/// can't accept onto `rt.pending_data` for next tick.
+fn emit_subsystem_data<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    channel: u32,
+    bytes: &[u8],
+    rt: &mut SubsystemRuntime,
+) -> Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let (payload, taken) = conn.send_data(channel, &bytes[off..])?;
+        if taken == 0 {
+            rt.pending_data.extend_from_slice(&bytes[off..]);
+            return Ok(());
+        }
+        write_payload(stream, codec, rng, &payload)?;
+        off += taken;
+    }
+    Ok(())
+}
+
 /// Like [`read_one_packet`], but returns `Ok(None)` on a 50 ms read
 /// timeout instead of erroring. Other I/O errors propagate.
 fn read_one_packet_maybe_timeout(
@@ -765,6 +1065,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     payload: &[u8],
     any_channel_opened: &mut bool,
     shells: &mut BTreeMap<u32, ShellRuntime>,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
 ) -> Result<()> {
     let ev = conn.on_packet(payload)?;
     match ev {
@@ -791,6 +1092,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
         } => {
             handle_channel_request(
                 stream, codec, rng, inbox, conn, cfg, user, channel, request, want_reply, shells,
+                subsystems,
             )?;
         }
         ChannelEvent::Data { channel, data } => {
@@ -815,6 +1117,13 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                     }
                 }
             }
+            // Subsystem ingress: hand the chunk to the handler thread. The
+            // ingress channel is unbounded so we never block the dispatcher;
+            // the actual backpressure comes from the SSH window (we only
+            // replenish after pushing — but pushing is cheap, so it's fine).
+            if let Some(rt) = subsystems.get_mut(&channel) {
+                let _ = rt.ingress_tx.send(Some(data.clone()));
+            }
             if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
                 write_payload(stream, codec, rng, &adj)?;
             }
@@ -830,6 +1139,11 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                     let _ = sess.close_stdin();
                 }
             }
+            if let Some(rt) = subsystems.get_mut(&channel) {
+                // None = EOF marker; the handler's `Read::read` returns
+                // `Ok(0)` next time it drains its buffer.
+                let _ = rt.ingress_tx.send(None);
+            }
         }
         ChannelEvent::Close { channel } => {
             if let Some(ch) = conn.channel(channel) {
@@ -840,6 +1154,9 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             }
             // Drop the runtime so the backend can reap its child / close fds.
             shells.remove(&channel);
+            // Dropping the SubsystemRuntime closes `ingress_tx`; the handler
+            // thread's next `Read` returns `Ok(0)` and the thread exits.
+            subsystems.remove(&channel);
         }
         ChannelEvent::WindowAdjust { .. } => {}
         ChannelEvent::GlobalRequest { want_reply, .. } if want_reply => {
@@ -864,6 +1181,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     request: ChannelRequest,
     want_reply: bool,
     shells: &mut BTreeMap<u32, ShellRuntime>,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
 ) -> Result<()> {
     match request {
         ChannelRequest::Exec { command } => {
@@ -974,6 +1292,44 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 if let Some(sess) = rt.session.as_mut() {
                     let _ = sess.resize(cols, rows, px_w, px_h);
                 }
+            }
+        }
+        ChannelRequest::Subsystem { name } => {
+            if let Some(handler) = cfg.subsystem_handler.clone() {
+                // Ingress: unbounded — the dispatcher must never block on
+                // its own dispatch path. Egress: bounded — the handler
+                // thread self-throttles when the remote window is full.
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                let cs = ChannelStream::new(ingress_rx, egress_tx);
+                let user_owned = user.to_string();
+                let name_owned = name.clone();
+                thread::spawn(move || {
+                    // Errors from the handler are swallowed: the stream
+                    // drops on return, which auto-emits EOF + Close so the
+                    // peer sees a clean teardown.
+                    let _ = handler.handle(&user_owned, &name_owned, cs);
+                });
+                subsystems.insert(
+                    channel,
+                    SubsystemRuntime {
+                        ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+                if want_reply {
+                    let p = conn.send_request_success(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            } else if want_reply {
+                let p = conn.send_request_failure(channel)?;
+                write_payload(stream, codec, rng, &p)?;
             }
         }
         // ChannelRequest::Signal { name } — forwarded as kill(child_pid,
@@ -1687,5 +2043,221 @@ mod tests {
         let neg = runner.negotiated().expect("negotiated");
         assert_eq!(neg.kex, "curve25519-sha256");
         assert_eq!(neg.host_key, "ssh-ed25519");
+    }
+
+    /// A subsystem handler that reads bytes from the channel until EOF and
+    /// writes them back uppercased. Used by [`loopback_subsystem_roundtrip`]
+    /// to exercise the `dispatch_app_packet` subsystem path end-to-end
+    /// (registration → ingress → egress → EOF → CLOSE) without depending on
+    /// any actual SFTP semantics.
+    ///
+    /// The latched `user` lets the test assert the authenticated identity
+    /// reaches the handler unchanged.
+    struct EchoUpperSubsystem {
+        captured_name: Arc<Mutex<Option<String>>>,
+        captured_user: Arc<Mutex<Option<String>>>,
+    }
+
+    impl SubsystemHandler for EchoUpperSubsystem {
+        fn handle(&self, user: &str, name: &str, mut stream: ChannelStream) -> Result<()> {
+            *self.captured_name.lock().unwrap() = Some(name.to_string());
+            *self.captured_user.lock().unwrap() = Some(user.to_string());
+
+            let mut acc = Vec::new();
+            let mut tmp = [0u8; 256];
+            loop {
+                match std::io::Read::read(&mut stream, &mut tmp) {
+                    Ok(0) => break, // EOF
+                    Ok(n) => acc.extend_from_slice(&tmp[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+            for b in acc.iter_mut() {
+                b.make_ascii_uppercase();
+            }
+            std::io::Write::write_all(&mut stream, &acc).ok();
+            // Dropping `stream` emits EOF + CLOSE to the peer.
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn loopback_subsystem_roundtrip() {
+        // Exercise the new `subsystem` channel-request path:
+        //   client opens session → asks for subsystem "echo" → pushes data
+        //   → EOFs → drains response → CLOSE.
+        // The handler runs on the dedicated subsystem thread spawned by
+        // dispatch_app_packet; the dispatcher routes Data/Eof/Close events
+        // through the mpsc plumbing in SubsystemRuntime.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "subsys-test-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let captured_name = Arc::new(Mutex::new(None));
+        let captured_user = Arc::new(Mutex::new(None));
+        let sub = EchoUpperSubsystem {
+            captured_name: captured_name.clone(),
+            captured_user: captured_user.clone(),
+        };
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused-exec\n".to_vec(),
+            }),
+        )
+        .with_subsystem(Arc::new(sub));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        let body = b"hello, subsystem world".to_vec();
+        let resp = client
+            .subsystem_once("echo", &body)
+            .expect("subsystem_once");
+        assert_eq!(resp, b"HELLO, SUBSYSTEM WORLD".to_vec());
+
+        // The handler saw the right subsystem name and authenticated user.
+        assert_eq!(
+            captured_name.lock().unwrap().as_deref(),
+            Some("echo"),
+            "subsystem name reached the handler",
+        );
+        assert_eq!(
+            captured_user.lock().unwrap().as_deref(),
+            Some(user.as_str()),
+            "authenticated user reached the handler",
+        );
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn loopback_subsystem_unconfigured_refused() {
+        // If Config has no subsystem_handler set, a `subsystem` request must
+        // be rejected with SSH_MSG_CHANNEL_FAILURE. The client surfaces that
+        // as a protocol error.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "subsys-reject-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused-exec\n".to_vec(),
+            }),
+        );
+        // Deliberately do NOT call with_subsystem.
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        let err = client
+            .subsystem_once("sftp", b"")
+            .expect_err("expected rejection");
+        match err {
+            Error::Protocol(_) => {}
+            other => panic!("expected Error::Protocol, got {:?}", other),
+        }
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
     }
 }

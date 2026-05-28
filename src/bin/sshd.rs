@@ -62,14 +62,16 @@ mod imp {
     use puressh::hostkey::HostKey;
     use puressh::key::{PrivateKey, PublicKey};
     use puressh::server::{
-        handle_session, AuthenticatorFactory, CommandHandler, Config, ExecResult, PtySpec,
-        ShellExitStatus, ShellHandler, ShellSession,
+        handle_session, AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult,
+        PtySpec, ShellExitStatus, ShellHandler, ShellSession, SubsystemHandler,
     };
+    use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
     const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
-                         [-A authorized_keys_file] [-u allowed_user]...";
+                         [-A authorized_keys_file] [-u allowed_user]... \
+                         [--no-sftp] [--sftp-read-only] [--sftp-root PATH]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -238,6 +240,12 @@ mod imp {
         authorized_keys_file: Option<String>,
         allowed_users: Vec<String>,
         debug: bool,
+        /// SFTP subsystem on by default; `--no-sftp` disables it.
+        sftp: bool,
+        /// Refuse any operation that would mutate the filesystem.
+        sftp_read_only: bool,
+        /// If set, refuse paths that escape this root.
+        sftp_root: Option<String>,
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -246,6 +254,9 @@ mod imp {
         let mut authorized_keys_file: Option<String> = None;
         let mut allowed_users: Vec<String> = Vec::new();
         let mut debug = false;
+        let mut sftp = true;
+        let mut sftp_read_only = false;
+        let mut sftp_root: Option<String> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -272,6 +283,13 @@ mod imp {
                     allowed_users.push(v);
                 }
                 "-d" => debug = true,
+                "--no-sftp" => sftp = false,
+                "--sftp-read-only" => sftp_read_only = true,
+                "--sftp-root" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("--sftp-root requires a value")?.clone();
+                    sftp_root = Some(v);
+                }
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -289,6 +307,9 @@ mod imp {
             authorized_keys_file,
             allowed_users,
             debug,
+            sftp,
+            sftp_read_only,
+            sftp_root,
         })
     }
 
@@ -705,6 +726,98 @@ mod imp {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // SftpSubsystemHandler — backend for `subsystem("sftp")`. Runs in-process
+    // (no fork, no execvp): a fresh thread is spawned for each SFTP channel,
+    // and the protocol loop reads/writes the channel via a `ChannelStream`.
+    //
+    // Privilege drop happens once per *connection* (see `drop_to_user` /
+    // `Config::on_session_open` below), so all SFTP threads on a given
+    // connection already run as the authenticated user — no per-channel
+    // setuid is needed. The per-session virtual cwd carried by
+    // `SftpServerSession` is what prevents concurrent SFTP channels from
+    // stomping each other's working directory.
+    // -------------------------------------------------------------------------
+
+    struct SftpSubsystemHandler {
+        read_only: bool,
+        root: Option<std::path::PathBuf>,
+        debug: bool,
+    }
+
+    impl SubsystemHandler for SftpSubsystemHandler {
+        fn handle(&self, user: &str, name: &str, stream: ChannelStream) -> puressh::Result<()> {
+            if name != "sftp" {
+                if self.debug {
+                    eprintln!("sshd: refusing unknown subsystem '{name}' for {user}");
+                }
+                return Ok(()); // dropping `stream` sends EOF + Close
+            }
+
+            // Start the per-session virtual cwd at the user's home directory
+            // so relative paths behave like a freshly-logged-in shell. If
+            // the lookup fails (rare on a configured system), fall back to
+            // root: `SftpServerSession` will still operate, just less
+            // intuitively.
+            let cwd = lookup_user(user)
+                .ok()
+                .map(|i| std::path::PathBuf::from(&i.home_str))
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+
+            let mut opts = SftpServerOptions::new(cwd);
+            if let Some(root) = &self.root {
+                opts = opts.with_root(root.clone());
+            }
+            if self.read_only {
+                opts = opts.read_only();
+            }
+
+            let mut session = SftpServerSession::new(opts);
+            if self.debug {
+                eprintln!("sshd: sftp session opened for {user}");
+            }
+            // Map SFTP-protocol errors into the generic puressh error type;
+            // the dispatcher only cares whether the handler returned cleanly.
+            session
+                .run(stream)
+                .map_err(|e| puressh::Error::Io(std::io::Error::other(format!("sftp: {e:?}"))))?;
+            if self.debug {
+                eprintln!("sshd: sftp session closed for {user}");
+            }
+            Ok(())
+        }
+    }
+
+    /// Drop the calling process to `user`'s primary uid/gid (with supplementary
+    /// groups via `initgroups`). Idempotent — if we already match `info`'s
+    /// ids, the function is a no-op. Called from `Config::on_session_open`
+    /// once per connection, after PAM session-open succeeded.
+    fn drop_to_user(user: &str, debug: bool) -> puressh::Result<()> {
+        let info = lookup_user(user)?;
+        if already_matches(&info) {
+            if debug {
+                eprintln!(
+                    "sshd: connection already running as {user} (uid={})",
+                    info.uid
+                );
+            }
+            return Ok(());
+        }
+        // setgid before initgroups (so initgroups assigns the right primary),
+        // setuid last (point of no return). Any failure here aborts the
+        // connection — running with mixed privileges is worse than refusing.
+        nix::unistd::setgid(info.gid).map_err(nix_io)?;
+        nix::unistd::initgroups(&info.name_c, info.gid).map_err(nix_io)?;
+        nix::unistd::setuid(info.uid).map_err(nix_io)?;
+        if debug {
+            eprintln!(
+                "sshd: dropped connection to {user} (uid={} gid={})",
+                info.uid, info.gid
+            );
+        }
+        Ok(())
+    }
+
     /// Build a `puressh::Error` from a `nix::errno::Errno` by wrapping the
     /// raw OS error as an `io::Error`. Avoids leaking nix types through the
     /// trait surface.
@@ -1055,21 +1168,40 @@ mod imp {
         // own copy — no cross-connection state bleed.
         let pam_gate = pam_gate::PamGate::new(cli.debug);
 
-        let cfg = Arc::new(
-            Config::new(
-                host_keys,
-                factory,
-                vec!["publickey"],
-                Arc::new(ShellCommandHandler {
-                    pam: pam_gate.clone(),
-                    debug: cli.debug,
-                }),
-            )
-            .with_shell(Arc::new(NixShellHandler {
+        let mut config = Config::new(
+            host_keys,
+            factory,
+            vec!["publickey"],
+            Arc::new(ShellCommandHandler {
                 pam: pam_gate.clone(),
                 debug: cli.debug,
-            })),
-        );
+            }),
+        )
+        .with_shell(Arc::new(NixShellHandler {
+            pam: pam_gate.clone(),
+            debug: cli.debug,
+        }));
+
+        if cli.sftp {
+            let sftp = SftpSubsystemHandler {
+                read_only: cli.sftp_read_only,
+                root: cli.sftp_root.as_ref().map(std::path::PathBuf::from),
+                debug: cli.debug,
+            };
+            config = config.with_subsystem(Arc::new(sftp));
+        }
+
+        // Drop privileges to the authenticated user *once per connection*
+        // (after PAM open, before any channel runs). Subsequent shell forks
+        // discover `already_matches(&info)` true and skip their own drop;
+        // SFTP threads run as the user in-process. The PAM session opened
+        // earlier (which needed root for pam_loginuid) stays valid; the
+        // eventual `pam_close_session` runs as the user, which works for
+        // every PAM module shipped by Linux distros today.
+        let debug = cli.debug;
+        config = config.on_session_open(move |user: &str| drop_to_user(user, debug));
+
+        let cfg = Arc::new(config);
 
         install_parent_sigchld()?;
 

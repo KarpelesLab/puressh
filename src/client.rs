@@ -873,6 +873,7 @@ impl Client {
             client: self,
             channel: local_id,
             read_buf: Vec::new(),
+            stderr_buf: Vec::new(),
             remote_eof: false,
             local_close_sent: false,
         };
@@ -885,6 +886,59 @@ impl Client {
                 _ => "sftp: handshake failed",
             })),
         }
+    }
+
+    /// Open a session channel and ask the server to execute `command`,
+    /// returning a [`ClientChannelStream`] borrowing the client for the
+    /// channel's lifetime. The stream's `Read` half delivers the command's
+    /// stdout, `Write` feeds stdin, and the channel is closed on drop.
+    /// Stderr is buffered and can be drained with
+    /// [`ClientChannelStream::take_stderr`].
+    ///
+    /// Mirrors [`Client::sftp`] but issues `ChannelRequest::Exec` instead
+    /// of `Subsystem`. Used by [`Client::scp_send_to`] /
+    /// [`Client::scp_recv_from`] to drive the remote `scp -t` / `scp -f`
+    /// helper over the channel. For one-shot commands whose output you just
+    /// want to collect, use [`Client::exec`] instead.
+    pub fn exec_stream(&mut self, command: &str) -> Result<ClientChannelStream<'_>> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
+        self.write_payload(&open_payload)?;
+
+        let mut opened = false;
+        let mut iter_guard = 0usize;
+        while !opened {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("exec_stream: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => opened = true,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("exec_stream: channel open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        let exec_req = self.conn.send_request(
+            local_id,
+            ChannelRequest::Exec {
+                command: command.into(),
+            },
+            true,
+        )?;
+        self.write_payload(&exec_req)?;
+        self.await_request_reply(local_id, "exec")?;
+
+        Ok(ClientChannelStream {
+            client: self,
+            channel: local_id,
+            read_buf: Vec::new(),
+            stderr_buf: Vec::new(),
+            remote_eof: false,
+            local_close_sent: false,
+        })
     }
 
     /// Open a `direct-tcpip` channel (RFC 4254 §7.2) that asks the server to
@@ -935,9 +989,101 @@ impl Client {
             client: self,
             channel: local_id,
             read_buf: Vec::new(),
+            stderr_buf: Vec::new(),
             remote_eof: false,
             local_close_sent: false,
         })
+    }
+
+    /// Upload one or more local sources to a remote destination via SCP.
+    ///
+    /// Issues `scp -t [-r] [-p] -- <quoted dest>` on the peer (a remote
+    /// `scp` binary, or our own `sshd`'s in-process [`crate::server::ExecStreamHandler`]
+    /// reading the SCP protocol). For each source we then drive
+    /// [`crate::scp::Sender::send_path`] over the channel.
+    ///
+    /// Remote-path quoting refuses `'`, `\n`, and `\0` to prevent shell
+    /// injection on the remote side. On error, any buffered server-side
+    /// stderr is appended to the message via
+    /// [`ClientChannelStream::take_stderr`].
+    pub fn scp_send_to(
+        &mut self,
+        sources: &[&std::path::Path],
+        remote_dest: &str,
+        opts: crate::scp::ScpSendOptions,
+    ) -> Result<()> {
+        let cmd = build_scp_to_cmd(remote_dest, &opts)?;
+        let mut stream = self.exec_stream(&cmd)?;
+        let result = (|| -> Result<()> {
+            let mut sender = crate::scp::Sender::new(&mut stream)
+                .map_err(|e| scp_proto(e, "scp_send_to: handshake"))?;
+            for src in sources {
+                sender
+                    .send_path(src, &opts)
+                    .map_err(|e| scp_proto(e, "scp_send_to: send_path"))?;
+            }
+            Ok(())
+        })();
+        // Drain any stderr the remote scp printed; surface it on error.
+        let stderr = stream.take_stderr();
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if !stderr.is_empty() {
+                    let msg = String::from_utf8_lossy(&stderr).trim().to_string();
+                    eprintln!("scp_send_to: remote stderr: {}", msg);
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Download from a remote source to a local destination via SCP.
+    ///
+    /// Issues `scp -f [-r] [-p] -- <quoted source>` on the peer, then
+    /// drives [`crate::scp::Receiver::run`] over the channel.
+    ///
+    /// `local_dest` is interpreted as a target *directory* unless
+    /// `opts.recursive` is false AND `local_dest` doesn't exist as a
+    /// directory — in which case it's treated as the literal file
+    /// path (matches `scp remote:foo /tmp/bar`). To force file-target
+    /// behaviour set the recv options' `target_is_file` flag.
+    pub fn scp_recv_from(
+        &mut self,
+        remote_source: &str,
+        local_dest: &std::path::Path,
+        mut opts: crate::scp::ScpRecvOptions,
+    ) -> Result<()> {
+        let cmd = build_scp_from_cmd(remote_source, &opts)?;
+        // If the local target is not an existing directory and the
+        // caller hasn't said otherwise, treat it as a file target.
+        if !opts.target_is_file && !opts.recursive {
+            if let Ok(md) = std::fs::metadata(local_dest) {
+                if !md.is_dir() {
+                    opts.target_is_file = true;
+                }
+            } else {
+                opts.target_is_file = true;
+            }
+        }
+        let mut stream = self.exec_stream(&cmd)?;
+        let result = (|| -> Result<()> {
+            let mut recv = crate::scp::Receiver::new(&mut stream, local_dest, opts)
+                .map_err(|e| scp_proto(e, "scp_recv_from: handshake"))?;
+            recv.run().map_err(|e| scp_proto(e, "scp_recv_from: run"))?;
+            Ok(())
+        })();
+        let stderr = stream.take_stderr();
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if !stderr.is_empty() {
+                    let msg = String::from_utf8_lossy(&stderr).trim().to_string();
+                    eprintln!("scp_recv_from: remote stderr: {}", msg);
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Send a `tcpip-forward` global request (RFC 4254 §7.1; the
@@ -1358,19 +1504,36 @@ impl Client {
 ///
 /// On `Drop` the channel is closed (CHANNEL_CLOSE is sent; the matching
 /// peer CLOSE is best-effort drained).
+///
+/// Extended-data (stderr) is **buffered** rather than dropped — pump_one
+/// appends each `SSH_EXTENDED_DATA_STDERR` payload into an internal buffer
+/// (still replenishing the window). Callers that want server-side
+/// diagnostic output (notably [`Client::scp_send_to`] /
+/// [`Client::scp_recv_from`]) drain it via [`Self::take_stderr`]. The SFTP
+/// subsystem doesn't emit extended data, so the buffer stays empty there.
 pub struct ClientChannelStream<'a> {
     client: &'a mut Client,
     channel: u32,
     read_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
     remote_eof: bool,
     local_close_sent: bool,
 }
 
 impl ClientChannelStream<'_> {
+    /// Take ownership of any accumulated server-side stderr (extended-data
+    /// channel) bytes. Leaves the buffer empty. Used by SCP error paths to
+    /// surface the remote `scp` binary's diagnostic output back to the
+    /// caller; for SFTP / direct-tcpip channels the buffer is normally
+    /// empty.
+    pub fn take_stderr(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.stderr_buf)
+    }
+
     /// Drive the SSH packet loop until either `read_buf` has bytes available
     /// or the peer closes the channel. Window-adjust packets are handled
-    /// transparently; extended-data is treated as stdout (subsystems
-    /// shouldn't emit stderr, but tolerate it).
+    /// transparently; extended-data (any code) is buffered into
+    /// [`Self::stderr_buf`].
     fn pump_one(&mut self) -> std::io::Result<()> {
         let payload = self.client.read_one_packet().map_err(io_err)?;
         let ev = self.client.conn.on_packet(&payload).map_err(io_err)?;
@@ -1393,6 +1556,7 @@ impl ClientChannelStream<'_> {
                 data,
             } if channel == self.channel => {
                 let n = data.len() as u32;
+                self.stderr_buf.extend_from_slice(&data);
                 if let Some(adj) = self
                     .client
                     .conn
@@ -1505,6 +1669,77 @@ fn io_err(e: Error) -> std::io::Error {
     match e {
         Error::Io(io) => io,
         other => std::io::Error::other(format!("{:?}", other)),
+    }
+}
+
+/// Build `scp -t [-r] [-p] -- '<dest>'` for [`Client::scp_send_to`].
+fn build_scp_to_cmd(remote_dest: &str, opts: &crate::scp::ScpSendOptions) -> Result<String> {
+    let quoted = single_quote_for_remote(remote_dest)?;
+    let mut s = String::from("scp -t");
+    if opts.recursive {
+        s.push_str(" -r");
+    }
+    if opts.preserve_times {
+        s.push_str(" -p");
+    }
+    s.push_str(" -- ");
+    s.push_str(&quoted);
+    Ok(s)
+}
+
+/// Build `scp -f [-r] [-p] -- '<source>'` for [`Client::scp_recv_from`].
+fn build_scp_from_cmd(remote_source: &str, opts: &crate::scp::ScpRecvOptions) -> Result<String> {
+    let quoted = single_quote_for_remote(remote_source)?;
+    let mut s = String::from("scp -f");
+    if opts.recursive {
+        s.push_str(" -r");
+    }
+    if opts.preserve_times {
+        s.push_str(" -p");
+    }
+    s.push_str(" -- ");
+    s.push_str(&quoted);
+    Ok(s)
+}
+
+/// Single-quote a remote path for the SSH server's command string.
+/// Rejects `'`, `\n`, `\0` — these are characters our own sshd parser
+/// can't safely unquote (`'` would terminate the quote; the others can
+/// desync most shell parsers). Matches the validation in
+/// [`crate::scp::protocol::validate_name`] but on full paths.
+fn single_quote_for_remote(p: &str) -> Result<String> {
+    if p.contains('\'') {
+        return Err(Error::Protocol("scp: remote path contains single quote"));
+    }
+    if p.contains('\n') {
+        return Err(Error::Protocol("scp: remote path contains newline"));
+    }
+    if p.contains('\0') {
+        return Err(Error::Protocol("scp: remote path contains NUL"));
+    }
+    if p.starts_with('-') {
+        return Err(Error::Protocol("scp: remote path starts with '-'"));
+    }
+    let mut q = String::with_capacity(p.len() + 2);
+    q.push('\'');
+    q.push_str(p);
+    q.push('\'');
+    Ok(q)
+}
+
+/// Map a [`crate::scp::ScpError`] into the lib's [`Error`] type. Drops
+/// the dynamic message string into `Error::Protocol`; the caller has
+/// already taken `stream.take_stderr()` so the precise wire error
+/// surfaces in `eprintln` rather than the typed error.
+fn scp_proto(e: crate::scp::ScpError, _stage: &'static str) -> Error {
+    match e {
+        crate::scp::ScpError::Io(io) => Error::Io(io),
+        crate::scp::ScpError::Remote(_) => Error::Protocol("scp: remote fatal frame"),
+        crate::scp::ScpError::Warning(_) => Error::Protocol("scp: remote warning frame"),
+        crate::scp::ScpError::BadHeader(_) => Error::Protocol("scp: malformed header"),
+        crate::scp::ScpError::BadName(_) => Error::Protocol("scp: invalid name"),
+        crate::scp::ScpError::PathEscape => Error::Protocol("scp: path escapes base"),
+        crate::scp::ScpError::Unexpected(_) => Error::Protocol("scp: unexpected protocol state"),
     }
 }
 

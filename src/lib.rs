@@ -54,6 +54,9 @@ pub mod server;
 pub mod sftp;
 
 #[cfg(feature = "std")]
+pub mod scp;
+
+#[cfg(feature = "std")]
 pub mod known_hosts;
 
 #[cfg(all(feature = "std", unix))]

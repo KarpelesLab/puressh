@@ -19,10 +19,13 @@ use std::process::ExitCode;
 
 use puressh::auth::ClientCredential;
 use puressh::client::{Client, Config, HostKeyPolicy};
-use puressh::key::PrivateKey;
 use puressh::sftp::{
     Attrs, FxpStatus, SftpClient, SftpError, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE,
 };
+
+#[path = "common.rs"]
+mod common;
+use common::{load_identity, read_password_from_stdin, resolve_user};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -92,47 +95,6 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         host,
         user_in_host,
     })
-}
-
-fn resolve_user(cli: &Cli) -> Result<String, String> {
-    if let Some(u) = &cli.cli_user {
-        return Ok(u.clone());
-    }
-    if let Some(u) = &cli.user_in_host {
-        return Ok(u.clone());
-    }
-    std::env::var("USER").map_err(|_| "no user specified and $USER is unset".into())
-}
-
-fn read_password_from_stdin() -> std::io::Result<String> {
-    eprint!("password: ");
-    std::io::stderr().flush()?;
-    let mut s = String::new();
-    let mut byte = [0u8; 1];
-    let mut stdin = std::io::stdin();
-    loop {
-        let n = stdin.read(&mut byte)?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        if byte[0] == b'\r' {
-            continue;
-        }
-        s.push(byte[0] as char);
-        if s.len() > 4096 {
-            break;
-        }
-    }
-    Ok(s)
-}
-
-fn load_identity(path: &str) -> Result<PrivateKey, String> {
-    let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    PrivateKey::parse_openssh_pem(&pem, None)
-        .map_err(|e| format!("parse {path}: {e} (passphrase-protected keys not supported here)"))
 }
 
 /// Resolve a remote path token against the session's virtual cwd.
@@ -462,7 +424,7 @@ fn run() -> Result<i32, String> {
     }
 
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
-    let user = resolve_user(&cli)?;
+    let user = resolve_user(cli.cli_user.as_deref(), cli.user_in_host.as_deref())?;
 
     let cfg = Config {
         host_key_policy: HostKeyPolicy::AcceptAny,

@@ -61,9 +61,12 @@ mod imp {
     use puressh::auth::{AuthAttempt, AuthDecision, Authenticator};
     use puressh::hostkey::HostKey;
     use puressh::key::{PrivateKey, PublicKey};
+    use puressh::scp::{
+        Receiver as ScpReceiver, ScpRecvOptions, ScpSendOptions, Sender as ScpSender,
+    };
     use puressh::server::{
         handle_session, AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult,
-        PtySpec, ShellExitStatus, ShellHandler, ShellSession, SubsystemHandler,
+        ExecStreamHandler, PtySpec, ShellExitStatus, ShellHandler, ShellSession, SubsystemHandler,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -71,7 +74,8 @@ mod imp {
 
     const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
                          [-A authorized_keys_file] [-u allowed_user]... \
-                         [--no-sftp] [--sftp-read-only] [--sftp-root PATH]";
+                         [--no-sftp] [--sftp-read-only] [--sftp-root PATH] \
+                         [--no-scp]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -246,6 +250,10 @@ mod imp {
         sftp_read_only: bool,
         /// If set, refuse paths that escape this root.
         sftp_root: Option<String>,
+        /// SCP support (in-process `scp -t/-f`) on by default; `--no-scp`
+        /// disables it. With SCP off, an `exec scp …` request falls through
+        /// to the buffered command handler — which refuses unknown commands.
+        scp: bool,
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -257,6 +265,7 @@ mod imp {
         let mut sftp = true;
         let mut sftp_read_only = false;
         let mut sftp_root: Option<String> = None;
+        let mut scp = true;
 
         let mut i = 0;
         while i < args.len() {
@@ -290,6 +299,7 @@ mod imp {
                     let v = args.get(i).ok_or("--sftp-root requires a value")?.clone();
                     sftp_root = Some(v);
                 }
+                "--no-scp" => scp = false,
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -310,6 +320,7 @@ mod imp {
             sftp,
             sftp_read_only,
             sftp_root,
+            scp,
         })
     }
 
@@ -788,6 +799,258 @@ mod imp {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // ScpExecHandler — intercept `exec scp -t …` / `exec scp -f …` requests
+    // and run the in-process SCP sender/receiver on the channel. Anything
+    // that doesn't look like an `scp` invocation falls through to the
+    // buffered command handler (which then either runs it or refuses).
+    //
+    // We deliberately do NOT spawn a shell. The command string is parsed
+    // ourselves with a single-quote-aware tokenizer; anything more elaborate
+    // (pipes, redirections, command substitution, env assignments) is
+    // refused. That gives us CVE-2020-15778-style protection without
+    // depending on the user's shell quoting.
+    //
+    // Privilege drop already happened in `Config::on_session_open`, so the
+    // handler thread runs as the authenticated user. The output path is
+    // resolved against the user's home directory — that's the cwd both real
+    // sshd and our own session loop expose to scp(1).
+    // -------------------------------------------------------------------------
+
+    struct ScpExecHandler {
+        debug: bool,
+    }
+
+    impl ExecStreamHandler for ScpExecHandler {
+        fn claims(&self, command: &str) -> bool {
+            // Cheap pre-check before tokenising. We're after the literal
+            // `scp ` prefix optionally preceded by whitespace.
+            let t = command.trim_start();
+            t.starts_with("scp ") || t == "scp"
+        }
+
+        fn run(&self, user: &str, command: &str, stream: ChannelStream) -> puressh::Result<()> {
+            let argv = match tokenize_argv(command) {
+                Ok(a) => a,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("sshd: scp: refusing command {command:?}: {e}");
+                    }
+                    return Err(puressh::Error::Io(std::io::Error::other(format!(
+                        "scp: {e}"
+                    ))));
+                }
+            };
+            let parsed = match parse_scp_args(&argv) {
+                Ok(p) => p,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("sshd: scp: bad args {argv:?}: {e}");
+                    }
+                    return Err(puressh::Error::Io(std::io::Error::other(format!(
+                        "scp: {e}"
+                    ))));
+                }
+            };
+
+            // Resolve the target path against $HOME if relative. After the
+            // connection-level priv drop the process cwd is wherever the
+            // daemon was started — we don't want scp's bare-name argument
+            // landing in /etc/sshd just because that's where systemd
+            // started us.
+            let home = lookup_user(user)
+                .ok()
+                .map(|i| std::path::PathBuf::from(&i.home_str))
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            let abs_path = if parsed.path.is_absolute() {
+                parsed.path.clone()
+            } else {
+                home.join(&parsed.path)
+            };
+
+            if self.debug {
+                eprintln!(
+                    "sshd: scp {:?} {:?} (recursive={}, preserve_times={}) for {user}",
+                    parsed.role, abs_path, parsed.recursive, parsed.preserve_times
+                );
+            }
+
+            match parsed.role {
+                ScpRole::To => {
+                    // `scp -t` — the peer is the sender, we receive.
+                    let opts = ScpRecvOptions {
+                        recursive: parsed.recursive,
+                        preserve_times: parsed.preserve_times,
+                        // If the local destination already exists as a
+                        // directory we use it as the parent; otherwise it's
+                        // the literal file path.
+                        target_is_file: !abs_path.is_dir(),
+                    };
+                    let mut rx = ScpReceiver::new(stream, &abs_path, opts).map_err(|e| {
+                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
+                    })?;
+                    rx.run().map_err(|e| {
+                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
+                    })?;
+                }
+                ScpRole::From => {
+                    // `scp -f` — we read from disk and send to the peer.
+                    let opts = ScpSendOptions {
+                        recursive: parsed.recursive,
+                        preserve_times: parsed.preserve_times,
+                    };
+                    let mut tx = ScpSender::new(stream).map_err(|e| {
+                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
+                    })?;
+                    tx.send_path(&abs_path, &opts).map_err(|e| {
+                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
+                    })?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// One `scp` invocation's worth of parsed arguments. We only care about
+    /// the role flag (`-t` or `-f`), the recursive/preserve_times modes, and
+    /// the single positional path. Anything else is a hard reject.
+    #[derive(Debug)]
+    struct ParsedScp {
+        role: ScpRole,
+        recursive: bool,
+        preserve_times: bool,
+        path: std::path::PathBuf,
+    }
+
+    #[derive(Debug)]
+    enum ScpRole {
+        /// `-t`: the peer is the sender; we write to disk.
+        To,
+        /// `-f`: the peer is the receiver; we read from disk.
+        From,
+    }
+
+    /// Tokenize a command string with single-quote support — enough to
+    /// handle the way OpenSSH's `scp(1)` quotes its remote arg list. We
+    /// refuse anything that smells like shell metacharacters (`$`, `` ` ``,
+    /// `&`, `|`, `;`, `<`, `>`, `(`, `)`, `\`, `"`, `*`, `?`, `[`, `]`,
+    /// `{`, `}`, `~`, `!`) outside quotes, because the local-side `scp`
+    /// crafts its remote command itself and never needs them.
+    fn tokenize_argv(command: &str) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        let mut in_word = false;
+        let mut in_quote = false;
+        let bytes = command.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i] as char;
+            if in_quote {
+                if c == '\'' {
+                    in_quote = false;
+                } else if c == '\n' || c == '\0' {
+                    return Err("control character in quoted arg".into());
+                } else {
+                    cur.push(c);
+                }
+            } else if c == '\'' {
+                in_quote = true;
+                in_word = true;
+            } else if c == ' ' || c == '\t' {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            } else if matches!(
+                c,
+                '$' | '`'
+                    | '&'
+                    | '|'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '\\'
+                    | '"'
+                    | '*'
+                    | '?'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+                    | '~'
+                    | '!'
+                    | '\n'
+                    | '\r'
+                    | '\0'
+            ) {
+                return Err(format!("unsupported character {c:?} in command"));
+            } else {
+                cur.push(c);
+                in_word = true;
+            }
+            i += 1;
+        }
+        if in_quote {
+            return Err("unterminated single quote".into());
+        }
+        if in_word {
+            out.push(cur);
+        }
+        Ok(out)
+    }
+
+    /// Parse `scp [-r] [-p] [-d] [-v] [-t|-f] [--] PATH`. We accept the
+    /// usual mode flags plus `-d` (target must be a dir — informational only
+    /// for us) and `-v` (verbose; ignored). Anything else is rejected.
+    fn parse_scp_args(argv: &[String]) -> Result<ParsedScp, String> {
+        if argv.is_empty() || argv[0] != "scp" {
+            return Err("not an scp invocation".into());
+        }
+        let mut role: Option<ScpRole> = None;
+        let mut recursive = false;
+        let mut preserve_times = false;
+        let mut positional: Vec<&str> = Vec::new();
+        let mut i = 1;
+        while i < argv.len() {
+            let a = argv[i].as_str();
+            match a {
+                "-t" => role = Some(ScpRole::To),
+                "-f" => role = Some(ScpRole::From),
+                "-r" => recursive = true,
+                "-p" => preserve_times = true,
+                // Innocent flags scp(1) sometimes adds — accept and ignore.
+                "-d" | "-v" | "-q" | "-B" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
+                "--" => {
+                    i += 1;
+                    while i < argv.len() {
+                        positional.push(argv[i].as_str());
+                        i += 1;
+                    }
+                    break;
+                }
+                s if s.starts_with('-') => return Err(format!("unsupported flag: {s}")),
+                _ => positional.push(a),
+            }
+            i += 1;
+        }
+        let role = role.ok_or_else(|| "missing -t or -f".to_string())?;
+        if positional.len() != 1 {
+            return Err(format!(
+                "expected exactly one path argument, got {}",
+                positional.len()
+            ));
+        }
+        let path = std::path::PathBuf::from(positional[0]);
+        Ok(ParsedScp {
+            role,
+            recursive,
+            preserve_times,
+            path,
+        })
+    }
+
     /// Drop the calling process to `user`'s primary uid/gid (with supplementary
     /// groups via `initgroups`). Idempotent — if we already match `info`'s
     /// ids, the function is a no-op. Called from `Config::on_session_open`
@@ -1189,6 +1452,11 @@ mod imp {
                 debug: cli.debug,
             };
             config = config.with_subsystem(Arc::new(sftp));
+        }
+
+        if cli.scp {
+            let scp = ScpExecHandler { debug: cli.debug };
+            config = config.with_exec_stream_handler(Arc::new(scp));
         }
 
         // Drop privileges to the authenticated user *once per connection*

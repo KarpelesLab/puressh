@@ -226,6 +226,40 @@ pub trait SubsystemHandler: Send + Sync {
     fn handle(&self, user: &str, name: &str, stream: ChannelStream) -> Result<()>;
 }
 
+/// Server-side hook called when a client sends an `"exec"` channel request,
+/// **before** the synchronous [`CommandHandler`] runs. Lets a stream-mode
+/// handler (SCP, custom RPC) claim the channel and drive it as a real
+/// bidirectional pipe rather than the buffer-and-return shape of
+/// [`CommandHandler::handle`].
+///
+/// The dispatcher consults the overlay in two phases:
+///
+/// 1. [`claims`] is called synchronously in the connection thread with
+///    just the command string. Return `true` to claim the request — the
+///    dispatcher then sends `request_success`, registers a per-channel
+///    runtime, and hands off to [`run`].
+/// 2. [`run`] executes on a dedicated thread per claimed channel, with
+///    a live [`ChannelStream`] it can `Read`/`Write` until the
+///    transaction finishes. Dropping the stream emits `EOF`+`Close` to
+///    the peer.
+///
+/// Both hooks run in the per-connection process after the
+/// [`Config::on_session_open`] drop-to-user has already happened, so
+/// handlers see the authenticated user's filesystem permissions.
+///
+/// [`claims`]: ExecStreamHandler::claims
+/// [`run`]: ExecStreamHandler::run
+pub trait ExecStreamHandler: Send + Sync {
+    /// Cheap synchronous decision based on the command string only.
+    /// Return `true` to claim; `false` to fall through to the buffered
+    /// [`CommandHandler`].
+    fn claims(&self, command: &str) -> bool;
+    /// Execute the claimed command on a dedicated thread. The handler
+    /// owns `stream` until it returns; on return the stream drops,
+    /// emitting `EOF`+`Close` automatically.
+    fn run(&self, user: &str, command: &str, stream: ChannelStream) -> Result<()>;
+}
+
 /// Decoded `direct-tcpip` channel-open request (RFC 4254 §7.2).
 ///
 /// The wire fields are `string dest_host, uint32 dest_port,
@@ -397,8 +431,17 @@ pub struct Config {
     pub authenticator: Arc<dyn AuthenticatorFactory>,
     /// Auth methods advertised in `USERAUTH_FAILURE`.
     pub allowed_auth_methods: Vec<&'static str>,
-    /// Command handler invoked on `"exec"` channel requests.
+    /// Command handler invoked on `"exec"` channel requests when no
+    /// [`ExecStreamHandler`] claims them.
     pub command_handler: Arc<dyn CommandHandler>,
+    /// Optional stream-mode `"exec"` overlay. When set, the dispatcher
+    /// calls [`ExecStreamHandler::claims`] *before* the synchronous
+    /// [`CommandHandler`]; commands the overlay claims are dispatched on
+    /// their own thread with a live [`ChannelStream`] via
+    /// [`ExecStreamHandler::run`]. Used by sshd's in-process SCP handler
+    /// to drive `scp -t` / `scp -f` without going through the
+    /// buffered-then-flushed [`CommandHandler`].
+    pub exec_stream_handler: Option<Arc<dyn ExecStreamHandler>>,
     /// Optional interactive-shell hook. When `None` (the default),
     /// `"pty-req"` and `"shell"` are rejected, matching the historical
     /// behaviour of this server.
@@ -448,6 +491,7 @@ impl Config {
             authenticator,
             allowed_auth_methods,
             command_handler,
+            exec_stream_handler: None,
             shell_handler: None,
             subsystem_handler: None,
             direct_tcpip_handler: None,
@@ -470,6 +514,15 @@ impl Config {
     /// `"subsystem"` channel request is rejected.
     pub fn with_subsystem(mut self, handler: Arc<dyn SubsystemHandler>) -> Self {
         self.subsystem_handler = Some(handler);
+        self
+    }
+
+    /// Attach an `ExecStreamHandler` overlay. The dispatcher consults it
+    /// **before** the synchronous [`CommandHandler`] on every `"exec"`
+    /// channel request; handlers that return `None` fall through to
+    /// the existing buffered path. Used by sshd's in-process SCP support.
+    pub fn with_exec_stream_handler(mut self, handler: Arc<dyn ExecStreamHandler>) -> Self {
+        self.exec_stream_handler = Some(handler);
         self
     }
 
@@ -1614,6 +1667,48 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
 ) -> Result<()> {
     match request {
         ChannelRequest::Exec { command } => {
+            // First-chance overlay: ask the ExecStreamHandler (if any)
+            // whether it wants to claim this command. The decision must
+            // happen synchronously — we can't take back a `request_success`
+            // reply, and the SubsystemRuntime we register here would
+            // deadlock the connection if no thread drained it. Once
+            // `claims` returns true we set up the runtime + spawn the
+            // handler thread the same way `ChannelRequest::Subsystem`
+            // below does.
+            if let Some(handler) = cfg.exec_stream_handler.clone() {
+                if handler.claims(&command) {
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    let user_owned = user.to_string();
+                    let command_owned = command.clone();
+                    let handler_for_thread = handler;
+                    thread::spawn(move || {
+                        // Errors swallowed: the stream auto-emits
+                        // EOF + Close on drop, so the peer sees teardown.
+                        let _ = handler_for_thread.run(&user_owned, &command_owned, cs);
+                    });
+                    subsystems.insert(
+                        channel,
+                        SubsystemRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                    if want_reply {
+                        let p = conn.send_request_success(channel)?;
+                        write_payload(stream, codec, rng, &p)?;
+                    }
+                    return Ok(());
+                }
+                // Not claimed — fall through to the buffered CommandHandler.
+            }
             let result = cfg.command_handler.handle(user, &command);
             if want_reply {
                 let p = conn.send_request_success(channel)?;

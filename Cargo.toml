@@ -10,6 +10,12 @@ documentation = "https://docs.rs/puressh"
 readme = "README.md"
 keywords = ["ssh", "ssh2", "crypto", "network", "no-std"]
 categories = ["cryptography", "network-programming"]
+# Cargo's auto-discovery scans `src/bin/` for `.rs` files and turns each one
+# into a binary. We list every binary explicitly below; turning auto-discovery
+# off lets us drop shared helpers in `src/bin/common.rs` (pulled in via
+# `#[path = "common.rs"] mod common;`) without Cargo trying to compile them
+# as a standalone binary.
+autobins = false
 
 [features]
 default = ["std", "client", "server", "compress", "pam"]
@@ -88,4 +94,9 @@ required-features = ["std"]
 [[bin]]
 name = "sftp"
 path = "src/bin/sftp.rs"
+required-features = ["std", "client"]
+
+[[bin]]
+name = "scp"
+path = "src/bin/scp.rs"
 required-features = ["std", "client"]

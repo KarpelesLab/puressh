@@ -2260,4 +2260,204 @@ mod tests {
         }
         let _ = server_thread.join();
     }
+
+    /// SubsystemHandler wrapping an `SftpServerSession` so the loopback
+    /// SFTP test can drive the in-process server over a real SSH channel.
+    struct SftpSubsystem {
+        cwd: std::path::PathBuf,
+        root: std::path::PathBuf,
+    }
+
+    impl SubsystemHandler for SftpSubsystem {
+        fn handle(&self, _user: &str, name: &str, stream: ChannelStream) -> Result<()> {
+            if name != "sftp" {
+                return Ok(());
+            }
+            let opts =
+                crate::sftp::SftpServerOptions::new(self.cwd.clone()).with_root(self.root.clone());
+            let mut sess = crate::sftp::SftpServerSession::new(opts);
+            // SftpError → Result is best-effort; drop the stream on return so
+            // the dispatcher emits EOF+CLOSE to the peer.
+            let _ = sess.run(stream);
+            Ok(())
+        }
+    }
+
+    /// pid + nanosecond timestamp gives a unique directory across parallel
+    /// `cargo test` workers without pulling in a tempfile dep — mirrors the
+    /// pattern in `src/sftp/tests.rs`.
+    struct SftpTempDir(std::path::PathBuf);
+
+    impl SftpTempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "puressh-server-sftp-{}-{}-{}",
+                tag,
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for SftpTempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn loopback_sftp_client_roundtrip() {
+        // End-to-end: Client::sftp() opens a channel, requests subsystem
+        // "sftp", performs INIT/VERSION, then drives a put + readdir + get
+        // round-trip against an in-process SftpServerSession running on the
+        // dispatcher's subsystem thread.
+        let tmp = SftpTempDir::new("roundtrip");
+        let root = tmp.path().to_path_buf();
+
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "sftp-test-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let sub = SftpSubsystem {
+            cwd: root.clone(),
+            root: root.clone(),
+        };
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused-exec\n".to_vec(),
+            }),
+        )
+        .with_subsystem(Arc::new(sub));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        {
+            let mut sftp = client.sftp().expect("sftp handshake");
+            assert!(sftp.server_version() >= 3);
+
+            // Realpath: ask the server to canonicalise "." → returns the cwd.
+            let cwd = sftp.realpath(b".").expect("realpath .");
+            assert_eq!(cwd.as_slice(), root.as_os_str().as_encoded_bytes());
+
+            // Write a file via SFTP.
+            let target = root.join("hello.txt");
+            let body = b"hello from sftp\n".to_vec();
+            let handle = sftp
+                .open(
+                    target.as_os_str().as_encoded_bytes(),
+                    crate::sftp::FXF_WRITE | crate::sftp::FXF_CREAT | crate::sftp::FXF_TRUNC,
+                    crate::sftp::Attrs::default(),
+                )
+                .expect("open for write");
+            sftp.write(&handle, 0, &body).expect("write");
+            sftp.close(&handle).expect("close write handle");
+
+            // Now read it back via SFTP.
+            let handle = sftp
+                .open(
+                    target.as_os_str().as_encoded_bytes(),
+                    crate::sftp::FXF_READ,
+                    crate::sftp::Attrs::default(),
+                )
+                .expect("open for read");
+            let got = sftp.read(&handle, 0, 1024).expect("read");
+            assert_eq!(got, body);
+            sftp.close(&handle).expect("close read handle");
+
+            // readdir sees the new entry.
+            let dh = sftp
+                .opendir(root.as_os_str().as_encoded_bytes())
+                .expect("opendir");
+            let mut all_names = Vec::<Vec<u8>>::new();
+            while let Some(batch) = sftp.readdir(&dh).expect("readdir") {
+                for e in batch {
+                    all_names.push(e.filename);
+                }
+            }
+            sftp.close(&dh).expect("close dir");
+            assert!(
+                all_names.iter().any(|n| n == b"hello.txt"),
+                "readdir saw the new file: {:?}",
+                all_names
+                    .iter()
+                    .map(|n| String::from_utf8_lossy(n).into_owned())
+                    .collect::<Vec<_>>(),
+            );
+
+            // remove() and confirm.
+            sftp.remove(target.as_os_str().as_encoded_bytes())
+                .expect("remove");
+            let err = sftp
+                .stat(target.as_os_str().as_encoded_bytes())
+                .expect_err("stat after remove");
+            match err {
+                crate::sftp::SftpError::Status {
+                    code: crate::sftp::FxpStatus::NoSuchFile,
+                    ..
+                } => {}
+                other => panic!("expected NoSuchFile, got {:?}", other),
+            }
+
+            // sftp's Drop closes the channel before client is dropped.
+        }
+
+        drop(client);
+
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
 }

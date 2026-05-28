@@ -24,6 +24,7 @@ use crate::channel::{
 };
 use crate::error::{Error, Result};
 use crate::hostkey::{host_key_verify_by_name, HostKey, HostKeyVerify};
+use crate::sftp::SftpClient;
 use crate::transport::kex::{defaults, KexAlgorithms};
 use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
 use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
@@ -628,6 +629,61 @@ impl Client {
         Ok(out)
     }
 
+    /// Open an SFTP session: opens a session channel, requests the `sftp`
+    /// subsystem, performs the SFTP `INIT`/`VERSION` handshake, and returns
+    /// a [`SftpClient`] borrowing the channel for its lifetime.
+    ///
+    /// The returned client serialises one request/response at a time. When
+    /// it's dropped, the channel is closed.
+    pub fn sftp(&mut self) -> Result<SftpClient<ClientSftpStream<'_>>> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
+        self.write_payload(&open_payload)?;
+
+        let mut opened = false;
+        let mut iter_guard = 0usize;
+        while !opened {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol("sftp: open loop did not converge"));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => opened = true,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("channel open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        let sub_req = self.conn.send_request(
+            local_id,
+            ChannelRequest::Subsystem {
+                name: "sftp".into(),
+            },
+            true,
+        )?;
+        self.write_payload(&sub_req)?;
+        self.await_request_reply(local_id, "subsystem")?;
+
+        let stream = ClientSftpStream {
+            client: self,
+            channel: local_id,
+            read_buf: Vec::new(),
+            remote_eof: false,
+            local_close_sent: false,
+        };
+        // SftpClient::new performs INIT/VERSION; on error we still want to
+        // try to close the channel. Wrap with a manual try-catch.
+        match SftpClient::new(stream) {
+            Ok(c) => Ok(c),
+            Err(e) => Err(Error::Protocol(match e {
+                crate::sftp::SftpError::Protocol(s) => s,
+                _ => "sftp: handshake failed",
+            })),
+        }
+    }
+
     /// Block until the peer answers a single `CHANNEL_REQUEST` we sent
     /// with `want_reply = true`. Used by [`shell_with_stdin`] to gate the
     /// pty-req → shell handoff.
@@ -849,6 +905,162 @@ impl Client {
         let frame = self.codec.encode(payload, &mut self.rng)?;
         self.stream.write_all(&frame)?;
         Ok(())
+    }
+}
+
+/// Read+Write adapter wrapping a single open channel on a [`Client`],
+/// driving the underlying SSH packet loop on every `read` / `write`. Used
+/// by [`Client::sftp`] to feed [`SftpClient`] a synchronous transport.
+///
+/// On `Drop` the channel is closed (CHANNEL_CLOSE is sent; the matching
+/// peer CLOSE is best-effort drained).
+pub struct ClientSftpStream<'a> {
+    client: &'a mut Client,
+    channel: u32,
+    read_buf: Vec<u8>,
+    remote_eof: bool,
+    local_close_sent: bool,
+}
+
+impl ClientSftpStream<'_> {
+    /// Drive the SSH packet loop until either `read_buf` has bytes available
+    /// or the peer closes the channel. Window-adjust packets are handled
+    /// transparently; extended-data is treated as stdout (subsystems
+    /// shouldn't emit stderr, but tolerate it).
+    fn pump_one(&mut self) -> std::io::Result<()> {
+        let payload = self.client.read_one_packet().map_err(io_err)?;
+        let ev = self.client.conn.on_packet(&payload).map_err(io_err)?;
+        match ev {
+            ChannelEvent::Data { channel, data } if channel == self.channel => {
+                let n = data.len() as u32;
+                self.read_buf.extend_from_slice(&data);
+                if let Some(adj) = self
+                    .client
+                    .conn
+                    .replenish_window(self.channel, n)
+                    .map_err(io_err)?
+                {
+                    self.client.write_payload(&adj).map_err(io_err)?;
+                }
+            }
+            ChannelEvent::ExtendedData {
+                channel,
+                code: _,
+                data,
+            } if channel == self.channel => {
+                let n = data.len() as u32;
+                if let Some(adj) = self
+                    .client
+                    .conn
+                    .replenish_window(self.channel, n)
+                    .map_err(io_err)?
+                {
+                    self.client.write_payload(&adj).map_err(io_err)?;
+                }
+            }
+            ChannelEvent::Eof { channel } if channel == self.channel => {
+                self.remote_eof = true;
+            }
+            ChannelEvent::Close { channel } if channel == self.channel => {
+                self.remote_eof = true;
+                if !self.local_close_sent {
+                    let p = self.client.conn.send_close(self.channel).map_err(io_err)?;
+                    self.client.write_payload(&p).map_err(io_err)?;
+                    self.local_close_sent = true;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+impl Read for ClientSftpStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Block until we have something in the buffer, or the peer is done.
+        while self.read_buf.is_empty() && !self.remote_eof {
+            self.pump_one()?;
+        }
+        if self.read_buf.is_empty() {
+            return Ok(0);
+        }
+        let n = core::cmp::min(buf.len(), self.read_buf.len());
+        buf[..n].copy_from_slice(&self.read_buf[..n]);
+        self.read_buf.drain(..n);
+        Ok(n)
+    }
+}
+
+impl Write for ClientSftpStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Loop until we manage to put something on the wire. `send_data`
+        // returns `taken == 0` when the remote window is full; we then read
+        // packets (which will eventually arrive with a WindowAdjust) until
+        // it opens.
+        loop {
+            let (payload, taken) = self
+                .client
+                .conn
+                .send_data(self.channel, buf)
+                .map_err(io_err)?;
+            if taken > 0 {
+                self.client.write_payload(&payload).map_err(io_err)?;
+                return Ok(taken);
+            }
+            // Window full — pump one packet. If the peer closed we can't
+            // make progress; surface as broken pipe.
+            if self.remote_eof {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "sftp: channel closed by peer mid-write",
+                ));
+            }
+            self.pump_one()?;
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // All writes are flushed inside `write_payload` via `write_all`.
+        Ok(())
+    }
+}
+
+impl Drop for ClientSftpStream<'_> {
+    fn drop(&mut self) {
+        // Best-effort tear-down: send EOF + CLOSE, then drain a few packets
+        // so the peer's matching CLOSE doesn't get stranded in the inbox.
+        if !self.local_close_sent {
+            if let Ok(p) = self.client.conn.send_eof(self.channel) {
+                let _ = self.client.write_payload(&p);
+            }
+            if let Ok(p) = self.client.conn.send_close(self.channel) {
+                let _ = self.client.write_payload(&p);
+            }
+            self.local_close_sent = true;
+        }
+        // Drain up to ~MAX_DRAIN packets so the peer's CLOSE is acknowledged.
+        const MAX_DRAIN: usize = 128;
+        for _ in 0..MAX_DRAIN {
+            if self.remote_eof {
+                break;
+            }
+            if self.pump_one().is_err() {
+                break;
+            }
+        }
+    }
+}
+
+fn io_err(e: Error) -> std::io::Error {
+    match e {
+        Error::Io(io) => io,
+        other => std::io::Error::other(format!("{:?}", other)),
     }
 }
 

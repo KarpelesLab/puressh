@@ -13,6 +13,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha256};
@@ -24,6 +26,7 @@ use crate::channel::{
 };
 use crate::error::{Error, Result};
 use crate::hostkey::{host_key_verify_by_name, HostKey, HostKeyVerify};
+use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
 use crate::transport::kex::{defaults, KexAlgorithms};
 use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
@@ -54,6 +57,50 @@ pub enum HostKeyPolicy {
     /// Accept only if the server's host-key SHA-256 fingerprint (the raw 32
     /// bytes, exactly as `ssh-keygen -lf` reports them) matches.
     AcceptFingerprint([u8; 32]),
+    /// Verify against an OpenSSH-format `known_hosts` store. Requires the
+    /// host name + port to be threaded in via [`Client::connect_to_host`];
+    /// constructors that take a bare socket address (`Client::connect`)
+    /// degrade to `AcceptAny` when this variant is configured because we
+    /// don't have an address-independent identifier to look up.
+    ///
+    /// See [`KnownHostsPolicy`] for the knobs.
+    KnownHosts(KnownHostsPolicy),
+}
+
+/// Configuration for [`HostKeyPolicy::KnownHosts`].
+///
+/// `store` is shared (Arc + Mutex) so the binary can keep a handle to
+/// inspect / persist independently of the client; the verifier itself
+/// locks it just long enough to look up and optionally append a TOFU
+/// entry. `save_path` (if set) is the file rewritten when a TOFU accept
+/// adds a new entry; absent it, accepts stay in memory only.
+pub struct KnownHostsPolicy {
+    /// The in-memory store. Locked just long enough for lookup / add.
+    pub store: Arc<Mutex<KnownHosts>>,
+    /// File path the store is persisted to on TOFU-accept. If `None`,
+    /// accepts stay in memory only (useful for tests).
+    pub save_path: Option<PathBuf>,
+    /// Hash new TOFU entries (OpenSSH's `HashKnownHosts yes`).
+    pub hash_new: bool,
+    /// What to do when the host is *unknown* (no entry matches). `Mismatch`
+    /// is always treated as a hard error regardless of this setting.
+    pub on_unknown: TofuAction,
+}
+
+/// Callback type for [`TofuAction::Prompt`] — `(host, port, key_type,
+/// key_blob) → accept?`.
+pub type TofuPromptFn = dyn Fn(&str, u16, &str, &[u8]) -> bool + Send + Sync;
+
+/// What to do when [`HostKeyPolicy::KnownHosts`] encounters an unknown host.
+pub enum TofuAction {
+    /// Refuse the connection — equivalent to OpenSSH's
+    /// `StrictHostKeyChecking=yes` against an empty `known_hosts`.
+    Reject,
+    /// Accept silently and add the entry — equivalent to
+    /// `StrictHostKeyChecking=accept-new`.
+    Accept,
+    /// Ask the user. See [`TofuPromptFn`] for the callback signature.
+    Prompt(Arc<TofuPromptFn>),
 }
 
 /// Client configuration knobs.
@@ -110,6 +157,14 @@ pub struct Client {
     /// App-layer payloads received while a re-KEX was in flight (RFC 4253
     /// §7.3). Drained out by `read_one_packet` ahead of new wire reads.
     deferred: Vec<Vec<u8>>,
+    /// Hostname the user passed to `connect_to_host`, used for
+    /// `HostKeyPolicy::KnownHosts` lookups. Empty when the client was
+    /// constructed via `connect` (in which case `KnownHosts` policy
+    /// degrades to AcceptAny — see [`HostKeyPolicy::KnownHosts`] docs).
+    target_host: String,
+    /// Port the user passed to `connect_to_host`. 0 means "not threaded
+    /// in"; lookups need a non-zero port to match.
+    target_port: u16,
 }
 
 impl Client {
@@ -142,6 +197,45 @@ impl Client {
             last_kex: Instant::now(),
             rekey_policy: RekeyPolicy::default(),
             deferred: Vec::new(),
+            target_host: String::new(),
+            target_port: 0,
+        };
+        me.host_key_policy = cfg.host_key_policy;
+        me.do_version_and_kex()?;
+        Ok(me)
+    }
+
+    /// Like [`Self::connect`], but threads the user-supplied host name and
+    /// port through so [`HostKeyPolicy::KnownHosts`] has something stable
+    /// to look up. Use this instead of `connect` whenever the host key
+    /// policy reads `known_hosts` — `connect` accepts any `ToSocketAddrs`
+    /// (including `IpAddr`) and so cannot recover the original hostname.
+    pub fn connect_to_host(host: &str, port: u16, cfg: Config) -> Result<Self> {
+        let stream = TcpStream::connect((host, port))?;
+        if let Some(t) = cfg.timeout {
+            stream.set_read_timeout(Some(t))?;
+            stream.set_write_timeout(Some(t))?;
+        }
+        stream.set_nodelay(true)?;
+
+        let mut rng = OsRng;
+        let placeholder_advert = build_default_kexinit(&mut rng);
+        let mut me = Self {
+            stream,
+            codec: PacketCodec::new(),
+            conn: ConnectionState::new(),
+            session_id: Vec::new(),
+            inbox: Vec::new(),
+            rng,
+            runner: KexRunner::new(Role::Client, placeholder_advert),
+            v_c: Vec::new(),
+            v_s: Vec::new(),
+            host_key_policy: HostKeyPolicy::AcceptAny,
+            last_kex: Instant::now(),
+            rekey_policy: RekeyPolicy::default(),
+            deferred: Vec::new(),
+            target_host: host.to_string(),
+            target_port: port,
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -769,6 +863,8 @@ impl Client {
                 payload,
                 &self.host_key_policy,
                 &self.runner,
+                &self.target_host,
+                self.target_port,
             )?);
             verifier_box.as_deref()
         } else {
@@ -1086,6 +1182,8 @@ fn build_verifier(
     reply_payload: &[u8],
     policy: &HostKeyPolicy,
     runner: &KexRunner,
+    target_host: &str,
+    target_port: u16,
 ) -> Result<Box<dyn HostKeyVerify>> {
     if reply_payload.len() < 5 {
         return Err(Error::Format("kex-ecdh-reply too short"));
@@ -1101,6 +1199,10 @@ fn build_verifier(
     }
     let k_s = &reply_payload[5..5 + k_s_len];
 
+    let neg = runner
+        .negotiated()
+        .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;
+
     match policy {
         HostKeyPolicy::AcceptAny => {}
         HostKeyPolicy::AcceptFingerprint(fp) => {
@@ -1109,11 +1211,49 @@ fn build_verifier(
                 return Err(Error::HostKeyRejected);
             }
         }
+        HostKeyPolicy::KnownHosts(kh) => {
+            // No host was threaded in (caller used `connect` not
+            // `connect_to_host`). We cannot do a lookup; fall through to
+            // AcceptAny rather than fail hard, matching the documented
+            // contract of `HostKeyPolicy::KnownHosts`.
+            if target_host.is_empty() || target_port == 0 {
+                // Intentionally silent — the docs on the variant explain
+                // the degradation.
+            } else {
+                let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
+                match lookup {
+                    LookupResult::Match => {}
+                    LookupResult::Mismatch { .. } => {
+                        return Err(Error::HostKeyRejected);
+                    }
+                    LookupResult::Unknown => {
+                        let accept = match &kh.on_unknown {
+                            TofuAction::Reject => false,
+                            TofuAction::Accept => true,
+                            TofuAction::Prompt(cb) => {
+                                // Drop the lock for the duration of the
+                                // callback — it may block on stdin and
+                                // shouldn't hold up other policy users.
+                                drop(store);
+                                let ok = cb(target_host, target_port, &neg.host_key, k_s);
+                                store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                                ok
+                            }
+                        };
+                        if !accept {
+                            return Err(Error::HostKeyRejected);
+                        }
+                        store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
+                        if let Some(path) = &kh.save_path {
+                            store.save(path).map_err(Error::from)?;
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    let neg = runner
-        .negotiated()
-        .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;
     host_key_verify_by_name(&neg.host_key, k_s)
 }
 

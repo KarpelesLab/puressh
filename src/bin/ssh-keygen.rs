@@ -5,6 +5,9 @@
 //! ssh-keygen -l -f path[.pub]
 //! ssh-keygen -y -f path [-N passphrase]
 //! ssh-keygen -p -f path [-P old] -N new
+//! ssh-keygen -R host [-f known_hosts_path]            (remove entries)
+//! ssh-keygen -F host [-f known_hosts_path]            (find / print entries)
+//! ssh-keygen -H [-f known_hosts_path]                 (hash all entries)
 //! ```
 
 use std::fs;
@@ -29,13 +32,18 @@ fn open_create_new(path: &str, _mode: u32) -> std::io::Result<fs::File> {
 
 use purecrypto::rng::OsRng;
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
+use puressh::known_hosts::format::format_entry;
+use puressh::known_hosts::KnownHosts;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage: ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C comment] -f path  (generate)\n       \
                      ssh-keygen -l -f path[.pub]                                          (fingerprint)\n       \
                      ssh-keygen -y -f path [-N passphrase]                                (extract public)\n       \
-                     ssh-keygen -p -f path [-P old_passphrase] -N new_passphrase          (change passphrase)";
+                     ssh-keygen -p -f path [-P old_passphrase] -N new_passphrase          (change passphrase)\n       \
+                     ssh-keygen -R host [-f known_hosts_path]                             (remove host entries)\n       \
+                     ssh-keygen -F host [-f known_hosts_path]                             (find host entries)\n       \
+                     ssh-keygen -H [-f known_hosts_path]                                  (hash all entries)";
 
 #[derive(Default)]
 struct Args {
@@ -49,10 +57,23 @@ struct Args {
     fingerprint: bool,
     derive_pub: bool,
     change_pass: bool,
+    /// `-R host`: remove every entry matching `host` from known_hosts.
+    remove_host: Option<String>,
+    /// `-F host`: find / print entries matching `host`.
+    find_host: Option<String>,
+    /// `-H`: hash every plain entry in the file in place.
+    hash_all: bool,
+    /// `-p` (in known_hosts mode means port — but ssh-keygen historically
+    /// uses `host` directly; we accept `[host]:port` syntax via the
+    /// pattern matcher instead and don't reuse `-p`).
+    port: u16,
 }
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
-    let mut out = Args::default();
+    let mut out = Args {
+        port: 22,
+        ..Args::default()
+    };
     let mut i = 0;
     let max = args.len() + 1;
     let mut guard = 0;
@@ -100,6 +121,15 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "-l" => out.fingerprint = true,
             "-y" => out.derive_pub = true,
             "-p" => out.change_pass = true,
+            "-R" => {
+                i += 1;
+                out.remove_host = Some(args.get(i).ok_or("-R requires a host")?.clone());
+            }
+            "-F" => {
+                i += 1;
+                out.find_host = Some(args.get(i).ok_or("-F requires a host")?.clone());
+            }
+            "-H" => out.hash_all = true,
             s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
             _ => return Err(format!("unexpected argument: {a}")),
         }
@@ -346,6 +376,56 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
+/// Resolve `-f`, falling back to `$HOME/.ssh/known_hosts` for the
+/// `-R`/`-F`/`-H` modes (matching OpenSSH).
+fn resolve_known_hosts_path(args: &Args) -> Result<String, String> {
+    if let Some(f) = &args.file {
+        return Ok(f.clone());
+    }
+    let home = std::env::var("HOME").map_err(|_| {
+        "no -f given and $HOME is unset; cannot locate default known_hosts".to_string()
+    })?;
+    Ok(format!("{home}/.ssh/known_hosts"))
+}
+
+fn run_known_hosts_remove(args: &Args, host: &str) -> Result<i32, String> {
+    let path = resolve_known_hosts_path(args)?;
+    let mut kh = KnownHosts::load(&path).map_err(|e| format!("load {path}: {e}"))?;
+    let removed = kh.remove(host, args.port);
+    if removed == 0 {
+        eprintln!("ssh-keygen: no matching entries found in {path}");
+        return Ok(1);
+    }
+    kh.save(&path).map_err(|e| format!("save {path}: {e}"))?;
+    println!("# Host {host} found: line(s) removed: {removed}");
+    println!("# Updated {path}");
+    Ok(0)
+}
+
+fn run_known_hosts_find(args: &Args, host: &str) -> Result<i32, String> {
+    let path = resolve_known_hosts_path(args)?;
+    let kh = KnownHosts::load(&path).map_err(|e| format!("load {path}: {e}"))?;
+    let matches = kh.find(host, args.port);
+    if matches.is_empty() {
+        // OpenSSH exits 1 with no output when nothing matches.
+        return Ok(1);
+    }
+    println!("# Host {host} found: line(s): {}", matches.len());
+    for entry in matches {
+        println!("{}", format_entry(entry));
+    }
+    Ok(0)
+}
+
+fn run_known_hosts_hash(args: &Args) -> Result<i32, String> {
+    let path = resolve_known_hosts_path(args)?;
+    let mut kh = KnownHosts::load(&path).map_err(|e| format!("load {path}: {e}"))?;
+    kh.hash_in_place();
+    kh.save(&path).map_err(|e| format!("save {path}: {e}"))?;
+    println!("# Hashed {path}");
+    Ok(0)
+}
+
 fn run() -> Result<i32, i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -372,6 +452,9 @@ fn run() -> Result<i32, i32> {
         parsed.derive_pub as u8,
         parsed.change_pass as u8,
         parsed.type_.is_some() as u8,
+        parsed.remove_host.is_some() as u8,
+        parsed.find_host.is_some() as u8,
+        parsed.hash_all as u8,
     ]
     .iter()
     .sum::<u8>();
@@ -380,7 +463,7 @@ fn run() -> Result<i32, i32> {
         return Err(2);
     }
     if mode_count > 1 {
-        eprintln!("ssh-keygen: -t / -l / -y / -p are mutually exclusive");
+        eprintln!("ssh-keygen: -t / -l / -y / -p / -R / -F / -H are mutually exclusive");
         return Err(2);
     }
 
@@ -390,6 +473,12 @@ fn run() -> Result<i32, i32> {
         run_extract_public(&parsed)
     } else if parsed.change_pass {
         run_change_passphrase(&parsed)
+    } else if let Some(host) = &parsed.remove_host {
+        run_known_hosts_remove(&parsed, host)
+    } else if let Some(host) = &parsed.find_host {
+        run_known_hosts_find(&parsed, host)
+    } else if parsed.hash_all {
+        run_known_hosts_hash(&parsed)
     } else {
         run_generate(&parsed)
     };

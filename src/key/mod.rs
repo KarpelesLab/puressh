@@ -23,7 +23,7 @@ use purecrypto::kdf::bcrypt_pbkdf;
 use crate::error::{Error, Result};
 use crate::format::{read_mpint, write_mpint, Reader, Writer};
 
-mod base64;
+pub(crate) mod base64;
 mod writer;
 
 pub use writer::EcdsaCurve;

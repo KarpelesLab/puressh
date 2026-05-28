@@ -1,26 +1,50 @@
 //! `ssh` — puressh's SSH client driver.
 //!
 //! ```text
-//! ssh [-p port] [-i identity_file] [-l user] [-o StrictHostKeyChecking=no] [user@]host [command...]
+//! ssh [-p port] [-i identity_file] [-l user]
+//!     [-o StrictHostKeyChecking={yes,no,accept-new,ask}]
+//!     [-o UserKnownHostsFile=PATH]
+//!     [-o HashKnownHosts={yes,no}]
+//!     [user@]host [command...]
 //! ```
 
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex};
 
 use puressh::auth::ClientCredential;
-use puressh::client::{Client, Config, HostKeyPolicy};
+use puressh::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
+use puressh::known_hosts::KnownHosts;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
-                     [-o StrictHostKeyChecking=no] [user@]host [command...]";
+                     [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
+                     [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
+                     [user@]host [command...]";
+
+/// Maps `StrictHostKeyChecking` modes to TOFU behaviour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StrictMode {
+    /// `yes`: refuse Unknown; reject Mismatch.
+    Yes,
+    /// `no`: accept Unknown silently AND tolerate Mismatch (insecure).
+    No,
+    /// `accept-new`: silently accept Unknown; still reject Mismatch.
+    AcceptNew,
+    /// `ask` (OpenSSH default): prompt on Unknown; reject Mismatch.
+    Ask,
+}
 
 struct Cli {
     port: u16,
     identities: Vec<String>,
     cli_user: Option<String>,
-    strict_host_key: bool,
+    strict: StrictMode,
+    known_hosts_path: Option<PathBuf>,
+    hash_known_hosts: bool,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -30,7 +54,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut port = 22u16;
     let mut identities: Vec<String> = Vec::new();
     let mut cli_user: Option<String> = None;
-    let mut strict_host_key = true;
+    let mut strict = StrictMode::Ask;
+    let mut known_hosts_path: Option<PathBuf> = None;
+    let mut hash_known_hosts = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -59,12 +85,29 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             "-o" => {
                 i += 1;
                 let v = args.get(i).ok_or("-o requires a value")?;
-                if v.eq_ignore_ascii_case("StrictHostKeyChecking=no") {
-                    strict_host_key = false;
-                } else if v.eq_ignore_ascii_case("StrictHostKeyChecking=yes") {
-                    strict_host_key = true;
-                } else {
-                    return Err(format!("unsupported -o option: {v}"));
+                let (k, val) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
+                match k.to_ascii_lowercase().as_str() {
+                    "stricthostkeychecking" => {
+                        strict = match val.to_ascii_lowercase().as_str() {
+                            "yes" => StrictMode::Yes,
+                            "no" | "off" => StrictMode::No,
+                            "accept-new" => StrictMode::AcceptNew,
+                            "ask" => StrictMode::Ask,
+                            other => return Err(format!("unknown StrictHostKeyChecking={other}")),
+                        };
+                    }
+                    "userknownhostsfile" => {
+                        known_hosts_path = Some(PathBuf::from(val));
+                    }
+                    "hashknownhosts" => {
+                        hash_known_hosts =
+                            matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                    }
+                    other => {
+                        return Err(format!("unsupported -o option: {other}={val}"));
+                    }
                 }
             }
             s if s.starts_with('-') => {
@@ -96,7 +139,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         port,
         identities,
         cli_user,
-        strict_host_key,
+        strict,
+        known_hosts_path,
+        hash_known_hosts,
         host,
         user_in_host,
         command,
@@ -144,6 +189,109 @@ fn load_identity(path: &str) -> Result<PrivateKey, String> {
         .map_err(|e| format!("parse {path}: {e} (passphrase-protected keys not supported here)"))
 }
 
+/// Compute the user's default known_hosts path: `$HOME/.ssh/known_hosts`.
+fn default_known_hosts_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".ssh").join("known_hosts"))
+}
+
+/// SHA-256 fingerprint, base64-encoded (no padding), formatted as
+/// `SHA256:<base64>` — matches `ssh-keygen -lf`.
+fn fingerprint_b64_sha256(blob: &[u8]) -> String {
+    use purecrypto::hash::{Digest, Sha256};
+    let digest = Sha256::digest(blob);
+    // Standard base64, no padding, as OpenSSH renders.
+    let s = base64_no_pad(digest.as_ref());
+    format!("SHA256:{s}")
+}
+
+fn base64_no_pad(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let b = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(b & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let b = (bytes[i] as u32) << 16;
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+    } else if rem == 2 {
+        let b = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 6) & 0x3F) as usize] as char);
+    }
+    out
+}
+
+/// Build the [`HostKeyPolicy`] for the requested strict mode + path.
+fn build_host_key_policy(cli: &Cli) -> Result<HostKeyPolicy, String> {
+    // `StrictHostKeyChecking=no` is the historical OpenSSH "trust on every
+    // connect" mode. We approximate it as AcceptAny since the user has
+    // explicitly opted out of the check.
+    if cli.strict == StrictMode::No {
+        return Ok(HostKeyPolicy::AcceptAny);
+    }
+
+    let path = match &cli.known_hosts_path {
+        Some(p) => p.clone(),
+        None => default_known_hosts_path()
+            .ok_or_else(|| "no $HOME, cannot locate default known_hosts".to_string())?,
+    };
+    let store = KnownHosts::load(&path).map_err(|e| format!("load {}: {e}", path.display()))?;
+
+    let on_unknown = match cli.strict {
+        StrictMode::Yes => TofuAction::Reject,
+        StrictMode::AcceptNew => TofuAction::Accept,
+        StrictMode::Ask => TofuAction::Prompt(Arc::new(tofu_prompt)),
+        StrictMode::No => unreachable!(),
+    };
+
+    Ok(HostKeyPolicy::KnownHosts(KnownHostsPolicy {
+        store: Arc::new(Mutex::new(store)),
+        save_path: Some(path),
+        hash_new: cli.hash_known_hosts,
+        on_unknown,
+    }))
+}
+
+/// The TOFU prompt — mimics OpenSSH's wording so muscle-memory ports.
+fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
+    let fp = fingerprint_b64_sha256(key_blob);
+    let target = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    eprintln!("The authenticity of host '{target}' can't be established.");
+    eprintln!("{key_type} key fingerprint is {fp}.");
+    eprint!("Are you sure you want to continue connecting (yes/no)? ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    let mut byte = [0u8; 1];
+    let mut stdin = std::io::stdin();
+    while let Ok(n) = stdin.read(&mut byte) {
+        if n == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if byte[0] == b'\r' {
+            continue;
+        }
+        line.push(byte[0] as char);
+        if line.len() > 16 {
+            break;
+        }
+    }
+    matches!(line.trim().to_ascii_lowercase().as_str(), "yes" | "y")
+}
+
 fn run() -> Result<i32, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "-h" || a == "--help") {
@@ -160,16 +308,16 @@ fn run() -> Result<i32, String> {
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     let user = resolve_user(&cli)?;
 
-    if cli.strict_host_key {
-        eprintln!("warning: host key verification is disabled (no known-hosts support yet)");
-    }
+    let policy = build_host_key_policy(&cli)?;
     let cfg = Config {
-        host_key_policy: HostKeyPolicy::AcceptAny,
+        host_key_policy: policy,
         timeout: None,
     };
 
-    let addr = (cli.host.as_str(), cli.port);
-    let mut client = Client::connect(addr, cfg).map_err(|e| format!("connect: {e}"))?;
+    // Use connect_to_host so KnownHosts can look the host up by its
+    // user-supplied name.
+    let mut client = Client::connect_to_host(cli.host.as_str(), cli.port, cfg)
+        .map_err(|e| format!("connect: {e}"))?;
 
     let mut authed = false;
     if !cli.identities.is_empty() {

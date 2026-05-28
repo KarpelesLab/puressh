@@ -50,6 +50,9 @@ pub mod server;
 #[cfg(feature = "std")]
 pub mod sftp;
 
+#[cfg(feature = "std")]
+pub mod known_hosts;
+
 #[cfg(feature = "ffi")]
 pub mod ffi;
 

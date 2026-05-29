@@ -1,120 +1,130 @@
 //! `zlib` and `zlib@openssh.com` — RFC 1950 zlib with `Z_SYNC_FLUSH` between
 //! packets. The DEFLATE stream is persistent for the lifetime of the
 //! connection so inter-packet matches keep paying.
+//!
+//! Backed by `compcol::zlib`. Per packet we drive the encoder with
+//! [`compcol::Encoder::encode`] to consume the plaintext and then call
+//! [`compcol::Encoder::flush`] with [`compcol::Flush::Sync`] to emit the
+//! `Z_SYNC_FLUSH` marker (RFC 4253 §6.2). The decoder is a straightforward
+//! [`compcol::Decoder::decode`] drain — `Z_SYNC_FLUSH` markers are regular
+//! DEFLATE empty stored blocks, which the inflate side consumes without
+//! special-casing.
 
-use alloc::boxed::Box;
-use alloc::vec;
 use alloc::vec::Vec;
 
-use miniz_oxide::deflate::core::{
-    compress as deflate_step, CompressorOxide, TDEFLFlush, TDEFLStatus,
-};
-use miniz_oxide::inflate::core::inflate_flags::{
-    TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_PARSE_ZLIB_HEADER,
-};
-use miniz_oxide::inflate::core::{decompress as inflate_step, DecompressorOxide};
-use miniz_oxide::inflate::TINFLStatus;
+use compcol::zlib::{Decoder as CcDecoder, Encoder as CcEncoder};
+use compcol::{Decoder as _, Encoder as _, Flush, Status};
 
 use crate::error::{Error, Result};
 
 use super::{Compress, Decompress};
 
-const INFLATE_DICT_SIZE: usize = 32 * 1024;
+/// Output staging chunk used per inner-loop step. 8 KiB matches the size
+/// the previous miniz_oxide path used and keeps copy granularity well
+/// under typical SSH payload sizes.
+const CHUNK: usize = 8 * 1024;
 
 struct ZlibDeflate {
-    state: Box<CompressorOxide>,
+    enc: CcEncoder,
 }
 
 impl ZlibDeflate {
     fn new() -> Self {
         Self {
-            state: Box::new(CompressorOxide::default()),
+            enc: CcEncoder::new(),
         }
     }
 
+    /// Compress one SSH packet of `input` and return the bytes that go on
+    /// the wire (deflate output up to and including the `Z_SYNC_FLUSH`
+    /// marker). The encoder state — sliding window, Huffman histograms,
+    /// bit-writer alignment — persists for the next call.
     fn step(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         let mut out: Vec<u8> = Vec::with_capacity(input.len() + 64);
-        let mut chunk = [0u8; 8192];
-        let mut in_pos = 0usize;
+        let mut chunk = [0u8; CHUNK];
 
-        loop {
-            let remaining_in = &input[in_pos..];
-            let (status, ci, co) =
-                deflate_step(&mut self.state, remaining_in, &mut chunk, TDEFLFlush::Sync);
-            in_pos += ci;
-            out.extend_from_slice(&chunk[..co]);
-
+        // ── push input ───────────────────────────────────────────────────
+        let mut consumed = 0usize;
+        while consumed < input.len() {
+            let (progress, status) = self
+                .enc
+                .encode(&input[consumed..], &mut chunk)
+                .map_err(|_| Error::Crypto("zlib compress failed"))?;
+            consumed += progress.consumed;
+            out.extend_from_slice(&chunk[..progress.written]);
             match status {
-                TDEFLStatus::BadParam | TDEFLStatus::PutBufFailed => {
-                    return Err(Error::Crypto("zlib compress failed"));
-                }
-                TDEFLStatus::Done => return Ok(out),
-                TDEFLStatus::Okay => {
-                    if co == chunk.len() {
-                        continue;
-                    }
-                    if in_pos >= input.len() {
-                        return Ok(out);
-                    }
-                    if ci == 0 && co == 0 {
+                Status::InputEmpty => break,
+                Status::OutputFull => {
+                    if progress.consumed == 0 && progress.written == 0 {
                         return Err(Error::Crypto("zlib compress stalled"));
                     }
                 }
+                Status::StreamEnd => return Err(Error::Crypto("zlib compress closed")),
             }
         }
+
+        // ── per-packet sync flush ─────────────────────────────────────────
+        loop {
+            let (progress, status) = self
+                .enc
+                .flush(&mut chunk, Flush::Sync)
+                .map_err(|_| Error::Crypto("zlib compress failed"))?;
+            out.extend_from_slice(&chunk[..progress.written]);
+            match status {
+                Status::InputEmpty => break,
+                Status::OutputFull => {
+                    if progress.written == 0 {
+                        return Err(Error::Crypto("zlib compress stalled"));
+                    }
+                }
+                Status::StreamEnd => return Err(Error::Crypto("zlib compress closed")),
+            }
+        }
+
+        Ok(out)
     }
 }
 
 struct ZlibInflate {
-    state: Box<DecompressorOxide>,
-    ring: Vec<u8>,
-    out_pos: usize,
-    saw_header: bool,
+    dec: CcDecoder,
 }
 
 impl ZlibInflate {
     fn new() -> Self {
         Self {
-            state: Box::new(DecompressorOxide::default()),
-            ring: vec![0u8; INFLATE_DICT_SIZE],
-            out_pos: 0,
-            saw_header: false,
+            dec: CcDecoder::new(),
         }
     }
 
+    /// Decompress one SSH packet of `input`. `Z_SYNC_FLUSH` markers are
+    /// regular deflate blocks to the inflate side, so the persistent
+    /// sliding window seamlessly bridges packet boundaries.
     fn step(&mut self, input: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(input.len() * 2);
-        let mut input = input;
-        let mut header_flag = if self.saw_header {
-            0
-        } else {
-            TINFL_FLAG_PARSE_ZLIB_HEADER
-        };
+        let mut out: Vec<u8> = Vec::with_capacity(input.len() * 2);
+        let mut chunk = [0u8; CHUNK];
 
+        let mut consumed = 0usize;
         loop {
-            let flags = header_flag | TINFL_FLAG_HAS_MORE_INPUT;
-            let (status, ci, co) =
-                inflate_step(&mut self.state, input, &mut self.ring, self.out_pos, flags);
-
-            for i in 0..co {
-                out.push(self.ring[(self.out_pos + i) % INFLATE_DICT_SIZE]);
-            }
-            self.out_pos = (self.out_pos + co) % INFLATE_DICT_SIZE;
-            input = &input[ci..];
-            if co > 0 {
-                self.saw_header = true;
-                header_flag = 0;
-            }
-
+            let (progress, status) = self
+                .dec
+                .decode(&input[consumed..], &mut chunk)
+                .map_err(|_| Error::Format("zlib decompress failed"))?;
+            consumed += progress.consumed;
+            out.extend_from_slice(&chunk[..progress.written]);
             match status {
-                TINFLStatus::NeedsMoreInput => return Ok(out),
-                TINFLStatus::HasMoreOutput => {
-                    if ci == 0 && co == 0 {
+                // All of this packet's bytes consumed; output drained.
+                Status::InputEmpty => return Ok(out),
+                // More to come — drain `chunk` and loop. If neither side
+                // moved we'd spin forever, so treat that as a stall.
+                Status::OutputFull => {
+                    if progress.consumed == 0 && progress.written == 0 {
                         return Err(Error::Format("zlib decompress stalled"));
                     }
                 }
-                TINFLStatus::Done => return Ok(out),
-                _ => return Err(Error::Format("zlib decompress failed")),
+                // SSH zlib never ends the deflate stream — `Z_SYNC_FLUSH`
+                // emits BFINAL=0 blocks. If we ever see StreamEnd the peer
+                // closed the stream, which violates the protocol.
+                Status::StreamEnd => return Err(Error::Format("zlib decompress closed")),
             }
         }
     }

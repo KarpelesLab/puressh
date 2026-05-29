@@ -25,7 +25,7 @@ alloc = ["purecrypto/alloc"]
 # `std::thread`, so they require the `std` feature.
 client = ["std"]
 server = ["std"]
-compress = ["dep:miniz_oxide"]
+compress = ["dep:compcol"]
 # C ABI surface. Requires `std` and the `client` module; produces additional
 # `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
 ffi = ["std", "client"]
@@ -39,7 +39,7 @@ pam = ["dep:pam-client2"]
 purecrypto = { version = "0.2", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der",
 ] }
-miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"], optional = true }
+compcol = { version = "0.4.2", default-features = false, features = ["alloc", "zlib"], optional = true }
 
 # Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
 # set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it

@@ -148,6 +148,17 @@ struct ChannelQueue {
     remote_eof: bool,
     /// The peer has sent CLOSE for this channel.
     remote_close: bool,
+    /// Latest `exit-status` request the peer sent on this channel
+    /// (RFC 4254 §6.10). Set by the pump path when the request lands.
+    exit_status: Option<i32>,
+    /// Latest `exit-signal` request the peer sent on this channel
+    /// (RFC 4254 §6.10). Carries the signal *name* — e.g. `"TERM"`,
+    /// `"KILL"`. Set by the pump path when the request lands.
+    exit_signal: Option<String>,
+    /// True once we have already half-closed our write side via
+    /// `SSH_MSG_CHANNEL_EOF` on this channel — used to make
+    /// [`OwnedChannelStream::send_eof`] idempotent.
+    local_eof_sent: bool,
 }
 
 /// Shared state: the underlying [`Client`], a per-channel mailbox map,
@@ -179,6 +190,23 @@ struct Inner {
 #[derive(Clone)]
 pub struct SharedClient {
     inner: Arc<Mutex<Inner>>,
+    /// Number of threads currently in a `read_stream` /
+    /// `channel_recv_stderr` / `channel_send_data` / `channel_send_eof`
+    /// call — i.e. *contending for* the inner mutex. Bumped on entry by
+    /// each such call (via [`LockTicket`]) and decremented on exit. Sits
+    /// outside the mutex so the read-pump can observe it without
+    /// locking.
+    ///
+    /// The pump path consults this counter between iterations and
+    /// yields generously when it sees a sibling waiting (`> 1` means
+    /// "more than just self"). Linux `std::sync::Mutex` is unfair: a
+    /// thread that releases and immediately re-acquires can starve a
+    /// contended waiter indefinitely without an explicit yield window.
+    /// In the interactive-shell case this manifested as the stderr-
+    /// reader thread (which becomes pumper first) monopolising the
+    /// lock, starving the data-reader thread that would otherwise
+    /// drain SHELL prompt bytes.
+    lock_waiters: Arc<core::sync::atomic::AtomicUsize>,
 }
 
 impl From<Client> for SharedClient {
@@ -190,7 +218,32 @@ impl From<Client> for SharedClient {
                 notifiers: BTreeMap::new(),
                 pumping: false,
             })),
+            lock_waiters: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+}
+
+/// RAII guard: bumps [`SharedClient::lock_waiters`] on construction and
+/// decrements on Drop. Held for the full duration of any read / write
+/// entry point on `SharedClient` / `OwnedChannelStream` so the read-pump
+/// can detect "another thread also wants the lock" and yield enough for
+/// the kernel to actually schedule that thread onto the freshly-released
+/// mutex (Linux `std::sync::Mutex` is unfair — see [`SharedClient::lock_waiters`]).
+struct LockTicket<'a> {
+    counter: &'a core::sync::atomic::AtomicUsize,
+}
+
+impl<'a> LockTicket<'a> {
+    fn new(counter: &'a core::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for LockTicket<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -276,7 +329,39 @@ impl SharedClient {
     /// `term` / `cols` / `rows` follow the PTY-req convention from
     /// RFC 4254 §6.2. For a non-PTY shell, issue `exec_stream("")`
     /// against your login shell instead.
+    ///
+    /// This is a convenience wrapper around [`Self::shell_stream`] with
+    /// zero pixel dimensions and no terminal modes — adequate for
+    /// scripted use. Interactive callers should prefer
+    /// [`Self::shell_stream`].
     pub fn shell(&self, term: &str, cols: u32, rows: u32) -> Result<OwnedChannelStream> {
+        self.shell_stream(term, cols, rows, 0, 0, Vec::new())
+    }
+
+    /// Open a session channel with a PTY allocated to `term` /
+    /// `cols`×`rows` / `px_w`×`px_h` and the encoded terminal `modes`
+    /// blob (RFC 4254 §8), then start a remote shell. Returns an owned
+    /// [`OwnedChannelStream`] over the shell's stdin/stdout pair.
+    ///
+    /// `modes` is the opcode-encoded modes payload — pass an empty
+    /// [`Vec`] for "server defaults", or build one from a local
+    /// `termios` with [`crate::client::encode_termios_modes`].
+    ///
+    /// To resize the PTY after open, call [`Self::send_window_change`]
+    /// with the same channel id (use
+    /// [`OwnedChannelStream::channel_id`]). To learn the remote exit
+    /// status when the shell terminates, drain the stream to EOF, then
+    /// call [`OwnedChannelStream::exit_status`] /
+    /// [`OwnedChannelStream::exit_signal`].
+    pub fn shell_stream(
+        &self,
+        term: &str,
+        cols: u32,
+        rows: u32,
+        px_w: u32,
+        px_h: u32,
+        modes: Vec<u8>,
+    ) -> Result<OwnedChannelStream> {
         let local_id = {
             let mut g = lock_or_poison(&self.inner)?;
             let id = open_session_under_lock(&mut g, "shell")?;
@@ -287,9 +372,9 @@ impl SharedClient {
                     term: term.into(),
                     cols,
                     rows,
-                    px_w: 0,
-                    px_h: 0,
-                    modes: Vec::new(),
+                    px_w,
+                    px_h,
+                    modes,
                 },
                 "shell: pty-req",
             )?;
@@ -301,6 +386,207 @@ impl SharedClient {
             channel: local_id,
             local_close_sent: false,
         })
+    }
+
+    /// Open a session channel and start a remote shell **without**
+    /// allocating a PTY. Returns an owned [`OwnedChannelStream`] over
+    /// the shell's stdin/stdout pair.
+    ///
+    /// This is the non-interactive fallback path: the client uses it
+    /// when its own stdin is not a TTY (matching `ssh host` with stdin
+    /// redirected). The remote shell will run in line-buffered
+    /// non-canonical mode and won't see terminal control sequences;
+    /// the channel still carries data + stderr as usual.
+    pub fn shell_stream_no_pty(&self) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = lock_or_poison(&self.inner)?;
+            let id = open_session_under_lock(&mut g, "shell")?;
+            send_request_and_await(&mut g, id, ChannelRequest::Shell, "shell: shell-req")?;
+            id
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+        })
+    }
+
+    /// Send a `window-change` request (RFC 4254 §6.7) on a previously
+    /// opened session channel. `want_reply` is always false per the
+    /// RFC, so this call returns as soon as the packet is on the wire.
+    ///
+    /// Pass the channel id returned by
+    /// [`OwnedChannelStream::channel_id`]. Calling this from a SIGWINCH
+    /// handler thread on a sibling [`SharedClient`] clone is supported
+    /// — the call serialises through the same mutex as the I/O
+    /// threads but does not block waiting for any reply.
+    pub fn send_window_change(
+        &self,
+        channel: u32,
+        cols: u32,
+        rows: u32,
+        px_w: u32,
+        px_h: u32,
+    ) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let payload = g.client.conn.send_request(
+            channel,
+            ChannelRequest::WindowChange {
+                cols,
+                rows,
+                px_w,
+                px_h,
+            },
+            false,
+        )?;
+        g.client.write_payload(&payload)?;
+        Ok(())
+    }
+
+    /// Write up to `data.len()` bytes on `channel`'s data stream,
+    /// respecting peer flow-control. Returns the number of bytes actually
+    /// taken (the rest must be retried — same semantics as
+    /// [`std::io::Write::write`]).
+    ///
+    /// Lets a caller that already holds the channel id (e.g. from
+    /// [`OwnedChannelStream::channel_id`]) send data **without** going
+    /// through the owning stream's `&mut self` — useful for the
+    /// interactive shell, where the stdout-reader thread holds the
+    /// stream and a sibling stdin thread needs to push input without
+    /// contending on an outer mutex.
+    pub fn channel_send_data(&self, channel: u32, data: &[u8]) -> std::io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0);
+        }
+        let _ticket = LockTicket::new(&self.lock_waiters);
+        loop {
+            let mut g = lock_or_poison_io(&self.inner)?;
+            let (payload, taken) = g.client.conn.send_data(channel, data).map_err(io_err)?;
+            if taken > 0 {
+                g.client.write_payload(&payload).map_err(io_err)?;
+                return Ok(taken);
+            }
+            // Zero credit: bail if the peer already closed us, otherwise
+            // become pumper (or wait for one) so a window-adjust can land.
+            let queue = g.queues.entry(channel).or_default();
+            if queue.remote_close {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "channel closed by peer mid-write",
+                ));
+            }
+            if !g.pumping {
+                g.pumping = true;
+                let res = OwnedChannelStream::pump_one_step(&mut g);
+                g.pumping = false;
+                for cv in g.notifiers.values() {
+                    cv.notify_one();
+                }
+                drop(g);
+                res?;
+            } else {
+                let cv = notifier_for(&mut g, channel);
+                let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "SharedClient mutex poisoned",
+                    )
+                })?;
+                drop(waited.0);
+            }
+        }
+    }
+
+    /// Drain bytes from `channel`'s stderr (extended-data) mailbox.
+    /// Same semantics as [`std::io::Read::read`] on the stream: `Ok(0)`
+    /// means EOF, `Ok(n)` returns up to `buf.len()` bytes. Blocks while
+    /// pumping the wire if no bytes are buffered yet. Returns
+    /// immediately on the next yield window if a sibling thread is
+    /// currently pumping.
+    ///
+    /// Use this from a thread that does not own the channel's
+    /// [`OwnedChannelStream`] (e.g. an interactive shell's
+    /// dedicated-stderr thread, where the main reader thread holds the
+    /// stream for the data side).
+    pub fn channel_recv_stderr(&self, channel: u32, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _ticket = LockTicket::new(&self.lock_waiters);
+        loop {
+            let mut g = lock_or_poison_io(&self.inner)?;
+            let queue = g.queues.entry(channel).or_default();
+            if !queue.stderr.is_empty() {
+                let n = OwnedChannelStream::drain_into(queue, Stream::Stderr, buf);
+                replenish_under_lock(&mut g, channel, n as u32)?;
+                return Ok(n);
+            }
+            if queue.remote_eof {
+                return Ok(0);
+            }
+            if !g.pumping {
+                g.pumping = true;
+                let res = OwnedChannelStream::pump_one_step(&mut g);
+                g.pumping = false;
+                for cv in g.notifiers.values() {
+                    cv.notify_one();
+                }
+                drop(g);
+                res?;
+                // Symmetric with `read_stream`'s pump branch: yield CPU
+                // long enough for any sibling thread that's also waiting
+                // for the lock (other reader half of this channel, or a
+                // writer) to actually be scheduled onto the freshly
+                // released mutex. Without this, t_err's tight
+                // pump→re-acquire loop monopolises the lock and starves
+                // the data-side reader of the interactive shell.
+                if self.lock_waiters.load(core::sync::atomic::Ordering::SeqCst) > 1 {
+                    std::thread::sleep(Duration::from_millis(1));
+                } else {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            } else {
+                let cv = notifier_for(&mut g, channel);
+                let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "SharedClient mutex poisoned",
+                    )
+                })?;
+                drop(waited.0);
+            }
+        }
+    }
+
+    /// Send `SSH_MSG_CHANNEL_EOF` on `channel`. Idempotent (silently
+    /// skipped if EOF was already emitted on this channel via this
+    /// SharedClient).
+    pub fn channel_send_eof(&self, channel: u32) -> std::io::Result<()> {
+        let _ticket = LockTicket::new(&self.lock_waiters);
+        let mut g = lock_or_poison_io(&self.inner)?;
+        let q = g.queues.entry(channel).or_default();
+        if q.local_eof_sent {
+            return Ok(());
+        }
+        q.local_eof_sent = true;
+        let payload = g.client.conn.send_eof(channel).map_err(io_err)?;
+        g.client.write_payload(&payload).map_err(io_err)?;
+        Ok(())
+    }
+
+    /// Configure the underlying TCP socket's read timeout. Delegates to
+    /// [`Client::set_read_timeout`]. Pass `None` to clear the timeout
+    /// (the default; long blocking reads). Pass `Some(d)` to make the
+    /// pump release its inner mutex at least every `d`, so siblings
+    /// (e.g. the write half of an interactive shell, or other channels
+    /// sharing this client) can squeeze in.
+    ///
+    /// Recommended for interactive (`shell_stream` + concurrent stdin
+    /// thread) workloads: typically 50–100 ms. Not needed for
+    /// request/response SFTP / exec flows.
+    pub fn set_read_timeout(&self, t: Option<core::time::Duration>) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        g.client.set_read_timeout(t).map_err(Error::Io)
     }
 
     /// Open a `direct-tcpip` channel (RFC 4254 §7.2) — the server
@@ -563,6 +849,20 @@ fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
             q.remote_eof = true;
             q.remote_close = true;
         }
+        ChannelEvent::Request {
+            channel, request, ..
+        } => {
+            // Capture exit-status / exit-signal so the caller can
+            // surface a meaningful exit code from an interactive shell
+            // / exec stream. All other request types (eow, env, etc.)
+            // are silently dropped — we don't currently surface them.
+            let q = queues.entry(channel).or_default();
+            match request {
+                ChannelRequest::ExitStatus { code } => q.exit_status = Some(code as i32),
+                ChannelRequest::ExitSignal { name, .. } => q.exit_signal = Some(name),
+                _ => {}
+            }
+        }
         _ => {}
     }
 }
@@ -610,6 +910,52 @@ enum Stream {
 }
 
 impl OwnedChannelStream {
+    /// Local channel id this stream owns. Pass this to
+    /// [`SharedClient::send_window_change`] (or any sibling control
+    /// method that takes a channel id) when driving the channel from a
+    /// thread that doesn't own the stream.
+    pub fn channel_id(&self) -> u32 {
+        self.channel
+    }
+
+    /// Send `SSH_MSG_CHANNEL_EOF` on this channel — half-close our
+    /// write side without closing the channel. The peer can still send
+    /// us data; we just won't send any more. Idempotent: calling twice
+    /// is a no-op.
+    ///
+    /// Interactive shell consumers call this when local stdin hits
+    /// EOF — telling the remote shell "no more input is coming" so it
+    /// can exit cleanly.
+    pub fn send_eof(&mut self) -> std::io::Result<()> {
+        let mut g = lock_or_poison_io(&self.shared.inner)?;
+        let q = g.queues.entry(self.channel).or_default();
+        if q.local_eof_sent {
+            return Ok(());
+        }
+        q.local_eof_sent = true;
+        let payload = g.client.conn.send_eof(self.channel).map_err(io_err)?;
+        g.client.write_payload(&payload).map_err(io_err)?;
+        Ok(())
+    }
+
+    /// Snapshot of the most recent `exit-status` request the peer sent
+    /// on this channel (RFC 4254 §6.10). `None` until a request lands.
+    /// Drain the stream to EOF before calling — exit-status normally
+    /// arrives just before the peer sends EOF/CLOSE.
+    pub fn exit_status(&self) -> Option<i32> {
+        let g = self.shared.inner.lock().ok()?;
+        g.queues.get(&self.channel).and_then(|q| q.exit_status)
+    }
+
+    /// Snapshot of the most recent `exit-signal` request name (e.g.
+    /// `"TERM"`, `"KILL"`) the peer sent on this channel, if any.
+    pub fn exit_signal(&self) -> Option<String> {
+        let g = self.shared.inner.lock().ok()?;
+        g.queues
+            .get(&self.channel)
+            .and_then(|q| q.exit_signal.clone())
+    }
+
     /// Drain bytes from the chosen stream of the given channel queue
     /// into `buf`. Returns the number of bytes written. Caller is
     /// responsible for window replenishment.
@@ -635,8 +981,9 @@ impl OwnedChannelStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut g = lock_or_poison_io(&self.shared.inner)?;
+        let _ticket = LockTicket::new(&self.shared.lock_waiters);
         loop {
+            let mut g = lock_or_poison_io(&self.shared.inner)?;
             // 1. Drain our mailbox if non-empty.
             let queue = g.queues.entry(self.channel).or_default();
             let avail = match stream {
@@ -656,7 +1003,15 @@ impl OwnedChannelStream {
             if queue.remote_eof {
                 return Ok(0);
             }
-            // 3. Become pumper or wait on our channel's notifier.
+            // 3. Become pumper or wait on our channel's notifier. Each
+            //    pump iteration releases and re-acquires the inner lock
+            //    (the outer `loop` drops `g` on continue) so concurrent
+            //    write threads on sibling channels — or the write half of
+            //    the same channel in an interactive shell — get a chance
+            //    to push their data through. When a read timeout is
+            //    configured (via `Client::set_read_timeout`), the pumper
+            //    additionally yields the lock every timeout interval even
+            //    while no bytes are arriving.
             if !g.pumping {
                 g.pumping = true;
                 let res = Self::pump_one_step(&mut g);
@@ -669,21 +1024,45 @@ impl OwnedChannelStream {
                 for cv in g.notifiers.values() {
                     cv.notify_one();
                 }
+                drop(g);
                 res?;
-                // Loop: maybe we have data now, or we'll pump again.
+                // std::sync::Mutex on Linux is not fair: a thread that
+                // releases and immediately re-acquires can starve a
+                // contended waiter (writers, or sibling readers on the
+                // same / a different channel). Check the lock-waiters
+                // counter (bumped by every read/write entry point via
+                // [`LockTicket`]) and, if more than just self is
+                // contending, sleep long enough for the kernel to
+                // schedule the waiter onto the freshly-released mutex
+                // before we re-acquire. When no one else is waiting we
+                // keep the short 100 µs yield — it's enough for sibling
+                // channels' read paths to grab the lock without
+                // measurably hurting bulk throughput.
+                if self
+                    .shared
+                    .lock_waiters
+                    .load(core::sync::atomic::Ordering::SeqCst)
+                    > 1
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                } else {
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                // Loop: drop above released the lock so siblings can
+                // squeeze in; we'll re-acquire at the top.
             } else {
                 let cv = notifier_for(&mut g, self.channel);
                 // Bounded wait so a missed notify (e.g. pumper panicked
                 // and unwound through the mutex guard) cannot strand us.
-                g = cv
-                    .wait_timeout(g, WAIT_TIMEOUT)
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "SharedClient mutex poisoned",
-                        )
-                    })?
-                    .0;
+                // Explicitly drop the re-acquired guard so the next loop
+                // iteration starts clean.
+                let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "SharedClient mutex poisoned",
+                    )
+                })?;
+                drop(waited.0);
             }
         }
     }
@@ -714,7 +1093,15 @@ impl OwnedChannelStream {
     /// emission rule trivially safe (one CLOSE per stream, period) and
     /// avoids a double-close race between the pumper and Drop.
     fn pump_one_step(g: &mut Inner) -> std::io::Result<()> {
-        let payload = g.client.read_one_packet().map_err(io_err)?;
+        // Use the timeout-tolerant variant so a `Client::set_read_timeout`
+        // configuration (used by the interactive shell to keep the inner
+        // mutex from being held across long quiescent reads) returns
+        // `Ok(None)` instead of `WouldBlock` / `TimedOut`. Either way the
+        // pumper releases the lock immediately after this call and the
+        // outer `read_stream` loop re-acquires it.
+        let Some(payload) = g.client.read_one_packet_maybe_timeout().map_err(io_err)? else {
+            return Ok(());
+        };
         let ev = g.client.conn.on_packet(&payload).map_err(io_err)?;
         dispatch_event(g, ev);
         Ok(())

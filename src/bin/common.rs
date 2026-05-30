@@ -198,6 +198,68 @@ fn read_password_no_echo_unix() -> std::io::Result<Option<Zeroizing<String>>> {
     Ok(Some(Zeroizing::new(buf)))
 }
 
+/// Drop-guard wrapper around a saved `termios` snapshot that switches
+/// stdin into raw mode on construction and restores it on drop. Used
+/// by the interactive-shell path in `ssh.rs` so a panic, signal, or
+/// early-return through any of the I/O threads still leaves the
+/// user's terminal usable.
+///
+/// "Raw" here mirrors the bit-clear set OpenSSH applies for
+/// `ssh -tt`: clear `ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG |
+/// IEXTEN` on `c_lflag`, `IXON | ICRNL | BRKINT | INPCK | ISTRIP` on
+/// `c_iflag`, `OPOST` on `c_oflag`, plus `VMIN=1 / VTIME=0` so reads
+/// return as soon as a single byte arrives.
+#[cfg(unix)]
+pub struct TermiosRawGuard {
+    fd: libc::c_int,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl TermiosRawGuard {
+    /// Switch fd 0 into raw mode and return a guard that restores the
+    /// passed-in `original` termios on drop. Best-effort: if the
+    /// `tcsetattr` call fails (e.g. stdin isn't a tty after all), the
+    /// returned guard still restores on drop — no observable effect
+    /// in that case.
+    pub fn install(original: &libc::termios) -> Self {
+        let fd: libc::c_int = 0;
+        let mut raw = *original;
+        raw.c_lflag &= !(libc::ICANON
+            | libc::ECHO
+            | libc::ECHOE
+            | libc::ECHOK
+            | libc::ECHONL
+            | libc::ISIG
+            | libc::IEXTEN);
+        raw.c_iflag &= !(libc::IXON | libc::ICRNL | libc::BRKINT | libc::INPCK | libc::ISTRIP);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+        // SAFETY: `raw` is derived from `original` (which the caller
+        // got from a successful tcgetattr); the fd is stdin and valid
+        // for the process lifetime.
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, &raw);
+        }
+        TermiosRawGuard {
+            fd,
+            original: *original,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TermiosRawGuard {
+    fn drop(&mut self) {
+        // SAFETY: same justification as `install` — we captured a
+        // valid termios; the fd is stdin.
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
 /// Honour `$SSH_ASKPASS` when set: invoke the named helper, take its
 /// first stdout line as the password. The helper conventionally takes
 /// the prompt string as its sole argument. Returns `Ok(None)` if the

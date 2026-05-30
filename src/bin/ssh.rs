@@ -558,14 +558,328 @@ fn run() -> Result<i32, String> {
         return run_forwarding(client, &cli);
     }
 
-    let command = cli
-        .command
-        .ok_or_else(|| "interactive shell not yet implemented".to_string())?;
+    if let Some(command) = cli.command {
+        let out = client.exec(&command).map_err(|e| format!("exec: {e}"))?;
+        let _ = std::io::stdout().write_all(&out.stdout);
+        let _ = std::io::stderr().write_all(&out.stderr);
+        return Ok(out.exit_status.map(|s| s as i32).unwrap_or(255));
+    }
 
-    let out = client.exec(&command).map_err(|e| format!("exec: {e}"))?;
-    let _ = std::io::stdout().write_all(&out.stdout);
-    let _ = std::io::stderr().write_all(&out.stderr);
-    Ok(out.exit_status.map(|s| s as i32).unwrap_or(255))
+    // No command on the CLI → interactive shell. Hand the connection
+    // off to the SharedClient-driven runner so the SIGWINCH thread can
+    // call back into the same SSH connection without contending with
+    // the I/O threads.
+    let shared: puressh::shared::SharedClient = client.into();
+    #[cfg(unix)]
+    {
+        if stdin_is_tty() {
+            run_interactive_pty_shell(shared)
+        } else {
+            run_interactive_pipe_shell(shared)
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Windows: no PTY plumbing yet. The pipe path is portable —
+        // splice stdin/stdout/stderr against a no-PTY shell. The
+        // remote login shell will run line-buffered; not great for
+        // interactive use but useful for scripts.
+        let _ = shared;
+        Err(
+            "interactive shell on non-Unix needs the pipe fallback path, which has \
+             not been wired up for Windows in this version"
+                .into(),
+        )
+    }
+}
+
+/// `isatty(0)` — true if stdin is connected to a terminal. We only
+/// allocate a PTY when this is the case (matching OpenSSH `ssh host`
+/// behaviour when stdin is redirected from a file or a pipe).
+#[cfg(unix)]
+fn stdin_is_tty() -> bool {
+    // nix's IsAtty helper is feature-gated and not in our nix flags;
+    // call libc directly under the bin's own unsafe (binaries are
+    // outside the lib's `forbid(unsafe_code)`).
+    unsafe { nix::libc::isatty(0) == 1 }
+}
+
+/// Run an interactive shell with a real PTY:
+///   1. capture local terminal size + termios
+///   2. switch local TTY into raw mode (restored on Drop)
+///   3. open the remote shell with our `term`/dimensions/modes
+///   4. spawn three I/O threads (stdin→remote, remote-stdout→1,
+///      remote-stderr→2) and a SIGWINCH watcher that sends
+///      window-change requests on local resize
+///   5. wait for the I/O threads to finish, then read exit-status
+#[cfg(unix)]
+fn run_interactive_pty_shell(shared: puressh::shared::SharedClient) -> Result<i32, String> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    // 1. Geometry.
+    let (cols, rows, px_w, px_h) = query_window_size();
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
+
+    // 2. Termios capture + raw mode.
+    let mut original_termios: nix::libc::termios = unsafe { core::mem::zeroed() };
+    let tcget_ok = unsafe { nix::libc::tcgetattr(0, &mut original_termios) } == 0;
+    let modes = if tcget_ok {
+        puressh::client::encode_termios_modes(&original_termios)
+    } else {
+        Vec::new()
+    };
+    let _raw_guard = if tcget_ok {
+        Some(common::TermiosRawGuard::install(&original_termios))
+    } else {
+        None
+    };
+
+    // 3. Open the remote shell.
+    let stream = shared
+        .shell_stream(&term, cols, rows, px_w, px_h, modes)
+        .map_err(|e| format!("shell: {e}"))?;
+    let channel_id = stream.channel_id();
+
+    // Short read timeout so the channel-reader pump releases the
+    // SharedClient mutex periodically. The stdin → channel writer thread
+    // and the SIGWINCH watcher both need to acquire that mutex, and
+    // without the timeout the reader would park indefinitely in the
+    // socket read while there's nothing to read — wedging the writer.
+    let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+
+    // 4. Three I/O threads. We do NOT wrap the OwnedChannelStream in a
+    //    mutex — that would serialise the read pump and the write path
+    //    on the outer lock and deadlock interactive sessions. Instead
+    //    the reader thread owns the stream; the writer thread issues
+    //    sends via `SharedClient::channel_send_data` / `channel_send_eof`
+    //    keyed by `channel_id`, which goes through the inner mutex
+    //    independently and yields between pump iterations.
+    let stdout_done = Arc::new(AtomicBool::new(false));
+
+    // stdin → channel.
+    let writer_shared = shared.clone();
+    let t_in = thread::spawn(move || {
+        let mut buf = [0u8; 8 * 1024];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut off = 0;
+                    while off < n {
+                        match writer_shared.channel_send_data(channel_id, &buf[off..n]) {
+                            Ok(0) => return,
+                            Err(_) => return,
+                            Ok(taken) => off += taken,
+                        }
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        // Half-close the write side so the remote shell sees EOF on
+        // its stdin. We don't close the channel — the remote stdout
+        // is probably still draining.
+        let _ = writer_shared.channel_send_eof(channel_id);
+    });
+
+    // channel → stdout. Owns the stream — no outer mutex.
+    let stdout_flag = stdout_done.clone();
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel::<puressh::shared::OwnedChannelStream>();
+    let t_out = thread::spawn(move || {
+        let mut stream = stream;
+        let mut buf = [0u8; 32 * 1024];
+        let mut stdout = std::io::stdout();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdout.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush();
+                }
+                Err(_) => break,
+            }
+        }
+        stdout_flag.store(true, Ordering::Relaxed);
+        // Hand the stream out so the main thread can pull exit-status
+        // and run Drop (which sends CHANNEL_CLOSE).
+        let _ = stream_tx.send(stream);
+    });
+
+    // channel.stderr → stderr. Reads via the SharedClient directly so
+    // it doesn't need to share the OwnedChannelStream with t_out.
+    let err_shared = shared.clone();
+    let t_err = thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        let mut stderr = std::io::stderr();
+        loop {
+            match err_shared.channel_recv_stderr(channel_id, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stderr.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = stderr.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    // 5. SIGWINCH watcher.
+    static RESIZED: AtomicBool = AtomicBool::new(false);
+    extern "C" fn on_winch(_sig: nix::libc::c_int) {
+        RESIZED.store(true, Ordering::Relaxed);
+    }
+    // SAFETY: signal handler is async-signal-safe — it only stores
+    // into an AtomicBool. Replacing SIGWINCH is the standard idiom
+    // for terminal resize handling.
+    unsafe {
+        nix::libc::signal(
+            nix::libc::SIGWINCH,
+            on_winch as *const () as nix::libc::sighandler_t,
+        );
+    }
+    let winch_shared = shared.clone();
+    let winch_stop = stdout_done.clone();
+    let t_winch = thread::spawn(move || {
+        while !winch_stop.load(Ordering::Relaxed) {
+            thread::sleep(std::time::Duration::from_millis(100));
+            if RESIZED.swap(false, Ordering::Relaxed) {
+                let (cols, rows, px_w, px_h) = query_window_size();
+                let _ = winch_shared.send_window_change(channel_id, cols, rows, px_w, px_h);
+            }
+        }
+    });
+
+    // Wait for the channel reader to wind down — that's the canonical
+    // "remote shell exited" signal. The stdin thread may still be
+    // parked in read(0); we don't try to join it (read(0) is
+    // uninterruptible without closing the fd, which would mangle the
+    // user's terminal). The kernel cleans it up on process exit.
+    let _ = t_out.join();
+    let _ = t_err.join();
+    drop(t_in);
+    drop(t_winch);
+
+    // Recover the stream so we can read exit-status and run Drop
+    // (which sends CHANNEL_CLOSE).
+    let stream = stream_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .ok();
+    Ok(stream.and_then(|s| s.exit_status()).unwrap_or(0))
+}
+
+/// Non-PTY shell: stdin is a pipe / file, not a terminal. Same
+/// three-way splice, no termios fiddling, no SIGWINCH. The remote
+/// shell runs in non-canonical line-buffered mode but still works for
+/// `echo cmd | ssh host`-style usage.
+#[cfg(unix)]
+fn run_interactive_pipe_shell(shared: puressh::shared::SharedClient) -> Result<i32, String> {
+    let stream = shared
+        .shell_stream_no_pty()
+        .map_err(|e| format!("shell: {e}"))?;
+    let channel_id = stream.channel_id();
+
+    // See run_interactive_pty_shell: a short read timeout lets the
+    // stdin → channel writer thread acquire the SharedClient mutex
+    // while the channel → stdout reader thread is otherwise pumping.
+    let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+
+    // stdin → channel.
+    let writer_shared = shared.clone();
+    let t_in = thread::spawn(move || {
+        let mut buf = [0u8; 8 * 1024];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut off = 0;
+                    while off < n {
+                        match writer_shared.channel_send_data(channel_id, &buf[off..n]) {
+                            Ok(0) | Err(_) => return,
+                            Ok(taken) => off += taken,
+                        }
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = writer_shared.channel_send_eof(channel_id);
+    });
+
+    // channel → stdout. Owns the stream — no outer mutex.
+    let (stream_tx, stream_rx) = std::sync::mpsc::channel::<puressh::shared::OwnedChannelStream>();
+    let t_out = thread::spawn(move || {
+        let mut stream = stream;
+        let mut buf = [0u8; 32 * 1024];
+        let mut stdout = std::io::stdout();
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stdout.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = stdout.flush();
+                }
+                Err(_) => break,
+            }
+        }
+        let _ = stream_tx.send(stream);
+    });
+
+    // channel.stderr → stderr.
+    let err_shared = shared.clone();
+    let t_err = thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        let mut stderr = std::io::stderr();
+        loop {
+            match err_shared.channel_recv_stderr(channel_id, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stderr.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = stderr.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let _ = t_out.join();
+    let _ = t_err.join();
+    drop(t_in);
+
+    let stream = stream_rx
+        .recv_timeout(std::time::Duration::from_secs(1))
+        .ok();
+    Ok(stream.and_then(|s| s.exit_status()).unwrap_or(0))
+}
+
+/// Query the local terminal's size via `TIOCGWINSZ` on fd 0. Returns
+/// `(cols, rows, px_w, px_h)`. Falls back to `(80, 24, 0, 0)` if the
+/// ioctl fails.
+#[cfg(unix)]
+fn query_window_size() -> (u32, u32, u32, u32) {
+    let mut ws: nix::libc::winsize = unsafe { core::mem::zeroed() };
+    let ok = unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut ws) } == 0;
+    if ok {
+        (
+            ws.ws_col as u32,
+            ws.ws_row as u32,
+            ws.ws_xpixel as u32,
+            ws.ws_ypixel as u32,
+        )
+    } else {
+        (80, 24, 0, 0)
+    }
 }
 
 /// Splice a `forwarded-tcpip` channel against a fresh outbound `TcpStream`

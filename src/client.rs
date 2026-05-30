@@ -708,6 +708,19 @@ impl Client {
         Ok(local_id)
     }
 
+    /// Set the underlying TCP socket's read timeout. `None` clears it
+    /// (blocking reads, the default). Used by the SharedClient pump in
+    /// interactive-shell mode to release its inner mutex periodically so
+    /// sibling write threads can make progress; you generally don't need
+    /// it for one-shot exec / SFTP flows where there's only one waiter.
+    ///
+    /// Callers that set a non-`None` value MUST tolerate
+    /// `ErrorKind::WouldBlock` / `ErrorKind::TimedOut` on subsequent
+    /// reads (or only use code paths that fold those into a no-op).
+    pub fn set_read_timeout(&mut self, t: Option<core::time::Duration>) -> std::io::Result<()> {
+        self.stream.set_read_timeout(t)
+    }
+
     /// Send `SSH_MSG_CHANNEL_CLOSE` for `channel`. Used to tear down a
     /// session channel opened by
     /// [`Self::open_session_for_agent_forward`] once the matching serve
@@ -1707,8 +1720,10 @@ impl Client {
     /// Like [`Self::read_one_packet`] but returns `Ok(None)` on a read
     /// timeout (the socket's `set_read_timeout` having elapsed) instead of
     /// erroring. Used by [`Self::serve`] to interleave wire reads with
-    /// per-channel egress draining.
-    fn read_one_packet_maybe_timeout(&mut self) -> Result<Option<Vec<u8>>> {
+    /// per-channel egress draining, and by the `SharedClient` pump in
+    /// short-timeout (interactive) mode to release its inner mutex
+    /// between reads so siblings can write.
+    pub(crate) fn read_one_packet_maybe_timeout(&mut self) -> Result<Option<Vec<u8>>> {
         match self.read_one_packet() {
             Ok(p) => Ok(Some(p)),
             Err(Error::Io(e))
@@ -2140,6 +2155,178 @@ pub(crate) fn io_err(e: Error) -> std::io::Error {
         Error::Io(io) => io,
         other => std::io::Error::other(format!("{:?}", other)),
     }
+}
+
+/// Encode a local Unix termios into the RFC 4254 §8 terminal-modes
+/// blob expected by the `pty-req` channel request. Each significant
+/// opcode is followed by a u32 value; the blob is terminated by
+/// `TTY_OP_END = 0`. Pass the result through to
+/// the `SharedClient::shell_stream` mirror as the `modes` parameter so
+/// the remote PTY mirrors the local control characters (e.g. `^C` to
+/// interrupt) and flag set (canonical mode, echo, etc.).
+///
+/// The full opcode list and wire format live in RFC 4254 §8. We emit
+/// the opcodes OpenSSH considers core: control characters
+/// `VINTR`/`VQUIT`/…/`VEOL2`, IXON/IXOFF/IXANY, ICANON/ECHO/ISIG and
+/// friends, OPOST/ONLCR/OCRNL/ONLRET, CS7/CS8/PARENB/PARODD, plus the
+/// two `TTY_OP_*SPEED` bauds. Unknown / non-portable opcodes are
+/// skipped — the peer ignores opcodes it doesn't recognise per the
+/// RFC.
+///
+/// Only available on Unix builds with the default `std` feature, since
+/// the source `termios` type is itself a libc construct.
+#[cfg(all(feature = "std", unix))]
+pub fn encode_termios_modes(t: &libc::termios) -> Vec<u8> {
+    // Opcode numbers per RFC 4254 §8.
+    const TTY_OP_END: u8 = 0;
+    const VINTR: u8 = 1;
+    const VQUIT: u8 = 2;
+    const VERASE: u8 = 3;
+    const VKILL: u8 = 4;
+    const VEOF: u8 = 5;
+    const VEOL: u8 = 6;
+    const VEOL2: u8 = 7;
+    const VSTART: u8 = 8;
+    const VSTOP: u8 = 9;
+    const VSUSP: u8 = 10;
+    const VREPRINT: u8 = 12;
+    const VWERASE: u8 = 13;
+    const VLNEXT: u8 = 14;
+    const IGNPAR: u8 = 30;
+    const PARMRK: u8 = 31;
+    const INPCK: u8 = 32;
+    const ISTRIP: u8 = 33;
+    const INLCR: u8 = 34;
+    const IGNCR: u8 = 35;
+    const ICRNL: u8 = 36;
+    const IXON: u8 = 39;
+    const IXANY: u8 = 40;
+    const IXOFF: u8 = 41;
+    const IMAXBEL: u8 = 42;
+    const ISIG: u8 = 50;
+    const ICANON: u8 = 51;
+    const ECHO: u8 = 53;
+    const ECHOE: u8 = 54;
+    const ECHOK: u8 = 55;
+    const ECHONL: u8 = 56;
+    const NOFLSH: u8 = 57;
+    const TOSTOP: u8 = 58;
+    const IEXTEN: u8 = 59;
+    const ECHOCTL: u8 = 60;
+    const ECHOKE: u8 = 61;
+    const OPOST: u8 = 70;
+    const ONLCR: u8 = 72;
+    const OCRNL: u8 = 73;
+    const ONOCR: u8 = 74;
+    const ONLRET: u8 = 75;
+    const CS7: u8 = 90;
+    const CS8: u8 = 91;
+    const PARENB: u8 = 92;
+    const PARODD: u8 = 93;
+    const TTY_OP_ISPEED: u8 = 128;
+    const TTY_OP_OSPEED: u8 = 129;
+
+    let mut out = Vec::with_capacity(128);
+    let mut push = |op: u8, val: u32| {
+        out.push(op);
+        out.extend_from_slice(&val.to_be_bytes());
+    };
+
+    // Control characters. Each is one byte in `c_cc`; the wire field
+    // is u32 so we zero-extend. Skip if the slot is at the libc
+    // sentinel (0xff means "disabled" on Linux/macOS, but we just
+    // forward whatever is there — the remote can interpret it).
+    let cc = |i: usize| -> u32 { t.c_cc[i] as u32 };
+    push(VINTR, cc(libc::VINTR));
+    push(VQUIT, cc(libc::VQUIT));
+    push(VERASE, cc(libc::VERASE));
+    push(VKILL, cc(libc::VKILL));
+    push(VEOF, cc(libc::VEOF));
+    push(VEOL, cc(libc::VEOL));
+    push(VEOL2, cc(libc::VEOL2));
+    push(VSTART, cc(libc::VSTART));
+    push(VSTOP, cc(libc::VSTOP));
+    push(VSUSP, cc(libc::VSUSP));
+    push(VREPRINT, cc(libc::VREPRINT));
+    push(VWERASE, cc(libc::VWERASE));
+    push(VLNEXT, cc(libc::VLNEXT));
+
+    // Input modes. Wire value is 0 (clear) or non-zero (set) per the
+    // RFC; we use 1 for set so the peer sees a tidy boolean.
+    let iflag = t.c_iflag;
+    let bit_i = |mask: libc::tcflag_t| -> u32 {
+        if iflag & mask != 0 {
+            1
+        } else {
+            0
+        }
+    };
+    push(IGNPAR, bit_i(libc::IGNPAR));
+    push(PARMRK, bit_i(libc::PARMRK));
+    push(INPCK, bit_i(libc::INPCK));
+    push(ISTRIP, bit_i(libc::ISTRIP));
+    push(INLCR, bit_i(libc::INLCR));
+    push(IGNCR, bit_i(libc::IGNCR));
+    push(ICRNL, bit_i(libc::ICRNL));
+    push(IXON, bit_i(libc::IXON));
+    push(IXANY, bit_i(libc::IXANY));
+    push(IXOFF, bit_i(libc::IXOFF));
+    push(IMAXBEL, bit_i(libc::IMAXBEL));
+
+    // Local modes.
+    let lflag = t.c_lflag;
+    let bit_l = |mask: libc::tcflag_t| -> u32 {
+        if lflag & mask != 0 {
+            1
+        } else {
+            0
+        }
+    };
+    push(ISIG, bit_l(libc::ISIG));
+    push(ICANON, bit_l(libc::ICANON));
+    push(ECHO, bit_l(libc::ECHO));
+    push(ECHOE, bit_l(libc::ECHOE));
+    push(ECHOK, bit_l(libc::ECHOK));
+    push(ECHONL, bit_l(libc::ECHONL));
+    push(NOFLSH, bit_l(libc::NOFLSH));
+    push(TOSTOP, bit_l(libc::TOSTOP));
+    push(IEXTEN, bit_l(libc::IEXTEN));
+    push(ECHOCTL, bit_l(libc::ECHOCTL));
+    push(ECHOKE, bit_l(libc::ECHOKE));
+
+    // Output modes.
+    let oflag = t.c_oflag;
+    let bit_o = |mask: libc::tcflag_t| -> u32 {
+        if oflag & mask != 0 {
+            1
+        } else {
+            0
+        }
+    };
+    push(OPOST, bit_o(libc::OPOST));
+    push(ONLCR, bit_o(libc::ONLCR));
+    push(OCRNL, bit_o(libc::OCRNL));
+    push(ONOCR, bit_o(libc::ONOCR));
+    push(ONLRET, bit_o(libc::ONLRET));
+
+    // Control modes (character size, parity).
+    let cflag = t.c_cflag;
+    let cs = cflag & libc::CSIZE;
+    push(CS7, if cs == libc::CS7 { 1 } else { 0 });
+    push(CS8, if cs == libc::CS8 { 1 } else { 0 });
+    push(PARENB, if cflag & libc::PARENB != 0 { 1 } else { 0 });
+    push(PARODD, if cflag & libc::PARODD != 0 { 1 } else { 0 });
+
+    // Line speeds. The cf*speed accessors require unsafe FFI and the
+    // value is cosmetic for a virtual PTY anyway — pin to the RFC's
+    // illustrative 38400 baud so no caller has to think about it.
+    // (`forbid(unsafe_code)` outside `ffi` rules out the libc path.)
+    let _ = t; // suppress unused-binding lint once the cf*speed calls are gone
+    push(TTY_OP_ISPEED, 38_400);
+    push(TTY_OP_OSPEED, 38_400);
+
+    out.push(TTY_OP_END);
+    out
 }
 
 /// Build `scp -t [-r] [-p] -- '<dest>'` for [`Client::scp_send_to`].

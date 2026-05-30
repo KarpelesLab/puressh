@@ -106,7 +106,10 @@ crate-type = ["lib"]
 [[bin]]
 name = "ssh"
 path = "src/bin/ssh.rs"
-required-features = ["std", "client"]
+# `multichannel` is needed for the interactive shell path — it spins a
+# sibling `SharedClient` clone to deliver SIGWINCH-driven `window-change`
+# requests while the stdio threads hold the channel stream.
+required-features = ["std", "client", "multichannel"]
 
 [[bin]]
 name = "sshd"

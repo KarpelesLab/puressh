@@ -38,6 +38,12 @@ pub const PCSSH_ERR_PROTOCOL: c_int = -9;
 pub const PCSSH_ERR_PARSE: c_int = -10;
 /// Error code: a Rust panic was caught at the FFI boundary.
 pub const PCSSH_ERR_PANIC: c_int = -99;
+/// Error code: caller-supplied configuration is internally inconsistent
+/// (e.g. a known-hosts policy without a target host).
+pub const PCSSH_ERR_CONFIG: c_int = -11;
+/// Error code: a child handle (e.g. SFTP file) was used after its parent
+/// (e.g. SFTP session) was freed. Detected via generation counters.
+pub const PCSSH_ERR_INVALID_HANDLE: c_int = -12;
 
 /// Map a Rust [`Error`] to a C error code.
 pub(crate) fn map_error(err: &Error) -> c_int {
@@ -55,6 +61,7 @@ pub(crate) fn map_error(err: &Error) -> c_int {
         Error::AuthFailed => PCSSH_ERR_AUTH_FAILED,
         Error::BadChannelState => PCSSH_ERR_PROTOCOL,
         Error::Unsupported(_) => PCSSH_ERR_GENERIC,
+        Error::Config(_) => PCSSH_ERR_CONFIG,
     }
 }
 
@@ -103,6 +110,8 @@ pub extern "C" fn pcssh_error_message(code: c_int) -> *const c_char {
         PCSSH_ERR_HOSTKEY_REJECTED => b"host key rejected\0",
         PCSSH_ERR_PROTOCOL => b"protocol error\0",
         PCSSH_ERR_PARSE => b"parse error\0",
+        PCSSH_ERR_CONFIG => b"configuration error\0",
+        PCSSH_ERR_INVALID_HANDLE => b"invalid or stale handle\0",
         PCSSH_ERR_PANIC => b"caught panic at FFI boundary\0",
         _ => return ptr::null(),
     };
@@ -146,6 +155,8 @@ mod tests {
             PCSSH_ERR_HOSTKEY_REJECTED,
             PCSSH_ERR_PROTOCOL,
             PCSSH_ERR_PARSE,
+            PCSSH_ERR_CONFIG,
+            PCSSH_ERR_INVALID_HANDLE,
             PCSSH_ERR_PANIC,
         ] {
             let p = pcssh_error_message(code);

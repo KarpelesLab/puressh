@@ -48,6 +48,11 @@ purecrypto = { version = "0.2", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der",
 ] }
 compcol = { version = "0.4.2", default-features = false, features = ["alloc", "zlib"], optional = true }
+# `zeroize` provides `Zeroizing<T>` (drop wipes the inner value) and a derive
+# for compound secrets. Kept default-on so `no_std + alloc` builds still get
+# secret-wiping for derived KDF output, password buffers carried across FFI,
+# and similar transient secrets. The crate itself is `no_std`-friendly.
+zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
 # Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
 # set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it
@@ -65,6 +70,12 @@ compcol = { version = "0.4.2", default-features = false, features = ["alloc", "z
 nix = { version = "0.30", default-features = false, features = [
     "process", "signal", "term", "fs", "ioctl", "user",
 ] }
+# `libc` for the few low-level POSIX bits the binaries need (terminal
+# echo control in the password reader; geteuid + Unix-socket stat() for
+# the SSH_AUTH_SOCK trust check in the agent client). The library
+# proper continues to stay no-std-friendly; only the cfg(unix)-gated
+# bin/agent paths reach for libc.
+libc = { version = "0.2", default-features = false }
 
 # `pam-client2` is gated to **Linux only**, not all of `cfg(unix)`.
 # Upstream `pam-client2 0.5.5` references Linux-PAM constants

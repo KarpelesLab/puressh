@@ -201,12 +201,26 @@ pub struct NegotiatedOwned {
     /// True when the early-KEX guess included by either side was wrong and
     /// must be discarded (RFC 4253 §7.1).
     pub first_kex_packet_follows_wrong_guess: bool,
+    /// True when both sides advertised the matching strict-kex marker
+    /// (`kex-strict-c-v00@openssh.com` in the client's `kex_algorithms`
+    /// AND `kex-strict-s-v00@openssh.com` in the server's). Enables the
+    /// Terrapin mitigation (CVE-2023-48795): the transport resets sequence
+    /// counters at NEWKEYS and rejects non-KEX packets between KEXINIT and
+    /// NEWKEYS.
+    pub strict_kex_enabled: bool,
 }
 
 /// Walk the **client's** list in order; the first name that also appears in
-/// the **server's** list is the agreed algorithm (RFC 4253 §7.1).
+/// the **server's** list is the agreed algorithm (RFC 4253 §7.1). For the
+/// KEX category, strict-kex signalling markers
+/// (`kex-strict-{c,s}-v00@openssh.com`) are ignored — they are *not* real
+/// algorithms.
 fn pick<'a>(category: &'static str, client: &'a [String], server: &[String]) -> Result<&'a str> {
+    let is_kex = category == "kex algorithm";
     for name in client {
+        if is_kex && super::kex::is_strict_kex_marker(name) {
+            continue;
+        }
         if server.iter().any(|s| s == name) {
             return Ok(name.as_str());
         }
@@ -266,6 +280,18 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
         false
     };
 
+    // Strict-kex (Terrapin / CVE-2023-48795): only enabled when each side
+    // saw the OTHER side's matching marker in its kex_algorithms list.
+    let client_advertised = client
+        .kex
+        .iter()
+        .any(|s| s == super::kex::STRICT_KEX_CLIENT_MARKER);
+    let server_advertised = server
+        .kex
+        .iter()
+        .any(|s| s == super::kex::STRICT_KEX_SERVER_MARKER);
+    let strict_kex_enabled = client_advertised && server_advertised;
+
     Ok(NegotiatedOwned {
         kex: kex.to_string(),
         host_key: host_key.to_string(),
@@ -276,6 +302,7 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
         comp_c2s: comp_c2s.to_string(),
         comp_s2c: comp_s2c.to_string(),
         first_kex_packet_follows_wrong_guess: wrong,
+        strict_kex_enabled,
     })
 }
 
@@ -358,6 +385,44 @@ mod tests {
         let mut b = a.clone();
         a.kex = vec!["curve25519-sha256".into()];
         b.kex = vec!["diffie-hellman-group14-sha256".into()];
+        assert!(matches!(
+            negotiate(&a, &b),
+            Err(Error::NoCommonAlgorithm(_))
+        ));
+    }
+
+    #[test]
+    fn negotiate_strict_kex_requires_both_markers() {
+        use crate::transport::kex::{STRICT_KEX_CLIENT_MARKER, STRICT_KEX_SERVER_MARKER};
+
+        let base = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16]);
+
+        // Both sides advertise the appropriate marker -> enabled.
+        let neg = negotiate(&base, &base).unwrap();
+        assert!(neg.strict_kex_enabled);
+
+        // Client missing -c marker -> disabled.
+        let mut a = base.clone();
+        a.kex.retain(|n| n != STRICT_KEX_CLIENT_MARKER);
+        let neg = negotiate(&a, &base).unwrap();
+        assert!(!neg.strict_kex_enabled);
+
+        // Server missing -s marker -> disabled.
+        let mut b = base.clone();
+        b.kex.retain(|n| n != STRICT_KEX_SERVER_MARKER);
+        let neg = negotiate(&base, &b).unwrap();
+        assert!(!neg.strict_kex_enabled);
+    }
+
+    #[test]
+    fn negotiate_does_not_pick_strict_kex_marker_as_algorithm() {
+        use crate::transport::kex::STRICT_KEX_CLIENT_MARKER;
+
+        let mut a = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16]);
+        let mut b = a.clone();
+        // Only common entries are the strict markers. Picker must reject.
+        a.kex = vec![STRICT_KEX_CLIENT_MARKER.to_string()];
+        b.kex = vec![STRICT_KEX_CLIENT_MARKER.to_string()];
         assert!(matches!(
             negotiate(&a, &b),
             Err(Error::NoCommonAlgorithm(_))

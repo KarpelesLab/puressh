@@ -30,7 +30,15 @@ impl VersionExchange {
     }
 
     /// Parse a single line of peer identification (with or without CR LF).
+    ///
+    /// Per RFC 4253 §4.2 the identification string MUST NOT exceed 255
+    /// octets including the trailing CR LF. We reject anything longer so
+    /// a peer cannot push us into unbounded line buffering before any
+    /// authentication has occurred.
     pub fn parse_remote(line: &[u8]) -> Result<alloc::string::String> {
+        if line.len() > 255 {
+            return Err(Error::Protocol("version line exceeds 255 bytes"));
+        }
         let trimmed = match line.strip_suffix(b"\r\n") {
             Some(t) => t,
             None => line.strip_suffix(b"\n").unwrap_or(line),
@@ -41,5 +49,51 @@ impl VersionExchange {
         core::str::from_utf8(trimmed)
             .map(alloc::string::String::from)
             .map_err(|_| Error::Protocol("non-ASCII in version string"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_remote_accepts_reasonable_line() {
+        let v = VersionExchange::parse_remote(b"SSH-2.0-OpenSSH_9.7\r\n").unwrap();
+        assert_eq!(v, "SSH-2.0-OpenSSH_9.7");
+    }
+
+    #[test]
+    fn parse_remote_rejects_oversized_line() {
+        let mut huge = alloc::vec::Vec::with_capacity(300);
+        huge.extend_from_slice(b"SSH-2.0-");
+        huge.extend(core::iter::repeat_n(b'X', 300 - huge.len() - 2));
+        huge.extend_from_slice(b"\r\n");
+        assert_eq!(huge.len(), 300);
+        let err = VersionExchange::parse_remote(&huge).unwrap_err();
+        match err {
+            Error::Protocol(msg) => assert_eq!(msg, "version line exceeds 255 bytes"),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_remote_accepts_at_255_octets() {
+        // Boundary: 255 octets including CRLF is allowed.
+        let mut at_limit = alloc::vec::Vec::with_capacity(255);
+        at_limit.extend_from_slice(b"SSH-2.0-");
+        at_limit.extend(core::iter::repeat_n(b'A', 255 - at_limit.len() - 2));
+        at_limit.extend_from_slice(b"\r\n");
+        assert_eq!(at_limit.len(), 255);
+        assert!(VersionExchange::parse_remote(&at_limit).is_ok());
+    }
+
+    #[test]
+    fn parse_remote_rejects_non_ssh_prefix() {
+        let line = b"HTTP/1.1 200 OK\r\n";
+        let err = VersionExchange::parse_remote(line).unwrap_err();
+        match err {
+            Error::Protocol(_) => {}
+            other => panic!("expected Protocol, got {other:?}"),
+        }
     }
 }

@@ -16,6 +16,7 @@ use compcol::zlib::{Decoder as CcDecoder, Encoder as CcEncoder};
 use compcol::{Decoder as _, Encoder as _, Flush, Status};
 
 use crate::error::{Error, Result};
+use crate::transport::packet::MAX_PACKET_LEN;
 
 use super::{Compress, Decompress};
 
@@ -23,6 +24,15 @@ use super::{Compress, Decompress};
 /// the previous miniz_oxide path used and keeps copy granularity well
 /// under typical SSH payload sizes.
 const CHUNK: usize = 8 * 1024;
+
+/// Default upper bound on the number of bytes a single inflate call may
+/// produce. SSH's per-packet payload limit is `MAX_PACKET_LEN` (35 000 by
+/// default); a malicious peer could otherwise hand us a tiny compressed
+/// frame that inflates to gigabytes. Capping at `MAX_PACKET_LEN * 64`
+/// (~2 MiB) leaves comfortable headroom for legitimate traffic — even
+/// highly-compressible streams stay well below this — while bounding the
+/// allocator and CPU work a single bad frame can cost us.
+const DEFAULT_MAX_INFLATE_OUTPUT: usize = (MAX_PACKET_LEN as usize) * 64;
 
 struct ZlibDeflate {
     enc: CcEncoder,
@@ -87,18 +97,29 @@ impl ZlibDeflate {
 
 struct ZlibInflate {
     dec: CcDecoder,
+    max_output_size: usize,
 }
 
 impl ZlibInflate {
     fn new() -> Self {
         Self {
             dec: CcDecoder::new(),
+            max_output_size: DEFAULT_MAX_INFLATE_OUTPUT,
         }
+    }
+
+    fn set_max_output_size(&mut self, n: usize) {
+        self.max_output_size = n;
     }
 
     /// Decompress one SSH packet of `input`. `Z_SYNC_FLUSH` markers are
     /// regular deflate blocks to the inflate side, so the persistent
     /// sliding window seamlessly bridges packet boundaries.
+    ///
+    /// Returns `Error::Format("zlib decompressed too large")` if the
+    /// decoded output would exceed `self.max_output_size` — this guards
+    /// against decompression-bomb attacks where a tiny compressed frame
+    /// expands to gigabytes.
     fn step(&mut self, input: &[u8]) -> Result<Vec<u8>> {
         let mut out: Vec<u8> = Vec::with_capacity(input.len() * 2);
         let mut chunk = [0u8; CHUNK];
@@ -110,6 +131,12 @@ impl ZlibInflate {
                 .decode(&input[consumed..], &mut chunk)
                 .map_err(|_| Error::Format("zlib decompress failed"))?;
             consumed += progress.consumed;
+            // Enforce the bomb-resistance cap BEFORE growing the output
+            // buffer — otherwise a single decode call could already have
+            // allocated megabytes.
+            if out.len().saturating_add(progress.written) > self.max_output_size {
+                return Err(Error::Format("zlib decompressed too large"));
+            }
             out.extend_from_slice(&chunk[..progress.written]);
             match status {
                 // All of this packet's bytes consumed; output drained.
@@ -179,6 +206,14 @@ impl ZlibDecompress {
         Self {
             inner: ZlibInflate::new(),
         }
+    }
+
+    /// Override the per-call inflate output cap. The default is roughly
+    /// 2 MiB; lowering it tightens the bomb-resistance guard, raising it
+    /// loosens it. Callers that ship larger SSH payloads (CHANNEL_DATA
+    /// holding tens of MiB) may need to raise this.
+    pub fn set_max_output_size(&mut self, n: usize) {
+        self.inner.set_max_output_size(n);
     }
 }
 
@@ -253,12 +288,26 @@ impl Compress for ZlibOpenSshCompress {
 /// `"zlib@openssh.com"` — counterpart to [`ZlibOpenSshCompress`].
 pub struct ZlibOpenSshDecompress {
     inner: Option<ZlibInflate>,
+    max_output_size: usize,
 }
 
 impl ZlibOpenSshDecompress {
     /// Construct an inactive `"zlib@openssh.com"` decompressor.
     pub fn new() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            max_output_size: DEFAULT_MAX_INFLATE_OUTPUT,
+        }
+    }
+
+    /// Override the per-call inflate output cap. The setting is preserved
+    /// across [`activate`](Decompress::activate); see
+    /// [`ZlibDecompress::set_max_output_size`] for the trade-off.
+    pub fn set_max_output_size(&mut self, n: usize) {
+        self.max_output_size = n;
+        if let Some(inner) = self.inner.as_mut() {
+            inner.set_max_output_size(n);
+        }
     }
 }
 
@@ -286,7 +335,9 @@ impl Decompress for ZlibOpenSshDecompress {
 
     fn activate(&mut self) {
         if self.inner.is_none() {
-            self.inner = Some(ZlibInflate::new());
+            let mut state = ZlibInflate::new();
+            state.set_max_output_size(self.max_output_size);
+            self.inner = Some(state);
         }
     }
 }
@@ -386,5 +437,40 @@ mod tests {
         let payload = b"payload through trait objects";
         let on_wire = c.compress(payload).unwrap();
         assert_eq!(d.decompress(&on_wire).unwrap().as_slice(), payload);
+    }
+
+    #[test]
+    fn decompress_bomb_cap_rejects_oversized_output() {
+        // Compress a highly-compressible 256 KiB blob — its inflated size
+        // dwarfs the 1 KiB cap we install below.
+        let mut c = ZlibCompress::new();
+        let big = vec![b'A'; 256 * 1024];
+        let on_wire = c.compress(&big).unwrap();
+        assert!(on_wire.len() < big.len());
+
+        let mut d = ZlibDecompress::new();
+        d.set_max_output_size(1024);
+        let err = d.decompress(&on_wire).unwrap_err();
+        match err {
+            Error::Format(msg) => assert_eq!(msg, "zlib decompressed too large"),
+            other => panic!("expected Format(\"...too large\"), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openssh_decompress_bomb_cap_survives_activation() {
+        let mut c = ZlibOpenSshCompress::new();
+        c.activate();
+        let big = vec![b'B'; 64 * 1024];
+        let on_wire = c.compress(&big).unwrap();
+
+        let mut d = ZlibOpenSshDecompress::new();
+        d.set_max_output_size(512);
+        d.activate();
+        let err = d.decompress(&on_wire).unwrap_err();
+        match err {
+            Error::Format(msg) => assert_eq!(msg, "zlib decompressed too large"),
+            other => panic!("expected Format(\"...too large\"), got {other:?}"),
+        }
     }
 }

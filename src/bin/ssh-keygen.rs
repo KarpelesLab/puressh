@@ -17,6 +17,12 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::ExitCode;
 
+use purecrypto::rng::{OsRng, RngCore};
+use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
+use puressh::known_hosts::format::format_entry;
+use puressh::known_hosts::KnownHosts;
+use zeroize::Zeroizing;
+
 /// Open a file with `create_new` semantics, applying the requested Unix mode
 /// when available. On non-Unix targets the mode is silently ignored (the
 /// filesystem lacks the bits anyway).
@@ -30,11 +36,30 @@ fn open_create_new(path: &str, _mode: u32) -> std::io::Result<fs::File> {
     opts.open(path)
 }
 
-use purecrypto::rng::OsRng;
-use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
-use puressh::known_hosts::format::format_entry;
-use puressh::known_hosts::KnownHosts;
-use zeroize::Zeroizing;
+/// Build a per-call unique temporary path next to `path`. The suffix
+/// combines the process id and a fresh `u64` from `OsRng`, so two
+/// concurrent invocations cannot collide on the same tmp name and an
+/// attacker with write access to the directory cannot pre-create the
+/// tmp path as a symlink. Pair with `open_create_new` for O_EXCL.
+fn unique_tmp_path(path: &str) -> String {
+    let mut rng = OsRng;
+    let mut nonce = [0u8; 8];
+    rng.fill_bytes(&mut nonce);
+    let nonce = u64::from_le_bytes(nonce);
+    let pid = std::process::id();
+    let p = Path::new(path);
+    let file_name = p
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("ssh-keygen");
+    let tmp_name = format!(".{file_name}.tmp.{pid}.{nonce:016x}");
+    match p.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            parent.join(tmp_name).to_string_lossy().into_owned()
+        }
+        _ => tmp_name,
+    }
+}
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -448,16 +473,26 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
         })
         .map_err(|e| format!("encode: {e}"))?;
 
-    let tmp = format!("{file}.tmp");
-    if Path::new(&tmp).exists() {
-        let _ = fs::remove_file(&tmp);
-    }
-    {
+    // Per-call unique tmp name + O_EXCL so two concurrent rotations
+    // cannot race on the same temporary path, and an attacker with
+    // write access to the parent directory cannot pre-create the path
+    // as a symlink to bait us into clobbering an arbitrary file.
+    let tmp = unique_tmp_path(&file);
+    let write_result = (|| -> Result<(), String> {
         let mut f = open_create_new(&tmp, 0o600).map_err(|e| format!("open {tmp}: {e}"))?;
         f.write_all(pem.as_bytes())
             .map_err(|e| format!("write {tmp}: {e}"))?;
+        f.sync_all().map_err(|e| format!("fsync {tmp}: {e}"))?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
-    fs::rename(&tmp, &file).map_err(|e| format!("rename {tmp} -> {file}: {e}"))?;
+    if let Err(e) = fs::rename(&tmp, &file) {
+        let _ = fs::remove_file(&tmp);
+        return Err(format!("rename {tmp} -> {file}: {e}"));
+    }
     println!("Your identification has been updated.");
     Ok(0)
 }

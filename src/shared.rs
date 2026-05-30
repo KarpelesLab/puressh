@@ -36,31 +36,69 @@
 //!
 //! ## Concurrency model
 //!
-//! Calls serialise on a single mutex. Two threads using two
-//! [`SftpSession`]s on the same [`SharedClient`] both make progress, but
-//! they take turns at the wire: while thread A is blocked on a TCP read
-//! inside `OwnedChannelStream::read`, thread B is blocked on the mutex.
-//! When A's `read_one_packet` returns, A either consumes the packet
-//! (queue full → returns) or queues it for some other channel and loops.
-//! Either way the mutex is eventually released and B gets in.
+//! Multiple [`OwnedChannelStream`]s (from any combination of SFTP / exec
+//! / shell / forward handles) coexist on a single [`SharedClient`].
+//! Threads using them serialise on a single mutex, but only one thread
+//! is the *pumper* at any moment — the one actively driving the wire.
+//! All other threads sleep on a per-channel [`std::sync::Condvar`].
 //!
-//! This is correct for the common case (synchronous request/response
-//! SFTP), allows arbitrary numbers of independent SFTP handles, and
-//! avoids the complexity of a dedicated reader thread. It is **not**
-//! suitable for genuinely concurrent reads on different channels with
-//! independent flow control — that would need an evented reactor, which
-//! is out of scope here.
+//! Read flow under the mutex:
+//!
+//! 1. If our channel's mailbox already holds bytes, drain into the
+//!    caller's buffer, replenish the receive window for the drained
+//!    bytes, and return.
+//! 2. Else, if no thread is currently pumping, claim the pump seat,
+//!    pump exactly one packet off the wire, dispatch it into the right
+//!    channel's mailbox, signal that channel's notifier, release the
+//!    pump seat, and loop.
+//! 3. Else, wait on our channel's notifier with a 500 ms safety-net
+//!    timeout. The pumper signals our notifier when it deposits data
+//!    for us; the timeout catches the rare missed notify (e.g. a
+//!    panicked pumper).
+//!
+//! Write flow follows the same pattern: if `send_data` reports zero
+//! bytes taken (peer window credit is zero), become pumper or wait,
+//! hoping for a window-adjust to arrive on the next packet.
+//!
+//! Backpressure: receive-window credit is replenished only at drain
+//! time in [`Read::read`], never on enqueue inside the pumper. A
+//! reader that stops draining its channel lets the SSH per-channel
+//! window naturally cap the in-memory mailbox at the initial window
+//! size, which in turn stops the peer from sending more.
+//!
+//! ### Limitations
+//!
+//! `Client::read_one_packet` is a blocking socket read on a bare
+//! `TcpStream`. While the pumper is parked there no
+//! other thread can grab the mutex — including a thread whose data is
+//! already in its mailbox. In practice this only matters when one
+//! channel is genuinely quiet for long stretches; the typical
+//! request/response SFTP workload doesn't trigger it. Lifting this
+//! fully needs either a dedicated reader thread or splitting the
+//! read-half of the `TcpStream` — both deferred.
 
 #![cfg(feature = "std")]
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use crate::channel::{ChannelEvent, ChannelOpen, ChannelRequest};
 use crate::client::{io_err, Client};
 use crate::error::{Error, Result};
 use crate::sftp::{SftpClient, SftpError};
+
+/// Safety-net wake interval for non-pumping waiters. If the pumper
+/// panics or otherwise fails to fire a notification, waiters reawaken
+/// on this cadence and re-check their mailbox. Short enough that
+/// latency is human-tolerable, long enough that idle channels do not
+/// burn CPU.
+const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// The message used for `expect` calls on the shared mutex. Lifted out
+/// of the call sites to keep them readable.
+const POISONED: &str = "SharedClient mutex poisoned";
 
 /// Local alias for SFTP-flavoured results, since
 /// [`crate::error::Result`] only takes one generic parameter (and pins
@@ -88,14 +126,25 @@ struct ChannelQueue {
     remote_close: bool,
 }
 
-/// Shared state: the underlying [`Client`] and a per-channel mailbox map.
+/// Shared state: the underlying [`Client`], a per-channel mailbox map,
+/// per-channel waiter notifiers, and a single-occupancy pump flag.
 /// All access goes through [`SharedClient`]'s `Arc<Mutex<Inner>>`.
 struct Inner {
     client: Client,
-    /// Keyed by *local* channel id (the value
+    /// Per-channel mailboxes, keyed by *local* channel id (the value
     /// [`crate::channel::ConnectionState::open`] returned when the
     /// channel was opened).
     queues: BTreeMap<u32, ChannelQueue>,
+    /// Wake-up notifier per channel. The pumper signals these whenever
+    /// it deposits data / EOF / close for the corresponding channel.
+    /// Get-or-create one via [`notifier_for`]. Removed by `Drop` when
+    /// a stream goes away, so the map size tracks live channels.
+    notifiers: BTreeMap<u32, Arc<Condvar>>,
+    /// True iff some thread is currently inside
+    /// [`OwnedChannelStream::pump_one_step`] for this connection.
+    /// Only one pumper at a time; everyone else either drains its
+    /// mailbox (returns immediately) or waits on its channel notifier.
+    pumping: bool,
 }
 
 /// Owned, clonable handle to a connected [`Client`] that supports
@@ -114,6 +163,8 @@ impl From<Client> for SharedClient {
             inner: Arc::new(Mutex::new(Inner {
                 client,
                 queues: BTreeMap::new(),
+                notifiers: BTreeMap::new(),
+                pumping: false,
             })),
         }
     }
@@ -126,7 +177,7 @@ impl SharedClient {
     /// supported and can coexist with shells / exec / forwards.
     pub fn sftp(&self) -> Result<SftpSession> {
         let local_id = {
-            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            let mut g = self.inner.lock().expect(POISONED);
             let id = open_session_under_lock(&mut g, "sftp")?;
             send_request_and_await(
                 &mut g,
@@ -175,7 +226,7 @@ impl SharedClient {
     /// coexist with SFTP / shell / forward handles on the same client.
     pub fn exec_stream(&self, command: &str) -> Result<OwnedChannelStream> {
         let local_id = {
-            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            let mut g = self.inner.lock().expect(POISONED);
             let id = open_session_under_lock(&mut g, "exec")?;
             send_request_and_await(
                 &mut g,
@@ -203,7 +254,7 @@ impl SharedClient {
     /// against your login shell instead.
     pub fn shell(&self, term: &str, cols: u32, rows: u32) -> Result<OwnedChannelStream> {
         let local_id = {
-            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            let mut g = self.inner.lock().expect(POISONED);
             let id = open_session_under_lock(&mut g, "shell")?;
             send_request_and_await(
                 &mut g,
@@ -242,7 +293,7 @@ impl SharedClient {
         orig_port: u16,
     ) -> Result<OwnedChannelStream> {
         let local_id = {
-            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            let mut g = self.inner.lock().expect(POISONED);
             open_direct_tcpip_under_lock(&mut g, dest_host, dest_port, orig_host, orig_port)?
         };
         Ok(OwnedChannelStream {
@@ -262,7 +313,7 @@ impl SharedClient {
     /// where state lives.
     #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
     pub(crate) fn with_client<R>(&self, f: impl FnOnce(&mut Client) -> R) -> R {
-        let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+        let mut g = self.inner.lock().expect(POISONED);
         f(&mut g.client)
     }
 }
@@ -293,7 +344,7 @@ fn open_session_under_lock(g: &mut Inner, what: &'static str) -> Result<u32> {
             ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                 return Err(Error::Protocol(open_failed_msg(what)));
             }
-            other => stash_event(&mut g.queues, other),
+            other => dispatch_event(&mut *g, other),
         }
     }
 
@@ -334,7 +385,7 @@ fn open_direct_tcpip_under_lock(
             ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                 return Err(Error::Protocol(open_failed_msg("direct-tcpip")));
             }
-            other => stash_event(&mut g.queues, other),
+            other => dispatch_event(&mut *g, other),
         }
     }
     g.queues.entry(local_id).or_default();
@@ -365,7 +416,7 @@ fn send_request_and_await(
             ChannelEvent::Failure { channel } if channel == local_id => {
                 return Err(Error::Protocol(reply_failed_msg(what)));
             }
-            other => stash_event(&mut g.queues, other),
+            other => dispatch_event(&mut *g, other),
         }
     }
 }
@@ -413,6 +464,36 @@ fn reply_failed_msg(what: &'static str) -> &'static str {
     }
 }
 
+/// Get-or-create the [`Condvar`] for `channel`. Returned as an `Arc` so
+/// the caller can hold a clone while releasing the [`Inner`] mutex
+/// inside [`Condvar::wait_timeout`].
+fn notifier_for(g: &mut Inner, channel: u32) -> Arc<Condvar> {
+    g.notifiers
+        .entry(channel)
+        .or_insert_with(|| Arc::new(Condvar::new()))
+        .clone()
+}
+
+/// File the inbound event into the right mailbox **and** wake any
+/// waiter sleeping on the target channel's notifier. The pump path and
+/// the under-lock open helpers both go through this so the CV
+/// notification can't be forgotten on one path and not the other.
+fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
+    let target = match &ev {
+        ChannelEvent::Data { channel, .. }
+        | ChannelEvent::ExtendedData { channel, .. }
+        | ChannelEvent::Eof { channel }
+        | ChannelEvent::Close { channel } => Some(*channel),
+        _ => None,
+    };
+    stash_event(&mut g.queues, ev);
+    if let Some(ch) = target {
+        if let Some(cv) = g.notifiers.get(&ch) {
+            cv.notify_all();
+        }
+    }
+}
+
 /// File the inbound `ChannelEvent` into the appropriate per-channel
 /// mailbox. Window-adjust events have already updated
 /// `ConnectionState`'s internal flow-control bookkeeping inside
@@ -420,6 +501,11 @@ fn reply_failed_msg(what: &'static str) -> &'static str {
 /// events on channels other than the one we're actively opening are
 /// dropped (we don't currently expose a global event API on the shared
 /// client).
+///
+/// Pure routing — does **not** notify any [`Condvar`]. Use
+/// [`dispatch_event`] from runtime paths; this helper is kept separate
+/// so it can be unit-tested without constructing an [`Inner`] (which
+/// requires a real [`Client`]).
 fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
     match ev {
         ChannelEvent::Data { channel, data } => {
@@ -466,54 +552,23 @@ impl OwnedChannelStream {
         n
     }
 
-    /// Pump one packet off the wire and dispatch its event. If the
-    /// event is `Close` for `my_channel` and `local_close_sent` is
-    /// still `false`, also emit our own CLOSE reply so the peer can
-    /// complete its tear-down (and flip the flag).
+    /// Pump exactly one packet off the wire under an already-held
+    /// [`Inner`] lock guard, decode it, and file the resulting event
+    /// into the right mailbox via [`dispatch_event`] (which also wakes
+    /// any waiter sleeping on that channel's notifier).
     ///
-    /// Implemented as an associated function rather than `&mut self`
-    /// because the borrow chain `self.shared.inner.lock()` already pins
-    /// `self` immutably for the duration of the lock, so a `&mut self`
-    /// pump call wouldn't typecheck. Caller passes the bits we need
-    /// (channel id by value, close flag by mut ref) explicitly.
-    fn pump_one(
-        g: &mut Inner,
-        my_channel: u32,
-        local_close_sent: &mut bool,
-    ) -> std::io::Result<()> {
+    /// Does **not** replenish the receive window — the drain path in
+    /// [`Read::read`] owns that, so the SSH per-channel window can
+    /// backpressure the peer if no one is reading.
+    ///
+    /// Does **not** auto-ack peer CLOSE. Local CLOSE is emitted from
+    /// [`OwnedChannelStream`]'s [`Drop`] only, which keeps the wire
+    /// emission rule trivially safe (one CLOSE per stream, period) and
+    /// avoids a double-close race between the pumper and Drop.
+    fn pump_one_step(g: &mut Inner) -> std::io::Result<()> {
         let payload = g.client.read_one_packet().map_err(io_err)?;
         let ev = g.client.conn.on_packet(&payload).map_err(io_err)?;
-        match ev {
-            ChannelEvent::Data { channel, data } => {
-                let n = data.len() as u32;
-                g.queues.entry(channel).or_default().data.extend(data);
-                if let Some(adj) = g.client.conn.replenish_window(channel, n).map_err(io_err)? {
-                    g.client.write_payload(&adj).map_err(io_err)?;
-                }
-            }
-            ChannelEvent::ExtendedData { channel, data, .. } => {
-                let n = data.len() as u32;
-                g.queues.entry(channel).or_default().stderr.extend(data);
-                if let Some(adj) = g.client.conn.replenish_window(channel, n).map_err(io_err)? {
-                    g.client.write_payload(&adj).map_err(io_err)?;
-                }
-            }
-            ChannelEvent::Eof { channel } => {
-                g.queues.entry(channel).or_default().remote_eof = true;
-            }
-            ChannelEvent::Close { channel } => {
-                let q = g.queues.entry(channel).or_default();
-                q.remote_eof = true;
-                q.remote_close = true;
-                // If it's our channel and we haven't already closed, ack now.
-                if channel == my_channel && !*local_close_sent {
-                    let p = g.client.conn.send_close(my_channel).map_err(io_err)?;
-                    g.client.write_payload(&p).map_err(io_err)?;
-                    *local_close_sent = true;
-                }
-            }
-            _ => {}
-        }
+        dispatch_event(g, ev);
         Ok(())
     }
 }
@@ -523,18 +578,14 @@ impl Read for OwnedChannelStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut g = self
-            .shared
-            .inner
-            .lock()
-            .expect("SharedClient mutex poisoned");
+        let mut g = self.shared.inner.lock().expect(POISONED);
         loop {
-            // 1. Look at our queue first.
+            // 1. Drain our mailbox if non-empty.
             let queue = g.queues.entry(self.channel).or_default();
             if !queue.data.is_empty() {
                 let n = Self::drain_into(queue, buf);
-                // Replenish window. Drop the borrow on queue first so we
-                // can re-borrow g.client mutably.
+                // Single point of receive-window credit: replenish only
+                // for what we just drained.
                 if let Some(adj) = g
                     .client
                     .conn
@@ -545,12 +596,32 @@ impl Read for OwnedChannelStream {
                 }
                 return Ok(n);
             }
-            // 2. EOF / closed?
+            // 2. EOF for our channel (with no buffered bytes) is the
+            //    standard zero-byte-read signal.
             if queue.remote_eof {
                 return Ok(0);
             }
-            // 3. Pump the wire.
-            Self::pump_one(&mut g, self.channel, &mut self.local_close_sent)?;
+            // 3. Become pumper or wait on our channel's notifier.
+            if !g.pumping {
+                g.pumping = true;
+                let res = Self::pump_one_step(&mut g);
+                g.pumping = false;
+                // Wake one waiter per registered channel. The pumper
+                // already notified the target channel's CV inside
+                // dispatch_event; this catches any waiter that was
+                // sleeping on a *different* channel and now has a chance
+                // to become the next pumper.
+                for cv in g.notifiers.values() {
+                    cv.notify_one();
+                }
+                res?;
+                // Loop: maybe we have data now, or we'll pump again.
+            } else {
+                let cv = notifier_for(&mut g, self.channel);
+                // Bounded wait so a missed notify (e.g. pumper panicked
+                // and unwound through the mutex guard) cannot strand us.
+                g = cv.wait_timeout(g, WAIT_TIMEOUT).expect(POISONED).0;
+            }
         }
     }
 }
@@ -560,18 +631,16 @@ impl Write for OwnedChannelStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut g = self
-            .shared
-            .inner
-            .lock()
-            .expect("SharedClient mutex poisoned");
+        let mut g = self.shared.inner.lock().expect(POISONED);
         loop {
             let (payload, taken) = g.client.conn.send_data(self.channel, buf).map_err(io_err)?;
             if taken > 0 {
                 g.client.write_payload(&payload).map_err(io_err)?;
                 return Ok(taken);
             }
-            // Window full — pump packets until the peer credits us.
+            // Zero credit: peer either closed us, or hasn't extended the
+            // send window yet. Check for close, otherwise become pumper
+            // (or wait for one) so a window-adjust can land.
             let queue = g.queues.entry(self.channel).or_default();
             if queue.remote_close {
                 return Err(std::io::Error::new(
@@ -579,7 +648,18 @@ impl Write for OwnedChannelStream {
                     "channel closed by peer mid-write",
                 ));
             }
-            Self::pump_one(&mut g, self.channel, &mut self.local_close_sent)?;
+            if !g.pumping {
+                g.pumping = true;
+                let res = Self::pump_one_step(&mut g);
+                g.pumping = false;
+                for cv in g.notifiers.values() {
+                    cv.notify_one();
+                }
+                res?;
+            } else {
+                let cv = notifier_for(&mut g, self.channel);
+                g = cv.wait_timeout(g, WAIT_TIMEOUT).expect(POISONED).0;
+            }
         }
     }
 
@@ -604,7 +684,11 @@ impl Drop for OwnedChannelStream {
             }
             self.local_close_sent = true;
         }
-        // Drain a few packets so the peer's matching CLOSE is acked.
+        // Drain a bounded number of packets so the peer's matching
+        // CLOSE is observed. Drop holds the mutex exclusively (Rust
+        // ownership guarantees no other thread holds an
+        // OwnedChannelStream-mediated lock right now), so we can pump
+        // without consulting the `pumping` flag.
         const MAX_DRAIN: usize = 128;
         for _ in 0..MAX_DRAIN {
             let already_closed = g
@@ -615,12 +699,13 @@ impl Drop for OwnedChannelStream {
             if already_closed {
                 break;
             }
-            if Self::pump_one(&mut g, self.channel, &mut self.local_close_sent).is_err() {
+            if Self::pump_one_step(&mut g).is_err() {
                 break;
             }
         }
-        // Reclaim mailbox space.
+        // Reclaim mailbox + notifier space.
         g.queues.remove(&self.channel);
+        g.notifiers.remove(&self.channel);
     }
 }
 
@@ -827,6 +912,30 @@ mod tests {
         stash_event(&mut queues, ChannelEvent::Close { channel: 3 });
         assert!(queues[&3].remote_eof);
         assert!(queues[&3].remote_close);
+    }
+
+    #[test]
+    fn notifier_map_round_trips_arc_identity() {
+        // notifier_for is a get-or-create helper; a second call for the
+        // same channel id must return a CV that's `Arc::ptr_eq` to the
+        // first, so a waiter cloned from one call wakes on a notify
+        // issued through the other.
+        let mut notifiers: BTreeMap<u32, Arc<Condvar>> = BTreeMap::new();
+        let cv1 = notifiers
+            .entry(7)
+            .or_insert_with(|| Arc::new(Condvar::new()))
+            .clone();
+        let cv2 = notifiers
+            .entry(7)
+            .or_insert_with(|| Arc::new(Condvar::new()))
+            .clone();
+        assert!(Arc::ptr_eq(&cv1, &cv2));
+        // Distinct channels get distinct CVs.
+        let cv3 = notifiers
+            .entry(9)
+            .or_insert_with(|| Arc::new(Condvar::new()))
+            .clone();
+        assert!(!Arc::ptr_eq(&cv1, &cv3));
     }
 
     #[test]

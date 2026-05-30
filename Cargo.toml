@@ -18,7 +18,7 @@ categories = ["cryptography", "network-programming"]
 autobins = false
 
 [features]
-default = ["std", "client", "server", "compress", "pam"]
+default = ["std", "client", "server", "compress", "pam", "multichannel"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -26,9 +26,17 @@ alloc = ["purecrypto/alloc"]
 client = ["std"]
 server = ["std"]
 compress = ["dep:compcol"]
-# C ABI surface. Requires `std` and the `client` module; produces additional
-# `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
-ffi = ["std", "client"]
+# Concurrent multi-channel client layer (SharedClient, OwnedChannelStream,
+# SftpSession). Enables several SFTP / exec / shell / direct-tcpip handles
+# to coexist on one connection with per-channel fairness (Condvar-based
+# pumper-or-wait) and per-channel backpressure (window credit deferred to
+# drain). Default on; turning it off keeps the borrow-based Client API and
+# strips ~600 lines of code from `src/shared.rs`.
+multichannel = ["client"]
+# C ABI surface. Requires `std`, the `client` module, and the multi-channel
+# layer (the FFI's PcSshSftp / PcSshAgent depend on `SharedClient`). Produces
+# additional `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
+ffi = ["std", "client", "multichannel"]
 # PAM session integration for the `sshd` binary. Default-on but opt-out:
 # building with `--no-default-features` (or `--features ...` without `pam`)
 # drops the libpam runtime dep entirely. The dep itself is also gated to

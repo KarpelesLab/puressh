@@ -47,7 +47,7 @@ pub mod stream;
 #[cfg(feature = "client")]
 pub mod client;
 
-#[cfg(feature = "client")]
+#[cfg(feature = "multichannel")]
 pub mod shared;
 
 #[cfg(feature = "server")]

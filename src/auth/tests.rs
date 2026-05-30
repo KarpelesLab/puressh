@@ -544,6 +544,71 @@ fn end_to_end_publickey_loopback() {
     assert!(matches!(done, ClientStep::Success));
 }
 
+struct AlwaysAccept;
+impl Authenticator for AlwaysAccept {
+    fn evaluate(&mut self, _attempt: AuthAttempt) -> AuthDecision {
+        AuthDecision::Accept
+    }
+}
+
+#[test]
+fn server_rejects_none_by_default_even_when_authenticator_accepts() {
+    // The default-on `none` gate must short-circuit `AuthAttempt::None`
+    // *before* the authenticator runs. An accept-everything backend used
+    // to be enough to let an unauthenticated client in — that footgun
+    // is the whole reason the gate exists.
+    let mut s = ServerAuth::new(TEST_SID.to_vec(), vec!["password"], Box::new(AlwaysAccept));
+    let _ = s
+        .on_packet(
+            &super::message::ServiceRequest {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let req = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::None,
+    }
+    .encode();
+    let step = s.on_packet(&req).unwrap();
+    match step {
+        ServerStep::Send(p) => {
+            UserauthFailure::decode(&p).unwrap();
+        }
+        _ => panic!("expected Send(failure), got something else"),
+    }
+}
+
+#[test]
+fn server_accepts_none_only_when_opted_in() {
+    // Same flow as above, but `allow_none(true)` lets the authenticator
+    // see the `None` attempt and answer `Accept`. This is the only path
+    // where `none` should ever succeed.
+    let mut s = ServerAuth::new(TEST_SID.to_vec(), vec!["password"], Box::new(AlwaysAccept));
+    s.allow_none(true);
+    let _ = s
+        .on_packet(
+            &super::message::ServiceRequest {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let req = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::None,
+    }
+    .encode();
+    let step = s.on_packet(&req).unwrap();
+    match step {
+        ServerStep::Authenticated { user, .. } => assert_eq!(user, "alice"),
+        _ => panic!("expected Authenticated"),
+    }
+}
+
 #[test]
 fn auth_attempt_password_debug_is_redacted() {
     let a = AuthAttempt::Password {

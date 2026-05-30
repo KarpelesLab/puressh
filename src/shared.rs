@@ -1,13 +1,16 @@
 //! Owned-handle wrapper around [`Client`] that supports **multiple
-//! concurrent channel sessions** on a single SSH connection.
+//! concurrent channel sessions of every type** on a single SSH
+//! connection — SFTP, exec, interactive shells, and direct-tcpip
+//! forwards all coexisting on the same transport.
 //!
-//! `Client::sftp`/`exec_stream`/`open_direct_tcpip` each return a stream
-//! that mutably borrows the [`Client`], so only one channel can be in
-//! flight at a time at the type-system level. That's fine for the
-//! command-line tools and the existing single-shot helpers, but the C
-//! ABI surface (and any user wrapping the lib in a long-lived service)
-//! needs to hold *multiple* SFTP sessions simultaneously over the same
-//! underlying transport.
+//! `Client::sftp` / `exec_stream` / `shell_with_stdin` /
+//! `open_direct_tcpip` each return a stream that mutably borrows the
+//! [`Client`], so only one channel can be in flight at a time at the
+//! type-system level. That's fine for the command-line tools and the
+//! single-shot helpers, but the C ABI surface (and any user wrapping
+//! the lib in a long-lived service) needs to hold *multiple* sessions
+//! simultaneously over the same underlying transport — possibly a mix
+//! of two SFTP sessions, a shell, and two port forwards on one client.
 //!
 //! [`SharedClient`] wraps the connected [`Client`] in `Arc<Mutex<...>>`
 //! and tags each open channel with a per-channel byte queue, so a stream
@@ -16,6 +19,20 @@
 //! adapter — it locks the mutex on every `read`/`write`, pumps the wire
 //! as needed, dispatches inbound packets to the right queue, and only
 //! returns to the caller once *its* channel has bytes.
+//!
+//! ## Surface
+//!
+//! - [`SharedClient::sftp`] — open an SFTP session (returns
+//!   [`SftpSession`]).
+//! - [`SharedClient::exec_stream`] — run a remote command, returning a
+//!   raw [`OwnedChannelStream`] over its stdin/stdout pair.
+//! - [`SharedClient::shell`] — open an interactive shell with a PTY,
+//!   returning an [`OwnedChannelStream`].
+//! - [`SharedClient::open_direct_tcpip`] — open a `direct-tcpip` channel
+//!   for a port-forward.
+//!
+//! All four return an owned handle that keeps the connection alive
+//! via an `Arc` clone. Any combination can be live at once.
 //!
 //! ## Concurrency model
 //!
@@ -105,89 +122,26 @@ impl From<Client> for SharedClient {
 impl SharedClient {
     /// Open a session channel, request the `sftp` subsystem, perform the
     /// SFTP `INIT`/`VERSION` handshake, and return an owned
-    /// [`SftpSession`]. Multiple sessions per `SharedClient` are
-    /// supported — each one rides on its own SSH channel.
+    /// [`SftpSession`]. Multiple SFTP sessions per `SharedClient` are
+    /// supported and can coexist with shells / exec / forwards.
     pub fn sftp(&self) -> Result<SftpSession> {
-        // Open the channel + send Subsystem(sftp). Hold the lock for
-        // the whole open flow so a second SharedClient::sftp() racing
-        // against us doesn't see a half-built channel.
         let local_id = {
             let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
-            let (local_id, open_payload) =
-                g.client.conn.open(ChannelOpen::Session).map_err(map_err)?;
-            g.client.write_payload(&open_payload).map_err(map_err)?;
-
-            // Drive the wire until our open is confirmed. Any other
-            // channels' events get queued.
-            let mut opened = false;
-            let mut iter_guard = 0usize;
-            while !opened {
-                iter_guard += 1;
-                if iter_guard > MAX_OPEN_ITER {
-                    return Err(Error::Protocol("sftp: open loop did not converge"));
-                }
-                let payload = g.client.read_one_packet().map_err(map_err)?;
-                let ev = g.client.conn.on_packet(&payload).map_err(map_err)?;
-                match ev {
-                    ChannelEvent::OpenConfirmed { channel } if channel == local_id => {
-                        opened = true;
-                    }
-                    ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
-                        return Err(Error::Protocol("sftp: channel open failed"));
-                    }
-                    other => stash_event(&mut g.queues, other),
-                }
-            }
-
-            g.client
-                .maybe_send_auth_agent_req(local_id)
-                .map_err(map_err)?;
-            g.client.maybe_send_x11_req(local_id).map_err(map_err)?;
-
-            let sub_req = g
-                .client
-                .conn
-                .send_request(
-                    local_id,
-                    ChannelRequest::Subsystem {
-                        name: "sftp".into(),
-                    },
-                    true,
-                )
-                .map_err(map_err)?;
-            g.client.write_payload(&sub_req).map_err(map_err)?;
-
-            // Drive the wire until the request is acknowledged. Same
-            // event-stash pattern.
-            let mut done = false;
-            let mut iter_guard = 0usize;
-            while !done {
-                iter_guard += 1;
-                if iter_guard > MAX_OPEN_ITER {
-                    return Err(Error::Protocol(
-                        "sftp: subsystem-reply loop did not converge",
-                    ));
-                }
-                let payload = g.client.read_one_packet().map_err(map_err)?;
-                let ev = g.client.conn.on_packet(&payload).map_err(map_err)?;
-                match ev {
-                    ChannelEvent::Success { channel } if channel == local_id => {
-                        done = true;
-                    }
-                    ChannelEvent::Failure { channel } if channel == local_id => {
-                        return Err(Error::Protocol("sftp: subsystem request denied"));
-                    }
-                    other => stash_event(&mut g.queues, other),
-                }
-            }
-
-            g.queues.entry(local_id).or_default();
-            local_id
+            let id = open_session_under_lock(&mut g, "sftp")?;
+            send_request_and_await(
+                &mut g,
+                id,
+                ChannelRequest::Subsystem {
+                    name: "sftp".into(),
+                },
+                "sftp: subsystem",
+            )?;
+            id
         };
 
-        // Lock dropped: now build the stream and run INIT/VERSION
-        // through it. Each transport call re-locks the inner Mutex,
-        // which is fine.
+        // Lock dropped: build the stream and run INIT/VERSION through
+        // it. Each transport call re-locks the inner Mutex, which is
+        // fine.
         let stream = OwnedChannelStream {
             shared: self.clone(),
             channel: local_id,
@@ -199,15 +153,103 @@ impl SharedClient {
                 inner: c,
             }),
             Err(e) => {
-                // Best-effort tear-down — the stream has been moved into
-                // SftpClient and dropped on the error path, so its Drop
-                // already attempted to send CHANNEL_CLOSE.
+                // The stream has been moved into SftpClient and dropped
+                // on the error path, so its Drop already attempted to
+                // send CHANNEL_CLOSE.
                 Err(Error::Protocol(match e {
                     SftpError::Protocol(s) => s,
                     _ => "sftp: handshake failed",
                 }))
             }
         }
+    }
+
+    /// Open a session channel and ask the server to execute `command`,
+    /// returning an owned [`OwnedChannelStream`] over the channel's
+    /// stdin/stdout pair. Stderr lands in the channel's stderr mailbox
+    /// (currently not exposed on the owned stream — exec callers should
+    /// rely on stdout-only output for now; full stderr accessors land in
+    /// a follow-up).
+    ///
+    /// Multiple concurrent exec streams are supported, and they can
+    /// coexist with SFTP / shell / forward handles on the same client.
+    pub fn exec_stream(&self, command: &str) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            let id = open_session_under_lock(&mut g, "exec")?;
+            send_request_and_await(
+                &mut g,
+                id,
+                ChannelRequest::Exec {
+                    command: command.into(),
+                },
+                "exec: command",
+            )?;
+            id
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+        })
+    }
+
+    /// Open a session channel, request a PTY, and start a remote shell.
+    /// Returns an owned [`OwnedChannelStream`] over the shell's
+    /// stdin/stdout pair.
+    ///
+    /// `term` / `cols` / `rows` follow the PTY-req convention from
+    /// RFC 4254 §6.2. For a non-PTY shell, issue `exec_stream("")`
+    /// against your login shell instead.
+    pub fn shell(&self, term: &str, cols: u32, rows: u32) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            let id = open_session_under_lock(&mut g, "shell")?;
+            send_request_and_await(
+                &mut g,
+                id,
+                ChannelRequest::PtyReq {
+                    term: term.into(),
+                    cols,
+                    rows,
+                    px_w: 0,
+                    px_h: 0,
+                    modes: Vec::new(),
+                },
+                "shell: pty-req",
+            )?;
+            send_request_and_await(&mut g, id, ChannelRequest::Shell, "shell: shell-req")?;
+            id
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+        })
+    }
+
+    /// Open a `direct-tcpip` channel (RFC 4254 §7.2) — the server
+    /// connects to `dest_host:dest_port` and proxies bytes across the
+    /// returned stream. `orig_host` / `orig_port` are informational.
+    ///
+    /// Multiple concurrent forwards are supported and can coexist with
+    /// SFTP / shell / exec handles.
+    pub fn open_direct_tcpip(
+        &self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
+            open_direct_tcpip_under_lock(&mut g, dest_host, dest_port, orig_host, orig_port)?
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+        })
     }
 
     /// Lock the inner client for one synchronous operation. Internal helper
@@ -218,10 +260,156 @@ impl SharedClient {
     /// they should call methods on [`SharedClient`] or [`SftpSession`].
     /// The C ABI is the asymmetric case where the wrapped `Client` is
     /// where state lives.
-    #[allow(dead_code)] // wired up by Phase 2 (FFI client migration)
+    #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
     pub(crate) fn with_client<R>(&self, f: impl FnOnce(&mut Client) -> R) -> R {
         let mut g = self.inner.lock().expect("SharedClient mutex poisoned");
         f(&mut g.client)
+    }
+}
+
+/// Open a session channel under an already-held lock guard. Returns the
+/// new local channel id with its mailbox slot initialised; the caller is
+/// responsible for sending whatever subsystem / exec / shell request it
+/// needs next (still under the same lock).
+///
+/// `what` is a short tag used in error messages.
+fn open_session_under_lock(g: &mut Inner, what: &'static str) -> Result<u32> {
+    let (local_id, open_payload) = g.client.conn.open(ChannelOpen::Session)?;
+    g.client.write_payload(&open_payload)?;
+
+    let mut opened = false;
+    let mut iter_guard = 0usize;
+    while !opened {
+        iter_guard += 1;
+        if iter_guard > MAX_OPEN_ITER {
+            return Err(Error::Protocol(open_loop_msg(what)));
+        }
+        let payload = g.client.read_one_packet()?;
+        let ev = g.client.conn.on_packet(&payload)?;
+        match ev {
+            ChannelEvent::OpenConfirmed { channel } if channel == local_id => {
+                opened = true;
+            }
+            ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                return Err(Error::Protocol(open_failed_msg(what)));
+            }
+            other => stash_event(&mut g.queues, other),
+        }
+    }
+
+    g.client.maybe_send_auth_agent_req(local_id)?;
+    g.client.maybe_send_x11_req(local_id)?;
+    g.queues.entry(local_id).or_default();
+    Ok(local_id)
+}
+
+/// Open a `direct-tcpip` channel under an already-held lock guard.
+/// Direct-tcpip channels don't take a follow-on request — once the open
+/// is confirmed, the channel is ready for raw byte I/O.
+fn open_direct_tcpip_under_lock(
+    g: &mut Inner,
+    dest_host: &str,
+    dest_port: u16,
+    orig_host: &str,
+    orig_port: u16,
+) -> Result<u32> {
+    let (local_id, open_payload) = g.client.conn.open(ChannelOpen::DirectTcpip {
+        dest_host: dest_host.to_string(),
+        dest_port: dest_port as u32,
+        orig_host: orig_host.to_string(),
+        orig_port: orig_port as u32,
+    })?;
+    g.client.write_payload(&open_payload)?;
+
+    let mut iter_guard = 0usize;
+    loop {
+        iter_guard += 1;
+        if iter_guard > MAX_OPEN_ITER {
+            return Err(Error::Protocol(open_loop_msg("direct-tcpip")));
+        }
+        let payload = g.client.read_one_packet()?;
+        let ev = g.client.conn.on_packet(&payload)?;
+        match ev {
+            ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
+            ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                return Err(Error::Protocol(open_failed_msg("direct-tcpip")));
+            }
+            other => stash_event(&mut g.queues, other),
+        }
+    }
+    g.queues.entry(local_id).or_default();
+    Ok(local_id)
+}
+
+/// Send a channel request and drain inbound packets until the matching
+/// Success / Failure lands. Other channels' events are stashed.
+fn send_request_and_await(
+    g: &mut Inner,
+    local_id: u32,
+    req: ChannelRequest,
+    what: &'static str,
+) -> Result<()> {
+    let payload = g.client.conn.send_request(local_id, req, true)?;
+    g.client.write_payload(&payload)?;
+
+    let mut iter_guard = 0usize;
+    loop {
+        iter_guard += 1;
+        if iter_guard > MAX_OPEN_ITER {
+            return Err(Error::Protocol(reply_loop_msg(what)));
+        }
+        let payload = g.client.read_one_packet()?;
+        let ev = g.client.conn.on_packet(&payload)?;
+        match ev {
+            ChannelEvent::Success { channel } if channel == local_id => return Ok(()),
+            ChannelEvent::Failure { channel } if channel == local_id => {
+                return Err(Error::Protocol(reply_failed_msg(what)));
+            }
+            other => stash_event(&mut g.queues, other),
+        }
+    }
+}
+
+/// Produce a `&'static str` for an open-loop divergence message. Hard-codes
+/// the known short tags so we don't have to allocate or use `format!` in
+/// an error path that returns `Error::Protocol(&'static str)`.
+fn open_loop_msg(what: &'static str) -> &'static str {
+    match what {
+        "sftp" => "sftp: open loop did not converge",
+        "exec" => "exec: open loop did not converge",
+        "shell" => "shell: open loop did not converge",
+        "direct-tcpip" => "direct-tcpip: open loop did not converge",
+        _ => "channel: open loop did not converge",
+    }
+}
+
+fn open_failed_msg(what: &'static str) -> &'static str {
+    match what {
+        "sftp" => "sftp: channel open failed",
+        "exec" => "exec: channel open failed",
+        "shell" => "shell: channel open failed",
+        "direct-tcpip" => "direct-tcpip: open failed",
+        _ => "channel: open failed",
+    }
+}
+
+fn reply_loop_msg(what: &'static str) -> &'static str {
+    match what {
+        "sftp: subsystem" => "sftp: subsystem-reply loop did not converge",
+        "exec: command" => "exec: command-reply loop did not converge",
+        "shell: pty-req" => "shell: pty-req-reply loop did not converge",
+        "shell: shell-req" => "shell: shell-req-reply loop did not converge",
+        _ => "channel: request-reply loop did not converge",
+    }
+}
+
+fn reply_failed_msg(what: &'static str) -> &'static str {
+    match what {
+        "sftp: subsystem" => "sftp: subsystem request denied",
+        "exec: command" => "exec: command request denied",
+        "shell: pty-req" => "shell: pty-req denied",
+        "shell: shell-req" => "shell: shell-req denied",
+        _ => "channel: request denied",
     }
 }
 
@@ -250,13 +438,6 @@ fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
         }
         _ => {}
     }
-}
-
-/// Map a [`crate::error::Error`] through unchanged. Helper for the
-/// `map_err` calls inside [`SharedClient::sftp`] — Rust can't otherwise
-/// infer the closure type without a hint.
-fn map_err(e: Error) -> Error {
-    e
 }
 
 /// Read+Write adapter wrapping a single open channel on a

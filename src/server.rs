@@ -3452,11 +3452,15 @@ mod tests {
 
     /// SubsystemHandler wrapping an `SftpServerSession` so the loopback
     /// SFTP test can drive the in-process server over a real SSH channel.
+    /// Only used by the Unix-only `loopback_sftp_client_roundtrip` test
+    /// below — gated to silence dead-code warnings on Windows.
+    #[cfg(unix)]
     struct SftpSubsystem {
         cwd: std::path::PathBuf,
         root: std::path::PathBuf,
     }
 
+    #[cfg(unix)]
     impl SubsystemHandler for SftpSubsystem {
         fn handle(
             &self,
@@ -3480,9 +3484,12 @@ mod tests {
 
     /// pid + nanosecond timestamp gives a unique directory across parallel
     /// `cargo test` workers without pulling in a tempfile dep — mirrors the
-    /// pattern in `src/sftp/tests.rs`.
+    /// pattern in `src/sftp/tests.rs`. Only used by the Unix-only test
+    /// below; gated to silence dead-code warnings on Windows.
+    #[cfg(unix)]
     struct SftpTempDir(std::path::PathBuf);
 
+    #[cfg(unix)]
     impl SftpTempDir {
         fn new(tag: &str) -> Self {
             let dir = std::env::temp_dir().join(format!(
@@ -3501,12 +3508,21 @@ mod tests {
             &self.0
         }
     }
+    #[cfg(unix)]
     impl Drop for SftpTempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
+    // Gated to Unix: the test compares native filesystem paths to
+    // SFTP-protocol paths byte-for-byte (e.g. `realpath(".")` vs
+    // `root.as_os_str().as_encoded_bytes()`), and the server's
+    // `lexically_clean` deliberately strips Windows path prefixes and roots
+    // them at `/`. On Windows the roundtrip is therefore lossy by design —
+    // SFTP semantics over a non-POSIX filesystem aren't a target use case
+    // for this end-to-end test.
+    #[cfg(unix)]
     #[test]
     fn loopback_sftp_client_roundtrip() {
         // End-to-end: Client::sftp() opens a channel, requests subsystem

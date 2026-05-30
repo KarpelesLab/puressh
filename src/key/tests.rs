@@ -511,6 +511,29 @@ fn wire_blob_ed25519_matches_known_layout() {
 }
 
 #[test]
+fn empty_passphrase_on_encrypted_key_is_rejected_loudly() {
+    // Round-tripping with a real passphrase and then trying to decrypt with
+    // Some(b"") must fail with the same "passphrase required" error as None,
+    // not with a wrong-passphrase / format error after bcrypt churn.
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "empty-pass@test".to_string());
+    let pem = sk.to_openssh_pem(Some(b"actual-secret")).unwrap();
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"")).expect_err("empty passphrase");
+    match err {
+        Error::Crypto(msg) => assert!(
+            msg.contains("passphrase"),
+            "expected 'passphrase required', got {msg:?}"
+        ),
+        other => panic!("expected Crypto(passphrase required), got {other:?}"),
+    }
+    let err2 = PrivateKey::parse_openssh_pem(&pem, None).expect_err("None passphrase");
+    match err2 {
+        Error::Crypto(msg) => assert!(msg.contains("passphrase"), "{msg}"),
+        other => panic!("expected Crypto for None, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_wire_blob_rejects_off_curve_ecdsa_p256() {
     // Build an otherwise well-formed ecdsa-sha2-nistp256 public blob whose
     // SEC1 point is the right shape (0x04 || 32-byte X || 32-byte Y) but

@@ -620,7 +620,18 @@ fn decrypt_payload(
         return Ok(encrypted.to_vec());
     }
 
-    let pass = passphrase.ok_or(Error::Crypto("passphrase required"))?;
+    // Treat an empty passphrase as "no passphrase". Callers occasionally
+    // wire Some(b"") through (e.g. a CLI prompt where the user pressed
+    // Enter on an encrypted key, or a config that left the field blank),
+    // and accepting it would attempt to derive a key against the empty
+    // string — which silently succeeds at the bcrypt step and produces a
+    // garbage AES key, surfacing only at the post-decrypt magic check
+    // with the same generic error as a real wrong passphrase. Fail loud
+    // and early with the same error as None.
+    let pass = match passphrase {
+        Some(p) if !p.is_empty() => p,
+        _ => return Err(Error::Crypto("passphrase required")),
+    };
 
     let (key_len, iv_len) = match ciphername {
         b"aes256-ctr" => (32usize, 16usize),

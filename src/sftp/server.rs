@@ -850,6 +850,7 @@ fn apply_attrs(
     }
     #[cfg(unix)]
     {
+        use nix::sys::stat::{fchmodat, FchmodatFlags, Mode};
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
         if let Some(mode) = a.permissions {
@@ -866,18 +867,41 @@ fn apply_attrs(
                 match opt.open(path) {
                     Ok(f) => f.set_permissions(fs::Permissions::from_mode(masked))?,
                     Err(e) => {
-                        // Directories can't always be opened O_RDONLY;
-                        // verify with symlink_metadata that the target
-                        // isn't a symlink and then chmod by path.
-                        let _ = map_open_err(e);
-                        let md = fs::symlink_metadata(path)?;
-                        if md.file_type().is_symlink() {
-                            return Err(SftpError::status_msg(
-                                FxpStatus::NoSuchFile,
-                                "symlink rejected",
-                            ));
+                        // ELOOP from O_NOFOLLOW means the final component
+                        // is a symlink — reject before we try anything
+                        // else. `map_open_err` turns ELOOP into
+                        // `FxpStatus::NoSuchFile` so a probe can't
+                        // distinguish "absent" from "symlinked".
+                        let code = e.raw_os_error();
+                        if matches!(code, Some(40) | Some(62)) {
+                            return Err(map_open_err(e));
                         }
-                        fs::set_permissions(path, fs::Permissions::from_mode(masked))?;
+                        // Otherwise: directories can't always be opened
+                        // O_RDONLY. Fall back to `fchmodat(AT_SYMLINK_NOFOLLOW)`,
+                        // which atomically refuses to follow a symlink at
+                        // the final component. The old code did
+                        // `symlink_metadata` then `set_permissions(path,...)`,
+                        // which is racy — an attacker who swapped in a
+                        // symlink between the two syscalls would retarget
+                        // the chmod onto the symlink's victim. fchmodat
+                        // collapses both into a single atomic check.
+                        let mode_bits = Mode::from_bits_truncate(masked as nix::libc::mode_t);
+                        fchmodat(
+                            nix::fcntl::AT_FDCWD,
+                            path,
+                            mode_bits,
+                            FchmodatFlags::NoFollowSymlink,
+                        )
+                        .map_err(|e| match e {
+                            // ELOOP, or EOPNOTSUPP on Linux where chmod
+                            // on a symlink is unsupported: treat as a
+                            // rejected symlink (same NoSuchFile mapping
+                            // as map_open_err).
+                            nix::errno::Errno::ELOOP | nix::errno::Errno::EOPNOTSUPP => {
+                                SftpError::status_msg(FxpStatus::NoSuchFile, "symlink rejected")
+                            }
+                            other => SftpError::Io(io::Error::from_raw_os_error(other as i32)),
+                        })?;
                     }
                 }
             } else {

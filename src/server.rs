@@ -3958,7 +3958,10 @@ mod tests {
             }),
         )
         .with_direct_tcpip(Arc::new(
-            crate::forwarding::direct::DefaultDirectTcpipHandler::new(),
+            // Test wants the bytes to round-trip; ::new() is default-deny
+            // post-2026-05, so call ::permit_all() to restore the pre-fix
+            // behaviour for the splice path.
+            crate::forwarding::direct::DefaultDirectTcpipHandler::permit_all(),
         ));
 
         let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
@@ -4396,7 +4399,10 @@ mod tests {
             }),
         )
         .with_direct_tcpip(Arc::new(
-            crate::forwarding::direct::DefaultDirectTcpipHandler::new(),
+            // Test wants the bytes to round-trip; ::new() is default-deny
+            // post-2026-05, so call ::permit_all() to restore the pre-fix
+            // behaviour for the splice path.
+            crate::forwarding::direct::DefaultDirectTcpipHandler::permit_all(),
         ));
 
         let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");

@@ -22,26 +22,63 @@ use crate::server::{ChannelEgress, ChannelStream, DirectTcpipHandler, DirectTcpi
 /// Filter callback type for [`DefaultDirectTcpipHandler::with_allow_list`].
 type AllowFilter = Box<dyn Fn(&str, u16) -> bool + Send + Sync>;
 
+/// Internal policy describing which destinations the handler will dial.
+///
+/// `Deny` is the default-constructed state — every request is refused
+/// (silently closed) until the operator opts into something looser via
+/// [`DefaultDirectTcpipHandler::permit_all`] or
+/// [`DefaultDirectTcpipHandler::with_allow_list`].
+enum Policy {
+    /// Refuse every destination. Returned by [`DefaultDirectTcpipHandler::new`]
+    /// to make a multi-tenant deployment safe by default.
+    Deny,
+    /// Allow every destination. Restores the historical OpenSSH-style
+    /// permit-everything behaviour for callers who genuinely want it.
+    All,
+    /// Allow only destinations for which the filter returns `true`.
+    Filter(AllowFilter),
+}
+
 /// Drop-in [`DirectTcpipHandler`] that connects to the requested
 /// `dest_host:dest_port` and proxies bytes.
 ///
-/// Apply an optional **allow-list** to refuse forwards the operator doesn't
-/// want (e.g. only permitting localhost):
+/// # Default-deny
+///
+/// A bare [`DefaultDirectTcpipHandler::new`] is **default-deny**: every
+/// `direct-tcpip` request is silently refused. This is the safe default for
+/// multi-tenant servers, where an unrestricted handler lets any
+/// authenticated user pivot to host-local services (databases bound to
+/// `127.0.0.1`, the AWS/GCP instance metadata service at
+/// `169.254.169.254`, IPC sockets reachable over loopback, etc.) via
+/// `ssh -L`.
+///
+/// Operators must explicitly choose one of:
+///
+/// - [`Self::with_allow_list`] to permit a specific set of destinations.
+/// - [`Self::permit_all`] to restore the old "allow everything" behaviour.
 ///
 /// ```ignore
 /// use std::sync::Arc;
 /// use puressh::forwarding::direct::DefaultDirectTcpipHandler;
 ///
+/// // Allow only the Postgres on loopback.
 /// let h = Arc::new(
 ///     DefaultDirectTcpipHandler::new()
 ///         .with_allow_list(|host, port| host == "127.0.0.1" && port == 5432),
 /// );
 /// ```
 ///
-/// Without a filter every request is allowed — matching the historical
-/// OpenSSH default before `PermitOpen` arrived.
+/// # Hardening an allow-list
+///
+/// When you build an allow-list it's worth explicitly *blocking* the
+/// destinations that an attacker is most likely to chase: loopback
+/// (`127.0.0.1`, `::1`), IPv4-mapped IPv6 forms of those (`::ffff:127.0.0.1`),
+/// and the link-local instance-metadata service (`169.254.169.254`). The
+/// handler doesn't impose this for you — many legitimate deployments need
+/// loopback forwards — but if your allow-list is just a port whitelist on a
+/// hostname pattern you should add the negative checks yourself.
 pub struct DefaultDirectTcpipHandler {
-    allow: Option<AllowFilter>,
+    policy: Policy,
     connect_timeout: Option<Duration>,
 }
 
@@ -52,10 +89,32 @@ impl Default for DefaultDirectTcpipHandler {
 }
 
 impl DefaultDirectTcpipHandler {
-    /// Allow every destination (callers should usually attach a filter).
+    /// Build a **default-deny** handler: every request is silently refused
+    /// until the caller opts into a looser policy via
+    /// [`Self::with_allow_list`] or [`Self::permit_all`].
+    ///
+    /// Historically (before 2026-05) `::new()` returned an allow-everything
+    /// handler. That default was a silent multi-tenant footgun, so the
+    /// constructor was flipped to default-deny. If you genuinely want the
+    /// old behaviour, call [`Self::permit_all`] explicitly.
     pub fn new() -> Self {
         Self {
-            allow: None,
+            policy: Policy::Deny,
+            connect_timeout: Some(Duration::from_secs(10)),
+        }
+    }
+
+    /// Restore the historical "allow every destination" behaviour. Equivalent
+    /// to the pre-2026-05 `::new()` default.
+    ///
+    /// Only use this on single-tenant servers (one trusted operator with
+    /// shell access) — on a multi-tenant box this lets any authenticated
+    /// user pivot to loopback-only services. Prefer [`Self::with_allow_list`]
+    /// in any deployment where the SSH users aren't the same trust principal
+    /// as the host's root.
+    pub fn permit_all() -> Self {
+        Self {
+            policy: Policy::All,
             connect_timeout: Some(Duration::from_secs(10)),
         }
     }
@@ -73,7 +132,7 @@ impl DefaultDirectTcpipHandler {
     where
         F: Fn(&str, u16) -> bool + Send + Sync + 'static,
     {
-        self.allow = Some(Box::new(filter));
+        self.policy = Policy::Filter(Box::new(filter));
         self
     }
 
@@ -84,9 +143,10 @@ impl DefaultDirectTcpipHandler {
     }
 
     fn allowed(&self, host: &str, port: u16) -> bool {
-        match &self.allow {
-            Some(f) => f(host, port),
-            None => true,
+        match &self.policy {
+            Policy::Deny => false,
+            Policy::All => true,
+            Policy::Filter(f) => f(host, port),
         }
     }
 }
@@ -274,7 +334,10 @@ mod tests {
         let host = addr.ip().to_string();
         let port = addr.port();
         let handler = thread::spawn(move || {
-            let h = DefaultDirectTcpipHandler::new();
+            // Pre-2026-05 default; the round-trip test exercises the
+            // splice path, which only fires when the destination is
+            // permitted, so use the explicit "old default" constructor.
+            let h = DefaultDirectTcpipHandler::permit_all();
             let req = DirectTcpipRequest {
                 dest_host: &host,
                 dest_port: port as u32,
@@ -329,7 +392,7 @@ mod tests {
         let (_ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
         let (egress_tx, _egress_rx) = mpsc::sync_channel::<ChannelEgress>(8);
         let stream = ChannelStream::new(ingress_rx, egress_tx);
-        let h = DefaultDirectTcpipHandler::new();
+        let h = DefaultDirectTcpipHandler::permit_all();
         let req = DirectTcpipRequest {
             dest_host: "127.0.0.1",
             dest_port: 70_000,
@@ -337,6 +400,27 @@ mod tests {
             orig_port: 0,
         };
         // Should return Ok and drop `stream`, which triggers auto-EOF/Close.
+        h.handle("u", req, stream).expect("handle");
+    }
+
+    /// `::new()` is default-deny: every request is refused without ever
+    /// attempting a TCP connection. Regression test for the silent-permit
+    /// footgun that used to live here.
+    #[test]
+    fn default_constructor_is_deny_all() {
+        let (_ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+        let (egress_tx, _egress_rx) = mpsc::sync_channel::<ChannelEgress>(8);
+        let stream = ChannelStream::new(ingress_rx, egress_tx);
+        let h = DefaultDirectTcpipHandler::new();
+        // 127.0.0.1:1 is the canonical "should never answer" target; if
+        // the default-deny path is broken we'd hit a connect attempt
+        // here. With the fix, the handler short-circuits on policy.
+        let req = DirectTcpipRequest {
+            dest_host: "127.0.0.1",
+            dest_port: 1,
+            orig_host: "client",
+            orig_port: 0,
+        };
         h.handle("u", req, stream).expect("handle");
     }
 

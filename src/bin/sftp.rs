@@ -36,13 +36,14 @@ use puressh::sftp::{
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, load_identity, read_password_from_stdin,
-    resolve_user, StrictMode,
+    build_host_key_policy, connect_agent_credentials, default_identity_paths, load_identity,
+    read_password_from_stdin, resolve_user, set_verbose, try_load_default_identity, vlog,
+    StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: sftp [-P port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: sftp [-v[v[v]]] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] [user@]host";
@@ -55,6 +56,9 @@ struct Cli {
     known_hosts_path: Option<PathBuf>,
     hash_known_hosts: bool,
     identities_only: bool,
+    /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
+    /// See [`common::set_verbose`].
+    verbose: u8,
     host: String,
     user_in_host: Option<String>,
 }
@@ -67,6 +71,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut known_hosts_path: Option<PathBuf> = None;
     let mut hash_known_hosts = false;
     let mut identities_only = false;
+    let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -123,6 +128,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     }
                 }
             }
+            "-v" => {
+                verbose = verbose.saturating_add(1).min(3);
+            }
+            "-vv" => {
+                verbose = verbose.max(2);
+            }
+            "-vvv" => {
+                verbose = 3;
+            }
             s if s.starts_with('-') => {
                 return Err(format!("unknown flag: {s}"));
             }
@@ -151,6 +165,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         known_hosts_path,
         hash_known_hosts,
         identities_only,
+        verbose,
         host,
         user_in_host,
     })
@@ -483,6 +498,7 @@ fn run() -> Result<i32, String> {
     }
 
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    set_verbose(cli.verbose);
     let user = resolve_user(cli.cli_user.as_deref(), cli.user_in_host.as_deref())?;
 
     let policy = build_host_key_policy(
@@ -494,18 +510,26 @@ fn run() -> Result<i32, String> {
         host_key_policy: policy,
         timeout: None,
     };
+    vlog(1, &format!("connecting to {}:{}", cli.host, cli.port));
     // Use connect_to_host so KnownHosts can look the host up by its
     // user-supplied name (HostKeyPolicy::KnownHosts now fails hard if
     // the host name is missing, since silently degrading to AcceptAny
     // would defeat the whole point of the check).
     let mut client = Client::connect_to_host(cli.host.as_str(), cli.port, cfg)
         .map_err(|e| format!("connect: {e}"))?;
+    vlog(1, &format!("connected to {}:{}", cli.host, cli.port));
 
     // Collect publickey credentials (agent first unless IdentitiesOnly=yes).
     let mut credentials: Vec<ClientCredential> = Vec::new();
     if !cli.identities_only {
         match connect_agent_credentials() {
-            Ok(mut from_agent) => credentials.append(&mut from_agent),
+            Ok(mut from_agent) => {
+                vlog(
+                    1,
+                    &format!("agent: offered {} identities", from_agent.len()),
+                );
+                credentials.append(&mut from_agent);
+            }
             Err(e) => eprintln!("warning: agent: {e}"),
         }
     }
@@ -518,14 +542,50 @@ fn run() -> Result<i32, String> {
             }
         };
         match pk.into_host_key() {
-            Ok(hk) => credentials.push(ClientCredential::PublicKey(hk)),
+            Ok(hk) => {
+                vlog(1, &format!("identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
             Err(e) => eprintln!("warning: identity {id_path}: {e}"),
+        }
+    }
+    // OpenSSH-style default identities: tried after agent + explicit -i,
+    // suppressed entirely by IdentitiesOnly=yes (which also disables the
+    // agent above).
+    if !cli.identities_only {
+        for path in default_identity_paths() {
+            match try_load_default_identity(&path) {
+                Ok(Some(pk)) => match pk.into_host_key() {
+                    Ok(hk) => {
+                        vlog(1, &format!("default identity {}: loaded", path.display()));
+                        credentials.push(ClientCredential::PublicKey(hk));
+                    }
+                    Err(e) => {
+                        eprintln!("warning: default identity {}: {e}", path.display());
+                    }
+                },
+                Ok(None) => {
+                    vlog(2, &format!("default identity {}: skipped", path.display()));
+                }
+                Err(msg) => eprintln!("warning: {msg}"),
+            }
         }
     }
 
     let authed = if !credentials.is_empty() {
+        vlog(
+            1,
+            &format!(
+                "trying publickey auth as {} ({} credentials)",
+                user,
+                credentials.len()
+            ),
+        );
         match client.authenticate(&user, credentials) {
-            Ok(()) => true,
+            Ok(()) => {
+                vlog(1, &format!("authenticated as {user} via publickey"));
+                true
+            }
             Err(e) => {
                 eprintln!("publickey auth: {e}");
                 false
@@ -535,10 +595,12 @@ fn run() -> Result<i32, String> {
         false
     };
     if !authed {
+        vlog(1, &format!("trying password auth as {user}"));
         let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
         client
             .authenticate_password(&user, &password)
             .map_err(|e| format!("Auth failed: {e}"))?;
+        vlog(1, &format!("authenticated as {user} via password"));
     }
 
     // The interactive sftp shell is single-channel by design; the

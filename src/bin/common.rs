@@ -24,8 +24,9 @@
 
 #![allow(dead_code)]
 
+use core::sync::atomic::{AtomicU8, Ordering};
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[cfg(unix)]
@@ -34,6 +35,7 @@ use puressh::auth::ClientCredential;
 use puressh::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
+use puressh::Error;
 use zeroize::Zeroizing;
 
 /// Maps `StrictHostKeyChecking` modes to TOFU behaviour. Mirrors the
@@ -417,4 +419,96 @@ pub fn build_host_key_policy(
         on_unknown,
         on_mismatch,
     }))
+}
+
+/// Binary-local verbosity level (`-v` / `-vv` / `-vvv`). One copy per
+/// binary because `common.rs` is `#[path]`-included rather than shared
+/// as a crate — that's fine, since each binary's process only ever sees
+/// its own.
+///
+/// Levels: 0 = silent (default), 1..=3 = OpenSSH-style debug1/2/3. Held
+/// in an atomic so [`vlog`] callers don't need to thread a handle
+/// through every helper (which would noisify every signature for a
+/// debug aid).
+static VERBOSE: AtomicU8 = AtomicU8::new(0);
+
+/// Bump the binary-local verbosity to `level`, clamped to `0..=3`.
+/// Idempotent; call once after `parse_args` returns.
+pub fn set_verbose(level: u8) {
+    VERBOSE.store(level.min(3), Ordering::Relaxed);
+}
+
+/// Current verbose level (0..=3). Cheap; safe to call on the hot path.
+pub fn verbose_level() -> u8 {
+    VERBOSE.load(Ordering::Relaxed)
+}
+
+/// Emit `"debug{level}: {msg}"` to stderr iff the current verbose
+/// level is at least `level`. Mirrors OpenSSH's `debug1:` /
+/// `debug2:` / `debug3:` prefix convention so users porting muscle
+/// memory get the same shape of output.
+///
+/// `level` is clamped to `1..=3`; passing 0 means "always print" but
+/// callers should just `eprintln!` directly in that case.
+pub fn vlog(level: u8, msg: &str) {
+    let level = level.clamp(1, 3);
+    if VERBOSE.load(Ordering::Relaxed) >= level {
+        eprintln!("debug{level}: {msg}");
+    }
+}
+
+/// OpenSSH-style default identity paths under `$HOME/.ssh/`, in
+/// preference order. Returns an empty vector when `$HOME` is unset
+/// (no defaults to try, no error — callers fall back to the password
+/// flow).
+///
+/// We deliberately omit:
+///   - `id_dsa` — DSA is removed from modern OpenSSH defaults; our
+///     key parser doesn't accept it.
+///   - `id_ecdsa_sk`, `id_ed25519_sk` — FIDO/U2F security-key keys
+///     need a hardware-token handshake (`sk-*` algorithms) that
+///     puressh doesn't implement yet.
+///
+/// The returned paths are absolute and may not exist on disk; pair
+/// each with [`try_load_default_identity`] which silently treats a
+/// missing file as "skip".
+pub fn default_identity_paths() -> Vec<PathBuf> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let dot_ssh = PathBuf::from(home).join(".ssh");
+    ["id_ed25519", "id_ecdsa", "id_rsa"]
+        .iter()
+        .map(|name| dot_ssh.join(name))
+        .collect()
+}
+
+/// Load a default-discovery identity *silently*.
+///
+/// Returns:
+///   - `Ok(None)` when the file is missing — that's the common case
+///     for any default path the user doesn't actually have.
+///   - `Ok(None)` when the file exists but is passphrase-protected
+///     and we have no passphrase. OpenSSH prompts; for now we skip,
+///     matching the explicit-`-i` policy in [`load_identity`] which
+///     also refuses passphrase-protected keys. Distinguishes
+///     "encrypted, no key material" from "broken file" via the
+///     `Error::Crypto("passphrase required")` sentinel produced by
+///     `PrivateKey::parse_openssh_pem`.
+///   - `Ok(Some(_))` when the key parsed.
+///   - `Err(_)` when the file exists but is malformed — surfaced
+///     so the caller can warn once, since a broken default identity
+///     is almost certainly a real misconfiguration the user wants
+///     to know about.
+pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, String> {
+    let pem = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    match PrivateKey::parse_openssh_pem(&pem, None) {
+        Ok(pk) => Ok(Some(pk)),
+        Err(Error::Crypto("passphrase required")) => Ok(None),
+        Err(e) => Err(format!("parse {}: {e}", path.display())),
+    }
 }

@@ -32,13 +32,14 @@ use puressh::scp::{ScpRecvOptions, ScpSendOptions};
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, load_identity, parse_userhost_path,
-    read_password_from_stdin, resolve_user, StrictMode,
+    build_host_key_policy, connect_agent_credentials, default_identity_paths, load_identity,
+    parse_userhost_path, read_password_from_stdin, resolve_user, set_verbose,
+    try_load_default_identity, vlog, StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: scp [-r] [-p] [-P port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: scp [-v[v[v]]] [-r] [-p] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
@@ -56,6 +57,9 @@ struct Cli {
     known_hosts_path: Option<PathBuf>,
     hash_known_hosts: bool,
     identities_only: bool,
+    /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
+    /// See [`common::set_verbose`].
+    verbose: u8,
     /// All positional args, last is TARGET, the rest are SOURCEs.
     positional: Vec<String>,
 }
@@ -70,6 +74,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut known_hosts_path: Option<PathBuf> = None;
     let mut hash_known_hosts = false;
     let mut identities_only = false;
+    let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -128,8 +133,17 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     }
                 }
             }
+            "-v" => {
+                verbose = verbose.saturating_add(1).min(3);
+            }
+            "-vv" => {
+                verbose = verbose.max(2);
+            }
+            "-vvv" => {
+                verbose = 3;
+            }
             // Ignore harmless flags scp(1) users sometimes set.
-            "-q" | "-v" | "-B" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
+            "-q" | "-B" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
             s if s.starts_with('-') => {
                 return Err(format!("unknown flag: {s}"));
             }
@@ -159,6 +173,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         known_hosts_path,
         hash_known_hosts,
         identities_only,
+        verbose,
         positional,
     })
 }
@@ -203,14 +218,22 @@ fn open_authenticated(
         host_key_policy: policy,
         timeout: None,
     };
+    vlog(1, &format!("connecting to {host}:{port}"));
     let mut client =
         Client::connect_to_host(host, port, cfg).map_err(|e| format!("connect: {e}"))?;
+    vlog(1, &format!("connected to {host}:{port}"));
 
     // Collect publickey credentials (agent first, unless IdentitiesOnly=yes).
     let mut credentials: Vec<ClientCredential> = Vec::new();
     if !cli.identities_only {
         match connect_agent_credentials() {
-            Ok(mut from_agent) => credentials.append(&mut from_agent),
+            Ok(mut from_agent) => {
+                vlog(
+                    1,
+                    &format!("agent: offered {} identities", from_agent.len()),
+                );
+                credentials.append(&mut from_agent);
+            }
             Err(e) => eprintln!("warning: agent: {e}"),
         }
     }
@@ -223,21 +246,60 @@ fn open_authenticated(
             }
         };
         match pk.into_host_key() {
-            Ok(hk) => credentials.push(ClientCredential::PublicKey(hk)),
+            Ok(hk) => {
+                vlog(1, &format!("identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
             Err(e) => eprintln!("warning: identity {id_path}: {e}"),
+        }
+    }
+    // OpenSSH-style default identities: tried after agent + explicit -i,
+    // suppressed entirely by IdentitiesOnly=yes (which also disables the
+    // agent above).
+    if !cli.identities_only {
+        for path in default_identity_paths() {
+            match try_load_default_identity(&path) {
+                Ok(Some(pk)) => match pk.into_host_key() {
+                    Ok(hk) => {
+                        vlog(1, &format!("default identity {}: loaded", path.display()));
+                        credentials.push(ClientCredential::PublicKey(hk));
+                    }
+                    Err(e) => {
+                        eprintln!("warning: default identity {}: {e}", path.display());
+                    }
+                },
+                Ok(None) => {
+                    vlog(2, &format!("default identity {}: skipped", path.display()));
+                }
+                Err(msg) => eprintln!("warning: {msg}"),
+            }
         }
     }
 
     let authed = if !credentials.is_empty() {
-        client.authenticate(&user, credentials).is_ok()
+        vlog(
+            1,
+            &format!(
+                "trying publickey auth as {} ({} credentials)",
+                user,
+                credentials.len()
+            ),
+        );
+        let ok = client.authenticate(&user, credentials).is_ok();
+        if ok {
+            vlog(1, &format!("authenticated as {user} via publickey"));
+        }
+        ok
     } else {
         false
     };
     if !authed {
+        vlog(1, &format!("trying password auth as {user}"));
         let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
         client
             .authenticate_password(&user, &password)
             .map_err(|e| format!("Auth failed: {e}"))?;
+        vlog(1, &format!("authenticated as {user} via password"));
     }
     Ok(client)
 }
@@ -259,6 +321,7 @@ fn run() -> Result<i32, String> {
     }
 
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    set_verbose(cli.verbose);
 
     // Split into sources (all but last) and target (last).
     let mut endpoints: Vec<Endpoint> = cli.positional.iter().map(|s| classify(s)).collect();

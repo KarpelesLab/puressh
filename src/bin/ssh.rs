@@ -27,13 +27,14 @@ use puressh::client::{
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, load_identity, read_password_from_stdin,
-    resolve_user, StrictMode,
+    build_host_key_policy, connect_agent_credentials, default_identity_paths, load_identity,
+    read_password_from_stdin, resolve_user, set_verbose, try_load_default_identity, vlog,
+    StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: ssh [-p port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: ssh [-v[v[v]]] [-p port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
@@ -91,6 +92,10 @@ struct Cli {
     locals: Vec<LocalForward>,
     remotes: Vec<RemoteForward>,
     no_command: bool,
+    /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
+    /// Repeated single `-v`s also stack and saturate at 3. Drives
+    /// `common::vlog` — see [`common::set_verbose`].
+    verbose: u8,
     /// `-A`: ask the server to forward the local ssh-agent. The lib sends
     /// `auth-agent-req@openssh.com` on the session channel; incoming
     /// `auth-agent@openssh.com` channels get spliced against
@@ -167,6 +172,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut no_command = false;
     let mut agent_forward = false;
     let mut x11_forward: Option<X11Forward> = None;
+    let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -213,6 +219,18 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             "-Y" => {
                 x11_forward = Some(X11Forward::Trusted);
+            }
+            // OpenSSH-style verbosity. Accept the stacked forms `-vv` /
+            // `-vvv` as single tokens (the common way users type them),
+            // plus repeated `-v` which also accumulates.
+            "-v" => {
+                verbose = verbose.saturating_add(1).min(3);
+            }
+            "-vv" => {
+                verbose = verbose.max(2);
+            }
+            "-vvv" => {
+                verbose = 3;
             }
             "-o" => {
                 i += 1;
@@ -283,6 +301,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         no_command,
         agent_forward,
         x11_forward,
+        verbose,
         host,
         user_in_host,
         command,
@@ -303,6 +322,7 @@ fn run() -> Result<i32, String> {
     }
 
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    set_verbose(cli.verbose);
     let user = resolve_user(cli.cli_user.as_deref(), cli.user_in_host.as_deref())?;
 
     let policy = build_host_key_policy(
@@ -317,16 +337,29 @@ fn run() -> Result<i32, String> {
 
     // Use connect_to_host so KnownHosts can look the host up by its
     // user-supplied name.
+    vlog(1, &format!("connecting to {}:{}", cli.host, cli.port));
     let mut client = Client::connect_to_host(cli.host.as_str(), cli.port, cfg)
         .map_err(|e| format!("connect: {e}"))?;
+    vlog(1, &format!("connected to {}:{}", cli.host, cli.port));
 
     // Collect publickey credentials. Per OpenSSH default, agent identities
-    // are tried first (when `$SSH_AUTH_SOCK` is set and `IdentitiesOnly=no`),
-    // then `-i` identity files in command-line order.
+    // come first (when `$SSH_AUTH_SOCK` is set and `IdentitiesOnly=no`),
+    // then `-i` identity files in command-line order, then the OpenSSH
+    // default identities under `~/.ssh/` (`id_ed25519`, `id_ecdsa`,
+    // `id_rsa`). `IdentitiesOnly=yes` suppresses both the agent and the
+    // defaults, mirroring OpenSSH.
     let mut credentials: Vec<ClientCredential> = Vec::new();
     if !cli.identities_only {
         match connect_agent_credentials() {
-            Ok(mut from_agent) => credentials.append(&mut from_agent),
+            Ok(mut from_agent) => {
+                if !from_agent.is_empty() {
+                    vlog(
+                        1,
+                        &format!("agent contributed {} identities", from_agent.len()),
+                    );
+                }
+                credentials.append(&mut from_agent);
+            }
             Err(e) => eprintln!("warning: agent: {e}"),
         }
     }
@@ -339,20 +372,56 @@ fn run() -> Result<i32, String> {
             }
         };
         match pk.into_host_key() {
-            Ok(hk) => credentials.push(ClientCredential::PublicKey(hk)),
+            Ok(hk) => {
+                vlog(1, &format!("identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
             Err(e) => eprintln!("warning: identity {id_path}: {e}"),
+        }
+    }
+    if !cli.identities_only {
+        for path in default_identity_paths() {
+            match try_load_default_identity(&path) {
+                Ok(Some(pk)) => match pk.into_host_key() {
+                    Ok(hk) => {
+                        vlog(1, &format!("default identity {}: loaded", path.display()));
+                        credentials.push(ClientCredential::PublicKey(hk));
+                    }
+                    Err(e) => {
+                        eprintln!("warning: default identity {}: {e}", path.display());
+                    }
+                },
+                Ok(None) => {
+                    vlog(2, &format!("default identity {}: skipped", path.display()));
+                }
+                Err(msg) => eprintln!("warning: {msg}"),
+            }
         }
     }
 
     let authed = if !credentials.is_empty() {
+        vlog(
+            1,
+            &format!(
+                "attempting publickey auth with {} credentials",
+                credentials.len()
+            ),
+        );
         match client.authenticate(&user, credentials) {
-            Ok(()) => true,
+            Ok(()) => {
+                vlog(1, &format!("authenticated as {user} via publickey"));
+                true
+            }
             Err(e) => {
                 eprintln!("publickey auth: {e}");
                 false
             }
         }
     } else {
+        vlog(
+            1,
+            "no publickey credentials available; falling back to password",
+        );
         false
     };
 
@@ -365,6 +434,7 @@ fn run() -> Result<i32, String> {
         client
             .authenticate_password(&user, &password)
             .map_err(|e| format!("Auth failed: {e}"))?;
+        vlog(1, &format!("authenticated as {user} via password"));
     }
 
     // If any port-forwarding was requested, switch over to the multi-channel

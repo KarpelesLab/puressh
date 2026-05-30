@@ -453,12 +453,18 @@ impl SftpServerSession {
 
     fn op_fstat(&mut self, id: u32, handle: Vec<u8>) -> Result<Packet, SftpError> {
         let h = parse_handle(&handle)?;
+        let jailed = self.opts.root.is_some();
         let entry = self
             .handles
             .get(&h)
             .ok_or_else(|| SftpError::status_msg(FxpStatus::Failure, "invalid handle"))?;
         let md = match entry {
             FileHandle::File { file, .. } => file.metadata()?,
+            // When jailed, never traverse the final symlink — `fs::metadata`
+            // would follow it and leak attributes of a target outside the
+            // jail. Matches the behaviour of op_stat with `follow=false`
+            // under a jail.
+            FileHandle::Dir { path, .. } if jailed => fs::symlink_metadata(path)?,
             FileHandle::Dir { path, .. } => fs::metadata(path)?,
         };
         Ok(Packet::Attrs {
@@ -503,6 +509,24 @@ impl SftpServerSession {
 
     fn op_opendir(&mut self, id: u32, path: Vec<u8>) -> Result<Packet, SftpError> {
         let p = self.resolve(&path)?;
+        // Inside a jail, refuse to traverse a symlink at the final
+        // component for directories too — otherwise a writable jail
+        // could host a symlink pointing outside, letting `read_dir`
+        // enumerate the target. op_open already does this with
+        // O_NOFOLLOW; symlink_metadata is the equivalent for dirs
+        // (we can't pass O_NOFOLLOW to read_dir directly without
+        // dropping to openat2 / fdopendir). Match the wording used by
+        // `map_open_err` so a probe can't distinguish "absent" from
+        // "symlinked".
+        if self.opts.root.is_some() {
+            let md = fs::symlink_metadata(&p)?;
+            if md.file_type().is_symlink() {
+                return Err(SftpError::status_msg(
+                    FxpStatus::NoSuchFile,
+                    "symlink rejected",
+                ));
+            }
+        }
         let iter = fs::read_dir(&p)?;
         let handle = self.alloc_handle(FileHandle::Dir {
             iter: Some(iter),

@@ -76,7 +76,8 @@ mod imp {
     const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
                          [-A authorized_keys_file] [-u allowed_user]... \
                          [--no-sftp] [--sftp-read-only] [--sftp-root PATH] \
-                         [--no-scp] [--no-agent-forward] [--no-x11-forward]";
+                         [--no-scp] [--no-agent-forward] [--no-x11-forward] \
+                         [--no-strict-modes] [--debug-commands]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -269,6 +270,12 @@ mod imp {
         /// X11 forwarding on by default; `--no-x11-forward` disables it.
         /// When off, any client `x11-req` is refused.
         x11_forward: bool,
+        /// `--no-strict-modes`: skip the 0o077 / 0o022 file-permission
+        /// checks on host keys / authorized_keys.
+        strict_modes: bool,
+        /// `--debug-commands`: log full exec command lines (otherwise
+        /// only the first whitespace token is logged in debug mode).
+        debug_commands: bool,
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -283,6 +290,8 @@ mod imp {
         let mut scp = true;
         let mut agent_forward = true;
         let mut x11_forward = true;
+        let mut strict_modes = true;
+        let mut debug_commands = false;
 
         let mut i = 0;
         while i < args.len() {
@@ -319,6 +328,8 @@ mod imp {
                 "--no-scp" => scp = false,
                 "--no-agent-forward" => agent_forward = false,
                 "--no-x11-forward" => x11_forward = false,
+                "--no-strict-modes" => strict_modes = false,
+                "--debug-commands" => debug_commands = true,
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -342,12 +353,20 @@ mod imp {
             scp,
             agent_forward,
             x11_forward,
+            strict_modes,
+            debug_commands,
         })
     }
 
-    fn load_host_keys(paths: &[String]) -> Result<Vec<Box<dyn HostKey + Send + Sync>>, String> {
+    fn load_host_keys(
+        paths: &[String],
+        strict_modes: bool,
+    ) -> Result<Vec<Box<dyn HostKey + Send + Sync>>, String> {
         let mut out: Vec<Box<dyn HostKey + Send + Sync>> = Vec::new();
         for path in paths {
+            if strict_modes {
+                check_mode_strict(path, 0o077, "host key")?;
+            }
             let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
             let priv_key = PrivateKey::parse_openssh_pem(&pem, None)
                 .map_err(|e| format!("parse {path}: {e}"))?;
@@ -361,6 +380,30 @@ mod imp {
             out.push(SyncHostKey::wrap(hk));
         }
         Ok(out)
+    }
+
+    /// Refuse to read `path` when its Unix mode shares any forbidden bit
+    /// with `forbidden_mask` (e.g. `0o077` for host keys — "not readable
+    /// by group or world"). Matches OpenSSH's `StrictModes`. The
+    /// `--no-strict-modes` CLI flag short-circuits this check.
+    ///
+    /// `kind` is just a human label for the error message ("host key",
+    /// "authorized_keys file").
+    fn check_mode_strict(path: &str, forbidden_mask: u32, kind: &str) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
+        if !md.is_file() {
+            return Err(format!("{kind} {path}: not a regular file"));
+        }
+        let mode = md.mode() & 0o777;
+        if (mode as u32) & forbidden_mask != 0 {
+            return Err(format!(
+                "{kind} {path}: insecure mode 0o{mode:o} (must not have any of 0o{forbidden_mask:o}); \
+                 fix with `chmod 0{:o} {path}` or override with --no-strict-modes",
+                mode & !forbidden_mask & 0o777
+            ));
+        }
+        Ok(())
     }
 
     struct SyncHostKey {
@@ -397,7 +440,10 @@ mod imp {
         }
     }
 
-    fn load_authorized_keys(path: &str) -> Result<Vec<PublicKey>, String> {
+    fn load_authorized_keys(path: &str, strict_modes: bool) -> Result<Vec<PublicKey>, String> {
+        if strict_modes {
+            check_mode_strict(path, 0o022, "authorized_keys file")?;
+        }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         let mut keys: Vec<PublicKey> = Vec::new();
         for (idx, line) in body.lines().enumerate() {
@@ -491,12 +537,29 @@ mod imp {
     struct ShellCommandHandler {
         pam: Arc<pam_gate::PamGate>,
         debug: bool,
+        /// When `false` (the default), debug-mode exec logs print only the
+        /// first whitespace-separated token of the command — secrets passed
+        /// on the command line (e.g. `mysql -p<pass>`, `curl
+        /// https://u:p@host`) never reach stderr/journald.  `--debug-commands`
+        /// opts in to full command logging for development.
+        debug_commands: bool,
     }
 
     impl CommandHandler for ShellCommandHandler {
         fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
             if self.debug {
-                eprintln!("sshd: exec by {user}: {command}");
+                if self.debug_commands {
+                    eprintln!("sshd: exec by {user}: {command}");
+                } else {
+                    // Log only the first token (the program name) plus an
+                    // argument count, so operators can see *what* ran
+                    // without leaking secrets passed on the command line.
+                    // Use char_indices so we never split inside a UTF-8
+                    // codepoint and don't allocate a Vec to count args.
+                    let name = command.split_whitespace().next().unwrap_or("");
+                    let extra = command.split_whitespace().skip(1).count();
+                    eprintln!("sshd: exec by {user}: {name} (+{extra} args, redacted)");
+                }
             }
 
             // Resolve the target user in /etc/passwd first — every
@@ -582,23 +645,108 @@ mod imp {
                 cmd.current_dir(&info.home_str);
             }
 
-            match cmd.output() {
-                Ok(out) => {
-                    let code = out.status.code().unwrap_or(255);
-                    let code_u32 = if code < 0 { 255u32 } else { code as u32 };
-                    ExecResult {
-                        stdout: out.stdout,
-                        stderr: out.stderr,
-                        exit_status: code_u32,
-                    }
+            // Spawn + manually drain so we can cap total buffered
+            // output. `cmd.output()` would grow each stream
+            // unboundedly — a long-running `find /` or `cat /dev/zero`
+            // would let the daemon OOM. 16 MiB per stream is more than
+            // any sane `ssh host cmd` produces; if a workload needs to
+            // ship more, it should use SFTP / a streaming
+            // ExecStreamHandler / a pty shell instead.
+            const EXEC_BUFFER_CAP: usize = 16 * 1024 * 1024;
+            cmd.stdin(std::process::Stdio::null());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    return ExecResult {
+                        stdout: Vec::new(),
+                        stderr: format!("sshd: failed to spawn {}: {e}\n", info.shell_str)
+                            .into_bytes(),
+                        exit_status: 255,
+                    };
                 }
-                Err(e) => ExecResult {
-                    stdout: Vec::new(),
-                    stderr: format!("sshd: failed to spawn {}: {e}\n", info.shell_str).into_bytes(),
-                    exit_status: 255,
-                },
+            };
+
+            // Drain stdout and stderr on dedicated threads so a slow
+            // reader on one doesn't deadlock the producer (kernel-pipe
+            // backpressure → child blocks → other stream never read).
+            let mut out_pipe = child.stdout.take().expect("stdout piped");
+            let mut err_pipe = child.stderr.take().expect("stderr piped");
+            let out_thr = std::thread::spawn(move || drain_capped(&mut out_pipe, EXEC_BUFFER_CAP));
+            let err_thr = std::thread::spawn(move || drain_capped(&mut err_pipe, EXEC_BUFFER_CAP));
+
+            let status = match child.wait() {
+                Ok(s) => s,
+                Err(e) => {
+                    return ExecResult {
+                        stdout: Vec::new(),
+                        stderr: format!("sshd: wait failed: {e}\n").into_bytes(),
+                        exit_status: 255,
+                    };
+                }
+            };
+            let (mut stdout_buf, stdout_overflow) = out_thr.join().unwrap_or_default();
+            let (mut stderr_buf, stderr_overflow) = err_thr.join().unwrap_or_default();
+            if stdout_overflow {
+                stderr_buf
+                    .extend_from_slice(b"\nsshd: stdout exceeded 16 MiB cap (truncated)\n");
+            }
+            if stderr_overflow {
+                stderr_buf
+                    .extend_from_slice(b"\nsshd: stderr exceeded 16 MiB cap (truncated)\n");
+            }
+            let code = status.code().unwrap_or(255);
+            let code_u32 = if code < 0 { 255u32 } else { code as u32 };
+            // If we capped, force a non-zero exit so the client knows
+            // its command's output was lossy (matches the "abort the
+            // channel beyond that" intent from finding #6).
+            let final_code = if (stdout_overflow || stderr_overflow) && code_u32 == 0 {
+                stdout_buf.clear();
+                255u32
+            } else {
+                code_u32
+            };
+            ExecResult {
+                stdout: stdout_buf,
+                stderr: stderr_buf,
+                exit_status: final_code,
             }
         }
+    }
+
+    /// Read from `r` until EOF, capping the returned buffer at `cap`
+    /// bytes. Returns `(buf, overflowed)`: `overflowed` is true when at
+    /// least one extra byte was on the wire — the caller treats this as
+    /// "channel aborted".
+    fn drain_capped<R: std::io::Read>(r: &mut R, cap: usize) -> (Vec<u8>, bool) {
+        let mut buf = Vec::with_capacity(8 * 1024);
+        let mut chunk = [0u8; 8 * 1024];
+        let mut overflow = false;
+        loop {
+            match r.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if buf.len() + n > cap {
+                        let room = cap.saturating_sub(buf.len());
+                        if room > 0 {
+                            buf.extend_from_slice(&chunk[..room]);
+                        }
+                        overflow = true;
+                        // Keep draining so the child's pipe doesn't
+                        // back up — but discard everything past the
+                        // cap. Without this the producer eventually
+                        // blocks on PIPE-full and we hang in
+                        // `child.wait()`.
+                        continue;
+                    }
+                    buf.extend_from_slice(&chunk[..n]);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        (buf, overflow)
     }
 
     /// `pre_exec` closures need a closed `io::Error`-returning path; nix
@@ -1221,8 +1369,18 @@ mod imp {
                 let _ = nix::unistd::setsid();
                 // SAFETY: TIOCSCTTY on a slave pty in a fresh session
                 // is well-defined; dup2 rewires stdio onto it.
+                //
+                // Treat TIOCSCTTY failure as fatal: if we can't claim the
+                // pty as the controlling tty, foreground job control is
+                // broken (Ctrl-C / Ctrl-Z won't work, no SIGWINCH on
+                // resize) and the shell would silently misbehave.  Better
+                // to refuse the session than to hand the user a half-wired
+                // pty. _exit(126) matches the "could not execute"
+                // convention used elsewhere in this file.
                 unsafe {
-                    libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY as _, 0);
+                    if libc::ioctl(pty.slave.as_raw_fd(), libc::TIOCSCTTY as _, 0) != 0 {
+                        libc::_exit(126);
+                    }
                     libc::dup2(pty.slave.as_raw_fd(), 0);
                     libc::dup2(pty.slave.as_raw_fd(), 1);
                     libc::dup2(pty.slave.as_raw_fd(), 2);
@@ -1497,9 +1655,9 @@ mod imp {
 
         let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
 
-        let host_keys = load_host_keys(&cli.host_key_files)?;
+        let host_keys = load_host_keys(&cli.host_key_files, cli.strict_modes)?;
         let authorized_blobs: Vec<Vec<u8>> = match &cli.authorized_keys_file {
-            Some(path) => load_authorized_keys(path)?
+            Some(path) => load_authorized_keys(path, cli.strict_modes)?
                 .into_iter()
                 .map(|k| k.wire_blob())
                 .collect(),
@@ -1533,6 +1691,7 @@ mod imp {
             Arc::new(ShellCommandHandler {
                 pam: pam_gate.clone(),
                 debug: cli.debug,
+                debug_commands: cli.debug_commands,
             }),
         )
         .with_shell(Arc::new(NixShellHandler {

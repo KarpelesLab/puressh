@@ -17,6 +17,10 @@ use std::path::{Component, Path, PathBuf};
 
 use super::protocol::{read_header, read_payload_term, write_fatal, write_ok, Header, ScpError};
 
+/// Default cap on a single incoming file's payload size: 64 GiB. See
+/// [`Receiver::with_max_file_size`].
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Knobs for [`Receiver`].
 #[derive(Default, Clone, Copy)]
 pub struct ScpRecvOptions {
@@ -50,6 +54,14 @@ pub struct Receiver<S: Read + Write> {
     /// Pending `T` preamble for the next `C`/`D`. Cleared after use.
     pending_times: Option<(i64, i64)>,
     opts: ScpRecvOptions,
+    /// Maximum size for any single incoming file. A `C` header that
+    /// advertises more than this is refused with a fatal `0x02` frame
+    /// *before* the receiver starts streaming payload, so a malicious
+    /// sender that announces `u64::MAX` cannot fill the operator's disk
+    /// by streaming forever. `None` disables the cap (not recommended on
+    /// hostile peers). Defaults to `Some(DEFAULT_MAX_FILE_SIZE)` (64 GiB);
+    /// tune via [`Receiver::with_max_file_size`].
+    max_file_size: Option<u64>,
 }
 
 impl<S: Read + Write> Receiver<S> {
@@ -73,7 +85,16 @@ impl<S: Read + Write> Receiver<S> {
             stack: Vec::new(),
             pending_times: None,
             opts,
+            max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
         })
+    }
+
+    /// Override the per-file size cap. Pass `None` to disable (not
+    /// recommended on hostile peers — protects against disk-fill DoS
+    /// from a peer that advertises an absurd `C` header size).
+    pub fn with_max_file_size(mut self, cap: Option<u64>) -> Self {
+        self.max_file_size = cap;
+        self
     }
 
     /// Run the receive loop to completion. Reads headers in a loop and
@@ -163,11 +184,30 @@ impl<S: Read + Write> Receiver<S> {
         }
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o7777));
+            use nix::sys::stat::{fchmodat, FchmodatFlags, Mode};
+            // Use `fchmodat(AT_SYMLINK_NOFOLLOW)` instead of
+            // `fs::set_permissions`, which under the hood does a
+            // path-based `chmod(2)` that *follows* symlinks. The
+            // symlink_metadata check above narrows the race but
+            // doesn't close it — a swap between the stat and the
+            // chmod would still let an attacker redirect the chmod
+            // onto an arbitrary file. fchmodat handles both checks
+            // in one syscall.
+            let mode_bits = Mode::from_bits_truncate((mode & 0o7777) as nix::libc::mode_t);
+            let _ = fchmodat(
+                nix::fcntl::AT_FDCWD,
+                &target,
+                mode_bits,
+                FchmodatFlags::NoFollowSymlink,
+            );
         }
         #[cfg(not(unix))]
-        let _ = mode;
+        {
+            // Windows / other non-Unix: we don't apply mode bits, and
+            // `set_permissions` would only translate the read-only bit
+            // anyway. The TOCTOU concern is Unix-specific.
+            let _ = mode;
+        }
         if let Some((mtime, atime)) = self.pending_times.take() {
             if self.opts.preserve_times {
                 let _ = set_times(&target, mtime, atime);
@@ -179,6 +219,17 @@ impl<S: Read + Write> Receiver<S> {
     }
 
     fn recv_file(&mut self, mode: u32, size: u64, name: &str) -> Result<(), ScpError> {
+        // Refuse oversized headers *before* we ack the `C` and start
+        // streaming bytes from the peer. A sender that announces
+        // `u64::MAX` would otherwise be allowed to fill the receiver's
+        // disk until ENOSPC. Default cap is generous (64 GiB).
+        if let Some(cap) = self.max_file_size {
+            if size > cap {
+                let msg = "file size exceeds configured maximum";
+                let _ = write_fatal(&mut self.stream, msg);
+                return Err(ScpError::Unexpected("file size exceeds configured maximum"));
+            }
+        }
         let target = self.resolve_file_target(name);
         self.guard_path(&target)?;
         // Refuse to overwrite an existing symlink at the target path:
@@ -223,11 +274,16 @@ impl<S: Read + Write> Receiver<S> {
             let _ = write_fatal(&mut self.stream, &e.to_string());
             return Err(e);
         }
-        // Apply mode + times.
+        // Apply mode + times. Chmod the open fd, not the path — the
+        // path-based variant would `chmod(2)` through any symlink
+        // raced into place between this point and the call. `fchmod`
+        // operates on the inode we already opened with `O_NOFOLLOW`,
+        // closing the window entirely.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode & 0o7777));
+            use nix::sys::stat::{fchmod, Mode};
+            let mode_bits = Mode::from_bits_truncate((mode & 0o7777) as nix::libc::mode_t);
+            let _ = fchmod(&f, mode_bits);
         }
         #[cfg(not(unix))]
         let _ = mode;

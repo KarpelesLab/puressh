@@ -388,7 +388,7 @@ struct ServeRuntime {
 pub struct Client {
     stream: TcpStream,
     codec: PacketCodec,
-    conn: ConnectionState,
+    pub(crate) conn: ConnectionState,
     session_id: Vec<u8>,
     inbox: Vec<u8>,
     rng: OsRng,
@@ -688,7 +688,7 @@ impl Client {
     /// Internal: emit `auth-agent-req@openssh.com` if the toggle is set.
     /// Called by every session-channel helper between OpenConfirmed and
     /// the matching shell/exec/subsystem request.
-    fn maybe_send_auth_agent_req(&mut self, channel: u32) -> Result<()> {
+    pub(crate) fn maybe_send_auth_agent_req(&mut self, channel: u32) -> Result<()> {
         if self.request_auth_agent {
             let p = self
                 .conn
@@ -729,7 +729,7 @@ impl Client {
     /// session-channel helper between OpenConfirmed and the matching
     /// shell/exec/subsystem request, right after
     /// [`Self::maybe_send_auth_agent_req`].
-    fn maybe_send_x11_req(&mut self, channel: u32) -> Result<()> {
+    pub(crate) fn maybe_send_x11_req(&mut self, channel: u32) -> Result<()> {
         if let Some(args) = self.request_x11.clone() {
             let p = self.conn.send_request(
                 channel,
@@ -1663,7 +1663,7 @@ impl Client {
     /// pty-req → shell handoff.
     ///
     /// [`shell_with_stdin`]: Self::shell_with_stdin
-    fn await_request_reply(&mut self, channel: u32, what: &'static str) -> Result<()> {
+    pub(crate) fn await_request_reply(&mut self, channel: u32, what: &'static str) -> Result<()> {
         for _ in 0..MAX_EXEC_ITER {
             let payload = self.read_one_packet()?;
             match self.conn.on_packet(&payload)? {
@@ -1795,7 +1795,7 @@ impl Client {
         Err(Error::Protocol("peer banner too long"))
     }
 
-    fn read_one_packet(&mut self) -> Result<Vec<u8>> {
+    pub(crate) fn read_one_packet(&mut self) -> Result<Vec<u8>> {
         loop {
             // Drain any app packets we buffered during a re-KEX before
             // pulling more bytes off the wire.
@@ -1877,7 +1877,7 @@ impl Client {
         }
     }
 
-    fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
+    pub(crate) fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
         let frame = self.codec.encode(payload, &mut self.rng)?;
         self.stream.write_all(&frame)?;
         Ok(())
@@ -2053,7 +2053,7 @@ impl Drop for ClientChannelStream<'_> {
     }
 }
 
-fn io_err(e: Error) -> std::io::Error {
+pub(crate) fn io_err(e: Error) -> std::io::Error {
     match e {
         Error::Io(io) => io,
         other => std::io::Error::other(format!("{:?}", other)),

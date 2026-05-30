@@ -96,9 +96,37 @@ use crate::sftp::{SftpClient, SftpError};
 /// burn CPU.
 const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The message used for `expect` calls on the shared mutex. Lifted out
-/// of the call sites to keep them readable.
-const POISONED: &str = "SharedClient mutex poisoned";
+/// Lock the shared mutex, mapping poison to `Error::Protocol`. Used by
+/// fallible API paths whose return type is `Result<_, crate::Error>` —
+/// they propagate poisoning as a hard error rather than panicking the
+/// thread, so callers in long-lived programs (servers, the FFI, etc.)
+/// can free the [`SharedClient`] and reconnect.
+///
+/// Finding #9 (Medium). Panicking on `lock()` poisoning meant that one
+/// panic in any pumper or session worker tore down the entire process
+/// instead of being contained to that connection. The Drop / Read / Write
+/// paths that return `std::io::Result` translate poisoning into a
+/// `BrokenPipe` via [`lock_or_poison_io`] for the same reason.
+fn lock_or_poison<'a>(
+    m: &'a Mutex<Inner>,
+) -> Result<std::sync::MutexGuard<'a, Inner>> {
+    m.lock()
+        .map_err(|_| Error::Protocol("SharedClient mutex poisoned"))
+}
+
+/// `std::io::Result` flavour of [`lock_or_poison`]. Maps poisoning to a
+/// `BrokenPipe` so the `Read` / `Write` impls below can surface it the
+/// same way they surface "channel closed".
+fn lock_or_poison_io<'a>(
+    m: &'a Mutex<Inner>,
+) -> std::io::Result<std::sync::MutexGuard<'a, Inner>> {
+    m.lock().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::BrokenPipe,
+            "SharedClient mutex poisoned",
+        )
+    })
+}
 
 /// Local alias for SFTP-flavoured results, since
 /// [`crate::error::Result`] only takes one generic parameter (and pins
@@ -177,7 +205,7 @@ impl SharedClient {
     /// supported and can coexist with shells / exec / forwards.
     pub fn sftp(&self) -> Result<SftpSession> {
         let local_id = {
-            let mut g = self.inner.lock().expect(POISONED);
+            let mut g = lock_or_poison(&self.inner)?;
             let id = open_session_under_lock(&mut g, "sftp")?;
             send_request_and_await(
                 &mut g,
@@ -226,7 +254,7 @@ impl SharedClient {
     /// coexist with SFTP / shell / forward handles on the same client.
     pub fn exec_stream(&self, command: &str) -> Result<OwnedChannelStream> {
         let local_id = {
-            let mut g = self.inner.lock().expect(POISONED);
+            let mut g = lock_or_poison(&self.inner)?;
             let id = open_session_under_lock(&mut g, "exec")?;
             send_request_and_await(
                 &mut g,
@@ -254,7 +282,7 @@ impl SharedClient {
     /// against your login shell instead.
     pub fn shell(&self, term: &str, cols: u32, rows: u32) -> Result<OwnedChannelStream> {
         let local_id = {
-            let mut g = self.inner.lock().expect(POISONED);
+            let mut g = lock_or_poison(&self.inner)?;
             let id = open_session_under_lock(&mut g, "shell")?;
             send_request_and_await(
                 &mut g,
@@ -293,7 +321,7 @@ impl SharedClient {
         orig_port: u16,
     ) -> Result<OwnedChannelStream> {
         let local_id = {
-            let mut g = self.inner.lock().expect(POISONED);
+            let mut g = lock_or_poison(&self.inner)?;
             open_direct_tcpip_under_lock(&mut g, dest_host, dest_port, orig_host, orig_port)?
         };
         Ok(OwnedChannelStream {
@@ -313,8 +341,28 @@ impl SharedClient {
     /// where state lives.
     #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
     pub(crate) fn with_client<R>(&self, f: impl FnOnce(&mut Client) -> R) -> R {
-        let mut g = self.inner.lock().expect(POISONED);
+        // This helper exists for the FFI surface, which expects an infallible
+        // return. If the mutex is poisoned the only meaningful recovery is to
+        // free the handle and reconnect — but the FFI can't observe that from
+        // a function returning `R`. Keep the panic here; the multi-channel
+        // entry points (`sftp`, `exec_stream`, `shell`, …) use `lock_or_poison`
+        // and propagate `Error::Protocol` instead.
+        let mut g = self
+            .inner
+            .lock()
+            .expect("SharedClient mutex poisoned (with_client)");
         f(&mut g.client)
+    }
+
+    /// Fallible variant of [`Self::with_client`] for callers that can
+    /// propagate poisoning. New FFI surfaces should prefer this.
+    #[allow(dead_code)]
+    pub(crate) fn try_with_client<R>(
+        &self,
+        f: impl FnOnce(&mut Client) -> R,
+    ) -> Result<R> {
+        let mut g = lock_or_poison(&self.inner)?;
+        Ok(f(&mut g.client))
     }
 }
 
@@ -594,7 +642,7 @@ impl OwnedChannelStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut g = self.shared.inner.lock().expect(POISONED);
+        let mut g = lock_or_poison_io(&self.shared.inner)?;
         loop {
             // 1. Drain our mailbox if non-empty.
             let queue = g.queues.entry(self.channel).or_default();
@@ -634,7 +682,10 @@ impl OwnedChannelStream {
                 let cv = notifier_for(&mut g, self.channel);
                 // Bounded wait so a missed notify (e.g. pumper panicked
                 // and unwound through the mutex guard) cannot strand us.
-                g = cv.wait_timeout(g, WAIT_TIMEOUT).expect(POISONED).0;
+                g = cv
+                    .wait_timeout(g, WAIT_TIMEOUT)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SharedClient mutex poisoned"))?
+                    .0;
             }
         }
     }
@@ -683,7 +734,7 @@ impl Write for OwnedChannelStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut g = self.shared.inner.lock().expect(POISONED);
+        let mut g = lock_or_poison_io(&self.shared.inner)?;
         loop {
             let (payload, taken) = g.client.conn.send_data(self.channel, buf).map_err(io_err)?;
             if taken > 0 {
@@ -710,7 +761,10 @@ impl Write for OwnedChannelStream {
                 res?;
             } else {
                 let cv = notifier_for(&mut g, self.channel);
-                g = cv.wait_timeout(g, WAIT_TIMEOUT).expect(POISONED).0;
+                g = cv
+                    .wait_timeout(g, WAIT_TIMEOUT)
+                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SharedClient mutex poisoned"))?
+                    .0;
             }
         }
     }

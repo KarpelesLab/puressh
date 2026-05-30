@@ -30,6 +30,12 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # release-plz runs `cargo publish` which compiles the crate against
+      # all default features (including `pam` on Linux). The `pam-client2`
+      # dep links libpam, so we need the dev package available.
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
       - name: Run release-plz
         id: release-plz
         uses: release-plz/action@v0.5
@@ -70,6 +76,11 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # See the matching note in the `release-plz-release` job above —
+      # libpam is needed for the `cargo publish`-style preflight build.
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
 
       - name: Run release-plz
         uses: release-plz/action@v0.5

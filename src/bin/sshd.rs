@@ -93,7 +93,12 @@ mod imp {
     // connection — there's no cross-connection bleed even though the
     // daemon's parent process never opens any PAM session itself.
     // -------------------------------------------------------------------------
-    #[cfg(feature = "pam")]
+    // The real PAM gate compiles only when both the `pam` feature is enabled
+    // AND we're targeting Linux — `pam-client2` itself is dep-gated to Linux
+    // because it references Linux-PAM constants that OpenPAM (macOS / *BSD)
+    // doesn't expose. Every other configuration (Linux without `pam`, macOS
+    // with `--all-features`, etc.) falls through to the stub below.
+    #[cfg(all(feature = "pam", target_os = "linux"))]
     mod pam_gate {
         use std::ffi::CString;
         use std::os::unix::ffi::OsStrExt;
@@ -214,14 +219,16 @@ mod imp {
         }
     }
 
-    #[cfg(not(feature = "pam"))]
+    #[cfg(not(all(feature = "pam", target_os = "linux")))]
     mod pam_gate {
         use std::ffi::CString;
         use std::sync::Arc;
 
-        /// Stub gate used when the `pam` feature is off. All operations
-        /// are no-ops so the rest of the binary can ignore the feature
-        /// state.
+        /// Stub gate used when the `pam` feature is off, or when the
+        /// target isn't Linux (the `pam-client2` dep is Linux-only — see
+        /// the cfg gate on the real `pam_gate` module above). All
+        /// operations are no-ops so the rest of the binary can ignore
+        /// the feature state.
         pub struct PamGate;
 
         impl PamGate {
@@ -560,7 +567,7 @@ mod imp {
                 unsafe {
                     cmd.pre_exec(move || {
                         nix::unistd::setgid(gid).map_err(to_io)?;
-                        nix::unistd::initgroups(&name_c, gid).map_err(to_io)?;
+                        initgroups_libc(&name_c, gid).map_err(to_io)?;
                         nix::unistd::setuid(uid).map_err(to_io)?;
                         // chdir best-effort: a missing/unreadable home
                         // shouldn't refuse the exec — fall back to /.
@@ -599,6 +606,24 @@ mod imp {
     /// stays `'static`-friendly.
     fn to_io(e: Errno) -> std::io::Error {
         std::io::Error::from_raw_os_error(e as i32)
+    }
+
+    /// Apple targets dropped `nix::unistd::initgroups` (see the cfg gate at
+    /// `nix-0.30/src/unistd.rs`), so we call the libc function directly. The
+    /// signature is POSIX-stable across Linux and macOS; the gid type
+    /// (`libc::gid_t`) matches `nix::unistd::Gid` byte-for-byte.
+    ///
+    /// SAFETY: `user` must be a valid NUL-terminated C string. The pre-fork
+    /// callers all pass `info.name_c.as_ptr()` from a long-lived `CString`.
+    fn initgroups_libc(user: &std::ffi::CStr, gid: nix::unistd::Gid) -> nix::Result<()> {
+        // SAFETY: `user.as_ptr()` is a valid NUL-terminated string for the
+        // duration of the call (CStr's invariant).
+        let rc = unsafe { libc::initgroups(user.as_ptr(), gid.as_raw() as _) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Errno::last())
+        }
     }
 
     fn current_user() -> Result<String, String> {
@@ -1111,7 +1136,7 @@ mod imp {
         // setuid last (point of no return). Any failure here aborts the
         // connection — running with mixed privileges is worse than refusing.
         nix::unistd::setgid(info.gid).map_err(nix_io)?;
-        nix::unistd::initgroups(&info.name_c, info.gid).map_err(nix_io)?;
+        initgroups_libc(&info.name_c, info.gid).map_err(nix_io)?;
         nix::unistd::setuid(info.uid).map_err(nix_io)?;
         if debug {
             eprintln!(
@@ -1213,7 +1238,7 @@ mod imp {
                 // setuid — once setuid runs we can't go back.
                 if drop_privs
                     && (nix::unistd::setgid(info.gid).is_err()
-                        || nix::unistd::initgroups(&info.name_c, info.gid).is_err()
+                        || initgroups_libc(&info.name_c, info.gid).is_err()
                         || nix::unistd::setuid(info.uid).is_err())
                 {
                     // Any step failing means we can't safely

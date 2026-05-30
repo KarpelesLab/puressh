@@ -537,16 +537,27 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
     // loop. We close it at the end so the server unlinks its
     // `SSH_AUTH_SOCK`.
     let agent_fwd_channel: Option<u32> = if cli.agent_forward {
-        use puressh::forwarding::agent::splice_to_local_agent_callback;
-        let cb = splice_to_local_agent_callback().ok_or_else(|| {
-            "-A: $SSH_AUTH_SOCK is unset or names a socket that doesn't exist".to_string()
-        })?;
-        handlers = handlers.with_auth_agent(cb);
-        let id = client
-            .open_session_for_agent_forward()
-            .map_err(|e| format!("agent-forward session: {e}"))?;
-        eprintln!("ssh: -A agent forwarding requested");
-        Some(id)
+        // Agent forwarding routes through `$SSH_AUTH_SOCK`, a Unix-domain
+        // socket. The forwarding implementation lives behind `cfg(unix)`
+        // in `puressh::forwarding::agent`, so on Windows we hard-fail
+        // rather than silently ignoring `-A`.
+        #[cfg(unix)]
+        {
+            use puressh::forwarding::agent::splice_to_local_agent_callback;
+            let cb = splice_to_local_agent_callback().ok_or_else(|| {
+                "-A: $SSH_AUTH_SOCK is unset or names a socket that doesn't exist".to_string()
+            })?;
+            handlers = handlers.with_auth_agent(cb);
+            let id = client
+                .open_session_for_agent_forward()
+                .map_err(|e| format!("agent-forward session: {e}"))?;
+            eprintln!("ssh: -A agent forwarding requested");
+            Some(id)
+        }
+        #[cfg(not(unix))]
+        {
+            return Err("-A agent forwarding is not supported on this platform".to_string());
+        }
     } else {
         None
     };
@@ -565,25 +576,37 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
     // without rewriting the X-protocol auth record. Cookie substitution
     // (untrusted-X11 isolation) is a follow-up.
     let x11_fwd_channel: Option<u32> = if let Some(mode) = cli.x11_forward {
-        use puressh::forwarding::x11::splice_to_local_display_callback;
-        let cb = splice_to_local_display_callback().ok_or_else(|| {
-            "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial".to_string()
-        })?;
-        handlers = handlers.with_x11(cb);
-        let cookie = mint_x11_cookie();
-        let id = client
-            .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", &cookie, 0)
-            .map_err(|e| format!("x11-forward session: {e}"))?;
-        eprintln!(
-            "ssh: -{} X11 forwarding requested (cookie={} chars)",
-            if mode == X11Forward::Trusted {
-                "Y"
-            } else {
-                "X"
-            },
-            cookie.len(),
-        );
-        Some(id)
+        // X11 forwarding dials `$DISPLAY` — either a TCP `host:N` form or
+        // a `/tmp/.X11-unix/X<N>` Unix-domain socket. The forwarding
+        // implementation in `puressh::forwarding::x11` is `cfg(unix)` for
+        // the UDS case, so we gate the consumer here too.
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            return Err("-X/-Y X11 forwarding is not supported on this platform".to_string());
+        }
+        #[cfg(unix)]
+        {
+            use puressh::forwarding::x11::splice_to_local_display_callback;
+            let cb = splice_to_local_display_callback().ok_or_else(|| {
+                "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial".to_string()
+            })?;
+            handlers = handlers.with_x11(cb);
+            let cookie = mint_x11_cookie();
+            let id = client
+                .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", &cookie, 0)
+                .map_err(|e| format!("x11-forward session: {e}"))?;
+            eprintln!(
+                "ssh: -{} X11 forwarding requested (cookie={} chars)",
+                if mode == X11Forward::Trusted {
+                    "Y"
+                } else {
+                    "X"
+                },
+                cookie.len(),
+            );
+            Some(id)
+        }
     } else {
         None
     };
@@ -669,6 +692,10 @@ fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: 
 /// OpenSSH normally reads the real cookie out of `$XAUTHORITY` via `xauth
 /// list`; we don't yet, so untrusted (`-X`) and trusted (`-Y`) currently
 /// share the same generated cookie.
+///
+/// X11 forwarding is Unix-only (the channel handlers depend on Unix-domain
+/// sockets), so this helper is too — gating keeps Windows builds clean.
+#[cfg(unix)]
 fn mint_x11_cookie() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {

@@ -27,20 +27,35 @@
 //! `$DISPLAY` (see [`crate::client::ClientHandlers::on_x11`]).
 
 use std::io::{ErrorKind, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
+
+// Server-handler-only imports — the splice-to-local-display callbacks below
+// don't need any of these. Gating keeps the `client`-only build clean of
+// "unused import" warnings.
+#[cfg(feature = "server")]
+use std::net::{SocketAddr, TcpListener};
+#[cfg(feature = "server")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "server")]
+use std::thread::JoinHandle;
+#[cfg(feature = "server")]
 use std::time::Duration;
 
+// Server handler types live behind `feature = "server"`; the splice-to-
+// local-display callbacks below only need `ChannelStream` / `ChannelEgress`
+// from `crate::stream` and are exposed to both client and server consumers.
+#[cfg(feature = "server")]
 use crate::error::{Error, Result};
-use crate::server::{
-    ChannelEgress, ChannelStream, X11ForwardContext, X11ForwardHandle, X11ForwardHandler,
-};
+#[cfg(feature = "server")]
+use crate::server::{X11ForwardContext, X11ForwardHandle, X11ForwardHandler};
+use crate::stream::{ChannelEgress, ChannelStream};
 
 /// How often the accept-loop polls the non-blocking listener while waiting
 /// for either a connection or the stop flag.
+#[cfg(feature = "server")]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The base TCP port for X displays. Display `N` lives on port `6000 + N`.
@@ -48,19 +63,23 @@ const X_BASE_PORT: u16 = 6000;
 
 /// Default first display number to try. OpenSSH starts at 10 to leave
 /// `:0`–`:9` for real local X servers.
+#[cfg(feature = "server")]
 const DEFAULT_MIN_DISPLAY: u16 = 10;
 
 /// Default last display number to try. Matches OpenSSH's `X11DisplayOffset`
 /// range (10..1000) trimmed to something the kernel won't blink at.
+#[cfg(feature = "server")]
 const DEFAULT_MAX_DISPLAY: u16 = 999;
 
 /// RAII guard that lives inside the [`X11ForwardHandle::stopper`] box.
 /// Dropping it sets the stop flag and joins the worker thread.
+#[cfg(feature = "server")]
 struct X11Binding {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
 
+#[cfg(feature = "server")]
 impl Drop for X11Binding {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -81,17 +100,20 @@ impl Drop for X11Binding {
 /// (default 10), the handler tries `127.0.0.1:6000+N` until one succeeds.
 /// Returns `Err(Error::Io(_))` if no port in `[min_display, max_display]`
 /// is free.
+#[cfg(feature = "server")]
 pub struct DefaultX11ForwardHandler {
     min_display: u16,
     max_display: u16,
 }
 
+#[cfg(feature = "server")]
 impl Default for DefaultX11ForwardHandler {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "server")]
 impl DefaultX11ForwardHandler {
     /// Build a fresh handler that scans displays `10..=999` for a free
     /// `127.0.0.1:6000+N`.
@@ -126,6 +148,7 @@ impl DefaultX11ForwardHandler {
     }
 }
 
+#[cfg(feature = "server")]
 impl X11ForwardHandler for DefaultX11ForwardHandler {
     fn setup(
         &self,
@@ -355,7 +378,9 @@ fn spawn_unix_splice(uds: std::os::unix::net::UnixStream, stream: ChannelStream)
     });
 }
 
-#[cfg(test)]
+// Tests exercise `DefaultX11ForwardHandler` and the X11 forward context, both
+// of which are server-side; gate them to match.
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
 

@@ -35,7 +35,10 @@ pub mod protocol;
 pub mod receiver;
 pub mod sender;
 
-#[cfg(test)]
+// Round-trip tests need `UnixStream::pair()`, so the module is gated to
+// Unix. Pure-protocol tests for header parsing live alongside the parser
+// in `protocol.rs` and stay portable.
+#[cfg(all(test, unix))]
 mod tests;
 
 pub use protocol::{Header, ScpError};

@@ -28,6 +28,7 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+#[cfg(unix)]
 use puressh::agent::{Agent, AgentHostKey};
 use puressh::auth::ClientCredential;
 use puressh::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
@@ -135,6 +136,12 @@ pub fn load_identity(path: &str) -> Result<PrivateKey, String> {
 /// publickey credential backed by [`AgentHostKey`]. Returns `Ok(empty)` when
 /// no agent is reachable — that's an expected "no agent" state, not an
 /// error.
+///
+/// On non-Unix platforms there is no `ssh-agent` to talk to (the
+/// `puressh::agent` module is `cfg(unix)`); the function returns
+/// `Ok(empty)` so callers can keep the "agent first, identity files
+/// second" credential layering without platform checks.
+#[cfg(unix)]
 pub fn connect_agent_credentials() -> Result<Vec<ClientCredential>, String> {
     let agent = match Agent::connect_env().map_err(|e| format!("connect: {e}"))? {
         Some(a) => a,
@@ -158,6 +165,12 @@ pub fn connect_agent_credentials() -> Result<Vec<ClientCredential>, String> {
         }
     }
     Ok(creds)
+}
+
+/// Non-Unix stub: no `ssh-agent` to consult, so return an empty list.
+#[cfg(not(unix))]
+pub fn connect_agent_credentials() -> Result<Vec<ClientCredential>, String> {
+    Ok(Vec::new())
 }
 
 /// Compute the user's default known_hosts path: `$HOME/.ssh/known_hosts`.

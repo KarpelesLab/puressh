@@ -39,11 +39,16 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             asset_suffix: linux-x86_64
+            # `pam-client2` (default-on for sshd on Linux) needs libpam.
+            apt_packages: libpam0g-dev
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             archive: tar.gz
             asset_suffix: linux-aarch64
-            apt_packages: gcc-aarch64-linux-gnu
+            # Cross-toolchain + matching arm64 libpam for the sshd link.
+            # `dpkg --add-architecture` runs from the workflow step below.
+            apt_packages: gcc-aarch64-linux-gnu libpam0g-dev:arm64
+            apt_add_arch: arm64
             linker: aarch64-linux-gnu-gcc
           - target: x86_64-pc-windows-msvc
             os: windows-latest
@@ -57,9 +62,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install cross compiler (Linux aarch64)
+      - name: Install Linux build deps
         if: matrix.apt_packages
         run: |
+          if [ -n "${{ matrix.apt_add_arch }}" ]; then
+            sudo dpkg --add-architecture ${{ matrix.apt_add_arch }}
+          fi
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_packages }}
 

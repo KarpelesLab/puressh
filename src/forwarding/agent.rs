@@ -20,34 +20,56 @@
 //!   to stop, joins it, and unlinks the socket on disk.
 
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::thread;
+
+// Server-handler-only imports — the splice-to-local-agent callback below
+// doesn't need any of these. Gating keeps the `client`-only build clean of
+// "unused import" warnings.
+#[cfg(feature = "server")]
+use std::os::unix::fs::PermissionsExt;
+#[cfg(feature = "server")]
+use std::os::unix::net::UnixListener;
+#[cfg(feature = "server")]
+use std::path::Path;
+#[cfg(feature = "server")]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "server")]
+use std::thread::JoinHandle;
+#[cfg(feature = "server")]
 use std::time::Duration;
 
+#[cfg(feature = "server")]
 use purecrypto::rng::{OsRng, RngCore};
 
+// The server-side handler types live behind `feature = "server"`; the
+// splice-to-local-agent callback below only needs the shared `ChannelStream`
+// /`ChannelEgress` types from `crate::stream` and is exposed to both client
+// and server consumers.
+#[cfg(feature = "server")]
 use crate::error::Result;
-use crate::server::{
-    AgentForwardContext, AgentForwardHandle, AgentForwardHandler, ChannelEgress, ChannelStream,
-};
+#[cfg(feature = "server")]
+use crate::server::{AgentForwardContext, AgentForwardHandle, AgentForwardHandler};
+use crate::stream::{ChannelEgress, ChannelStream};
 
 /// How often the accept-loop polls the non-blocking listener while waiting
 /// for either a connection or the stop flag.
+#[cfg(feature = "server")]
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// RAII guard that lives inside the [`AgentForwardHandle::stopper`] box.
 /// Dropping it sets the stop flag, joins the worker thread, and unlinks the
 /// on-disk socket.
+#[cfg(feature = "server")]
 struct AgentBinding {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     socket_path: PathBuf,
 }
 
+#[cfg(feature = "server")]
 impl Drop for AgentBinding {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -74,6 +96,7 @@ impl Drop for AgentBinding {
 /// `/tmp` (where the socket's own permission still keeps other users out).
 /// The file name is `puressh-agent.<pid>.<random>.sock` — random hex from
 /// [`OsRng`] to keep concurrent sessions from colliding.
+#[cfg(feature = "server")]
 pub struct DefaultAgentForwardHandler {
     /// Optional override for the parent directory. When `None`, the
     /// handler resolves it at `setup` time from `$XDG_RUNTIME_DIR` or
@@ -82,12 +105,14 @@ pub struct DefaultAgentForwardHandler {
     parent_dir: Option<PathBuf>,
 }
 
+#[cfg(feature = "server")]
 impl Default for DefaultAgentForwardHandler {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "server")]
 impl DefaultAgentForwardHandler {
     /// Build a fresh handler that picks a parent directory at `setup` time
     /// (`$XDG_RUNTIME_DIR` if set, otherwise `/tmp`).
@@ -116,6 +141,7 @@ impl DefaultAgentForwardHandler {
     }
 }
 
+#[cfg(feature = "server")]
 impl AgentForwardHandler for DefaultAgentForwardHandler {
     fn setup(&self, _user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle> {
         let parent = self.resolve_parent();
@@ -220,6 +246,7 @@ fn spawn_unix_splice(uds: UnixStream, stream: ChannelStream) {
 
 /// Build a fresh per-session socket path under `parent`. The hex suffix is
 /// drawn from [`OsRng`] so concurrent sessions don't collide.
+#[cfg(feature = "server")]
 fn mint_socket_path(parent: &Path) -> Result<PathBuf> {
     let mut entropy = [0u8; 8];
     OsRng.fill_bytes(&mut entropy);
@@ -269,6 +296,7 @@ pub fn splice_to_local_agent_callback() -> Option<Arc<dyn Fn(ChannelStream) + Se
     splice_to_unix_socket_callback(PathBuf::from(raw))
 }
 
+#[cfg(feature = "server")]
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -279,7 +307,9 @@ fn hex_encode(bytes: &[u8]) -> String {
     out
 }
 
-#[cfg(test)]
+// Tests exercise `DefaultAgentForwardHandler` and the agent-forward context,
+// both of which are server-side; gate them to match.
+#[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
 

@@ -65,9 +65,17 @@ compcol = { version = "0.4.2", default-features = false, features = ["alloc", "z
 nix = { version = "0.30", default-features = false, features = [
     "process", "signal", "term", "fs", "ioctl", "user",
 ] }
-# Pulled in only when the `pam` feature is on (default) AND we're on Unix.
+
+# `pam-client2` is gated to **Linux only**, not all of `cfg(unix)`.
+# Upstream `pam-client2 0.5.5` references Linux-PAM constants
+# (`PAM_CONV_AGAIN`, `PAM_INCOMPLETE`) that OpenPAM (macOS / *BSD) does not
+# expose, so the crate fails to compile there. Confining the dep to Linux
+# keeps `cargo build --all-features` green on macOS, at the cost of PAM
+# session integration being a Linux-only feature for now.
+#
 # `default-features = false` drops the `cli` feature (which would pull in
 # `rpassword`) — the sshd binary is a non-interactive PAM consumer.
+[target.'cfg(target_os = "linux")'.dependencies]
 pam-client2 = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]

@@ -37,7 +37,21 @@
 
 #![cfg(feature = "std")]
 
+// Agent and X11 forwarding depend on Unix-domain sockets and Unix-only
+// permission bits; gate them out on Windows. The other two modules
+// (direct-tcpip, reverse port-forward) are TCP-only and stay portable.
+//
+// `direct` and `reverse` are entirely server-side handlers (no client-
+// callable helpers), so they're additionally gated on `feature = "server"`.
+// `agent` and `x11` straddle the line: their `Default*Handler` types are
+// server-only, but they also expose `splice_to_local_*_callback` helpers the
+// client binary uses, so each file uses per-item `#[cfg(feature = "server")]`
+// internally rather than a single module-level gate.
+#[cfg(unix)]
 pub mod agent;
+#[cfg(feature = "server")]
 pub mod direct;
+#[cfg(feature = "server")]
 pub mod reverse;
+#[cfg(unix)]
 pub mod x11;

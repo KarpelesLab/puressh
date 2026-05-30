@@ -32,6 +32,14 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
+      # `pam-client2` (gated to Linux in Cargo.toml) links against libpam,
+      # so the Ubuntu runner needs the dev headers + shared library before
+      # any `--all-features` build. macOS and Windows don't see the dep at
+      # all (target-conditional) so nothing extra is needed there.
+      - name: Install libpam (Linux only)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
       - name: Format
         if: runner.os == 'Linux' # formatting is platform-independent
         run: cargo fmt --all --check
@@ -96,6 +104,9 @@ jobs:
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
+
+      - name: Install libpam (for --all-features doc build)
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
 
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features

@@ -526,6 +526,24 @@ fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
     }
 }
 
+/// Receive-window credit, under an already-held [`Inner`] lock guard,
+/// for `n` bytes that the consumer just drained out of its channel's
+/// mailbox. If the connection-state asks us to emit a
+/// `SSH_MSG_CHANNEL_WINDOW_ADJUST`, that payload is written here. This
+/// is the **single point** at which window credit goes back to the
+/// peer — the pumper deliberately does not credit on enqueue, so a
+/// reader that stops draining lets the SSH per-channel window cap the
+/// in-memory mailbox at the initial window size.
+fn replenish_under_lock(g: &mut Inner, channel: u32, n: u32) -> std::io::Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    if let Some(adj) = g.client.conn.replenish_window(channel, n).map_err(io_err)? {
+        g.client.write_payload(&adj).map_err(io_err)?;
+    }
+    Ok(())
+}
+
 /// Read+Write adapter wrapping a single open channel on a
 /// [`SharedClient`]. Locks the underlying mutex on every operation and
 /// pumps the wire as needed, queuing inbound packets for other channels
@@ -540,41 +558,39 @@ pub struct OwnedChannelStream {
     local_close_sent: bool,
 }
 
+/// Which queue inside a [`ChannelQueue`] a drain or stash should target.
+#[derive(Clone, Copy)]
+enum Stream {
+    /// `SSH_MSG_CHANNEL_DATA` — stdout / main payload.
+    Data,
+    /// `SSH_MSG_CHANNEL_EXTENDED_DATA` — stderr (the only extended type
+    /// SSH currently defines).
+    Stderr,
+}
+
 impl OwnedChannelStream {
-    /// Drain bytes from our channel's queue into `buf`. Returns the
-    /// number of bytes written. Caller is responsible for window
-    /// replenishment.
-    fn drain_into(queue: &mut ChannelQueue, buf: &mut [u8]) -> usize {
-        let n = core::cmp::min(buf.len(), queue.data.len());
+    /// Drain bytes from the chosen stream of the given channel queue
+    /// into `buf`. Returns the number of bytes written. Caller is
+    /// responsible for window replenishment.
+    fn drain_into(queue: &mut ChannelQueue, stream: Stream, buf: &mut [u8]) -> usize {
+        let src = match stream {
+            Stream::Data => &mut queue.data,
+            Stream::Stderr => &mut queue.stderr,
+        };
+        let n = core::cmp::min(buf.len(), src.len());
         for slot in buf.iter_mut().take(n) {
-            *slot = queue.data.pop_front().unwrap();
+            *slot = src.pop_front().unwrap();
         }
         n
     }
 
-    /// Pump exactly one packet off the wire under an already-held
-    /// [`Inner`] lock guard, decode it, and file the resulting event
-    /// into the right mailbox via [`dispatch_event`] (which also wakes
-    /// any waiter sleeping on that channel's notifier).
+    /// Shared body for `Read::read` (stdout) and [`read_stderr`]
+    /// (stderr). Drains from the chosen [`Stream`] or pumps until data
+    /// arrives, replenishing the receive window for whatever it
+    /// drained — the single backpressure point.
     ///
-    /// Does **not** replenish the receive window — the drain path in
-    /// [`Read::read`] owns that, so the SSH per-channel window can
-    /// backpressure the peer if no one is reading.
-    ///
-    /// Does **not** auto-ack peer CLOSE. Local CLOSE is emitted from
-    /// [`OwnedChannelStream`]'s [`Drop`] only, which keeps the wire
-    /// emission rule trivially safe (one CLOSE per stream, period) and
-    /// avoids a double-close race between the pumper and Drop.
-    fn pump_one_step(g: &mut Inner) -> std::io::Result<()> {
-        let payload = g.client.read_one_packet().map_err(io_err)?;
-        let ev = g.client.conn.on_packet(&payload).map_err(io_err)?;
-        dispatch_event(g, ev);
-        Ok(())
-    }
-}
-
-impl Read for OwnedChannelStream {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    /// [`read_stderr`]: Self::read_stderr
+    fn read_stream(&mut self, stream: Stream, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -582,18 +598,16 @@ impl Read for OwnedChannelStream {
         loop {
             // 1. Drain our mailbox if non-empty.
             let queue = g.queues.entry(self.channel).or_default();
-            if !queue.data.is_empty() {
-                let n = Self::drain_into(queue, buf);
+            let avail = match stream {
+                Stream::Data => !queue.data.is_empty(),
+                Stream::Stderr => !queue.stderr.is_empty(),
+            };
+            if avail {
+                let n = Self::drain_into(queue, stream, buf);
                 // Single point of receive-window credit: replenish only
-                // for what we just drained.
-                if let Some(adj) = g
-                    .client
-                    .conn
-                    .replenish_window(self.channel, n as u32)
-                    .map_err(io_err)?
-                {
-                    g.client.write_payload(&adj).map_err(io_err)?;
-                }
+                // for what we just drained. Extended-data shares the
+                // same window as data per RFC 4254.
+                replenish_under_lock(&mut g, self.channel, n as u32)?;
                 return Ok(n);
             }
             // 2. EOF for our channel (with no buffered bytes) is the
@@ -623,6 +637,44 @@ impl Read for OwnedChannelStream {
                 g = cv.wait_timeout(g, WAIT_TIMEOUT).expect(POISONED).0;
             }
         }
+    }
+
+    /// Read from the stderr (extended-data) side of this channel.
+    /// Same semantics as [`Read::read`] but drains the channel's
+    /// `SSH_MSG_CHANNEL_EXTENDED_DATA` stream instead of the main one.
+    ///
+    /// Backpressure: the receive-window credit is shared between data
+    /// and stderr per RFC 4254 §5.2, so calling this drains the same
+    /// pool that `read` does — a consumer that ignores stderr will
+    /// eventually stall the data side too. Read both, or read neither.
+    pub fn read_stderr(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_stream(Stream::Stderr, buf)
+    }
+
+    /// Pump exactly one packet off the wire under an already-held
+    /// [`Inner`] lock guard, decode it, and file the resulting event
+    /// into the right mailbox via [`dispatch_event`] (which also wakes
+    /// any waiter sleeping on that channel's notifier).
+    ///
+    /// Does **not** replenish the receive window — the drain path in
+    /// [`Read::read`] owns that, so the SSH per-channel window can
+    /// backpressure the peer if no one is reading.
+    ///
+    /// Does **not** auto-ack peer CLOSE. Local CLOSE is emitted from
+    /// [`OwnedChannelStream`]'s [`Drop`] only, which keeps the wire
+    /// emission rule trivially safe (one CLOSE per stream, period) and
+    /// avoids a double-close race between the pumper and Drop.
+    fn pump_one_step(g: &mut Inner) -> std::io::Result<()> {
+        let payload = g.client.read_one_packet().map_err(io_err)?;
+        let ev = g.client.conn.on_packet(&payload).map_err(io_err)?;
+        dispatch_event(g, ev);
+        Ok(())
+    }
+}
+
+impl Read for OwnedChannelStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_stream(Stream::Data, buf)
     }
 }
 
@@ -854,7 +906,7 @@ mod tests {
         let mut q = ChannelQueue::default();
         q.data.extend(b"hello".iter().copied());
         let mut buf = [0u8; 3];
-        let n = OwnedChannelStream::drain_into(&mut q, &mut buf);
+        let n = OwnedChannelStream::drain_into(&mut q, Stream::Data, &mut buf);
         assert_eq!(n, 3);
         assert_eq!(&buf, b"hel");
         assert_eq!(q.data.iter().copied().collect::<Vec<_>>(), b"lo");
@@ -865,10 +917,24 @@ mod tests {
         let mut q = ChannelQueue::default();
         q.data.extend(b"hi".iter().copied());
         let mut buf = [0u8; 8];
-        let n = OwnedChannelStream::drain_into(&mut q, &mut buf);
+        let n = OwnedChannelStream::drain_into(&mut q, Stream::Data, &mut buf);
         assert_eq!(n, 2);
         assert_eq!(&buf[..2], b"hi");
         assert!(q.data.is_empty());
+    }
+
+    #[test]
+    fn drain_into_stderr() {
+        let mut q = ChannelQueue::default();
+        q.stderr.extend(b"err".iter().copied());
+        q.data.extend(b"std".iter().copied());
+        let mut buf = [0u8; 8];
+        let n = OwnedChannelStream::drain_into(&mut q, Stream::Stderr, &mut buf);
+        assert_eq!(n, 3);
+        assert_eq!(&buf[..3], b"err");
+        assert!(q.stderr.is_empty());
+        // Data side untouched.
+        assert_eq!(q.data.iter().copied().collect::<Vec<_>>(), b"std");
     }
 
     #[test]

@@ -708,6 +708,11 @@ fn attrs_from_metadata(md: &fs::Metadata) -> Attrs {
 /// hostile uploader from planting suid binaries; the high file-type bits
 /// (0o170000) are always stripped because the syscalls below take just the
 /// permission portion.
+///
+/// Only the Unix code paths apply uploaded modes (Windows ignores the
+/// permission bits entirely), so gate the helper to `cfg(unix)` to avoid a
+/// dead-code lint on Windows.
+#[cfg(unix)]
 fn mask_mode(mode: u32, allow_special_bits: bool) -> u32 {
     if allow_special_bits {
         mode & 0o7777

@@ -75,8 +75,9 @@ pub mod defaults {
     /// (`kex-strict-{c,s}-v00@openssh.com`) are *signalling* names rather
     /// than negotiable algorithms — they tell the peer this side supports
     /// strict-kex (Terrapin / CVE-2023-48795). They are intentionally last
-    /// so they cannot win the negotiation; the [`super::negotiate`] picker
-    /// also skips them when choosing a real KEX.
+    /// so they cannot win the negotiation; the
+    /// [`crate::transport::kexinit::negotiate`] picker also skips them when
+    /// choosing a real KEX.
     pub const KEX: &[&str] = &[
         "curve25519-sha256",
         "curve25519-sha256@libssh.org",

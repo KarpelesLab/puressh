@@ -34,8 +34,8 @@ static ALLOW_RSA_SHA1: AtomicBool = AtomicBool::new(false);
 /// Opt in (or out) of the legacy `ssh-rsa` (SHA-1) signature algorithm
 /// process-wide.
 ///
-/// See [`ALLOW_RSA_SHA1`] for the rationale. The default is `false` and
-/// callers should leave it that way unless they have a concrete interop
+/// See the `ALLOW_RSA_SHA1` static for the rationale. The default is `false`
+/// and callers should leave it that way unless they have a concrete interop
 /// requirement.
 pub fn set_allow_rsa_sha1(allow: bool) {
     ALLOW_RSA_SHA1.store(allow, Ordering::Relaxed);

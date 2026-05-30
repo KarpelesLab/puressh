@@ -118,9 +118,10 @@ impl ChannelStream {
     /// constructors / sub-takers can compose without an `unreachable!`.
     ///
     /// Today this always returns `Some(_)` for a `ChannelStream` produced
-    /// by [`Self::new`], because the only path that nulls `rx` / `tx` is
-    /// `into_raw` itself, which consumes the value. Defensive callers
-    /// that prefer a `?` over a panic should use this method.
+    /// by the internal `new` constructor, because the only path that nulls
+    /// `rx` / `tx` is `into_raw` itself, which consumes the value.
+    /// Defensive callers that prefer a `?` over a panic should use this
+    /// method.
     #[allow(clippy::type_complexity)] // mirrors `into_raw`'s public tuple
     pub fn try_into_raw(
         mut self,

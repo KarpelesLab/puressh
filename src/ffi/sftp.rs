@@ -83,7 +83,8 @@ pub const PCSSH_ATTR_ACMODTIME: u32 = 0x0000_0008;
 /// Opaque SFTP session handle. Multiple per `PcSshClient` are supported.
 ///
 /// Holds an `Arc<SftpCell>` rather than the `SftpSession` directly so
-/// child file/dir handles can detect a freed parent (see [`SftpCell`]).
+/// child file/dir handles can detect a freed parent (see the private
+/// `SftpCell` alias above).
 pub struct PcSshSftp {
     inner: Arc<SftpCell>,
 }

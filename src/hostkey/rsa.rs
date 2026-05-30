@@ -102,6 +102,15 @@ fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, usize)> {
     if n.is_zero() {
         return Err(Error::Format("rsa: zero modulus"));
     }
+    // Enforce a 2048-bit minimum modulus. purecrypto's BoxedRsaPublicKey
+    // accepts anything down to ~1024 bits, but 1024-bit RSA is considered
+    // broken for SSH host-key authentication (NIST SP 800-131A withdrew it
+    // and OpenSSH 7.6+ rejects shorter-than-2048 by default). We refuse
+    // here at parse time rather than at verify time so callers cannot hold
+    // a `dyn HostKeyVerify` for a key that will never be safely usable.
+    if n.bit_len() < 2048 {
+        return Err(Error::Format("rsa: modulus shorter than 2048 bits"));
+    }
     let k = n.bit_len().div_ceil(8);
     let pk = BoxedRsaPublicKey::try_new(n, e)
         .map_err(|_| Error::Format("rsa: modulus out of accepted range"))?;
@@ -345,6 +354,29 @@ mod tests {
             pk.verify(b"x", &bad.into_vec()),
             Err(Error::Format(_))
         ));
+    }
+
+    #[test]
+    fn rsa_parse_rejects_short_modulus() {
+        // 1024-bit modulus encoded as a public blob: must be refused by the
+        // 2048-bit floor in parse_rsa_public_blob.
+        let mut n_bytes = alloc::vec![0u8; 128];
+        n_bytes[0] = 0xc0;
+        for (i, b) in n_bytes.iter_mut().enumerate().skip(1) {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7) | 0x01;
+        }
+        let n = BoxedUint::from_be_bytes(&n_bytes);
+        let e = BoxedUint::from_u64(65537);
+        let hk = RsaSha2_256HostKey::from_public_components(n, e).unwrap();
+        let blob = hk.public_blob();
+        match RsaSha2_256HostKey::from_public_blob(&blob) {
+            Err(Error::Format(msg)) => assert!(
+                msg.contains("2048"),
+                "expected 2048-bit floor error, got {msg:?}"
+            ),
+            Err(other) => panic!("expected Format(2048), got {other:?}"),
+            Ok(_) => panic!("expected 1024-bit modulus to be rejected"),
+        }
     }
 
     #[test]

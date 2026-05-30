@@ -146,15 +146,33 @@ impl AgentForwardHandler for DefaultAgentForwardHandler {
     fn setup(&self, _user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle> {
         let parent = self.resolve_parent();
         let socket_path = mint_socket_path(&parent)?;
-        // Make sure no stale file is in the way (a previous crash, a name
-        // collision, etc.). Best-effort: bind() will fail loudly if this
-        // turns out to be an in-use socket.
-        let _ = std::fs::remove_file(&socket_path);
+        // Don't unlink-then-bind: a `remove_file` followed by `bind` opens a
+        // narrow window where an attacker (or a buggy peer) can swap a
+        // symlink into place pointing at /etc/passwd, $HOME/.ssh/, etc., and
+        // have the subsequent `bind` walk the symlink. The 64 bits of OsRng
+        // entropy in `mint_socket_path` make a benign collision astronomically
+        // unlikely, so the safe move is to skip the pre-bind unlink entirely
+        // and let `bind` fail with EADDRINUSE on the (theoretical) collision.
+        //
+        // The one case worth handling explicitly: if `mint_socket_path`
+        // *did* collide with an existing path AND that path is a symlink,
+        // bail immediately rather than letting `bind` walk the symlink. A
+        // regular-file collision is still safe — `bind` will refuse it with
+        // EADDRINUSE / EEXIST, which propagates up as an error.
+        if let Ok(meta) = std::fs::symlink_metadata(&socket_path) {
+            if meta.file_type().is_symlink() {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "agent-forward: refusing to bind over a symlink at the per-session socket path",
+                )));
+            }
+        }
 
         let listener = UnixListener::bind(&socket_path)?;
         listener.set_nonblocking(true)?;
-        // Lock the socket file down to the owner. UnixListener::bind honours
-        // the process umask, which we don't trust to be tight enough.
+        // Belt-and-braces: UnixListener::bind honours the process umask, which
+        // we don't trust to be tight enough. Lock the socket down to the owner
+        // immediately after bind.
         let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
 
         let stop = Arc::new(AtomicBool::new(false));

@@ -34,6 +34,7 @@ use purecrypto::rng::OsRng;
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
 use puressh::known_hosts::format::format_entry;
 use puressh::known_hosts::KnownHosts;
+use zeroize::Zeroizing;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -168,9 +169,26 @@ fn write_public(path: &str, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn read_passphrase_interactive(prompt: &str) -> Result<String, String> {
+/// Prompt the user for a passphrase. Returns a [`Zeroizing<String>`] so
+/// the buffer is wiped on drop; on Unix tty inputs the terminal echo
+/// bit is cleared via `tcsetattr` and restored via a `Drop` guard,
+/// matching OpenSSH ssh-keygen behaviour.
+fn read_passphrase_interactive(prompt: &str) -> Result<Zeroizing<String>, String> {
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
+
+    #[cfg(unix)]
+    {
+        if let Some(out) =
+            read_passphrase_no_echo_unix().map_err(|e| format!("read passphrase: {e}"))?
+        {
+            return Ok(out);
+        }
+    }
+
+    // Non-Unix or non-tty: announce the echo gap once, then read with echo.
+    eprintln!();
+    eprintln!("(warning: terminal echo could not be disabled; passphrase will be visible)");
     let mut s = String::new();
     let mut byte = [0u8; 1];
     let mut stdin = std::io::stdin();
@@ -179,10 +197,7 @@ fn read_passphrase_interactive(prompt: &str) -> Result<String, String> {
         let n = stdin
             .read(&mut byte)
             .map_err(|e| format!("read passphrase: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
+        if n == 0 || byte[0] == b'\n' {
             break;
         }
         if byte[0] == b'\r' {
@@ -193,7 +208,58 @@ fn read_passphrase_interactive(prompt: &str) -> Result<String, String> {
             break;
         }
     }
-    Ok(s)
+    Ok(Zeroizing::new(s))
+}
+
+#[cfg(unix)]
+fn read_passphrase_no_echo_unix() -> std::io::Result<Option<Zeroizing<String>>> {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    // SAFETY: zero-init is the documented way to allocate termios.
+    let mut term: libc::termios = unsafe { core::mem::zeroed() };
+    // SAFETY: fd valid (stdin), term writable.
+    if unsafe { libc::tcgetattr(fd, &mut term as *mut _) } != 0 {
+        return Ok(None);
+    }
+    let original = term;
+
+    struct EchoGuard {
+        fd: libc::c_int,
+        original: libc::termios,
+    }
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            // SAFETY: original captured from a successful tcgetattr.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+        }
+    }
+
+    term.c_lflag &= !libc::ECHO;
+    // SAFETY: term valid (derived via tcgetattr).
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+        return Ok(None);
+    }
+    let _guard = EchoGuard { fd, original };
+
+    let mut s = String::new();
+    let mut byte = [0u8; 1];
+    let mut stdin = std::io::stdin();
+    let max_len = 4096usize;
+    loop {
+        let n = stdin.read(&mut byte)?;
+        if n == 0 || byte[0] == b'\n' {
+            break;
+        }
+        if byte[0] == b'\r' {
+            continue;
+        }
+        s.push(byte[0] as char);
+        if s.len() > max_len {
+            break;
+        }
+    }
+    eprintln!();
+    Ok(Some(Zeroizing::new(s)))
 }
 
 fn algorithm_label(pk: &PublicKey) -> &'static str {
@@ -348,8 +414,8 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
         Err(e) => return Err(format!("parse {file}: {e}")),
     };
 
-    let new_pass = if args.new_pass_set {
-        args.new_pass.clone().unwrap_or_default()
+    let new_pass: Zeroizing<String> = if args.new_pass_set {
+        Zeroizing::new(args.new_pass.clone().unwrap_or_default())
     } else {
         read_passphrase_interactive("Enter new passphrase: ")?
     };

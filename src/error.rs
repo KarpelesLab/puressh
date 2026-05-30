@@ -36,6 +36,11 @@ pub enum Error {
     Io(std::io::Error),
     /// Error originating from the `purecrypto` backend.
     Crypto(&'static str),
+    /// A configuration value supplied to the library was internally
+    /// inconsistent or insufficient (e.g. a `HostKeyPolicy::KnownHosts`
+    /// without a connect target). Distinct from `Protocol` so callers can
+    /// tell "I configured this wrong" from "the peer is misbehaving".
+    Config(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -55,6 +60,7 @@ impl fmt::Display for Error {
             #[cfg(feature = "std")]
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Crypto(s) => write!(f, "crypto: {s}"),
+            Error::Config(s) => write!(f, "config error: {s}"),
         }
     }
 }

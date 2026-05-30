@@ -548,6 +548,11 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
             save_path: save_path_opt,
             hash_new: hash_new != 0,
             on_unknown,
+            // FFI callers that want loud-but-permissive mismatch can
+            // upgrade to a future pcssh_client_connect_known_hosts_ex
+            // taking an on_mismatch action; the default here matches
+            // OpenSSH's `StrictHostKeyChecking=yes` for mismatches.
+            on_mismatch: TofuAction::Reject,
         };
 
         let cfg = Config {

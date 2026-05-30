@@ -15,6 +15,7 @@
 use core::ffi::{c_char, c_int};
 use core::ptr;
 use std::slice;
+use std::sync::Mutex;
 
 use super::common::{
     catch, cstr_to_str, map_error, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC,
@@ -33,10 +34,21 @@ pub const PCSSH_AGENT_RSA_SHA2_512: u32 = 4;
 ///
 /// Holds the underlying [`Agent`] plus a cached identity vector built
 /// lazily on the first call to [`pcssh_agent_identity_count`].
+///
+/// Thread-safety: this handle is intended to be shareable between C
+/// threads (it is `Send + Sync` because the interior `Agent` is owned
+/// behind a `Mutex`). Concurrent calls from multiple threads serialize
+/// at the `Mutex`; without it, two threads calling `pcssh_agent_sign`
+/// on the same handle would race on the underlying Unix socket and
+/// interleave request/reply frames. We surface a poisoned mutex as
+/// `PCSSH_ERR_GENERIC` — the underlying socket is now in an unknown
+/// state and the caller should free the handle and reconnect.
 pub struct PcSshAgent {
-    inner: Agent,
-    /// Cached identities; `None` until populated.
-    identities: Option<Vec<AgentIdentity>>,
+    inner: Mutex<Agent>,
+    /// Cached identities; `None` until populated. Behind the same mutex
+    /// as `inner` so cache reads and refreshes can't interleave with an
+    /// in-flight sign on another thread.
+    identities: Mutex<Option<Vec<AgentIdentity>>>,
 }
 
 /// Connect to an ssh-agent at the Unix socket `path`.
@@ -64,8 +76,8 @@ pub unsafe extern "C" fn pcssh_agent_connect(
         match Agent::connect(path_s) {
             Ok(agent) => {
                 let boxed = Box::new(PcSshAgent {
-                    inner: agent,
-                    identities: None,
+                    inner: Mutex::new(agent),
+                    identities: Mutex::new(None),
                 });
                 // SAFETY: out non-NULL.
                 unsafe { *out = Box::into_raw(boxed) };
@@ -95,8 +107,8 @@ pub unsafe extern "C" fn pcssh_agent_connect_env(out: *mut *mut PcSshAgent) -> c
             Ok(None) => PCSSH_OK, // *out stays NULL
             Ok(Some(agent)) => {
                 let boxed = Box::new(PcSshAgent {
-                    inner: agent,
-                    identities: None,
+                    inner: Mutex::new(agent),
+                    identities: Mutex::new(None),
                 });
                 // SAFETY: out non-NULL.
                 unsafe { *out = Box::into_raw(boxed) };
@@ -124,16 +136,29 @@ pub unsafe extern "C" fn pcssh_agent_identity_count(
         if agent.is_null() || out_count.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: agent non-NULL per check.
-        let a = unsafe { &mut *agent };
-        if a.identities.is_none() {
-            match a.inner.identities() {
-                Ok(ids) => a.identities = Some(ids),
+        // SAFETY: agent non-NULL per check; handle is `Sync` and lives
+        // for the call so a shared reference is sound.
+        let a = unsafe { &*agent };
+        let mut ids_guard = match a.identities.lock() {
+            Ok(g) => g,
+            Err(_) => return PCSSH_ERR_GENERIC,
+        };
+        if ids_guard.is_none() {
+            // Hold the cache lock while we round-trip — otherwise two
+            // threads could each push a list. The inner socket lock is
+            // taken separately and dropped before we return so a parallel
+            // `sign()` is only blocked for one wire RTT.
+            let mut inner = match a.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return PCSSH_ERR_GENERIC,
+            };
+            match inner.identities() {
+                Ok(ids) => *ids_guard = Some(ids),
                 Err(e) => return map_error(&e),
             }
         }
         // SAFETY: out_count non-NULL.
-        unsafe { *out_count = a.identities.as_ref().map(|v| v.len()).unwrap_or(0) };
+        unsafe { *out_count = ids_guard.as_ref().map(|v| v.len()).unwrap_or(0) };
         PCSSH_OK
     })
 }
@@ -153,8 +178,12 @@ pub unsafe extern "C" fn pcssh_agent_refresh_identities(agent: *mut PcSshAgent) 
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: agent non-NULL per check.
-        let a = unsafe { &mut *agent };
-        a.identities = None;
+        let a = unsafe { &*agent };
+        let mut g = match a.identities.lock() {
+            Ok(g) => g,
+            Err(_) => return PCSSH_ERR_GENERIC,
+        };
+        *g = None;
         PCSSH_OK
     })
 }
@@ -204,7 +233,11 @@ pub unsafe extern "C" fn pcssh_agent_identity(
         }
         // SAFETY: agent non-NULL.
         let a = unsafe { &*agent };
-        let ids = match a.identities.as_ref() {
+        let ids_guard = match a.identities.lock() {
+            Ok(g) => g,
+            Err(_) => return PCSSH_ERR_GENERIC,
+        };
+        let ids = match ids_guard.as_ref() {
             Some(v) => v,
             None => return PCSSH_ERR_GENERIC,
         };
@@ -299,11 +332,16 @@ pub unsafe extern "C" fn pcssh_agent_sign(
         };
 
         // SAFETY: agent non-NULL.
-        let a = unsafe { &mut *agent };
-        let sig = match a.inner.sign(key_slice, data_slice, flags) {
+        let a = unsafe { &*agent };
+        let mut inner = match a.inner.lock() {
+            Ok(g) => g,
+            Err(_) => return PCSSH_ERR_GENERIC,
+        };
+        let sig = match inner.sign(key_slice, data_slice, flags) {
             Ok(s) => s,
             Err(e) => return map_error(&e),
         };
+        drop(inner);
         let need = sig.len();
         // SAFETY: sig_len non-NULL.
         unsafe { *sig_len = need };

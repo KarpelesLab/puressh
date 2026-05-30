@@ -357,8 +357,10 @@ fn run() -> Result<i32, String> {
     };
 
     if !authed {
-        // v0 limitation: password input is echoed to the terminal — there is no
-        // portable in-tree way to disable terminal echo without adding a dep.
+        // Password reader honors $SSH_ASKPASS and suppresses terminal echo
+        // on Unix via termios (see src/bin/common.rs). On Windows / when the
+        // tty layer is unavailable, the user is warned and a plain read is
+        // used as a last resort.
         let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
         client
             .authenticate_password(&user, &password)
@@ -592,7 +594,7 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
                 "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial".to_string()
             })?;
             handlers = handlers.with_x11(cb);
-            let cookie = mint_x11_cookie();
+            let cookie = mint_x11_cookie()?;
             let id = client
                 .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", &cookie, 0)
                 .map_err(|e| format!("x11-forward session: {e}"))?;
@@ -693,30 +695,33 @@ fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: 
 /// list`; we don't yet, so untrusted (`-X`) and trusted (`-Y`) currently
 /// share the same generated cookie.
 ///
+/// Security: this is a credential. We seed it strictly from purecrypto's
+/// `OsRng` (the same CSPRNG the rest of the crate uses for session keys).
+/// We deliberately do NOT mix in PID + wall-clock nanoseconds as a fallback
+/// — those are low-entropy and would mask an underlying RNG fault. If the
+/// OS RNG isn't available `OsRng::fill_bytes` panics, which is the only
+/// safe behaviour: we cannot forward X11 with a guessable cookie.
+///
 /// X11 forwarding is Unix-only (the channel handlers depend on Unix-domain
 /// sockets), so this helper is too — gating keeps Windows builds clean.
 #[cfg(unix)]
-fn mint_x11_cookie() -> String {
+fn mint_x11_cookie() -> Result<String, String> {
+    use purecrypto::rng::{OsRng, RngCore};
     let mut bytes = [0u8; 16];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = std::io::Read::read_exact(&mut f, &mut bytes);
+    OsRng.fill_bytes(&mut bytes);
+    // Defence in depth: if for some reason `fill_bytes` returned a buffer
+    // of all-zero bytes (i.e. the OS RNG produced nothing observable), bail
+    // rather than emit a known-weak cookie. A 16-byte all-zero read from a
+    // healthy CSPRNG has probability 2^-128, so this only catches "RNG is
+    // returning a fixed value" type faults, not legitimate output.
+    if bytes.iter().all(|&b| b == 0) {
+        return Err("x11 cookie: OS RNG returned all-zero entropy; refusing to forward".into());
     }
-    // Mix in PID + nanosecond clock just in case /dev/urandom fell short.
-    // 32 bits per source is plenty here — the cookie is opaque to us.
-    let pid = std::process::id();
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    bytes[0] ^= (pid & 0xff) as u8;
-    bytes[1] ^= ((pid >> 8) & 0xff) as u8;
-    bytes[2] ^= (nanos & 0xff) as u8;
-    bytes[3] ^= ((nanos >> 8) & 0xff) as u8;
     let mut s = String::with_capacity(32);
     for b in bytes {
         s.push_str(&format!("{b:02x}"));
     }
-    s
+    Ok(s)
 }
 
 fn main() -> ExitCode {

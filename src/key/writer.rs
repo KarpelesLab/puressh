@@ -17,6 +17,7 @@ use purecrypto::kdf::bcrypt_pbkdf;
 use purecrypto::rng::OsRng;
 use purecrypto::rng::{CryptoRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
+use zeroize::Zeroizing;
 
 use super::{base64, PrivateKey, PublicKey, MAGIC};
 use crate::error::{Error, Result};
@@ -37,7 +38,15 @@ const PEM_BEGIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
 const PEM_END: &str = "-----END OPENSSH PRIVATE KEY-----";
 const PEM_WRAP: usize = 70;
 
-const BCRYPT_ROUNDS: u32 = 16;
+/// `bcrypt_pbkdf` round count for new encrypted private keys. OpenSSH 9.x
+/// defaults to 16; we bump to 24 so a single derivation costs ~50% more
+/// CPU than upstream, matching `ssh-keygen -a 24`. This is a one-shot
+/// hit at key-load time and well within the seconds-per-attempt range a
+/// brute-forcer would face, but it noticeably slows offline cracking of
+/// a leaked private key file. Existing keys keep whatever round count
+/// they were originally written with — only re-encrypt operations (key
+/// generation or `ssh-keygen -p`) pick up the new default.
+const BCRYPT_ROUNDS: u32 = 24;
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 const IV_LEN: usize = 16;
@@ -177,11 +186,22 @@ impl PrivateKey {
             let pass = passphrase.expect("checked above");
             let mut salt = [0u8; SALT_LEN];
             rng.fill_bytes(&mut salt);
-            let derived = bcrypt_pbkdf(pass, &salt, BCRYPT_ROUNDS, KEY_LEN + IV_LEN)
-                .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?;
-            let mut key = [0u8; KEY_LEN];
+            // `derived` is a wrapping passphrase-equivalent secret: from
+            // it you can reconstruct the AES key and IV that protect the
+            // private key blob. Wrap in `Zeroizing` so it is wiped from
+            // memory at scope exit — without this it would linger in the
+            // heap until the allocator reused the slot.
+            let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
+                bcrypt_pbkdf(pass, &salt, BCRYPT_ROUNDS, KEY_LEN + IV_LEN)
+                    .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
+            );
+            // `key` and `iv` are derived material too; wrap so the stack
+            // copies are wiped when the block ends. The `Aes256` instance
+            // takes a copy internally but that is owned by the Ctr cipher
+            // and dropped at end of scope; the copies we hold are wiped.
+            let mut key: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new([0u8; KEY_LEN]);
             key.copy_from_slice(&derived[..KEY_LEN]);
-            let mut iv = [0u8; IV_LEN];
+            let mut iv: Zeroizing<[u8; IV_LEN]> = Zeroizing::new([0u8; IV_LEN]);
             iv.copy_from_slice(&derived[KEY_LEN..KEY_LEN + IV_LEN]);
             let mut buf = inner;
             let mut ctr = Ctr::new(Aes256::new(&key), &iv);

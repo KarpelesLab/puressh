@@ -43,13 +43,15 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(unix)]
 mod imp {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::ffi::OsStr;
+    use std::net::IpAddr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, ExitCode};
-    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
 
     use nix::errno::Errno;
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
@@ -67,7 +69,7 @@ mod imp {
     use puressh::server::{
         handle_session, AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult,
         ExecStreamHandler, PtySpec, SessionEnv, ShellExitStatus, ShellHandler, ShellSession,
-        SubsystemHandler,
+        SubsystemHandler, HARD_BLOCKED_ENV_NAMES,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -77,7 +79,9 @@ mod imp {
                          [-A authorized_keys_file] [-u allowed_user]... \
                          [--no-sftp] [--sftp-read-only] [--sftp-root PATH] \
                          [--no-scp] [--no-agent-forward] [--no-x11-forward] \
-                         [--no-strict-modes] [--debug-commands]";
+                         [--no-strict-modes] [--debug-commands] \
+                         [--accept-env GLOB]... [--login-grace-time SECONDS] \
+                         [--max-startups N] [--per-source-max N]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -276,6 +280,18 @@ mod imp {
         /// `--debug-commands`: log full exec command lines (otherwise
         /// only the first whitespace token is logged in debug mode).
         debug_commands: bool,
+        /// `--accept-env GLOB`: OpenSSH-style env name allowlist; can be
+        /// repeated, supports `*`/`?` wildcards. Empty = drop everything.
+        accept_env: Vec<String>,
+        /// `--login-grace-time SECONDS`: pre-auth inactivity timeout
+        /// applied to the connection's read side. 0 disables.
+        login_grace_time: u32,
+        /// `--max-startups N`: cap on concurrent unauthenticated /
+        /// authenticated children (0 = unlimited).
+        max_startups: u32,
+        /// `--per-source-max N`: cap on simultaneous connections from any
+        /// single peer IP (0 = unlimited).
+        per_source_max: u32,
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -292,6 +308,10 @@ mod imp {
         let mut x11_forward = true;
         let mut strict_modes = true;
         let mut debug_commands = false;
+        let mut accept_env: Vec<String> = Vec::new();
+        let mut login_grace_time: u32 = 120;
+        let mut max_startups: u32 = 100;
+        let mut per_source_max: u32 = 10;
 
         let mut i = 0;
         while i < args.len() {
@@ -330,6 +350,32 @@ mod imp {
                 "--no-x11-forward" => x11_forward = false,
                 "--no-strict-modes" => strict_modes = false,
                 "--debug-commands" => debug_commands = true,
+                "--accept-env" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("--accept-env requires a value")?.clone();
+                    accept_env.push(v);
+                }
+                "--login-grace-time" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("--login-grace-time requires a value")?;
+                    login_grace_time = v
+                        .parse::<u32>()
+                        .map_err(|_| "invalid --login-grace-time".to_string())?;
+                }
+                "--max-startups" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("--max-startups requires a value")?;
+                    max_startups = v
+                        .parse::<u32>()
+                        .map_err(|_| "invalid --max-startups".to_string())?;
+                }
+                "--per-source-max" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("--per-source-max requires a value")?;
+                    per_source_max = v
+                        .parse::<u32>()
+                        .map_err(|_| "invalid --per-source-max".to_string())?;
+                }
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -355,6 +401,10 @@ mod imp {
             x11_forward,
             strict_modes,
             debug_commands,
+            accept_env,
+            login_grace_time,
+            max_startups,
+            per_source_max,
         })
     }
 
@@ -524,9 +574,7 @@ mod imp {
                     if !(allow && verified) {
                         if self.debug {
                             if !user_ok {
-                                eprintln!(
-                                    "sshd: auth publickey: user {user} not in allowed set"
-                                );
+                                eprintln!("sshd: auth publickey: user {user} not in allowed set");
                             } else if !blob_ok {
                                 eprintln!(
                                     "sshd: auth publickey: key not in authorized_keys for {user}"
@@ -655,7 +703,9 @@ mod imp {
             // client's LANG / LC_* / TERM / user-supplied variables win.
             // RFC 4254 §6.4 makes this scope per-session-channel; the
             // dispatcher already discards the env on channel close.
-            for (k, v) in env.iter() {
+            // safe_session_env enforces a defense-in-depth blocklist
+            // (LD_PRELOAD/IFS/PATH/etc.) on top of the server's filter.
+            for (k, v) in safe_session_env(env) {
                 cmd.env(k, v);
             }
 
@@ -744,12 +794,10 @@ mod imp {
             let (mut stdout_buf, stdout_overflow) = out_thr.join().unwrap_or_default();
             let (mut stderr_buf, stderr_overflow) = err_thr.join().unwrap_or_default();
             if stdout_overflow {
-                stderr_buf
-                    .extend_from_slice(b"\nsshd: stdout exceeded 16 MiB cap (truncated)\n");
+                stderr_buf.extend_from_slice(b"\nsshd: stdout exceeded 16 MiB cap (truncated)\n");
             }
             if stderr_overflow {
-                stderr_buf
-                    .extend_from_slice(b"\nsshd: stderr exceeded 16 MiB cap (truncated)\n");
+                stderr_buf.extend_from_slice(b"\nsshd: stderr exceeded 16 MiB cap (truncated)\n");
             }
             let code = status.code().unwrap_or(255);
             let code_u32 = if code < 0 { 255u32 } else { code as u32 };
@@ -911,6 +959,40 @@ mod imp {
             .map_err(|_| "could not determine current user (set $USER)".into())
     }
 
+    /// Defense-in-depth: scrub the per-channel SSH `env` list of any name
+    /// in `HARD_BLOCKED_ENV_NAMES` before we layer it onto the child
+    /// process's environment. The server's accept-env filter already runs
+    /// upstream (see `puressh::server::env_name_accepted`), so under
+    /// normal operation no blocked name should ever reach here. This is a
+    /// belt-and-suspenders check: a future bug, a misconfigured custom
+    /// `ChannelRequest::Env` interceptor, or a downstream caller that
+    /// bypasses the server layer must not be able to slip
+    /// LD_PRELOAD/IFS/PATH/etc. into the user's shell.
+    ///
+    /// Names with embedded NUL are dropped too — they can't safely make
+    /// it into a `setenv`/`Command::env` call anyway.
+    fn safe_session_env(env: &SessionEnv) -> Vec<(&str, &str)> {
+        env.iter()
+            .filter(|(k, v)| {
+                !k.contains('\0') && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
+            })
+            .collect()
+    }
+
+    /// Same filter as [`safe_session_env`], but on an owned `(String,
+    /// String)` snapshot already in hand. Kept as a separate helper so
+    /// the borrow-vs-owned call sites don't need to allocate twice.
+    fn safe_owned_env(env: &[(String, String)]) -> Vec<(String, String)> {
+        env.iter()
+            .filter(|(k, v)| {
+                !k.contains('\0')
+                    && !v.contains('\0')
+                    && !HARD_BLOCKED_ENV_NAMES.contains(&k.as_str())
+            })
+            .cloned()
+            .collect()
+    }
+
     // -------------------------------------------------------------------------
     // User lookup + drop-to-user plumbing.
     //
@@ -1059,8 +1141,10 @@ mod imp {
             // Snapshot the per-channel env into an owned vector. spawn_pty_shell
             // forks and then setenv()s post-fork; the child can't hold a borrow
             // across that boundary, so we hand it owned (key, value) pairs.
-            let env_pairs: Vec<(String, String)> = env
-                .iter()
+            // safe_session_env enforces a defense-in-depth blocklist
+            // (LD_PRELOAD/IFS/PATH/etc.) on top of the server's filter.
+            let env_pairs: Vec<(String, String)> = safe_session_env(env)
+                .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             match pty {
@@ -1478,9 +1562,15 @@ mod imp {
         // safely between fork and execvp. Reject any pair with interior
         // NUL bytes (would smuggle past setenv's terminator otherwise);
         // such pairs cannot reach us through a well-formed SSH peer.
+        //
+        // Re-run the hard blocklist here as a final defense-in-depth
+        // barrier — the caller already filtered via safe_session_env,
+        // but the spawn_pty_shell signature accepts any
+        // `&[(String,String)]` and a future caller might forget.
+        let session_env = safe_owned_env(session_env);
         let mut channel_envs: Vec<(std::ffi::CString, std::ffi::CString)> =
             Vec::with_capacity(session_env.len());
-        for (k, v) in session_env {
+        for (k, v) in &session_env {
             let kc = std::ffi::CString::new(k.as_bytes()).map_err(|_| {
                 puressh::Error::Io(std::io::Error::other("channel env name contains NUL byte"))
             })?;
@@ -1770,17 +1860,167 @@ mod imp {
     // Accept loop with fork() per connection.
     // -------------------------------------------------------------------------
 
-    /// Set SIGCHLD to SIG_IGN so the kernel auto-reaps connection children
-    /// — no zombies pile up in the daemon, even under heavy connection
-    /// churn. The connection child resets SIGCHLD to SIG_DFL before its
-    /// own forkpty so it can `waitpid(WNOHANG)` for the user shell's
-    /// real exit status.
-    fn install_parent_sigchld() -> Result<(), String> {
-        // SAFETY: setting SIGCHLD=SIG_IGN is async-signal-safe and changes
-        // no async invariants the daemon depends on.
-        unsafe { signal(Signal::SIGCHLD, SigHandler::SigIgn) }
-            .map(|_| ())
-            .map_err(|e| format!("signal(SIGCHLD, SIG_IGN): {e}"))
+    // -------------------------------------------------------------------------
+    // Parent-side state for connection caps and graceful shutdown.
+    //
+    // All three of these are touched from `extern "C"` signal handlers, so
+    // they must use only async-signal-safe primitives. `AtomicUsize` and
+    // `AtomicBool` qualify (lock-free on every target we ship to); a
+    // `Mutex<HashMap>` would not. Per-IP counts are kept in a parking-lot
+    // `Mutex<HashMap>` accessed only from the main accept loop (never
+    // from signal context) — see `OnIpScope` below.
+    // -------------------------------------------------------------------------
+
+    /// Live (unreaped + serving) connection children.  Incremented after
+    /// a successful `fork()`, decremented on `SIGCHLD` once `waitpid`
+    /// confirms the child exited.
+    static LIVE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+
+    /// Set to `true` by the SIGTERM/SIGINT handler. The accept loop polls
+    /// it before each `accept()` and exits cleanly when it flips, letting
+    /// in-flight children drain to their own SIGCHLD without orphaning
+    /// them.
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// Per-peer-IP simultaneous-connection counts. Touched only by the
+    /// main accept loop (`OnIpScope::new` / `OnIpScope::drop`) — never
+    /// from signal context — so a `Mutex` is fine. Wrapped in a
+    /// `OnceLock` so we get a stable-API one-shot initialiser without
+    /// pulling in `once_cell`.
+    static PER_IP_COUNTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
+
+    fn per_ip_counts() -> &'static Mutex<HashMap<IpAddr, usize>> {
+        PER_IP_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// SIGCHLD handler: drain every reapable child via `waitpid(WNOHANG)`
+    /// and decrement `LIVE_CHILDREN` per kid. Replaces the previous
+    /// `SIG_IGN` setup so we keep an accurate live-children count for
+    /// `--max-startups`.
+    ///
+    /// SAFETY: handler runs in signal context; uses only async-signal-safe
+    /// calls (`waitpid` and atomic ops).
+    extern "C" fn sigchld_handler(_sig: libc::c_int) {
+        loop {
+            // SAFETY: WNOHANG waitpid in a signal handler is documented
+            // safe on every Unix we target.
+            let r = unsafe { libc::waitpid(-1, core::ptr::null_mut(), libc::WNOHANG) };
+            if r > 0 {
+                // Reaped one. Saturate at 0 in case of double-decrement
+                // races (shouldn't happen, but cheap insurance).
+                let prev = LIVE_CHILDREN.load(Ordering::Relaxed);
+                if prev > 0 {
+                    LIVE_CHILDREN.fetch_sub(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+            // 0: no more reapable. <0: error (typically ECHILD).
+            break;
+        }
+    }
+
+    /// SIGTERM / SIGINT handler: flip the shutdown flag so the accept
+    /// loop exits at the next iteration. We deliberately do *not* try to
+    /// signal in-flight children — they each carry their own client
+    /// socket and the natural EOF on shutdown will tear them down.
+    ///
+    /// SAFETY: signal-context safe — just a single relaxed atomic store.
+    extern "C" fn shutdown_handler(_sig: libc::c_int) {
+        SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    /// Install SIGCHLD (zombie reaper + live-count tracking) and
+    /// SIGTERM/SIGINT (graceful shutdown). Replaces the prior
+    /// `install_parent_sigchld` SIG_IGN setup.
+    fn install_parent_signals() -> Result<(), String> {
+        // SAFETY: `sigaction` with caller-owned `sigaction` structs is
+        // POSIX-defined; the handler funcs we install reference only
+        // statics + async-signal-safe APIs.
+        unsafe {
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = sigchld_handler as *const () as usize;
+            // SA_NOCLDSTOP: don't notify on stopped/continued children.
+            // SA_RESTART:  let accept() restart on EINTR rather than
+            //              fail out — the loop already handles EAGAIN
+            //              backoff but spurious EINTR shouldn't error.
+            sa.sa_flags = libc::SA_NOCLDSTOP | libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(libc::SIGCHLD, &sa, core::ptr::null_mut()) != 0 {
+                return Err(format!(
+                    "sigaction(SIGCHLD): {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = shutdown_handler as *const () as usize;
+            // Deliberately no SA_RESTART: we *want* SIGTERM/SIGINT to
+            // wake a blocked accept() so the loop can observe the flag.
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(libc::SIGTERM, &sa, core::ptr::null_mut()) != 0 {
+                return Err(format!(
+                    "sigaction(SIGTERM): {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            if libc::sigaction(libc::SIGINT, &sa, core::ptr::null_mut()) != 0 {
+                return Err(format!(
+                    "sigaction(SIGINT): {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// RAII guard that increments `PER_IP_COUNTS[ip]` on construction and
+    /// decrements on drop. Returned by [`admit_connection`] when the new
+    /// connection is allowed under both caps; held by the parent for the
+    /// lifetime of the child PID so a `kill -9` of the parent simply
+    /// vaporises the counts (no cleanup needed). Held by the *parent*,
+    /// not the forked child — drop runs only when the parent loop drops
+    /// the guard at child-spawn time, so the live count is the count of
+    /// in-flight admits, not of finished children. To reconcile: the
+    /// SIGCHLD handler bounds the lifetime via `LIVE_CHILDREN`.
+    struct OnIpScope {
+        ip: IpAddr,
+    }
+
+    impl Drop for OnIpScope {
+        fn drop(&mut self) {
+            if let Ok(mut m) = per_ip_counts().lock() {
+                if let Some(c) = m.get_mut(&self.ip) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        m.remove(&self.ip);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Apply the two connection caps (global `--max-startups` and
+    /// per-source `--per-source-max`) atomically. Returns the per-IP
+    /// scope guard on admission, or `Err(reason)` for refusal — the
+    /// caller logs the reason and closes the socket.
+    fn admit_connection(
+        peer: &std::net::SocketAddr,
+        max_startups: u32,
+        per_source_max: u32,
+    ) -> Result<OnIpScope, &'static str> {
+        if max_startups > 0 && LIVE_CHILDREN.load(Ordering::Relaxed) >= max_startups as usize {
+            return Err("max-startups");
+        }
+        let ip = peer.ip();
+        if per_source_max > 0 {
+            let mut m = per_ip_counts().lock().map_err(|_| "per-ip-lock")?;
+            let c = m.entry(ip).or_insert(0);
+            if *c >= per_source_max as usize {
+                return Err("per-source-max");
+            }
+            *c += 1;
+        }
+        Ok(OnIpScope { ip })
     }
 
     fn run() -> Result<i32, String> {
@@ -1876,9 +2116,24 @@ mod imp {
         let debug = cli.debug;
         config = config.on_session_open(move |user: &str| drop_to_user(user, debug));
 
+        // Plumb finding-#1 (env allowlist) and finding-#2 (pre-auth
+        // inactivity timeout) into the server config. with_accept_env
+        // accepts an empty vec to mean "drop every client env" — which
+        // is the secure default. login_grace_time = 0 disables the
+        // timeout for users who want OpenSSH's classic "no limit"
+        // behaviour.
+        config = config.with_accept_env(cli.accept_env.clone());
+        if cli.login_grace_time > 0 {
+            config = config
+                .with_login_grace_time(std::time::Duration::from_secs(cli.login_grace_time.into()));
+        } else {
+            // Pass Duration::ZERO so the server can treat 0 as "disabled".
+            config = config.with_login_grace_time(std::time::Duration::ZERO);
+        }
+
         let cfg = Arc::new(config);
 
-        install_parent_sigchld()?;
+        install_parent_signals()?;
 
         let addr = format!("127.0.0.1:{}", cli.port);
         let listener =
@@ -1889,14 +2144,45 @@ mod imp {
             std::process::id()
         );
 
+        // Exponential backoff for `fork()` EAGAIN — under a fork-bomb a
+        // tight `continue` loop just makes the kernel keep saying no.
+        // Reset to `MIN` on any successful fork.
+        const FORK_BACKOFF_MIN_MS: u64 = 10;
+        const FORK_BACKOFF_MAX_MS: u64 = 1_000;
+        let mut fork_backoff_ms: u64 = FORK_BACKOFF_MIN_MS;
+
         loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                eprintln!("sshd: shutdown requested, exiting accept loop");
+                break;
+            }
             let (stream, peer) = match listener.accept() {
                 Ok(p) => p,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                    // Was probably our SIGTERM/SIGINT — loop and let the
+                    // shutdown flag check catch it.
+                    continue;
+                }
                 Err(e) => {
                     eprintln!("sshd: accept: {e}");
                     continue;
                 }
             };
+
+            // Enforce both connection caps *before* fork so a flood
+            // can't OOM us via per-process accounting. On refusal we
+            // simply drop the socket — RST tells the client to retry.
+            let scope = match admit_connection(&peer, cli.max_startups, cli.per_source_max) {
+                Ok(s) => s,
+                Err(reason) => {
+                    if cli.debug {
+                        eprintln!("sshd: refused {peer}: {reason}");
+                    }
+                    drop(stream);
+                    continue;
+                }
+            };
+
             // SAFETY: the daemon parent is single-threaded — no `thread::spawn`
             // in this loop — so the `fork()` is followed by ordinary Rust
             // code with no async-signal-safety concerns. The kernel
@@ -1904,14 +2190,31 @@ mod imp {
             // `stream` and `listener`.
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child }) => {
+                    fork_backoff_ms = FORK_BACKOFF_MIN_MS;
+                    // Account the child against `--max-startups` once we
+                    // know fork() succeeded; SIGCHLD will decrement it
+                    // back on reap.
+                    LIVE_CHILDREN.fetch_add(1, Ordering::Relaxed);
                     if cli.debug {
-                        eprintln!("sshd: forked connection {peer} -> pid {}", child.as_raw());
+                        eprintln!(
+                            "sshd: forked connection {peer} -> pid {} (live={})",
+                            child.as_raw(),
+                            LIVE_CHILDREN.load(Ordering::Relaxed),
+                        );
                     }
                     // Parent has no further use for this socket — its
                     // refcount in the child keeps it alive.
                     drop(stream);
+                    // OnIpScope auto-drops at end of iteration —
+                    // explicit drop here makes the lifetime clear.
+                    drop(scope);
                 }
                 Ok(ForkResult::Child) => {
+                    // Child doesn't own the parent's per-IP scope.
+                    // `mem::forget` so dropping in the child doesn't
+                    // touch the parent's count and *decrement someone
+                    // else's per-IP entry*.
+                    core::mem::forget(scope);
                     // CRUCIAL: release the listener fd before we enter the
                     // long session loop. Without this, restarting the
                     // daemon on the same port keeps hitting EADDRINUSE
@@ -1922,6 +2225,11 @@ mod imp {
                     // SAFETY: same justification as the parent — we run
                     // in a single-threaded process here.
                     let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
+                    // Likewise restore default SIGTERM/SIGINT so the
+                    // child dies cleanly on signal rather than getting
+                    // the parent's "set the shutdown flag" handler.
+                    let _ = unsafe { signal(Signal::SIGTERM, SigHandler::SigDfl) };
+                    let _ = unsafe { signal(Signal::SIGINT, SigHandler::SigDfl) };
 
                     // Stash the peer address on *this child's* PamGate
                     // copy — set_peer mutates state behind a Mutex but
@@ -1942,13 +2250,17 @@ mod imp {
                     unsafe { libc::_exit(rc) };
                 }
                 Err(e) => {
-                    eprintln!("sshd: fork: {e}");
+                    eprintln!("sshd: fork: {e} (backoff {fork_backoff_ms}ms)");
                     drop(stream);
-                    // Keep serving — a transient fork failure (EAGAIN
-                    // under fork-bomb-style load) is not fatal.
+                    drop(scope);
+                    // Bounded exponential backoff so a sustained EAGAIN
+                    // (rlimit, OOM-killer pressure) doesn't pin a core.
+                    std::thread::sleep(std::time::Duration::from_millis(fork_backoff_ms));
+                    fork_backoff_ms = (fork_backoff_ms * 2).min(FORK_BACKOFF_MAX_MS);
                 }
             }
         }
+        Ok(0)
     }
 
     pub fn main() -> ExitCode {

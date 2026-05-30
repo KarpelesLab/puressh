@@ -12,7 +12,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::packet::{self, read_packet, write_packet, Packet};
-use super::path::resolve;
+use super::path::{is_inside, lexically_clean, resolve};
 use super::types::{
     Attrs, FxpStatus, NameEntry, SftpError, FXF_APPEND, FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC,
     FXF_WRITE, SFTP_VERSION,
@@ -621,7 +621,7 @@ impl SftpServerSession {
         // unconfined path.
         let display = if self.opts.hide_jail_in_realpath {
             if let Some(root) = self.opts.root.as_deref() {
-                let root_clean = super::path::lexically_clean(root);
+                let root_clean = lexically_clean(root);
                 match p.strip_prefix(&root_clean) {
                     Ok(suffix) => {
                         let mut out = PathBuf::from("/");
@@ -697,18 +697,45 @@ impl SftpServerSession {
         let target_s = std::str::from_utf8(&target_path)
             .map_err(|_| SftpError::status(FxpStatus::BadMessage))?;
         // When a jail is configured, refuse to create symlinks that
-        // explicitly point outside it via an absolute target.
+        // resolve outside it — either via an absolute target, or via a
+        // relative target whose `..` components walk above the jail
+        // root when resolved against the link's parent directory.
         //
-        // Note: this does NOT block escape via a relative `..` target —
-        // that requires resolve-time confinement. Open-time `O_NOFOLLOW`
-        // (applied in op_open above) is what actually keeps a relative
-        // traversal symlink from being used to read /etc/passwd.
-        if self.opts.root.is_some() && Path::new(target_s).is_absolute() {
-            return Ok(status_pkt(
-                id,
-                FxpStatus::PermissionDenied,
-                "absolute symlink target rejected by jail",
-            ));
+        // This is purely a lexical check; the symlink is written verbatim
+        // (POSIX preserves the original string), but we make sure that
+        // even a *future* path-join against this link cannot leave the
+        // jail. Open-time `O_NOFOLLOW` (applied in op_open above) still
+        // catches the runtime traversal — this check just keeps the
+        // hostile symlink from being created in the first place.
+        if let Some(root) = self.opts.root.as_deref() {
+            let target_path_obj = Path::new(target_s);
+            if target_path_obj.is_absolute() {
+                return Ok(status_pkt(
+                    id,
+                    FxpStatus::PermissionDenied,
+                    "absolute symlink target rejected by jail",
+                ));
+            }
+            // Resolve the relative target lexically against the link's
+            // parent directory (i.e. where the symlink will sit), then
+            // confirm the result is still inside the jail and contains
+            // no leftover `..` (belt-and-braces — `lexically_clean` will
+            // have collapsed any `..` it could, so a residual one means
+            // the path is unresolvable under any real ancestor).
+            let link_parent = link.parent().unwrap_or(Path::new("/"));
+            let joined = link_parent.join(target_path_obj);
+            let cleaned = lexically_clean(&joined);
+            let root_clean = lexically_clean(root);
+            let has_parent_residue = cleaned
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+            if has_parent_residue || !is_inside(&cleaned, &root_clean) {
+                return Ok(status_pkt(
+                    id,
+                    FxpStatus::PermissionDenied,
+                    "symlink target escapes jail",
+                ));
+            }
         }
         #[cfg(unix)]
         {

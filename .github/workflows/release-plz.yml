@@ -8,9 +8,6 @@ permissions:
   # Open/update the release PR and create GitHub Releases.
   contents: write
   pull-requests: write
-  # `gh workflow run release-binaries.yml` (workflow_dispatch) needs this even
-  # with GITHUB_TOKEN.
-  actions: write
 
 # Don't run two release-plz jobs in parallel.
 concurrency:
@@ -22,10 +19,19 @@ jobs:
     name: Release-plz release
     runs-on: ubuntu-latest
     steps:
+      # `token:` is the RELEASE_PLZ_TOKEN (a user PAT / fine-grained token)
+      # so that:
+      #   1. release-plz can push the release tag and the GitHub Release,
+      #   2. those push/release events actually trigger downstream workflows.
+      # GitHub suppresses workflow triggers for events created by the default
+      # GITHUB_TOKEN (anti-recursion); a user-owned PAT is not subject to that
+      # rule, so `release-binaries.yml` (`on: release: types: [published]`)
+      # fires on its own and we don't need an explicit `gh workflow run` chain.
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -37,42 +43,25 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
 
       - name: Run release-plz
-        id: release-plz
         uses: release-plz/action@v0.5
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-
-      # release-plz creates the GitHub Release with the workflow's GITHUB_TOKEN.
-      # GitHub suppresses downstream workflow triggers for GITHUB_TOKEN-created
-      # events (anti-recursion), so `release: published` doesn't fire.
-      # workflow_dispatch is the exception — chain into release-binaries here.
-      - name: Trigger release-binaries for each new release
-        if: ${{ steps.release-plz.outputs.releases_created == 'true' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASES: ${{ steps.release-plz.outputs.releases }}
-        run: |
-          # release-plz emits `.releases[].tag`; see
-          # https://release-plz.dev/docs/github/output for the schema.
-          echo "$RELEASES" | jq -r '.[].tag' | while read -r tag; do
-            if [ -z "$tag" ] || [ "$tag" = "null" ]; then
-              continue
-            fi
-            echo "Dispatching release-binaries for $tag"
-            gh workflow run release-binaries.yml -f tag="$tag"
-          done
 
   release-plz-pr:
     name: Release-plz PR
     runs-on: ubuntu-latest
     steps:
+      # See the matching note in the `release-plz-release` job above —
+      # using the PAT here means the release-PR's branch pushes trigger
+      # CI on the PR (the default GITHUB_TOKEN would suppress them).
       - name: Checkout
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_PLZ_TOKEN }}
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -87,4 +76,4 @@ jobs:
         with:
           command: release-pr
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}

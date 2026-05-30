@@ -489,22 +489,54 @@ mod imp {
                     verified,
                     ..
                 } => {
-                    if !self.allowed_users.contains(&user) {
-                        if self.debug {
-                            eprintln!("sshd: auth publickey: user {user} not in allowed set");
-                        }
-                        return AuthDecision::Reject;
-                    }
-                    if !self.authorized_blobs.contains(&public_blob) {
-                        if self.debug {
-                            eprintln!("sshd: auth publickey: key not in authorized_keys");
-                        }
-                        return AuthDecision::Reject;
-                    }
+                    // Always run *both* checks unconditionally so an
+                    // attacker can't distinguish "unknown user" from
+                    // "known user / wrong key" via wall-clock timing.
+                    // The HashSet lookup is O(1); the linear scan over
+                    // authorized_blobs is the dominant cost — running
+                    // it for every attempt keeps the two paths uniform.
+                    let user_ok = self.allowed_users.contains(&user);
+                    let blob_ok = self.authorized_blobs.contains(&public_blob);
+                    let allow = user_ok && blob_ok;
+
+                    // probe_only attempts (no signature) only need
+                    // user+blob to be acceptable so the client knows it
+                    // can move on to the signed step.
                     if probe_only {
-                        return AuthDecision::Accept;
+                        return if allow {
+                            AuthDecision::Accept
+                        } else {
+                            if self.debug {
+                                if !user_ok {
+                                    eprintln!(
+                                        "sshd: auth publickey probe: user {user} not in allowed set"
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "sshd: auth publickey probe: key not in authorized_keys for {user}"
+                                    );
+                                }
+                            }
+                            AuthDecision::Reject
+                        };
                     }
-                    if !verified {
+
+                    if !(allow && verified) {
+                        if self.debug {
+                            if !user_ok {
+                                eprintln!(
+                                    "sshd: auth publickey: user {user} not in allowed set"
+                                );
+                            } else if !blob_ok {
+                                eprintln!(
+                                    "sshd: auth publickey: key not in authorized_keys for {user}"
+                                );
+                            } else {
+                                eprintln!(
+                                    "sshd: auth publickey: signature missing or unverified for {user}"
+                                );
+                            }
+                        }
                         return AuthDecision::Reject;
                     }
                     if self.debug {
@@ -512,7 +544,23 @@ mod imp {
                     }
                     AuthDecision::Accept
                 }
-                AuthAttempt::KeyboardInteractive { .. } => AuthDecision::Reject,
+                AuthAttempt::KeyboardInteractive { user } => {
+                    // We never advertise "keyboard-interactive" in
+                    // Config::allowed_auth_methods, so the auth core
+                    // should never dispatch a KI attempt here.  Catch
+                    // mis-wired configs in debug builds before they
+                    // become a silent prompt-loop in production.
+                    debug_assert!(
+                        false,
+                        "LocalAuthenticator received KeyboardInteractive but \
+                         keyboard-interactive is not enabled in allowed_auth_methods \
+                         (user={user})",
+                    );
+                    if self.debug {
+                        eprintln!("sshd: auth keyboard-interactive rejected for user {user}");
+                    }
+                    AuthDecision::Reject
+                }
             }
         }
     }

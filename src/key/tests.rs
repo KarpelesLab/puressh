@@ -509,3 +509,28 @@ fn wire_blob_ed25519_matches_known_layout() {
     assert_eq!(&blob[15..19], &[0, 0, 0, 32]);
     assert_eq!(&blob[19..], &[0xab; 32]);
 }
+
+#[test]
+fn parse_wire_blob_rejects_off_curve_ecdsa_p256() {
+    // Build an otherwise well-formed ecdsa-sha2-nistp256 public blob whose
+    // SEC1 point is the right shape (0x04 || 32-byte X || 32-byte Y) but
+    // whose coordinates are not on P-256. parse_wire_blob must refuse it.
+    let mut w = crate::format::Writer::new();
+    w.write_string(b"ecdsa-sha2-nistp256");
+    w.write_string(b"nistp256");
+    let mut bogus_point = alloc::vec![0u8; 65];
+    bogus_point[0] = 0x04;
+    for (i, b) in bogus_point.iter_mut().enumerate().skip(1) {
+        *b = (i as u8).wrapping_mul(17).wrapping_add(3);
+    }
+    w.write_string(&bogus_point);
+    let blob = w.into_vec();
+    match PublicKey::parse_wire_blob(&blob) {
+        Err(crate::error::Error::Format(msg)) => assert!(
+            msg.contains("SEC1") || msg.contains("ecdsa"),
+            "expected ecdsa SEC1 rejection, got {msg:?}"
+        ),
+        Err(other) => panic!("expected Format, got {other:?}"),
+        Ok(_) => panic!("expected off-curve point to be rejected"),
+    }
+}

@@ -18,6 +18,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
+use purecrypto::ec::{BoxedEcdsaPublicKey, CurveId};
 use purecrypto::kdf::bcrypt_pbkdf;
 
 use crate::error::{Error, Result};
@@ -260,21 +261,27 @@ impl PublicKey {
                 }
             }
             b if b == ECDSA_P256.as_bytes() => {
-                parse_ecdsa_public(&mut r, NISTP256, |p, c| PublicKey::EcdsaP256 {
-                    point: p,
-                    comment: c,
+                parse_ecdsa_public(&mut r, NISTP256, CurveId::P256, |p, c| {
+                    PublicKey::EcdsaP256 {
+                        point: p,
+                        comment: c,
+                    }
                 })?
             }
             b if b == ECDSA_P384.as_bytes() => {
-                parse_ecdsa_public(&mut r, NISTP384, |p, c| PublicKey::EcdsaP384 {
-                    point: p,
-                    comment: c,
+                parse_ecdsa_public(&mut r, NISTP384, CurveId::P384, |p, c| {
+                    PublicKey::EcdsaP384 {
+                        point: p,
+                        comment: c,
+                    }
                 })?
             }
             b if b == ECDSA_P521.as_bytes() => {
-                parse_ecdsa_public(&mut r, NISTP521, |p, c| PublicKey::EcdsaP521 {
-                    point: p,
-                    comment: c,
+                parse_ecdsa_public(&mut r, NISTP521, CurveId::P521, |p, c| {
+                    PublicKey::EcdsaP521 {
+                        point: p,
+                        comment: c,
+                    }
                 })?
             }
             b if b == RSA.as_bytes() => {
@@ -295,15 +302,28 @@ impl PublicKey {
     }
 }
 
-fn parse_ecdsa_public<F>(r: &mut Reader<'_>, curve: &str, ctor: F) -> Result<PublicKey>
+fn parse_ecdsa_public<F>(
+    r: &mut Reader<'_>,
+    curve_name: &str,
+    curve_id: CurveId,
+    ctor: F,
+) -> Result<PublicKey>
 where
     F: FnOnce(Vec<u8>, String) -> PublicKey,
 {
     let c = r.read_string()?;
-    if c != curve.as_bytes() {
+    if c != curve_name.as_bytes() {
         return Err(Error::Format("ecdsa: curve name mismatch"));
     }
     let point = r.read_string()?.to_vec();
+    // Validate the SEC1 point eagerly at parse time. Without this the
+    // PublicKey would hold an opaque byte string that only fails later
+    // when used (e.g. by an authorized_keys check), and a malformed or
+    // off-curve point could otherwise sneak through to the verifier
+    // construction site. BoxedEcdsaPublicKey::from_sec1 enforces the
+    // SEC1 uncompressed prefix, length, and on-curve membership.
+    BoxedEcdsaPublicKey::from_sec1(curve_id, &point)
+        .map_err(|_| Error::Format("ecdsa: invalid SEC1 point"))?;
     Ok(ctor(point, String::new()))
 }
 

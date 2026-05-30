@@ -77,3 +77,10 @@ Usage:
   filenames, etc.; a real consumer should follow the two-pass pattern
   (call once with `cap=0` to learn the required size, allocate, call
   again).
+- The "two SFTP sessions on one client" demo is backed by per-channel
+  fairness (one pumper at a time; the other readers sleep on their
+  channel's `Condvar`) and per-channel backpressure (receive-window
+  credit deferred to drain). A starved session — one a consumer never
+  reads from — caps its in-memory mailbox at the initial window size
+  and stops the peer rather than growing unbounded. See the
+  `src/shared.rs` module doc for the concurrency model.

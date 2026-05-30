@@ -346,11 +346,13 @@ fn jailed_symlink_with_absolute_target_rejected() {
 }
 
 #[test]
-fn jailed_realpath_strips_jail_prefix() {
+fn jailed_realpath_strips_jail_prefix_when_opted_in() {
     let tmp = TempDir::new("realpath-jail");
     let jail = tmp.path().to_path_buf();
     let (a, b) = pair();
-    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let opts = SftpServerOptions::new(jail.clone())
+        .with_root(jail.clone())
+        .hide_jail_in_realpath(true);
     let h = spawn_server(opts, a);
     let mut client = SftpClient::new(b).unwrap();
     // Asking the jailed server to realpath "." should give us "/" not the
@@ -364,6 +366,28 @@ fn jailed_realpath_strips_jail_prefix() {
     assert_eq!(s, "/", "expected '/' inside jail, got {s}");
     let p = client.realpath(b"sub/file").unwrap();
     assert_eq!(String::from_utf8_lossy(&p), "/sub/file");
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_realpath_leaks_jail_prefix_by_default() {
+    // Without `hide_jail_in_realpath(true)` the historical (leaky)
+    // behaviour is preserved — the server returns the host-side
+    // absolute path. Operators that don't want this MUST opt in.
+    let tmp = TempDir::new("realpath-jail-default");
+    let jail = tmp.path().to_path_buf();
+    let canon_jail = std::fs::canonicalize(&jail).unwrap_or_else(|_| jail.clone());
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let p = client.realpath(b".").unwrap();
+    let s = String::from_utf8_lossy(&p).to_string();
+    assert!(
+        s == jail.to_string_lossy() || s == canon_jail.to_string_lossy(),
+        "expected unstripped jail path by default, got {s}"
+    );
     drop(client);
     h.join().unwrap();
 }

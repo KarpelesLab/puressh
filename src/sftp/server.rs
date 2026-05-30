@@ -50,6 +50,15 @@ pub struct SftpServerOptions {
     /// sticky bits supplied by an SFTP peer. Set `true` only for trusted
     /// callers that need to upload mode bits verbatim.
     pub allow_special_bits: bool,
+    /// When `true` and a jail is configured, `op_realpath` strips the
+    /// jail prefix from the returned path so the client sees paths
+    /// relative to the jail root (e.g. `/foo/bar` instead of
+    /// `/srv/jail/u/foo/bar`). Defaults to `false` so the historical
+    /// behaviour — returning the host-side absolute path — is preserved
+    /// unless the operator explicitly opts in; new deployments that
+    /// don't want to leak the host filesystem layout should set this
+    /// to `true`.
+    pub hide_jail_in_realpath: bool,
 }
 
 impl SftpServerOptions {
@@ -61,6 +70,7 @@ impl SftpServerOptions {
             read_only: false,
             max_set_len: DEFAULT_MAX_SET_LEN,
             allow_special_bits: false,
+            hide_jail_in_realpath: false,
         }
     }
 
@@ -90,6 +100,15 @@ impl SftpServerOptions {
     /// attributes. Off by default.
     pub fn allow_special_bits(mut self, allow: bool) -> Self {
         self.allow_special_bits = allow;
+        self
+    }
+
+    /// Hide the jail prefix in `op_realpath` so the client sees paths
+    /// relative to the jail root (`/foo/bar` instead of
+    /// `/srv/jail/u/foo/bar`). Off by default to preserve historical
+    /// behaviour.
+    pub fn hide_jail_in_realpath(mut self, hide: bool) -> Self {
+        self.hide_jail_in_realpath = hide;
         self
     }
 }
@@ -542,22 +561,30 @@ impl SftpServerSession {
 
     fn op_realpath(&mut self, id: u32, path: Vec<u8>) -> Result<Packet, SftpError> {
         let p = self.resolve(&path)?;
-        // When a jail is configured, present paths to the client relative
-        // to the jail root so the absolute filesystem layout doesn't leak
-        // (e.g. the client sees `/u/foo` rather than `/srv/jail/u/foo`).
-        let display = if let Some(root) = self.opts.root.as_deref() {
-            let root_clean = super::path::lexically_clean(root);
-            match p.strip_prefix(&root_clean) {
-                Ok(suffix) => {
-                    let mut out = PathBuf::from("/");
-                    if suffix.as_os_str().is_empty() {
-                        out
-                    } else {
-                        out.push(suffix);
-                        out
+        // When a jail is configured AND the operator opted in via
+        // `hide_jail_in_realpath`, present paths to the client relative
+        // to the jail root so the absolute filesystem layout doesn't
+        // leak (e.g. the client sees `/u/foo` rather than
+        // `/srv/jail/u/foo`). Default is off to preserve historical
+        // behaviour for existing callers that still depend on the
+        // unconfined path.
+        let display = if self.opts.hide_jail_in_realpath {
+            if let Some(root) = self.opts.root.as_deref() {
+                let root_clean = super::path::lexically_clean(root);
+                match p.strip_prefix(&root_clean) {
+                    Ok(suffix) => {
+                        let mut out = PathBuf::from("/");
+                        if suffix.as_os_str().is_empty() {
+                            out
+                        } else {
+                            out.push(suffix);
+                            out
+                        }
                     }
+                    Err(_) => PathBuf::from("/"),
                 }
-                Err(_) => PathBuf::from("/"),
+            } else {
+                p
             }
         } else {
             p

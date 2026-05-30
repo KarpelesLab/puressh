@@ -34,7 +34,13 @@ impl TestTempDir {
         // spin up the listener twice in quick succession.
         static N: AtomicUsize = AtomicUsize::new(0);
         let seq = N.fetch_add(1, Ordering::SeqCst);
-        let path = std::env::temp_dir().join(format!("puressh-agent-{prefix}-{pid}-{nanos}-{seq}"));
+        // Use `/tmp` directly (not `std::env::temp_dir()`). On macOS the
+        // latter resolves to a deep `/var/folders/XX/HASH/T/` path that
+        // pushes the bound socket path past SUN_LEN (104 chars). `/tmp`
+        // is always available on Unix and short enough to stay under the
+        // limit with the test sockets we create here.
+        let path = std::path::PathBuf::from("/tmp")
+            .join(format!("p-ag-{prefix}-{pid:x}-{:x}-{seq}", nanos as u32));
         std::fs::create_dir_all(&path).expect("create tempdir");
         Self { path }
     }

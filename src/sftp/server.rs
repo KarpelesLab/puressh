@@ -53,6 +53,13 @@ impl SftpServerOptions {
     }
 }
 
+// On Windows `std::fs::ReadDir` is much larger than on Unix (it carries the
+// FindFirst handle + a 64 KiB-class `WIN32_FIND_DATA` buffer inline), which
+// trips `clippy::large_enum_variant` even though the asymmetry is unavoidable
+// at this layer. There's typically a single-digit number of open handles per
+// SFTP session, so boxing the iterator just to silence the lint would cost an
+// allocation per directory open with no measurable benefit.
+#[allow(clippy::large_enum_variant)]
 enum FileHandle {
     File {
         file: File,

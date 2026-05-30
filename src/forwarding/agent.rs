@@ -328,8 +328,17 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let pid = std::process::id();
-            let path =
-                std::env::temp_dir().join(format!("puressh-agentfwd-{prefix}-{pid}-{nanos}"));
+            // Use `/tmp` directly instead of `std::env::temp_dir()`. macOS's
+            // SUN_LEN is 104 chars and `temp_dir()` there resolves to
+            // `/var/folders/XX/HASH/T/`, leaving too little headroom once
+            // we append our prefix + the per-session socket name. `/tmp`
+            // is always available on Unix and short enough to stay under
+            // SUN_LEN even with the longest suffix the handler mints.
+            //
+            // Keep the prefix short (no `puressh-agentfwd-` repetition)
+            // for the same headroom reason.
+            let path = std::path::PathBuf::from("/tmp")
+                .join(format!("p-afwd-{prefix}-{pid:x}-{:x}", nanos as u32));
             std::fs::create_dir_all(&path).expect("create tempdir");
             Self { path }
         }

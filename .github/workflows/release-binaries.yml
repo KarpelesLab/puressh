@@ -45,11 +45,16 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
             asset_suffix: linux-aarch64
-            # Cross-toolchain + matching arm64 libpam for the sshd link.
-            # `dpkg --add-architecture` runs from the workflow step below.
-            apt_packages: gcc-aarch64-linux-gnu libpam0g-dev:arm64
-            apt_add_arch: arm64
+            apt_packages: gcc-aarch64-linux-gnu
             linker: aarch64-linux-gnu-gcc
+            # GitHub's `ubuntu-latest` runners only mirror amd64 packages
+            # for the security/updates suites; arm64 lives on
+            # ports.ubuntu.com and pulling `libpam0g-dev:arm64` through
+            # `dpkg --add-architecture` 404s on the default mirror. Easier
+            # to drop the `pam` feature for this one cross binary —
+            # everything else stays on by default. Downstream users who
+            # need PAM on aarch64 can rebuild from source.
+            cargo_features: --no-default-features --features "std,client,server,compress,multichannel"
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
@@ -65,9 +70,6 @@ jobs:
       - name: Install Linux build deps
         if: matrix.apt_packages
         run: |
-          if [ -n "${{ matrix.apt_add_arch }}" ]; then
-            sudo dpkg --add-architecture ${{ matrix.apt_add_arch }}
-          fi
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.apt_packages }}
 
@@ -88,8 +90,11 @@ jobs:
           # a no-op for the native targets.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          cargo build --release --bin ssh  --target ${{ matrix.target }}
-          cargo build --release --bin sshd --target ${{ matrix.target }}
+          # `cargo_features` is empty for default-feature builds; matrix
+          # entries that need a different set (e.g. aarch64-linux dropping
+          # the `pam` feature, see the matrix comment above) populate it.
+          cargo build --release --bin ssh  ${{ matrix.cargo_features }} --target ${{ matrix.target }}
+          cargo build --release --bin sshd ${{ matrix.cargo_features }} --target ${{ matrix.target }}
           cargo rustc --lib --release --features ffi --crate-type staticlib --target ${{ matrix.target }}
           cargo rustc --lib --release --features ffi --crate-type cdylib    --target ${{ matrix.target }}
 

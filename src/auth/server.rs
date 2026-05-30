@@ -14,7 +14,11 @@ use super::message::{
 };
 
 /// A single authentication attempt presented by the client.
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually so the cleartext `password` field is
+/// never rendered — it is replaced by `"<redacted>"`. This prevents
+/// accidental leakage through `tracing::debug!`, `dbg!`, `Result::unwrap`'s
+/// `{:?}` formatter, and similar developer-ergonomics paths.
 pub enum AuthAttempt {
     /// `none` — bare probe.
     None {
@@ -25,7 +29,7 @@ pub enum AuthAttempt {
     Password {
         /// Requested user name.
         user: String,
-        /// Plaintext password.
+        /// Plaintext password. **Not** rendered by the [`core::fmt::Debug`] impl.
         password: String,
     },
     /// `publickey` authentication.
@@ -47,6 +51,37 @@ pub enum AuthAttempt {
         /// Requested user name.
         user: String,
     },
+}
+
+impl core::fmt::Debug for AuthAttempt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AuthAttempt::None { user } => f.debug_struct("None").field("user", user).finish(),
+            AuthAttempt::Password { user, password: _ } => f
+                .debug_struct("Password")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+            AuthAttempt::PublicKey {
+                user,
+                algorithm,
+                public_blob,
+                probe_only,
+                verified,
+            } => f
+                .debug_struct("PublicKey")
+                .field("user", user)
+                .field("algorithm", algorithm)
+                .field("public_blob", public_blob)
+                .field("probe_only", probe_only)
+                .field("verified", verified)
+                .finish(),
+            AuthAttempt::KeyboardInteractive { user } => f
+                .debug_struct("KeyboardInteractive")
+                .field("user", user)
+                .finish(),
+        }
+    }
 }
 
 /// Authenticator's verdict on an attempt.

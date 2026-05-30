@@ -84,7 +84,13 @@ impl ServiceAccept {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Method-specific tail of a `SSH_MSG_USERAUTH_REQUEST` packet.
+///
+/// `Debug` is implemented manually so the cleartext `password` /
+/// `new_password` fields of the `Password` variant are never rendered —
+/// they appear as `"<redacted>"`. The redaction protects against
+/// accidental leakage through `tracing` or ad-hoc `dbg!()` prints.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthMethodPayload {
     None,
     Password {
@@ -105,6 +111,50 @@ pub enum AuthMethodPayload {
         method: String,
         tail: Vec<u8>,
     },
+}
+
+impl core::fmt::Debug for AuthMethodPayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AuthMethodPayload::None => f.write_str("None"),
+            AuthMethodPayload::Password {
+                new_password,
+                password: _,
+            } => f
+                .debug_struct("Password")
+                .field(
+                    "new_password",
+                    &new_password.as_ref().map(|_| "<redacted>"),
+                )
+                .field("password", &"<redacted>")
+                .finish(),
+            AuthMethodPayload::PublicKey {
+                signature_present,
+                algorithm,
+                public_blob,
+                signature,
+            } => f
+                .debug_struct("PublicKey")
+                .field("signature_present", signature_present)
+                .field("algorithm", algorithm)
+                .field("public_blob", public_blob)
+                .field("signature", signature)
+                .finish(),
+            AuthMethodPayload::KeyboardInteractive {
+                language_tag,
+                submethods,
+            } => f
+                .debug_struct("KeyboardInteractive")
+                .field("language_tag", language_tag)
+                .field("submethods", submethods)
+                .finish(),
+            AuthMethodPayload::Other { method, tail } => f
+                .debug_struct("Other")
+                .field("method", method)
+                .field("tail", tail)
+                .finish(),
+        }
+    }
 }
 
 impl AuthMethodPayload {
@@ -650,5 +700,42 @@ mod tests {
         assert!(UserauthRequest::decode(&[]).is_err());
         assert!(UserauthRequest::decode(&[50]).is_err());
         assert!(UserauthRequest::decode(&[50, 0, 0, 0, 100]).is_err());
+    }
+
+    #[test]
+    fn password_debug_is_redacted() {
+        use alloc::format;
+        let m = AuthMethodPayload::Password {
+            new_password: Some("brand-new-secret".into()),
+            password: "super-secret-pw".into(),
+        };
+        let s = format!("{m:?}");
+        assert!(
+            !s.contains("super-secret-pw"),
+            "password leaked in Debug output: {s}"
+        );
+        assert!(
+            !s.contains("brand-new-secret"),
+            "new_password leaked in Debug output: {s}"
+        );
+        assert!(
+            s.contains("redacted"),
+            "redaction marker missing in Debug output: {s}"
+        );
+    }
+
+    #[test]
+    fn userauth_request_debug_is_redacted() {
+        use alloc::format;
+        let req = UserauthRequest {
+            user: "alice".into(),
+            service: "ssh-connection".into(),
+            method: AuthMethodPayload::Password {
+                new_password: None,
+                password: "hunter2".into(),
+            },
+        };
+        let s = format!("{req:?}");
+        assert!(!s.contains("hunter2"), "password leaked: {s}");
     }
 }

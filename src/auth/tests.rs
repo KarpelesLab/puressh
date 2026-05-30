@@ -545,6 +545,23 @@ fn end_to_end_publickey_loopback() {
 }
 
 #[test]
+fn auth_attempt_password_debug_is_redacted() {
+    let a = AuthAttempt::Password {
+        user: "alice".into(),
+        password: "the-actual-secret".into(),
+    };
+    let s = alloc::format!("{a:?}");
+    assert!(
+        !s.contains("the-actual-secret"),
+        "password leaked in Debug output: {s}"
+    );
+    assert!(
+        s.contains("redacted"),
+        "redaction marker missing in Debug output: {s}"
+    );
+}
+
+#[test]
 fn end_to_end_kbdint_loopback() {
     struct KbdAuth;
     impl Authenticator for KbdAuth {

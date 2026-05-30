@@ -41,7 +41,9 @@ pub use msg::{
 
 pub use global::GlobalRequest;
 pub use request::ChannelRequest;
-pub use state::{ChannelEvent, ChannelOpen, ChannelState, ConnectionState};
+pub use state::{
+    ChannelEvent, ChannelOpen, ChannelState, ConnectionState, DEFAULT_MAX_CHANNELS_PER_CONNECTION,
+};
 
 /// Default initial window advertised for new local channels (256 KiB).
 pub const DEFAULT_WINDOW: u32 = 256 * 1024;

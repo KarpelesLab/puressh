@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/KarpelesLab/puressh/compare/v0.0.2...v0.0.3) - 2026-05-30
+
+### Other
+
+- gate mask_mode to cfg(unix) and fix 4 broken rustdoc intra-doc links
+- Merge client + FFI + agent + zeroize security fixes
+- Merge server + sshd security fixes
+- Merge auth/hostkey/key/known_hosts security fixes
+- Merge transport/KEX/compression security fixes
+- gate loopback SFTP roundtrip test to cfg(unix)
+- round-2 fixes — macOS SUN_LEN, Windows clippy, aarch64 cross binary
+
+### Security
+
+- *(agent)* replace libc unsafe with nix + MetadataExt in SSH_AUTH_SOCK validation
+- *(sftp)* gate jail-prefix hiding in op_realpath behind opt-in
+- rustfmt cleanup across channel/scp/sftp test+impl
+- *(forwarding)* X11 single_connection, tcpip-forward allow filter, X11 cookie note
+- *(scp)* O_NOFOLLOW recv, canonicalised base, reject '.' name
+- *(sftp)* jail-aware symlink rejection, set_len cap, mode masking
+- *(channel)* reject traffic on unconfirmed channels
+
 ## [0.0.2](https://github.com/KarpelesLab/puressh/compare/v0.0.1...v0.0.2) - 2026-05-30
 
 ### Other

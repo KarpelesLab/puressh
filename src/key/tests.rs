@@ -534,6 +534,77 @@ fn empty_passphrase_on_encrypted_key_is_rejected_loudly() {
 }
 
 #[test]
+fn bcrypt_rounds_cap_rejects_oversize_kdfoptions() {
+    // Hand-build an openssh-key-v1 blob whose kdfoptions claim rounds=65.
+    // Parser must refuse before running bcrypt — no need for a valid
+    // ciphertext or salt; the rounds check fires first.
+    use crate::format::Writer;
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+
+    let mut opts = Writer::new();
+    opts.write_string(&[0u8; 16]); // salt
+    opts.write_u32(65); // > MAX_BCRYPT_ROUNDS (64)
+    let kdfopts = opts.into_vec();
+
+    let mut pubw = Writer::new();
+    pubw.write_string(b"ssh-ed25519");
+    pubw.write_string(&[0u8; 32]);
+    let pub_blob = pubw.into_vec();
+
+    let mut w = Writer::new();
+    w.write_raw(MAGIC);
+    w.write_string(b"aes256-ctr");
+    w.write_string(b"bcrypt");
+    w.write_string(&kdfopts);
+    w.write_u32(1);
+    w.write_string(&pub_blob);
+    w.write_string(&alloc::vec![0u8; 16]);
+    let pem = alloc::format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        base64::encode(&w.into_vec())
+    );
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"anything")).expect_err("rounds cap");
+    match err {
+        Error::Format(msg) => assert!(
+            msg.contains("rounds") || msg.contains("64"),
+            "expected rounds cap message, got {msg:?}"
+        ),
+        other => panic!("expected Format(rounds cap), got {other:?}"),
+    }
+}
+
+#[test]
+fn bcrypt_zero_rounds_is_rejected() {
+    use crate::format::Writer;
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    let mut opts = Writer::new();
+    opts.write_string(&[0u8; 16]);
+    opts.write_u32(0);
+    let kdfopts = opts.into_vec();
+    let mut pubw = Writer::new();
+    pubw.write_string(b"ssh-ed25519");
+    pubw.write_string(&[0u8; 32]);
+    let pub_blob = pubw.into_vec();
+    let mut w = Writer::new();
+    w.write_raw(MAGIC);
+    w.write_string(b"aes256-ctr");
+    w.write_string(b"bcrypt");
+    w.write_string(&kdfopts);
+    w.write_u32(1);
+    w.write_string(&pub_blob);
+    w.write_string(&alloc::vec![0u8; 16]);
+    let pem = alloc::format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        base64::encode(&w.into_vec())
+    );
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"x")).expect_err("zero rounds");
+    match err {
+        Error::Format(msg) => assert!(msg.contains("rounds"), "{msg}"),
+        other => panic!("expected Format, got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_wire_blob_rejects_off_curve_ecdsa_p256() {
     // Build an otherwise well-formed ecdsa-sha2-nistp256 public blob whose
     // SEC1 point is the right shape (0x04 || 32-byte X || 32-byte Y) but

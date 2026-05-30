@@ -650,6 +650,22 @@ fn decrypt_payload(
         return Err(Error::Format("openssh key: trailing kdfoptions"));
     }
 
+    // Cap rounds. bcrypt_pbkdf's cost is linear in the rounds count, and
+    // a malicious key file could otherwise pin a victim's thread on the
+    // KDF for an unbounded amount of time before they ever learn the
+    // passphrase is wrong. OpenSSH's `-a` flag defaults to 16; 64 is a
+    // comfortable ceiling that still lets legitimate hardening through
+    // while keeping per-attempt cost bounded.
+    const MAX_BCRYPT_ROUNDS: u32 = 64;
+    if rounds == 0 {
+        return Err(Error::Format("openssh key: bcrypt rounds must be > 0"));
+    }
+    if rounds > MAX_BCRYPT_ROUNDS {
+        return Err(Error::Format(
+            "openssh key: bcrypt rounds exceeds 64 (DoS guard)",
+        ));
+    }
+
     let derived = bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
         .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?;
 

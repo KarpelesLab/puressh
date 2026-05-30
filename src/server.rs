@@ -4142,7 +4142,10 @@ mod tests {
             }),
         )
         .with_tcpip_forward(Arc::new(
-            crate::forwarding::reverse::DefaultTcpipForwardHandler::new(),
+            // Test wants the bind to succeed and the splice path to fire;
+            // ::new() is default-deny post-2026-05, so call the explicit
+            // "old default" constructor here.
+            crate::forwarding::reverse::DefaultTcpipForwardHandler::permit_all_interfaces(),
         ));
 
         let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");

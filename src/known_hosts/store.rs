@@ -100,25 +100,55 @@ impl KnownHosts {
         out
     }
 
-    /// Atomically save to `path`. Writes to `path.tmp` then renames.
+    /// Atomically save to `path`. Writes to a per-call unique temporary
+    /// file then renames into place.
     ///
-    /// On Unix the temporary file is created with mode `0o600` so the
-    /// host-key list is never world- or group-readable, even during the
-    /// brief window before the rename. This matches OpenSSH's
-    /// behaviour and avoids leaking the set of hosts a user has
-    /// connected to via a `umask 0` shell or shared filesystem.
+    /// Hardening notes:
+    /// - The tmp filename embeds `pid` plus a fresh `u64` from `OsRng`,
+    ///   so two concurrent saves cannot collide on the same temp name.
+    /// - On Unix the tmp file is opened with `O_EXCL` (`create_new`) and
+    ///   mode `0o600`, so a pre-existing symlink in the directory cannot
+    ///   be used to trick us into overwriting an attacker-chosen target.
+    /// - After writing, the tmp file is `fsync`ed, then renamed into
+    ///   place. On Unix the parent directory is `fsync`ed after the
+    ///   rename so the new entry survives a crash. The host-key list is
+    ///   thus never world- or group-readable, even during the brief
+    ///   window before the rename — matching OpenSSH and avoiding
+    ///   information leak via `umask 0` shells or shared filesystems.
+    /// - On error the leftover tmp file is best-effort cleaned up; the
+    ///   cleanup error is intentionally swallowed so we surface the
+    ///   original failure.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
-        let tmp = path.with_extension({
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if ext.is_empty() {
-                "tmp".to_string()
-            } else {
-                format!("{ext}.tmp")
+        let tmp = unique_tmp_path(path);
+        match write_private_file(&tmp, &self.to_bytes()) {
+            Ok(()) => {}
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err(e);
             }
-        });
-        write_private_file(&tmp, &self.to_bytes())?;
-        fs::rename(&tmp, path)?;
+        }
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        #[cfg(unix)]
+        {
+            // Best-effort directory fsync so the rename is durable.
+            // Failing here is not fatal: the data has already been
+            // written and renamed, and many filesystems (notably
+            // virtualised ones) reject O_RDONLY+fsync on directories.
+            if let Some(parent) = path.parent() {
+                let parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -268,27 +298,47 @@ impl KnownHosts {
     }
 }
 
-/// Write `data` to `path` with permissions `0o600` on Unix. On other
-/// platforms this is a plain `fs::write` — Windows ACLs handle owner-only
-/// access by default for files created under the user's profile.
+/// Write `data` to `path` with permissions `0o600` on Unix. The file is
+/// opened with `O_EXCL` (`create_new`) so a pre-existing symlink in the
+/// target directory cannot be used to redirect the write — the open
+/// fails outright if the path already exists. On non-Unix targets the
+/// `create_new(true)` open is still used (so we never follow a
+/// pre-existing entry); the explicit mode bits are dropped because
+/// Windows ACLs already grant owner-only access for files created under
+/// the user's profile.
 fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::io::Write as _;
         use std::os::unix::fs::OpenOptionsExt as _;
-        let mut f = fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
-        f.write_all(data)?;
-        f.sync_all()?;
-        Ok(())
+        opts.mode(0o600);
     }
-    #[cfg(not(unix))]
-    {
-        fs::write(path, data)
+    let mut f = opts.open(path)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+/// Build a per-call unique temporary path next to `path`. The suffix
+/// combines the process id and a fresh `u64` from `OsRng`, so two
+/// concurrent saves in the same process cannot collide and an attacker
+/// cannot predict the name to pre-create as a symlink.
+fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
+    let mut rng = OsRng;
+    let mut nonce = [0u8; 8];
+    rng.fill_bytes(&mut nonce);
+    let nonce = u64::from_le_bytes(nonce);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("known_hosts");
+    let tmp_name = format!(".{file_name}.tmp.{pid}.{nonce:016x}");
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(tmp_name),
+        _ => std::path::PathBuf::from(tmp_name),
     }
 }
 

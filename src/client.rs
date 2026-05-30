@@ -2217,8 +2217,7 @@ fn scp_proto(e: crate::scp::ScpError, _stage: &'static str) -> Error {
 /// in-tree mismatch warning so the user can manually cross-check the
 /// peer's key before deciding to clean up `known_hosts`.
 fn fingerprint_b64_sha256(blob: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let d = Sha256::digest(blob);
     let bytes: &[u8] = d.as_ref();
     let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4 + 7);
@@ -2285,6 +2284,17 @@ fn build_verifier(
     }
     let k_s = &reply_payload[5..5 + k_s_len];
 
+    // Reject misconfigured KnownHosts callers *before* we touch the KEX
+    // runner state — the missing-host case is a config error, not a
+    // protocol error, regardless of where in the connect we are.
+    if matches!(policy, HostKeyPolicy::KnownHosts(_))
+        && (target_host.is_empty() || target_port == 0)
+    {
+        return Err(Error::Config(
+            "HostKeyPolicy::KnownHosts requires Client::connect_to_host",
+        ));
+    }
+
     let neg = runner
         .negotiated()
         .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;
@@ -2298,20 +2308,9 @@ fn build_verifier(
             }
         }
         HostKeyPolicy::KnownHosts(kh) => {
-            // A KnownHosts policy *requires* a host name to look up. If
-            // the caller routed through `Client::connect` (raw socket
-            // address) instead of `Client::connect_to_host`, we have no
-            // address-independent identifier — fall back to refusing
-            // rather than silently degrading to `AcceptAny`, which is
-            // what older code did. The previous behaviour effectively
-            // demoted the policy to "trust anyone" any time the wrong
-            // constructor was used; that's the worst possible mode for
-            // a host-key check.
-            if target_host.is_empty() || target_port == 0 {
-                return Err(Error::Config(
-                    "HostKeyPolicy::KnownHosts requires Client::connect_to_host",
-                ));
-            }
+            // Host-empty / port-zero already rejected above. Past this
+            // point we have a real (host, port) pair, so the lookup can
+            // proceed.
             let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
             let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
             match lookup {
@@ -2321,9 +2320,15 @@ fn build_verifier(
                         TofuAction::Reject => false,
                         TofuAction::Accept => true,
                         TofuAction::AcceptWithWarning => {
-                            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-                            eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
-                            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                            eprintln!(
+                                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+                            );
+                            eprintln!(
+                                "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @"
+                            );
+                            eprintln!(
+                                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
+                            );
                             eprintln!(
                                 "Host {target_host}:{target_port} key {} fingerprint: {}",
                                 neg.host_key,
@@ -2837,21 +2842,24 @@ mod tests {
         // Drive runner just enough to have a negotiated()-returning state
         // is not actually needed for this branch — the empty-host check
         // fires first. Build a dummy runner that we never call into.
-        let runner = KexRunner::new(Role::Client, KexInit::from_algorithms(
-            &KexAlgorithms {
-                kex: defaults::KEX,
-                server_host_key: defaults::HOST_KEY,
-                ciphers_c2s: defaults::CIPHERS,
-                ciphers_s2c: defaults::CIPHERS,
-                macs_c2s: defaults::MACS,
-                macs_s2c: defaults::MACS,
-                comp_c2s: defaults::COMP,
-                comp_s2c: defaults::COMP,
-                lang_c2s: &[],
-                lang_s2c: &[],
-            },
-            [0u8; 16],
-        ));
+        let runner = KexRunner::new(
+            Role::Client,
+            KexInit::from_algorithms(
+                &KexAlgorithms {
+                    kex: defaults::KEX,
+                    server_host_key: defaults::HOST_KEY,
+                    ciphers_c2s: defaults::CIPHERS,
+                    ciphers_s2c: defaults::CIPHERS,
+                    macs_c2s: defaults::MACS,
+                    macs_s2c: defaults::MACS,
+                    comp_c2s: defaults::COMP,
+                    comp_s2c: defaults::COMP,
+                    lang_c2s: &[],
+                    lang_s2c: &[],
+                },
+                [0u8; 16],
+            ),
+        );
         // Provide a reply payload of the minimum shape (5 bytes header +
         // a 0-byte K_S). The host-empty branch fires before negotiated()
         // is consulted, so we don't need a real KEX outcome.

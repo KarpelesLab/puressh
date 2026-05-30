@@ -121,6 +121,7 @@ impl ChannelStream {
     /// by [`Self::new`], because the only path that nulls `rx` / `tx` is
     /// `into_raw` itself, which consumes the value. Defensive callers
     /// that prefer a `?` over a panic should use this method.
+    #[allow(clippy::type_complexity)] // mirrors `into_raw`'s public tuple
     pub fn try_into_raw(
         mut self,
     ) -> Option<(Receiver<Option<Vec<u8>>>, SyncSender<ChannelEgress>)> {

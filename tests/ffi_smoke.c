@@ -71,6 +71,8 @@ int main(void) {
         PCSSH_ERR_HOSTKEY_REJECTED,
         PCSSH_ERR_PROTOCOL,
         PCSSH_ERR_PARSE,
+        PCSSH_ERR_CONFIG,
+        PCSSH_ERR_INVALID_HANDLE,
         PCSSH_ERR_PANIC,
     };
     size_t n_codes = sizeof(codes) / sizeof(codes[0]);
@@ -94,6 +96,33 @@ int main(void) {
     rc = pcssh_client_connect("127.0.0.1", 22, 100, NULL);
     EXPECT(rc == PCSSH_ERR_INVALID_ARGUMENT,
            "connect with NULL out should be PCSSH_ERR_INVALID_ARGUMENT");
+
+    /* connect_ex: unknown policy id is rejected. */
+    PcSshClient *c2 = (PcSshClient *)0xDEADBEEF;
+    rc = pcssh_client_connect_ex("127.0.0.1", 1, 100, 999, NULL, &c2);
+    EXPECT(rc == PCSSH_ERR_INVALID_ARGUMENT,
+           "connect_ex with bogus policy should be PCSSH_ERR_INVALID_ARGUMENT");
+    EXPECT(c2 == NULL, "connect_ex must NULL out on rejection");
+
+    /* connect_ex: KNOWN_HOSTS policy on _ex returns PCSSH_ERR_CONFIG. */
+    rc = pcssh_client_connect_ex("127.0.0.1", 1, 100,
+                                 PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS, NULL, &c2);
+    EXPECT(rc == PCSSH_ERR_CONFIG,
+           "connect_ex with KNOWN_HOSTS should return PCSSH_ERR_CONFIG");
+
+    /* connect_ex: ACCEPT_FINGERPRINT with missing fingerprint → PCSSH_ERR_CONFIG. */
+    rc = pcssh_client_connect_ex("127.0.0.1", 1, 100,
+                                 PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT,
+                                 NULL, &c2);
+    EXPECT(rc == PCSSH_ERR_CONFIG,
+           "connect_ex with ACCEPT_FINGERPRINT + NULL fp should return PCSSH_ERR_CONFIG");
+
+    /* connect_ex: ACCEPT_FINGERPRINT with malformed fingerprint → PCSSH_ERR_CONFIG. */
+    rc = pcssh_client_connect_ex("127.0.0.1", 1, 100,
+                                 PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT,
+                                 "not-base64!@#", &c2);
+    EXPECT(rc == PCSSH_ERR_CONFIG,
+           "connect_ex with garbage fingerprint should return PCSSH_ERR_CONFIG");
 
     if (failures == 0) {
         printf("ffi_smoke: ok\n");

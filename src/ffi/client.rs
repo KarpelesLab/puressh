@@ -18,6 +18,7 @@ use std::ffi::CStr;
 use std::net::ToSocketAddrs;
 use std::slice;
 use std::time::Duration;
+use zeroize::Zeroizing;
 
 use super::common::{
     catch, cstr_to_str, map_error, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
@@ -29,6 +30,29 @@ use crate::error::Error;
 use crate::key::PrivateKey;
 use crate::shared::SharedClient;
 
+// ---------------------------------------------------------------------------
+// Host-key policy enum (for `pcssh_client_connect_ex`)
+// ---------------------------------------------------------------------------
+
+/// `pcssh_client_connect_ex` policy: accept any host key the server
+/// presents. **Insecure** — equivalent to `StrictHostKeyChecking=no`
+/// with no known-hosts file. Use only when the caller will pin the
+/// fingerprint themselves out-of-band, or in tests against ephemeral
+/// loopback servers.
+pub const PCSSH_HOSTKEY_POLICY_ACCEPT_ANY: c_int = 0;
+
+/// `pcssh_client_connect_ex` policy: accept only host keys whose
+/// SHA-256 fingerprint matches the base64 string (no `SHA256:` prefix,
+/// no `=` padding — `ssh-keygen -lf` format) supplied via the
+/// `fingerprint_b64` argument.
+pub const PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT: c_int = 1;
+
+/// `pcssh_client_connect_ex` policy: defer to a `PcSshKnownHosts` store.
+/// **Not implemented in `_ex`** — use [`super::known_hosts::
+/// pcssh_client_connect_known_hosts`] instead, which accepts the store
+/// handle and per-call TOFU thresholds.
+pub const PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS: c_int = 2;
+
 /// Opaque handle to a connected SSH client.
 ///
 /// Allocated by [`pcssh_client_connect`], freed by [`pcssh_client_free`].
@@ -38,26 +62,38 @@ pub struct PcSshClient {
     pub(crate) inner: SharedClient,
 }
 
-/// Connect to `host:port`, run version-exchange and KEX, and return a
-/// client handle ready for authentication.
+/// Connect to `host:port` with an explicit host-key policy.
 ///
-/// Uses [`HostKeyPolicy::AcceptAny`] (insecure — TOFU is the caller's
-/// responsibility). A future revision may expose a fingerprint-pinned
-/// variant.
+/// `policy` is one of `PCSSH_HOSTKEY_POLICY_*`:
 ///
-/// On success returns [`PCSSH_OK`] and writes a non-NULL pointer into
-/// `*out`. On error returns a negative code; `*out` is set to NULL.
+///  - `PCSSH_HOSTKEY_POLICY_ACCEPT_ANY`: accept whatever the server
+///    presents. Insecure; `fingerprint_b64` is ignored.
+///  - `PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT`: `fingerprint_b64` must
+///    be a NUL-terminated, base64 (no padding, no `SHA256:` prefix)
+///    SHA-256 fingerprint of the server's host key in the same format
+///    `ssh-keygen -lf` prints. Mismatch ⇒ `PCSSH_ERR_HOSTKEY_REJECTED`.
+///  - `PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS`: not supported from this
+///    function — call [`super::known_hosts::pcssh_client_connect_known_hosts`]
+///    instead. Returns `PCSSH_ERR_CONFIG` when supplied.
+///
+/// Finding #1 (Critical): the original `pcssh_client_connect` hardcoded
+/// AcceptAny with no opt-out. New callers should use this function and
+/// pass an explicit policy.
 ///
 /// # Safety
 ///
 /// - `host` must be NUL-terminated, valid UTF-8.
 /// - `out` must be non-NULL and point to writable storage for one
 ///   `*mut PcSshClient`.
+/// - `fingerprint_b64`, when policy is `ACCEPT_FINGERPRINT`, must be
+///   NUL-terminated.
 #[no_mangle]
-pub unsafe extern "C" fn pcssh_client_connect(
+pub unsafe extern "C" fn pcssh_client_connect_ex(
     host: *const c_char,
     port: u16,
     timeout_ms: i32,
+    policy: c_int,
+    fingerprint_b64: *const c_char,
     out: *mut *mut PcSshClient,
 ) -> c_int {
     catch(|| {
@@ -71,6 +107,45 @@ pub unsafe extern "C" fn pcssh_client_connect(
         let host_str = match unsafe { cstr_to_str(host) } {
             Some(s) => s,
             None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+
+        // Resolve the policy enum into a `HostKeyPolicy` before opening
+        // a socket so a misconfigured caller fails fast.
+        let host_key_policy = match policy {
+            PCSSH_HOSTKEY_POLICY_ACCEPT_ANY => HostKeyPolicy::AcceptAny,
+            PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT => {
+                if fingerprint_b64.is_null() {
+                    return super::common::PCSSH_ERR_CONFIG;
+                }
+                // SAFETY: caller contract: NUL-terminated.
+                let fp_str = match unsafe { cstr_to_str(fingerprint_b64) } {
+                    Some(s) => s,
+                    None => return PCSSH_ERR_INVALID_ARGUMENT,
+                };
+                // Normalize: strip a "SHA256:" prefix if present, and trim any
+                // padding `=` so callers can pass either ssh-keygen's display
+                // form or raw base64.
+                let trimmed = fp_str
+                    .strip_prefix("SHA256:")
+                    .unwrap_or(fp_str)
+                    .trim_end_matches('=');
+                let raw = match crate::key::base64::decode(trimmed.as_bytes()) {
+                    Ok(v) => v,
+                    Err(_) => return super::common::PCSSH_ERR_CONFIG,
+                };
+                if raw.len() != 32 {
+                    return super::common::PCSSH_ERR_CONFIG;
+                }
+                let mut fp = [0u8; 32];
+                fp.copy_from_slice(&raw);
+                HostKeyPolicy::AcceptFingerprint(fp)
+            }
+            PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS => {
+                // KnownHosts requires a store handle; that path lives in
+                // ffi::known_hosts::pcssh_client_connect_known_hosts.
+                return super::common::PCSSH_ERR_CONFIG;
+            }
+            _ => return PCSSH_ERR_INVALID_ARGUMENT,
         };
 
         let addr = format!("{host_str}:{port}");
@@ -87,8 +162,18 @@ pub unsafe extern "C" fn pcssh_client_connect(
 
         let mut last_err: Option<Error> = None;
         for sa in addrs {
+            // We have to rebuild the policy per loop iteration because
+            // `HostKeyPolicy` is not `Clone` (the `KnownHosts` variant
+            // holds an `Arc<Mutex<...>>` — but it's currently rejected
+            // above for the FFI path, so for `AcceptAny` / `AcceptFingerprint`
+            // we can just copy the bytes).
+            let policy_for_iter = match &host_key_policy {
+                HostKeyPolicy::AcceptAny => HostKeyPolicy::AcceptAny,
+                HostKeyPolicy::AcceptFingerprint(fp) => HostKeyPolicy::AcceptFingerprint(*fp),
+                HostKeyPolicy::KnownHosts(_) => unreachable!("rejected above"),
+            };
             let cfg = Config {
-                host_key_policy: HostKeyPolicy::AcceptAny,
+                host_key_policy: policy_for_iter,
                 timeout,
             };
             match Client::connect(sa, cfg) {
@@ -112,7 +197,54 @@ pub unsafe extern "C" fn pcssh_client_connect(
     })
 }
 
+/// Connect to `host:port` with [`HostKeyPolicy::AcceptAny`].
+///
+/// **Deprecated**: this is the insecure shortcut — it accepts whatever
+/// host key the server presents, which is equivalent to OpenSSH's
+/// `StrictHostKeyChecking=no` with no known-hosts file. Prefer
+/// [`pcssh_client_connect_ex`] (explicit policy) or
+/// [`super::known_hosts::pcssh_client_connect_known_hosts`] (real TOFU
+/// verifier) instead. Kept as a thin shim so existing C callers don't
+/// break, and so the insecure choice is searchable by string in code
+/// review.
+///
+/// On success returns [`PCSSH_OK`] and writes a non-NULL pointer into
+/// `*out`. On error returns a negative code; `*out` is set to NULL.
+///
+/// # Safety
+///
+/// - `host` must be NUL-terminated, valid UTF-8.
+/// - `out` must be non-NULL and point to writable storage for one
+///   `*mut PcSshClient`.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_client_connect(
+    host: *const c_char,
+    port: u16,
+    timeout_ms: i32,
+    out: *mut *mut PcSshClient,
+) -> c_int {
+    // SAFETY: same contract as `pcssh_client_connect_ex`; we forward
+    // unchanged arguments and an empty fingerprint pointer (unused for
+    // ACCEPT_ANY).
+    unsafe {
+        pcssh_client_connect_ex(
+            host,
+            port,
+            timeout_ms,
+            PCSSH_HOSTKEY_POLICY_ACCEPT_ANY,
+            ptr::null(),
+            out,
+        )
+    }
+}
+
 /// Authenticate using a password.
+///
+/// **Memory note** (Finding #8): the password bytes are borrowed from
+/// caller-owned storage; the FFI never makes a heap copy here so there
+/// is nothing for the library to zeroize. The caller is responsible for
+/// wiping the C-side buffer (e.g. with `explicit_bzero(3)`) once this
+/// call returns.
 ///
 /// # Safety
 ///
@@ -193,8 +325,9 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
         };
 
         // Passphrase: NULL → None; empty C string → None; otherwise bytes
-        // up to NUL.
-        let passphrase_opt: Option<Vec<u8>> = if passphrase.is_null() {
+        // up to NUL. Wrapped in `Zeroizing` so the heap copy is wiped on
+        // drop even on the error paths below (Finding #8).
+        let passphrase_opt: Option<Zeroizing<Vec<u8>>> = if passphrase.is_null() {
             None
         } else {
             // SAFETY: caller contract: NUL-terminated.
@@ -203,11 +336,14 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
             if bytes.is_empty() {
                 None
             } else {
-                Some(bytes.to_vec())
+                Some(Zeroizing::new(bytes.to_vec()))
             }
         };
 
-        let priv_key = match PrivateKey::parse_openssh_pem(pem_str, passphrase_opt.as_deref()) {
+        let priv_key = match PrivateKey::parse_openssh_pem(
+            pem_str,
+            passphrase_opt.as_deref().map(|v| v.as_slice()),
+        ) {
             Ok(k) => k,
             Err(e) => return map_error(&e),
         };

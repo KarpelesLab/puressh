@@ -32,7 +32,22 @@ extern "C" {
 #define PCSSH_ERR_HOSTKEY_REJECTED   (-8)
 #define PCSSH_ERR_PROTOCOL           (-9)
 #define PCSSH_ERR_PARSE             (-10)
+#define PCSSH_ERR_CONFIG            (-11)
+#define PCSSH_ERR_INVALID_HANDLE    (-12)
 #define PCSSH_ERR_PANIC             (-99)
+
+/* ----- Host-key policy (pcssh_client_connect_ex) ------------------------ */
+
+/* Accept any host key the server presents.  Insecure; equivalent to
+ * OpenSSH `StrictHostKeyChecking=no` with no known_hosts. */
+#define PCSSH_HOSTKEY_POLICY_ACCEPT_ANY          0
+/* Accept only host keys matching the SHA-256 fingerprint given as a
+ * base64 string (with or without a `SHA256:` prefix; `=` padding
+ * optional). Mismatch ⇒ PCSSH_ERR_HOSTKEY_REJECTED. */
+#define PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT  1
+/* Defer to a PcSshKnownHosts store. Not supported via
+ * pcssh_client_connect_ex — use pcssh_client_connect_known_hosts. */
+#define PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS         2
 
 /* ----- Types ------------------------------------------------------------- */
 
@@ -42,13 +57,13 @@ typedef struct PcSshClient PcSshClient;
 /* ----- API --------------------------------------------------------------- */
 
 /*
- * Connect to `host:port` and complete version-exchange + KEX.
+ * DEPRECATED.  Connect to `host:port` with the AcceptAny host-key policy.
  *
- * `timeout_ms`  socket read/write timeout in milliseconds; 0 = no timeout.
- * `out`         on success, receives a non-NULL handle; on error, set NULL.
+ * Insecure: the client trusts whatever key the server presents. Prefer
+ * pcssh_client_connect_ex (explicit policy enum) or
+ * pcssh_client_connect_known_hosts (real TOFU/known_hosts verifier).
  *
- * Host-key policy is currently hardcoded to AcceptAny (TOFU is caller's
- * responsibility).
+ * Kept as a thin shim so existing C callers continue to link.
  *
  * Returns PCSSH_OK on success, a negative PCSSH_ERR_* otherwise.
  */
@@ -60,7 +75,36 @@ int pcssh_client_connect(
 );
 
 /*
+ * Connect to `host:port` and complete version-exchange + KEX with an
+ * explicit host-key policy.
+ *
+ * `policy`           one of PCSSH_HOSTKEY_POLICY_*.
+ * `fingerprint_b64`  used only when policy == ACCEPT_FINGERPRINT; a NUL-
+ *                    terminated base64 SHA-256 fingerprint (`SHA256:`
+ *                    prefix and `=` padding both tolerated). Otherwise
+ *                    pass NULL.
+ * `out`              on success, receives a non-NULL handle; on error,
+ *                    set NULL.
+ *
+ * Returns PCSSH_OK on success, a negative PCSSH_ERR_* otherwise.
+ * Passing PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS returns PCSSH_ERR_CONFIG —
+ * use pcssh_client_connect_known_hosts (which takes the store handle).
+ */
+int pcssh_client_connect_ex(
+    const char *host,
+    uint16_t port,
+    int32_t timeout_ms,
+    int policy,
+    const char *fingerprint_b64,
+    PcSshClient **out
+);
+
+/*
  * Authenticate using a password. Returns PCSSH_OK on success.
+ *
+ * NOTE: the password bytes are borrowed from caller-owned storage; the
+ * FFI does not heap-copy them, so the caller is responsible for wiping
+ * (e.g. explicit_bzero) the buffer once this call returns.
  */
 int pcssh_client_auth_password(
     PcSshClient *client,
@@ -291,7 +335,12 @@ int pcssh_client_connect_known_hosts(
 
 #if defined(__unix__) || defined(__APPLE__)
 
-/* Opaque agent handle. */
+/* Opaque agent handle.
+ *
+ * Thread-safety: the handle is Send + Sync (an internal mutex serialises
+ * concurrent calls), so it may be shared across threads. A poisoned
+ * mutex (panic in another thread) surfaces as PCSSH_ERR_GENERIC.
+ */
 typedef struct PcSshAgent PcSshAgent;
 
 /* Agent-sign flags (mirror SSH_AGENT_RSA_SHA2_* wire bits). */

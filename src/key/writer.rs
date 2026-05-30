@@ -204,7 +204,7 @@ impl PrivateKey {
             let mut iv: Zeroizing<[u8; IV_LEN]> = Zeroizing::new([0u8; IV_LEN]);
             iv.copy_from_slice(&derived[KEY_LEN..KEY_LEN + IV_LEN]);
             let mut buf = inner;
-            let mut ctr = Ctr::new(Aes256::new(&*key), &*iv);
+            let mut ctr = Ctr::new(Aes256::new(&key), &iv);
             ctr.apply_keystream(&mut buf);
             let mut opts = Writer::new();
             opts.write_string(&salt);

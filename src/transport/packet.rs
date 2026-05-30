@@ -126,22 +126,57 @@ impl PacketCodec {
 
     /// Install outbound cipher state and (optionally) MAC after NEWKEYS.
     /// `mac` must be `Some` for non-AEAD ciphers and is `None` for AEAD.
+    ///
+    /// Returns `Err(Error::Protocol("MAC required for non-AEAD cipher"))`
+    /// when the cipher/MAC pair is inconsistent. Previously this panicked,
+    /// which let an attacker (in principle) crash the process by feeding
+    /// us a cipher/MAC pair that survived negotiation but failed
+    /// classification.
     pub fn install_outbound(
         &mut self,
         cipher: SshCipher,
         mac: Option<Box<dyn SshMac + Send + Sync>>,
-    ) {
-        self.outbound = classify(cipher, mac).expect("install_outbound: cipher/mac mismatch");
+    ) -> Result<()> {
+        self.outbound = classify(cipher, mac)?;
+        Ok(())
     }
 
     /// Install inbound cipher state and (optionally) MAC after NEWKEYS.
+    ///
+    /// Returns `Err(Error::Protocol("MAC required for non-AEAD cipher"))`
+    /// when the cipher/MAC pair is inconsistent. See
+    /// [`install_outbound`](Self::install_outbound) for the rationale.
     pub fn install_inbound(
         &mut self,
         cipher: SshCipher,
         mac: Option<Box<dyn SshMac + Send + Sync>>,
-    ) {
-        self.inbound = classify(cipher, mac).expect("install_inbound: cipher/mac mismatch");
+    ) -> Result<()> {
+        self.inbound = classify(cipher, mac)?;
         self.pending_first_block = None;
+        Ok(())
+    }
+
+    /// Reset both sequence counters to zero. Used by the strict-kex
+    /// (Terrapin / CVE-2023-48795) mitigation at NEWKEYS: the OpenSSH
+    /// `PROTOCOL` document and commit `1edb00c58` specify that when strict
+    /// KEX is enabled, `seq_in` and `seq_out` are reset to 0 right after
+    /// the NEWKEYS exchange — this prevents an attacker from manipulating
+    /// the sequence-counter state via injected packets during KEX.
+    pub fn reset_sequence_numbers(&mut self) {
+        self.seq_in = 0;
+        self.seq_out = 0;
+    }
+
+    /// Reset the outbound sequence counter only. Strict-kex direction-
+    /// specific reset: called right after this side sends NEWKEYS.
+    pub fn reset_outbound_sequence(&mut self) {
+        self.seq_out = 0;
+    }
+
+    /// Reset the inbound sequence counter only. Strict-kex direction-
+    /// specific reset: called right after this side receives peer NEWKEYS.
+    pub fn reset_inbound_sequence(&mut self) {
+        self.seq_in = 0;
     }
 
     /// Install the outbound compression channel for this direction. The KEX
@@ -251,7 +286,22 @@ impl PacketCodec {
     }
 }
 
+/// Upper bound on the SSH payload length we ever attempt to encode. The
+/// guard is conservative: it leaves room (~256 bytes) for header, padding,
+/// MAC/tag and any compression-side overhead so the encoder's arithmetic
+/// stays in u32/u64 range and we fail cleanly instead of wrapping or
+/// panicking on absurd input.
+const MAX_ENCODABLE_PAYLOAD: usize = (MAX_PACKET_LEN as usize).saturating_sub(256);
+
+/// Returns `true` if `payload_len` is small enough that the encoder won't
+/// overflow when adding header, padding and MAC.
+fn payload_within_limit(payload_len: usize) -> bool {
+    payload_len < MAX_ENCODABLE_PAYLOAD
+}
+
 fn padding_for(payload_len: usize, block_size: usize, encrypts_length: bool) -> usize {
+    // Bound the input so the arithmetic below stays in usize.
+    debug_assert!(payload_within_limit(payload_len));
     let bs = block_size.max(8);
     let unit = if encrypts_length {
         4 + 1 + payload_len
@@ -282,6 +332,9 @@ fn fill_padding<R: CryptoRng + RngCore>(rng: &mut R, out: &mut [u8]) {
 
 #[cfg(feature = "alloc")]
 fn encode_cleartext<R: CryptoRng + RngCore>(payload: &[u8], rng: &mut R) -> Result<Vec<u8>> {
+    if !payload_within_limit(payload.len()) {
+        return Err(Error::Protocol("payload exceeds encoder limit"));
+    }
     let pad = padding_for(payload.len(), BLOCK_SIZE_DEFAULT, true);
     let packet_length = 1 + payload.len() + pad;
     if packet_length + 4 < MIN_TOTAL_LEN {
@@ -336,6 +389,9 @@ fn encode_stream<R: CryptoRng + RngCore>(
     cipher: &mut SshCipher,
     mac: &dyn SshMac,
 ) -> Result<Vec<u8>> {
+    if !payload_within_limit(payload.len()) {
+        return Err(Error::Protocol("payload exceeds encoder limit"));
+    }
     let block_size = 16usize;
     let etm = mac.etm();
     let pad = padding_for(payload.len(), block_size, !etm);
@@ -478,6 +534,9 @@ fn encode_gcm<R: CryptoRng + RngCore>(
     rng: &mut R,
     cipher: &mut SshCipher,
 ) -> Result<Vec<u8>> {
+    if !payload_within_limit(payload.len()) {
+        return Err(Error::Protocol("payload exceeds encoder limit"));
+    }
     let block_size = 16usize;
     let pad = padding_for(payload.len(), block_size, false);
     let packet_length = 1 + payload.len() + pad;
@@ -538,6 +597,9 @@ fn encode_chachapoly<R: CryptoRng + RngCore>(
     rng: &mut R,
     cipher: &mut SshCipher,
 ) -> Result<Vec<u8>> {
+    if !payload_within_limit(payload.len()) {
+        return Err(Error::Protocol("payload exceeds encoder limit"));
+    }
     let block_size = 8usize;
     let pad = padding_for(payload.len(), block_size, false);
     let packet_length = 1 + payload.len() + pad;
@@ -643,8 +705,10 @@ mod tests {
         let in_cipher = cipher_by_name("aes256-ctr", &key, &iv).unwrap().unwrap();
         let out_mac = mac_by_name(mac_name, &mac_key).unwrap();
         let in_mac = mac_by_name(mac_name, &mac_key).unwrap();
-        codec_out.install_outbound(out_cipher, Some(out_mac));
-        codec_in.install_inbound(in_cipher, Some(in_mac));
+        codec_out
+            .install_outbound(out_cipher, Some(out_mac))
+            .unwrap();
+        codec_in.install_inbound(in_cipher, Some(in_mac)).unwrap();
     }
 
     #[test]
@@ -678,8 +742,8 @@ mod tests {
         let ic = cipher_by_name("aes128-gcm@openssh.com", &key, &iv)
             .unwrap()
             .unwrap();
-        codec_out.install_outbound(oc, None);
-        codec_in.install_inbound(ic, None);
+        codec_out.install_outbound(oc, None).unwrap();
+        codec_in.install_inbound(ic, None).unwrap();
     }
 
     #[test]
@@ -701,8 +765,8 @@ mod tests {
         let ic = cipher_by_name("chacha20-poly1305@openssh.com", &key, &[])
             .unwrap()
             .unwrap();
-        codec_out.install_outbound(oc, None);
-        codec_in.install_inbound(ic, None);
+        codec_out.install_outbound(oc, None).unwrap();
+        codec_in.install_inbound(ic, None).unwrap();
     }
 
     #[test]
@@ -802,6 +866,32 @@ mod tests {
         frame.extend_from_slice(&[0u8; 3]);
         let mut codec = PacketCodec::new();
         assert!(matches!(codec.decode(&frame), Err(Error::BadPadding)));
+    }
+
+    #[test]
+    fn install_outbound_returns_err_for_missing_mac_on_non_aead() {
+        let key = [0x11u8; 32];
+        let iv = [0x22u8; 16];
+        let cipher = cipher_by_name("aes256-ctr", &key, &iv).unwrap().unwrap();
+        let mut codec = PacketCodec::new();
+        let res = codec.install_outbound(cipher, None);
+        match res {
+            Err(Error::Protocol(_)) => {}
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encode_rejects_oversized_payload() {
+        // Larger than MAX_ENCODABLE_PAYLOAD (~MAX_PACKET_LEN - 256).
+        let payload = vec![0u8; MAX_PACKET_LEN as usize];
+        let mut codec = PacketCodec::new();
+        let mut rng = OsRng;
+        let err = codec.encode(&payload, &mut rng).unwrap_err();
+        match err {
+            Error::Protocol(msg) => assert_eq!(msg, "payload exceeds encoder limit"),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
     }
 
     #[test]

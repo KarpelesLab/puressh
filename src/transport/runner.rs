@@ -184,6 +184,14 @@ pub struct KexRunner {
     sent_newkeys: bool,
     peer_newkeys: bool,
     phase: Phase,
+    /// True when the most recent negotiation enabled strict-kex (Terrapin /
+    /// CVE-2023-48795). Locked at `handle_peer_kexinit`. Latched across
+    /// re-keys: once enabled it cannot be downgraded.
+    strict_kex: bool,
+    /// Set after handle_peer_kexinit when the peer's first_kex_packet_follows
+    /// hint produced the wrong guess (RFC 4253 §7.1). The next KEX
+    /// algorithm-specific packet must be silently discarded.
+    pending_wrong_guess_discard: bool,
 }
 
 impl KexRunner {
@@ -206,7 +214,16 @@ impl KexRunner {
             sent_newkeys: false,
             peer_newkeys: false,
             phase: Phase::Idle,
+            strict_kex: false,
+            pending_wrong_guess_discard: false,
         }
+    }
+
+    /// Strict-kex (Terrapin / CVE-2023-48795) enabled on this connection,
+    /// as negotiated at the most recent KEX. Once a connection negotiates
+    /// strict-kex it stays enabled across all subsequent re-keys.
+    pub fn strict_kex_enabled(&self) -> bool {
+        self.strict_kex
     }
 
     /// Kick the runner off: emit our KEXINIT. Both client and server call
@@ -251,7 +268,10 @@ impl KexRunner {
         self.installed_keys = None;
         self.sent_newkeys = false;
         self.peer_newkeys = false;
+        self.pending_wrong_guess_discard = false;
         // session_id stays put — it's the H of the FIRST KEX (RFC 4253 §7.2).
+        // strict_kex is also latched across re-keys: once enabled on a
+        // connection it cannot be downgraded by the peer mid-session.
         self.phase = Phase::SentKexInit;
         Ok(KexAdvance {
             outbound: vec![self.our_advert_bytes.clone()],
@@ -294,6 +314,36 @@ impl KexRunner {
             return Err(Error::Format("empty payload"));
         }
         let msg = payload[0];
+
+        // RFC 4253 §7.1 wrong-guess discard. The peer set
+        // `first_kex_packet_follows` and our negotiation said the guess
+        // was wrong: drop the first KEX algorithm-specific packet that
+        // arrives, then resume normally. Anything outside the KEX
+        // algorithm-specific byte range falls through and is rejected.
+        if self.pending_wrong_guess_discard
+            && matches!(
+                &self.phase,
+                Phase::Negotiated { .. }
+                    | Phase::GexClientAwaitGroup { .. }
+                    | Phase::GexServerAwaitInit { .. }
+            )
+            && matches!(msg, 30..=49)
+        {
+            self.pending_wrong_guess_discard = false;
+            return Ok(KexAdvance::default());
+        }
+
+        // Strict-kex (Terrapin / CVE-2023-48795) enforcement: between
+        // KEXINIT and NEWKEYS, only KEX-bytes (20, 21, 30..=49) may flow.
+        // The transport router should already filter, but defence-in-depth:
+        // the runner refuses anything else when strict-kex is on.
+        if self.strict_kex
+            && !matches!(self.phase, Phase::Idle | Phase::Completed)
+            && !matches!(msg, 20 | 21 | 30..=49)
+        {
+            return Err(Error::Protocol("non-KEX message during strict-kex window"));
+        }
+
         let backend_is_gex = matches!(self.backend, Some(KexBackend::Gex));
         let mut adv = match (&self.phase, msg) {
             (Phase::SentKexInit, super::kexinit::SSH_MSG_KEXINIT) => {
@@ -337,9 +387,18 @@ impl KexRunner {
                 self.handle_gex_reply(codec, payload, host_key_verifier, v_c, v_s)?
             }
             (Phase::AwaitingPeerNewKeys, SSH_MSG_NEWKEYS) => self.handle_peer_newkeys(codec)?,
-            (Phase::Negotiated { .. }, SSH_MSG_NEWKEYS) => {
-                self.peer_newkeys = true;
-                KexAdvance::default()
+            // NEWKEYS is ONLY valid after both sides have completed the
+            // algorithm-specific KEX. Accepting it earlier (during
+            // Phase::Negotiated or any GEX intermediate phase) lets a
+            // peer move us into the post-keys regime before the agreed
+            // session_id and keys have been derived — a protocol
+            // violation. RFC 4253 §7.3 places NEWKEYS strictly after the
+            // KEX-method-specific exchange.
+            (Phase::Negotiated { .. }, SSH_MSG_NEWKEYS)
+            | (Phase::GexClientAwaitGroup { .. }, SSH_MSG_NEWKEYS)
+            | (Phase::GexClientAwaitReply { .. }, SSH_MSG_NEWKEYS)
+            | (Phase::GexServerAwaitInit { .. }, SSH_MSG_NEWKEYS) => {
+                return Err(Error::Protocol("NEWKEYS before KEX completion"));
             }
             (_, _) => return Err(Error::Protocol("unexpected message during KEX")),
         };
@@ -388,6 +447,18 @@ impl KexRunner {
         };
         let neg = negotiate(client_init, server_init)?;
         self.backend = Some(KexBackend::from_name(&neg.kex)?);
+        // Latch strict-kex across re-keys: once on, stays on.
+        if neg.strict_kex_enabled {
+            self.strict_kex = true;
+        }
+        // Per RFC 4253 §7.1: if the peer prefixed a guess to its KEXINIT
+        // and our negotiation says that guess was wrong, the next KEX
+        // algorithm-specific packet from the peer must be silently dropped.
+        // The peer is the one that sent the guess (`first_kex_packet_follows`
+        // on their KEXINIT, not ours).
+        if peer.first_kex_packet_follows && neg.first_kex_packet_follows_wrong_guess {
+            self.pending_wrong_guess_discard = true;
+        }
         self.negotiated = Some(neg);
 
         let mut outbound = Vec::new();
@@ -777,9 +848,9 @@ impl KexRunner {
         };
 
         let (out_cipher, out_mac) = build_cipher_mac(outbound_dir)?;
-        codec.install_outbound(out_cipher, out_mac);
+        codec.install_outbound(out_cipher, out_mac)?;
         let (in_cipher, in_mac) = build_cipher_mac(inbound_dir)?;
-        codec.install_inbound(in_cipher, in_mac);
+        codec.install_inbound(in_cipher, in_mac)?;
 
         // Wire negotiated compression. The factories return `None` only for
         // names we don't recognise — by the time we get here the negotiation
@@ -798,6 +869,15 @@ impl KexRunner {
             .ok_or(Error::Unsupported("unsupported compression"))?;
         codec.install_outbound_compress(out_comp);
         codec.install_inbound_decompress(in_comp);
+
+        // Strict-kex (Terrapin / CVE-2023-48795): reset both sequence
+        // counters once both sides have completed NEWKEYS. The OLD-cipher
+        // NEWKEYS frames have already been encoded/decoded (so their
+        // sequence numbers were consumed normally); the very first packet
+        // under the new cipher will be at seq = 0.
+        if self.strict_kex {
+            codec.reset_sequence_numbers();
+        }
         Ok(())
     }
 
@@ -921,6 +1001,11 @@ mod tests {
     #[test]
     fn every_default_kex_algorithm_maps_to_backend() {
         for &name in defaults::KEX {
+            // Strict-kex markers are signalling-only and don't map to a
+            // KEX algorithm — skip them.
+            if crate::transport::kex::is_strict_kex_marker(name) {
+                continue;
+            }
             KexBackend::from_name(name).expect(name);
         }
     }
@@ -1288,6 +1373,147 @@ mod tests {
                 break;
             }
         }
+    }
+
+    fn make_advert_with_kex_list(
+        kex: &'static [&'static str],
+        cipher: &'static str,
+        mac: &'static str,
+    ) -> KexInit {
+        let hk_only: [&str; 1] = ["ssh-ed25519"];
+        let ciphers: [&str; 1] = [cipher];
+        let macs: [&str; 1] = [mac];
+        let algs = KexAlgorithms {
+            kex,
+            server_host_key: &hk_only,
+            ciphers_c2s: &ciphers,
+            ciphers_s2c: &ciphers,
+            macs_c2s: &macs,
+            macs_s2c: &macs,
+            comp_c2s: defaults::COMP,
+            comp_s2c: defaults::COMP,
+            lang_c2s: &[],
+            lang_s2c: &[],
+        };
+        let mut cookie = [0u8; 16];
+        OsRng.fill_bytes(&mut cookie);
+        KexInit::from_algorithms(&algs, cookie)
+    }
+
+    #[test]
+    fn strict_kex_default_advertised_and_resets_sequence_counters() {
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        // Use the full default KEX list — strict-kex markers are in there.
+        let mut client = KexRunner::new(
+            Role::Client,
+            make_advert_with_kex_list(defaults::KEX, cipher, mac),
+        );
+        let mut server = KexRunner::new(
+            Role::Server,
+            make_advert_with_kex_list(defaults::KEX, cipher, mac),
+        );
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        // Pre-poison the sequence counters: if strict-kex resets, they'll
+        // be 0 after install. Otherwise they'd continue from these values.
+        client_codec.seq_in = 7;
+        client_codec.seq_out = 11;
+        server_codec.seq_in = 11;
+        server_codec.seq_out = 7;
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        assert!(client.strict_kex_enabled());
+        assert!(server.strict_kex_enabled());
+        // Both sides must have reset the sequence counters at install.
+        assert_eq!(client_codec.seq_in, 0);
+        assert_eq!(client_codec.seq_out, 0);
+        assert_eq!(server_codec.seq_in, 0);
+        assert_eq!(server_codec.seq_out, 0);
+
+        // Data plane still works after the reset.
+        let frame = client_codec.encode(b"strict-kex c2s", &mut rng).unwrap();
+        let (got, _) = server_codec.decode(&frame).unwrap().expect("c2s");
+        assert_eq!(got, b"strict-kex c2s");
+    }
+
+    #[test]
+    fn newkeys_before_kex_completion_is_rejected() {
+        // F2: NEWKEYS arriving in Phase::Negotiated must error, not be
+        // silently latched. Drive client through start + KEXINIT but then
+        // feed it a NEWKEYS before the ECDH_REPLY.
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(Role::Client, make_advert(cipher, mac));
+        let server_advert = make_advert(cipher, mac);
+        let mut client_codec = PacketCodec::new();
+
+        let _ = client.start(&mut rng).unwrap();
+        // Feed the server's KEXINIT to the client.
+        client
+            .on_packet(
+                &mut rng,
+                &mut client_codec,
+                &server_advert.encode(),
+                None,
+                Some(&client_verifier),
+                v_c,
+                v_s,
+            )
+            .unwrap();
+        // Now client is in Phase::Negotiated. Inject a stray NEWKEYS.
+        let res = client.on_packet(
+            &mut rng,
+            &mut client_codec,
+            &[SSH_MSG_NEWKEYS],
+            None,
+            Some(&client_verifier),
+            v_c,
+            v_s,
+        );
+        match res {
+            Err(Error::Protocol(msg)) => {
+                assert_eq!(msg, "NEWKEYS before KEX completion");
+            }
+            other => panic!("expected Protocol(NEWKEYS before KEX completion), got {other:?}"),
+        }
+        // Server is unused — silence the warning.
+        let _ = &server_hk;
     }
 
     #[test]

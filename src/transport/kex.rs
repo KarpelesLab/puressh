@@ -52,9 +52,31 @@ pub struct Negotiated {
     pub comp_s2c: alloc::string::String,
 }
 
+/// `kex-strict-c-v00@openssh.com` — sentinel name advertised by the client
+/// to indicate it supports strict-kex (Terrapin / CVE-2023-48795).
+/// See OpenSSH `PROTOCOL` and commit `1edb00c58`.
+pub const STRICT_KEX_CLIENT_MARKER: &str = "kex-strict-c-v00@openssh.com";
+/// `kex-strict-s-v00@openssh.com` — server-direction strict-kex marker.
+pub const STRICT_KEX_SERVER_MARKER: &str = "kex-strict-s-v00@openssh.com";
+
+/// Returns `true` if the given KEX algorithm name is one of the strict-kex
+/// signalling markers (`kex-strict-{c,s}-v00@openssh.com`) rather than a
+/// real KEX algorithm. The negotiator skips these when picking the agreed
+/// kex but inspects them separately to set the strict-kex flag.
+pub fn is_strict_kex_marker(name: &str) -> bool {
+    name == STRICT_KEX_CLIENT_MARKER || name == STRICT_KEX_SERVER_MARKER
+}
+
 /// Sensible default algorithm lists matching modern OpenSSH.
 pub mod defaults {
-    /// KEX algorithms in preference order.
+    use super::{STRICT_KEX_CLIENT_MARKER, STRICT_KEX_SERVER_MARKER};
+
+    /// KEX algorithms in preference order. The trailing two entries
+    /// (`kex-strict-{c,s}-v00@openssh.com`) are *signalling* names rather
+    /// than negotiable algorithms — they tell the peer this side supports
+    /// strict-kex (Terrapin / CVE-2023-48795). They are intentionally last
+    /// so they cannot win the negotiation; the [`super::negotiate`] picker
+    /// also skips them when choosing a real KEX.
     pub const KEX: &[&str] = &[
         "curve25519-sha256",
         "curve25519-sha256@libssh.org",
@@ -65,6 +87,8 @@ pub mod defaults {
         "diffie-hellman-group16-sha512",
         "diffie-hellman-group18-sha512",
         "diffie-hellman-group14-sha256",
+        STRICT_KEX_CLIENT_MARKER,
+        STRICT_KEX_SERVER_MARKER,
     ];
 
     /// Server host-key algorithms in preference order.

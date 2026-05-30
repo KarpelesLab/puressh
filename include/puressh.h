@@ -112,6 +112,85 @@ int pcssh_client_exec(
  */
 void pcssh_client_free(PcSshClient *client);
 
+/* ----- known_hosts ------------------------------------------------------- */
+
+/* Opaque known_hosts store handle (in-memory OpenSSH-format store). */
+typedef struct PcSshKnownHosts PcSshKnownHosts;
+
+/* Lookup result codes for pcssh_known_hosts_lookup. */
+#define PCSSH_KH_MATCH       0
+#define PCSSH_KH_MISMATCH    1
+#define PCSSH_KH_UNKNOWN     2
+
+/* TOFU policy actions for pcssh_client_connect_known_hosts. */
+#define PCSSH_TOFU_REJECT    0
+#define PCSSH_TOFU_ACCEPT    1
+#define PCSSH_TOFU_PROMPT    2
+
+/*
+ * TOFU prompt callback. Invoked when the connecting host is unknown to
+ * the store and on_unknown == PCSSH_TOFU_PROMPT. Return 1 to accept the
+ * key (caller is responsible for showing the fingerprint to the user),
+ * 0 to refuse.
+ */
+typedef int (*PcSshTofuPromptCb)(
+    void *ctx,
+    const char *host,
+    uint16_t port,
+    const char *algorithm,
+    const uint8_t *key_blob,
+    size_t key_blob_len
+);
+
+int pcssh_known_hosts_new(PcSshKnownHosts **out);
+int pcssh_known_hosts_load(const char *path, PcSshKnownHosts **out);
+int pcssh_known_hosts_save(const PcSshKnownHosts *kh, const char *path);
+int pcssh_known_hosts_from_bytes(const uint8_t *buf, size_t len, PcSshKnownHosts **out);
+int pcssh_known_hosts_to_bytes(const PcSshKnownHosts *kh,
+                               uint8_t *buf, size_t cap, size_t *out_len);
+int pcssh_known_hosts_lookup(const PcSshKnownHosts *kh,
+                             const char *host, uint16_t port,
+                             const char *algorithm,
+                             const uint8_t *key_blob, size_t key_blob_len,
+                             int *out_result);
+int pcssh_known_hosts_add(PcSshKnownHosts *kh,
+                          const char *host, uint16_t port,
+                          const char *algorithm,
+                          const uint8_t *key_blob, size_t key_blob_len,
+                          int hash_host);
+int pcssh_known_hosts_remove(PcSshKnownHosts *kh,
+                             const char *host, uint16_t port,
+                             size_t *out_removed);
+int pcssh_known_hosts_hash_in_place(PcSshKnownHosts *kh);
+void pcssh_known_hosts_free(PcSshKnownHosts *kh);
+
+/*
+ * Connect with a known_hosts-backed host-key policy. On an unknown host
+ * the policy follows on_unknown (REJECT / ACCEPT / PROMPT). Mismatch is
+ * always a hard reject.
+ *
+ * save_path (if non-NULL) is the file the store is persisted back to on
+ * a successful TOFU accept. hash_new != 0 stores newly added entries
+ * with hashed host fields.
+ *
+ * The PcSshKnownHosts handle remains owned by the caller; the policy
+ * holds an internal shared reference to it for the connect's duration.
+ */
+int pcssh_client_connect_known_hosts(
+    const char *host,
+    uint16_t port,
+    int32_t timeout_ms,
+    PcSshKnownHosts *kh,
+    int on_unknown,
+    PcSshTofuPromptCb prompt_cb,
+    void *prompt_ctx,
+    const char *save_path,
+    int hash_new,
+    PcSshClient **out_client
+);
+
+/* ----- diagnostics ------------------------------------------------------- */
+
 /*
  * Convert a non-success error code into a static, NUL-terminated ASCII
  * description. The pointer is owned by the library; do not free.

@@ -32,8 +32,10 @@
 
 pub mod client;
 pub mod common;
+pub mod known_hosts;
 pub mod sftp;
 
 pub use client::*;
 pub use common::*;
+pub use known_hosts::*;
 pub use sftp::*;

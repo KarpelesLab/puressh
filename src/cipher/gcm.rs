@@ -55,20 +55,34 @@ impl GcmState {
         n
     }
 
-    fn step(&mut self) {
-        self.invocation = self.invocation.wrapping_add(1);
+    /// Advance the 64-bit invocation counter, hard-failing on overflow.
+    ///
+    /// RFC 5647 §7.1 mandates a rekey before this counter can wrap; a wrap
+    /// would reuse the (fixed || invocation) nonce under the same key, which
+    /// is catastrophic for AES-GCM (trivial forgery plus plaintext recovery
+    /// from any two ciphertexts sharing a nonce). The higher-level rekey
+    /// policy in `src/transport/rekey.rs` is the primary defence, but we
+    /// refuse to ever emit the wrapped nonce here as defence-in-depth so a
+    /// bug or misconfiguration in that layer cannot translate into a nonce
+    /// reuse on the wire.
+    fn step(&mut self) -> Result<()> {
+        self.invocation = self
+            .invocation
+            .checked_add(1)
+            .ok_or(Error::Crypto("aes-gcm invocation counter exhausted"))?;
+        Ok(())
     }
 
     /// Seals `payload` in place and returns the 16-byte tag. `aad` is the
     /// 4-byte unencrypted length field.
-    pub(crate) fn seal(&mut self, aad: &[u8], payload: &mut [u8]) -> [u8; 16] {
+    pub(crate) fn seal(&mut self, aad: &[u8], payload: &mut [u8]) -> Result<[u8; 16]> {
         let nonce = self.nonce();
         let tag = match &self.cipher {
             AesGcm::Aes128(g) => g.encrypt(&nonce, aad, payload),
             AesGcm::Aes256(g) => g.encrypt(&nonce, aad, payload),
         };
-        self.step();
-        tag
+        self.step()?;
+        Ok(tag)
     }
 
     /// Verifies `tag` and decrypts `payload` in place on success. The buffer
@@ -84,7 +98,7 @@ impl GcmState {
         };
         match r {
             Ok(()) => {
-                self.step();
+                self.step()?;
                 Ok(())
             }
             Err(TagMismatch) => Err(Error::BadTag),
@@ -125,7 +139,7 @@ mod tests {
             "d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a72\
              1c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255",
         );
-        let tag = g.seal(&[], &mut buf);
+        let tag = g.seal(&[], &mut buf).unwrap();
         assert_eq!(
             buf,
             h(
@@ -147,7 +161,7 @@ mod tests {
             let aad = [0, 0, 0, 32u8];
             let plain = [pkt; 32];
             let mut buf = plain;
-            let tag = enc.seal(&aad, &mut buf);
+            let tag = enc.seal(&aad, &mut buf).unwrap();
             dec.open(&aad, &mut buf, &tag).unwrap();
             assert_eq!(buf, plain);
         }
@@ -163,7 +177,7 @@ mod tests {
         let aad = [0, 0, 0, 16u8];
         let plain = [0xaau8; 16];
         let mut buf = plain;
-        let tag = enc.seal(&aad, &mut buf);
+        let tag = enc.seal(&aad, &mut buf).unwrap();
         let mut bad = tag;
         bad[0] ^= 1;
         assert!(matches!(dec.open(&aad, &mut buf, &bad), Err(Error::BadTag)));

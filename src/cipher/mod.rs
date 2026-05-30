@@ -163,7 +163,7 @@ impl SshCipher {
     /// Returns [`Error::Unsupported`] when called on a non-GCM suite.
     pub fn aead_seal_len_aad(&mut self, length: &[u8], payload: &mut [u8]) -> Result<[u8; 16]> {
         match self {
-            SshCipher::Gcm(g) => Ok(g.seal(length, payload)),
+            SshCipher::Gcm(g) => g.seal(length, payload),
             _ => Err(Error::Unsupported("GCM seal on non-GCM cipher")),
         }
     }

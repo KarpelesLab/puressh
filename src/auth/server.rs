@@ -14,7 +14,11 @@ use super::message::{
 };
 
 /// A single authentication attempt presented by the client.
-#[derive(Debug)]
+///
+/// `Debug` is implemented manually so the cleartext `password` field is
+/// never rendered — it is replaced by `"<redacted>"`. This prevents
+/// accidental leakage through `tracing::debug!`, `dbg!`, `Result::unwrap`'s
+/// `{:?}` formatter, and similar developer-ergonomics paths.
 pub enum AuthAttempt {
     /// `none` — bare probe.
     None {
@@ -25,7 +29,7 @@ pub enum AuthAttempt {
     Password {
         /// Requested user name.
         user: String,
-        /// Plaintext password.
+        /// Plaintext password. **Not** rendered by the [`core::fmt::Debug`] impl.
         password: String,
     },
     /// `publickey` authentication.
@@ -47,6 +51,37 @@ pub enum AuthAttempt {
         /// Requested user name.
         user: String,
     },
+}
+
+impl core::fmt::Debug for AuthAttempt {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AuthAttempt::None { user } => f.debug_struct("None").field("user", user).finish(),
+            AuthAttempt::Password { user, password: _ } => f
+                .debug_struct("Password")
+                .field("user", user)
+                .field("password", &"<redacted>")
+                .finish(),
+            AuthAttempt::PublicKey {
+                user,
+                algorithm,
+                public_blob,
+                probe_only,
+                verified,
+            } => f
+                .debug_struct("PublicKey")
+                .field("user", user)
+                .field("algorithm", algorithm)
+                .field("public_blob", public_blob)
+                .field("probe_only", probe_only)
+                .field("verified", verified)
+                .finish(),
+            AuthAttempt::KeyboardInteractive { user } => f
+                .debug_struct("KeyboardInteractive")
+                .field("user", user)
+                .finish(),
+        }
+    }
 }
 
 /// Authenticator's verdict on an attempt.
@@ -116,11 +151,20 @@ pub struct ServerAuth {
     auth: Box<dyn Authenticator>,
     state: State,
     pending_user: Option<String>,
+    /// Default-off opt-in: when false (the default), any `AuthAttempt::None`
+    /// is short-circuited to `AuthDecision::Reject` **before** the
+    /// [`Authenticator`] sees it. This protects against an
+    /// accept-everything authenticator silently letting unauthenticated
+    /// clients in via the bare-probe `"none"` method.
+    allow_none: bool,
 }
 
 impl ServerAuth {
     /// Build a new server-side driver. `methods` advertises what we accept in
     /// USERAUTH_FAILURE continuations (e.g. `["publickey", "password"]`).
+    ///
+    /// By default, the `"none"` method is hard-rejected before the
+    /// [`Authenticator`] sees it (see [`Self::allow_none`]).
     pub fn new(
         session_id: Vec<u8>,
         methods: Vec<&'static str>,
@@ -133,7 +177,26 @@ impl ServerAuth {
             auth,
             state: State::AwaitingServiceRequest,
             pending_user: None,
+            allow_none: false,
         }
+    }
+
+    /// Opt in to letting the [`Authenticator`] see `AuthAttempt::None`.
+    ///
+    /// By default this is `false` and the server short-circuits every
+    /// `"none"` userauth method to a [`UserauthFailure`] before invoking
+    /// the authenticator — RFC 4252 §5.2 describes `"none"` as a probe
+    /// the client uses to *learn* which methods the server allows, not
+    /// as a credential. Letting an accept-everything authenticator
+    /// answer that probe with `Accept` would silently authenticate any
+    /// client; the gate prevents that footgun.
+    ///
+    /// Enable only if your authenticator deliberately uses `"none"` as
+    /// a real credential (e.g. an anonymous-access tier that does not
+    /// require any secret).
+    pub fn allow_none(&mut self, allow: bool) -> &mut Self {
+        self.allow_none = allow;
+        self
     }
 
     /// Process an inbound payload from the peer.
@@ -188,6 +251,15 @@ impl ServerAuth {
         let user = req.user.clone();
         match req.method {
             AuthMethodPayload::None => {
+                // Hard gate: refuse `"none"` unless the caller explicitly
+                // opted in via `allow_none(true)`. Without this gate an
+                // overly-permissive [`Authenticator`] (e.g. one that returns
+                // `Accept` for any well-formed request) would let an
+                // unauthenticated client through the bare RFC 4252 §5.2
+                // probe. The authenticator is never consulted in this path.
+                if !self.allow_none {
+                    return self.emit_failure();
+                }
                 let decision = self.auth.evaluate(AuthAttempt::None { user: user.clone() });
                 self.apply_decision(decision, &user)
             }

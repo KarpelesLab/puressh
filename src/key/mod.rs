@@ -18,6 +18,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
+use purecrypto::ec::{BoxedEcdsaPublicKey, CurveId};
 use purecrypto::kdf::bcrypt_pbkdf;
 
 use crate::error::{Error, Result};
@@ -140,6 +141,17 @@ const NISTP521: &str = "nistp521";
 
 const MAGIC: &[u8] = b"openssh-key-v1\0";
 
+/// Whitelist of SSH public-key algorithm names we accept as the first
+/// token on an `authorized_keys` / `.pub` line. Anything else — most
+/// notably an options prefix like `from="..."` — is refused by
+/// [`PublicKey::parse_authorized_keys_line`].
+fn is_known_algorithm_name(s: &str) -> bool {
+    matches!(
+        s,
+        ED25519 | ECDSA_P256 | ECDSA_P384 | ECDSA_P521 | RSA | "rsa-sha2-256" | "rsa-sha2-512"
+    )
+}
+
 impl PublicKey {
     /// SSH algorithm name (e.g. `"ssh-ed25519"`).
     pub fn algorithm(&self) -> &'static str {
@@ -199,18 +211,42 @@ impl PublicKey {
 
     /// Parse a single-line `authorized_keys` / `.pub` entry.
     ///
-    /// Format: `<algorithm> <base64(wire_blob)> [comment...]`. Leading
-    /// `from=...`/`command=...` option prefixes are not supported.
+    /// Format: `<algorithm> <base64(wire_blob)> [comment...]`. Whitespace
+    /// between fields can be any run of spaces or tabs (matches sshd's
+    /// behaviour). Leading `from=...`/`command=...`/etc. option prefixes
+    /// are explicitly refused — silently treating an options-prefixed
+    /// line as a bare key would drop those restrictions and grant the
+    /// key broader access than the file author intended.
     pub fn parse_authorized_keys_line(s: &str) -> Result<Self> {
-        let line = s.trim_end_matches(['\n', '\r']).trim_start();
-        let mut it = line.splitn(3, ' ');
-        let algo = it
+        let line = s.trim_end_matches(['\n', '\r']).trim();
+        if line.is_empty() || line.starts_with('#') {
+            return Err(Error::Format("authorized_keys: empty or comment line"));
+        }
+
+        // First whitespace-separated token. If it isn't one of the known
+        // SSH algorithm names — i.e. it contains '=', or has a comma, or
+        // is any other shape sshd uses for the optional restriction list
+        // — refuse loudly. We don't try to parse the options here;
+        // dropping them silently would be the security regression.
+        let mut it = line.split_whitespace();
+        let first = it
             .next()
             .ok_or(Error::Format("authorized_keys: empty line"))?;
+        if !is_known_algorithm_name(first) {
+            return Err(Error::Format(
+                "authorized_keys: line begins with options or unknown tag — refusing rather than silently dropping",
+            ));
+        }
+        let algo = first;
         let b64 = it
             .next()
             .ok_or(Error::Format("authorized_keys: missing key blob"))?;
-        let comment = it.next().unwrap_or("").trim().to_string();
+        // The rest of the line (already split) is the comment, rejoined
+        // with single spaces — comments are free-form so the exact
+        // whitespace doesn't survive a roundtrip, which matches OpenSSH.
+        let comment_parts: Vec<&str> = it.collect();
+        let comment = comment_parts.join(" ");
+
         let blob = base64::decode(b64.as_bytes())?;
         let mut pk = Self::parse_wire_blob(&blob)?;
         match &mut pk {
@@ -260,21 +296,27 @@ impl PublicKey {
                 }
             }
             b if b == ECDSA_P256.as_bytes() => {
-                parse_ecdsa_public(&mut r, NISTP256, |p, c| PublicKey::EcdsaP256 {
-                    point: p,
-                    comment: c,
+                parse_ecdsa_public(&mut r, NISTP256, CurveId::P256, |p, c| {
+                    PublicKey::EcdsaP256 {
+                        point: p,
+                        comment: c,
+                    }
                 })?
             }
             b if b == ECDSA_P384.as_bytes() => {
-                parse_ecdsa_public(&mut r, NISTP384, |p, c| PublicKey::EcdsaP384 {
-                    point: p,
-                    comment: c,
+                parse_ecdsa_public(&mut r, NISTP384, CurveId::P384, |p, c| {
+                    PublicKey::EcdsaP384 {
+                        point: p,
+                        comment: c,
+                    }
                 })?
             }
             b if b == ECDSA_P521.as_bytes() => {
-                parse_ecdsa_public(&mut r, NISTP521, |p, c| PublicKey::EcdsaP521 {
-                    point: p,
-                    comment: c,
+                parse_ecdsa_public(&mut r, NISTP521, CurveId::P521, |p, c| {
+                    PublicKey::EcdsaP521 {
+                        point: p,
+                        comment: c,
+                    }
                 })?
             }
             b if b == RSA.as_bytes() => {
@@ -295,15 +337,28 @@ impl PublicKey {
     }
 }
 
-fn parse_ecdsa_public<F>(r: &mut Reader<'_>, curve: &str, ctor: F) -> Result<PublicKey>
+fn parse_ecdsa_public<F>(
+    r: &mut Reader<'_>,
+    curve_name: &str,
+    curve_id: CurveId,
+    ctor: F,
+) -> Result<PublicKey>
 where
     F: FnOnce(Vec<u8>, String) -> PublicKey,
 {
     let c = r.read_string()?;
-    if c != curve.as_bytes() {
+    if c != curve_name.as_bytes() {
         return Err(Error::Format("ecdsa: curve name mismatch"));
     }
     let point = r.read_string()?.to_vec();
+    // Validate the SEC1 point eagerly at parse time. Without this the
+    // PublicKey would hold an opaque byte string that only fails later
+    // when used (e.g. by an authorized_keys check), and a malformed or
+    // off-curve point could otherwise sneak through to the verifier
+    // construction site. BoxedEcdsaPublicKey::from_sec1 enforces the
+    // SEC1 uncompressed prefix, length, and on-curve membership.
+    BoxedEcdsaPublicKey::from_sec1(curve_id, &point)
+        .map_err(|_| Error::Format("ecdsa: invalid SEC1 point"))?;
     Ok(ctor(point, String::new()))
 }
 
@@ -600,7 +655,18 @@ fn decrypt_payload(
         return Ok(encrypted.to_vec());
     }
 
-    let pass = passphrase.ok_or(Error::Crypto("passphrase required"))?;
+    // Treat an empty passphrase as "no passphrase". Callers occasionally
+    // wire Some(b"") through (e.g. a CLI prompt where the user pressed
+    // Enter on an encrypted key, or a config that left the field blank),
+    // and accepting it would attempt to derive a key against the empty
+    // string — which silently succeeds at the bcrypt step and produces a
+    // garbage AES key, surfacing only at the post-decrypt magic check
+    // with the same generic error as a real wrong passphrase. Fail loud
+    // and early with the same error as None.
+    let pass = match passphrase {
+        Some(p) if !p.is_empty() => p,
+        _ => return Err(Error::Crypto("passphrase required")),
+    };
 
     let (key_len, iv_len) = match ciphername {
         b"aes256-ctr" => (32usize, 16usize),
@@ -617,6 +683,22 @@ fn decrypt_payload(
     let rounds = kr.read_u32()?;
     if !kr.is_empty() {
         return Err(Error::Format("openssh key: trailing kdfoptions"));
+    }
+
+    // Cap rounds. bcrypt_pbkdf's cost is linear in the rounds count, and
+    // a malicious key file could otherwise pin a victim's thread on the
+    // KDF for an unbounded amount of time before they ever learn the
+    // passphrase is wrong. OpenSSH's `-a` flag defaults to 16; 64 is a
+    // comfortable ceiling that still lets legitimate hardening through
+    // while keeping per-attempt cost bounded.
+    const MAX_BCRYPT_ROUNDS: u32 = 64;
+    if rounds == 0 {
+        return Err(Error::Format("openssh key: bcrypt rounds must be > 0"));
+    }
+    if rounds > MAX_BCRYPT_ROUNDS {
+        return Err(Error::Format(
+            "openssh key: bcrypt rounds exceeds 64 (DoS guard)",
+        ));
     }
 
     let derived = bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)

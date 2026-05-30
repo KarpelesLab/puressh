@@ -22,11 +22,33 @@ pub const SSH_MSG_USERAUTH_PK_OK: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_REQUEST: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_RESPONSE: u8 = 61;
 
+/// Per-field upper bound on userauth strings. RFC 4252 / RFC 4256 don't
+/// fix a maximum, but every real-world field (user name, prompts,
+/// responses, banner text, public-key blob, signature) fits in well
+/// under this; capping protects against a peer sending a 4 GiB string
+/// length and forcing a huge allocation before any validation runs.
+const MAX_USERAUTH_STRING: usize = 64 * 1024;
+
 fn read_utf8(r: &mut Reader<'_>) -> Result<String> {
-    let bytes = r.read_string()?;
+    let bytes = read_bytes_capped(r)?;
     core::str::from_utf8(bytes)
         .map(|s| s.into())
         .map_err(|_| Error::Format("auth: invalid utf-8"))
+}
+
+/// Read an SSH `string` (uint32 length + bytes), rejecting any length
+/// above [`MAX_USERAUTH_STRING`]. Used in every per-field decode path
+/// in this module so we never allocate a multi-megabyte buffer just
+/// because the peer claimed to send one.
+fn read_bytes_capped<'a>(r: &mut Reader<'a>) -> Result<&'a [u8]> {
+    // We peek at the length first by reading u32 and then taking bytes
+    // ourselves, so the cap fires before `Reader::read_string` would
+    // attempt the take.
+    let len = r.read_u32()? as usize;
+    if len > MAX_USERAUTH_STRING {
+        return Err(Error::Format("userauth string too large"));
+    }
+    r.take(len)
 }
 
 fn ensure_empty(r: &Reader<'_>) -> Result<()> {
@@ -84,7 +106,13 @@ impl ServiceAccept {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Method-specific tail of a `SSH_MSG_USERAUTH_REQUEST` packet.
+///
+/// `Debug` is implemented manually so the cleartext `password` /
+/// `new_password` fields of the `Password` variant are never rendered —
+/// they appear as `"<redacted>"`. The redaction protects against
+/// accidental leakage through `tracing` or ad-hoc `dbg!()` prints.
+#[derive(Clone, PartialEq, Eq)]
 pub enum AuthMethodPayload {
     None,
     Password {
@@ -105,6 +133,47 @@ pub enum AuthMethodPayload {
         method: String,
         tail: Vec<u8>,
     },
+}
+
+impl core::fmt::Debug for AuthMethodPayload {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AuthMethodPayload::None => f.write_str("None"),
+            AuthMethodPayload::Password {
+                new_password,
+                password: _,
+            } => f
+                .debug_struct("Password")
+                .field("new_password", &new_password.as_ref().map(|_| "<redacted>"))
+                .field("password", &"<redacted>")
+                .finish(),
+            AuthMethodPayload::PublicKey {
+                signature_present,
+                algorithm,
+                public_blob,
+                signature,
+            } => f
+                .debug_struct("PublicKey")
+                .field("signature_present", signature_present)
+                .field("algorithm", algorithm)
+                .field("public_blob", public_blob)
+                .field("signature", signature)
+                .finish(),
+            AuthMethodPayload::KeyboardInteractive {
+                language_tag,
+                submethods,
+            } => f
+                .debug_struct("KeyboardInteractive")
+                .field("language_tag", language_tag)
+                .field("submethods", submethods)
+                .finish(),
+            AuthMethodPayload::Other { method, tail } => f
+                .debug_struct("Other")
+                .field("method", method)
+                .field("tail", tail)
+                .finish(),
+        }
+    }
 }
 
 impl AuthMethodPayload {
@@ -210,9 +279,9 @@ impl UserauthRequest {
             "publickey" => {
                 let signature_present = r.read_bool()?;
                 let algorithm = read_utf8(&mut r)?;
-                let public_blob = r.read_string()?.to_vec();
+                let public_blob = read_bytes_capped(&mut r)?.to_vec();
                 let signature = if signature_present {
-                    Some(r.read_string()?.to_vec())
+                    Some(read_bytes_capped(&mut r)?.to_vec())
                 } else {
                     None
                 };
@@ -276,7 +345,7 @@ impl UserauthFailure {
         if r.read_u8()? != SSH_MSG_USERAUTH_FAILURE {
             return Err(Error::Format("auth: not USERAUTH_FAILURE"));
         }
-        let raw = r.read_string()?;
+        let raw = read_bytes_capped(&mut r)?;
         let partial_success = r.read_bool()?;
         ensure_empty(&r)?;
         let mut continuations = Vec::new();
@@ -355,7 +424,7 @@ impl UserauthPkOk {
             return Err(Error::Format("auth: not USERAUTH_PK_OK"));
         }
         let algorithm = read_utf8(&mut r)?;
-        let public_blob = r.read_string()?.to_vec();
+        let public_blob = read_bytes_capped(&mut r)?.to_vec();
         ensure_empty(&r)?;
         Ok(Self {
             algorithm,
@@ -650,5 +719,65 @@ mod tests {
         assert!(UserauthRequest::decode(&[]).is_err());
         assert!(UserauthRequest::decode(&[50]).is_err());
         assert!(UserauthRequest::decode(&[50, 0, 0, 0, 100]).is_err());
+    }
+
+    #[test]
+    fn password_debug_is_redacted() {
+        use alloc::format;
+        let m = AuthMethodPayload::Password {
+            new_password: Some("brand-new-secret".into()),
+            password: "super-secret-pw".into(),
+        };
+        let s = format!("{m:?}");
+        assert!(
+            !s.contains("super-secret-pw"),
+            "password leaked in Debug output: {s}"
+        );
+        assert!(
+            !s.contains("brand-new-secret"),
+            "new_password leaked in Debug output: {s}"
+        );
+        assert!(
+            s.contains("redacted"),
+            "redaction marker missing in Debug output: {s}"
+        );
+    }
+
+    #[test]
+    fn userauth_string_cap_rejects_oversize_length() {
+        // Hand-craft a USERAUTH_REQUEST whose `user` string claims to be
+        // 1 GiB long. The cap must fire on the length header alone,
+        // before any allocation, and surface as Error::Format.
+        let payload = [
+            SSH_MSG_USERAUTH_REQUEST,
+            // user: length = 0x4000_0000 (1 GiB)
+            0x40,
+            0x00,
+            0x00,
+            0x00,
+        ];
+        let err = UserauthRequest::decode(&payload).expect_err("must reject oversize string");
+        match err {
+            Error::Format(msg) => assert!(
+                msg.contains("too large"),
+                "expected 'too large' error, got: {msg}"
+            ),
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn userauth_request_debug_is_redacted() {
+        use alloc::format;
+        let req = UserauthRequest {
+            user: "alice".into(),
+            service: "ssh-connection".into(),
+            method: AuthMethodPayload::Password {
+                new_password: None,
+                password: "hunter2".into(),
+            },
+        };
+        let s = format!("{req:?}");
+        assert!(!s.contains("hunter2"), "password leaked: {s}");
     }
 }

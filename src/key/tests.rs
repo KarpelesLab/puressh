@@ -509,3 +509,173 @@ fn wire_blob_ed25519_matches_known_layout() {
     assert_eq!(&blob[15..19], &[0, 0, 0, 32]);
     assert_eq!(&blob[19..], &[0xab; 32]);
 }
+
+#[test]
+fn empty_passphrase_on_encrypted_key_is_rejected_loudly() {
+    // Round-tripping with a real passphrase and then trying to decrypt with
+    // Some(b"") must fail with the same "passphrase required" error as None,
+    // not with a wrong-passphrase / format error after bcrypt churn.
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "empty-pass@test".to_string());
+    let pem = sk.to_openssh_pem(Some(b"actual-secret")).unwrap();
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"")).expect_err("empty passphrase");
+    match err {
+        Error::Crypto(msg) => assert!(
+            msg.contains("passphrase"),
+            "expected 'passphrase required', got {msg:?}"
+        ),
+        other => panic!("expected Crypto(passphrase required), got {other:?}"),
+    }
+    let err2 = PrivateKey::parse_openssh_pem(&pem, None).expect_err("None passphrase");
+    match err2 {
+        Error::Crypto(msg) => assert!(msg.contains("passphrase"), "{msg}"),
+        other => panic!("expected Crypto for None, got {other:?}"),
+    }
+}
+
+#[test]
+fn bcrypt_rounds_cap_rejects_oversize_kdfoptions() {
+    // Hand-build an openssh-key-v1 blob whose kdfoptions claim rounds=65.
+    // Parser must refuse before running bcrypt — no need for a valid
+    // ciphertext or salt; the rounds check fires first.
+    use crate::format::Writer;
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+
+    let mut opts = Writer::new();
+    opts.write_string(&[0u8; 16]); // salt
+    opts.write_u32(65); // > MAX_BCRYPT_ROUNDS (64)
+    let kdfopts = opts.into_vec();
+
+    let mut pubw = Writer::new();
+    pubw.write_string(b"ssh-ed25519");
+    pubw.write_string(&[0u8; 32]);
+    let pub_blob = pubw.into_vec();
+
+    let mut w = Writer::new();
+    w.write_raw(MAGIC);
+    w.write_string(b"aes256-ctr");
+    w.write_string(b"bcrypt");
+    w.write_string(&kdfopts);
+    w.write_u32(1);
+    w.write_string(&pub_blob);
+    w.write_string(&alloc::vec![0u8; 16]);
+    let pem = alloc::format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        base64::encode(&w.into_vec())
+    );
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"anything")).expect_err("rounds cap");
+    match err {
+        Error::Format(msg) => assert!(
+            msg.contains("rounds") || msg.contains("64"),
+            "expected rounds cap message, got {msg:?}"
+        ),
+        other => panic!("expected Format(rounds cap), got {other:?}"),
+    }
+}
+
+#[test]
+fn bcrypt_zero_rounds_is_rejected() {
+    use crate::format::Writer;
+    const MAGIC: &[u8] = b"openssh-key-v1\0";
+    let mut opts = Writer::new();
+    opts.write_string(&[0u8; 16]);
+    opts.write_u32(0);
+    let kdfopts = opts.into_vec();
+    let mut pubw = Writer::new();
+    pubw.write_string(b"ssh-ed25519");
+    pubw.write_string(&[0u8; 32]);
+    let pub_blob = pubw.into_vec();
+    let mut w = Writer::new();
+    w.write_raw(MAGIC);
+    w.write_string(b"aes256-ctr");
+    w.write_string(b"bcrypt");
+    w.write_string(&kdfopts);
+    w.write_u32(1);
+    w.write_string(&pub_blob);
+    w.write_string(&alloc::vec![0u8; 16]);
+    let pem = alloc::format!(
+        "-----BEGIN OPENSSH PRIVATE KEY-----\n{}\n-----END OPENSSH PRIVATE KEY-----\n",
+        base64::encode(&w.into_vec())
+    );
+    let err = PrivateKey::parse_openssh_pem(&pem, Some(b"x")).expect_err("zero rounds");
+    match err {
+        Error::Format(msg) => assert!(msg.contains("rounds"), "{msg}"),
+        other => panic!("expected Format, got {other:?}"),
+    }
+}
+
+#[test]
+fn authorized_keys_line_with_options_is_refused() {
+    // The most dangerous outcome would be to silently strip the options
+    // and treat the key as a bare entry — that drops `command=`,
+    // `from=`, `no-pty`, etc. and grants broader access than intended.
+    let line = alloc::format!(r#"command="/bin/echo hi",no-pty {ED25519_PUB_LINE}"#);
+    let err = PublicKey::parse_authorized_keys_line(&line).expect_err("must reject options prefix");
+    match err {
+        Error::Format(msg) => assert!(
+            msg.contains("options") || msg.contains("unknown") || msg.contains("tag"),
+            "expected explicit options rejection, got {msg:?}"
+        ),
+        other => panic!("expected Format, got {other:?}"),
+    }
+}
+
+#[test]
+fn authorized_keys_line_handles_tabs_and_runs_of_spaces() {
+    // sshd accepts tabs between fields, and a copy/paste may collapse
+    // multiple spaces — split_whitespace handles both.
+    let line = alloc::format!(
+        "ssh-ed25519\t{}\ttabbed comment",
+        ED25519_PUB_LINE.split_whitespace().nth(1).unwrap()
+    );
+    let pk = PublicKey::parse_authorized_keys_line(&line).unwrap();
+    assert_eq!(pk.comment(), "tabbed comment");
+
+    let line2 = alloc::format!(
+        "ssh-ed25519   {}   spaced   comment",
+        ED25519_PUB_LINE.split_whitespace().nth(1).unwrap()
+    );
+    let pk2 = PublicKey::parse_authorized_keys_line(&line2).unwrap();
+    assert_eq!(pk2.comment(), "spaced comment");
+}
+
+#[test]
+fn authorized_keys_blank_and_comment_lines_are_rejected_cleanly() {
+    match PublicKey::parse_authorized_keys_line("") {
+        Err(Error::Format(_)) => {}
+        other => panic!("blank: got {other:?}"),
+    }
+    match PublicKey::parse_authorized_keys_line("   \t  ") {
+        Err(Error::Format(_)) => {}
+        other => panic!("whitespace-only: got {other:?}"),
+    }
+    match PublicKey::parse_authorized_keys_line("# this is a comment") {
+        Err(Error::Format(_)) => {}
+        other => panic!("comment: got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_wire_blob_rejects_off_curve_ecdsa_p256() {
+    // Build an otherwise well-formed ecdsa-sha2-nistp256 public blob whose
+    // SEC1 point is the right shape (0x04 || 32-byte X || 32-byte Y) but
+    // whose coordinates are not on P-256. parse_wire_blob must refuse it.
+    let mut w = crate::format::Writer::new();
+    w.write_string(b"ecdsa-sha2-nistp256");
+    w.write_string(b"nistp256");
+    let mut bogus_point = alloc::vec![0u8; 65];
+    bogus_point[0] = 0x04;
+    for (i, b) in bogus_point.iter_mut().enumerate().skip(1) {
+        *b = (i as u8).wrapping_mul(17).wrapping_add(3);
+    }
+    w.write_string(&bogus_point);
+    let blob = w.into_vec();
+    match PublicKey::parse_wire_blob(&blob) {
+        Err(crate::error::Error::Format(msg)) => assert!(
+            msg.contains("SEC1") || msg.contains("ecdsa"),
+            "expected ecdsa SEC1 rejection, got {msg:?}"
+        ),
+        Err(other) => panic!("expected Format, got {other:?}"),
+        Ok(_) => panic!("expected off-curve point to be rejected"),
+    }
+}

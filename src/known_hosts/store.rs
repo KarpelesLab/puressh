@@ -101,6 +101,12 @@ impl KnownHosts {
     }
 
     /// Atomically save to `path`. Writes to `path.tmp` then renames.
+    ///
+    /// On Unix the temporary file is created with mode `0o600` so the
+    /// host-key list is never world- or group-readable, even during the
+    /// brief window before the rename. This matches OpenSSH's
+    /// behaviour and avoids leaking the set of hosts a user has
+    /// connected to via a `umask 0` shell or shared filesystem.
     pub fn save(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let tmp = path.with_extension({
@@ -111,7 +117,7 @@ impl KnownHosts {
                 format!("{ext}.tmp")
             }
         });
-        fs::write(&tmp, self.to_bytes())?;
+        write_private_file(&tmp, &self.to_bytes())?;
         fs::rename(&tmp, path)?;
         Ok(())
     }
@@ -259,6 +265,30 @@ impl KnownHosts {
             }
         }
         self.lines = new_lines;
+    }
+}
+
+/// Write `data` to `path` with permissions `0o600` on Unix. On other
+/// platforms this is a plain `fs::write` — Windows ACLs handle owner-only
+/// access by default for files created under the user's profile.
+fn write_private_file(path: &Path, data: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        fs::write(path, data)
     }
 }
 

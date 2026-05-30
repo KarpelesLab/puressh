@@ -22,6 +22,10 @@ use super::types::{
 /// [`SftpServerOptions::max_set_len`].
 pub const DEFAULT_MAX_SET_LEN: u64 = 1024 * 1024 * 1024;
 
+/// Default cap on simultaneously open file/dir handles per session.
+/// See [`SftpServerOptions::max_handles`].
+pub const DEFAULT_MAX_HANDLES: usize = 256;
+
 /// Tunables for a single SFTP server session.
 #[derive(Debug, Clone)]
 pub struct SftpServerOptions {
@@ -58,6 +62,11 @@ pub struct SftpServerOptions {
     /// require the historical (leaky) behaviour for back-compat with
     /// existing clients can opt out by setting this to `false`.
     pub hide_jail_in_realpath: bool,
+    /// Maximum number of simultaneously open file/dir handles per
+    /// session. Once this is exceeded `op_open`/`op_opendir` return
+    /// [`FxpStatus::Failure`] until the client closes some handles.
+    /// Defaults to [`DEFAULT_MAX_HANDLES`].
+    pub max_handles: usize,
 }
 
 impl SftpServerOptions {
@@ -70,6 +79,7 @@ impl SftpServerOptions {
             max_set_len: DEFAULT_MAX_SET_LEN,
             allow_special_bits: false,
             hide_jail_in_realpath: true,
+            max_handles: DEFAULT_MAX_HANDLES,
         }
     }
 
@@ -108,6 +118,14 @@ impl SftpServerOptions {
     /// existing client requires the historical host-path behaviour.
     pub fn hide_jail_in_realpath(mut self, hide: bool) -> Self {
         self.hide_jail_in_realpath = hide;
+        self
+    }
+
+    /// Override the per-session cap on simultaneously open file/dir
+    /// handles. Set to `usize::MAX` to disable (not recommended on
+    /// hostile peers — protects against EMFILE-style DoS).
+    pub fn with_max_handles(mut self, max: usize) -> Self {
+        self.max_handles = max;
         self
     }
 }
@@ -255,7 +273,17 @@ impl SftpServerSession {
         }
     }
 
-    fn alloc_handle(&mut self, h: FileHandle) -> Vec<u8> {
+    fn alloc_handle(&mut self, h: FileHandle) -> Result<Vec<u8>, SftpError> {
+        // Cap the open-handle table to bound the per-session FD cost and
+        // refuse EMFILE-style DoS where a peer opens handles without
+        // bound. The default is generous (DEFAULT_MAX_HANDLES) and the
+        // operator can lift it via `with_max_handles`.
+        if self.handles.len() >= self.opts.max_handles {
+            return Err(SftpError::status_msg(
+                FxpStatus::Failure,
+                "too many open handles",
+            ));
+        }
         // Skip any wrapped id that's still live (extremely unlikely with a
         // u64 counter but the previous code could in theory overwrite an
         // existing entry on wraparound).
@@ -268,7 +296,7 @@ impl SftpServerSession {
             }
         }
         self.handles.insert(id, h);
-        id.to_le_bytes().to_vec()
+        Ok(id.to_le_bytes().to_vec())
     }
 
     fn resolve(&self, raw: &[u8]) -> Result<PathBuf, SftpError> {
@@ -343,7 +371,7 @@ impl SftpServerSession {
             file,
             path: p,
             append: pflags & FXF_APPEND != 0,
-        });
+        })?;
         Ok(Packet::Handle { id, handle })
     }
 
@@ -480,7 +508,7 @@ impl SftpServerSession {
             iter: Some(iter),
             path: p,
             eof_sent: false,
-        });
+        })?;
         Ok(Packet::Handle { id, handle })
     }
 

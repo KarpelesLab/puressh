@@ -341,3 +341,19 @@ fn marker_round_trips_through_save_load() {
         LookupResult::Mismatch { .. }
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn save_produces_mode_0600_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = TestTempDir::new("perms");
+    let path = dir.child("known_hosts");
+    let mut kh = KnownHosts::new();
+    kh.add("example.com", 22, "ssh-ed25519", &ed25519_blob(1), false);
+    kh.save(&path).expect("save");
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "known_hosts must be owner-only (0o600), got {mode:o}"
+    );
+}

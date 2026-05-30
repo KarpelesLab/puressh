@@ -3,7 +3,7 @@
 //! ```ignore
 //! use puressh::client::{Client, Config};
 //!
-//! let mut c = Client::connect("example.com:22", Config::default())?;
+//! let mut c = Client::connect("example.com:22", Config::insecure())?;
 //! c.authenticate_password("alice", "hunter2")?;
 //! let out = c.exec("uname -a")?;
 //! print!("{}", String::from_utf8_lossy(&out.stdout));
@@ -99,16 +99,37 @@ pub struct KnownHostsPolicy {
     pub save_path: Option<PathBuf>,
     /// Hash new TOFU entries (OpenSSH's `HashKnownHosts yes`).
     pub hash_new: bool,
-    /// What to do when the host is *unknown* (no entry matches). `Mismatch`
-    /// is always treated as a hard error regardless of this setting.
+    /// What to do when the host is *unknown* (no entry matches).
     pub on_unknown: TofuAction,
+    /// What to do when the host **is** known but the key does not match
+    /// any stored entry. The OpenSSH-safe default (when constructed via
+    /// [`KnownHostsPolicy::strict`]) is [`TofuAction::Reject`]; binaries
+    /// honouring `StrictHostKeyChecking=no` can opt into
+    /// [`TofuAction::AcceptWithWarning`] to keep insecure-but-loud
+    /// parity with OpenSSH.
+    pub on_mismatch: TofuAction,
+}
+
+impl KnownHostsPolicy {
+    /// Build a policy with the OpenSSH-safe defaults: reject unknown
+    /// hosts, reject mismatched keys.
+    pub fn strict(store: Arc<Mutex<KnownHosts>>) -> Self {
+        Self {
+            store,
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Reject,
+            on_mismatch: TofuAction::Reject,
+        }
+    }
 }
 
 /// Callback type for [`TofuAction::Prompt`] — `(host, port, key_type,
 /// key_blob) → accept?`.
 pub type TofuPromptFn = dyn Fn(&str, u16, &str, &[u8]) -> bool + Send + Sync;
 
-/// What to do when [`HostKeyPolicy::KnownHosts`] encounters an unknown host.
+/// What to do when [`HostKeyPolicy::KnownHosts`] encounters an unknown
+/// host or a key that doesn't match any stored entry.
 pub enum TofuAction {
     /// Refuse the connection — equivalent to OpenSSH's
     /// `StrictHostKeyChecking=yes` against an empty `known_hosts`.
@@ -118,9 +139,25 @@ pub enum TofuAction {
     Accept,
     /// Ask the user. See [`TofuPromptFn`] for the callback signature.
     Prompt(Arc<TofuPromptFn>),
+    /// Accept the connection but emit a loud warning to stderr. This is
+    /// the only variant that makes sense for `on_mismatch` outside of
+    /// `Reject`: it mirrors `StrictHostKeyChecking=no` in OpenSSH, which
+    /// proceeds anyway after printing the
+    /// `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` banner.
+    /// Used for `on_unknown` it's silent like `Accept` but is included
+    /// here for symmetry.
+    AcceptWithWarning,
 }
 
 /// Client configuration knobs.
+///
+/// **Note**: `Config` deliberately does not implement [`Default`]. The
+/// only sane default for `host_key_policy` would be
+/// [`HostKeyPolicy::AcceptAny`], which is insecure (any peer with the
+/// right port is trusted). Forcing callers to spell the policy out makes
+/// the trust decision explicit at the call site — see [`Config::insecure`]
+/// for an explicit opt-in equivalent of the old default, or
+/// [`Config::with_known_hosts`] for the OpenSSH-style strict policy.
 pub struct Config {
     /// How to decide whether a server's host key is acceptable.
     pub host_key_policy: HostKeyPolicy,
@@ -128,10 +165,26 @@ pub struct Config {
     pub timeout: Option<Duration>,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    /// Explicit, audit-friendly constructor for "trust whatever the peer
+    /// presents" — the old behaviour of `Config::default()`. Replaces
+    /// the removed `Default` impl so the trust decision shows up in
+    /// `git grep` for `Config::insecure`.
+    pub fn insecure() -> Self {
         Self {
             host_key_policy: HostKeyPolicy::AcceptAny,
+            timeout: None,
+        }
+    }
+
+    /// Build a config that verifies the host key against `store` with
+    /// OpenSSH-style strict semantics (reject unknown, reject mismatch).
+    /// The caller is still responsible for routing connects through
+    /// [`Client::connect_to_host`] so the verifier has a host name to
+    /// look up.
+    pub fn with_known_hosts(store: Arc<Mutex<KnownHosts>>) -> Self {
+        Self {
+            host_key_policy: HostKeyPolicy::KnownHosts(KnownHostsPolicy::strict(store)),
             timeout: None,
         }
     }
@@ -2160,6 +2213,39 @@ fn scp_proto(e: crate::scp::ScpError, _stage: &'static str) -> Error {
     }
 }
 
+/// `SHA256:<base64>` fingerprint, matching `ssh-keygen -lf`. Used by the
+/// in-tree mismatch warning so the user can manually cross-check the
+/// peer's key before deciding to clean up `known_hosts`.
+fn fingerprint_b64_sha256(blob: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let d = Sha256::digest(blob);
+    let bytes: &[u8] = d.as_ref();
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4 + 7);
+    out.push_str("SHA256:");
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let b = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8) | (bytes[i + 2] as u32);
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 6) & 0x3F) as usize] as char);
+        out.push(ALPHABET[(b & 0x3F) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let b = (bytes[i] as u32) << 16;
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+    } else if rem == 2 {
+        let b = ((bytes[i] as u32) << 16) | ((bytes[i + 1] as u32) << 8);
+        out.push(ALPHABET[((b >> 18) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 12) & 0x3F) as usize] as char);
+        out.push(ALPHABET[((b >> 6) & 0x3F) as usize] as char);
+    }
+    out
+}
+
 fn build_default_kexinit<R: RngCore>(rng: &mut R) -> KexInit {
     let algs = KexAlgorithms {
         kex: defaults::KEX,
@@ -2212,42 +2298,85 @@ fn build_verifier(
             }
         }
         HostKeyPolicy::KnownHosts(kh) => {
-            // No host was threaded in (caller used `connect` not
-            // `connect_to_host`). We cannot do a lookup; fall through to
-            // AcceptAny rather than fail hard, matching the documented
-            // contract of `HostKeyPolicy::KnownHosts`.
+            // A KnownHosts policy *requires* a host name to look up. If
+            // the caller routed through `Client::connect` (raw socket
+            // address) instead of `Client::connect_to_host`, we have no
+            // address-independent identifier — fall back to refusing
+            // rather than silently degrading to `AcceptAny`, which is
+            // what older code did. The previous behaviour effectively
+            // demoted the policy to "trust anyone" any time the wrong
+            // constructor was used; that's the worst possible mode for
+            // a host-key check.
             if target_host.is_empty() || target_port == 0 {
-                // Intentionally silent — the docs on the variant explain
-                // the degradation.
-            } else {
-                let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
-                let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
-                match lookup {
-                    LookupResult::Match => {}
-                    LookupResult::Mismatch { .. } => {
+                return Err(Error::Config(
+                    "HostKeyPolicy::KnownHosts requires Client::connect_to_host",
+                ));
+            }
+            let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+            let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
+            match lookup {
+                LookupResult::Match => {}
+                LookupResult::Mismatch { .. } => {
+                    let accept = match &kh.on_mismatch {
+                        TofuAction::Reject => false,
+                        TofuAction::Accept => true,
+                        TofuAction::AcceptWithWarning => {
+                            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                            eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+                            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                            eprintln!(
+                                "Host {target_host}:{target_port} key {} fingerprint: {}",
+                                neg.host_key,
+                                fingerprint_b64_sha256(k_s),
+                            );
+                            eprintln!(
+                                "Continuing anyway because the host-key policy is configured \
+                                 to accept-with-warning on mismatch (insecure)."
+                            );
+                            true
+                        }
+                        TofuAction::Prompt(cb) => {
+                            // Drop the lock for the duration of the
+                            // callback — it may block on stdin and
+                            // shouldn't hold up other policy users.
+                            drop(store);
+                            let ok = cb(target_host, target_port, &neg.host_key, k_s);
+                            store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                            ok
+                        }
+                    };
+                    if !accept {
                         return Err(Error::HostKeyRejected);
                     }
-                    LookupResult::Unknown => {
-                        let accept = match &kh.on_unknown {
-                            TofuAction::Reject => false,
-                            TofuAction::Accept => true,
-                            TofuAction::Prompt(cb) => {
-                                // Drop the lock for the duration of the
-                                // callback — it may block on stdin and
-                                // shouldn't hold up other policy users.
-                                drop(store);
-                                let ok = cb(target_host, target_port, &neg.host_key, k_s);
-                                store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
-                                ok
-                            }
-                        };
-                        if !accept {
-                            return Err(Error::HostKeyRejected);
+                    // Replace the existing entries so future connects
+                    // don't keep tripping the mismatch path. Honours the
+                    // same hash-new / save-path knobs as the Unknown path.
+                    let _ = store.remove(target_host, target_port);
+                    store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
+                    if let Some(path) = &kh.save_path {
+                        store.save(path).map_err(Error::from)?;
+                    }
+                }
+                LookupResult::Unknown => {
+                    let accept = match &kh.on_unknown {
+                        TofuAction::Reject => false,
+                        TofuAction::Accept | TofuAction::AcceptWithWarning => true,
+                        TofuAction::Prompt(cb) => {
+                            // Drop the lock for the duration of the
+                            // callback — it may block on stdin and
+                            // shouldn't hold up other policy users.
+                            drop(store);
+                            let ok = cb(target_host, target_port, &neg.host_key, k_s);
+                            store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                            ok
                         }
-                        store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
-                        if let Some(path) = &kh.save_path {
-                            store.save(path).map_err(Error::from)?;
-                        }
+                    };
+                    if !accept {
+                        return Err(Error::HostKeyRejected);
+                    }
+                    store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
+                    if let Some(path) = &kh.save_path {
+                        store.save(path).map_err(Error::from)?;
                     }
                 }
             }
@@ -2675,10 +2804,63 @@ mod tests {
     }
 
     #[test]
-    fn config_default_is_accept_any() {
-        let cfg = Config::default();
+    fn config_insecure_constructor_is_accept_any() {
+        // `Config::insecure()` replaces the old `Default` impl. The trust
+        // decision now has to be spelled out explicitly at the call site;
+        // see `Config::with_known_hosts` for the strict alternative.
+        let cfg = Config::insecure();
         assert!(matches!(cfg.host_key_policy, HostKeyPolicy::AcceptAny));
         assert!(cfg.timeout.is_none());
+    }
+
+    #[test]
+    fn known_hosts_strict_constructor_defaults_reject_reject() {
+        // Sanity-check that the convenience constructor doesn't pick up
+        // an `Accept*` variant accidentally.
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let p = KnownHostsPolicy::strict(store);
+        assert!(matches!(p.on_unknown, TofuAction::Reject));
+        assert!(matches!(p.on_mismatch, TofuAction::Reject));
+        assert!(!p.hash_new);
+        assert!(p.save_path.is_none());
+    }
+
+    #[test]
+    fn build_verifier_fails_hard_on_empty_host() {
+        // Synthesise the minimum to drive build_verifier with a
+        // KnownHosts policy and an empty target_host. The KEX runner /
+        // reply payload don't get inspected because the host check
+        // fires first.
+        use crate::transport::{KexInit, KexRunner};
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let policy = HostKeyPolicy::KnownHosts(KnownHostsPolicy::strict(store));
+        // Drive runner just enough to have a negotiated()-returning state
+        // is not actually needed for this branch — the empty-host check
+        // fires first. Build a dummy runner that we never call into.
+        let runner = KexRunner::new(Role::Client, KexInit::from_algorithms(
+            &KexAlgorithms {
+                kex: defaults::KEX,
+                server_host_key: defaults::HOST_KEY,
+                ciphers_c2s: defaults::CIPHERS,
+                ciphers_s2c: defaults::CIPHERS,
+                macs_c2s: defaults::MACS,
+                macs_s2c: defaults::MACS,
+                comp_c2s: defaults::COMP,
+                comp_s2c: defaults::COMP,
+                lang_c2s: &[],
+                lang_s2c: &[],
+            },
+            [0u8; 16],
+        ));
+        // Provide a reply payload of the minimum shape (5 bytes header +
+        // a 0-byte K_S). The host-empty branch fires before negotiated()
+        // is consulted, so we don't need a real KEX outcome.
+        let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];
+        reply.extend_from_slice(&0u32.to_be_bytes());
+        let err = build_verifier(&reply, &policy, &runner, "", 22);
+        assert!(matches!(err, Err(Error::Config(_))));
+        let err = build_verifier(&reply, &policy, &runner, "host", 0);
+        assert!(matches!(err, Err(Error::Config(_))));
     }
 
     #[test]
@@ -2789,7 +2971,7 @@ mod tests {
         OsRng.fill_bytes(&mut seed);
         let server = run_server(listener, seed);
 
-        let client = Client::connect(addr, Config::default()).expect("client connect");
+        let client = Client::connect(addr, Config::insecure()).expect("client connect");
         let server_sid = server.join().unwrap().expect("server handshake");
         assert_eq!(client.session_id, server_sid);
         assert!(!client.session_id.is_empty());

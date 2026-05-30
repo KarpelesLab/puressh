@@ -260,8 +260,7 @@ fn recv_file_refuses_to_overwrite_symlink() {
     let (a, b) = UnixStream::pair().expect("socketpair");
     let dst_dir_thread = dst_dir.clone();
     let recv = thread::spawn(move || {
-        let mut r = Receiver::new(b, &dst_dir_thread, ScpRecvOptions::default())
-            .expect("recv new");
+        let mut r = Receiver::new(b, &dst_dir_thread, ScpRecvOptions::default()).expect("recv new");
         r.run()
     });
     let mut sender = Sender::new(a).expect("send new");

@@ -336,9 +336,7 @@ fn jailed_symlink_with_absolute_target_rejected() {
     let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
     let h = spawn_server(opts, a);
     let mut client = SftpClient::new(b).unwrap();
-    let err = client
-        .symlink(b"/etc/passwd", b"abs-link")
-        .unwrap_err();
+    let err = client.symlink(b"/etc/passwd", b"abs-link").unwrap_err();
     match err {
         SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::PermissionDenied),
         other => panic!("expected PermissionDenied, got {other:?}"),

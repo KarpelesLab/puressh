@@ -131,10 +131,8 @@ impl<S: Read + Write> Receiver<S> {
         match fs::symlink_metadata(&target) {
             Ok(md) => {
                 if md.file_type().is_symlink() {
-                    let _ = write_fatal(
-                        &mut self.stream,
-                        "directory target is an existing symlink",
-                    );
+                    let _ =
+                        write_fatal(&mut self.stream, "directory target is an existing symlink");
                     return Err(ScpError::PathEscape);
                 }
                 if !md.is_dir() {

@@ -844,10 +844,7 @@ impl ConnectionState {
         let n = r.remaining();
         let tail = r.take(n)?;
         let request = ChannelRequest::decode(&name, tail)?;
-        let ch = self
-            .channels
-            .get(&local_id)
-            .ok_or(Error::BadChannelState)?;
+        let ch = self.channels.get(&local_id).ok_or(Error::BadChannelState)?;
         if !ch.open_confirmed {
             return Err(Error::Protocol("channel not yet open"));
         }

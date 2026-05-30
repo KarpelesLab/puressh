@@ -677,9 +677,16 @@ mod imp {
                 // the single-threaded post-fork window.
                 unsafe {
                     cmd.pre_exec(move || {
+                        // setgroups([]) → setgid → initgroups → setuid
+                        // (see drop_to_user for the full rationale).
+                        setgroups_clear().map_err(to_io)?;
                         nix::unistd::setgid(gid).map_err(to_io)?;
                         initgroups_libc(&name_c, gid).map_err(to_io)?;
                         nix::unistd::setuid(uid).map_err(to_io)?;
+                        // Post-setuid sanity: the kernel can silently
+                        // refuse setuid if we lack CAP_SETUID, leaving
+                        // the child running as root.  Refuse to exec.
+                        verify_post_setuid(uid, gid).map_err(to_io)?;
                         // chdir best-effort: a missing/unreadable home
                         // shouldn't refuse the exec — fall back to /.
                         if libc::chdir(home_c.as_ptr()) != 0 {
@@ -819,6 +826,82 @@ mod imp {
             Ok(())
         } else {
             Err(Errno::last())
+        }
+    }
+
+    /// Drop every supplementary group from the calling process.
+    ///
+    /// `initgroups(user, gid)` reads /etc/group for the *target* user, but
+    /// if we never explicitly clear the root daemon's supplementary groups
+    /// first, certain libc implementations have historically retained
+    /// extras across the call (and a misconfigured /etc/group can simply
+    /// fail to assign new ones, leaving the daemon's groups intact in the
+    /// child). Call `setgroups([])` immediately before `initgroups` so the
+    /// post-setuid process is *guaranteed* to start from an empty
+    /// supplementary group list — matching OpenSSH's behaviour.
+    ///
+    /// SAFETY: We're the only thread in the post-fork child (or we hold
+    /// root in the pre-fork path); passing a 0-length list is well-defined
+    /// across Linux and the BSDs.
+    fn setgroups_clear() -> nix::Result<()> {
+        // SAFETY: `count=0` with a null/dangling pointer is the documented
+        // way to clear the supplementary group list on Linux and macOS.
+        let rc = unsafe { libc::setgroups(0, core::ptr::null()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Errno::last())
+        }
+    }
+
+    /// Confirm the calling process really dropped to `(uid, gid)`. Any
+    /// mismatch on real/effective/saved uid or real/effective gid means
+    /// the kernel call silently failed (or the binary lacks the necessary
+    /// capability) — refuse to continue rather than running the user's
+    /// shell with mixed privileges.
+    fn verify_post_setuid(uid: nix::unistd::Uid, gid: nix::unistd::Gid) -> nix::Result<()> {
+        // SAFETY: getresuid/getresgid only write to caller-owned locals.
+        // On non-Linux platforms we fall back to geteuid/getuid/getegid/
+        // getgid which are universally available.
+        #[cfg(target_os = "linux")]
+        {
+            let mut ruid: libc::uid_t = 0;
+            let mut euid: libc::uid_t = 0;
+            let mut suid: libc::uid_t = 0;
+            let mut rgid: libc::gid_t = 0;
+            let mut egid: libc::gid_t = 0;
+            let mut sgid: libc::gid_t = 0;
+            // SAFETY: pointers refer to live stack locals.
+            if unsafe { libc::getresuid(&mut ruid, &mut euid, &mut suid) } != 0 {
+                return Err(Errno::last());
+            }
+            if unsafe { libc::getresgid(&mut rgid, &mut egid, &mut sgid) } != 0 {
+                return Err(Errno::last());
+            }
+            let want_u = uid.as_raw();
+            let want_g = gid.as_raw();
+            if ruid != want_u || euid != want_u || suid != want_u {
+                return Err(Errno::EPERM);
+            }
+            if rgid != want_g || egid != want_g || sgid != want_g {
+                return Err(Errno::EPERM);
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // SAFETY: get{e,}{u,g}id never fail per POSIX.
+            let ruid = unsafe { libc::getuid() };
+            let euid = unsafe { libc::geteuid() };
+            let rgid = unsafe { libc::getgid() };
+            let egid = unsafe { libc::getegid() };
+            if ruid != uid.as_raw() || euid != uid.as_raw() {
+                return Err(Errno::EPERM);
+            }
+            if rgid != gid.as_raw() || egid != gid.as_raw() {
+                return Err(Errno::EPERM);
+            }
+            Ok(())
         }
     }
 
@@ -1328,12 +1411,17 @@ mod imp {
             }
             return Ok(());
         }
-        // setgid before initgroups (so initgroups assigns the right primary),
-        // setuid last (point of no return). Any failure here aborts the
-        // connection — running with mixed privileges is worse than refusing.
+        // setgroups([]) → setgid → initgroups → setuid. Clearing
+        // supplementary groups *before* initgroups guarantees the post-drop
+        // process starts from an empty list (a misconfigured /etc/group
+        // could leave initgroups a no-op that retains daemon groups).
+        // setuid is the point of no return; we verify the result
+        // afterwards to catch any silent capability/policy failure.
+        setgroups_clear().map_err(nix_io)?;
         nix::unistd::setgid(info.gid).map_err(nix_io)?;
         initgroups_libc(&info.name_c, info.gid).map_err(nix_io)?;
         nix::unistd::setuid(info.uid).map_err(nix_io)?;
+        verify_post_setuid(info.uid, info.gid).map_err(nix_io)?;
         if debug {
             eprintln!(
                 "sshd: dropped connection to {user} (uid={} gid={})",
@@ -1439,13 +1527,20 @@ mod imp {
                 let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
 
                 // Drop privileges to the target user before applying
-                // env / chdir / exec. Order matters: setgid first
-                // (still root), then initgroups (still root), then
-                // setuid — once setuid runs we can't go back.
+                // env / chdir / exec. Order matters:
+                //   setgroups([]) — clear daemon supplementary groups
+                //   setgid       — set primary group (still root)
+                //   initgroups   — install target's supplementary set
+                //   setuid       — point of no return
+                // verify_post_setuid catches a silent failure where the
+                // kernel returned 0 but the ids didn't actually change
+                // (e.g. seccomp filter, missing CAP_SETUID).
                 if drop_privs
-                    && (nix::unistd::setgid(info.gid).is_err()
+                    && (setgroups_clear().is_err()
+                        || nix::unistd::setgid(info.gid).is_err()
                         || initgroups_libc(&info.name_c, info.gid).is_err()
-                        || nix::unistd::setuid(info.uid).is_err())
+                        || nix::unistd::setuid(info.uid).is_err()
+                        || verify_post_setuid(info.uid, info.gid).is_err())
                 {
                     // Any step failing means we can't safely
                     // continue — refuse rather than running the

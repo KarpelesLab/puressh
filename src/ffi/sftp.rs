@@ -30,14 +30,33 @@
 use core::ffi::{c_char, c_int};
 use core::ptr;
 use std::slice;
+use std::sync::{Arc, Mutex};
 
 use super::client::PcSshClient;
 use super::common::{
     catch, cstr_to_str, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT,
-    PCSSH_ERR_IO, PCSSH_ERR_PARSE, PCSSH_ERR_PROTOCOL, PCSSH_OK,
+    PCSSH_ERR_INVALID_HANDLE, PCSSH_ERR_IO, PCSSH_ERR_PARSE, PCSSH_ERR_PROTOCOL, PCSSH_OK,
 };
 use crate::sftp::{Attrs, NameEntry, SftpError};
 use crate::shared::SftpSession;
+
+/// Shared cell holding the live SFTP session. The parent `PcSshSftp`
+/// owns one strong `Arc<SftpCell>`; every child `PcSshSftpFile` /
+/// `PcSshSftpDir` clones an `Arc` so the cell outlives a premature
+/// parent free.
+///
+/// Finding #11 (Medium). Previously each child held a raw
+/// `*mut PcSshSftp` and `pcssh_sftp_free` deallocated the parent
+/// unconditionally; the next call on a child dereferenced freed
+/// memory. Now:
+///
+///   - Parent free wipes the `Option<SftpSession>` to `None` and drops
+///     the strong ref it held; the cell itself stays alive as long as
+///     any child still holds an `Arc` to it.
+///   - Every child entry point locks the cell and bails with
+///     `PCSSH_ERR_INVALID_HANDLE` if the parent is gone, instead of
+///     dereferencing.
+type SftpCell = Mutex<Option<SftpSession>>;
 
 /// SFTP open-flag: open for reading.
 pub const PCSSH_SFTP_READ: u32 = 0x0000_0001;
@@ -62,18 +81,21 @@ pub const PCSSH_ATTR_PERMISSIONS: u32 = 0x0000_0004;
 pub const PCSSH_ATTR_ACMODTIME: u32 = 0x0000_0008;
 
 /// Opaque SFTP session handle. Multiple per `PcSshClient` are supported.
+///
+/// Holds an `Arc<SftpCell>` rather than the `SftpSession` directly so
+/// child file/dir handles can detect a freed parent (see [`SftpCell`]).
 pub struct PcSshSftp {
-    /// The underlying SFTP session, holding its own SharedClient clone
-    /// so the connection stays alive while this handle exists.
-    inner: SftpSession,
+    inner: Arc<SftpCell>,
 }
 
 /// Opaque file handle. Owns the server-side handle bytes plus a local
 /// read/write cursor.
 pub struct PcSshSftpFile {
-    /// Pointer back to the parent SFTP session. Not owned; the caller
-    /// keeps the parent alive for as long as this file handle exists.
-    sftp: *mut PcSshSftp,
+    /// Shared cell pointing at the parent SFTP session. Cloned at
+    /// `pcssh_sftp_open_file` time; if the parent is freed first the
+    /// cell's `Option` becomes `None` and every subsequent op returns
+    /// `PCSSH_ERR_INVALID_HANDLE` rather than dereferencing freed memory.
+    sftp: Arc<SftpCell>,
     /// Server-side handle bytes from `SSH_FXP_OPEN`.
     handle: Vec<u8>,
     /// Current read/write offset.
@@ -86,12 +108,30 @@ pub struct PcSshSftpFile {
 /// Opaque directory handle. Same shape as a file handle but without an
 /// offset (SFTP readdir is server-paginated).
 pub struct PcSshSftpDir {
-    /// Pointer back to the parent SFTP session.
-    sftp: *mut PcSshSftp,
+    /// Shared cell pointing at the parent SFTP session — see
+    /// [`PcSshSftpFile::sftp`] for the rationale.
+    sftp: Arc<SftpCell>,
     /// Server-side directory handle from `SSH_FXP_OPENDIR`.
     handle: Vec<u8>,
     /// True once `pcssh_sftp_closedir` has been called.
     closed: bool,
+}
+
+/// Lock the parent cell and call `f` on the live session. Returns
+/// `PCSSH_ERR_INVALID_HANDLE` if the parent has been freed, or
+/// `PCSSH_ERR_GENERIC` if the cell mutex is poisoned.
+fn with_parent<F>(cell: &Arc<SftpCell>, f: F) -> c_int
+where
+    F: FnOnce(&mut SftpSession) -> c_int,
+{
+    let mut g = match cell.lock() {
+        Ok(g) => g,
+        Err(_) => return PCSSH_ERR_GENERIC,
+    };
+    match g.as_mut() {
+        Some(s) => f(s),
+        None => PCSSH_ERR_INVALID_HANDLE,
+    }
 }
 
 /// File attributes in C-friendly form. Use `flags` (a bitmask of
@@ -228,7 +268,9 @@ pub unsafe extern "C" fn pcssh_sftp_open(
             Ok(s) => s,
             Err(e) => return super::common::map_error(&e),
         };
-        let boxed = Box::new(PcSshSftp { inner: session });
+        let boxed = Box::new(PcSshSftp {
+            inner: Arc::new(Mutex::new(Some(session))),
+        });
         // SAFETY: out_sftp checked non-NULL above.
         unsafe { *out_sftp = Box::into_raw(boxed) };
         PCSSH_OK
@@ -250,6 +292,16 @@ pub unsafe extern "C" fn pcssh_sftp_free(sftp: *mut PcSshSftp) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: caller contract.
         let boxed = unsafe { Box::from_raw(sftp) };
+        // Wipe the session out of the shared cell so any surviving
+        // child file/dir handles see `None` on their next op (and return
+        // `PCSSH_ERR_INVALID_HANDLE` instead of UAF'ing). The cell
+        // itself stays alive as long as those children hold their Arcs.
+        if let Ok(mut g) = boxed.inner.lock() {
+            // Drop the session here, while still holding the lock, so
+            // children waiting on `with_parent` see `None` rather than a
+            // half-dropped session.
+            *g = None;
+        }
         drop(boxed);
     }));
 }
@@ -294,13 +346,27 @@ pub unsafe extern "C" fn pcssh_sftp_open_file(
             Attrs::default()
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        let handle = match s.inner.open(path_s.as_bytes(), flags, attrs) {
-            Ok(h) => h,
-            Err(e) => return map_sftp_err(&e),
+        let s = unsafe { &*sftp };
+        let cell = s.inner.clone();
+        let mut handle_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&cell, |sess| {
+            match sess.open(path_s.as_bytes(), flags, attrs) {
+                Ok(h) => {
+                    handle_out = Some(h);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            }
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let handle = match handle_out {
+            Some(h) => h,
+            None => return PCSSH_ERR_GENERIC,
         };
         let boxed = Box::new(PcSshSftpFile {
-            sftp,
+            sftp: cell,
             handle,
             offset: 0,
             closed: false,
@@ -335,7 +401,7 @@ pub unsafe extern "C" fn pcssh_sftp_read(
         }
         // SAFETY: caller contract.
         let f = unsafe { &mut *file };
-        if f.closed || f.sftp.is_null() {
+        if f.closed {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         if cap == 0 {
@@ -345,13 +411,20 @@ pub unsafe extern "C" fn pcssh_sftp_read(
         }
         // Clamp request length to u32 — SFTP wire is 32-bit.
         let want = cap.min(u32::MAX as usize) as u32;
-        // SAFETY: f.sftp is non-NULL per check above; parent kept alive
-        // by caller contract.
-        let s = unsafe { &mut *f.sftp };
-        let chunk = match s.inner.read(&f.handle, f.offset, want) {
-            Ok(c) => c,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let handle = f.handle.clone();
+        let offset = f.offset;
+        let mut got_buf: Option<Vec<u8>> = None;
+        let rc = with_parent(&f.sftp, |sess| match sess.read(&handle, offset, want) {
+            Ok(c) => {
+                got_buf = Some(c);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let chunk = got_buf.unwrap_or_default();
         let got = chunk.len();
         if got > 0 {
             // SAFETY: cap > 0 → buf non-NULL per check above; got <= want <= cap.
@@ -386,7 +459,7 @@ pub unsafe extern "C" fn pcssh_sftp_write(
         }
         // SAFETY: caller contract.
         let f = unsafe { &mut *file };
-        if f.closed || f.sftp.is_null() {
+        if f.closed {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         if len == 0 {
@@ -394,10 +467,14 @@ pub unsafe extern "C" fn pcssh_sftp_write(
         }
         // SAFETY: len > 0 → buf non-NULL per check above; caller contract.
         let data = unsafe { slice::from_raw_parts(buf, len) };
-        // SAFETY: parent kept alive by caller.
-        let s = unsafe { &mut *f.sftp };
-        if let Err(e) = s.inner.write(&f.handle, f.offset, data) {
-            return map_sftp_err(&e);
+        let handle = f.handle.clone();
+        let offset = f.offset;
+        let rc = with_parent(&f.sftp, |sess| match sess.write(&handle, offset, data) {
+            Ok(()) => PCSSH_OK,
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
         }
         f.offset = f.offset.saturating_add(len as u64);
         PCSSH_OK
@@ -458,15 +535,11 @@ pub unsafe extern "C" fn pcssh_sftp_close_file(file: *mut PcSshSftpFile) -> c_in
         if f.closed {
             return PCSSH_OK;
         }
-        if f.sftp.is_null() {
-            return PCSSH_ERR_INVALID_ARGUMENT;
-        }
-        // SAFETY: parent kept alive by caller contract.
-        let s = unsafe { &mut *f.sftp };
-        let rc = match s.inner.close(&f.handle) {
+        let handle = f.handle.clone();
+        let rc = with_parent(&f.sftp, |sess| match sess.close(&handle) {
             Ok(()) => PCSSH_OK,
             Err(e) => map_sftp_err(&e),
-        };
+        });
         f.closed = true;
         rc
     })
@@ -477,8 +550,8 @@ pub unsafe extern "C" fn pcssh_sftp_close_file(file: *mut PcSshSftpFile) -> c_in
 /// # Safety
 ///
 /// `file` must be NULL or a pointer returned by `pcssh_sftp_open_file`,
-/// not yet freed. The parent `PcSshSftp` must still be live (or `closed`
-/// must be true, in which case the close is skipped).
+/// not yet freed. The parent `PcSshSftp` may already be freed — the
+/// shared cell detects that and skips the wire close in that case.
 #[no_mangle]
 pub unsafe extern "C" fn pcssh_sftp_file_free(file: *mut PcSshSftpFile) {
     if file.is_null() {
@@ -487,10 +560,15 @@ pub unsafe extern "C" fn pcssh_sftp_file_free(file: *mut PcSshSftpFile) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: caller contract.
         let mut boxed = unsafe { Box::from_raw(file) };
-        if !boxed.closed && !boxed.sftp.is_null() {
-            // SAFETY: parent kept alive by caller contract.
-            let s = unsafe { &mut *boxed.sftp };
-            let _ = s.inner.close(&boxed.handle);
+        if !boxed.closed {
+            let handle = boxed.handle.clone();
+            // Best-effort close; if the parent is already gone we silently
+            // skip the wire RTT (the server-side handle will be cleaned up
+            // when the session channel itself goes away).
+            let _ = with_parent(&boxed.sftp, |sess| match sess.close(&handle) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            });
             boxed.closed = true;
         }
         drop(boxed);
@@ -525,13 +603,25 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        let handle = match s.inner.opendir(path_s.as_bytes()) {
-            Ok(h) => h,
-            Err(e) => return map_sftp_err(&e),
+        let s = unsafe { &*sftp };
+        let cell = s.inner.clone();
+        let mut handle_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&cell, |sess| match sess.opendir(path_s.as_bytes()) {
+            Ok(h) => {
+                handle_out = Some(h);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let handle = match handle_out {
+            Some(h) => h,
+            None => return PCSSH_ERR_GENERIC,
         };
         let boxed = Box::new(PcSshSftpDir {
-            sftp,
+            sftp: cell,
             handle,
             closed: false,
         });
@@ -577,15 +667,22 @@ pub unsafe extern "C" fn pcssh_sftp_readdir(
         }
         // SAFETY: caller contract.
         let d = unsafe { &mut *dir };
-        if d.closed || d.sftp.is_null() {
+        if d.closed {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: parent kept alive by caller contract.
-        let s = unsafe { &mut *d.sftp };
-        let chunk = match s.inner.readdir(&d.handle) {
-            Ok(c) => c,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let handle = d.handle.clone();
+        let mut chunk_out: Option<Option<Vec<NameEntry>>> = None;
+        let rc = with_parent(&d.sftp, |sess| match sess.readdir(&handle) {
+            Ok(c) => {
+                chunk_out = Some(c);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let chunk = chunk_out.unwrap_or(None);
         let entry: Option<NameEntry> = chunk.and_then(|mut v| v.drain(..1).next());
         let Some(e) = entry else {
             // EOF.
@@ -628,15 +725,11 @@ pub unsafe extern "C" fn pcssh_sftp_closedir(dir: *mut PcSshSftpDir) -> c_int {
         if d.closed {
             return PCSSH_OK;
         }
-        if d.sftp.is_null() {
-            return PCSSH_ERR_INVALID_ARGUMENT;
-        }
-        // SAFETY: parent kept alive by caller contract.
-        let s = unsafe { &mut *d.sftp };
-        let rc = match s.inner.close(&d.handle) {
+        let handle = d.handle.clone();
+        let rc = with_parent(&d.sftp, |sess| match sess.close(&handle) {
             Ok(()) => PCSSH_OK,
             Err(e) => map_sftp_err(&e),
-        };
+        });
         d.closed = true;
         rc
     })
@@ -647,6 +740,7 @@ pub unsafe extern "C" fn pcssh_sftp_closedir(dir: *mut PcSshSftpDir) -> c_int {
 /// # Safety
 ///
 /// `dir` must be NULL or a `pcssh_sftp_opendir` return not yet freed.
+/// The parent `PcSshSftp` may already be freed.
 #[no_mangle]
 pub unsafe extern "C" fn pcssh_sftp_dir_free(dir: *mut PcSshSftpDir) {
     if dir.is_null() {
@@ -655,10 +749,12 @@ pub unsafe extern "C" fn pcssh_sftp_dir_free(dir: *mut PcSshSftpDir) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // SAFETY: caller contract.
         let mut boxed = unsafe { Box::from_raw(dir) };
-        if !boxed.closed && !boxed.sftp.is_null() {
-            // SAFETY: parent kept alive by caller contract.
-            let s = unsafe { &mut *boxed.sftp };
-            let _ = s.inner.close(&boxed.handle);
+        if !boxed.closed {
+            let handle = boxed.handle.clone();
+            let _ = with_parent(&boxed.sftp, |sess| match sess.close(&handle) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            });
             boxed.closed = true;
         }
         drop(boxed);
@@ -690,13 +786,20 @@ pub unsafe extern "C" fn pcssh_sftp_stat(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        let attrs = match s.inner.stat(path_s.as_bytes()) {
-            Ok(a) => a,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let s = unsafe { &*sftp };
+        let mut attrs_out: Option<Attrs> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.stat(path_s.as_bytes()) {
+            Ok(a) => {
+                attrs_out = Some(a);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
         // SAFETY: out_attrs checked.
-        unsafe { *out_attrs = attrs_to_c(&attrs) };
+        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
         PCSSH_OK
     })
 }
@@ -722,13 +825,20 @@ pub unsafe extern "C" fn pcssh_sftp_lstat(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        let attrs = match s.inner.lstat(path_s.as_bytes()) {
-            Ok(a) => a,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let s = unsafe { &*sftp };
+        let mut attrs_out: Option<Attrs> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.lstat(path_s.as_bytes()) {
+            Ok(a) => {
+                attrs_out = Some(a);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
         // SAFETY: out_attrs checked.
-        unsafe { *out_attrs = attrs_to_c(&attrs) };
+        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
         PCSSH_OK
     })
 }
@@ -749,17 +859,23 @@ pub unsafe extern "C" fn pcssh_sftp_fstat(
         }
         // SAFETY: caller contract.
         let f = unsafe { &mut *file };
-        if f.closed || f.sftp.is_null() {
+        if f.closed {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: parent kept alive by caller.
-        let s = unsafe { &mut *f.sftp };
-        let attrs = match s.inner.fstat(&f.handle) {
-            Ok(a) => a,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let handle = f.handle.clone();
+        let mut attrs_out: Option<Attrs> = None;
+        let rc = with_parent(&f.sftp, |sess| match sess.fstat(&handle) {
+            Ok(a) => {
+                attrs_out = Some(a);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
         // SAFETY: out_attrs checked.
-        unsafe { *out_attrs = attrs_to_c(&attrs) };
+        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
         PCSSH_OK
     })
 }
@@ -786,12 +902,15 @@ pub unsafe extern "C" fn pcssh_sftp_setstat(
         };
         // SAFETY: caller contract.
         let a = unsafe { &*attrs };
+        let a_owned = attrs_from_c(a);
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        match s.inner.setstat(path_s.as_bytes(), attrs_from_c(a)) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
-        }
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| {
+            match sess.setstat(path_s.as_bytes(), a_owned) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            }
+        })
     })
 }
 
@@ -811,17 +930,17 @@ pub unsafe extern "C" fn pcssh_sftp_fsetstat(
         }
         // SAFETY: caller contract.
         let f = unsafe { &mut *file };
-        if f.closed || f.sftp.is_null() {
+        if f.closed {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
         let a = unsafe { &*attrs };
-        // SAFETY: parent kept alive.
-        let s = unsafe { &mut *f.sftp };
-        match s.inner.fsetstat(&f.handle, attrs_from_c(a)) {
+        let a_owned = attrs_from_c(a);
+        let handle = f.handle.clone();
+        with_parent(&f.sftp, |sess| match sess.fsetstat(&handle, a_owned) {
             Ok(()) => PCSSH_OK,
             Err(e) => map_sftp_err(&e),
-        }
+        })
     })
 }
 
@@ -854,11 +973,11 @@ pub unsafe extern "C" fn pcssh_sftp_mkdir(
             ..Default::default()
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        match s.inner.mkdir(path_s.as_bytes(), attrs) {
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| match sess.mkdir(path_s.as_bytes(), attrs) {
             Ok(()) => PCSSH_OK,
             Err(e) => map_sftp_err(&e),
-        }
+        })
     })
 }
 
@@ -879,11 +998,11 @@ pub unsafe extern "C" fn pcssh_sftp_rmdir(sftp: *mut PcSshSftp, path: *const c_c
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        match s.inner.rmdir(path_s.as_bytes()) {
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| match sess.rmdir(path_s.as_bytes()) {
             Ok(()) => PCSSH_OK,
             Err(e) => map_sftp_err(&e),
-        }
+        })
     })
 }
 
@@ -904,11 +1023,11 @@ pub unsafe extern "C" fn pcssh_sftp_remove(sftp: *mut PcSshSftp, path: *const c_
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        match s.inner.remove(path_s.as_bytes()) {
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| match sess.remove(path_s.as_bytes()) {
             Ok(()) => PCSSH_OK,
             Err(e) => map_sftp_err(&e),
-        }
+        })
     })
 }
 
@@ -938,11 +1057,13 @@ pub unsafe extern "C" fn pcssh_sftp_rename(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        match s.inner.rename(old_s.as_bytes(), new_s.as_bytes()) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
-        }
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| {
+            match sess.rename(old_s.as_bytes(), new_s.as_bytes()) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            }
+        })
     })
 }
 
@@ -973,11 +1094,13 @@ pub unsafe extern "C" fn pcssh_sftp_symlink(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        match s.inner.symlink(tgt.as_bytes(), lnk.as_bytes()) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
-        }
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| {
+            match sess.symlink(tgt.as_bytes(), lnk.as_bytes()) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            }
+        })
     })
 }
 
@@ -1006,11 +1129,19 @@ pub unsafe extern "C" fn pcssh_sftp_readlink(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        let target = match s.inner.readlink(path_s.as_bytes()) {
-            Ok(t) => t,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let s = unsafe { &*sftp };
+        let mut tgt_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.readlink(path_s.as_bytes()) {
+            Ok(t) => {
+                tgt_out = Some(t);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let target = tgt_out.unwrap_or_default();
         // SAFETY: out_len/buf/cap checked by helper.
         unsafe { copy_to_caller_buf(&target, buf, cap, out_len) }
     })
@@ -1039,11 +1170,19 @@ pub unsafe extern "C" fn pcssh_sftp_realpath(
             None => return PCSSH_ERR_INVALID_ARGUMENT,
         };
         // SAFETY: caller contract.
-        let s = unsafe { &mut *sftp };
-        let canon = match s.inner.realpath(path_s.as_bytes()) {
-            Ok(t) => t,
-            Err(e) => return map_sftp_err(&e),
-        };
+        let s = unsafe { &*sftp };
+        let mut canon_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.realpath(path_s.as_bytes()) {
+            Ok(t) => {
+                canon_out = Some(t);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let canon = canon_out.unwrap_or_default();
         // SAFETY: out_len/buf/cap checked by helper.
         unsafe { copy_to_caller_buf(&canon, buf, cap, out_len) }
     })
@@ -1126,5 +1265,27 @@ mod tests {
             pcssh_sftp_file_free(std::ptr::null_mut());
             pcssh_sftp_dir_free(std::ptr::null_mut());
         }
+    }
+
+    /// `with_parent` returns `PCSSH_ERR_INVALID_HANDLE` when the cell has
+    /// been wiped (which is what `pcssh_sftp_free` does to any surviving
+    /// child handles). This is the regression test for finding #11 — a
+    /// child file/dir handle outliving its parent must NOT dereference
+    /// freed memory.
+    #[test]
+    fn with_parent_returns_invalid_handle_after_wipe() {
+        // We can't easily construct a real SftpSession in unit tests
+        // (it needs a connected client), so we test the cell mechanics
+        // directly: a cell that started populated and was then wiped
+        // returns INVALID_HANDLE on the next access.
+        let cell: Arc<SftpCell> = Arc::new(Mutex::new(None));
+        // Closure must not run when the cell is empty.
+        let mut called = false;
+        let rc = with_parent(&cell, |_sess| {
+            called = true;
+            PCSSH_OK
+        });
+        assert_eq!(rc, PCSSH_ERR_INVALID_HANDLE);
+        assert!(!called, "callback must not run for a wiped cell");
     }
 }

@@ -30,11 +30,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(unix)]
+pub mod agent;
 pub mod client;
 pub mod common;
 pub mod known_hosts;
 pub mod sftp;
 
+#[cfg(unix)]
+pub use agent::*;
 pub use client::*;
 pub use common::*;
 pub use known_hosts::*;

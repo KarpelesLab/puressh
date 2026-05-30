@@ -189,6 +189,76 @@ int pcssh_client_connect_known_hosts(
     PcSshClient **out_client
 );
 
+/* ----- ssh-agent (Unix only) -------------------------------------------- */
+
+#if defined(__unix__) || defined(__APPLE__)
+
+/* Opaque agent handle. */
+typedef struct PcSshAgent PcSshAgent;
+
+/* Agent-sign flags (mirror SSH_AGENT_RSA_SHA2_* wire bits). */
+#define PCSSH_AGENT_SIGN_DEFAULT    0
+#define PCSSH_AGENT_RSA_SHA2_256    2
+#define PCSSH_AGENT_RSA_SHA2_512    4
+
+/*
+ * Connect to a Unix-socket ssh-agent at `path`.
+ *
+ * Returns PCSSH_OK and writes *out on success.
+ */
+int pcssh_agent_connect(const char *path, PcSshAgent **out);
+
+/*
+ * Connect using $SSH_AUTH_SOCK. If unset or empty, returns PCSSH_OK
+ * with *out set to NULL (callers treat that as "no agent available").
+ */
+int pcssh_agent_connect_env(PcSshAgent **out);
+
+/*
+ * Query the agent's identity list, caching the result. Subsequent
+ * pcssh_agent_identity(i) calls index into the cache. Call
+ * pcssh_agent_refresh_identities to drop the cache and re-query.
+ */
+int pcssh_agent_identity_count(PcSshAgent *agent, size_t *out_count);
+
+/*
+ * Drop the cached identity list. Next pcssh_agent_identity_count call
+ * re-queries the agent.
+ */
+int pcssh_agent_refresh_identities(PcSshAgent *agent);
+
+/*
+ * Read the identity at `index` from the cache. Two-pass buffer pattern:
+ * pass NULL buffers with capacity 0 to query required lengths.
+ */
+int pcssh_agent_identity(
+    PcSshAgent *agent,
+    size_t index,
+    uint8_t *algorithm_buf, size_t algorithm_cap, size_t *algorithm_len,
+    uint8_t *comment_buf,   size_t comment_cap,   size_t *comment_len,
+    uint8_t *key_blob_buf,  size_t key_blob_cap,  size_t *key_blob_len
+);
+
+/*
+ * Sign `data` under the identity whose public key blob equals
+ * `key_blob`. Returns SSH wire-format signature (string algo || string
+ * raw_sig). Two-pass buffer pattern for sig_buf/sig_cap/sig_len.
+ *
+ * `flags` selects RSA hash variant (default = SHA1; SHA2_256; SHA2_512).
+ */
+int pcssh_agent_sign(
+    PcSshAgent *agent,
+    const uint8_t *key_blob, size_t key_blob_len,
+    const uint8_t *data,     size_t data_len,
+    uint32_t flags,
+    uint8_t *sig_buf, size_t sig_cap, size_t *sig_len
+);
+
+/* Free an agent handle. Safe to call with NULL. */
+void pcssh_agent_free(PcSshAgent *agent);
+
+#endif /* unix */
+
 /* ----- diagnostics ------------------------------------------------------- */
 
 /*

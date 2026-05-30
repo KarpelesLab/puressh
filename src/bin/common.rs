@@ -395,9 +395,17 @@ pub fn base64_no_pad(bytes: &[u8]) -> String {
     out
 }
 
-/// The TOFU prompt — mimics OpenSSH's wording so muscle-memory ports.
-/// Returns `true` if the user answers "yes" (or "y"), `false` otherwise
-/// (including on stdin EOF).
+/// The first-time / unknown-host TOFU prompt — mimics OpenSSH's
+/// wording so muscle-memory ports. Returns `true` if the user answers
+/// `yes` (or `y`), `false` otherwise (including on stdin EOF).
+///
+/// **Do not** reuse this for the mismatch path: a "yes" here is a
+/// trust-on-first-use decision, not a "the key I trusted yesterday is
+/// gone and I'm fine with that" decision. See [`tofu_mismatch_prompt`]
+/// for the mismatch variant, which is preceded by the loud
+/// `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` banner (emitted
+/// by `client::build_verifier`) and requires the user to type `yes`
+/// in full — no `y` shortcut.
 pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
     let fp = fingerprint_b64_sha256(key_blob);
     let target = if port == 22 {
@@ -409,6 +417,55 @@ pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bo
     eprintln!("{key_type} key fingerprint is {fp}.");
     eprint!("Are you sure you want to continue connecting (yes/no)? ");
     let _ = std::io::stderr().flush();
+    let answer = read_short_stdin_line();
+    matches!(answer.as_str(), "yes" | "y")
+}
+
+/// The mismatch TOFU prompt — used when the host IS already in
+/// `known_hosts` but the key the server just presented does NOT match
+/// any stored entry. The loud `WARNING: REMOTE HOST IDENTIFICATION
+/// HAS CHANGED!` banner (with both old and new fingerprints) is
+/// already printed by the verifier in `client::build_verifier` before
+/// this function runs.
+///
+/// Compared to [`tofu_prompt`] this is intentionally more frictional:
+///
+/// - Default on empty input is **deny**, same as `tofu_prompt`, but
+///   here it really matters — users have muscle-memory for hitting
+///   Enter through TOFU prompts.
+/// - The shortcut `y` is **not** accepted; the user must type `yes`
+///   in full.
+///
+/// This matches OpenSSH's `StrictHostKeyChecking=ask` behaviour for
+/// mismatches: refuse unless the user types something deliberate.
+pub fn tofu_mismatch_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
+    let fp = fingerprint_b64_sha256(key_blob);
+    let target = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    eprintln!(
+        "Host key verification for '{target}' FAILED: the {key_type} key the server presented \
+         ({fp}) does not match any entry in your known_hosts file."
+    );
+    eprintln!(
+        "If you are absolutely sure this is the new legitimate key for this host, type `yes` \
+         to accept it and overwrite the trusted entry. Anything else (including just pressing \
+         Enter) will refuse the connection."
+    );
+    eprint!("Accept the new key and replace the trusted entry (type `yes` to confirm)? ");
+    let _ = std::io::stderr().flush();
+    let answer = read_short_stdin_line();
+    // Deliberately strict: `y` is NOT accepted, only the full word
+    // `yes`. Forces the user to slow down past the muscle-memory point.
+    answer == "yes"
+}
+
+/// Read a single short line from stdin, lowercase + trim it, and cap
+/// at 16 bytes (longer answers are truncated since we only care about
+/// `yes`/`no`/short variants). Returns an empty string on EOF.
+fn read_short_stdin_line() -> String {
     let mut line = String::new();
     let mut byte = [0u8; 1];
     let mut stdin = std::io::stdin();
@@ -424,7 +481,7 @@ pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bo
             break;
         }
     }
-    matches!(line.trim().to_ascii_lowercase().as_str(), "yes" | "y")
+    line.trim().to_ascii_lowercase()
 }
 
 /// Build the [`HostKeyPolicy`] for a given strict mode + optional override
@@ -451,16 +508,24 @@ pub fn build_host_key_policy(
 
     let (on_unknown, on_mismatch) = match strict {
         StrictMode::Yes => (TofuAction::Reject, TofuAction::Reject),
-        StrictMode::AcceptNew => (TofuAction::Accept, TofuAction::Reject),
+        // `accept-new` ONLY auto-accepts truly new hosts — never a
+        // changed key. Mismatches still go through the strict
+        // mismatch prompt so the user has a chance to see the loud
+        // banner and explicitly accept (or, more likely, refuse).
+        StrictMode::AcceptNew => (
+            TofuAction::Accept,
+            TofuAction::Prompt(Arc::new(tofu_mismatch_prompt)),
+        ),
         StrictMode::Ask => (
             TofuAction::Prompt(Arc::new(tofu_prompt)),
-            TofuAction::Reject,
+            TofuAction::Prompt(Arc::new(tofu_mismatch_prompt)),
         ),
-        // `No` mirrors OpenSSH: silently accept unknown, and proceed on
-        // mismatch *with a very loud banner* (handled in
+        // `No` mirrors OpenSSH: silently accept unknown, and proceed
+        // on mismatch *with a very loud banner* (handled in
         // `client::build_verifier` via `TofuAction::AcceptWithWarning`).
-        // The known_hosts file is still consulted/saved so the warning
-        // can compare against the previously-stored fingerprint.
+        // The known_hosts file is still consulted but NOT mutated —
+        // OpenSSH does the same: the warning is the deterrent, not a
+        // silent key rotation.
         StrictMode::No => (TofuAction::Accept, TofuAction::AcceptWithWarning),
     };
 

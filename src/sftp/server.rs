@@ -18,16 +18,38 @@ use super::types::{
     FXF_WRITE, SFTP_VERSION,
 };
 
+/// Default cap on client-requested `set_len` values (1 GiB). See
+/// [`SftpServerOptions::max_set_len`].
+pub const DEFAULT_MAX_SET_LEN: u64 = 1024 * 1024 * 1024;
+
 /// Tunables for a single SFTP server session.
 #[derive(Debug, Clone)]
 pub struct SftpServerOptions {
     /// Initial virtual cwd for relative-path requests.
     pub cwd: PathBuf,
-    /// Optional jail root. Any resolved path outside this subtree is
-    /// rejected with [`FxpStatus::PermissionDenied`].
+    /// Optional jail root.
+    ///
+    /// When set, every resolved path must lie inside this subtree.
+    /// Operations that would open or stat through a symlink are additionally
+    /// refused on Unix via `O_NOFOLLOW` / `symlink_metadata`, and absolute
+    /// symlink targets are refused at create time.
+    ///
+    /// This is **best-effort** mitigation, not a full chroot. A confined
+    /// daemon should still rely on operating-system mechanisms such as
+    /// `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` or a real
+    /// `chroot(2)` for hard isolation.
     pub root: Option<PathBuf>,
     /// If `true`, refuse every mutating operation.
     pub read_only: bool,
+    /// Maximum file size a client may set via `setstat`/`fsetstat`. Larger
+    /// requests are refused with [`FxpStatus::PermissionDenied`]. Defaults
+    /// to [`DEFAULT_MAX_SET_LEN`] (1 GiB).
+    pub max_set_len: u64,
+    /// If `false` (the default), the high bits of an incoming `permissions`
+    /// attribute are masked to `0o0777` — refusing to honour setuid/setgid/
+    /// sticky bits supplied by an SFTP peer. Set `true` only for trusted
+    /// callers that need to upload mode bits verbatim.
+    pub allow_special_bits: bool,
 }
 
 impl SftpServerOptions {
@@ -37,10 +59,15 @@ impl SftpServerOptions {
             cwd: cwd.into(),
             root: None,
             read_only: false,
+            max_set_len: DEFAULT_MAX_SET_LEN,
+            allow_special_bits: false,
         }
     }
 
     /// Apply a jail root.
+    ///
+    /// Best-effort mitigation only — see the field-level docs on
+    /// [`SftpServerOptions::root`].
     pub fn with_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = Some(root.into());
         self
@@ -49,6 +76,20 @@ impl SftpServerOptions {
     /// Refuse mutating operations.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
+        self
+    }
+
+    /// Override the cap on client-requested `set_len`. Pass `u64::MAX` to
+    /// disable the cap (not recommended on hostile peers).
+    pub fn with_max_set_len(mut self, max: u64) -> Self {
+        self.max_set_len = max;
+        self
+    }
+
+    /// Opt in to honouring setuid/setgid/sticky bits in incoming mode
+    /// attributes. Off by default.
+    pub fn allow_special_bits(mut self, allow: bool) -> Self {
+        self.allow_special_bits = allow;
         self
     }
 }
@@ -197,8 +238,17 @@ impl SftpServerSession {
     }
 
     fn alloc_handle(&mut self, h: FileHandle) -> Vec<u8> {
-        let id = self.next;
-        self.next = self.next.wrapping_add(1).max(1);
+        // Skip any wrapped id that's still live (extremely unlikely with a
+        // u64 counter but the previous code could in theory overwrite an
+        // existing entry on wraparound).
+        let mut id;
+        loop {
+            id = self.next;
+            self.next = self.next.wrapping_add(1).max(1);
+            if !self.handles.contains_key(&id) {
+                break;
+            }
+        }
         self.handles.insert(id, h);
         id.to_le_bytes().to_vec()
     }
@@ -248,13 +298,29 @@ impl SftpServerSession {
         }
 
         #[cfg(unix)]
-        if let Some(perm) = attrs.permissions {
+        {
             use std::os::unix::fs::OpenOptionsExt;
-            opt.mode(perm & 0o7777);
+            // Inside a jail, refuse to traverse a symlink at the final
+            // component. Combined with the lexical jail check on the
+            // resolved path, this prevents an attacker who planted (or
+            // received-uploaded) a symlink inside the jail from escaping
+            // via open. Best-effort: TOCTOU on intermediate components is
+            // still possible — see SftpServerOptions::root for the real
+            // confinement caveat.
+            if self.opts.root.is_some() {
+                opt.custom_flags(nix::libc::O_NOFOLLOW);
+            }
+            if let Some(perm) = attrs.permissions {
+                let masked = mask_mode(perm, self.opts.allow_special_bits);
+                opt.mode(masked);
+            }
         }
         let _ = &attrs;
 
-        let file = opt.open(&p)?;
+        let file = match opt.open(&p) {
+            Ok(f) => f,
+            Err(e) => return Err(map_open_err(e)),
+        };
         let handle = self.alloc_handle(FileHandle::File {
             file,
             path: p,
@@ -324,7 +390,11 @@ impl SftpServerSession {
 
     fn op_stat(&mut self, id: u32, path: Vec<u8>, follow: bool) -> Result<Packet, SftpError> {
         let p = self.resolve(&path)?;
-        let md = if follow {
+        // Inside a jail, never traverse the final symlink: a symlink
+        // pointing outside the jail would otherwise leak attributes.
+        // (op_lstat below also lands here with `follow=false`.)
+        let jailed = self.opts.root.is_some();
+        let md = if follow && !jailed {
             fs::metadata(&p)?
         } else {
             fs::symlink_metadata(&p)?
@@ -354,7 +424,13 @@ impl SftpServerSession {
     fn op_setstat(&mut self, id: u32, path: Vec<u8>, attrs: Attrs) -> Result<Packet, SftpError> {
         self.require_writable()?;
         let p = self.resolve(&path)?;
-        apply_attrs(&p, &attrs)?;
+        apply_attrs(
+            &p,
+            &attrs,
+            self.opts.root.is_some(),
+            self.opts.max_set_len,
+            self.opts.allow_special_bits,
+        )?;
         Ok(status_ok(id))
     }
 
@@ -369,7 +445,13 @@ impl SftpServerSession {
             FileHandle::File { path, .. } => path.clone(),
             FileHandle::Dir { path, .. } => path.clone(),
         };
-        apply_attrs(&p, &attrs)?;
+        apply_attrs(
+            &p,
+            &attrs,
+            self.opts.root.is_some(),
+            self.opts.max_set_len,
+            self.opts.allow_special_bits,
+        )?;
         Ok(status_ok(id))
     }
 
@@ -441,7 +523,13 @@ impl SftpServerSession {
         self.require_writable()?;
         let p = self.resolve(&path)?;
         fs::create_dir(&p)?;
-        let _ = apply_attrs(&p, &attrs);
+        let _ = apply_attrs(
+            &p,
+            &attrs,
+            self.opts.root.is_some(),
+            self.opts.max_set_len,
+            self.opts.allow_special_bits,
+        );
         Ok(status_ok(id))
     }
 
@@ -454,7 +542,27 @@ impl SftpServerSession {
 
     fn op_realpath(&mut self, id: u32, path: Vec<u8>) -> Result<Packet, SftpError> {
         let p = self.resolve(&path)?;
-        let bytes = p.to_string_lossy().into_owned().into_bytes();
+        // When a jail is configured, present paths to the client relative
+        // to the jail root so the absolute filesystem layout doesn't leak
+        // (e.g. the client sees `/u/foo` rather than `/srv/jail/u/foo`).
+        let display = if let Some(root) = self.opts.root.as_deref() {
+            let root_clean = super::path::lexically_clean(root);
+            match p.strip_prefix(&root_clean) {
+                Ok(suffix) => {
+                    let mut out = PathBuf::from("/");
+                    if suffix.as_os_str().is_empty() {
+                        out
+                    } else {
+                        out.push(suffix);
+                        out
+                    }
+                }
+                Err(_) => PathBuf::from("/"),
+            }
+        } else {
+            p
+        };
+        let bytes = display.to_string_lossy().into_owned().into_bytes();
         let entry = NameEntry {
             filename: bytes.clone(),
             longname: bytes,
@@ -510,6 +618,20 @@ impl SftpServerSession {
         let link = self.resolve(&link_path)?;
         let target_s = std::str::from_utf8(&target_path)
             .map_err(|_| SftpError::status(FxpStatus::BadMessage))?;
+        // When a jail is configured, refuse to create symlinks that
+        // explicitly point outside it via an absolute target.
+        //
+        // Note: this does NOT block escape via a relative `..` target —
+        // that requires resolve-time confinement. Open-time `O_NOFOLLOW`
+        // (applied in op_open above) is what actually keeps a relative
+        // traversal symlink from being used to read /etc/passwd.
+        if self.opts.root.is_some() && Path::new(target_s).is_absolute() {
+            return Ok(status_pkt(
+                id,
+                FxpStatus::PermissionDenied,
+                "absolute symlink target rejected by jail",
+            ));
+        }
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(target_s, &link)?;
@@ -554,17 +676,103 @@ fn attrs_from_metadata(md: &fs::Metadata) -> Attrs {
     a
 }
 
-fn apply_attrs(path: &Path, a: &Attrs) -> Result<(), SftpError> {
+/// Mask the file-type and special bits out of a mode supplied by an SFTP
+/// peer. By default we strip setuid/setgid/sticky (0o7000) to prevent a
+/// hostile uploader from planting suid binaries; the high file-type bits
+/// (0o170000) are always stripped because the syscalls below take just the
+/// permission portion.
+fn mask_mode(mode: u32, allow_special_bits: bool) -> u32 {
+    if allow_special_bits {
+        mode & 0o7777
+    } else {
+        mode & 0o0777
+    }
+}
+
+/// Translate an `open(2)` error into an `SftpError`, mapping the `ELOOP`
+/// raised by `O_NOFOLLOW` to `FX_NO_SUCH_FILE` so a client probing for a
+/// planted symlink can't distinguish "absent" from "is a symlink".
+fn map_open_err(e: io::Error) -> SftpError {
+    #[cfg(unix)]
+    {
+        if let Some(40) = e.raw_os_error() {
+            // ELOOP on Linux
+            return SftpError::status_msg(FxpStatus::NoSuchFile, "symlink rejected");
+        }
+        if let Some(62) = e.raw_os_error() {
+            // ELOOP on macOS/BSD
+            return SftpError::status_msg(FxpStatus::NoSuchFile, "symlink rejected");
+        }
+    }
+    SftpError::Io(e)
+}
+
+fn apply_attrs(
+    path: &Path,
+    a: &Attrs,
+    jailed: bool,
+    max_set_len: u64,
+    allow_special_bits: bool,
+) -> Result<(), SftpError> {
     if let Some(size) = a.size {
-        if let Ok(f) = OpenOptions::new().write(true).open(path) {
-            f.set_len(size)?;
+        if size > max_set_len {
+            return Err(SftpError::status_msg(
+                FxpStatus::PermissionDenied,
+                "set_len above configured maximum",
+            ));
+        }
+        // Open with O_NOFOLLOW when jailed so we can't be lured into
+        // truncating a file outside the jail through a planted symlink.
+        let mut opt = OpenOptions::new();
+        opt.write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            if jailed {
+                opt.custom_flags(nix::libc::O_NOFOLLOW);
+            }
+        }
+        let _ = jailed;
+        match opt.open(path) {
+            Ok(f) => f.set_len(size)?,
+            Err(e) => return Err(map_open_err(e)),
         }
     }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
         if let Some(mode) = a.permissions {
-            fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o7777))?;
+            let masked = mask_mode(mode, allow_special_bits);
+            if jailed {
+                // To prevent traversal through a symlink, open the target
+                // with O_NOFOLLOW first and apply permissions via the fd
+                // (fchmod). If open fails (typically ELOOP on a planted
+                // symlink), refuse — falling back to a path-based chmod
+                // would defeat the safety.
+                let mut opt = OpenOptions::new();
+                opt.read(true);
+                opt.custom_flags(nix::libc::O_NOFOLLOW);
+                match opt.open(path) {
+                    Ok(f) => f.set_permissions(fs::Permissions::from_mode(masked))?,
+                    Err(e) => {
+                        // Directories can't always be opened O_RDONLY;
+                        // verify with symlink_metadata that the target
+                        // isn't a symlink and then chmod by path.
+                        let _ = map_open_err(e);
+                        let md = fs::symlink_metadata(path)?;
+                        if md.file_type().is_symlink() {
+                            return Err(SftpError::status_msg(
+                                FxpStatus::NoSuchFile,
+                                "symlink rejected",
+                            ));
+                        }
+                        fs::set_permissions(path, fs::Permissions::from_mode(masked))?;
+                    }
+                }
+            } else {
+                fs::set_permissions(path, fs::Permissions::from_mode(masked))?;
+            }
         }
         // chown and atime/mtime require either root or the libc utimes()
         // wrappers; we punt on them for now (they're rarely exercised by
@@ -572,7 +780,7 @@ fn apply_attrs(path: &Path, a: &Attrs) -> Result<(), SftpError> {
     }
     #[cfg(not(unix))]
     {
-        let _ = a;
+        let _ = (a, allow_special_bits);
     }
     Ok(())
 }

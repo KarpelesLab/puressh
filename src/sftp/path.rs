@@ -8,6 +8,15 @@
 //!
 //! An optional jail root constrains every resolved path to a subtree —
 //! requests escaping the jail are rejected with `FxpStatus::PermissionDenied`.
+//!
+//! **Caveat.** This path-level check is lexical only. It does *not* prevent
+//! escape through a symlink whose target points outside the jail —
+//! `[SftpServerSession]` mitigates that case at I/O time by opening with
+//! `O_NOFOLLOW` on the final component, but full confinement requires
+//! `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` or a real `chroot(2)`.
+//! Treat `with_root(...)` as defence-in-depth, not as a chroot replacement.
+//!
+//! [SftpServerSession]: super::server::SftpServerSession
 
 use std::path::{Component, Path, PathBuf};
 

@@ -240,6 +240,216 @@ fn fstat_after_open() {
     h.join().unwrap();
 }
 
+// --- security: jail-aware symlink rejection (finding #1) ---
+
+#[test]
+fn jailed_open_through_planted_symlink_rejected() {
+    let tmp = TempDir::new("symjail-open");
+    let jail = tmp.path().to_path_buf();
+    // Plant a symlink inside the jail pointing at /etc/passwd.
+    std::os::unix::fs::symlink("/etc/passwd", jail.join("escape")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let err = client
+        .open(b"escape", FXF_READ, Attrs::default())
+        .unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    }
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_setstat_through_symlink_rejected() {
+    let tmp = TempDir::new("symjail-setstat");
+    let jail = tmp.path().to_path_buf();
+    // Outside the jail, a victim file.
+    let outside = std::env::temp_dir().join(format!(
+        "puressh-sftp-victim-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    fs::write(&outside, b"victim").unwrap();
+    let _g = OutsideGuard(outside.clone());
+    // Plant a symlink inside the jail pointing at the victim.
+    std::os::unix::fs::symlink(&outside, jail.join("link")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    // Try to chmod through the planted symlink.
+    let attrs = Attrs {
+        permissions: Some(0o000),
+        ..Default::default()
+    };
+    let err = client.setstat(b"link", attrs).unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    }
+    // The victim should be untouched (permissions still readable).
+    let md = fs::metadata(&outside).unwrap();
+    use std::os::unix::fs::PermissionsExt as _;
+    assert_ne!(md.permissions().mode() & 0o777, 0o000);
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_open_relative_symlink_to_outside_rejected() {
+    let tmp = TempDir::new("symjail-rel");
+    let jail = tmp.path().to_path_buf();
+    // Even though the lexical jail check would clamp at `/`, the relative
+    // target only resolves at use time — and use time is gated by
+    // O_NOFOLLOW on the final component.
+    std::os::unix::fs::symlink("../../etc/passwd", jail.join("trap")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let err = client
+        .open(b"trap", FXF_READ, Attrs::default())
+        .unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    }
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_symlink_with_absolute_target_rejected() {
+    let tmp = TempDir::new("symjail-abs");
+    let jail = tmp.path().to_path_buf();
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let err = client
+        .symlink(b"/etc/passwd", b"abs-link")
+        .unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::PermissionDenied),
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_realpath_strips_jail_prefix() {
+    let tmp = TempDir::new("realpath-jail");
+    let jail = tmp.path().to_path_buf();
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    // Asking the jailed server to realpath "." should give us "/" not the
+    // jail's absolute path on disk.
+    let p = client.realpath(b".").unwrap();
+    let s = String::from_utf8_lossy(&p);
+    assert!(
+        !s.contains(jail.to_string_lossy().as_ref()),
+        "jail leaked in realpath: {s}"
+    );
+    assert_eq!(s, "/", "expected '/' inside jail, got {s}");
+    let p = client.realpath(b"sub/file").unwrap();
+    assert_eq!(String::from_utf8_lossy(&p), "/sub/file");
+    drop(client);
+    h.join().unwrap();
+}
+
+// --- security: setstat size cap (finding #4) ---
+
+#[test]
+fn setstat_set_len_above_cap_rejected() {
+    let tmp = TempDir::new("setlen");
+    fs::write(tmp.path().join("f"), b"x").unwrap();
+    let opts = SftpServerOptions::new(tmp.path()).with_max_set_len(1024);
+    let (a, b) = pair();
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let attrs = Attrs {
+        size: Some(8 * 1024), // above the 1 KiB cap
+        ..Default::default()
+    };
+    let err = client.setstat(b"f", attrs).unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::PermissionDenied),
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+    // File is unchanged.
+    assert_eq!(fs::read(tmp.path().join("f")).unwrap(), b"x");
+    drop(client);
+    h.join().unwrap();
+}
+
+// --- security: setuid/setgid/sticky stripping (finding #9) ---
+
+#[test]
+fn open_strips_setuid_bit_by_default() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new("setuid");
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+    let attrs = Attrs {
+        // 04755: setuid + rwxr-xr-x
+        permissions: Some(0o4755),
+        ..Default::default()
+    };
+    let handle = client
+        .open(b"suid.bin", FXF_WRITE | FXF_CREAT, attrs)
+        .unwrap();
+    client.close(&handle).unwrap();
+    let md = fs::metadata(tmp.path().join("suid.bin")).unwrap();
+    assert_eq!(
+        md.permissions().mode() & 0o7777,
+        0o0755,
+        "setuid should be stripped by default"
+    );
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn setstat_strips_special_bits_by_default() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tmp = TempDir::new("setstat-special");
+    fs::write(tmp.path().join("f"), b"x").unwrap();
+    fs::set_permissions(tmp.path().join("f"), fs::Permissions::from_mode(0o644)).unwrap();
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+    let attrs = Attrs {
+        permissions: Some(0o6755), // setuid + setgid
+        ..Default::default()
+    };
+    client.setstat(b"f", attrs).unwrap();
+    let md = fs::metadata(tmp.path().join("f")).unwrap();
+    assert_eq!(md.permissions().mode() & 0o7777, 0o0755);
+    drop(client);
+    h.join().unwrap();
+}
+
+struct OutsideGuard(PathBuf);
+impl Drop for OutsideGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 #[test]
 fn large_file_round_trip() {
     let tmp = TempDir::new("large");

@@ -41,7 +41,14 @@ use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
 /// Maximum line length when reading the peer's identification banner.
 const MAX_BANNER_LINE: usize = 1024;
 /// Maximum number of banner lines we'll skim through before giving up.
-const MAX_BANNER_LINES: usize = 256;
+/// Tightened (was 256) to match OpenSSH's much smaller pre-auth banner
+/// tolerance: an attacker should not be able to make us buffer hundreds of
+/// kilobytes of unauthenticated text before we even see the SSH version.
+const MAX_BANNER_LINES: usize = 32;
+/// Hard cap on the **total** bytes we will read across all pre-version
+/// banner lines (RFC 4253 §4.2 permits arbitrary text before the
+/// `SSH-2.0-…` line; OpenSSH caps this at ~64 KiB total).
+const MAX_BANNER_TOTAL_BYTES: usize = 64 * 1024;
 /// Soft cap on the inbound packet-reassembly buffer.
 const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
 /// Hard cap on accumulated exec stdout+stderr.
@@ -1881,9 +1888,14 @@ impl Client {
 
     fn read_peer_version(&mut self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
+        let mut total: usize = 0;
         for _ in 0..MAX_BANNER_LINES {
             buf.clear();
             read_line(&mut self.stream, &mut buf, MAX_BANNER_LINE)?;
+            total = total.saturating_add(buf.len());
+            if total > MAX_BANNER_TOTAL_BYTES {
+                return Err(Error::Protocol("banner too large"));
+            }
             if buf.starts_with(b"SSH-") {
                 let parsed = VersionExchange::parse_remote(&buf)?;
                 return Ok(parsed.into_bytes());

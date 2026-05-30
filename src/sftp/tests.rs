@@ -371,22 +371,40 @@ fn jailed_realpath_strips_jail_prefix_when_opted_in() {
 }
 
 #[test]
-fn jailed_realpath_leaks_jail_prefix_by_default() {
-    // Without `hide_jail_in_realpath(true)` the historical (leaky)
-    // behaviour is preserved — the server returns the host-side
-    // absolute path. Operators that don't want this MUST opt in.
+fn jailed_realpath_hides_jail_prefix_by_default() {
+    // The default is now `hide_jail_in_realpath(true)` so the host's
+    // filesystem layout is never leaked unless the operator opts out.
     let tmp = TempDir::new("realpath-jail-default");
     let jail = tmp.path().to_path_buf();
-    let canon_jail = std::fs::canonicalize(&jail).unwrap_or_else(|_| jail.clone());
     let (a, b) = pair();
     let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
     let h = spawn_server(opts, a);
     let mut client = SftpClient::new(b).unwrap();
     let p = client.realpath(b".").unwrap();
     let s = String::from_utf8_lossy(&p).to_string();
+    assert_eq!(s, "/", "default should hide jail prefix in realpath");
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_realpath_leaks_when_explicit_opt_out() {
+    // Setting `hide_jail_in_realpath(false)` restores the historical
+    // host-path behaviour for back-compat with clients that need it.
+    let tmp = TempDir::new("realpath-jail-leak-optout");
+    let jail = tmp.path().to_path_buf();
+    let canon_jail = std::fs::canonicalize(&jail).unwrap_or_else(|_| jail.clone());
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone())
+        .with_root(jail.clone())
+        .hide_jail_in_realpath(false);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let p = client.realpath(b".").unwrap();
+    let s = String::from_utf8_lossy(&p).to_string();
     assert!(
         s == jail.to_string_lossy() || s == canon_jail.to_string_lossy(),
-        "expected unstripped jail path by default, got {s}"
+        "expected unstripped jail path with opt-out, got {s}"
     );
     drop(client);
     h.join().unwrap();

@@ -53,11 +53,10 @@ pub struct SftpServerOptions {
     /// When `true` and a jail is configured, `op_realpath` strips the
     /// jail prefix from the returned path so the client sees paths
     /// relative to the jail root (e.g. `/foo/bar` instead of
-    /// `/srv/jail/u/foo/bar`). Defaults to `false` so the historical
-    /// behaviour — returning the host-side absolute path — is preserved
-    /// unless the operator explicitly opts in; new deployments that
-    /// don't want to leak the host filesystem layout should set this
-    /// to `true`.
+    /// `/srv/jail/u/foo/bar`). Defaults to `true` so the host-side
+    /// filesystem layout is not leaked to every client; operators that
+    /// require the historical (leaky) behaviour for back-compat with
+    /// existing clients can opt out by setting this to `false`.
     pub hide_jail_in_realpath: bool,
 }
 
@@ -70,7 +69,7 @@ impl SftpServerOptions {
             read_only: false,
             max_set_len: DEFAULT_MAX_SET_LEN,
             allow_special_bits: false,
-            hide_jail_in_realpath: false,
+            hide_jail_in_realpath: true,
         }
     }
 
@@ -105,8 +104,8 @@ impl SftpServerOptions {
 
     /// Hide the jail prefix in `op_realpath` so the client sees paths
     /// relative to the jail root (`/foo/bar` instead of
-    /// `/srv/jail/u/foo/bar`). Off by default to preserve historical
-    /// behaviour.
+    /// `/srv/jail/u/foo/bar`). On by default; set `false` only when an
+    /// existing client requires the historical host-path behaviour.
     pub fn hide_jail_in_realpath(mut self, hide: bool) -> Self {
         self.hide_jail_in_realpath = hide;
         self

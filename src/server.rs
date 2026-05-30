@@ -3698,8 +3698,14 @@ mod tests {
             if name != "sftp" {
                 return Ok(());
             }
-            let opts =
-                crate::sftp::SftpServerOptions::new(self.cwd.clone()).with_root(self.root.clone());
+            // Keep the historical (leaky) realpath behaviour here so the
+            // test below can compare against the host-side absolute root
+            // path. The default flipped to `true` (hide jail in realpath)
+            // as part of the SFTP info-leak security fix; opting out keeps
+            // this transport-layer roundtrip test's intent intact.
+            let opts = crate::sftp::SftpServerOptions::new(self.cwd.clone())
+                .with_root(self.root.clone())
+                .hide_jail_in_realpath(false);
             let mut sess = crate::sftp::SftpServerSession::new(opts);
             // SftpError → Result is best-effort; drop the stream on return so
             // the dispatcher emits EOF+CLOSE to the peer.

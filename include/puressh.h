@@ -112,6 +112,104 @@ int pcssh_client_exec(
  */
 void pcssh_client_free(PcSshClient *client);
 
+/* ----- SFTP ------------------------------------------------------------- */
+
+/* Opaque SFTP session, file, and directory handles. */
+typedef struct PcSshSftp     PcSshSftp;
+typedef struct PcSshSftpFile PcSshSftpFile;
+typedef struct PcSshSftpDir  PcSshSftpDir;
+
+/* Open-flags for pcssh_sftp_open_file (mirrors SFTP wire bits). */
+#define PCSSH_SFTP_READ      0x00000001u
+#define PCSSH_SFTP_WRITE     0x00000002u
+#define PCSSH_SFTP_APPEND    0x00000004u
+#define PCSSH_SFTP_CREAT     0x00000008u
+#define PCSSH_SFTP_TRUNC     0x00000010u
+#define PCSSH_SFTP_EXCL      0x00000020u
+
+/* Bits set in PcSshSftpAttrs.flags to mark which fields are valid. */
+#define PCSSH_ATTR_SIZE          0x00000001u
+#define PCSSH_ATTR_UIDGID        0x00000002u
+#define PCSSH_ATTR_PERMISSIONS   0x00000004u
+#define PCSSH_ATTR_ACMODTIME     0x00000008u
+
+/*
+ * File attributes (POSIX-shaped). Use `flags` to discover which fields
+ * are meaningful for this entry — unset bits leave the field zero.
+ */
+typedef struct PcSshSftpAttrs {
+    uint32_t flags;
+    uint64_t size;
+    uint32_t uid;
+    uint32_t gid;
+    uint32_t permissions;
+    uint32_t atime;
+    uint32_t mtime;
+} PcSshSftpAttrs;
+
+/*
+ * Multi-handle concurrency contract:
+ *   - One PcSshClient supports any combination of SFTP / shell / exec /
+ *     forward channels open simultaneously (SharedClient layer).
+ *   - PcSshSftp / PcSshSftpFile / PcSshSftpDir each hold a back-pointer
+ *     to their parent; the caller MUST NOT free a parent while any
+ *     child handle is live.
+ *   - Per-handle state (file cursor, dir read position) is NOT
+ *     thread-safe — do not share one file/dir handle across threads.
+ */
+
+/* Lifecycle. */
+int  pcssh_sftp_open(PcSshClient *client, PcSshSftp **out_sftp);
+void pcssh_sftp_free(PcSshSftp *sftp);
+
+/* File ops. */
+int  pcssh_sftp_open_file(PcSshSftp *sftp, const char *path,
+                          uint32_t flags, uint32_t mode,
+                          PcSshSftpFile **out_file);
+int  pcssh_sftp_read(PcSshSftpFile *file,
+                     uint8_t *buf, size_t cap, size_t *out_len);
+int  pcssh_sftp_write(PcSshSftpFile *file,
+                      const uint8_t *buf, size_t len);
+int  pcssh_sftp_seek(PcSshSftpFile *file, uint64_t offset);
+int  pcssh_sftp_tell(PcSshSftpFile *file, uint64_t *out_offset);
+int  pcssh_sftp_close_file(PcSshSftpFile *file);
+void pcssh_sftp_file_free(PcSshSftpFile *file);
+
+/* Directory ops. */
+int  pcssh_sftp_opendir(PcSshSftp *sftp, const char *path,
+                        PcSshSftpDir **out_dir);
+/*
+ * Read one directory entry. EOF is signalled by PCSSH_OK with
+ * *name_len == 0 and out_attrs->flags == 0.
+ */
+int  pcssh_sftp_readdir(PcSshSftpDir *dir,
+                        uint8_t *name_buf,     size_t name_cap,     size_t *name_len,
+                        uint8_t *longname_buf, size_t longname_cap, size_t *longname_len,
+                        PcSshSftpAttrs *out_attrs);
+int  pcssh_sftp_closedir(PcSshSftpDir *dir);
+void pcssh_sftp_dir_free(PcSshSftpDir *dir);
+
+/* Stat family. */
+int  pcssh_sftp_stat(PcSshSftp *sftp, const char *path, PcSshSftpAttrs *out_attrs);
+int  pcssh_sftp_lstat(PcSshSftp *sftp, const char *path, PcSshSftpAttrs *out_attrs);
+int  pcssh_sftp_fstat(PcSshSftpFile *file, PcSshSftpAttrs *out_attrs);
+int  pcssh_sftp_setstat(PcSshSftp *sftp, const char *path,
+                        const PcSshSftpAttrs *attrs);
+int  pcssh_sftp_fsetstat(PcSshSftpFile *file, const PcSshSftpAttrs *attrs);
+
+/* Path ops. */
+int  pcssh_sftp_mkdir(PcSshSftp *sftp, const char *path, uint32_t mode);
+int  pcssh_sftp_rmdir(PcSshSftp *sftp, const char *path);
+int  pcssh_sftp_remove(PcSshSftp *sftp, const char *path);
+int  pcssh_sftp_rename(PcSshSftp *sftp,
+                       const char *old_path, const char *new_path);
+int  pcssh_sftp_symlink(PcSshSftp *sftp,
+                        const char *target, const char *link_path);
+int  pcssh_sftp_readlink(PcSshSftp *sftp, const char *path,
+                         uint8_t *buf, size_t cap, size_t *out_len);
+int  pcssh_sftp_realpath(PcSshSftp *sftp, const char *path,
+                         uint8_t *buf, size_t cap, size_t *out_len);
+
 /* ----- known_hosts ------------------------------------------------------- */
 
 /* Opaque known_hosts store handle (in-memory OpenSSH-format store). */

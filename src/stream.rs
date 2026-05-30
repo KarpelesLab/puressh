@@ -96,16 +96,37 @@ impl ChannelStream {
     /// responsibility for sending those markers (typically once both
     /// copy loops finish). This is the right primitive for splice-style
     /// proxying.
+    ///
+    /// Panics: at the type level this method cannot fail — it takes
+    /// `self` by value, so by definition the `rx` / `tx` cells haven't
+    /// been moved out before. The internal asserts below are there to
+    /// catch a future logic bug if a constructor is added that leaves
+    /// either field `None`; new callers that want a non-panicking API
+    /// should use [`Self::try_into_raw`].
     pub fn into_raw(mut self) -> (Receiver<Option<Vec<u8>>>, SyncSender<ChannelEgress>) {
-        let rx = self
-            .rx
-            .take()
-            .expect("ChannelStream::into_raw called twice");
-        let tx = self
-            .tx
-            .take()
-            .expect("ChannelStream::into_raw called twice");
+        let rx = self.rx.take().unwrap_or_else(|| {
+            unreachable!("ChannelStream invariant: rx populated until into_raw consumes self")
+        });
+        let tx = self.tx.take().unwrap_or_else(|| {
+            unreachable!("ChannelStream invariant: tx populated until into_raw consumes self")
+        });
         (rx, tx)
+    }
+
+    /// Fallible variant of [`Self::into_raw`]. Returns `None` if either
+    /// half of the duplex has already been moved out. Provided so future
+    /// constructors / sub-takers can compose without an `unreachable!`.
+    ///
+    /// Today this always returns `Some(_)` for a `ChannelStream` produced
+    /// by [`Self::new`], because the only path that nulls `rx` / `tx` is
+    /// `into_raw` itself, which consumes the value. Defensive callers
+    /// that prefer a `?` over a panic should use this method.
+    pub fn try_into_raw(
+        mut self,
+    ) -> Option<(Receiver<Option<Vec<u8>>>, SyncSender<ChannelEgress>)> {
+        let rx = self.rx.take()?;
+        let tx = self.tx.take()?;
+        Some((rx, tx))
     }
 }
 

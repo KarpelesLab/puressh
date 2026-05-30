@@ -1066,6 +1066,22 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
                 "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial".to_string()
             })?;
             handlers = handlers.with_x11(cb);
+            // `-X` is documented as "untrusted X11 forwarding" but
+            // puressh has no SECURITY-extension cookie isolation yet:
+            // both `-X` and `-Y` mint and forward the same plain
+            // MIT-MAGIC-COOKIE-1, which means the remote can read X11
+            // input from the local display either way. Warn loudly
+            // (once, on session start) when the user asked for the
+            // safer `-X` mode so they aren't silently downgraded to
+            // `-Y`-equivalent behaviour. Don't refuse — that would
+            // break existing scripts that rely on `-X` working at all.
+            if mode == X11Forward::Untrusted {
+                eprintln!(
+                    "warning: -X is currently equivalent to -Y in puressh \
+                     (no SECURITY-extension cookie); the remote can read \
+                     X11 input from your local display."
+                );
+            }
             let cookie = mint_x11_cookie()?;
             let id = client
                 .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", &cookie, 0)

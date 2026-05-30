@@ -144,10 +144,7 @@ impl core::fmt::Debug for AuthMethodPayload {
                 password: _,
             } => f
                 .debug_struct("Password")
-                .field(
-                    "new_password",
-                    &new_password.as_ref().map(|_| "<redacted>"),
-                )
+                .field("new_password", &new_password.as_ref().map(|_| "<redacted>"))
                 .field("password", &"<redacted>")
                 .finish(),
             AuthMethodPayload::PublicKey {

@@ -227,10 +227,35 @@ fn pattern_match_inner(pattern: &str, host: &str, port: u16) -> bool {
     port == 22 && glob_match_ascii_ci(pattern, host)
 }
 
+/// Hard limit on a single pattern's length. A well-formed hostname is
+/// 253 chars; OpenSSH allows globs but doesn't need megabyte-scale
+/// patterns. 1024 is comfortably above any legitimate use.
+const MAX_GLOB_PATTERN_LEN: usize = 1024;
+
+/// Hard limit on `*` wildcards in a single pattern. The naive backtracking
+/// `glob_inner` is O(2^k) over the number of `*`s when made to backtrack
+/// against a long subject (`a*a*a*...` vs `aaaaa...`), so we cap k to
+/// keep worst-case match time bounded regardless of the input.
+const MAX_GLOB_STARS: usize = 32;
+
 /// `*` / `?` glob with ASCII case-insensitive comparisons. No character
 /// classes — OpenSSH supports them in some contexts but `known_hosts`
 /// has historically been `*`/`?` only.
+///
+/// Returns `false` (no match) for patterns that exceed
+/// [`MAX_GLOB_PATTERN_LEN`] or [`MAX_GLOB_STARS`]. We intentionally
+/// don't return an error here — `pattern_match` is on the lookup hot
+/// path and the caller treats any non-match identically. Refusing the
+/// pattern means "this entry doesn't apply to this host" rather than
+/// "the file is malformed"; the user's connection still proceeds via
+/// the TOFU path for any other valid entries.
 fn glob_match_ascii_ci(pat: &str, s: &str) -> bool {
+    if pat.len() > MAX_GLOB_PATTERN_LEN {
+        return false;
+    }
+    if pat.bytes().filter(|&b| b == b'*').count() > MAX_GLOB_STARS {
+        return false;
+    }
     let p: Vec<char> = pat.chars().collect();
     let t: Vec<char> = s.chars().collect();
     glob_inner(&p, &t)
@@ -361,6 +386,43 @@ mod tests {
         assert!(patterns_match(&pats, "good.example.com", 22));
         assert!(!patterns_match(&pats, "evil.example.com", 22));
         assert!(!patterns_match(&pats, "other.invalid", 22));
+    }
+
+    #[test]
+    fn glob_pathological_pattern_returns_quickly_without_match() {
+        // Classic exponential-glob input: many `*a` segments followed by a
+        // long run of `a`s in the subject. Without the wildcard cap this
+        // would visit on the order of 2^k states.
+        let mut pat = String::new();
+        for _ in 0..40 {
+            pat.push('*');
+            pat.push('a');
+        }
+        let subject = "a".repeat(60);
+        let start = std::time::Instant::now();
+        let result = glob_match_ascii_ci(&pat, &subject);
+        let elapsed = start.elapsed();
+        // 40 stars > MAX_GLOB_STARS (32) ⇒ refuse immediately.
+        assert!(!result, "pattern over cap should not match");
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "glob cap should bound runtime: took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn glob_pattern_length_cap_rejects_huge_pattern() {
+        let pat = "a".repeat(MAX_GLOB_PATTERN_LEN + 1);
+        // Returns false (no match) regardless of subject.
+        assert!(!glob_match_ascii_ci(&pat, &pat));
+    }
+
+    #[test]
+    fn glob_within_cap_still_matches_correctly() {
+        // Sanity: ordinary 3-star pattern within the cap matches as before.
+        assert!(glob_match_ascii_ci("*.example.com", "host.example.com"));
+        assert!(!glob_match_ascii_ci("*.example.com", "example.org"));
+        assert!(glob_match_ascii_ci("a*b*c", "axxxbyyyc"));
     }
 
     #[test]

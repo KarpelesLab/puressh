@@ -153,12 +153,34 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
     fn setup(
         &self,
         _user: &str,
-        _single_connection: bool,
+        single_connection: bool,
         _auth_protocol: &str,
         _auth_cookie: &str,
         screen: u32,
         ctx: X11ForwardContext,
     ) -> Result<X11ForwardHandle> {
+        // SECURITY NOTE — X11 authorisation cookie validation.
+        //
+        // RFC 4254 §6.3.1 carries `auth_protocol` + `auth_cookie` from the
+        // client so the server can program the X server (or its proxy) to
+        // accept only connections that present the matching cookie on the
+        // first wire bytes. We deliberately do NOT do that here — the
+        // default handler binds a plain TCP socket on `127.0.0.1:6000+N`
+        // and forwards anything that connects, trusting that:
+        //
+        //   1) the listener is loopback-only (no remote attacker can reach
+        //      it without already holding a shell on this host), AND
+        //   2) the operator wraps the binary or runs the X server with its
+        //      own access controls (`Xauthority` on a downstream display).
+        //
+        // This matches OpenSSH's default `X11UseLocalhost yes` behaviour,
+        // but it does NOT enforce the cookie itself. A local user on the
+        // server box CAN open `localhost:6000+N` and reach the client's X
+        // server without presenting the cookie — exactly as with stock
+        // OpenSSH. If you need per-connection cookie checks, wrap this
+        // handler with one that intercepts the first XAuth packet on each
+        // accepted connection and validates `auth_protocol`/`auth_cookie`
+        // before splicing.
         let (listener, display_number) = self.bind_first_free()?;
         listener.set_nonblocking(true)?;
 
@@ -180,6 +202,16 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
                             Err(_) => {
                                 let _ = conn.shutdown(Shutdown::Both);
                             }
+                        }
+                        // RFC 4254 §6.3.1: when the client set
+                        // `single_connection`, the server MUST refuse any
+                        // further forwarded X11 connections after the first
+                        // is accepted. Drop the listener (by exiting the
+                        // loop, which lets `listener` go out of scope) so
+                        // subsequent connects to `localhost:6000+N` see a
+                        // `ECONNREFUSED`.
+                        if single_connection {
+                            break;
                         }
                     }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
@@ -442,5 +474,41 @@ mod tests {
     #[test]
     fn tcp_display_callback_constructs() {
         let _cb = splice_to_tcp_display_callback("127.0.0.1".to_string(), 65000);
+    }
+
+    /// With `single_connection: true`, the accept-loop must drop the
+    /// listener after the first connection lands. A second connect to
+    /// the same display port should fail (ECONNREFUSED / timeout once
+    /// the worker has exited and released the port).
+    #[test]
+    fn single_connection_releases_listener_after_first_accept() {
+        let h = DefaultX11ForwardHandler::with_display_range(700, 720);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", true, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
+
+        // First connect succeeds; the accept-loop pushes it through
+        // (the `for_test_no_opens` context drops the conn) and then
+        // exits because single_connection is set.
+        let first =
+            TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("first connect");
+        drop(first);
+
+        // Give the worker time to exit and release the port.
+        let mut released = false;
+        for _ in 0..50 {
+            thread::sleep(Duration::from_millis(50));
+            if TcpListener::bind(addr).is_ok() {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "single_connection: listener should be released after the first accept"
+        );
+        drop(handle);
     }
 }

@@ -53,6 +53,9 @@ impl Drop for Binding {
     }
 }
 
+/// Filter callback type for [`DefaultTcpipForwardHandler::with_allow_filter`].
+type AllowFilter = Box<dyn Fn(&str, &str, u16) -> bool + Send + Sync>;
+
 /// Default in-process backing for `tcpip-forward` / `cancel-tcpip-forward`.
 ///
 /// One instance per server typically, registered via
@@ -60,11 +63,23 @@ impl Drop for Binding {
 /// share across connections — each `bind` opens its own listener and
 /// tracks it by the (`bind_address`, returned-port) key.
 ///
-/// **Important**: connections accepted on a bound port are currently
-/// closed immediately. End-to-end byte forwarding requires the
-/// `forwarded-tcpip` back-channel work in a follow-up commit.
+/// Apply an optional allow filter via [`Self::with_allow_filter`] to refuse
+/// specific bind requests (e.g. only permit loopback binds, or only certain
+/// ports). Without a filter every bind is accepted — matching OpenSSH's
+/// behaviour before `PermitListen` is configured.
+///
+/// ```ignore
+/// use puressh::forwarding::reverse::DefaultTcpipForwardHandler;
+///
+/// // Only allow loopback binds.
+/// let h = DefaultTcpipForwardHandler::new()
+///     .with_allow_filter(|_user, addr, _port| {
+///         matches!(addr, "127.0.0.1" | "::1" | "localhost")
+///     });
+/// ```
 pub struct DefaultTcpipForwardHandler {
     bindings: Mutex<BTreeMap<(String, u16), Binding>>,
+    allow: Option<AllowFilter>,
 }
 
 impl Default for DefaultTcpipForwardHandler {
@@ -78,6 +93,28 @@ impl DefaultTcpipForwardHandler {
     pub fn new() -> Self {
         Self {
             bindings: Mutex::new(BTreeMap::new()),
+            allow: None,
+        }
+    }
+
+    /// Attach an allow filter. Each `bind` request passes
+    /// `(user, bind_address, bind_port)` through the filter; a `false`
+    /// return value surfaces to the peer as a `REQUEST_FAILURE` for the
+    /// global request (no listener is created). The default (no filter)
+    /// accepts every bind, which is **insecure** for multi-tenant
+    /// servers and should be tightened by the operator.
+    pub fn with_allow_filter<F>(mut self, filter: F) -> Self
+    where
+        F: Fn(&str, &str, u16) -> bool + Send + Sync + 'static,
+    {
+        self.allow = Some(Box::new(filter));
+        self
+    }
+
+    fn allowed(&self, user: &str, bind_address: &str, bind_port: u16) -> bool {
+        match &self.allow {
+            Some(f) => f(user, bind_address, bind_port),
+            None => true,
         }
     }
 
@@ -182,11 +219,18 @@ fn resolve_bind(bind_address: &str, port: u16) -> Result<SocketAddr> {
 impl TcpipForwardHandler for DefaultTcpipForwardHandler {
     fn bind(
         &self,
-        _user: &str,
+        user: &str,
         bind_address: &str,
         bind_port: u16,
         ctx: ForwardContext,
     ) -> Result<u16> {
+        // Filter-first: refuse the request without ever touching the kernel
+        // if the operator's policy says no. Surface as a protocol error so
+        // the per-connection dispatcher turns it into REQUEST_FAILURE on
+        // the wire.
+        if !self.allowed(user, bind_address, bind_port) {
+            return Err(Error::Protocol("tcpip-forward: bind refused by policy"));
+        }
         let addr = resolve_bind(bind_address, bind_port)?;
         let listener = TcpListener::bind(addr)?;
         let actual_port = listener.local_addr()?.port();
@@ -323,5 +367,36 @@ mod tests {
                 ForwardContext::for_test_no_opens(),
             )
             .is_err());
+    }
+
+    #[test]
+    fn allow_filter_can_refuse_bind() {
+        // Loopback-only policy: 127.0.0.1 accepted, 0.0.0.0 refused.
+        let h = DefaultTcpipForwardHandler::new()
+            .with_allow_filter(|_user, addr, _port| addr == "127.0.0.1");
+        let port = h
+            .bind("u", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+            .expect("loopback bind allowed");
+        assert!(h
+            .bind("u", "0.0.0.0", 0, ForwardContext::for_test_no_opens())
+            .is_err());
+        // Filter refusal must NOT silently bind something; the binding
+        // count must still be 1 (the loopback bind we made above).
+        assert_eq!(h.binding_count(), 1);
+        h.unbind("u", "127.0.0.1", port).expect("unbind");
+    }
+
+    #[test]
+    fn allow_filter_sees_user() {
+        // Refuse everyone but "alice".
+        let h = DefaultTcpipForwardHandler::new()
+            .with_allow_filter(|user, _addr, _port| user == "alice");
+        assert!(h
+            .bind("bob", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+            .is_err());
+        let port = h
+            .bind("alice", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+            .expect("alice bind allowed");
+        h.unbind("alice", "127.0.0.1", port).expect("unbind");
     }
 }

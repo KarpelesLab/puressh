@@ -203,35 +203,23 @@ fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
     }
 
     // The standard library exposes file_type().is_file() / .is_dir() but
-    // not .is_socket(); reach for libc::stat to get the raw st_mode bits
-    // and check S_IFMT. We re-stat through libc rather than using the
-    // already-fetched `md` because converting the std Metadata to st_mode
-    // is platform-specific and noisy; one extra syscall on a Unix socket
-    // path is acceptable.
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| "path contains NUL byte".to_string())?;
-    // SAFETY: lstat(3) with a valid C string + a zeroed stat buffer; we
-    // check the return value before reading any fields. Using lstat (not
-    // stat) so a symlink doesn't slip past the check above due to TOCTOU
-    // between symlink_metadata and this call.
-    let mut st: libc::stat = unsafe { core::mem::zeroed() };
-    let rc = unsafe { libc::lstat(c_path.as_ptr(), &mut st as *mut libc::stat) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        return Err(format!("lstat failed: {err}"));
-    }
-    if (st.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+    // not .is_socket(); on Unix, std::os::unix::fs::FileTypeExt gives us
+    // is_socket() and MetadataExt exposes raw st_mode / st_uid bits — both
+    // routed through the already-fetched `md`, avoiding both a second
+    // syscall and any unsafe libc surface. (The library forbids
+    // `unsafe_code` outside the `ffi` feature; nix::unistd::geteuid wraps
+    // the syscall safely for us.)
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if !md.file_type().is_socket() {
         return Err("path is not a Unix-domain socket".into());
     }
 
-    // SAFETY: geteuid(3) takes no args and cannot fail.
-    let euid = unsafe { libc::geteuid() };
-    if st.st_uid != euid {
+    let euid = nix::unistd::geteuid().as_raw();
+    if md.uid() != euid {
         return Err(format!(
             "socket is owned by uid {} but we are euid {} (refusing to trust another user's agent)",
-            st.st_uid, euid
+            md.uid(),
+            euid
         ));
     }
 
@@ -239,10 +227,11 @@ fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
     // obvious foot-gun; group-writable is also unsafe in any multi-user
     // setup. OpenSSH enforces the same on `ssh-agent -a`. The constant is
     // 0o077 (rwx for group and other).
-    if (st.st_mode & 0o077) != 0 {
+    let mode = md.mode();
+    if (mode & 0o077) != 0 {
         return Err(format!(
             "socket is group/world-accessible (mode {:o}); refusing to use it",
-            st.st_mode & 0o777
+            mode & 0o777
         ));
     }
 

@@ -78,9 +78,12 @@ fn classify(cipher: SshCipher, mac: Option<Box<dyn SshMac + Send + Sync>>) -> Re
 /// block alignment.
 #[cfg(feature = "alloc")]
 pub struct PacketCodec {
-    /// Inbound sequence counter — increments per packet, wraps at u32::MAX.
+    /// Inbound sequence counter — increments per packet. RFC 4253 §6.4
+    /// forbids wrapping (MAC/AEAD nonces derive from `seq`), so the codec
+    /// errors out before this would roll over.
     pub seq_in: u32,
-    /// Outbound sequence counter — increments per packet, wraps at u32::MAX.
+    /// Outbound sequence counter — increments per packet. Same wrap policy
+    /// as [`seq_in`](Self::seq_in).
     pub seq_out: u32,
     /// Total on-wire bytes encoded since this codec was created. Counts the
     /// post-compression, post-encryption framing (length + body + MAC/tag),
@@ -249,7 +252,13 @@ impl PacketCodec {
                 encode_chachapoly(self.seq_out, to_frame, rng, cipher)?
             }
         };
-        self.seq_out = self.seq_out.wrapping_add(1);
+        // RFC 4253 §6.4: the sequence number must never wrap — both the MAC
+        // input and the AEAD nonce (AES-GCM / ChaCha20-Poly1305) derive from
+        // it, so a wrap reuses the nonce under the same key.
+        self.seq_out = self
+            .seq_out
+            .checked_add(1)
+            .ok_or(Error::Protocol("sequence number overflow"))?;
         self.bytes_out = self.bytes_out.saturating_add(frame.len() as u64);
         Ok(frame)
     }
@@ -271,7 +280,12 @@ impl PacketCodec {
             CipherSlot::ChaChaPoly(cipher) => decode_chachapoly(self.seq_in, buf, cipher),
         }?;
         if let Some((payload, consumed)) = r {
-            self.seq_in = self.seq_in.wrapping_add(1);
+            // RFC 4253 §6.4: wrap would reuse the MAC/AEAD nonce under the
+            // same key — refuse rather than silently roll over.
+            self.seq_in = self
+                .seq_in
+                .checked_add(1)
+                .ok_or(Error::Protocol("sequence number overflow"))?;
             self.bytes_in = self.bytes_in.saturating_add(consumed as u64);
             let payload =
                 if self.inbound_decompress.active() && self.inbound_decompress.name() != "none" {

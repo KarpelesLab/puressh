@@ -123,17 +123,41 @@ impl KexBackend {
     }
 }
 
-/// Default GEX group selection (RFC 4419 §3). We map the client's preferred
-/// size to one of the RFC 3526 safe-prime groups we ship — they're known to
-/// be well-formed and stay inside the `[min, max]` range the client requested
-/// (the client's `client_init` rejects mismatches anyway).
+/// Default GEX group selection (RFC 4419 §3). Honour the `[min, max]`
+/// range the client requested as a hard constraint: a group whose prime
+/// is smaller than `req.min` would let a downgrade attacker force weaker
+/// DH parameters. We map to one of the RFC 3526 safe-prime groups we
+/// ship (group14 = 2048, group16 = 4096, group18 = 8192) — they're
+/// well-formed and conservatively sized for their bit count.
 fn default_gex_group(req: GexRequest) -> DhGroup {
-    if req.n <= 2048 {
+    // Pick the smallest group that satisfies `req.min`, then bound by
+    // the preferred `n`. If the client demands more than group18 offers,
+    // we still hand back group18 (best we have) — the client's
+    // `client_finish` independently re-validates that the returned
+    // prime/generator lie in its own [min, max] range and will reject if
+    // not, which keeps us honest.
+    if req.min > 4096 {
+        return group18();
+    }
+    if req.min > 2048 {
+        // Need at least 4096 bits. Pick group16 unless the preferred
+        // size also demands group18.
+        return if req.n > 4096 { group18() } else { group16() };
+    }
+    // req.min <= 2048: any of our groups qualifies on the min side.
+    // Fall back to the existing n-based selection, bounded by req.max
+    // so we never hand back something the client said was too large.
+    if req.n <= 2048 && req.max >= 2048 {
         group14()
-    } else if req.n <= 4096 {
+    } else if req.n <= 4096 && req.max >= 4096 {
+        group16()
+    } else if req.max >= 8192 {
+        group18()
+    } else if req.max >= 4096 {
         group16()
     } else {
-        group18()
+        // req.max < 4096 (and >= 2048 by the path we took here).
+        group14()
     }
 }
 
@@ -997,6 +1021,49 @@ mod tests {
     use crate::transport::kex::{defaults, KexAlgorithms};
     use crate::transport::version::LOCAL_VERSION;
     use purecrypto::rng::OsRng;
+
+    #[test]
+    fn default_gex_group_honours_client_min_floor() {
+        // min > 4096: must get group18 (8192-bit), regardless of n/max.
+        let req = GexRequest {
+            min: 5000,
+            n: 5000,
+            max: 8192,
+        };
+        assert_eq!(default_gex_group(req).bit_size(), 8192);
+
+        // min > 2048: at least 4096-bit. n=4096 -> group16.
+        let req = GexRequest {
+            min: 3000,
+            n: 4096,
+            max: 8192,
+        };
+        assert_eq!(default_gex_group(req).bit_size(), 4096);
+
+        // min > 2048, n > 4096 -> group18.
+        let req = GexRequest {
+            min: 3000,
+            n: 6000,
+            max: 8192,
+        };
+        assert_eq!(default_gex_group(req).bit_size(), 8192);
+
+        // Standard request -> group14 / group16 per `n` (legacy behaviour).
+        let req = GexRequest {
+            min: 1024,
+            n: 2048,
+            max: 8192,
+        };
+        assert_eq!(default_gex_group(req).bit_size(), 2048);
+
+        // max caps the n-based pick downward.
+        let req = GexRequest {
+            min: 1024,
+            n: 8192,
+            max: 4096,
+        };
+        assert_eq!(default_gex_group(req).bit_size(), 4096);
+    }
 
     #[test]
     fn every_default_kex_algorithm_maps_to_backend() {

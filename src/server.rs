@@ -771,6 +771,101 @@ pub struct Config {
     /// Thresholds that trigger a re-key (RFC 4253 §9). Defaults to 1 GiB /
     /// 1 hour / `1u32 << 31` packets per direction.
     pub rekey_policy: RekeyPolicy,
+    /// Allow-list of glob patterns matched against client-supplied
+    /// `"env"` channel-request names (RFC 4254 §6.4). When empty (the
+    /// default), every client env request is silently dropped.
+    /// Patterns use the OpenSSH `AcceptEnv` syntax: literal names, with
+    /// `*` and `?` wildcards. Matches against the names in
+    /// [`HARD_BLOCKED_ENV_NAMES`] are always refused regardless of the
+    /// allow-list. See [`Config::with_accept_env`].
+    pub accept_env: Vec<String>,
+    /// Pre-authentication inactivity timeout, applied to the socket
+    /// between TCP accept and `userauth-success` (RFC 4252 — OpenSSH's
+    /// `LoginGraceTime`). A peer that doesn't get past auth in this
+    /// window has the connection dropped with `Error::Io`/`TimedOut`.
+    /// Defaults to 120 seconds. Set to [`Duration::ZERO`] to disable.
+    pub login_grace_time: Duration,
+}
+
+/// Environment variable names that no [`Config::accept_env`] glob may
+/// override. Mirrors the set OpenSSH refuses to import even with
+/// `AcceptEnv *`: dynamic-linker preload knobs, shell init scripts that
+/// run before the parent can sanitize the env, and identity names that
+/// must follow `/etc/passwd` (not the peer).
+pub const HARD_BLOCKED_ENV_NAMES: &[&str] = &[
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "LD_AUDIT",
+    "LD_BIND_NOT",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "BASH_ENV",
+    "ENV",
+    "IFS",
+    "PATH",
+    "SHELL",
+    "HOME",
+    "USER",
+    "LOGNAME",
+];
+
+/// True when `name` matches `pattern` under the OpenSSH `AcceptEnv`
+/// glob syntax: literal byte-match plus `*` (zero or more) / `?` (one).
+/// No bracket sets, no escapes — same minimal grammar OpenSSH uses.
+fn env_glob_match(pattern: &str, name: &str) -> bool {
+    let pb = pattern.as_bytes();
+    let nb = name.as_bytes();
+    fn rec(p: &[u8], n: &[u8]) -> bool {
+        let mut pi = 0usize;
+        let mut ni = 0usize;
+        while pi < p.len() {
+            match p[pi] {
+                b'*' => {
+                    // Collapse runs of `*` so the recursion isn't quadratic.
+                    while pi < p.len() && p[pi] == b'*' {
+                        pi += 1;
+                    }
+                    if pi == p.len() {
+                        return true;
+                    }
+                    while ni <= n.len() {
+                        if rec(&p[pi..], &n[ni..]) {
+                            return true;
+                        }
+                        ni += 1;
+                    }
+                    return false;
+                }
+                b'?' => {
+                    if ni >= n.len() {
+                        return false;
+                    }
+                    pi += 1;
+                    ni += 1;
+                }
+                c => {
+                    if ni >= n.len() || n[ni] != c {
+                        return false;
+                    }
+                    pi += 1;
+                    ni += 1;
+                }
+            }
+        }
+        ni == n.len()
+    }
+    rec(pb, nb)
+}
+
+/// Decide whether a client-supplied `(name, _)` env pair should be
+/// honoured. Returns `true` only when:
+/// - `name` is not in [`HARD_BLOCKED_ENV_NAMES`], AND
+/// - at least one pattern in `accept_env` matches it.
+pub(crate) fn env_name_accepted(name: &str, accept_env: &[String]) -> bool {
+    if HARD_BLOCKED_ENV_NAMES.contains(&name) {
+        return false;
+    }
+    accept_env.iter().any(|pat| env_glob_match(pat, name))
 }
 
 impl Config {
@@ -796,7 +891,32 @@ impl Config {
             x11_forward_handler: None,
             on_session_open: None,
             rekey_policy: RekeyPolicy::default(),
+            accept_env: Vec::new(),
+            login_grace_time: Duration::from_secs(120),
         }
+    }
+
+    /// Replace the env-request allow-list. Each entry is a name pattern
+    /// matched against the `name` field of incoming `"env"` channel
+    /// requests (RFC 4254 §6.4); the pattern grammar is the OpenSSH
+    /// `AcceptEnv` subset (`*`, `?`). Names in
+    /// [`HARD_BLOCKED_ENV_NAMES`] (`LD_PRELOAD`, `PATH`, `HOME`, …) are
+    /// always refused — they cannot be re-enabled by listing them.
+    ///
+    /// The default is empty, i.e. every client env request is dropped.
+    pub fn with_accept_env(mut self, patterns: Vec<String>) -> Self {
+        self.accept_env = patterns;
+        self
+    }
+
+    /// Set the pre-authentication inactivity timeout (OpenSSH's
+    /// `LoginGraceTime`). The socket carries this read-timeout from
+    /// banner exchange through to `userauth-success`; after auth the
+    /// timeout is cleared. Defaults to 120 seconds. Pass
+    /// [`Duration::ZERO`] to disable.
+    pub fn with_login_grace_time(mut self, dur: Duration) -> Self {
+        self.login_grace_time = dur;
+        self
     }
 
     /// Attach a `ShellHandler` to this config. Without a handler, `"shell"`
@@ -942,18 +1062,50 @@ pub fn handle_session(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     handle_connection_inner(stream, cfg)
 }
 
+/// Normalize a pre-auth I/O outcome into something the caller can treat
+/// as "clean disconnect" without conflating it with a true protocol
+/// error. Read-timeouts (the socket-level `LoginGraceTime` deadline) and
+/// the would-block flavour of the same arrive as `io::ErrorKind::TimedOut`
+/// or `WouldBlock`; we rewrap them as a fresh `TimedOut` so call sites
+/// don't have to know the platform's spelling.
+fn map_preauth_timeout<T>(r: Result<T>) -> Result<T> {
+    match r {
+        Err(Error::Io(e)) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            Err(Error::Io(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "pre-auth inactivity timeout (LoginGraceTime)",
+            )))
+        }
+        other => other,
+    }
+}
+
 fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
     stream.set_nodelay(true)?;
+
+    // RFC 4252 / OpenSSH "LoginGraceTime": cap the time the peer can
+    // sit idle between TCP accept and userauth-success. We arm the
+    // socket-level read timeout once here; every subsequent blocking
+    // `read` in banner exchange, KEX, and auth inherits it without
+    // having to thread a deadline through the handshake.
+    let grace = cfg.login_grace_time;
+    if !grace.is_zero() {
+        stream.set_read_timeout(Some(grace))?;
+    }
 
     let mut codec = PacketCodec::new();
     let mut inbox: Vec<u8> = Vec::new();
     let mut rng = OsRng;
 
     let v_s = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
-    stream.write_all(&VersionExchange::outgoing_bytes())?;
-    let v_c = read_peer_version(&mut stream)?;
+    map_preauth_timeout(
+        stream
+            .write_all(&VersionExchange::outgoing_bytes())
+            .map_err(Error::Io),
+    )?;
+    let v_c = map_preauth_timeout(read_peer_version(&mut stream))?;
 
-    let (mut runner, session_id) = do_server_kex(
+    let (mut runner, session_id) = map_preauth_timeout(do_server_kex(
         &mut stream,
         &mut codec,
         &mut rng,
@@ -961,17 +1113,25 @@ fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()
         &cfg,
         &v_c,
         &v_s,
-    )?;
+    ))?;
     let mut last_kex = Instant::now();
 
-    let user = do_server_auth(
+    let user = map_preauth_timeout(do_server_auth(
         &mut stream,
         &mut codec,
         &mut rng,
         &mut inbox,
         &cfg,
         session_id,
-    )?;
+    ))?;
+
+    // Past userauth-success: lift the grace timeout. The connection
+    // loop installs its own short read timeout (50 ms) on demand when
+    // it has work to drain; we don't want the grace deadline tripping
+    // mid-session on a keep-alive lull.
+    if !grace.is_zero() {
+        stream.set_read_timeout(None)?;
+    }
 
     // Connection-level hook: drop privileges to the authenticated user
     // before any shell / exec / subsystem runs. After this call all I/O on
@@ -2383,13 +2543,21 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
         }
         ChannelRequest::Env { name, value } => {
             // RFC 4254 §6.4: env is scoped to the session channel. We
-            // accumulate every accepted variable; handlers reading the bag
-            // see them at exec / shell / subsystem dispatch time. No
-            // filtering — the implementation that consumes the env decides
-            // what to honour.
-            envs.entry(channel).or_default().insert(name, value);
-            if want_reply {
-                let p = conn.send_request_success(channel)?;
+            // filter against `cfg.accept_env` (a glob allow-list) and
+            // refuse anything in [`HARD_BLOCKED_ENV_NAMES`] regardless
+            // of the allow-list — dynamic-linker preload knobs, shell
+            // init files, and identity names that must follow
+            // /etc/passwd. RFC 4254 lets us reply `CHANNEL_SUCCESS` for
+            // accepted requests and `CHANNEL_FAILURE` for rejected
+            // ones; clients treat the failure as a benign hint.
+            if env_name_accepted(&name, &cfg.accept_env) {
+                envs.entry(channel).or_default().insert(name, value);
+                if want_reply {
+                    let p = conn.send_request_success(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            } else if want_reply {
+                let p = conn.send_request_failure(channel)?;
                 write_payload(stream, codec, rng, &p)?;
             }
         }
@@ -4250,5 +4418,87 @@ mod tests {
         }
         let _ = server_thread.join();
         let _ = echo_thread.join();
+    }
+
+    // ---- env allowlist filter ---------------------------------------------
+
+    #[test]
+    fn env_filter_blocks_ld_preload_even_when_glob_matches() {
+        // Worst-case operator typo: `AcceptEnv *` lets through *everything*
+        // that isn't on the hard-block list. LD_PRELOAD is on that list,
+        // so it must be refused even with the broadest possible pattern.
+        let allow = vec!["*".to_string()];
+        assert!(
+            !env_name_accepted("LD_PRELOAD", &allow),
+            "LD_PRELOAD must NEVER be accepted, even with `AcceptEnv *`"
+        );
+        assert!(!env_name_accepted("LD_LIBRARY_PATH", &allow));
+        assert!(!env_name_accepted("LD_AUDIT", &allow));
+        assert!(!env_name_accepted("LD_BIND_NOT", &allow));
+        assert!(!env_name_accepted("DYLD_INSERT_LIBRARIES", &allow));
+        assert!(!env_name_accepted("DYLD_LIBRARY_PATH", &allow));
+        assert!(!env_name_accepted("BASH_ENV", &allow));
+        assert!(!env_name_accepted("ENV", &allow));
+        assert!(!env_name_accepted("IFS", &allow));
+        assert!(!env_name_accepted("PATH", &allow));
+        assert!(!env_name_accepted("SHELL", &allow));
+        assert!(!env_name_accepted("HOME", &allow));
+        assert!(!env_name_accepted("USER", &allow));
+        assert!(!env_name_accepted("LOGNAME", &allow));
+        // Non-blocked names with `*` still succeed.
+        assert!(env_name_accepted("LANG", &allow));
+        assert!(env_name_accepted("LC_ALL", &allow));
+        assert!(env_name_accepted("TERM", &allow));
+    }
+
+    #[test]
+    fn env_filter_explicit_listing_of_blocked_name_still_blocks() {
+        // Operator typo #2: explicitly listing LD_PRELOAD in AcceptEnv.
+        // Still must not be honoured.
+        let allow = vec!["LD_PRELOAD".to_string()];
+        assert!(!env_name_accepted("LD_PRELOAD", &allow));
+    }
+
+    #[test]
+    fn env_filter_empty_allowlist_drops_everything() {
+        let allow: Vec<String> = Vec::new();
+        assert!(!env_name_accepted("LANG", &allow));
+        assert!(!env_name_accepted("TERM", &allow));
+        assert!(!env_name_accepted("FOO", &allow));
+        assert!(!env_name_accepted("LD_PRELOAD", &allow));
+    }
+
+    #[test]
+    fn env_filter_glob_matching() {
+        let allow = vec!["LC_*".to_string(), "LANG".to_string(), "X???".to_string()];
+        // Direct matches.
+        assert!(env_name_accepted("LANG", &allow));
+        assert!(env_name_accepted("LC_ALL", &allow));
+        assert!(env_name_accepted("LC_TIME", &allow));
+        assert!(env_name_accepted("LC_CTYPE", &allow));
+        assert!(env_name_accepted("XABC", &allow));
+        // Non-matches.
+        assert!(!env_name_accepted("LANGUAGE", &allow)); // no pattern
+        assert!(!env_name_accepted("XABCD", &allow)); // ??? matches exactly 3
+        assert!(!env_name_accepted("XAB", &allow));
+        assert!(!env_name_accepted("MC_ALL", &allow));
+        // Empty name (defensive).
+        assert!(!env_name_accepted("", &allow));
+    }
+
+    #[test]
+    fn env_glob_match_grammar_basics() {
+        assert!(env_glob_match("*", "anything"));
+        assert!(env_glob_match("*", ""));
+        assert!(env_glob_match("a*b", "ab"));
+        assert!(env_glob_match("a*b", "aXYZb"));
+        assert!(!env_glob_match("a*b", "aXYZ"));
+        assert!(env_glob_match("?", "a"));
+        assert!(!env_glob_match("?", "ab"));
+        assert!(!env_glob_match("?", ""));
+        assert!(env_glob_match("**", "anything"));
+        // Literal exact match.
+        assert!(env_glob_match("FOO", "FOO"));
+        assert!(!env_glob_match("FOO", "foo"));
     }
 }

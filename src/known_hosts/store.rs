@@ -273,20 +273,43 @@ impl KnownHosts {
                 Slot::Entry(e) => match e.host_spec {
                     HostSpec::Hashed(_) => new_lines.push(Slot::Entry(e)),
                     HostSpec::Patterns(pats) => {
-                        for pat in pats {
-                            let (host, port) = split_host_port(&pat);
+                        // Buffer one entry per pattern. If any pattern
+                        // is malformed (e.g. `[host]:NOT-A-PORT`), we
+                        // refuse to silently downgrade — the whole
+                        // entry is preserved verbatim instead, so a
+                        // typo can't mask a hostkey-change.
+                        let mut hashed: Vec<Entry> = Vec::with_capacity(pats.len());
+                        let mut all_ok = true;
+                        for pat in &pats {
+                            let Some((host, port)) = split_host_port(pat) else {
+                                all_ok = false;
+                                break;
+                            };
                             let mut salt = [0u8; super::hash::SALT_LEN];
                             rng.fill_bytes(&mut salt);
                             let token = super::hash::encode_hashed(
                                 &salt,
                                 &super::hash::format_host(&host, port),
                             );
-                            new_lines.push(Slot::Entry(Entry {
+                            hashed.push(Entry {
                                 marker: e.marker,
                                 host_spec: HostSpec::Hashed(token),
                                 key_type: e.key_type.clone(),
                                 key_blob: e.key_blob.clone(),
                                 comment: e.comment.clone(),
+                            });
+                        }
+                        if all_ok {
+                            for entry in hashed {
+                                new_lines.push(Slot::Entry(entry));
+                            }
+                        } else {
+                            new_lines.push(Slot::Entry(Entry {
+                                marker: e.marker,
+                                host_spec: HostSpec::Patterns(pats),
+                                key_type: e.key_type,
+                                key_blob: e.key_blob,
+                                comment: e.comment,
                             }));
                         }
                     }
@@ -358,17 +381,25 @@ fn host_field_matches(spec: &HostSpec, host: &str, port: u16) -> bool {
 
 /// Split a plain host pattern (`host` or `[host]:port`) into
 /// `(host, port)`. Default port is 22.
-fn split_host_port(pat: &str) -> (String, u16) {
+///
+/// Returns `None` for malformed bracketed forms — specifically
+/// `[host]:NOT-A-PORT`, `[host]:` (empty port) and `[host`-without-`]`.
+/// Silently downgrading those to port 22 would mask a host-key change
+/// (subsequent lookups would target a different host record than the
+/// one the user wrote down).
+fn split_host_port(pat: &str) -> Option<(String, u16)> {
     if let Some(stripped) = pat.strip_prefix('[') {
-        if let Some(idx) = stripped.rfind(']') {
-            let host = stripped[..idx].to_string();
-            if let Some(rest) = stripped[idx + 1..].strip_prefix(':') {
-                if let Ok(p) = rest.parse::<u16>() {
-                    return (host, p);
-                }
-            }
-            return (host, 22);
+        // Bracketed form: must have a closing `]` and either nothing or
+        // `:<u16>` after it.
+        let idx = stripped.rfind(']')?;
+        let host = stripped[..idx].to_string();
+        let after = &stripped[idx + 1..];
+        if after.is_empty() {
+            return Some((host, 22));
         }
+        let rest = after.strip_prefix(':')?;
+        let port = rest.parse::<u16>().ok()?;
+        return Some((host, port));
     }
-    (pat.to_string(), 22)
+    Some((pat.to_string(), 22))
 }

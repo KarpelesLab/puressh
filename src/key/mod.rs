@@ -141,6 +141,17 @@ const NISTP521: &str = "nistp521";
 
 const MAGIC: &[u8] = b"openssh-key-v1\0";
 
+/// Whitelist of SSH public-key algorithm names we accept as the first
+/// token on an `authorized_keys` / `.pub` line. Anything else — most
+/// notably an options prefix like `from="..."` — is refused by
+/// [`PublicKey::parse_authorized_keys_line`].
+fn is_known_algorithm_name(s: &str) -> bool {
+    matches!(
+        s,
+        ED25519 | ECDSA_P256 | ECDSA_P384 | ECDSA_P521 | RSA | "rsa-sha2-256" | "rsa-sha2-512"
+    )
+}
+
 impl PublicKey {
     /// SSH algorithm name (e.g. `"ssh-ed25519"`).
     pub fn algorithm(&self) -> &'static str {
@@ -200,18 +211,42 @@ impl PublicKey {
 
     /// Parse a single-line `authorized_keys` / `.pub` entry.
     ///
-    /// Format: `<algorithm> <base64(wire_blob)> [comment...]`. Leading
-    /// `from=...`/`command=...` option prefixes are not supported.
+    /// Format: `<algorithm> <base64(wire_blob)> [comment...]`. Whitespace
+    /// between fields can be any run of spaces or tabs (matches sshd's
+    /// behaviour). Leading `from=...`/`command=...`/etc. option prefixes
+    /// are explicitly refused — silently treating an options-prefixed
+    /// line as a bare key would drop those restrictions and grant the
+    /// key broader access than the file author intended.
     pub fn parse_authorized_keys_line(s: &str) -> Result<Self> {
-        let line = s.trim_end_matches(['\n', '\r']).trim_start();
-        let mut it = line.splitn(3, ' ');
-        let algo = it
+        let line = s.trim_end_matches(['\n', '\r']).trim();
+        if line.is_empty() || line.starts_with('#') {
+            return Err(Error::Format("authorized_keys: empty or comment line"));
+        }
+
+        // First whitespace-separated token. If it isn't one of the known
+        // SSH algorithm names — i.e. it contains '=', or has a comma, or
+        // is any other shape sshd uses for the optional restriction list
+        // — refuse loudly. We don't try to parse the options here;
+        // dropping them silently would be the security regression.
+        let mut it = line.split_whitespace();
+        let first = it
             .next()
             .ok_or(Error::Format("authorized_keys: empty line"))?;
+        if !is_known_algorithm_name(first) {
+            return Err(Error::Format(
+                "authorized_keys: line begins with options or unknown tag — refusing rather than silently dropping",
+            ));
+        }
+        let algo = first;
         let b64 = it
             .next()
             .ok_or(Error::Format("authorized_keys: missing key blob"))?;
-        let comment = it.next().unwrap_or("").trim().to_string();
+        // The rest of the line (already split) is the comment, rejoined
+        // with single spaces — comments are free-form so the exact
+        // whitespace doesn't survive a roundtrip, which matches OpenSSH.
+        let comment_parts: Vec<&str> = it.collect();
+        let comment = comment_parts.join(" ");
+
         let blob = base64::decode(b64.as_bytes())?;
         let mut pk = Self::parse_wire_blob(&blob)?;
         match &mut pk {

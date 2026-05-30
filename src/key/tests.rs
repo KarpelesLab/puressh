@@ -605,6 +605,57 @@ fn bcrypt_zero_rounds_is_rejected() {
 }
 
 #[test]
+fn authorized_keys_line_with_options_is_refused() {
+    // The most dangerous outcome would be to silently strip the options
+    // and treat the key as a bare entry — that drops `command=`,
+    // `from=`, `no-pty`, etc. and grants broader access than intended.
+    let line = alloc::format!(r#"command="/bin/echo hi",no-pty {ED25519_PUB_LINE}"#);
+    let err = PublicKey::parse_authorized_keys_line(&line).expect_err("must reject options prefix");
+    match err {
+        Error::Format(msg) => assert!(
+            msg.contains("options") || msg.contains("unknown") || msg.contains("tag"),
+            "expected explicit options rejection, got {msg:?}"
+        ),
+        other => panic!("expected Format, got {other:?}"),
+    }
+}
+
+#[test]
+fn authorized_keys_line_handles_tabs_and_runs_of_spaces() {
+    // sshd accepts tabs between fields, and a copy/paste may collapse
+    // multiple spaces — split_whitespace handles both.
+    let line = alloc::format!(
+        "ssh-ed25519\t{}\ttabbed comment",
+        ED25519_PUB_LINE.split_whitespace().nth(1).unwrap()
+    );
+    let pk = PublicKey::parse_authorized_keys_line(&line).unwrap();
+    assert_eq!(pk.comment(), "tabbed comment");
+
+    let line2 = alloc::format!(
+        "ssh-ed25519   {}   spaced   comment",
+        ED25519_PUB_LINE.split_whitespace().nth(1).unwrap()
+    );
+    let pk2 = PublicKey::parse_authorized_keys_line(&line2).unwrap();
+    assert_eq!(pk2.comment(), "spaced comment");
+}
+
+#[test]
+fn authorized_keys_blank_and_comment_lines_are_rejected_cleanly() {
+    match PublicKey::parse_authorized_keys_line("") {
+        Err(Error::Format(_)) => {}
+        other => panic!("blank: got {other:?}"),
+    }
+    match PublicKey::parse_authorized_keys_line("   \t  ") {
+        Err(Error::Format(_)) => {}
+        other => panic!("whitespace-only: got {other:?}"),
+    }
+    match PublicKey::parse_authorized_keys_line("# this is a comment") {
+        Err(Error::Format(_)) => {}
+        other => panic!("comment: got {other:?}"),
+    }
+}
+
+#[test]
 fn parse_wire_blob_rejects_off_curve_ecdsa_p256() {
     // Build an otherwise well-formed ecdsa-sha2-nistp256 public blob whose
     // SEC1 point is the right shape (0x04 || 32-byte X || 32-byte Y) but

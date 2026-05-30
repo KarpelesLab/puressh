@@ -13,7 +13,7 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use super::protocol::{read_header, read_payload_term, write_fatal, write_ok, Header, ScpError};
 
@@ -56,11 +56,20 @@ impl<S: Read + Write> Receiver<S> {
     /// Wrap a transport. Sends the initial `0x00` ack to tell the peer
     /// "ready" — the OpenSSH convention is that the `-t` (toward)
     /// receiver sends ack before the first header.
+    ///
+    /// The base path is canonicalised at construction so the receiver
+    /// has a single, symlink-resolved anchor against which every
+    /// resolved target is checked. If the base path does not exist or
+    /// cannot be canonicalised, the call fails with `ScpError::Io` —
+    /// we refuse to start a receive into a non-existent location so an
+    /// unprivileged peer can't trick the receiver into materialising a
+    /// tree at the wrong root.
     pub fn new(mut stream: S, base_path: &Path, opts: ScpRecvOptions) -> Result<Self, ScpError> {
+        let canon_base = fs::canonicalize(base_path).map_err(ScpError::Io)?;
         write_ok(&mut stream)?;
         Ok(Self {
             stream,
-            base: base_path.to_path_buf(),
+            base: canon_base,
             stack: Vec::new(),
             pending_times: None,
             opts,
@@ -115,9 +124,44 @@ impl<S: Read + Write> Receiver<S> {
         let parent = self.current_dir();
         let target = parent.join(name);
         self.guard_path(&target)?;
-        if let Err(e) = fs::create_dir_all(&target) {
-            let _ = write_fatal(&mut self.stream, &e.to_string());
-            return Err(ScpError::Io(e));
+        // If `target` already exists, it MUST be a real directory — not a
+        // symlink (even one pointing into a directory), not a regular file.
+        // `symlink_metadata` does not traverse the final component, so we
+        // see the link as-is.
+        match fs::symlink_metadata(&target) {
+            Ok(md) => {
+                if md.file_type().is_symlink() {
+                    let _ = write_fatal(
+                        &mut self.stream,
+                        "directory target is an existing symlink",
+                    );
+                    return Err(ScpError::PathEscape);
+                }
+                if !md.is_dir() {
+                    let _ = write_fatal(
+                        &mut self.stream,
+                        "directory target collides with a non-directory",
+                    );
+                    return Err(ScpError::Unexpected(
+                        "directory target collides with non-directory",
+                    ));
+                }
+                // Real directory — accept and reuse.
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Use `create_dir` (not `create_dir_all`) so we never
+                // silently materialise intermediates that should have
+                // been announced via `D` headers — they'd bypass the
+                // `recv_dir` checks we just performed.
+                if let Err(e) = fs::create_dir(&target) {
+                    let _ = write_fatal(&mut self.stream, &e.to_string());
+                    return Err(ScpError::Io(e));
+                }
+            }
+            Err(e) => {
+                let _ = write_fatal(&mut self.stream, &e.to_string());
+                return Err(ScpError::Io(e));
+            }
         }
         #[cfg(unix)]
         {
@@ -139,6 +183,17 @@ impl<S: Read + Write> Receiver<S> {
     fn recv_file(&mut self, mode: u32, size: u64, name: &str) -> Result<(), ScpError> {
         let target = self.resolve_file_target(name);
         self.guard_path(&target)?;
+        // Refuse to overwrite an existing symlink at the target path:
+        // following it would let the peer pick the actual destination
+        // (defeats the jail). `symlink_metadata` doesn't traverse the
+        // final component.
+        match fs::symlink_metadata(&target) {
+            Ok(md) if md.file_type().is_symlink() => {
+                let _ = write_fatal(&mut self.stream, "refusing to overwrite a symlink");
+                return Err(ScpError::PathEscape);
+            }
+            _ => {}
+        }
         // Ack the C header — OpenSSH expects this before payload starts.
         write_ok(&mut self.stream)?;
         if let Some(parent) = target.parent() {
@@ -146,12 +201,18 @@ impl<S: Read + Write> Receiver<S> {
             // target_is_file with a deep relative path).
             let _ = fs::create_dir_all(parent);
         }
-        let f = match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&target)
+        let mut open_opts = OpenOptions::new();
+        open_opts.create(true).write(true).truncate(true);
+        // On Unix, refuse to follow a symlink that races into existence
+        // between the stat above and the open below. `O_NOFOLLOW` causes
+        // `open(2)` to fail with `ELOOP` if the final component is a
+        // symlink, which we surface as a fatal error.
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            open_opts.custom_flags(nix::libc::O_NOFOLLOW);
+        }
+        let f = match open_opts.open(&target) {
             Ok(f) => f,
             Err(e) => {
                 let _ = write_fatal(&mut self.stream, &e.to_string());
@@ -203,10 +264,20 @@ impl<S: Read + Write> Receiver<S> {
 
     /// Lexical-escape guard: the resolved path (after `..` normalisation)
     /// must remain under `base`. The receiver never follows symlinks on
-    /// directory components for traversal — they're created fresh — so
-    /// this check is sufficient.
+    /// directory components for traversal — `recv_dir` rejects symlink
+    /// collisions and `recv_file` opens with `O_NOFOLLOW` — so this
+    /// purely-lexical check is sufficient defence-in-depth.
     fn guard_path(&mut self, target: &Path) -> Result<(), ScpError> {
         let norm = lexical_normalize(target);
+        // If normalisation still left any `ParentDir` components, the
+        // path resolves outside any conceivable base (no real ancestor
+        // could swallow them). Reject without comparing prefixes —
+        // `Path::starts_with` would happily match `/foo/..` against
+        // `/foo` otherwise.
+        if norm.components().any(|c| matches!(c, Component::ParentDir)) {
+            let _ = write_fatal(&mut self.stream, "path escapes base directory");
+            return Err(ScpError::PathEscape);
+        }
         let base_norm = lexical_normalize(&self.base);
         if !norm.starts_with(&base_norm) && norm != base_norm {
             let _ = write_fatal(&mut self.stream, "path escapes base directory");
@@ -245,10 +316,16 @@ fn lexical_normalize(p: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn set_times(path: &Path, mtime: i64, atime: i64) -> std::io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::time::{Duration, SystemTime};
     let m = SystemTime::UNIX_EPOCH + Duration::from_secs(mtime.max(0) as u64);
     let a = SystemTime::UNIX_EPOCH + Duration::from_secs(atime.max(0) as u64);
-    let f = std::fs::File::options().write(true).open(path)?;
+    // `O_NOFOLLOW` so a planted symlink at the final component cannot
+    // redirect `set_modified` onto an arbitrary file.
+    let f = std::fs::File::options()
+        .write(true)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)?;
     f.set_modified(m)?;
     // set_times is on FileTimes since 1.75; for now we set modified
     // (atime requires libc::utimes — defer to a follow-up).

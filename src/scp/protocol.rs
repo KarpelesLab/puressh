@@ -101,11 +101,15 @@ pub enum Header {
     },
 }
 
-/// Validate a filename before sending or after receiving. The four rules
-/// (no `\0`, no `\n`, not `..`, not starting with `-`) match OpenSSH's
-/// `do_localcopy`/`source_file` hardening; together they prevent the
-/// receiver from being tricked into writing under arbitrary paths and
-/// keep the sender from synthesising "scp option" strings.
+/// Validate a filename before sending or after receiving. The rules
+/// (no `\0`, no `\n`, no `/`, not `.`, not `..`, not starting with `-`)
+/// match OpenSSH's `do_localcopy`/`source_file` hardening; together they
+/// prevent the receiver from being tricked into writing under arbitrary
+/// paths and keep the sender from synthesising "scp option" strings.
+///
+/// `.` is rejected because using it as a basename would let a peer
+/// re-target the *current* directory entry on the receiver — replacing
+/// its mode/contents — which the directory stack does not anticipate.
 pub fn validate_name(name: &str) -> Result<(), ScpError> {
     if name.is_empty() {
         return Err(ScpError::BadName("empty"));
@@ -119,7 +123,7 @@ pub fn validate_name(name: &str) -> Result<(), ScpError> {
     if name.starts_with('-') {
         return Err(ScpError::BadName("starts with '-'"));
     }
-    if name == ".." || name.contains('/') {
+    if name == "." || name == ".." || name.contains('/') {
         return Err(ScpError::BadName("path component"));
     }
     Ok(())

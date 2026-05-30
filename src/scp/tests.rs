@@ -207,6 +207,127 @@ fn validate_rejects_leading_dash() {
 }
 
 #[test]
+fn validate_rejects_dot_name() {
+    use super::protocol::{validate_name, ScpError};
+    assert!(matches!(validate_name("."), Err(ScpError::BadName(_))));
+}
+
+#[test]
+fn validate_rejects_dotdot_name() {
+    use super::protocol::{validate_name, ScpError};
+    assert!(matches!(validate_name(".."), Err(ScpError::BadName(_))));
+}
+
+#[test]
+fn receiver_new_rejects_missing_base() {
+    // canonicalize() on a path that doesn't exist must surface as an
+    // Io error from `Receiver::new`. Use a freshly-allocated tmp name
+    // we explicitly never create.
+    let bogus = std::env::temp_dir().join(format!(
+        "puressh-scp-test-DOES-NOT-EXIST-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let (a, _b) = UnixStream::pair().expect("socketpair");
+    let r = Receiver::new(a, &bogus, ScpRecvOptions::default());
+    assert!(r.is_err(), "expected Receiver::new to reject missing base");
+}
+
+#[cfg(unix)]
+#[test]
+fn recv_file_refuses_to_overwrite_symlink() {
+    // Plant a symlink in the destination directory at the basename
+    // that the sender will use. recv_file must refuse to follow it
+    // rather than truncating/overwriting the link target.
+    let src_dir = fresh_tmp("send-sym-f");
+    let _g1 = DirGuard(src_dir.clone());
+    let dst_dir = fresh_tmp("recv-sym-f");
+    let _g2 = DirGuard(dst_dir.clone());
+    let outside_dir = fresh_tmp("recv-sym-outside");
+    let _g3 = DirGuard(outside_dir.clone());
+
+    let outside_file = outside_dir.join("target.txt");
+    std::fs::write(&outside_file, b"PRECIOUS").unwrap();
+    let dst_link = dst_dir.join("hello.txt");
+    std::os::unix::fs::symlink(&outside_file, &dst_link).unwrap();
+
+    let src_file = src_dir.join("hello.txt");
+    std::fs::write(&src_file, b"OVERWRITE").unwrap();
+
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let dst_dir_thread = dst_dir.clone();
+    let recv = thread::spawn(move || {
+        let mut r = Receiver::new(b, &dst_dir_thread, ScpRecvOptions::default())
+            .expect("recv new");
+        r.run()
+    });
+    let mut sender = Sender::new(a).expect("send new");
+    // The sender may see an error from the fatal frame; that's fine.
+    let _ = sender.send_path(&src_file, &ScpSendOptions::default());
+    drop(sender);
+    let r = recv.join().expect("recv join");
+    assert!(r.is_err(), "receiver should refuse symlink overwrite");
+
+    // The outside file must be untouched.
+    let still = std::fs::read(&outside_file).expect("read outside");
+    assert_eq!(still, b"PRECIOUS");
+}
+
+#[cfg(unix)]
+#[test]
+fn recv_dir_refuses_to_descend_into_symlinked_directory() {
+    // Plant a symlink under the destination at the directory name the
+    // sender will announce. recv_dir must refuse rather than descend
+    // through the symlink and write under its (potentially outside)
+    // target.
+    let src_dir = fresh_tmp("send-sym-d");
+    let _g1 = DirGuard(src_dir.clone());
+    let dst_dir = fresh_tmp("recv-sym-d");
+    let _g2 = DirGuard(dst_dir.clone());
+    let outside_dir = fresh_tmp("recv-sym-d-outside");
+    let _g3 = DirGuard(outside_dir.clone());
+
+    let tree_name = "tree";
+    let tree = src_dir.join(tree_name);
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("f.txt"), b"x").unwrap();
+
+    // Plant the symlink at dst_dir/tree -> outside_dir.
+    std::os::unix::fs::symlink(&outside_dir, dst_dir.join(tree_name)).unwrap();
+
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let dst_dir_thread = dst_dir.clone();
+    let recv = thread::spawn(move || {
+        let mut r = Receiver::new(
+            b,
+            &dst_dir_thread,
+            ScpRecvOptions {
+                recursive: true,
+                preserve_times: false,
+                target_is_file: false,
+            },
+        )
+        .expect("recv new");
+        r.run()
+    });
+    let opts = ScpSendOptions {
+        recursive: true,
+        preserve_times: false,
+    };
+    let mut sender = Sender::new(a).expect("send new");
+    let _ = sender.send_path(&tree, &opts);
+    drop(sender);
+    let r = recv.join().expect("recv join");
+    assert!(r.is_err(), "receiver should refuse symlinked dir");
+
+    // Nothing should have landed under outside_dir.
+    assert!(!outside_dir.join("f.txt").exists());
+}
+
+#[test]
 fn round_trip_empty_file() {
     let src_dir = fresh_tmp("send-empty");
     let _g1 = DirGuard(src_dir.clone());

@@ -12,6 +12,17 @@ use super::msg::*;
 use super::request::ChannelRequest;
 use super::{DEFAULT_MAX_PACKET, DEFAULT_WINDOW};
 
+/// Default ceiling on simultaneously-tracked channels per connection.
+///
+/// The peer can open and tear down channels freely, but at any instant we
+/// will not accept a new `SSH_MSG_CHANNEL_OPEN` once the live count reaches
+/// this value — the dispatcher returns an `SSH_MSG_CHANNEL_OPEN_FAILURE`
+/// payload with reason `SSH_OPEN_RESOURCE_SHORTAGE` (RFC 4254 §5.1) for the
+/// caller to ship, and the offending channel is never inserted into the
+/// per-connection map. Mirrors the OpenSSH ballpark of
+/// `MaxSessions * fanout`.
+pub const DEFAULT_MAX_CHANNELS_PER_CONNECTION: u32 = 256;
+
 /// One channel's bookkeeping.
 #[derive(Debug, Clone)]
 pub struct ChannelState {
@@ -229,6 +240,20 @@ pub enum ChannelEvent {
         /// `description` field.
         description: String,
     },
+    /// We refused a peer-initiated `SSH_MSG_CHANNEL_OPEN` before allocating
+    /// any local state for it (e.g. because [`ConnectionState::max_channels`]
+    /// was already reached). The wire `SSH_MSG_CHANNEL_OPEN_FAILURE` payload
+    /// the caller must forward is in [`payload`]; no [`ChannelState`] was
+    /// inserted, so there is nothing else to clean up.
+    ///
+    /// [`payload`]: Self::OpenRejected::payload
+    OpenRejected {
+        /// Pre-built `SSH_MSG_CHANNEL_OPEN_FAILURE` bytes to ship to the peer.
+        payload: Vec<u8>,
+        /// `reason_code` we put in the payload (e.g.
+        /// [`SSH_OPEN_RESOURCE_SHORTAGE`]).
+        reason: u32,
+    },
     /// `SSH_MSG_CHANNEL_DATA`.
     Data {
         /// Local id.
@@ -306,6 +331,14 @@ pub struct ConnectionState {
     pub default_window: u32,
     /// Max packet size we advertise for new local channels.
     pub default_max_packet: u32,
+    /// Per-connection cap on simultaneously-tracked channels. Inbound
+    /// `SSH_MSG_CHANNEL_OPEN` once `channels.len() >= max_channels as usize`
+    /// is refused with reason `SSH_OPEN_RESOURCE_SHORTAGE` (RFC 4254 §5.1)
+    /// instead of being allocated. Defaults to
+    /// [`DEFAULT_MAX_CHANNELS_PER_CONNECTION`]. Outbound opens initiated by
+    /// `open()` are not throttled here — they are bounded by the caller's
+    /// own willingness to wait for confirmation.
+    pub max_channels: u32,
 }
 
 impl Default for ConnectionState {
@@ -322,6 +355,7 @@ impl ConnectionState {
             next_local_id: 0,
             default_window: DEFAULT_WINDOW,
             default_max_packet: DEFAULT_MAX_PACKET,
+            max_channels: DEFAULT_MAX_CHANNELS_PER_CONNECTION,
         }
     }
 
@@ -678,6 +712,23 @@ impl ConnectionState {
         let tail = r.take(n)?;
         let kind = ChannelOpen::decode(&kind_name, tail)?;
 
+        // RFC 4254 §5.1 resource-shortage cap. Refuse before allocating any
+        // state so a flood of opens can never grow the per-connection map
+        // past `max_channels`; the peer is expected to back off after the
+        // failure reply, not tear down the whole transport.
+        if self.channels.len() >= self.max_channels as usize {
+            let mut w = Writer::new();
+            w.write_u8(MSG_CHANNEL_OPEN_FAILURE);
+            w.write_u32(remote_id);
+            w.write_u32(SSH_OPEN_RESOURCE_SHORTAGE);
+            w.write_string(b"channel limit reached");
+            w.write_string(b"");
+            return Ok(ChannelEvent::OpenRejected {
+                payload: w.into_vec(),
+                reason: SSH_OPEN_RESOURCE_SHORTAGE,
+            });
+        }
+
         let local_id = self.allocate_local_id();
         let local_window = self.default_window;
         let local_max_packet = self.default_max_packet;
@@ -900,4 +951,50 @@ fn read_utf8(r: &mut Reader<'_>) -> Result<String> {
 fn read_utf8_borrowed<'a>(r: &mut Reader<'a>) -> Result<&'a str> {
     let bytes = r.read_string()?;
     core::str::from_utf8(bytes).map_err(|_| Error::Format("invalid utf-8"))
+}
+
+#[cfg(test)]
+mod cap_tests {
+    use super::*;
+
+    /// Opening up to `max_channels` peer-initiated channels succeeds; the
+    /// (cap+1)th open is refused with `SSH_OPEN_RESOURCE_SHORTAGE` and no
+    /// new state is allocated.
+    #[test]
+    fn peer_open_cap_returns_resource_shortage() {
+        let mut server = ConnectionState::new();
+        server.max_channels = 3;
+
+        // Drive `cap` peer-initiated session opens through a fresh peer.
+        let mut peer = ConnectionState::new();
+        for _ in 0..server.max_channels {
+            let (_, open_payload) = peer.open(ChannelOpen::Session).unwrap();
+            let ev = server.on_packet(&open_payload).unwrap();
+            match ev {
+                ChannelEvent::OpenRequest { channel, .. } => {
+                    let _ = server.accept_open(channel).unwrap();
+                }
+                other => panic!("expected OpenRequest, got {:?}", other),
+            }
+        }
+        assert_eq!(server.channels().count(), server.max_channels as usize);
+
+        // The next open must be refused; the wire payload is
+        // SSH_MSG_CHANNEL_OPEN_FAILURE with reason 4 and we must not have
+        // grown the channel map.
+        let before = server.channels().count();
+        let (_, open_payload) = peer.open(ChannelOpen::Session).unwrap();
+        let ev = server.on_packet(&open_payload).unwrap();
+        let (payload, reason) = match ev {
+            ChannelEvent::OpenRejected { payload, reason } => (payload, reason),
+            other => panic!("expected OpenRejected, got {:?}", other),
+        };
+        assert_eq!(reason, SSH_OPEN_RESOURCE_SHORTAGE);
+        assert_eq!(server.channels().count(), before);
+        assert_eq!(payload[0], MSG_CHANNEL_OPEN_FAILURE);
+        // Bytes 1..5 = recipient (peer's local id we just minted)
+        // Bytes 5..9 = reason code
+        let reason_on_wire = u32::from_be_bytes(payload[5..9].try_into().unwrap());
+        assert_eq!(reason_on_wire, SSH_OPEN_RESOURCE_SHORTAGE);
+    }
 }

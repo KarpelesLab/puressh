@@ -2088,6 +2088,17 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 let _ = reply.send(Err(Error::Protocol("x11: open rejected by peer")));
             }
         }
+        ChannelEvent::OpenRejected {
+            payload: failure_payload,
+            reason: _reason,
+        } => {
+            // Per-connection channel cap (RFC 4254 §5.1 resource-shortage).
+            // `ConnectionState::on_packet` already built the
+            // SSH_MSG_CHANNEL_OPEN_FAILURE bytes and did NOT allocate a
+            // local channel id; we just ship the payload so the peer can
+            // back off without us tearing down the transport.
+            write_payload(stream, codec, rng, &failure_payload)?;
+        }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
             ChannelOpen::Session => {
                 *any_channel_opened = true;

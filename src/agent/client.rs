@@ -87,12 +87,40 @@ impl Agent {
     /// Connect using `$SSH_AUTH_SOCK`. Returns `None` if the env var is
     /// unset or empty — callers typically degrade to "no agent
     /// available" rather than treating that as an error.
+    ///
+    /// Security: a malicious or careless setup can point `SSH_AUTH_SOCK`
+    /// at a symlink, a regular file, or a socket owned by another user
+    /// (or world-writable) and trick this process into asking the wrong
+    /// agent to sign challenges — i.e. impersonate us against any server
+    /// we contact. Before connecting we therefore validate the path with
+    /// `lstat`-equivalent semantics:
+    ///
+    /// - the path must exist and not be a symlink (`symlink_metadata`,
+    ///   `file_type().is_symlink()` check);
+    /// - it must be a Unix-domain socket (the file type bits via
+    ///   `libc::stat`, since the standard library does not expose
+    ///   `is_socket()` directly);
+    /// - it must be owned by the calling user (`st_uid == geteuid()`);
+    /// - it must not be group- or world-accessible
+    ///   (`st_mode & 0o077 == 0`).
+    ///
+    /// Any failure is reported on stderr and the function returns
+    /// `Ok(None)` so the caller falls back to other auth methods rather
+    /// than aborting the whole session. We only return `Err` when the
+    /// underlying connect itself fails after the path passed validation.
     pub fn connect_env() -> Result<Option<Self>> {
         let raw: OsString = match std::env::var_os("SSH_AUTH_SOCK") {
             Some(v) if !v.is_empty() => v,
             _ => return Ok(None),
         };
         let path = PathBuf::from(raw);
+        if let Err(why) = validate_auth_sock(&path) {
+            eprintln!(
+                "warning: SSH_AUTH_SOCK={} rejected: {why}; ignoring agent",
+                path.display()
+            );
+            return Ok(None);
+        }
         Self::connect(path).map(Some)
     }
 
@@ -152,5 +180,168 @@ impl Agent {
         let msg_type = buf[0];
         let body = buf.split_off(1);
         Ok((msg_type, body))
+    }
+}
+
+/// Validate a candidate `SSH_AUTH_SOCK` path. See [`Agent::connect_env`]
+/// for the security rationale. Returns the human-readable reason on
+/// failure so callers can log it.
+fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
+    // `symlink_metadata` does not follow symlinks; combined with the
+    // `is_symlink()` check this means a symlink anywhere in the *final*
+    // component is rejected outright. We intentionally do NOT canonicalize
+    // — canonicalization would silently follow the symlink we're trying to
+    // diagnose. Symlinks earlier in the path (parent directories) are still
+    // allowed because they typically belong to the OS (e.g. `/tmp` on macOS
+    // is a symlink to `/private/tmp`).
+    let md = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot stat: {e} (does the agent socket exist?)"))?;
+    if md.file_type().is_symlink() {
+        return Err("path is a symlink (a malicious symlink could redirect to another agent)".into());
+    }
+
+    // The standard library exposes file_type().is_file() / .is_dir() but
+    // not .is_socket(); reach for libc::stat to get the raw st_mode bits
+    // and check S_IFMT. We re-stat through libc rather than using the
+    // already-fetched `md` because converting the std Metadata to st_mode
+    // is platform-specific and noisy; one extra syscall on a Unix socket
+    // path is acceptable.
+    use std::os::unix::ffi::OsStrExt;
+    use std::ffi::CString;
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| "path contains NUL byte".to_string())?;
+    // SAFETY: lstat(3) with a valid C string + a zeroed stat buffer; we
+    // check the return value before reading any fields. Using lstat (not
+    // stat) so a symlink doesn't slip past the check above due to TOCTOU
+    // between symlink_metadata and this call.
+    let mut st: libc::stat = unsafe { core::mem::zeroed() };
+    let rc = unsafe { libc::lstat(c_path.as_ptr(), &mut st as *mut libc::stat) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(format!("lstat failed: {err}"));
+    }
+    if (st.st_mode & libc::S_IFMT) != libc::S_IFSOCK {
+        return Err("path is not a Unix-domain socket".into());
+    }
+
+    // SAFETY: geteuid(3) takes no args and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if st.st_uid != euid {
+        return Err(format!(
+            "socket is owned by uid {} but we are euid {} (refusing to trust another user's agent)",
+            st.st_uid, euid
+        ));
+    }
+
+    // Group + other bits must all be clear. World-writable agents are an
+    // obvious foot-gun; group-writable is also unsafe in any multi-user
+    // setup. OpenSSH enforces the same on `ssh-agent -a`. The constant is
+    // 0o077 (rwx for group and other).
+    if (st.st_mode & 0o077) != 0 {
+        return Err(format!(
+            "socket is group/world-accessible (mode {:o}); refusing to use it",
+            st.st_mode & 0o777
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod auth_sock_tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// Helper: create a fresh Unix socket in a tempdir, return its path
+    /// and the listener (held by the caller so the socket stays alive).
+    fn make_socket() -> (PathBuf, UnixListener) {
+        let dir = std::env::temp_dir();
+        let unique = format!(
+            "puressh-auth-sock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        );
+        let p = dir.join(unique);
+        let _ = std::fs::remove_file(&p);
+        let l = UnixListener::bind(&p).expect("bind unix listener");
+        // Tighten mode to 0o600 in case the umask left g/o bits set.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        (p, l)
+    }
+
+    #[test]
+    fn valid_owned_socket_is_accepted() {
+        let (p, _l) = make_socket();
+        let r = validate_auth_sock(&p);
+        std::fs::remove_file(&p).ok();
+        assert!(r.is_ok(), "expected Ok, got {r:?}");
+    }
+
+    #[test]
+    fn nonexistent_is_rejected() {
+        let p = std::env::temp_dir().join(format!(
+            "puressh-noent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        assert!(validate_auth_sock(&p).is_err());
+    }
+
+    #[test]
+    fn regular_file_is_rejected() {
+        let p = std::env::temp_dir().join(format!(
+            "puressh-regular-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::write(&p, b"hello").unwrap();
+        // Tighten mode so the rejection is about S_IFMT, not 0o077.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let r = validate_auth_sock(&p);
+        std::fs::remove_file(&p).ok();
+        let msg = r.unwrap_err();
+        assert!(msg.contains("not a Unix-domain socket"), "got: {msg}");
+    }
+
+    #[test]
+    fn symlink_is_rejected() {
+        let (target, _l) = make_socket();
+        let link = std::env::temp_dir().join(format!(
+            "puressh-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let r = validate_auth_sock(&link);
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&target).ok();
+        let msg = r.unwrap_err();
+        assert!(msg.contains("symlink"), "got: {msg}");
+    }
+
+    #[test]
+    fn group_or_world_accessible_is_rejected() {
+        let (p, _l) = make_socket();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let r = validate_auth_sock(&p);
+        std::fs::remove_file(&p).ok();
+        let msg = r.unwrap_err();
+        assert!(msg.contains("group/world-accessible"), "got: {msg}");
     }
 }

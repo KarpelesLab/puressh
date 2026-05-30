@@ -38,20 +38,10 @@ use puressh::known_hosts::KnownHosts;
 use puressh::Error;
 use zeroize::Zeroizing;
 
-/// Maps `StrictHostKeyChecking` modes to TOFU behaviour. Mirrors the
-/// OpenSSH-ssh_config knob; the `ssh` binary parses `-o StrictHostKeyChecking=…`
-/// straight into this enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StrictMode {
-    /// `yes`: refuse Unknown; reject Mismatch.
-    Yes,
-    /// `no`: accept Unknown silently AND tolerate Mismatch (insecure).
-    No,
-    /// `accept-new`: silently accept Unknown; still reject Mismatch.
-    AcceptNew,
-    /// `ask` (OpenSSH default): prompt on Unknown; reject Mismatch.
-    Ask,
-}
+// `StrictMode` lives in the lib so the config parser and the binaries share
+// one definition. Re-exported here so existing `use common::StrictMode;`
+// sites keep compiling unchanged.
+pub use puressh::config::StrictMode;
 
 /// Pick the effective username for an SSH session, in OpenSSH's order of
 /// precedence: explicit `-l user` wins; otherwise `user@host` syntax;
@@ -511,4 +501,77 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
         Err(Error::Crypto("passphrase required")) => Ok(None),
         Err(e) => Err(format!("parse {}: {e}", path.display())),
     }
+}
+
+// ---------------------------------------------------------------------------
+// SSH config file discovery + loading
+// ---------------------------------------------------------------------------
+
+/// Load an `ssh_config(5)` for client binaries.
+///
+/// When `explicit` is `Some`, ONLY that file is parsed (matching OpenSSH's
+/// `-F` behaviour). When `None`, both `~/.ssh/config` and
+/// `/etc/ssh/ssh_config` are read in that order — the user file wins for
+/// scalar options and both contribute to cumulative lists.
+///
+/// A missing file is silently skipped; the only error path is a file that
+/// exists but won't parse.
+pub fn load_client_config(
+    explicit: Option<&Path>,
+) -> Result<puressh::config::SshClientConfig, String> {
+    use puressh::config::SshClientConfig;
+    if let Some(path) = explicit {
+        let src =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        return SshClientConfig::parse(&src).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    // Default search path: user file first (wins), then system file. The
+    // two are concatenated with a newline so block boundaries stay intact.
+    let mut combined = String::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let user = PathBuf::from(home).join(".ssh").join("config");
+        if let Ok(s) = std::fs::read_to_string(&user) {
+            combined.push_str(&s);
+            combined.push('\n');
+        }
+    }
+    let system = Path::new("/etc/ssh/ssh_config");
+    if let Ok(s) = std::fs::read_to_string(system) {
+        combined.push_str(&s);
+        combined.push('\n');
+    }
+    if combined.is_empty() {
+        return Ok(SshClientConfig::default());
+    }
+    SshClientConfig::parse(&combined).map_err(|e| format!("ssh_config: {e}"))
+}
+
+/// Load an `sshd_config(5)` for the `sshd` binary. Returns an error if the
+/// file is missing — server-side config is opt-in (`-f path`), so the caller
+/// asked for this exact file.
+pub fn load_server_config(path: &Path) -> Result<puressh::config::SshServerConfig, String> {
+    let src = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    puressh::config::SshServerConfig::parse(&src).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// OpenSSH precedence helper: returns the first `Some` of `cli`, `cfg`,
+/// otherwise `default`. The standard scalar-option resolution pattern is
+/// `pick(cli_flag, cfg_value, builtin_default)`.
+pub fn pick<T>(cli: Option<T>, cfg: Option<T>, default: T) -> T {
+    cli.or(cfg).unwrap_or(default)
+}
+
+/// Expand a leading `~/` or `~` in a config-supplied path to `$HOME`. Other
+/// strings pass through verbatim. We deliberately do NOT expand `~user/` —
+/// OpenSSH does, but our binaries don't currently consume cross-user paths.
+pub fn expand_tilde(path: &str) -> String {
+    if path == "~" {
+        return std::env::var("HOME").unwrap_or_else(|_| "~".into());
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    path.to_string()
 }

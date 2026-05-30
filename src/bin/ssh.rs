@@ -27,14 +27,14 @@ use puressh::client::{
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, default_identity_paths, load_identity,
-    read_password_from_stdin, resolve_user, set_verbose, try_load_default_identity, vlog,
-    StrictMode,
+    build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
+    load_identity, read_password_from_stdin, resolve_user, set_verbose, try_load_default_identity,
+    vlog, StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: ssh [-v[v[v]]] [-p port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: ssh [-v[v[v]]] [-F configfile] [-p port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
@@ -82,13 +82,19 @@ struct RemoteForward {
 }
 
 struct Cli {
-    port: u16,
+    /// `-F path`: load this `ssh_config` instead of the defaults.
+    config_file: Option<PathBuf>,
+    /// `None` when `-p` wasn't supplied; the ssh_config `Port` then wins.
+    port: Option<u16>,
     identities: Vec<String>,
     cli_user: Option<String>,
-    strict: StrictMode,
+    /// `None` when `-o StrictHostKeyChecking=…` wasn't supplied.
+    strict: Option<StrictMode>,
     known_hosts_path: Option<PathBuf>,
-    hash_known_hosts: bool,
-    identities_only: bool,
+    /// `None` when `-o HashKnownHosts=…` wasn't supplied.
+    hash_known_hosts: Option<bool>,
+    /// `None` when `-o IdentitiesOnly=…` wasn't supplied.
+    identities_only: Option<bool>,
     locals: Vec<LocalForward>,
     remotes: Vec<RemoteForward>,
     no_command: bool,
@@ -160,13 +166,14 @@ fn parse_remote_forward(s: &str) -> Result<RemoteForward, String> {
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
-    let mut port = 22u16;
+    let mut config_file: Option<PathBuf> = None;
+    let mut port: Option<u16> = None;
     let mut identities: Vec<String> = Vec::new();
     let mut cli_user: Option<String> = None;
-    let mut strict = StrictMode::Ask;
+    let mut strict: Option<StrictMode> = None;
     let mut known_hosts_path: Option<PathBuf> = None;
-    let mut hash_known_hosts = false;
-    let mut identities_only = false;
+    let mut hash_known_hosts: Option<bool> = None;
+    let mut identities_only: Option<bool> = None;
     let mut locals: Vec<LocalForward> = Vec::new();
     let mut remotes: Vec<RemoteForward> = Vec::new();
     let mut no_command = false;
@@ -186,7 +193,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             "-p" => {
                 i += 1;
                 let v = args.get(i).ok_or("-p requires a value")?;
-                port = v.parse::<u16>().map_err(|_| "invalid port".to_string())?;
+                port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
+            }
+            "-F" => {
+                i += 1;
+                let v = args.get(i).ok_or("-F requires a value")?.clone();
+                config_file = Some(PathBuf::from(v));
             }
             "-i" => {
                 i += 1;
@@ -240,23 +252,24 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
                 match k.to_ascii_lowercase().as_str() {
                     "stricthostkeychecking" => {
-                        strict = match val.to_ascii_lowercase().as_str() {
+                        strict = Some(match val.to_ascii_lowercase().as_str() {
                             "yes" => StrictMode::Yes,
                             "no" | "off" => StrictMode::No,
                             "accept-new" => StrictMode::AcceptNew,
                             "ask" => StrictMode::Ask,
                             other => return Err(format!("unknown StrictHostKeyChecking={other}")),
-                        };
+                        });
                     }
                     "userknownhostsfile" => {
                         known_hosts_path = Some(PathBuf::from(val));
                     }
                     "hashknownhosts" => {
                         hash_known_hosts =
-                            matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
                     }
                     "identitiesonly" => {
-                        identities_only = matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                        identities_only =
+                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
                     }
                     other => {
                         return Err(format!("unsupported -o option: {other}={val}"));
@@ -289,6 +302,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     };
 
     Ok(Cli {
+        config_file,
         port,
         identities,
         cli_user,
@@ -321,15 +335,71 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
-    let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+    let mut cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     set_verbose(cli.verbose);
-    let user = resolve_user(cli.cli_user.as_deref(), cli.user_in_host.as_deref())?;
 
-    let policy = build_host_key_policy(
-        cli.strict,
-        cli.known_hosts_path.clone(),
-        cli.hash_known_hosts,
-    )?;
+    // Resolve the ssh_config block matching the user-typed host name. CLI
+    // values then take precedence over the block; the block over built-in
+    // defaults (OpenSSH's documented order).
+    let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
+    let cfg_block = ssh_cfg.lookup(&cli.host);
+
+    // Append ssh_config-supplied forwards alongside `-L` / `-R` from the CLI.
+    // (Both lists are additive; OpenSSH treats `LocalForward` entries the
+    // same as `-L` arguments.)
+    for lf in &cfg_block.local_forwards {
+        cli.locals.push(LocalForward {
+            listen_port: lf.listen_port,
+            remote_host: lf.remote_host.clone(),
+            remote_port: lf.remote_port,
+        });
+    }
+    for rf in &cfg_block.remote_forwards {
+        cli.remotes.push(RemoteForward {
+            remote_port: rf.remote_port,
+            local_host: rf.local_host.clone(),
+            local_port: rf.local_port,
+        });
+    }
+    // `ForwardAgent yes` / `ForwardX11 yes` flip the CLI-side toggles if the
+    // user didn't already set them. (The flag form has no "off" — once `-A`
+    // is on, it's on; config-driven enable matches that.)
+    if !cli.agent_forward && cfg_block.forward_agent == Some(true) {
+        cli.agent_forward = true;
+    }
+    if cli.x11_forward.is_none() && cfg_block.forward_x11 == Some(true) {
+        cli.x11_forward = Some(if cfg_block.forward_x11_trusted == Some(true) {
+            X11Forward::Trusted
+        } else {
+            X11Forward::Untrusted
+        });
+    }
+    if cli.verbose == 0 {
+        if let Some(level) = cfg_block.log_level {
+            set_verbose(level);
+        }
+    }
+
+    // CLI `-l user` > config `User` > `user@host` syntax > $USER.
+    let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
+    let user = resolve_user(cli_user.as_deref(), cli.user_in_host.as_deref())?;
+
+    let strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    let known_hosts_path = cli
+        .known_hosts_path
+        .clone()
+        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
+    let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
+    let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
+    let port = common::pick(cli.port, cfg_block.port, 22);
+    // `HostName` rewrites the connect target; the original `cli.host` is
+    // what we *displayed* and what the config block matched on.
+    let connect_host = cfg_block
+        .host_name
+        .clone()
+        .unwrap_or_else(|| cli.host.clone());
+
+    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
     let cfg = Config {
         host_key_policy: policy,
         timeout: None,
@@ -337,10 +407,10 @@ fn run() -> Result<i32, String> {
 
     // Use connect_to_host so KnownHosts can look the host up by its
     // user-supplied name.
-    vlog(1, &format!("connecting to {}:{}", cli.host, cli.port));
-    let mut client = Client::connect_to_host(cli.host.as_str(), cli.port, cfg)
+    vlog(1, &format!("connecting to {connect_host}:{port}"));
+    let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)
         .map_err(|e| format!("connect: {e}"))?;
-    vlog(1, &format!("connected to {}:{}", cli.host, cli.port));
+    vlog(1, &format!("connected to {connect_host}:{port}"));
 
     // Collect publickey credentials. Per OpenSSH default, agent identities
     // come first (when `$SSH_AUTH_SOCK` is set and `IdentitiesOnly=no`),
@@ -349,7 +419,7 @@ fn run() -> Result<i32, String> {
     // `id_rsa`). `IdentitiesOnly=yes` suppresses both the agent and the
     // defaults, mirroring OpenSSH.
     let mut credentials: Vec<ClientCredential> = Vec::new();
-    if !cli.identities_only {
+    if !identities_only {
         match connect_agent_credentials() {
             Ok(mut from_agent) => {
                 if !from_agent.is_empty() {
@@ -379,7 +449,25 @@ fn run() -> Result<i32, String> {
             Err(e) => eprintln!("warning: identity {id_path}: {e}"),
         }
     }
-    if !cli.identities_only {
+    // Also load identities listed in the matching ssh_config block.
+    for id_path_raw in &cfg_block.identity_files {
+        let id_path = expand_tilde(id_path_raw);
+        let pk = match load_identity(&id_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
+        match pk.into_host_key() {
+            Ok(hk) => {
+                vlog(1, &format!("config identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
+            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
+        }
+    }
+    if !identities_only {
         for path in default_identity_paths() {
             match try_load_default_identity(&path) {
                 Ok(Some(pk)) => match pk.into_host_key() {

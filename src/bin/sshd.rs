@@ -75,11 +75,11 @@ mod imp {
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    const USAGE: &str = "usage: sshd [-d] [-p port] [-h host_key_file]... \
-                         [-A authorized_keys_file] [-u allowed_user]... \
-                         [--no-sftp] [--sftp-read-only] [--sftp-root PATH] \
-                         [--no-scp] [--no-agent-forward] [--no-x11-forward] \
-                         [--no-strict-modes] [--debug-commands] \
+    const USAGE: &str = "usage: sshd [-d] [-f configfile] [-p port] [-b address]... \
+                         [-h host_key_file]... [-A authorized_keys_file] \
+                         [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
+                         [--sftp-root PATH] [--no-scp] [--no-agent-forward] \
+                         [--no-x11-forward] [--no-strict-modes] [--debug-commands] \
                          [--accept-env GLOB]... [--login-grace-time SECONDS] \
                          [--max-startups N] [--per-source-max N]";
 
@@ -252,31 +252,39 @@ mod imp {
     }
 
     struct Cli {
-        port: u16,
+        /// `-f path`: read this `sshd_config` before processing CLI flags
+        /// (CLI still wins on scalars).
+        config_file: Option<String>,
+        port: Option<u16>,
+        /// `-b ADDR`: bind to ADDR (host or `host:port`). Repeats are
+        /// recognised; v1 uses only the first one and warns about extras
+        /// until multi-address bind lands. Config `ListenAddress` lines
+        /// fold into the same list.
+        listen_addresses: Vec<String>,
         host_key_files: Vec<String>,
         authorized_keys_file: Option<String>,
         allowed_users: Vec<String>,
         debug: bool,
         /// SFTP subsystem on by default; `--no-sftp` disables it.
-        sftp: bool,
+        sftp: Option<bool>,
         /// Refuse any operation that would mutate the filesystem.
-        sftp_read_only: bool,
+        sftp_read_only: Option<bool>,
         /// If set, refuse paths that escape this root.
         sftp_root: Option<String>,
         /// SCP support (in-process `scp -t/-f`) on by default; `--no-scp`
         /// disables it. With SCP off, an `exec scp …` request falls through
         /// to the buffered command handler — which refuses unknown commands.
-        scp: bool,
+        scp: Option<bool>,
         /// Agent forwarding on by default; `--no-agent-forward` disables
         /// it. When off, any client `auth-agent-req@openssh.com` is
         /// refused.
-        agent_forward: bool,
+        agent_forward: Option<bool>,
         /// X11 forwarding on by default; `--no-x11-forward` disables it.
         /// When off, any client `x11-req` is refused.
-        x11_forward: bool,
+        x11_forward: Option<bool>,
         /// `--no-strict-modes`: skip the 0o077 / 0o022 file-permission
         /// checks on host keys / authorized_keys.
-        strict_modes: bool,
+        strict_modes: Option<bool>,
         /// `--debug-commands`: log full exec command lines (otherwise
         /// only the first whitespace token is logged in debug mode).
         debug_commands: bool,
@@ -285,42 +293,73 @@ mod imp {
         accept_env: Vec<String>,
         /// `--login-grace-time SECONDS`: pre-auth inactivity timeout
         /// applied to the connection's read side. 0 disables.
-        login_grace_time: u32,
+        login_grace_time: Option<u32>,
         /// `--max-startups N`: cap on concurrent unauthenticated /
         /// authenticated children (0 = unlimited).
-        max_startups: u32,
+        max_startups: Option<u32>,
         /// `--per-source-max N`: cap on simultaneous connections from any
         /// single peer IP (0 = unlimited).
         per_source_max: u32,
     }
 
+    /// OpenSSH precedence helper: returns the first `Some` of `cli`, `cfg`,
+    /// otherwise `default`. The standard scalar-option resolution pattern is
+    /// `pick(cli_flag, cfg_value, builtin_default)`.
+    fn pick<T>(cli: Option<T>, cfg: Option<T>, default: T) -> T {
+        cli.or(cfg).unwrap_or(default)
+    }
+
+    /// Read and parse a single `sshd_config`-format file. There is no default
+    /// search path on the server side: distros disagree on where the file
+    /// lives, and the user explicitly opts in via `-f`.
+    fn load_server_config(
+        path: &std::path::Path,
+    ) -> Result<puressh::config::SshServerConfig, String> {
+        let src =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        puressh::config::SshServerConfig::parse(&src)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     fn parse_args(args: &[String]) -> Result<Cli, String> {
-        let mut port: u16 = 2222;
+        let mut config_file: Option<String> = None;
+        let mut port: Option<u16> = None;
+        let mut listen_addresses: Vec<String> = Vec::new();
         let mut host_key_files: Vec<String> = Vec::new();
         let mut authorized_keys_file: Option<String> = None;
         let mut allowed_users: Vec<String> = Vec::new();
         let mut debug = false;
-        let mut sftp = true;
-        let mut sftp_read_only = false;
+        let mut sftp: Option<bool> = None;
+        let mut sftp_read_only: Option<bool> = None;
         let mut sftp_root: Option<String> = None;
-        let mut scp = true;
-        let mut agent_forward = true;
-        let mut x11_forward = true;
-        let mut strict_modes = true;
+        let mut scp: Option<bool> = None;
+        let mut agent_forward: Option<bool> = None;
+        let mut x11_forward: Option<bool> = None;
+        let mut strict_modes: Option<bool> = None;
         let mut debug_commands = false;
         let mut accept_env: Vec<String> = Vec::new();
-        let mut login_grace_time: u32 = 120;
-        let mut max_startups: u32 = 100;
+        let mut login_grace_time: Option<u32> = None;
+        let mut max_startups: Option<u32> = None;
         let mut per_source_max: u32 = 10;
 
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
             match a.as_str() {
+                "-f" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("-f requires a value")?.clone();
+                    config_file = Some(v);
+                }
                 "-p" => {
                     i += 1;
                     let v = args.get(i).ok_or("-p requires a value")?;
-                    port = v.parse::<u16>().map_err(|_| "invalid port".to_string())?;
+                    port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
+                }
+                "-b" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("-b requires a value")?.clone();
+                    listen_addresses.push(v);
                 }
                 "-h" => {
                     i += 1;
@@ -338,17 +377,17 @@ mod imp {
                     allowed_users.push(v);
                 }
                 "-d" => debug = true,
-                "--no-sftp" => sftp = false,
-                "--sftp-read-only" => sftp_read_only = true,
+                "--no-sftp" => sftp = Some(false),
+                "--sftp-read-only" => sftp_read_only = Some(true),
                 "--sftp-root" => {
                     i += 1;
                     let v = args.get(i).ok_or("--sftp-root requires a value")?.clone();
                     sftp_root = Some(v);
                 }
-                "--no-scp" => scp = false,
-                "--no-agent-forward" => agent_forward = false,
-                "--no-x11-forward" => x11_forward = false,
-                "--no-strict-modes" => strict_modes = false,
+                "--no-scp" => scp = Some(false),
+                "--no-agent-forward" => agent_forward = Some(false),
+                "--no-x11-forward" => x11_forward = Some(false),
+                "--no-strict-modes" => strict_modes = Some(false),
                 "--debug-commands" => debug_commands = true,
                 "--accept-env" => {
                     i += 1;
@@ -358,16 +397,18 @@ mod imp {
                 "--login-grace-time" => {
                     i += 1;
                     let v = args.get(i).ok_or("--login-grace-time requires a value")?;
-                    login_grace_time = v
-                        .parse::<u32>()
-                        .map_err(|_| "invalid --login-grace-time".to_string())?;
+                    login_grace_time = Some(
+                        v.parse::<u32>()
+                            .map_err(|_| "invalid --login-grace-time".to_string())?,
+                    );
                 }
                 "--max-startups" => {
                     i += 1;
                     let v = args.get(i).ok_or("--max-startups requires a value")?;
-                    max_startups = v
-                        .parse::<u32>()
-                        .map_err(|_| "invalid --max-startups".to_string())?;
+                    max_startups = Some(
+                        v.parse::<u32>()
+                            .map_err(|_| "invalid --max-startups".to_string())?,
+                    );
                 }
                 "--per-source-max" => {
                     i += 1;
@@ -384,11 +425,12 @@ mod imp {
             i += 1;
         }
 
-        if host_key_files.is_empty() {
-            return Err("at least one -h host_key_file is required".into());
-        }
+        // `-h` validation moves to run() after config merge so a config file
+        // that supplies `HostKey` is sufficient.
         Ok(Cli {
+            config_file,
             port,
+            listen_addresses,
             host_key_files,
             authorized_keys_file,
             allowed_users,
@@ -2038,22 +2080,102 @@ mod imp {
 
         let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
 
-        let host_keys = load_host_keys(&cli.host_key_files, cli.strict_modes)?;
-        let authorized_blobs: Vec<Vec<u8>> = match &cli.authorized_keys_file {
-            Some(path) => load_authorized_keys(path, cli.strict_modes)?
+        // Load sshd_config if `-f` was supplied; otherwise an empty config
+        // so every `pick()` falls through to the CLI value or the built-in
+        // default. CLI flags always win over the config file (so adminstrators
+        // can override a baked-in config without editing it).
+        let sshd_cfg = match cli.config_file.as_deref() {
+            Some(p) => load_server_config(std::path::Path::new(p))?,
+            None => puressh::config::SshServerConfig::default(),
+        };
+
+        // Resolve effective values: CLI > config > built-in default.
+        let port = pick(cli.port, sshd_cfg.port, 2222u16);
+        let strict_modes = pick(cli.strict_modes, sshd_cfg.strict_modes, true);
+        let sftp_enabled = pick(cli.sftp, sshd_cfg.sftp_enabled, true);
+        let sftp_read_only = pick(cli.sftp_read_only, sshd_cfg.sftp_read_only, false);
+        let sftp_root: Option<std::path::PathBuf> = cli
+            .sftp_root
+            .as_deref()
+            .or(sshd_cfg.sftp_root.as_deref())
+            .map(std::path::PathBuf::from);
+        let scp_enabled = pick(cli.scp, sshd_cfg.scp_enabled, true);
+        let agent_forward = pick(cli.agent_forward, sshd_cfg.allow_agent_forwarding, true);
+        let x11_forward = pick(cli.x11_forward, sshd_cfg.x11_forwarding, true);
+        let login_grace_time = pick(cli.login_grace_time, sshd_cfg.login_grace_time, 120u32);
+        let max_startups = pick(cli.max_startups, sshd_cfg.max_startups, 100u32);
+
+        // CLI host-keys, then any HostKey lines from config (cumulative).
+        let mut host_key_files = cli.host_key_files.clone();
+        host_key_files.extend(sshd_cfg.host_key_files.iter().cloned());
+        if host_key_files.is_empty() {
+            return Err(
+                "at least one -h host_key_file (or HostKey in sshd_config) is required".into(),
+            );
+        }
+
+        let authorized_keys_file = cli
+            .authorized_keys_file
+            .clone()
+            .or_else(|| sshd_cfg.authorized_keys_file.clone());
+
+        // CLI `-u`, then `AllowUsers` from config (cumulative across blocks).
+        let mut allowed_user_list = cli.allowed_users.clone();
+        allowed_user_list.extend(sshd_cfg.allow_users.iter().cloned());
+
+        // Likewise `--accept-env` ++ `AcceptEnv`.
+        let mut accept_env = cli.accept_env.clone();
+        accept_env.extend(sshd_cfg.accept_env.iter().cloned());
+
+        // Pick the bind address. We support a single listener for v1; warn
+        // if more than one ListenAddress / -b was supplied.
+        let mut bind_specs = cli.listen_addresses.clone();
+        bind_specs.extend(sshd_cfg.listen_addresses.iter().cloned());
+        if bind_specs.len() > 1 {
+            eprintln!(
+                "sshd: warning: {} ListenAddress entries supplied; binding only the first \
+                 (multi-address listen is a follow-up). Extras: {:?}",
+                bind_specs.len(),
+                &bind_specs[1..]
+            );
+        }
+        let bind_addr = match bind_specs.first() {
+            Some(s) => {
+                // Bare host → add the effective port. `host:port` passes through.
+                if s.contains(':') && !s.contains("::") {
+                    s.clone()
+                } else if s.starts_with('[') {
+                    // [v6]:port literal — already complete
+                    s.clone()
+                } else {
+                    // bare host or bare IPv6 → append :port
+                    if s.contains(':') {
+                        // bare IPv6 literal
+                        format!("[{s}]:{port}")
+                    } else {
+                        format!("{s}:{port}")
+                    }
+                }
+            }
+            None => format!("127.0.0.1:{port}"),
+        };
+
+        let host_keys = load_host_keys(&host_key_files, strict_modes)?;
+        let authorized_blobs: Vec<Vec<u8>> = match &authorized_keys_file {
+            Some(path) => load_authorized_keys(path, strict_modes)?
                 .into_iter()
                 .map(|k| k.wire_blob())
                 .collect(),
             None => Vec::new(),
         };
 
-        let allowed_users: HashSet<String> = if cli.allowed_users.is_empty() {
+        let allowed_users: HashSet<String> = if allowed_user_list.is_empty() {
             let u = current_user()?;
             let mut s = HashSet::new();
             s.insert(u);
             s
         } else {
-            cli.allowed_users.iter().cloned().collect()
+            allowed_user_list.into_iter().collect()
         };
 
         let factory = Arc::new(LocalAuthFactory {
@@ -2082,26 +2204,26 @@ mod imp {
             debug: cli.debug,
         }));
 
-        if cli.sftp {
+        if sftp_enabled {
             let sftp = SftpSubsystemHandler {
-                read_only: cli.sftp_read_only,
-                root: cli.sftp_root.as_ref().map(std::path::PathBuf::from),
+                read_only: sftp_read_only,
+                root: sftp_root.clone(),
                 debug: cli.debug,
             };
             config = config.with_subsystem(Arc::new(sftp));
         }
 
-        if cli.scp {
+        if scp_enabled {
             let scp = ScpExecHandler { debug: cli.debug };
             config = config.with_exec_stream_handler(Arc::new(scp));
         }
 
-        if cli.agent_forward {
+        if agent_forward {
             use puressh::forwarding::agent::DefaultAgentForwardHandler;
             config = config.with_agent_forward(Arc::new(DefaultAgentForwardHandler::new()));
         }
 
-        if cli.x11_forward {
+        if x11_forward {
             use puressh::forwarding::x11::DefaultX11ForwardHandler;
             config = config.with_x11_forward(Arc::new(DefaultX11ForwardHandler::new()));
         }
@@ -2122,10 +2244,10 @@ mod imp {
         // is the secure default. login_grace_time = 0 disables the
         // timeout for users who want OpenSSH's classic "no limit"
         // behaviour.
-        config = config.with_accept_env(cli.accept_env.clone());
-        if cli.login_grace_time > 0 {
+        config = config.with_accept_env(accept_env);
+        if login_grace_time > 0 {
             config = config
-                .with_login_grace_time(std::time::Duration::from_secs(cli.login_grace_time.into()));
+                .with_login_grace_time(std::time::Duration::from_secs(login_grace_time.into()));
         } else {
             // Pass Duration::ZERO so the server can treat 0 as "disabled".
             config = config.with_login_grace_time(std::time::Duration::ZERO);
@@ -2135,7 +2257,7 @@ mod imp {
 
         install_parent_signals()?;
 
-        let addr = format!("127.0.0.1:{}", cli.port);
+        let addr = bind_addr;
         let listener =
             std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
 
@@ -2172,7 +2294,7 @@ mod imp {
             // Enforce both connection caps *before* fork so a flood
             // can't OOM us via per-process accounting. On refusal we
             // simply drop the socket — RST tells the client to retry.
-            let scope = match admit_connection(&peer, cli.max_startups, cli.per_source_max) {
+            let scope = match admit_connection(&peer, max_startups, cli.per_source_max) {
                 Ok(s) => s,
                 Err(reason) => {
                     if cli.debug {

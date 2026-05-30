@@ -32,14 +32,15 @@ use puressh::scp::{ScpRecvOptions, ScpSendOptions};
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, default_identity_paths, load_identity,
-    parse_userhost_path, read_password_from_stdin, resolve_user, set_verbose,
+    build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
+    load_identity, parse_userhost_path, read_password_from_stdin, resolve_user, set_verbose,
     try_load_default_identity, vlog, StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: scp [-v[v[v]]] [-r] [-p] [-P port] [-i identity_file] [-l user] \
+const USAGE: &str =
+    "usage: scp [-v[v[v]]] [-r] [-p] [-F configfile] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
@@ -50,13 +51,15 @@ struct Cli {
     recursive: bool,
     /// Preserve mtime/atime/mode (`-p`).
     preserve_times: bool,
-    port: u16,
+    /// `-F path`: load this `ssh_config` instead of the defaults.
+    config_file: Option<PathBuf>,
+    port: Option<u16>,
     identities: Vec<String>,
     cli_user: Option<String>,
-    strict: StrictMode,
+    strict: Option<StrictMode>,
     known_hosts_path: Option<PathBuf>,
-    hash_known_hosts: bool,
-    identities_only: bool,
+    hash_known_hosts: Option<bool>,
+    identities_only: Option<bool>,
     /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
     /// See [`common::set_verbose`].
     verbose: u8,
@@ -67,13 +70,14 @@ struct Cli {
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut recursive = false;
     let mut preserve_times = false;
-    let mut port = 22u16;
+    let mut config_file: Option<PathBuf> = None;
+    let mut port: Option<u16> = None;
     let mut identities: Vec<String> = Vec::new();
     let mut cli_user: Option<String> = None;
-    let mut strict = StrictMode::Ask;
+    let mut strict: Option<StrictMode> = None;
     let mut known_hosts_path: Option<PathBuf> = None;
-    let mut hash_known_hosts = false;
-    let mut identities_only = false;
+    let mut hash_known_hosts: Option<bool> = None;
+    let mut identities_only: Option<bool> = None;
     let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
@@ -90,7 +94,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             "-P" => {
                 i += 1;
                 let v = args.get(i).ok_or("-P requires a value")?;
-                port = v.parse::<u16>().map_err(|_| "invalid port".to_string())?;
+                port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
+            }
+            "-F" => {
+                i += 1;
+                let v = args.get(i).ok_or("-F requires a value")?.clone();
+                config_file = Some(PathBuf::from(v));
             }
             "-i" => {
                 i += 1;
@@ -110,23 +119,24 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
                 match k.to_ascii_lowercase().as_str() {
                     "stricthostkeychecking" => {
-                        strict = match val.to_ascii_lowercase().as_str() {
+                        strict = Some(match val.to_ascii_lowercase().as_str() {
                             "yes" => StrictMode::Yes,
                             "no" | "off" => StrictMode::No,
                             "accept-new" => StrictMode::AcceptNew,
                             "ask" => StrictMode::Ask,
                             other => return Err(format!("unknown StrictHostKeyChecking={other}")),
-                        };
+                        });
                     }
                     "userknownhostsfile" => {
                         known_hosts_path = Some(PathBuf::from(val));
                     }
                     "hashknownhosts" => {
                         hash_known_hosts =
-                            matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
                     }
                     "identitiesonly" => {
-                        identities_only = matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                        identities_only =
+                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
                     }
                     other => {
                         return Err(format!("unsupported -o option: {other}={val}"));
@@ -166,6 +176,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     Ok(Cli {
         recursive,
         preserve_times,
+        config_file,
         port,
         identities,
         cli_user,
@@ -203,29 +214,40 @@ fn classify(arg: &str) -> Endpoint {
 /// whether the remote is the source or the target.
 fn open_authenticated(
     host: &str,
-    port: u16,
     user_in_endpoint: Option<&str>,
     cli: &Cli,
+    ssh_cfg: &puressh::config::SshClientConfig,
 ) -> Result<Client, String> {
-    let user = resolve_user(cli.cli_user.as_deref(), user_in_endpoint)?;
+    let cfg_block = ssh_cfg.lookup(host);
 
-    let policy = build_host_key_policy(
-        cli.strict,
-        cli.known_hosts_path.clone(),
-        cli.hash_known_hosts,
-    )?;
+    let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
+    let user = resolve_user(cli_user.as_deref(), user_in_endpoint)?;
+    let strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    let known_hosts_path = cli
+        .known_hosts_path
+        .clone()
+        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
+    let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
+    let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
+    let port = common::pick(cli.port, cfg_block.port, 22);
+    let connect_host = cfg_block
+        .host_name
+        .clone()
+        .unwrap_or_else(|| host.to_string());
+
+    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
     let cfg = Config {
         host_key_policy: policy,
         timeout: None,
     };
-    vlog(1, &format!("connecting to {host}:{port}"));
-    let mut client =
-        Client::connect_to_host(host, port, cfg).map_err(|e| format!("connect: {e}"))?;
-    vlog(1, &format!("connected to {host}:{port}"));
+    vlog(1, &format!("connecting to {connect_host}:{port}"));
+    let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)
+        .map_err(|e| format!("connect: {e}"))?;
+    vlog(1, &format!("connected to {connect_host}:{port}"));
 
     // Collect publickey credentials (agent first, unless IdentitiesOnly=yes).
     let mut credentials: Vec<ClientCredential> = Vec::new();
-    if !cli.identities_only {
+    if !identities_only {
         match connect_agent_credentials() {
             Ok(mut from_agent) => {
                 vlog(
@@ -253,10 +275,28 @@ fn open_authenticated(
             Err(e) => eprintln!("warning: identity {id_path}: {e}"),
         }
     }
+    // Identities listed in the matching ssh_config block.
+    for id_path_raw in &cfg_block.identity_files {
+        let id_path = expand_tilde(id_path_raw);
+        let pk = match load_identity(&id_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
+        match pk.into_host_key() {
+            Ok(hk) => {
+                vlog(1, &format!("config identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
+            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
+        }
+    }
     // OpenSSH-style default identities: tried after agent + explicit -i,
     // suppressed entirely by IdentitiesOnly=yes (which also disables the
     // agent above).
-    if !cli.identities_only {
+    if !identities_only {
         for path in default_identity_paths() {
             match try_load_default_identity(&path) {
                 Ok(Some(pk)) => match pk.into_host_key() {
@@ -323,6 +363,10 @@ fn run() -> Result<i32, String> {
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     set_verbose(cli.verbose);
 
+    // Resolve config once; each remote host re-walks the same blocks via
+    // `open_authenticated`.
+    let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
+
     // Split into sources (all but last) and target (last).
     let mut endpoints: Vec<Endpoint> = cli.positional.iter().map(|s| classify(s)).collect();
     let target = endpoints.pop().expect("at least 2 positionals");
@@ -361,7 +405,7 @@ fn run() -> Result<i32, String> {
             .collect::<Result<_, _>>()?;
         let path_refs: Vec<&std::path::Path> = local_paths.iter().map(|p| p.as_path()).collect();
 
-        let mut client = open_authenticated(&host, cli.port, user.as_deref(), &cli)?;
+        let mut client = open_authenticated(&host, user.as_deref(), &cli, &ssh_cfg)?;
         let opts = ScpSendOptions {
             recursive: cli.recursive,
             preserve_times: cli.preserve_times,
@@ -384,7 +428,7 @@ fn run() -> Result<i32, String> {
             })
             .expect("one remote source");
 
-        let mut client = open_authenticated(&host, cli.port, user.as_deref(), &cli)?;
+        let mut client = open_authenticated(&host, user.as_deref(), &cli, &ssh_cfg)?;
         let opts = ScpRecvOptions {
             recursive: cli.recursive,
             preserve_times: cli.preserve_times,

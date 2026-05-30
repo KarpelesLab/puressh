@@ -41,6 +41,9 @@ pub mod transport;
 #[cfg(feature = "alloc")]
 pub mod compress;
 
+#[cfg(feature = "alloc")]
+pub mod config;
+
 #[cfg(feature = "std")]
 pub mod stream;
 

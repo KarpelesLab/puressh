@@ -466,6 +466,10 @@ fn run() -> Result<i32, String> {
             .map_err(|e| format!("Auth failed: {e}"))?;
     }
 
+    // The interactive sftp shell is single-channel by design; the
+    // borrow-based `Client::sftp` fits, even though it's now deprecated
+    // for new multi-channel callers (use `SharedClient::sftp`).
+    #[allow(deprecated)]
     let sftp = client.sftp().map_err(|e| format!("sftp: {e}"))?;
     let mut repl = Repl::new(sftp)?;
     repl.run()?;

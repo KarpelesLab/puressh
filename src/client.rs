@@ -1193,6 +1193,14 @@ impl Client {
     ///
     /// The returned client serialises one request/response at a time. When
     /// it's dropped, the channel is closed.
+    #[cfg_attr(
+        feature = "multichannel",
+        deprecated(
+            since = "0.0.2",
+            note = "Use SharedClient::sftp instead; the borrow-based API \
+                    prevents multiple concurrent channels on one connection."
+        )
+    )]
     pub fn sftp(&mut self) -> Result<SftpClient<ClientChannelStream<'_>>> {
         let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
         self.write_payload(&open_payload)?;
@@ -1258,6 +1266,13 @@ impl Client {
     /// [`Client::scp_recv_from`] to drive the remote `scp -t` / `scp -f`
     /// helper over the channel. For one-shot commands whose output you just
     /// want to collect, use [`Client::exec`] instead.
+    #[cfg_attr(
+        feature = "multichannel",
+        deprecated(
+            since = "0.0.2",
+            note = "Use SharedClient::exec_stream for multi-channel support."
+        )
+    )]
     pub fn exec_stream(&mut self, command: &str) -> Result<ClientChannelStream<'_>> {
         let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
         self.write_payload(&open_payload)?;
@@ -1315,6 +1330,13 @@ impl Client {
     /// helper: while the returned stream is alive, the client cannot be
     /// used for anything else. Multi-channel multiplexing comes later via
     /// the `Client::serve` event loop.
+    #[cfg_attr(
+        feature = "multichannel",
+        deprecated(
+            since = "0.0.2",
+            note = "Use SharedClient::open_direct_tcpip for multi-channel support."
+        )
+    )]
     pub fn open_direct_tcpip(
         &mut self,
         dest_host: &str,
@@ -1374,6 +1396,11 @@ impl Client {
         opts: crate::scp::ScpSendOptions,
     ) -> Result<()> {
         let cmd = build_scp_to_cmd(remote_dest, &opts)?;
+        // Internal scp-wrapping path: uses the borrow-based exec_stream
+        // because the helper itself is single-channel anyway. A future
+        // SharedClient::scp_send_to could replace this; for now we
+        // suppress the in-crate deprecation warning here.
+        #[allow(deprecated)]
         let mut stream = self.exec_stream(&cmd)?;
         let result = (|| -> Result<()> {
             let mut sender = crate::scp::Sender::new(&mut stream)
@@ -1427,6 +1454,8 @@ impl Client {
                 opts.target_is_file = true;
             }
         }
+        // Matches scp_send_to: single-channel helper, internal use.
+        #[allow(deprecated)]
         let mut stream = self.exec_stream(&cmd)?;
         let result = (|| -> Result<()> {
             let mut recv = crate::scp::Receiver::new(&mut stream, local_dest, opts)

@@ -3575,6 +3575,9 @@ mod tests {
             .expect("authenticate");
 
         {
+            // Single-channel sftp inside the borrow-based test; the
+            // multi-channel SharedClient::sftp has its own test.
+            #[allow(deprecated)]
             let mut sftp = client.sftp().expect("sftp handshake");
             assert!(sftp.server_version() >= 3);
 
@@ -3743,6 +3746,8 @@ mod tests {
             .expect("authenticate");
 
         {
+            // Single-channel test path; SharedClient is exercised elsewhere.
+            #[allow(deprecated)]
             let mut s = client
                 .open_direct_tcpip(
                     &echo_addr.ip().to_string(),
@@ -3772,6 +3777,9 @@ mod tests {
     }
 
     #[test]
+    // Whole test exercises the deprecated borrow-based open_direct_tcpip;
+    // SharedClient is covered by its own integration tests.
+    #[allow(deprecated)]
     fn loopback_direct_tcpip_unconfigured_refused() {
         // Without a direct_tcpip_handler attached the channel-open must be
         // rejected with SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, surfaced to

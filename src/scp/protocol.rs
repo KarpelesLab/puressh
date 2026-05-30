@@ -102,10 +102,11 @@ pub enum Header {
 }
 
 /// Validate a filename before sending or after receiving. The rules
-/// (no `\0`, no `\n`, no `/`, not `.`, not `..`, not starting with `-`)
-/// match OpenSSH's `do_localcopy`/`source_file` hardening; together they
-/// prevent the receiver from being tricked into writing under arbitrary
-/// paths and keep the sender from synthesising "scp option" strings.
+/// (no C0 control bytes, no DEL, no `/`, not `.`, not `..`, not starting
+/// with `-`) match OpenSSH's `do_localcopy`/`source_file` hardening and
+/// extend it: any byte `< 0x20` or `== 0x7f` is rejected so a hostile
+/// peer can't smuggle terminal escape sequences (ANSI / OSC) inside a
+/// filename and hijack the operator's terminal on the next `ls`.
 ///
 /// `.` is rejected because using it as a basename would let a peer
 /// re-target the *current* directory entry on the receiver — replacing
@@ -114,11 +115,13 @@ pub fn validate_name(name: &str) -> Result<(), ScpError> {
     if name.is_empty() {
         return Err(ScpError::BadName("empty"));
     }
-    if name.contains('\0') {
-        return Err(ScpError::BadName("contains NUL"));
-    }
-    if name.contains('\n') {
-        return Err(ScpError::BadName("contains newline"));
+    // Reject every C0 control byte (NUL, BEL, BS, TAB, LF, CR, ESC, ...)
+    // and DEL. This subsumes the historical \0 / \n rules while also
+    // blocking \r, \t, and \x1b which were previously accepted and let
+    // a sender embed ANSI / OSC sequences in filenames — a path to
+    // terminal hijack on the operator's next `ls`.
+    if name.as_bytes().iter().any(|&b| b < 0x20 || b == 0x7f) {
+        return Err(ScpError::BadName("contains control character"));
     }
     if name.starts_with('-') {
         return Err(ScpError::BadName("starts with '-'"));
@@ -461,6 +464,31 @@ mod unit {
     #[test]
     fn reject_slash_in_name() {
         assert!(matches!(validate_name("a/b"), Err(ScpError::BadName(_))));
+    }
+
+    #[test]
+    fn reject_cr_in_name() {
+        // \r alone could split log lines or confuse a terminal renderer.
+        assert!(matches!(validate_name("a\rb"), Err(ScpError::BadName(_))));
+    }
+
+    #[test]
+    fn reject_esc_in_name() {
+        // \x1b is the start byte of every ANSI/OSC terminal sequence.
+        assert!(matches!(
+            validate_name("a\x1b[31mb"),
+            Err(ScpError::BadName(_))
+        ));
+    }
+
+    #[test]
+    fn reject_tab_in_name() {
+        assert!(matches!(validate_name("a\tb"), Err(ScpError::BadName(_))));
+    }
+
+    #[test]
+    fn reject_del_in_name() {
+        assert!(matches!(validate_name("a\x7fb"), Err(ScpError::BadName(_))));
     }
 
     #[test]

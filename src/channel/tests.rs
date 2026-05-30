@@ -569,3 +569,93 @@ fn channel_request_for_unknown_channel_is_bad_state() {
     let err = server.on_packet(&w.into_vec()).unwrap_err();
     assert!(matches!(err, crate::Error::BadChannelState));
 }
+
+// --- security: confirm-before-traffic enforcement (finding #3) ---
+
+#[test]
+fn open_confirmation_for_peer_initiated_channel_rejected() {
+    // Peer sends us a CHANNEL_OPEN — we allocate a local id, but the
+    // channel is NOT initiated_by_us. If the peer then tries to send us
+    // an OPEN_CONFIRMATION for that same id (as it would after a
+    // legitimate outbound open from us), we must refuse.
+    let (mut a, mut b) = pair();
+    let (_, payload) = b.open(ChannelOpen::Session).unwrap();
+    let ev = a.on_packet(&payload).unwrap();
+    let local_id = match ev {
+        ChannelEvent::OpenRequest { channel, .. } => channel,
+        _ => unreachable!(),
+    };
+
+    // Craft a forged OPEN_CONFIRMATION pointing at our peer-initiated
+    // channel.
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_OPEN_CONFIRMATION);
+    w.write_u32(local_id);
+    w.write_u32(7); // remote id
+    w.write_u32(1024);
+    w.write_u32(16384);
+    let err = a.on_packet(&w.into_vec()).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+}
+
+#[test]
+fn data_before_open_confirmed_rejected() {
+    let mut a = ConnectionState::new();
+    // We're the opener; we sent CHANNEL_OPEN but never received
+    // confirmation. The peer must not send DATA yet.
+    let (local_id, _payload) = a.open(ChannelOpen::Session).unwrap();
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_DATA);
+    w.write_u32(local_id);
+    w.write_string(b"hi");
+    let err = a.on_packet(&w.into_vec()).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+}
+
+#[test]
+fn extended_data_before_open_confirmed_rejected() {
+    let mut a = ConnectionState::new();
+    let (local_id, _payload) = a.open(ChannelOpen::Session).unwrap();
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_EXTENDED_DATA);
+    w.write_u32(local_id);
+    w.write_u32(SSH_EXTENDED_DATA_STDERR);
+    w.write_string(b"oops");
+    let err = a.on_packet(&w.into_vec()).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+}
+
+#[test]
+fn eof_before_open_confirmed_rejected() {
+    let mut a = ConnectionState::new();
+    let (local_id, _payload) = a.open(ChannelOpen::Session).unwrap();
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_EOF);
+    w.write_u32(local_id);
+    let err = a.on_packet(&w.into_vec()).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+}
+
+#[test]
+fn close_before_open_confirmed_rejected() {
+    let mut a = ConnectionState::new();
+    let (local_id, _payload) = a.open(ChannelOpen::Session).unwrap();
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_CLOSE);
+    w.write_u32(local_id);
+    let err = a.on_packet(&w.into_vec()).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+}
+
+#[test]
+fn request_before_open_confirmed_rejected() {
+    let mut a = ConnectionState::new();
+    let (local_id, _payload) = a.open(ChannelOpen::Session).unwrap();
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_REQUEST);
+    w.write_u32(local_id);
+    w.write_string(b"shell");
+    w.write_bool(false);
+    let err = a.on_packet(&w.into_vec()).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+}

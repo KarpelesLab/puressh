@@ -41,6 +41,14 @@ pub struct ChannelState {
     initial_local_window: u32,
     pending_replenish: u32,
     open_confirmed: bool,
+    /// True iff we sent `CHANNEL_OPEN` (vs. a peer-initiated open we
+    /// allocated via `on_channel_open`).
+    ///
+    /// Defence-in-depth against a peer attempting to "force-confirm" an
+    /// inbound channel-open by sending us `OPEN_CONFIRMATION` for the local
+    /// id we minted to track its `CHANNEL_OPEN`. Only channels we initiated
+    /// may transition open via inbound `OPEN_CONFIRMATION`.
+    initiated_by_us: bool,
 }
 
 impl ChannelState {
@@ -376,6 +384,7 @@ impl ConnectionState {
             initial_local_window: local_window,
             pending_replenish: 0,
             open_confirmed: false,
+            initiated_by_us: true,
         };
         self.channels.insert(local_id, state);
 
@@ -688,6 +697,7 @@ impl ConnectionState {
             initial_local_window: local_window,
             pending_replenish: 0,
             open_confirmed: false,
+            initiated_by_us: false,
         };
         self.channels.insert(local_id, state);
         Ok(ChannelEvent::OpenRequest {
@@ -707,6 +717,15 @@ impl ConnectionState {
             .ok_or(Error::Protocol("open-confirm for unknown channel"))?;
         if ch.open_confirmed {
             return Err(Error::Protocol("double open-confirm"));
+        }
+        // A peer may not confirm a channel we never asked them to open.
+        // Inbound peer-initiated channels are confirmed locally via
+        // `accept_open`; OPEN_CONFIRMATION on the wire is only legal for
+        // channels for which we previously sent `CHANNEL_OPEN`.
+        if !ch.initiated_by_us {
+            return Err(Error::Protocol(
+                "open-confirm for channel not initiated by us",
+            ));
         }
         ch.remote_id = remote_id;
         ch.remote_window = initial_window;
@@ -748,6 +767,9 @@ impl ConnectionState {
         let local_id = r.read_u32()?;
         let data = r.read_string()?.to_vec();
         let ch = self.get_mut(local_id)?;
+        if !ch.open_confirmed {
+            return Err(Error::Protocol("channel not yet open"));
+        }
         if ch.remote_eof || ch.remote_closed {
             return Err(Error::Protocol("data after EOF/close"));
         }
@@ -770,6 +792,9 @@ impl ConnectionState {
         let code = r.read_u32()?;
         let data = r.read_string()?.to_vec();
         let ch = self.get_mut(local_id)?;
+        if !ch.open_confirmed {
+            return Err(Error::Protocol("channel not yet open"));
+        }
         if ch.remote_eof || ch.remote_closed {
             return Err(Error::Protocol("extended data after EOF/close"));
         }
@@ -791,6 +816,9 @@ impl ConnectionState {
     fn on_channel_eof(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
         let local_id = r.read_u32()?;
         let ch = self.get_mut(local_id)?;
+        if !ch.open_confirmed {
+            return Err(Error::Protocol("channel not yet open"));
+        }
         ch.remote_eof = true;
         Ok(ChannelEvent::Eof { channel: local_id })
     }
@@ -798,6 +826,9 @@ impl ConnectionState {
     fn on_channel_close(&mut self, r: &mut Reader<'_>) -> Result<ChannelEvent> {
         let local_id = r.read_u32()?;
         let ch = self.get_mut(local_id)?;
+        if !ch.open_confirmed {
+            return Err(Error::Protocol("channel not yet open"));
+        }
         ch.remote_closed = true;
         let fully_closed = ch.is_fully_closed();
         if fully_closed {
@@ -813,8 +844,12 @@ impl ConnectionState {
         let n = r.remaining();
         let tail = r.take(n)?;
         let request = ChannelRequest::decode(&name, tail)?;
-        if !self.channels.contains_key(&local_id) {
-            return Err(Error::BadChannelState);
+        let ch = self
+            .channels
+            .get(&local_id)
+            .ok_or(Error::BadChannelState)?;
+        if !ch.open_confirmed {
+            return Err(Error::Protocol("channel not yet open"));
         }
         Ok(ChannelEvent::Request {
             channel: local_id,

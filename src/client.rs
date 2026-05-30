@@ -2432,6 +2432,49 @@ fn fingerprint_b64_sha256(blob: &[u8]) -> String {
     out
 }
 
+/// Emit OpenSSH's `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!`
+/// banner to stderr, listing every previously-stored fingerprint we
+/// would have accepted next to the one the peer is presenting now.
+///
+/// This is what the user sees on a host-key mismatch regardless of the
+/// `on_mismatch` policy: `Reject` then refuses, `AcceptWithWarning`
+/// proceeds, `Prompt` asks. The banner itself never changes — only the
+/// follow-up wording does.
+fn print_mismatch_banner(
+    host: &str,
+    port: u16,
+    expected: &[(String, Vec<u8>)],
+    new_key_type: &str,
+    new_key_blob: &[u8],
+) {
+    let target = if port == 22 {
+        host.to_string()
+    } else {
+        format!("[{host}]:{port}")
+    };
+    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+    eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+    eprintln!("IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!");
+    eprintln!("Someone could be eavesdropping on you right now (man-in-the-middle attack)!");
+    eprintln!("It is also possible that a host key has just been changed.");
+    eprintln!(
+        "The host key for {target} has changed; the known_hosts entry does not match \
+         what the server presented."
+    );
+    if expected.is_empty() {
+        eprintln!("Old fingerprint: <none on file>");
+    } else {
+        for (kt, blob) in expected {
+            eprintln!("Old fingerprint: {} ({kt})", fingerprint_b64_sha256(blob));
+        }
+    }
+    eprintln!(
+        "New fingerprint: {} ({new_key_type})",
+        fingerprint_b64_sha256(new_key_blob),
+    );
+}
+
 fn build_default_kexinit<R: RngCore>(rng: &mut R) -> KexInit {
     let algs = KexAlgorithms {
         kex: defaults::KEX,
@@ -2502,28 +2545,27 @@ fn build_verifier(
             let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
             match lookup {
                 LookupResult::Match => {}
-                LookupResult::Mismatch { .. } => {
+                LookupResult::Mismatch { expected } => {
+                    // ALWAYS print the OpenSSH-style loud banner on
+                    // mismatch, before any policy decision. Shows both
+                    // the previously-stored ("old") fingerprint(s) and
+                    // the new one the peer just presented so the user
+                    // can spot the change without digging through
+                    // known_hosts manually.
+                    print_mismatch_banner(target_host, target_port, &expected, &neg.host_key, k_s);
+
                     let accept = match &kh.on_mismatch {
                         TofuAction::Reject => false,
                         TofuAction::Accept => true,
                         TofuAction::AcceptWithWarning => {
+                            // StrictHostKeyChecking=no: OpenSSH accepts
+                            // for the current session but does NOT
+                            // rotate the stored key. We follow suit —
+                            // the warning was printed above; nothing
+                            // touches the store.
                             eprintln!(
-                                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                            );
-                            eprintln!(
-                                "@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @"
-                            );
-                            eprintln!(
-                                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@"
-                            );
-                            eprintln!(
-                                "Host {target_host}:{target_port} key {} fingerprint: {}",
-                                neg.host_key,
-                                fingerprint_b64_sha256(k_s),
-                            );
-                            eprintln!(
-                                "Continuing anyway because the host-key policy is configured \
-                                 to accept-with-warning on mismatch (insecure)."
+                                "Connecting anyway because StrictHostKeyChecking is set to no; \
+                                 the trusted entry in known_hosts is NOT being updated."
                             );
                             true
                         }
@@ -2531,6 +2573,9 @@ fn build_verifier(
                             // Drop the lock for the duration of the
                             // callback — it may block on stdin and
                             // shouldn't hold up other policy users.
+                            // The loud banner was already printed above
+                            // so the callback only needs to ask the
+                            // accept/refuse question.
                             drop(store);
                             let ok = cb(target_host, target_port, &neg.host_key, k_s);
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
@@ -2540,13 +2585,21 @@ fn build_verifier(
                     if !accept {
                         return Err(Error::HostKeyRejected);
                     }
-                    // Replace the existing entries so future connects
-                    // don't keep tripping the mismatch path. Honours the
-                    // same hash-new / save-path knobs as the Unknown path.
-                    let _ = store.remove(target_host, target_port);
-                    store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
-                    if let Some(path) = &kh.save_path {
-                        store.save(path).map_err(Error::from)?;
+                    // Only rotate the stored entry when the policy is a
+                    // prompt that explicitly returned `true` — i.e. the
+                    // user typed `yes`. `AcceptWithWarning` (the
+                    // StrictHostKeyChecking=no path) deliberately
+                    // leaves the store untouched: OpenSSH does the same.
+                    if matches!(&kh.on_mismatch, TofuAction::Accept | TofuAction::Prompt(_)) {
+                        // Replace the existing entries so future
+                        // connects don't keep tripping the mismatch
+                        // path. Honours the same hash-new / save-path
+                        // knobs as the Unknown path.
+                        let _ = store.remove(target_host, target_port);
+                        store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
+                        if let Some(path) = &kh.save_path {
+                            store.save(path).map_err(Error::from)?;
+                        }
                     }
                 }
                 LookupResult::Unknown => {

@@ -974,9 +974,11 @@ pub unsafe extern "C" fn pcssh_sftp_mkdir(
         };
         // SAFETY: caller contract.
         let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| match sess.mkdir(path_s.as_bytes(), attrs) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
+        with_parent(&s.inner, |sess| {
+            match sess.mkdir(path_s.as_bytes(), attrs) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            }
         })
     })
 }

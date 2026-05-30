@@ -398,7 +398,10 @@ pub fn build_host_key_policy(
     let (on_unknown, on_mismatch) = match strict {
         StrictMode::Yes => (TofuAction::Reject, TofuAction::Reject),
         StrictMode::AcceptNew => (TofuAction::Accept, TofuAction::Reject),
-        StrictMode::Ask => (TofuAction::Prompt(Arc::new(tofu_prompt)), TofuAction::Reject),
+        StrictMode::Ask => (
+            TofuAction::Prompt(Arc::new(tofu_prompt)),
+            TofuAction::Reject,
+        ),
         // `No` mirrors OpenSSH: silently accept unknown, and proceed on
         // mismatch *with a very loud banner* (handled in
         // `client::build_verifier` via `TofuAction::AcceptWithWarning`).

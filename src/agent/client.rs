@@ -197,7 +197,9 @@ fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
     let md = std::fs::symlink_metadata(path)
         .map_err(|e| format!("cannot stat: {e} (does the agent socket exist?)"))?;
     if md.file_type().is_symlink() {
-        return Err("path is a symlink (a malicious symlink could redirect to another agent)".into());
+        return Err(
+            "path is a symlink (a malicious symlink could redirect to another agent)".into(),
+        );
     }
 
     // The standard library exposes file_type().is_file() / .is_dir() but
@@ -206,8 +208,8 @@ fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
     // already-fetched `md` because converting the std Metadata to st_mode
     // is platform-specific and noisy; one extra syscall on a Unix socket
     // path is acceptable.
-    use std::os::unix::ffi::OsStrExt;
     use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
     let c_path = CString::new(path.as_os_str().as_bytes())
         .map_err(|_| "path contains NUL byte".to_string())?;
     // SAFETY: lstat(3) with a valid C string + a zeroed stat buffer; we

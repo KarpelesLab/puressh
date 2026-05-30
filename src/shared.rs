@@ -107,9 +107,7 @@ const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 /// instead of being contained to that connection. The Drop / Read / Write
 /// paths that return `std::io::Result` translate poisoning into a
 /// `BrokenPipe` via [`lock_or_poison_io`] for the same reason.
-fn lock_or_poison<'a>(
-    m: &'a Mutex<Inner>,
-) -> Result<std::sync::MutexGuard<'a, Inner>> {
+fn lock_or_poison<'a>(m: &'a Mutex<Inner>) -> Result<std::sync::MutexGuard<'a, Inner>> {
     m.lock()
         .map_err(|_| Error::Protocol("SharedClient mutex poisoned"))
 }
@@ -117,9 +115,7 @@ fn lock_or_poison<'a>(
 /// `std::io::Result` flavour of [`lock_or_poison`]. Maps poisoning to a
 /// `BrokenPipe` so the `Read` / `Write` impls below can surface it the
 /// same way they surface "channel closed".
-fn lock_or_poison_io<'a>(
-    m: &'a Mutex<Inner>,
-) -> std::io::Result<std::sync::MutexGuard<'a, Inner>> {
+fn lock_or_poison_io<'a>(m: &'a Mutex<Inner>) -> std::io::Result<std::sync::MutexGuard<'a, Inner>> {
     m.lock().map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::BrokenPipe,
@@ -357,10 +353,7 @@ impl SharedClient {
     /// Fallible variant of [`Self::with_client`] for callers that can
     /// propagate poisoning. New FFI surfaces should prefer this.
     #[allow(dead_code)]
-    pub(crate) fn try_with_client<R>(
-        &self,
-        f: impl FnOnce(&mut Client) -> R,
-    ) -> Result<R> {
+    pub(crate) fn try_with_client<R>(&self, f: impl FnOnce(&mut Client) -> R) -> Result<R> {
         let mut g = lock_or_poison(&self.inner)?;
         Ok(f(&mut g.client))
     }
@@ -684,7 +677,12 @@ impl OwnedChannelStream {
                 // and unwound through the mutex guard) cannot strand us.
                 g = cv
                     .wait_timeout(g, WAIT_TIMEOUT)
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SharedClient mutex poisoned"))?
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "SharedClient mutex poisoned",
+                        )
+                    })?
                     .0;
             }
         }
@@ -763,7 +761,12 @@ impl Write for OwnedChannelStream {
                 let cv = notifier_for(&mut g, self.channel);
                 g = cv
                     .wait_timeout(g, WAIT_TIMEOUT)
-                    .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "SharedClient mutex poisoned"))?
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "SharedClient mutex poisoned",
+                        )
+                    })?
                     .0;
             }
         }

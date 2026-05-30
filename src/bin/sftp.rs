@@ -1,7 +1,12 @@
 //! `sftp` — puressh's SFTP client driver.
 //!
 //! ```text
-//! sftp [-P port] [-i identity_file] [-l user] [user@]host
+//! sftp [-P port] [-i identity_file] [-l user]
+//!      [-o StrictHostKeyChecking={yes,no,accept-new,ask}]
+//!      [-o UserKnownHostsFile=PATH]
+//!      [-o HashKnownHosts={yes,no}]
+//!      [-o IdentitiesOnly={yes,no}]
+//!      [user@]host
 //! ```
 //!
 //! Drops into an interactive REPL after authentication. Supports the
@@ -12,29 +17,44 @@
 //! Path resolution is dumb on purpose — relative remote paths are joined
 //! with the SFTP session's virtual cwd via `realpath`; relative local
 //! paths are joined with the process cwd. Glob patterns are not expanded.
+//!
+//! Host-key policy mirrors the `ssh` and `scp` binaries — default is
+//! `StrictHostKeyChecking=ask`. Earlier versions of this binary hard-
+//! coded `HostKeyPolicy::AcceptAny`, which trusted anything on the wire;
+//! that's no longer the default.
 
 use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use puressh::auth::ClientCredential;
-use puressh::client::{Client, Config, HostKeyPolicy};
+use puressh::client::{Client, Config};
 use puressh::sftp::{
     Attrs, FxpStatus, SftpClient, SftpError, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE,
 };
 
 #[path = "common.rs"]
 mod common;
-use common::{load_identity, read_password_from_stdin, resolve_user};
+use common::{
+    build_host_key_policy, connect_agent_credentials, load_identity, read_password_from_stdin,
+    resolve_user, StrictMode,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: sftp [-P port] [-i identity_file] [-l user] [user@]host";
+const USAGE: &str = "usage: sftp [-P port] [-i identity_file] [-l user] \
+                     [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
+                     [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
+                     [-o IdentitiesOnly={yes,no}] [user@]host";
 
 struct Cli {
     port: u16,
     identities: Vec<String>,
     cli_user: Option<String>,
+    strict: StrictMode,
+    known_hosts_path: Option<PathBuf>,
+    hash_known_hosts: bool,
+    identities_only: bool,
     host: String,
     user_in_host: Option<String>,
 }
@@ -43,6 +63,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut port = 22u16;
     let mut identities: Vec<String> = Vec::new();
     let mut cli_user: Option<String> = None;
+    let mut strict = StrictMode::Ask;
+    let mut known_hosts_path: Option<PathBuf> = None;
+    let mut hash_known_hosts = false;
+    let mut identities_only = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -68,6 +92,37 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 let v = args.get(i).ok_or("-l requires a value")?.clone();
                 cli_user = Some(v);
             }
+            "-o" => {
+                i += 1;
+                let v = args.get(i).ok_or("-o requires a value")?;
+                let (k, val) = v
+                    .split_once('=')
+                    .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
+                match k.to_ascii_lowercase().as_str() {
+                    "stricthostkeychecking" => {
+                        strict = match val.to_ascii_lowercase().as_str() {
+                            "yes" => StrictMode::Yes,
+                            "no" | "off" => StrictMode::No,
+                            "accept-new" => StrictMode::AcceptNew,
+                            "ask" => StrictMode::Ask,
+                            other => return Err(format!("unknown StrictHostKeyChecking={other}")),
+                        };
+                    }
+                    "userknownhostsfile" => {
+                        known_hosts_path = Some(PathBuf::from(val));
+                    }
+                    "hashknownhosts" => {
+                        hash_known_hosts =
+                            matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                    }
+                    "identitiesonly" => {
+                        identities_only = matches!(val.to_ascii_lowercase().as_str(), "yes" | "on");
+                    }
+                    other => {
+                        return Err(format!("unsupported -o option: {other}={val}"));
+                    }
+                }
+            }
             s if s.starts_with('-') => {
                 return Err(format!("unknown flag: {s}"));
             }
@@ -92,6 +147,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         port,
         identities,
         cli_user,
+        strict,
+        known_hosts_path,
+        hash_known_hosts,
+        identities_only,
         host,
         user_in_host,
     })
@@ -426,14 +485,30 @@ fn run() -> Result<i32, String> {
     let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     let user = resolve_user(cli.cli_user.as_deref(), cli.user_in_host.as_deref())?;
 
+    let policy = build_host_key_policy(
+        cli.strict,
+        cli.known_hosts_path.clone(),
+        cli.hash_known_hosts,
+    )?;
     let cfg = Config {
-        host_key_policy: HostKeyPolicy::AcceptAny,
+        host_key_policy: policy,
         timeout: None,
     };
-    let addr = (cli.host.as_str(), cli.port);
-    let mut client = Client::connect(addr, cfg).map_err(|e| format!("connect: {e}"))?;
+    // Use connect_to_host so KnownHosts can look the host up by its
+    // user-supplied name (HostKeyPolicy::KnownHosts now fails hard if
+    // the host name is missing, since silently degrading to AcceptAny
+    // would defeat the whole point of the check).
+    let mut client = Client::connect_to_host(cli.host.as_str(), cli.port, cfg)
+        .map_err(|e| format!("connect: {e}"))?;
 
-    let mut authed = false;
+    // Collect publickey credentials (agent first unless IdentitiesOnly=yes).
+    let mut credentials: Vec<ClientCredential> = Vec::new();
+    if !cli.identities_only {
+        match connect_agent_credentials() {
+            Ok(mut from_agent) => credentials.append(&mut from_agent),
+            Err(e) => eprintln!("warning: agent: {e}"),
+        }
+    }
     for id_path in &cli.identities {
         let pk = match load_identity(id_path) {
             Ok(p) => p,
@@ -442,23 +517,23 @@ fn run() -> Result<i32, String> {
                 continue;
             }
         };
-        let hk = match pk.into_host_key() {
-            Ok(h) => h,
-            Err(e) => {
-                eprintln!("warning: identity {id_path}: {e}");
-                continue;
-            }
-        };
-        match client.authenticate(&user, vec![ClientCredential::PublicKey(hk)]) {
-            Ok(()) => {
-                authed = true;
-                break;
-            }
-            Err(e) => {
-                eprintln!("publickey auth with {id_path}: {e}");
-            }
+        match pk.into_host_key() {
+            Ok(hk) => credentials.push(ClientCredential::PublicKey(hk)),
+            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
         }
     }
+
+    let authed = if !credentials.is_empty() {
+        match client.authenticate(&user, credentials) {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("publickey auth: {e}");
+                false
+            }
+        }
+    } else {
+        false
+    };
     if !authed {
         let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
         client

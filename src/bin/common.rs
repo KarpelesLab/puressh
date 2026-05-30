@@ -34,6 +34,7 @@ use puressh::auth::ClientCredential;
 use puressh::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
+use zeroize::Zeroizing;
 
 /// Maps `StrictHostKeyChecking` modes to TOFU behaviour. Mirrors the
 /// OpenSSH-ssh_config knob; the `ssh` binary parses `-o StrictHostKeyChecking=…`
@@ -95,32 +96,155 @@ pub fn parse_userhost_path(target: &str) -> Option<(Option<String>, String, Stri
     Some((user, host, path.to_string()))
 }
 
-/// Read a single line from stdin into a `String`. Used for password prompts;
-/// echo is NOT suppressed because doing so portably requires a dependency
-/// the lib doesn't carry. Documented in the help text.
-pub fn read_password_from_stdin() -> std::io::Result<String> {
+/// Read a passphrase from stdin (or `$SSH_ASKPASS` if set) without
+/// echoing it. Returns a [`Zeroizing<String>`] so the buffer is wiped on
+/// drop — callers should not clone the inner `String` and should drop
+/// the wrapper as soon as auth completes.
+///
+/// Lookup order:
+/// 1. `$SSH_ASKPASS` is set AND we have no controlling tty (matches
+///    OpenSSH): run the named helper, take its first stdout line.
+/// 2. Stdin is a TTY (Unix): disable echo via `tcsetattr(ECHO off)`,
+///    read one line, restore the old settings via a `Drop` guard.
+/// 3. Anything else (non-TTY stdin, no helper, or non-Unix platform):
+///    fall back to plain `read_line` with a warning printed once — the
+///    password *will* be echoed.
+pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
+    // Honour $SSH_ASKPASS the OpenSSH way: only use it when there's no
+    // controlling tty (or when SSH_ASKPASS_REQUIRE=force).
+    if let Some(out) = try_ssh_askpass()? {
+        return Ok(out);
+    }
+
     eprint!("password: ");
     std::io::stderr().flush()?;
-    let mut s = String::new();
+
+    #[cfg(unix)]
+    {
+        if let Some(out) = read_password_no_echo_unix()? {
+            return Ok(out);
+        }
+    }
+
+    // Non-Unix or non-tty stdin: warn once, then read with echo. This
+    // mirrors the v0 behaviour but at least announces it.
+    eprintln!();
+    eprintln!("(warning: terminal echo could not be disabled; password will be visible)");
+    let mut buf = String::new();
+    read_one_line(&mut buf, 4096)?;
+    Ok(Zeroizing::new(buf))
+}
+
+/// Pull one line off stdin into `buf`, stopping at `\n` (which is
+/// consumed but not appended). `\r` is dropped. Capped at `max_len`
+/// bytes to bound memory if the source is unbounded.
+fn read_one_line(buf: &mut String, max_len: usize) -> std::io::Result<()> {
     let mut byte = [0u8; 1];
     let mut stdin = std::io::stdin();
     loop {
         let n = stdin.read(&mut byte)?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
+        if n == 0 || byte[0] == b'\n' {
             break;
         }
         if byte[0] == b'\r' {
             continue;
         }
-        s.push(byte[0] as char);
-        if s.len() > 4096 {
+        buf.push(byte[0] as char);
+        if buf.len() > max_len {
             break;
         }
     }
-    Ok(s)
+    Ok(())
+}
+
+/// Unix-only no-echo password read. Returns `Ok(None)` if stdin isn't
+/// a tty (so caller falls back to plain read with the warning). On
+/// success the terminal echo bit is restored via a `Drop` guard,
+/// even if the read fails or panics.
+#[cfg(unix)]
+fn read_password_no_echo_unix() -> std::io::Result<Option<Zeroizing<String>>> {
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    // SAFETY: zero-init is the documented way to allocate a termios
+    // struct before tcgetattr fills it in.
+    let mut term: libc::termios = unsafe { core::mem::zeroed() };
+    // SAFETY: `fd` is a valid file descriptor (stdin); `term` is a
+    // writable termios.
+    if unsafe { libc::tcgetattr(fd, &mut term as *mut _) } != 0 {
+        // Not a tty (or some other failure); fall back.
+        return Ok(None);
+    }
+    let original = term;
+
+    // Drop guard restores echo even on panic/early-return.
+    struct EchoGuard {
+        fd: libc::c_int,
+        original: libc::termios,
+    }
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            // SAFETY: we captured the original termios just above; the
+            // fd is still stdin, valid for the lifetime of the process.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
+        }
+    }
+
+    term.c_lflag &= !libc::ECHO;
+    // SAFETY: `term` is a valid termios value derived from
+    // `tcgetattr`, with only ECHO cleared.
+    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
+        return Ok(None);
+    }
+    let _guard = EchoGuard { fd, original };
+
+    let mut buf = String::new();
+    let res = read_one_line(&mut buf, 4096);
+    // Print the missing newline so subsequent output doesn't run into
+    // the prompt line.
+    eprintln!();
+    res?;
+    Ok(Some(Zeroizing::new(buf)))
+}
+
+/// Honour `$SSH_ASKPASS` when set: invoke the named helper, take its
+/// first stdout line as the password. The helper conventionally takes
+/// the prompt string as its sole argument. Returns `Ok(None)` if the
+/// env var is unset.
+fn try_ssh_askpass() -> std::io::Result<Option<Zeroizing<String>>> {
+    let askpass = match std::env::var_os("SSH_ASKPASS") {
+        Some(v) if !v.is_empty() => v,
+        _ => return Ok(None),
+    };
+    // OpenSSH consults SSH_ASKPASS_REQUIRE: `force` -> always, `prefer`
+    // -> always if SSH_ASKPASS is set, `never` -> never. We treat any
+    // other value (including unset) as `prefer`, mirroring how the
+    // helper is typically wired up.
+    if let Some(req) = std::env::var_os("SSH_ASKPASS_REQUIRE") {
+        if req == "never" {
+            return Ok(None);
+        }
+    }
+    let mut cmd = std::process::Command::new(askpass);
+    cmd.arg("password: ");
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::inherit());
+    let out = match cmd.output() {
+        Ok(o) => o,
+        Err(_) => return Ok(None),
+    };
+    if !out.status.success() {
+        return Ok(None);
+    }
+    // Take the first line, drop the trailing newline if present.
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if let Some(idx) = s.find('\n') {
+        s.truncate(idx);
+    }
+    if s.ends_with('\r') {
+        s.pop();
+    }
+    Ok(Some(Zeroizing::new(s)))
 }
 
 /// Read an OpenSSH PEM identity file off disk and parse it. We refuse
@@ -250,19 +374,20 @@ pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bo
 }
 
 /// Build the [`HostKeyPolicy`] for a given strict mode + optional override
-/// path + hash-on-write flag. With `StrictMode::No`, the policy is
-/// [`HostKeyPolicy::AcceptAny`] (no known_hosts touched at all); otherwise
-/// the file is loaded (or starts empty), and the action on Unknown depends
-/// on the mode.
+/// path + hash-on-write flag. Every variant loads the known_hosts store —
+/// even `StrictMode::No`, which mirrors OpenSSH's loud-but-tolerant
+/// `StrictHostKeyChecking=no`: unknown hosts are accepted silently
+/// (matching `accept-new`), but a *changed* key still triggers the
+/// `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` banner before the
+/// connection proceeds. Pre-2026 puressh degraded `No` to
+/// `HostKeyPolicy::AcceptAny`, which dropped the mismatch warning on
+/// the floor; that gap is the reason this helper now never returns
+/// `AcceptAny`.
 pub fn build_host_key_policy(
     strict: StrictMode,
     explicit_path: Option<PathBuf>,
     hash_known_hosts: bool,
 ) -> Result<HostKeyPolicy, String> {
-    if strict == StrictMode::No {
-        return Ok(HostKeyPolicy::AcceptAny);
-    }
-
     let path = match explicit_path {
         Some(p) => p,
         None => default_known_hosts_path()
@@ -270,11 +395,16 @@ pub fn build_host_key_policy(
     };
     let store = KnownHosts::load(&path).map_err(|e| format!("load {}: {e}", path.display()))?;
 
-    let on_unknown = match strict {
-        StrictMode::Yes => TofuAction::Reject,
-        StrictMode::AcceptNew => TofuAction::Accept,
-        StrictMode::Ask => TofuAction::Prompt(Arc::new(tofu_prompt)),
-        StrictMode::No => unreachable!(),
+    let (on_unknown, on_mismatch) = match strict {
+        StrictMode::Yes => (TofuAction::Reject, TofuAction::Reject),
+        StrictMode::AcceptNew => (TofuAction::Accept, TofuAction::Reject),
+        StrictMode::Ask => (TofuAction::Prompt(Arc::new(tofu_prompt)), TofuAction::Reject),
+        // `No` mirrors OpenSSH: silently accept unknown, and proceed on
+        // mismatch *with a very loud banner* (handled in
+        // `client::build_verifier` via `TofuAction::AcceptWithWarning`).
+        // The known_hosts file is still consulted/saved so the warning
+        // can compare against the previously-stored fingerprint.
+        StrictMode::No => (TofuAction::Accept, TofuAction::AcceptWithWarning),
     };
 
     Ok(HostKeyPolicy::KnownHosts(KnownHostsPolicy {
@@ -282,5 +412,6 @@ pub fn build_host_key_policy(
         save_path: Some(path),
         hash_new: hash_known_hosts,
         on_unknown,
+        on_mismatch,
     }))
 }

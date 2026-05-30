@@ -58,6 +58,19 @@ const MAX_DRAIN_STEPS: usize = 1_000_000;
 /// exhausted).
 const SUBSYSTEM_EGRESS_BACKLOG: usize = 32;
 
+/// Maximum number of `"env"` channel requests we'll accept on a single
+/// session channel. A peer can ship `env` requests for free before any
+/// `shell` / `exec` / `subsystem` claim — without a cap, tens of
+/// thousands of accepted vars would sit in the per-channel `SessionEnv`
+/// bag forever. Mirrors the OpenSSH default ballpark of a few dozen.
+const MAX_ENV_PER_CHANNEL: usize = 64;
+
+/// Aggregate byte budget for one channel's `SessionEnv` bag, counted as
+/// `name.len() + value.len()` summed across all currently-stored pairs.
+/// Refuses further accepts once an insert would push the total over this
+/// ceiling, even if `MAX_ENV_PER_CHANNEL` has not yet been hit.
+const MAX_ENV_BYTES_PER_CHANNEL: usize = 16 * 1024;
+
 const SSH_DISCONNECT_BY_APPLICATION: u32 = 11;
 const SSH_DISCONNECT_HOST_NOT_ALLOWED: u32 = 9;
 
@@ -2562,10 +2575,44 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             // accepted requests and `CHANNEL_FAILURE` for rejected
             // ones; clients treat the failure as a benign hint.
             if env_name_accepted(&name, &cfg.accept_env) {
-                envs.entry(channel).or_default().insert(name, value);
-                if want_reply {
-                    let p = conn.send_request_success(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                let bag = envs.entry(channel).or_default();
+                // Per-channel env caps (anti-DoS). Without these, a peer
+                // could ship tens of thousands of accepted env requests
+                // before claiming `shell` / `exec` / `subsystem` and
+                // exhaust memory in the SessionEnv bag. Bytes is
+                // sum(name.len() + value.len()) across all stored pairs;
+                // count is the number of distinct names. A repeat insert
+                // of an existing name only changes the value half of the
+                // pair, so we subtract the old value's bytes (and leave
+                // the count unchanged) when projecting the post-insert
+                // total.
+                let replacing = bag.get(&name).map(|v| v.len());
+                let new_count = if replacing.is_some() {
+                    bag.len()
+                } else {
+                    bag.len().saturating_add(1)
+                };
+                let current_bytes: usize = bag.iter().map(|(k, v)| k.len() + v.len()).sum();
+                let new_bytes = if let Some(old_value_len) = replacing {
+                    current_bytes
+                        .saturating_sub(old_value_len)
+                        .saturating_add(value.len())
+                } else {
+                    current_bytes
+                        .saturating_add(name.len())
+                        .saturating_add(value.len())
+                };
+                if new_count > MAX_ENV_PER_CHANNEL || new_bytes > MAX_ENV_BYTES_PER_CHANNEL {
+                    if want_reply {
+                        let p = conn.send_request_failure(channel)?;
+                        write_payload(stream, codec, rng, &p)?;
+                    }
+                } else {
+                    bag.insert(name, value);
+                    if want_reply {
+                        let p = conn.send_request_success(channel)?;
+                        write_payload(stream, codec, rng, &p)?;
+                    }
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;

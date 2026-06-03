@@ -44,7 +44,7 @@ ffi = ["std", "client", "multichannel"]
 pam = ["dep:pam-client2"]
 
 [dependencies]
-purecrypto = { version = "0.2", default-features = false, features = [
+purecrypto = { version = "0.6.1", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der",
 ] }
 compcol = { version = "0.4.2", default-features = false, features = ["alloc", "zlib"], optional = true }

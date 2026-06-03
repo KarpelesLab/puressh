@@ -62,6 +62,11 @@ fn field_len(curve: CurveId) -> usize {
         CurveId::P384 => 48,
         CurveId::P521 => 66,
         CurveId::Secp256k1 => 32,
+        // `CurveId` is `#[non_exhaustive]` upstream. Only the curves above are
+        // ever passed here (see `ecdh_impl!` invocations at the bottom of the
+        // file); anything else would mean a new SSH KEX algorithm was added
+        // without wiring up its field length.
+        _ => unreachable!("unsupported CurveId in SSH ECDH KEX"),
     }
 }
 

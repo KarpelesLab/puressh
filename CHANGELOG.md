@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.4](https://github.com/KarpelesLab/puressh/compare/v0.0.3...v0.0.4) - 2026-06-03
+
+### Other
+
+- bump purecrypto 0.2 → 0.6.1
+- re-export DEFAULT_MAX_CHANNELS_PER_CONNECTION for intra-doc links
+- close apply_attrs chmod TOCTOU with fchmodat AT_SYMLINK_NOFOLLOW
+- reject relative .. symlink targets when jailed
+- reject symlinked dirs in op_opendir/op_fstat when jailed
+- cap max_handles per session (EMFILE DoS)
+- default hide_jail_in_realpath to true (info-leak)
+- cap incoming file size + use fchmod/fchmodat (no-follow)
+- reject C0 control bytes in filenames (terminal injection)
+- switch to linear-time iterative matcher (ReDoS)
+- warn that -X currently equals -Y (no SECURITY-extension cookie)
+- tighten pre-auth banner cap (lines + total bytes)
+- split TOFU prompt; show loud mismatch banner with both fingerprints
+- don't rotate stored host key under StrictHostKeyChecking=no
+- close TOCTOU race on socket setup
+- default-deny + add permit_localhost_only
+- default-deny (was default-permit, multi-tenant bypass)
+- cap per-channel env requests (count + total bytes)
+- cap channels-per-connection (RFC 4254 §5.1 resource-shortage)
+- unique tmp for passphrase rotation
+- create ~/.ssh as 0o700
+- reject malformed [host]:port instead of silent port-22 fallback
+- unique tmp + O_EXCL on save (race + symlink-bait hardening)
+- hard-error on sequence-number overflow (RFC 4253 §6.4)
+- hard-error on invocation counter exhaustion (CVE-class nonce reuse)
+- *(release-plz)* use RELEASE_PLZ_TOKEN PAT, drop manual binaries dispatch
+- interactive shell with PTY, SIGWINCH, exit-status
+- add OpenSSH ssh_config / sshd_config parser, wire into bins
+- try ~/.ssh/id_* defaults and accept -v/-vv/-vvv
+
 ## [0.0.3](https://github.com/KarpelesLab/puressh/compare/v0.0.2...v0.0.3) - 2026-05-30
 
 ### Other

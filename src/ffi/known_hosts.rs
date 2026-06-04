@@ -89,6 +89,10 @@ pub unsafe extern "C" fn pcssh_known_hosts_new(out: *mut *mut PcSshKnownHosts) -
         if out.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
+        // SAFETY: `out` non-NULL per caller contract. Zero up-front so
+        // the post-condition "on error, `*out` is NULL" holds for any
+        // future error path added between here and the success write.
+        unsafe { *out = ptr::null_mut() };
         let kh = PcSshKnownHosts {
             inner: Arc::new(Mutex::new(KnownHosts::new())),
         };
@@ -184,6 +188,12 @@ pub unsafe extern "C" fn pcssh_known_hosts_from_bytes(
         if out.is_null() || (buf.is_null() && len != 0) {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
+        // SAFETY: out non-NULL per check. Zero up-front so the
+        // post-condition "on error, `*out` is NULL" stays correct as
+        // future error paths are added between here and the success
+        // write — matches the convention used by other constructors
+        // (`pcssh_known_hosts_load`, `pcssh_agent_connect`, …).
+        unsafe { *out = ptr::null_mut() };
         // SAFETY: caller contract; len=0 is empty slice.
         let bytes = if len == 0 {
             &[][..]

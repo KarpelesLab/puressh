@@ -297,12 +297,21 @@ pub unsafe extern "C" fn pcssh_sftp_free(sftp: *mut PcSshSftp) {
         // child file/dir handles see `None` on their next op (and return
         // `PCSSH_ERR_INVALID_HANDLE` instead of UAF'ing). The cell
         // itself stays alive as long as those children hold their Arcs.
-        if let Ok(mut g) = boxed.inner.lock() {
-            // Drop the session here, while still holding the lock, so
-            // children waiting on `with_parent` see `None` rather than a
-            // half-dropped session.
-            *g = None;
-        }
+        //
+        // We must wipe even if the mutex is poisoned: poisoning means a
+        // panic happened mid-operation, which leaves the session in an
+        // unknown state — having children continue to call into it
+        // would be strictly worse than getting `PCSSH_ERR_INVALID_HANDLE`.
+        // `PoisonError::into_inner` lets us drop the session anyway.
+        let mut g = match boxed.inner.lock() {
+            Ok(g) => g,
+            Err(e) => e.into_inner(),
+        };
+        // Drop the session here, while still holding the lock, so
+        // children waiting on `with_parent` see `None` rather than a
+        // half-dropped session.
+        *g = None;
+        drop(g);
         drop(boxed);
     }));
 }

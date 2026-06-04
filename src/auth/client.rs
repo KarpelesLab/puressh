@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
-use alloc::string::String;
+use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
@@ -90,6 +90,10 @@ pub struct ClientAuth {
     server_continuations: Vec<String>,
     last_partial_success: bool,
     state: State,
+    /// `server-sig-algs` from `SSH_MSG_EXT_INFO` (RFC 8308 §3.1). When
+    /// present, publickey credentials whose `HostKey::algorithm()` is
+    /// not in this list are skipped before we even probe the server.
+    server_sig_algs: Option<Vec<String>>,
 }
 
 impl ClientAuth {
@@ -105,12 +109,27 @@ impl ClientAuth {
             server_continuations: Vec::new(),
             last_partial_success: false,
             state: State::Initial,
+            server_sig_algs: None,
         }
     }
 
     /// Queue a credential to try; tried in FIFO order.
     pub fn add_credential(&mut self, cred: ClientCredential) {
         self.credentials.push_back(cred);
+    }
+
+    /// Install the comma-separated `server-sig-algs` value learned from
+    /// `SSH_MSG_EXT_INFO` (RFC 8308 §3.1). When set, publickey credentials
+    /// whose signature algorithm name is not in the list are skipped
+    /// rather than probed — this prevents the legacy `ssh-rsa` fallback on
+    /// modern OpenSSH servers that only accept `rsa-sha2-{256,512}`.
+    pub fn set_server_sig_algs(&mut self, csv: &str) {
+        let algs: Vec<String> = csv
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        self.server_sig_algs = Some(algs);
     }
 
     /// Build the very first outbound payload: SERVICE_REQUEST("ssh-userauth").
@@ -179,11 +198,26 @@ impl ClientAuth {
     }
 
     fn server_allows(&self, cred: &ClientCredential) -> bool {
-        if self.server_continuations.is_empty() {
-            return true;
+        // First gate: does the server advertise this *method* on the latest
+        // USERAUTH_FAILURE continuations? (Empty list = no prior failure
+        // observed yet, so all methods are still on the table.)
+        if !self.server_continuations.is_empty() {
+            let name = cred.method_name();
+            if !self.server_continuations.iter().any(|m| m == name) {
+                return false;
+            }
         }
-        let name = cred.method_name();
-        self.server_continuations.iter().any(|m| m == name)
+        // Second gate (RFC 8308 §3.1): if the server advertised
+        // `server-sig-algs`, drop publickey credentials whose signature
+        // algorithm is not on it — saves a USERAUTH_REQUEST round-trip
+        // and skips the legacy `ssh-rsa` fallback on modern servers.
+        if let (ClientCredential::PublicKey(hk), Some(allowed)) = (cred, &self.server_sig_algs) {
+            let algo = hk.algorithm();
+            if !allowed.iter().any(|a| a == algo) {
+                return false;
+            }
+        }
+        true
     }
 
     fn emit_current_request(&mut self) -> Result<ClientStep> {

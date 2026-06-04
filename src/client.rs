@@ -584,6 +584,14 @@ impl Client {
     /// Try every credential in order until one succeeds or all are refused.
     pub fn authenticate(&mut self, user: &str, credentials: Vec<ClientCredential>) -> Result<()> {
         let mut auth = ClientAuth::new(user, self.session_id.clone());
+        // RFC 8308 §3.1: if the server told us which signature algorithms
+        // it will accept on a publickey auth, propagate that to the auth
+        // driver so we skip credentials it would reject anyway.
+        if let Some(ext) = self.runner.peer_ext_info() {
+            if let Some(algs) = ext.server_sig_algs.as_deref() {
+                auth.set_server_sig_algs(algs);
+            }
+        }
         for c in credentials {
             auth.add_credential(c);
         }
@@ -621,6 +629,15 @@ impl Client {
     /// *first* key exchange (RFC 4253 §7.2). Stable across re-keys.
     pub fn session_id(&self) -> &[u8] {
         &self.session_id
+    }
+
+    /// Most recent `SSH_MSG_EXT_INFO` (RFC 8308) received from the server,
+    /// if any. Carries `server-sig-algs` and any forward-compatible
+    /// extensions the server advertised. Returns `None` when neither side
+    /// advertised the `ext-info-{c,s}` markers or the server simply
+    /// declined to send one.
+    pub fn peer_ext_info(&self) -> Option<&crate::transport::ExtInfo> {
+        self.runner.peer_ext_info()
     }
 
     /// Convenience: try publickey authentication only.

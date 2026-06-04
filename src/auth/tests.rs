@@ -687,3 +687,95 @@ fn end_to_end_kbdint_loopback() {
     let done = c.on_packet(&success_payload).unwrap();
     assert!(matches!(done, ClientStep::Success));
 }
+
+#[test]
+fn client_skips_publickey_not_in_server_sig_algs() {
+    // ssh-ed25519 key, server-sig-algs advertises rsa-sha2-{256,512} only.
+    // The client should skip the ed25519 credential entirely (no probe
+    // emitted) and fall through to the next credential — here, password.
+    let hk = Box::new(Ed25519HostKey::from_seed(TEST_SEED));
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.set_server_sig_algs("rsa-sha2-512,rsa-sha2-256");
+    c.add_credential(ClientCredential::PublicKey(hk));
+    c.add_credential(ClientCredential::Password("hunter2".into()));
+
+    let _ = c.start();
+    let step = c
+        .on_packet(
+            &ServiceAccept {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let payload = match step {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected Send"),
+    };
+    // The first emitted request should be the password fallback, not the
+    // disallowed-by-server-sig-algs publickey probe.
+    let parsed = UserauthRequest::decode(&payload).unwrap();
+    assert!(
+        matches!(parsed.method, AuthMethodPayload::Password { .. }),
+        "expected password fallback, got non-password method",
+    );
+}
+
+#[test]
+fn client_accepts_publickey_listed_in_server_sig_algs() {
+    // ssh-ed25519 key, server-sig-algs includes it: probe must go out.
+    let hk = Box::new(Ed25519HostKey::from_seed(TEST_SEED));
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.set_server_sig_algs("ssh-ed25519,rsa-sha2-512");
+    c.add_credential(ClientCredential::PublicKey(hk));
+
+    let _ = c.start();
+    let step = c
+        .on_packet(
+            &ServiceAccept {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let payload = match step {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected Send"),
+    };
+    let parsed = UserauthRequest::decode(&payload).unwrap();
+    match parsed.method {
+        AuthMethodPayload::PublicKey {
+            signature_present,
+            algorithm,
+            ..
+        } => {
+            assert!(!signature_present, "first publickey msg is a probe");
+            assert_eq!(algorithm, "ssh-ed25519");
+        }
+        _ => panic!("expected publickey probe"),
+    }
+}
+
+#[test]
+fn client_unset_server_sig_algs_does_not_filter() {
+    // No call to set_server_sig_algs — every credential is tried.
+    let hk = Box::new(Ed25519HostKey::from_seed(TEST_SEED));
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.add_credential(ClientCredential::PublicKey(hk));
+
+    let _ = c.start();
+    let step = c
+        .on_packet(
+            &ServiceAccept {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let payload = match step {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected Send"),
+    };
+    let parsed = UserauthRequest::decode(&payload).unwrap();
+    assert!(matches!(parsed.method, AuthMethodPayload::PublicKey { .. }));
+}

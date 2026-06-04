@@ -7,6 +7,8 @@
 //! - Key exchange (`SSH_MSG_KEXINIT` + chosen KEX) and key re-exchange
 //! - Negotiated symmetric crypto state for inbound and outbound streams
 
+#[cfg(feature = "alloc")]
+pub mod ext_info;
 pub mod kex;
 pub mod kexinit;
 pub mod packet;
@@ -15,6 +17,10 @@ pub mod rekey;
 pub mod runner;
 pub mod version;
 
+#[cfg(feature = "alloc")]
+pub use ext_info::{
+    is_ext_info_marker, ExtInfo, EXT_INFO_CLIENT_MARKER, EXT_INFO_SERVER_MARKER, SSH_MSG_EXT_INFO,
+};
 pub use kex::{KexAlgorithms, Negotiated};
 pub use kexinit::{KexInit, NegotiatedOwned, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS};
 pub use packet::{Packet, PacketCodec, BLOCK_SIZE_DEFAULT, MAX_PACKET_LEN};

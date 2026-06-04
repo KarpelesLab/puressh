@@ -87,6 +87,27 @@ impl KexInit {
         }
     }
 
+    /// Append the appropriate RFC 8308 `ext-info-{c,s}` marker to this
+    /// advert's `kex_algorithms` list. The marker tells the peer we are
+    /// willing to receive a single `SSH_MSG_EXT_INFO` after `NEWKEYS`.
+    ///
+    /// RFC 8308 §2.1 *forbids* sending the marker in a rekey KEXINIT — call
+    /// this only on the first KEX of a connection.
+    ///
+    /// Like the strict-kex markers, ext-info markers are *signalling* names
+    /// and not real algorithms; the negotiator filters them out before
+    /// picking an agreed KEX.
+    pub fn with_ext_info_marker(mut self, role: super::runner::Role) -> Self {
+        let marker = match role {
+            super::runner::Role::Client => super::ext_info::EXT_INFO_CLIENT_MARKER,
+            super::runner::Role::Server => super::ext_info::EXT_INFO_SERVER_MARKER,
+        };
+        if !self.kex.iter().any(|n| n == marker) {
+            self.kex.push(marker.to_string());
+        }
+        self
+    }
+
     /// Encode the full payload (including the leading message-type byte).
     /// The result is exactly what gets fed in as `I_C` or `I_S` to the
     /// exchange-hash builder.
@@ -208,17 +229,24 @@ pub struct NegotiatedOwned {
     /// counters at NEWKEYS and rejects non-KEX packets between KEXINIT and
     /// NEWKEYS.
     pub strict_kex_enabled: bool,
+    /// True when both sides advertised the matching ext-info marker
+    /// (`ext-info-c` in the client's `kex_algorithms` AND `ext-info-s` in
+    /// the server's). RFC 8308 §2.1. When set, this side may send
+    /// `SSH_MSG_EXT_INFO` immediately after its `NEWKEYS`.
+    pub ext_info_enabled: bool,
 }
 
 /// Walk the **client's** list in order; the first name that also appears in
 /// the **server's** list is the agreed algorithm (RFC 4253 §7.1). For the
-/// KEX category, strict-kex signalling markers
-/// (`kex-strict-{c,s}-v00@openssh.com`) are ignored — they are *not* real
-/// algorithms.
+/// KEX category, the strict-kex signalling markers
+/// (`kex-strict-{c,s}-v00@openssh.com`) and the RFC 8308 ext-info markers
+/// (`ext-info-{c,s}`) are ignored — they are *not* real algorithms.
 fn pick<'a>(category: &'static str, client: &'a [String], server: &[String]) -> Result<&'a str> {
     let is_kex = category == "kex algorithm";
     for name in client {
-        if is_kex && super::kex::is_strict_kex_marker(name) {
+        if is_kex
+            && (super::kex::is_strict_kex_marker(name) || super::ext_info::is_ext_info_marker(name))
+        {
             continue;
         }
         if server.iter().any(|s| s == name) {
@@ -292,6 +320,19 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
         .any(|s| s == super::kex::STRICT_KEX_SERVER_MARKER);
     let strict_kex_enabled = client_advertised && server_advertised;
 
+    // Ext-info (RFC 8308 §2.1): mirror of strict-kex — enabled only when
+    // each side saw the matching marker. A peer that did NOT advertise the
+    // matching marker must not receive an `SSH_MSG_EXT_INFO`.
+    let client_ext = client
+        .kex
+        .iter()
+        .any(|s| s == super::ext_info::EXT_INFO_CLIENT_MARKER);
+    let server_ext = server
+        .kex
+        .iter()
+        .any(|s| s == super::ext_info::EXT_INFO_SERVER_MARKER);
+    let ext_info_enabled = client_ext && server_ext;
+
     Ok(NegotiatedOwned {
         kex: kex.to_string(),
         host_key: host_key.to_string(),
@@ -303,6 +344,7 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
         comp_s2c: comp_s2c.to_string(),
         first_kex_packet_follows_wrong_guess: wrong,
         strict_kex_enabled,
+        ext_info_enabled,
     })
 }
 
@@ -427,6 +469,77 @@ mod tests {
             negotiate(&a, &b),
             Err(Error::NoCommonAlgorithm(_))
         ));
+    }
+
+    #[test]
+    fn ext_info_marker_is_dropped_from_kex_algorithms_list() {
+        use crate::transport::ext_info::EXT_INFO_CLIENT_MARKER;
+        use crate::transport::runner::Role;
+
+        // First-kex advert: marker present, but the negotiator must not
+        // ever pick it as the real KEX algorithm.
+        let base = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16])
+            .with_ext_info_marker(Role::Client);
+        assert!(base.kex.iter().any(|n| n == EXT_INFO_CLIENT_MARKER));
+
+        // Even when the marker is the only commonality, the picker rejects.
+        let mut a = base.clone();
+        let mut b = base.clone();
+        a.kex = vec![EXT_INFO_CLIENT_MARKER.to_string()];
+        b.kex = vec![EXT_INFO_CLIENT_MARKER.to_string()];
+        assert!(matches!(
+            negotiate(&a, &b),
+            Err(Error::NoCommonAlgorithm(_))
+        ));
+    }
+
+    #[test]
+    fn negotiate_ext_info_requires_both_markers() {
+        use crate::transport::ext_info::{EXT_INFO_CLIENT_MARKER, EXT_INFO_SERVER_MARKER};
+        use crate::transport::runner::Role;
+
+        let client_with = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16])
+            .with_ext_info_marker(Role::Client);
+        let server_with = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16])
+            .with_ext_info_marker(Role::Server);
+
+        // Both sides advertise → enabled.
+        let neg = negotiate(&client_with, &server_with).unwrap();
+        assert!(neg.ext_info_enabled);
+
+        // Client missing → disabled.
+        let mut c_no = client_with.clone();
+        c_no.kex.retain(|n| n != EXT_INFO_CLIENT_MARKER);
+        let neg = negotiate(&c_no, &server_with).unwrap();
+        assert!(!neg.ext_info_enabled);
+
+        // Server missing → disabled.
+        let mut s_no = server_with.clone();
+        s_no.kex.retain(|n| n != EXT_INFO_SERVER_MARKER);
+        let neg = negotiate(&client_with, &s_no).unwrap();
+        assert!(!neg.ext_info_enabled);
+
+        // Both missing (defaults; nothing called `with_ext_info_marker`) →
+        // disabled.
+        let base = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16]);
+        let neg = negotiate(&base, &base).unwrap();
+        assert!(!neg.ext_info_enabled);
+    }
+
+    #[test]
+    fn with_ext_info_marker_is_idempotent() {
+        use crate::transport::ext_info::EXT_INFO_CLIENT_MARKER;
+        use crate::transport::runner::Role;
+
+        let ki = KexInit::from_algorithms(&defaults_algorithms(), [0u8; 16])
+            .with_ext_info_marker(Role::Client)
+            .with_ext_info_marker(Role::Client);
+        let count = ki
+            .kex
+            .iter()
+            .filter(|n| n.as_str() == EXT_INFO_CLIENT_MARKER)
+            .count();
+        assert_eq!(count, 1);
     }
 
     #[test]

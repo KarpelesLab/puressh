@@ -11,6 +11,7 @@ use purecrypto::bignum::BoxedUint;
 use purecrypto::dh::{group14, group16, group18, DhGroup, DhPrivateKey, DhPublicKey};
 use purecrypto::hash::{Digest, Sha256, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
+use zeroize::Zeroizing;
 
 use super::common::{
     KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_DH_GEX_GROUP, SSH_MSG_KEX_DH_GEX_INIT,
@@ -137,7 +138,9 @@ where
     let shared = secret
         .shared_secret(&peer)
         .map_err(|_| Error::Crypto("DH agreement failed"))?;
-    let k_mag = shared.into_bytes();
+    // Locally-materialised raw DH shared secret (magnitude bytes). Wipe on
+    // return; the SSH-mpint re-encoding lives on in `KexOutput.k`.
+    let k_mag: Zeroizing<Vec<u8>> = Zeroizing::new(shared.into_bytes());
 
     let k_s = host_key.public_blob();
     let mut eh = ExchangeHash::<D>::new();
@@ -189,7 +192,8 @@ fn dh_client_finish<D: Digest>(
         .secret
         .shared_secret(&peer)
         .map_err(|_| Error::Crypto("DH agreement failed"))?;
-    let k_mag = shared.into_bytes();
+    // Wipe the locally-materialised raw DH shared secret on return.
+    let k_mag: Zeroizing<Vec<u8>> = Zeroizing::new(shared.into_bytes());
 
     let mut eh = ExchangeHash::<D>::new();
     eh.write_string(ctx.v_c);
@@ -424,7 +428,9 @@ impl GexSha256 {
         let shared = secret
             .shared_secret(&peer)
             .map_err(|_| Error::Crypto("DH agreement failed"))?;
-        let k_mag = shared.into_bytes();
+        // Wipe the locally-materialised raw GEX shared secret on return; the
+        // SSH-mpint re-encoding lives on in `KexOutput.k`.
+        let k_mag: Zeroizing<Vec<u8>> = Zeroizing::new(shared.into_bytes());
         let p_mag = group.p().to_be_bytes(group.byte_size());
         let g_mag = group.g().to_be_bytes(group.byte_size());
 
@@ -493,7 +499,8 @@ impl GexSha256 {
         let shared = secret
             .shared_secret(&peer)
             .map_err(|_| Error::Crypto("DH agreement failed"))?;
-        let k_mag = shared.into_bytes();
+        // Wipe the locally-materialised raw GEX shared secret on return.
+        let k_mag: Zeroizing<Vec<u8>> = Zeroizing::new(shared.into_bytes());
 
         let mut eh = ExchangeHash::<Sha256>::new();
         eh.write_string(ctx.v_c);

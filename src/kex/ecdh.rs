@@ -10,6 +10,7 @@ use purecrypto::ec::boxed::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey};
 use purecrypto::ec::curves::CurveId;
 use purecrypto::hash::{Digest, Sha256, Sha384, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
+use zeroize::Zeroizing;
 
 use super::common::{
     KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY,
@@ -110,9 +111,14 @@ where
 
     let secret = BoxedEcdhPrivateKey::generate(curve, rng);
     let q_s = secret.public_key().to_sec1();
-    let k_raw = secret
-        .diffie_hellman(&peer)
-        .map_err(|_| Error::Crypto("ECDH agreement failed"))?;
+    // Raw ECDH shared X-coordinate. Wipe the locally-materialised copy when
+    // the function returns; the SSH-mpint re-encoding lives on in
+    // `KexOutput.k`.
+    let k_raw: Zeroizing<Vec<u8>> = Zeroizing::new(
+        secret
+            .diffie_hellman(&peer)
+            .map_err(|_| Error::Crypto("ECDH agreement failed"))?,
+    );
 
     let k_s = host_key.public_blob();
 
@@ -165,10 +171,13 @@ fn client_finish_inner<D: Digest>(
 
     let peer = BoxedEcdsaPublicKey::from_sec1(state.curve, q_s_bytes)
         .map_err(|_| Error::Format("invalid ECDH Q_S"))?;
-    let k_raw = state
-        .secret
-        .diffie_hellman(&peer)
-        .map_err(|_| Error::Crypto("ECDH agreement failed"))?;
+    // Wipe the locally-materialised raw ECDH shared X-coordinate on return.
+    let k_raw: Zeroizing<Vec<u8>> = Zeroizing::new(
+        state
+            .secret
+            .diffie_hellman(&peer)
+            .map_err(|_| Error::Crypto("ECDH agreement failed"))?,
+    );
 
     let mut eh = ExchangeHash::<D>::new();
     eh.write_string(ctx.v_c);

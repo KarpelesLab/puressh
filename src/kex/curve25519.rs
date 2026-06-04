@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 use purecrypto::ec::x25519::X25519PrivateKey;
 use purecrypto::hash::Sha256;
 use purecrypto::rng::{CryptoRng, RngCore};
+use zeroize::Zeroizing;
 
 use super::common::{
     KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY,
@@ -92,9 +93,16 @@ impl Curve25519Sha256 {
 
         let secret = X25519PrivateKey::generate(rng);
         let q_s = secret.public_key();
-        let k_raw = secret
-            .diffie_hellman(&q_c)
-            .map_err(|_| Error::Crypto("X25519 small-order peer"))?;
+        // The raw 32-byte X25519 shared secret is the highest-value piece of
+        // material in this exchange — wrap the local copy so it is wiped from
+        // the stack when this function returns. The `mpint_bytes` re-encoding
+        // (length-prefixed two's complement) lives on in `KexOutput.k`; that
+        // copy is the responsibility of the transport-layer owner.
+        let k_raw: Zeroizing<[u8; 32]> = Zeroizing::new(
+            secret
+                .diffie_hellman(&q_c)
+                .map_err(|_| Error::Crypto("X25519 small-order peer"))?,
+        );
 
         let k_s = host_key.public_blob();
 
@@ -106,7 +114,7 @@ impl Curve25519Sha256 {
         eh.write_string(&k_s);
         eh.write_string(&q_c);
         eh.write_string(&q_s);
-        eh.write_mpint(&k_raw);
+        eh.write_mpint(&*k_raw);
         let h = eh.finalize();
 
         let sig = host_key.sign(&h)?;
@@ -120,7 +128,7 @@ impl Curve25519Sha256 {
         payload.extend_from_slice(&(sig.len() as u32).to_be_bytes());
         payload.extend_from_slice(&sig);
 
-        let k = mpint_bytes(&k_raw);
+        let k = mpint_bytes(&*k_raw);
         Ok(ServerReplyOut {
             payload,
             kex: KexOutput { k, h },
@@ -149,10 +157,14 @@ impl Curve25519Sha256 {
         q_s.copy_from_slice(q_s_bytes);
         let sig = r.read_string()?;
 
-        let k_raw = state
-            .secret
-            .diffie_hellman(&q_s)
-            .map_err(|_| Error::Crypto("X25519 small-order peer"))?;
+        // Wipe the raw 32-byte X25519 shared secret from the stack on return;
+        // see `server_reply` for rationale.
+        let k_raw: Zeroizing<[u8; 32]> = Zeroizing::new(
+            state
+                .secret
+                .diffie_hellman(&q_s)
+                .map_err(|_| Error::Crypto("X25519 small-order peer"))?,
+        );
 
         let mut eh = ExchangeHash::<Sha256>::new();
         eh.write_string(ctx.v_c);
@@ -162,12 +174,12 @@ impl Curve25519Sha256 {
         eh.write_string(k_s);
         eh.write_string(&state.q_c);
         eh.write_string(&q_s);
-        eh.write_mpint(&k_raw);
+        eh.write_mpint(&*k_raw);
         let h = eh.finalize();
 
         verifier.verify(&h, sig)?;
 
-        let k = mpint_bytes(&k_raw);
+        let k = mpint_bytes(&*k_raw);
         Ok(KexOutput { k, h })
     }
 }

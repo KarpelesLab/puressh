@@ -435,9 +435,15 @@ pub unsafe extern "C" fn pcssh_sftp_read(
             return rc;
         }
         let chunk = got_buf.unwrap_or_default();
-        let got = chunk.len();
+        // Defensive: a misbehaving server (or a bug in the underlying
+        // `sess.read` implementation) could in principle return more
+        // bytes than `want`. Cap the copy at the caller's buffer size
+        // so we can never overflow `buf` — the per-call read clamp
+        // (`want = cap.min(u32::MAX)`) already bounded the *request*
+        // to `cap` bytes, so honest peers never trip this path.
+        let got = chunk.len().min(cap);
         if got > 0 {
-            // SAFETY: cap > 0 → buf non-NULL per check above; got <= want <= cap.
+            // SAFETY: cap > 0 → buf non-NULL per check above; got <= cap by the min above.
             unsafe { ptr::copy_nonoverlapping(chunk.as_ptr(), buf, got) };
             f.offset = f.offset.saturating_add(got as u64);
         }

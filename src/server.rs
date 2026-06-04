@@ -43,7 +43,7 @@ use crate::format::Writer;
 use crate::hostkey::HostKey;
 use crate::transport::kex::{defaults, KexAlgorithms};
 use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
-use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
+use crate::transport::{ExtInfo, KexInit, KexRunner, PacketCodec, Role, VersionExchange};
 
 const MAX_BANNER_LINE: usize = 1024;
 const MAX_BANNER_LINES: usize = 256;
@@ -1191,8 +1191,14 @@ fn do_server_kex<R: RngCore + CryptoRng>(
     v_c: &[u8],
     v_s: &[u8],
 ) -> Result<(KexRunner, Vec<u8>)> {
-    let advert = build_server_kexinit(rng, &cfg.host_keys);
+    // First KEX only: advertise ext-info-s so the client may send us
+    // SSH_MSG_EXT_INFO (RFC 8308 §2.1). Re-KEX paths use the un-marked
+    // builder via KexRunner::restart, which scrubs the marker.
+    let advert = build_server_kexinit(rng, &cfg.host_keys).with_ext_info_marker(Role::Server);
     let mut runner = KexRunner::new(Role::Server, advert);
+    // Queue our outbound EXT_INFO; the runner emits it after NEWKEYS on the
+    // first KEX iff the client also advertised the marker.
+    runner.set_outbound_ext_info(server_ext_info());
     let initial = runner.start(rng)?;
     for p in initial.outbound {
         write_payload(stream, codec, rng, &p)?;
@@ -1597,6 +1603,9 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // Drain any application packets we couldn't process while re-KEXing.
         if !runner.is_kexing() && !deferred.is_empty() {
             let payload = deferred.remove(0);
+            // The deferred queue only ever holds non-KEX, non-EXT_INFO app
+            // traffic. Re-asserting closes the window if it was ever opened.
+            runner.note_inbound_other();
             dispatch_app_packet(
                 stream,
                 codec,
@@ -1687,11 +1696,23 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             read_one_packet(stream, codec, inbox)?
         };
 
+        let msg = payload.first().copied().unwrap_or(0);
+
+        // RFC 8308 §2.3: client may send a single SSH_MSG_EXT_INFO at the
+        // post-NEWKEYS slot of the first KEX. Anywhere else it is a protocol
+        // error.
+        if msg == 7 {
+            if !runner.may_accept_ext_info() {
+                return Err(Error::Protocol("unexpected SSH_MSG_EXT_INFO"));
+            }
+            runner.handle_inbound_ext_info(&payload)?;
+            continue;
+        }
+
         // RFC 4253 §7.3: KEX messages (20, 21, 30..=49) are routed through
         // the KEX runner, not the application layer. A peer-initiated re-KEX
         // is signalled by an inbound SSH_MSG_KEXINIT while we are still in
         // Phase::Completed — handle that by emitting our own KEXINIT first.
-        let msg = payload.first().copied().unwrap_or(0);
         if is_kex_msg(msg) {
             if msg == 20 && !runner.is_kexing() {
                 let advert = build_server_kexinit(rng, &cfg.host_keys);
@@ -1722,6 +1743,10 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             deferred.push(payload);
             continue;
         }
+
+        // RFC 8308 §2.3: the post-NEWKEYS ext-info slot is one-shot. Any
+        // non-EXT_INFO packet closes the acceptance window.
+        runner.note_inbound_other();
 
         dispatch_app_packet(
             stream,
@@ -2810,6 +2835,20 @@ fn pick_host_key<'a>(
         }
     }
     None
+}
+
+/// Build the `SSH_MSG_EXT_INFO` we send to the client on the first KEX.
+/// Carries `server-sig-algs` (RFC 8308 §3.1) so the client can pick
+/// rsa-sha2-{256,512} instead of legacy `ssh-rsa` for publickey signatures.
+fn server_ext_info() -> ExtInfo {
+    // Algorithms we are willing to verify a client publickey signature with.
+    // Order is the same priority as our host-key KEX list — strongest first.
+    // Legacy `ssh-rsa` (SHA-1) is intentionally omitted; it stays opt-in via
+    // hostkey::set_allow_rsa_sha1.
+    ExtInfo::new().with_server_sig_algs(
+        "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
+         rsa-sha2-512,rsa-sha2-256",
+    )
 }
 
 fn build_server_kexinit<R: RngCore>(

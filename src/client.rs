@@ -597,6 +597,11 @@ impl Client {
                 ClientStep::Success => {
                     // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
                     self.codec.activate_compress();
+                    // RFC 8308 §2.3: server may send a second EXT_INFO as
+                    // the first packet after USERAUTH_SUCCESS. Re-open the
+                    // one-shot acceptance window (no-op if ext-info was not
+                    // negotiated).
+                    self.runner.arm_ext_info_post_auth();
                     return Ok(());
                 }
                 ClientStep::Failed { .. } => return Err(Error::AuthFailed),
@@ -1792,7 +1797,9 @@ impl Client {
         self.v_c = v_c;
         self.v_s = v_s;
 
-        let advert = build_default_kexinit(&mut self.rng);
+        // First KEX only: advertise ext-info-c so the server is allowed to
+        // send us SSH_MSG_EXT_INFO with server-sig-algs (RFC 8308 §2.1).
+        let advert = build_default_kexinit(&mut self.rng).with_ext_info_marker(Role::Client);
         self.runner = KexRunner::new(Role::Client, advert);
         let initial = self.runner.start(&mut self.rng)?;
         for p in initial.outbound {
@@ -1909,6 +1916,10 @@ impl Client {
             // Drain any app packets we buffered during a re-KEX before
             // pulling more bytes off the wire.
             if !self.runner.is_kexing() && !self.deferred.is_empty() {
+                // Deferred packets are non-KEX, non-EXT_INFO app traffic;
+                // surfacing them closes the ext-info one-shot window if
+                // it was somehow still open (rekey itself does not open it).
+                self.runner.note_inbound_other();
                 return Ok(self.deferred.remove(0));
             }
 
@@ -1929,6 +1940,15 @@ impl Client {
                 Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
                 // SSH_MSG_IGNORE, SSH_MSG_UNIMPLEMENTED, SSH_MSG_DEBUG — drop.
                 Some(2) | Some(3) | Some(4) => continue,
+                // SSH_MSG_EXT_INFO (RFC 8308) — route into the runner only at
+                // the legal one-shot slot. Outside it, fail loudly per §2.3.
+                Some(7) => {
+                    if !self.runner.may_accept_ext_info() {
+                        return Err(Error::Protocol("unexpected SSH_MSG_EXT_INFO"));
+                    }
+                    self.runner.handle_inbound_ext_info(&payload)?;
+                    continue;
+                }
                 // KEX messages route through the runner. A SSH_MSG_KEXINIT
                 // (20) while we're not already KEXing is a peer-initiated
                 // re-KEX — we must answer with our own KEXINIT first.
@@ -1951,6 +1971,9 @@ impl Client {
                         self.deferred.push(payload);
                         continue;
                     }
+                    // Any non-EXT_INFO packet at the post-NEWKEYS slot
+                    // closes the one-shot acceptance window — RFC 8308 §2.3.
+                    self.runner.note_inbound_other();
                     return Ok(payload);
                 }
             }

@@ -10,6 +10,7 @@
 
 use purecrypto::cipher::{ChaCha20, Poly1305};
 use purecrypto::ct::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
@@ -24,8 +25,13 @@ impl ChaChaPoly {
         if key.len() != 64 {
             return Err(Error::Format("chacha20-poly1305 key len"));
         }
-        let mut k2 = [0u8; 32];
-        let mut k1 = [0u8; 32];
+        // Wrap the locally-materialised K_2 (payload) and K_1 (length-field)
+        // keys in `Zeroizing` so the 32-byte ChaCha20 raw key bytes are wiped
+        // from the caller's stack frame after `ChaCha20::new` has folded them
+        // into the upstream cipher state. The cipher state itself is owned by
+        // `purecrypto::cipher::ChaCha20` and not zeroized by us.
+        let mut k2: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
+        let mut k1: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         k2.copy_from_slice(&key[..32]);
         k1.copy_from_slice(&key[32..]);
         Ok(ChaChaPoly {
@@ -58,7 +64,10 @@ impl ChaChaPoly {
     pub(crate) fn tag(&self, seq: u64, enc_len: &[u8], enc_payload: &[u8]) -> [u8; 16] {
         let n = Self::nonce(seq);
         let block0 = self.payload_key.block(&n, 0);
-        let mut otk = [0u8; 32];
+        // The Poly1305 one-time key is per-packet but lets a holder forge a
+        // tag for that packet, so wipe the locally-materialised copy after
+        // it has been folded into the MAC state.
+        let mut otk: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
         otk.copy_from_slice(&block0[..32]);
         let mut mac = Poly1305::new(&otk);
         mac.update(enc_len);

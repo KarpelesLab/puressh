@@ -31,6 +31,7 @@ use crate::kex::{
 use crate::mac::{mac_by_name, SshMac};
 use purecrypto::dh::{group14, group16, group18, DhGroup};
 
+use super::ext_info::ExtInfo;
 use super::kex::Negotiated;
 use super::kexinit::{negotiate, KexInit, NegotiatedOwned, SSH_MSG_NEWKEYS};
 use super::packet::PacketCodec;
@@ -216,6 +217,36 @@ pub struct KexRunner {
     /// hint produced the wrong guess (RFC 4253 §7.1). The next KEX
     /// algorithm-specific packet must be silently discarded.
     pending_wrong_guess_discard: bool,
+    /// `true` until [`Self::restart`] is called for the first time. RFC
+    /// 8308 §2.1 ties the ext-info advert + send eligibility to the *first*
+    /// KEX of a connection; we drop the marker from rekey adverts and
+    /// refuse to send/receive a second ext-info even if a peer asks.
+    first_kex: bool,
+    /// True when the most recent negotiation enabled ext-info (RFC 8308).
+    /// Like strict-kex, this is set at `handle_peer_kexinit` time. Unlike
+    /// strict-kex it is NOT carried across rekeys: ext-info only fires on
+    /// the first KEX.
+    ext_info_enabled: bool,
+    /// Outbound `SSH_MSG_EXT_INFO` payload the caller would like us to
+    /// send. The runner emits it as part of the outbound batch produced by
+    /// `handle_peer_newkeys` on the first KEX iff [`ext_info_enabled`] is
+    /// true. Caller fills via [`Self::set_outbound_ext_info`].
+    outbound_ext_info: Option<ExtInfo>,
+    /// Parsed `SSH_MSG_EXT_INFO` received from the peer. Updated by
+    /// [`Self::handle_inbound_ext_info`]; consumers read via
+    /// [`Self::peer_ext_info`].
+    peer_ext_info: Option<ExtInfo>,
+    /// True iff the peer is *currently* allowed to send us a single
+    /// `SSH_MSG_EXT_INFO`. Becomes true:
+    ///
+    /// - immediately after the peer's NEWKEYS on the first KEX (when
+    ///   both sides advertised the marker), and
+    /// - on the client, after the higher layer notes
+    ///   `SSH_MSG_USERAUTH_SUCCESS` via [`Self::arm_ext_info_post_auth`].
+    ///
+    /// Becomes false again on the very next packet of any kind from the
+    /// peer (whether or not it was the ext-info).
+    accept_ext_info_now: bool,
 }
 
 impl KexRunner {
@@ -240,6 +271,11 @@ impl KexRunner {
             phase: Phase::Idle,
             strict_kex: false,
             pending_wrong_guess_discard: false,
+            first_kex: true,
+            ext_info_enabled: false,
+            outbound_ext_info: None,
+            peer_ext_info: None,
+            accept_ext_info_now: false,
         }
     }
 
@@ -296,6 +332,13 @@ impl KexRunner {
         // session_id stays put — it's the H of the FIRST KEX (RFC 4253 §7.2).
         // strict_kex is also latched across re-keys: once enabled on a
         // connection it cannot be downgraded by the peer mid-session.
+        // Ext-info, by contrast, is FIRST-KEX-ONLY: clear the per-connection
+        // flags and refuse to send/receive a second ext-info regardless of
+        // what the peer's rekey advert claims (RFC 8308 §2.1).
+        self.first_kex = false;
+        self.ext_info_enabled = false;
+        self.outbound_ext_info = None;
+        self.accept_ext_info_now = false;
         self.phase = Phase::SentKexInit;
         Ok(KexAdvance {
             outbound: vec![self.our_advert_bytes.clone()],
@@ -338,6 +381,15 @@ impl KexRunner {
             return Err(Error::Format("empty payload"));
         }
         let msg = payload[0];
+
+        // RFC 8308 §2.3: the ext-info one-shot window covers exactly the
+        // first post-NEWKEYS packet from the peer. Whatever lands here
+        // closes it — the higher-layer router only forwards non-KEX
+        // packets via [`Self::note_inbound_other`], so this covers the
+        // KEX-message case (e.g. a rekey KEXINIT). The window is
+        // re-armed later via [`Self::arm_ext_info_post_auth`] for the
+        // client's post-USERAUTH_SUCCESS opportunity.
+        self.accept_ext_info_now = false;
 
         // RFC 4253 §7.1 wrong-guess discard. The peer set
         // `first_kex_packet_follows` and our negotiation said the guess
@@ -455,6 +507,80 @@ impl KexRunner {
         self.installed_keys.as_ref()
     }
 
+    /// Set the `SSH_MSG_EXT_INFO` we'd like the runner to emit. The runner
+    /// only sends it iff (a) ext-info negotiation succeeded on the first
+    /// KEX AND (b) this method has been called before the runner has
+    /// already produced the post-NEWKEYS outbound batch. Setting it twice
+    /// replaces the previous value.
+    ///
+    /// Set this from the higher layer per role: the server typically wants
+    /// to advertise `server-sig-algs`; the client may advertise
+    /// `publickey-algorithms-in-use` or simply send an empty ext-info.
+    pub fn set_outbound_ext_info(&mut self, ext: ExtInfo) {
+        self.outbound_ext_info = Some(ext);
+    }
+
+    /// `true` iff RFC 8308 ext-info negotiation succeeded on the first
+    /// KEX. Cleared on every rekey. The higher layer consults this when
+    /// deciding whether to honour `server-sig-algs` for pubkey algorithm
+    /// selection.
+    pub fn ext_info_enabled(&self) -> bool {
+        self.ext_info_enabled
+    }
+
+    /// Most-recent `SSH_MSG_EXT_INFO` received from the peer. The auth
+    /// layer reads `server_sig_algs` from here to pick the strongest pubkey
+    /// signature algorithm the server accepts.
+    pub fn peer_ext_info(&self) -> Option<&ExtInfo> {
+        self.peer_ext_info.as_ref()
+    }
+
+    /// `true` iff the runner is currently in a state where a
+    /// `SSH_MSG_EXT_INFO` from the peer would be accepted per RFC 8308 §2.3.
+    /// The higher-layer router uses this as a precondition before calling
+    /// [`Self::handle_inbound_ext_info`]; any other inbound packet seen
+    /// while this is true *closes* the window (see [`Self::note_inbound_other`]).
+    pub fn may_accept_ext_info(&self) -> bool {
+        self.accept_ext_info_now
+    }
+
+    /// Arm the ext-info acceptance window because the client just observed
+    /// `SSH_MSG_USERAUTH_SUCCESS`. RFC 8308 §2.3 permits a server to send a
+    /// second ext-info as the very first packet after USERAUTH_SUCCESS.
+    ///
+    /// Only takes effect when ext-info was negotiated. No-op on the server.
+    pub fn arm_ext_info_post_auth(&mut self) {
+        if self.role == Role::Client && self.ext_info_enabled {
+            self.accept_ext_info_now = true;
+        }
+    }
+
+    /// Parse and stash an `SSH_MSG_EXT_INFO` payload received from the peer.
+    /// Closes the acceptance window and (for the client) also marks that
+    /// we've consumed the post-NEWKEYS / post-USERAUTH_SUCCESS one-shot.
+    ///
+    /// Returns `Error::Protocol("unexpected SSH_MSG_EXT_INFO")` if the
+    /// runner is not currently armed to accept one.
+    pub fn handle_inbound_ext_info(&mut self, payload: &[u8]) -> Result<()> {
+        if !self.accept_ext_info_now {
+            return Err(Error::Protocol("unexpected SSH_MSG_EXT_INFO"));
+        }
+        let parsed = ExtInfo::decode(payload)?;
+        self.peer_ext_info = Some(parsed);
+        self.accept_ext_info_now = false;
+        Ok(())
+    }
+
+    /// Tell the runner that the higher layer has just routed a non-ext-info
+    /// packet through it. Closes the one-shot ext-info acceptance window
+    /// without recording anything. Callers SHOULD invoke this right before
+    /// dispatching the inbound packet to the auth / connection layers, on
+    /// every post-NEWKEYS packet — RFC 8308 §2.3 makes ext-info a one-shot
+    /// at the legal position.
+    pub fn note_inbound_other(&mut self) {
+        self.accept_ext_info_now = false;
+    }
+
     fn handle_peer_kexinit<R: RngCore + CryptoRng>(
         &mut self,
         rng: &mut R,
@@ -475,6 +601,9 @@ impl KexRunner {
         if neg.strict_kex_enabled {
             self.strict_kex = true;
         }
+        // RFC 8308 §2.1: ext-info MUST be ignored on rekeys. Even if a
+        // misbehaving peer advertised the marker again, we refuse.
+        self.ext_info_enabled = self.first_kex && neg.ext_info_enabled;
         // Per RFC 4253 §7.1: if the peer prefixed a guess to its KEXINIT
         // and our negotiation says that guess was wrong, the next KEX
         // algorithm-specific packet from the peer must be silently dropped.
@@ -851,7 +980,26 @@ impl KexRunner {
         self.peer_newkeys = true;
         self.maybe_install(codec)?;
         self.phase = Phase::Completed;
-        Ok(KexAdvance::default())
+
+        // RFC 8308 §2.3: once the peer's NEWKEYS has landed on the first
+        // KEX, the next packet from the peer MAY be `SSH_MSG_EXT_INFO`.
+        // Arm a one-shot acceptance window the higher-layer router can
+        // consult.
+        let mut adv = KexAdvance::default();
+        if self.first_kex && self.ext_info_enabled {
+            self.accept_ext_info_now = true;
+
+            // Emit our own ext-info if the caller supplied one. New keys
+            // are now installed (maybe_install fired above), so the codec
+            // will frame this packet under the post-NEWKEYS cipher.
+            if let Some(ext) = self.outbound_ext_info.take() {
+                adv.outbound.push(ext.encode());
+            }
+        }
+        // First-kex bookkeeping: clear the flag now that the first KEX has
+        // completed end-to-end. Subsequent rekeys are gated by `first_kex
+        // = false` in `restart`.
+        Ok(adv)
     }
 
     fn maybe_install(&mut self, codec: &mut PacketCodec) -> Result<()> {
@@ -1653,5 +1801,415 @@ mod tests {
         let frame = client_codec.encode(b"after rekey", &mut rng).unwrap();
         let (got, _) = server_codec.decode(&frame).unwrap().expect("rekeyed frame");
         assert_eq!(got, b"after rekey");
+    }
+
+    fn make_advert_ext_info(cipher: &'static str, mac: &'static str, role: Role) -> KexInit {
+        make_advert(cipher, mac).with_ext_info_marker(role)
+    }
+
+    /// Like [`drive_to_completion`] but ext-info-aware: msg-type 7 packets
+    /// are routed to `handle_inbound_ext_info` instead of `on_packet`.
+    #[allow(clippy::too_many_arguments)]
+    fn drive_to_completion_ext_aware(
+        client: &mut KexRunner,
+        server: &mut KexRunner,
+        client_codec: &mut PacketCodec,
+        server_codec: &mut PacketCodec,
+        client_verifier: &dyn HostKeyVerify,
+        server_hk: &dyn HostKey,
+        from_client: &mut Vec<Vec<u8>>,
+        from_server: &mut Vec<Vec<u8>>,
+        v_c: &[u8],
+        v_s: &[u8],
+    ) {
+        use crate::transport::ext_info::SSH_MSG_EXT_INFO;
+        let mut rng = OsRng;
+        let mut steps = 0;
+        loop {
+            steps += 1;
+            assert!(steps < 24, "handshake did not converge");
+            let mut next_from_client = Vec::new();
+            for p in from_server.drain(..) {
+                if p.first() == Some(&SSH_MSG_EXT_INFO) {
+                    client.handle_inbound_ext_info(&p).unwrap();
+                } else {
+                    let adv = client
+                        .on_packet(
+                            &mut rng,
+                            client_codec,
+                            &p,
+                            None,
+                            Some(client_verifier),
+                            v_c,
+                            v_s,
+                        )
+                        .unwrap();
+                    next_from_client.extend(adv.outbound);
+                }
+            }
+            let mut next_from_server = Vec::new();
+            for p in from_client.drain(..) {
+                if p.first() == Some(&SSH_MSG_EXT_INFO) {
+                    server.handle_inbound_ext_info(&p).unwrap();
+                } else {
+                    let adv = server
+                        .on_packet(&mut rng, server_codec, &p, Some(server_hk), None, v_c, v_s)
+                        .unwrap();
+                    next_from_server.extend(adv.outbound);
+                }
+            }
+            *from_client = next_from_client;
+            *from_server = next_from_server;
+            if from_client.is_empty() && from_server.is_empty() {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn ext_info_round_trips_after_first_kex_when_negotiated() {
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(
+            Role::Client,
+            make_advert_ext_info(cipher, mac, Role::Client),
+        );
+        let mut server = KexRunner::new(
+            Role::Server,
+            make_advert_ext_info(cipher, mac, Role::Server),
+        );
+
+        // Server stashes the ext-info it wants to send (server-sig-algs).
+        server.set_outbound_ext_info(
+            ExtInfo::new().with_server_sig_algs("rsa-sha2-512,rsa-sha2-256,ssh-ed25519"),
+        );
+        // Client likewise advertises its pubkey algorithms.
+        client.set_outbound_ext_info(
+            ExtInfo::new().with_publickey_algorithms_in_use("ssh-ed25519,rsa-sha2-512"),
+        );
+
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion_ext_aware(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        // Both sides negotiated ext-info.
+        assert!(client.ext_info_enabled());
+        assert!(server.ext_info_enabled());
+
+        // Ext-info delivered both ways by the drive helper.
+        let client_view = client.peer_ext_info().expect("client got peer ext-info");
+        assert_eq!(
+            client_view.server_sig_algs.as_deref(),
+            Some("rsa-sha2-512,rsa-sha2-256,ssh-ed25519"),
+        );
+        let server_view = server.peer_ext_info().expect("server got peer ext-info");
+        assert_eq!(
+            server_view.publickey_algorithms_in_use.as_deref(),
+            Some("ssh-ed25519,rsa-sha2-512"),
+        );
+
+        // The one-shot window is closed on both sides.
+        assert!(!client.may_accept_ext_info());
+        assert!(!server.may_accept_ext_info());
+    }
+
+    #[test]
+    fn ext_info_not_emitted_when_peer_did_not_advertise_marker() {
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        // Server advertises the marker; client does not. The runner must
+        // refuse to emit ext-info even though the server has one queued.
+        let mut client = KexRunner::new(Role::Client, make_advert(cipher, mac));
+        let mut server = KexRunner::new(
+            Role::Server,
+            make_advert_ext_info(cipher, mac, Role::Server),
+        );
+        server.set_outbound_ext_info(ExtInfo::new().with_server_sig_algs("rsa-sha2-512"));
+
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        assert!(!server.ext_info_enabled());
+        assert!(!client.ext_info_enabled());
+        // No EXT_INFO payloads should be in flight on either direction.
+        assert!(from_client.is_empty());
+        assert!(from_server.is_empty());
+        assert!(!client.may_accept_ext_info());
+        assert!(!server.may_accept_ext_info());
+    }
+
+    #[test]
+    fn ext_info_inbound_before_newkeys_is_rejected() {
+        // The runner is `Idle` (start hasn't been called). Feeding it an
+        // ext-info via `handle_inbound_ext_info` must error.
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+        let mut client = KexRunner::new(
+            Role::Client,
+            make_advert_ext_info(cipher, mac, Role::Client),
+        );
+        let ext_bytes = ExtInfo::new().with_server_sig_algs("ssh-ed25519").encode();
+        let err = client.handle_inbound_ext_info(&ext_bytes).unwrap_err();
+        match err {
+            Error::Protocol(m) => assert_eq!(m, "unexpected SSH_MSG_EXT_INFO"),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn second_ext_info_after_first_is_rejected() {
+        // Drive a normal KEX with ext-info negotiated. After the first
+        // ext-info is consumed, a second one must be refused — the
+        // window is one-shot until `arm_ext_info_post_auth` re-arms it.
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(
+            Role::Client,
+            make_advert_ext_info(cipher, mac, Role::Client),
+        );
+        let mut server = KexRunner::new(
+            Role::Server,
+            make_advert_ext_info(cipher, mac, Role::Server),
+        );
+        server.set_outbound_ext_info(ExtInfo::new().with_server_sig_algs("rsa-sha2-512"));
+
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        // Consume the server's ext-info.
+        let first = from_server.remove(0);
+        client.handle_inbound_ext_info(&first).unwrap();
+        assert!(!client.may_accept_ext_info());
+
+        // Feed a second ext-info directly — must be refused.
+        let second = ExtInfo::new().with_server_sig_algs("rsa-sha2-256").encode();
+        let err = client.handle_inbound_ext_info(&second).unwrap_err();
+        match err {
+            Error::Protocol(m) => assert_eq!(m, "unexpected SSH_MSG_EXT_INFO"),
+            other => panic!("expected Protocol, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arm_ext_info_post_auth_re_opens_window_on_client_only() {
+        // After USERAUTH_SUCCESS the client may receive a second ext-info.
+        // The server has no equivalent re-arm; calling the same method on a
+        // server runner is a no-op.
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(
+            Role::Client,
+            make_advert_ext_info(cipher, mac, Role::Client),
+        );
+        let mut server = KexRunner::new(
+            Role::Server,
+            make_advert_ext_info(cipher, mac, Role::Server),
+        );
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        // First-KEX window is open on both sides because ext-info was
+        // negotiated. The higher layer normally drains it by routing the
+        // peer's ext-info (or by noting some other packet); simulate that
+        // closure here.
+        assert!(client.may_accept_ext_info());
+        assert!(server.may_accept_ext_info());
+        client.note_inbound_other();
+        server.note_inbound_other();
+        assert!(!client.may_accept_ext_info());
+        assert!(!server.may_accept_ext_info());
+
+        // Now the client observes USERAUTH_SUCCESS — the window re-opens
+        // exactly once.
+        client.arm_ext_info_post_auth();
+        assert!(client.may_accept_ext_info());
+
+        // Server: no re-arm.
+        server.arm_ext_info_post_auth();
+        assert!(!server.may_accept_ext_info());
+    }
+
+    #[test]
+    fn rekey_does_not_advertise_or_accept_ext_info() {
+        // After the first KEX completes, restart() must reset first_kex
+        // and ext_info_enabled to false, so a rekey advert does not carry
+        // the marker and a peer ext-info post-rekey is rejected.
+        let mut rng = OsRng;
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let server_hk = Ed25519HostKey::from_seed(seed);
+        let public = server_hk.public_bytes();
+        let client_verifier = Ed25519HostKey::from_public(public);
+
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+
+        let mut client = KexRunner::new(
+            Role::Client,
+            make_advert_ext_info(cipher, mac, Role::Client),
+        );
+        let mut server = KexRunner::new(
+            Role::Server,
+            make_advert_ext_info(cipher, mac, Role::Server),
+        );
+        let mut client_codec = PacketCodec::new();
+        let mut server_codec = PacketCodec::new();
+
+        let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
+        let mut from_server: Vec<Vec<u8>> = server.start(&mut rng).unwrap().outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+        assert!(client.ext_info_enabled());
+        assert!(server.ext_info_enabled());
+
+        // Rekey — advert MUST NOT carry the ext-info marker even if a
+        // caller mistakenly re-applied `with_ext_info_marker`. The runner
+        // strips/ignores it via `first_kex = false` && `ext_info_enabled = false`.
+        let rekey_client_advert = make_advert_ext_info(cipher, mac, Role::Client);
+        let rekey_server_advert = make_advert_ext_info(cipher, mac, Role::Server);
+        let mut from_client: Vec<Vec<u8>> = client
+            .restart(&mut rng, rekey_client_advert)
+            .unwrap()
+            .outbound;
+        let mut from_server: Vec<Vec<u8>> = server
+            .restart(&mut rng, rekey_server_advert)
+            .unwrap()
+            .outbound;
+        drive_to_completion(
+            &mut client,
+            &mut server,
+            &mut client_codec,
+            &mut server_codec,
+            &client_verifier,
+            &server_hk,
+            &mut from_client,
+            &mut from_server,
+            v_c,
+            v_s,
+        );
+
+        // Rekey: ext-info MUST be disabled on both sides.
+        assert!(!client.ext_info_enabled());
+        assert!(!server.ext_info_enabled());
+        assert!(!client.may_accept_ext_info());
+        assert!(!server.may_accept_ext_info());
+
+        // Even if the peer sends ext-info post-rekey, the runner rejects.
+        let stray = ExtInfo::new().with_server_sig_algs("ssh-ed25519").encode();
+        assert!(matches!(
+            client.handle_inbound_ext_info(&stray),
+            Err(Error::Protocol(_))
+        ));
     }
 }

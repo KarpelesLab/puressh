@@ -964,9 +964,20 @@ impl OwnedChannelStream {
             Stream::Data => &mut queue.data,
             Stream::Stderr => &mut queue.stderr,
         };
-        let n = core::cmp::min(buf.len(), src.len());
-        for slot in buf.iter_mut().take(n) {
-            *slot = src.pop_front().unwrap();
+        // Iterate up to `buf.len()` slots, but stop as soon as `src` empties.
+        // `zip` with `pop_front()` returning `Option<u8>` would shorten the
+        // sequence early on its own; the `while let` form keeps the loop body
+        // panic-free without needing the previous `unwrap()` after a manual
+        // `min` (which assumed `src.len()` couldn't change under our feet).
+        let mut n = 0;
+        for slot in buf.iter_mut() {
+            match src.pop_front() {
+                Some(b) => {
+                    *slot = b;
+                    n += 1;
+                }
+                None => break,
+            }
         }
         n
     }

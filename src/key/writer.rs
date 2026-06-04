@@ -176,14 +176,17 @@ impl PrivateKey {
         rng: &mut R,
         passphrase: Option<&[u8]>,
     ) -> Result<String> {
-        let encrypt = matches!(passphrase, Some(p) if !p.is_empty());
-        let block = if encrypt { 16 } else { 8 };
+        // `non_empty_pass` is the single source of truth for "encrypt?": both
+        // the `block` choice and the encryption branch read from it, so the
+        // branches can't disagree (which was the latent risk behind the prior
+        // `passphrase.expect("checked above")`).
+        let non_empty_pass = passphrase.filter(|p| !p.is_empty());
+        let block = if non_empty_pass.is_some() { 16 } else { 8 };
 
         let inner = encode_inner_block(rng, self, block);
         let pub_blob = self.public_key().wire_blob();
 
-        let (ciphername, kdfname, kdfoptions, payload) = if encrypt {
-            let pass = passphrase.expect("checked above");
+        let (ciphername, kdfname, kdfoptions, payload) = if let Some(pass) = non_empty_pass {
             let mut salt = [0u8; SALT_LEN];
             rng.fill_bytes(&mut salt);
             // `derived` is a wrapping passphrase-equivalent secret: from

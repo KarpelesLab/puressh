@@ -209,10 +209,132 @@ fn read_password_no_echo_unix() -> std::io::Result<Option<Zeroizing<String>>> {
 /// IEXTEN` on `c_lflag`, `IXON | ICRNL | BRKINT | INPCK | ISTRIP` on
 /// `c_iflag`, `OPOST` on `c_oflag`, plus `VMIN=1 / VTIME=0` so reads
 /// return as soon as a single byte arrives.
+///
+/// In addition to the `Drop` restore (which covers normal exit + panic
+/// unwind), `install` arms an async-signal-safe handler for
+/// SIGINT/SIGTERM/SIGHUP/SIGQUIT that runs `tcsetattr` back to the
+/// saved settings *before* the process dies — otherwise Ctrl-C from
+/// the local tty would leave the user's shell in raw mode, no echo,
+/// no line discipline, and they'd have to type `reset` blind. The
+/// handler is installed with `SA_RESETHAND` so the second occurrence
+/// of the same signal kills the process with the default disposition
+/// (and the correct WIFSIGNALED exit code); the first occurrence both
+/// restores termios and re-raises the signal after re-installing the
+/// previous disposition.
+///
+/// Nested guards on the same fd are NOT supported: `install` will
+/// fall back to a Drop-only guard (no signal handler) when one is
+/// already armed, so the outer guard's handler stays in place and
+/// the inner guard is a no-op for signal purposes. The current call
+/// site in `ssh.rs` never nests, so this is a defensive contract,
+/// not a hot path.
 #[cfg(unix)]
 pub struct TermiosRawGuard {
     fd: libc::c_int,
     original: libc::termios,
+    /// `true` when *this* guard owns the installed signal handlers
+    /// and must tear them down on drop; `false` for a nested
+    /// guard (which restores termios on drop but leaves the
+    /// outer guard's handler in place).
+    owns_handler: bool,
+}
+
+#[cfg(unix)]
+mod termios_signal {
+    //! Signal-handler state for [`super::TermiosRawGuard`].
+    //!
+    //! Everything here is laid out so the handler can run from
+    //! inside `sigaction(2)` without touching anything that isn't
+    //! on POSIX's async-signal-safe list (`tcsetattr`, `sigaction`,
+    //! `raise`, atomic loads/stores). No `Mutex`, no allocation,
+    //! no `eprintln!`, no `Drop`.
+    use core::cell::UnsafeCell;
+    use core::mem::MaybeUninit;
+    use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    /// `true` while a [`super::TermiosRawGuard`] holds the
+    /// install slot. Set by `try_install` (compare-exchange) and
+    /// cleared by `uninstall`. Read by both the install path and,
+    /// indirectly (via the saved state), the handler.
+    pub(super) static INSTALLED: AtomicBool = AtomicBool::new(false);
+
+    /// fd to call `tcsetattr` on from inside the handler. `-1`
+    /// means "no install active" — the handler must check this
+    /// to avoid acting on stale state if it ever races with
+    /// `uninstall` (which it shouldn't, since we `SA_RESETHAND`
+    /// and tear down the disposition before clearing `INSTALLED`,
+    /// but the read is free).
+    pub(super) static SAVED_FD: AtomicI32 = AtomicI32::new(-1);
+
+    /// Saved termios bytes. Written by `try_install` *before*
+    /// `sigaction` arms the handler, read by the handler. The
+    /// store/arm ordering is the only thing that makes this
+    /// safe to read from the handler.
+    ///
+    /// Not behind a `Mutex` on purpose: the handler may not
+    /// lock. Outside the handler, accesses are gated by
+    /// `INSTALLED` (a single guard owns the slot at a time).
+    pub(super) struct TermiosCell(pub UnsafeCell<MaybeUninit<libc::termios>>);
+    // SAFETY: writes are gated by `INSTALLED` (only one guard at
+    // a time); the handler reads via a raw pointer and `tcsetattr`
+    // treats the buffer as read-only.
+    unsafe impl Sync for TermiosCell {}
+    pub(super) static SAVED_TERMIOS: TermiosCell =
+        TermiosCell(UnsafeCell::new(MaybeUninit::uninit()));
+
+    /// Previous `sigaction` for SIGINT/SIGTERM/SIGHUP/SIGQUIT,
+    /// captured at install time and restored on uninstall. Indexed
+    /// in the same order as [`SIGNALS`].
+    pub(super) struct SigactionCell(pub UnsafeCell<MaybeUninit<libc::sigaction>>);
+    // SAFETY: same `INSTALLED`-gated access pattern as `TermiosCell`.
+    unsafe impl Sync for SigactionCell {}
+    pub(super) static PREV_SIGACTIONS: [SigactionCell; 4] = [
+        SigactionCell(UnsafeCell::new(MaybeUninit::uninit())),
+        SigactionCell(UnsafeCell::new(MaybeUninit::uninit())),
+        SigactionCell(UnsafeCell::new(MaybeUninit::uninit())),
+        SigactionCell(UnsafeCell::new(MaybeUninit::uninit())),
+    ];
+
+    /// Signals we intercept. Order matches `PREV_SIGACTIONS`.
+    pub(super) const SIGNALS: [libc::c_int; 4] =
+        [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+    /// Async-signal-safe handler. Restores the saved termios,
+    /// then re-raises `sig` so the process dies with the proper
+    /// WIFSIGNALED exit code. We armed via `SA_RESETHAND`, so
+    /// the disposition has already reverted to the default by the
+    /// time we re-enter (no `sigaction` call needed from inside
+    /// the handler).
+    ///
+    /// Only async-signal-safe libc calls are used:
+    ///   - `tcsetattr` (POSIX-listed)
+    ///   - `raise` (POSIX-listed)
+    ///
+    /// Atomic loads/stores are lock-free on every Unix tier-1
+    /// target and are safe from a signal handler.
+    pub(super) extern "C" fn handler(sig: libc::c_int) {
+        let fd = SAVED_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            // SAFETY: `SAVED_TERMIOS` was initialised before
+            // `sigaction` armed this handler, by the install
+            // path which set `SAVED_FD` last. So whenever
+            // `fd >= 0` the cell holds a valid `libc::termios`
+            // that the handler may read. `tcsetattr` only reads
+            // the buffer. Failure (-1) is intentionally ignored
+            // — we cannot `eprintln!` from here.
+            unsafe {
+                let ptr = SAVED_TERMIOS.0.get();
+                libc::tcsetattr(fd, libc::TCSANOW, (*ptr).as_ptr());
+            }
+        }
+        // SA_RESETHAND already restored the default disposition;
+        // re-raise so the process dies with the correct status.
+        // Ignore the return — there's nothing useful to do on
+        // failure, and `raise` is async-signal-safe.
+        unsafe {
+            libc::raise(sig);
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -222,6 +344,12 @@ impl TermiosRawGuard {
     /// `tcsetattr` call fails (e.g. stdin isn't a tty after all), the
     /// returned guard still restores on drop — no observable effect
     /// in that case.
+    ///
+    /// Also arms a signal-safe handler for SIGINT/SIGTERM/SIGHUP/
+    /// SIGQUIT that runs `tcsetattr` back to `original` before the
+    /// process dies — see the type-level docs for the rationale.
+    /// Failure to arm a handler is non-fatal: the guard still works
+    /// for the panic / clean-exit case.
     pub fn install(original: &libc::termios) -> Self {
         let fd: libc::c_int = 0;
         let mut raw = *original;
@@ -242,9 +370,15 @@ impl TermiosRawGuard {
         unsafe {
             libc::tcsetattr(fd, libc::TCSANOW, &raw);
         }
+        // Arm the signal handler. Returns false if one is already
+        // installed (nested guard) — in that case we leave the outer
+        // guard's handler in charge and the inner guard becomes
+        // Drop-only.
+        let owns_handler = install_signal_handler(fd, original);
         TermiosRawGuard {
             fd,
             original: *original,
+            owns_handler,
         }
     }
 }
@@ -252,12 +386,119 @@ impl TermiosRawGuard {
 #[cfg(unix)]
 impl Drop for TermiosRawGuard {
     fn drop(&mut self) {
+        if self.owns_handler {
+            // Tear down the signal handler *before* the termios
+            // restore: the handler is now a no-op-ish path
+            // (SAVED_FD will be set to -1), and if a signal lands
+            // between the two operations the default disposition
+            // (or whatever was there before us) is exactly what we
+            // want — the user's shell will already be in cooked
+            // mode by then because we're about to do the
+            // tcsetattr below.
+            uninstall_signal_handler();
+        }
         // SAFETY: same justification as `install` — we captured a
         // valid termios; the fd is stdin.
         unsafe {
             libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
         }
     }
+}
+
+/// Arm the signal-safe restore handler. Returns `true` if this call
+/// installed the handlers (and the caller must call
+/// [`uninstall_signal_handler`] later), `false` if a handler was
+/// already installed (nested guard — leave the outer handler alone).
+///
+/// On `sigaction` failure for any of the four signals, the slot is
+/// left in its prior state and we keep going: any signal we did
+/// manage to install on still restores the tty; a SIGTERM we
+/// couldn't install on still kills the process, but the Drop guard
+/// handles the clean-exit path too.
+#[cfg(unix)]
+fn install_signal_handler(fd: libc::c_int, original: &libc::termios) -> bool {
+    use core::sync::atomic::Ordering;
+    // CAS: refuse to install when another guard already owns the slot.
+    if termios_signal::INSTALLED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
+    // SAFETY: we hold the install slot (the CAS above), so we're the
+    // only writer to these statics. The termios store *must* happen
+    // before SAVED_FD is set (the handler keys off SAVED_FD >= 0).
+    unsafe {
+        (*termios_signal::SAVED_TERMIOS.0.get()).write(*original);
+    }
+    // Publish `fd` last; this is the "data ready" signal for the
+    // handler. Release ordering pairs with the Relaxed load in the
+    // handler — relaxed is fine on the handler side because signal
+    // delivery already establishes a synchronizes-with relation with
+    // the kernel's sigaction install.
+    termios_signal::SAVED_FD.store(fd, Ordering::Release);
+
+    let mut all_ok = true;
+    // SAFETY: caller-owned `sigaction` structs, well-formed. The
+    // handler we point at uses only async-signal-safe calls.
+    unsafe {
+        for (idx, &sig) in termios_signal::SIGNALS.iter().enumerate() {
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = termios_signal::handler as *const () as usize;
+            // SA_RESETHAND: a second signal of the same type after
+            // the first one's been handled gets the default
+            // disposition — which is what we want, since we'll have
+            // re-raised the signal at the end of the handler and the
+            // default is "die with WIFSIGNALED set". Also avoids any
+            // re-entrancy worry on the rare path where the handler
+            // is interrupted by a second SIGINT.
+            sa.sa_flags = libc::SA_RESETHAND;
+            libc::sigemptyset(&mut sa.sa_mask);
+            let prev_ptr = termios_signal::PREV_SIGACTIONS[idx].0.get();
+            if libc::sigaction(sig, &sa, (*prev_ptr).as_mut_ptr()) != 0 {
+                // Mark the slot as uninitialised so uninstall
+                // doesn't try to restore garbage. We do this by
+                // zero-initialising the prev — `sigaction(sig, prev, NULL)`
+                // with a zeroed sigaction installs SIG_DFL, which is
+                // the safest fallback for a signal we couldn't manage.
+                (*prev_ptr).write(core::mem::zeroed());
+                all_ok = false;
+            }
+        }
+    }
+    let _ = all_ok;
+    true
+}
+
+/// Tear down the signal-safe restore handler installed by
+/// [`install_signal_handler`]. Restores the previous `sigaction` for
+/// each of SIGINT/SIGTERM/SIGHUP/SIGQUIT (which is `SIG_DFL` in the
+/// common case where the process never installed its own), clears
+/// the install slot, and zeros `SAVED_FD` so any stray late delivery
+/// is a no-op.
+#[cfg(unix)]
+fn uninstall_signal_handler() {
+    use core::sync::atomic::Ordering;
+    // Reset SAVED_FD first: a signal racing with uninstall will see
+    // -1 and skip the tcsetattr (the Drop guard runs the restore
+    // synchronously right after this anyway). Release pairs with the
+    // handler's Relaxed load.
+    termios_signal::SAVED_FD.store(-1, Ordering::Release);
+    // SAFETY: we own the install slot; only writer to these statics.
+    unsafe {
+        for (idx, &sig) in termios_signal::SIGNALS.iter().enumerate() {
+            let prev_ptr = termios_signal::PREV_SIGACTIONS[idx].0.get();
+            // The prev sigaction was either populated by a successful
+            // sigaction() in install (real previous disposition) or
+            // zeroed by install on failure (which restores SIG_DFL,
+            // the safe fallback). Either way the buffer is valid to
+            // hand back to sigaction().
+            libc::sigaction(sig, (*prev_ptr).as_ptr(), core::ptr::null_mut());
+        }
+    }
+    // Release the install slot last so any future install can
+    // observe the cleared SAVED_FD via the Acquire CAS.
+    termios_signal::INSTALLED.store(false, Ordering::Release);
 }
 
 /// Honour `$SSH_ASKPASS` when set: invoke the named helper, take its
@@ -701,4 +942,107 @@ pub fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use core::sync::atomic::Ordering;
+
+    /// Read back the current `sigaction` for `sig` via `sigaction(NULL, prev)`.
+    /// Returns the handler pointer value (`sa_sigaction`) — `0` is SIG_DFL,
+    /// `1` is SIG_IGN, anything else is a function pointer.
+    fn current_handler_ptr(sig: libc::c_int) -> usize {
+        // SAFETY: passing NULL for the new disposition leaves the signal
+        // alone; we only read the previous via the out param.
+        unsafe {
+            let mut prev: libc::sigaction = core::mem::zeroed();
+            let rc = libc::sigaction(sig, core::ptr::null(), &mut prev);
+            assert_eq!(rc, 0, "sigaction(read) failed");
+            prev.sa_sigaction
+        }
+    }
+
+    /// Install/uninstall the signal handler on its own (without going
+    /// through `TermiosRawGuard::install`, which would also try to
+    /// `tcsetattr` stdin — fine in cargo test where stdin is not a tty
+    /// and the call is a silent no-op, but the bookkeeping is what we
+    /// care about here).
+    ///
+    /// Asserts that:
+    ///   1. After `install_signal_handler` returns true, the four signal
+    ///      handlers point at our `termios_signal::handler`.
+    ///   2. A second `install_signal_handler` call returns false (the
+    ///      slot is already owned).
+    ///   3. After `uninstall_signal_handler`, none of the four signals
+    ///      still has *our* handler installed — they've reverted to
+    ///      whatever was there before (typically SIG_DFL in the test
+    ///      runner, though the test does not assert that exact value
+    ///      because libtest is free to install its own dispositions).
+    ///   4. A fresh `install_signal_handler` after the clean uninstall
+    ///      succeeds.
+    #[test]
+    fn signal_handler_install_cycle_is_clean() {
+        // Capture pre-install dispositions so we can assert the
+        // uninstall path restored *something other than* our handler.
+        let pre = [
+            current_handler_ptr(libc::SIGINT),
+            current_handler_ptr(libc::SIGTERM),
+            current_handler_ptr(libc::SIGHUP),
+            current_handler_ptr(libc::SIGQUIT),
+        ];
+
+        // SAFETY: zero-init is the documented way to allocate a termios
+        // struct; we never call `tcsetattr` with it in this test, we
+        // only stash a copy in the static.
+        let original: libc::termios = unsafe { core::mem::zeroed() };
+
+        // First install.
+        let installed = install_signal_handler(0, &original);
+        assert!(installed, "first install should succeed");
+        assert!(
+            termios_signal::INSTALLED.load(Ordering::Acquire),
+            "INSTALLED must be true after first install"
+        );
+        let our_handler = termios_signal::handler as *const () as usize;
+        for &sig in &termios_signal::SIGNALS {
+            assert_eq!(
+                current_handler_ptr(sig),
+                our_handler,
+                "signal {sig} should now point at our handler"
+            );
+        }
+
+        // Second install must refuse (nested guard contract).
+        let second = install_signal_handler(0, &original);
+        assert!(!second, "second install while one is active must fail");
+
+        // Uninstall.
+        uninstall_signal_handler();
+        assert!(
+            !termios_signal::INSTALLED.load(Ordering::Acquire),
+            "INSTALLED must be false after uninstall"
+        );
+        assert_eq!(
+            termios_signal::SAVED_FD.load(Ordering::Acquire),
+            -1,
+            "SAVED_FD must be cleared after uninstall"
+        );
+        for (sig, &prev_ptr) in termios_signal::SIGNALS.iter().zip(pre.iter()) {
+            let now = current_handler_ptr(*sig);
+            assert_ne!(
+                now, our_handler,
+                "signal {sig} still points at our handler after uninstall"
+            );
+            assert_eq!(
+                now, prev_ptr,
+                "signal {sig} disposition was not restored to its pre-install value"
+            );
+        }
+
+        // Fresh install after a clean uninstall must succeed.
+        let reinstall = install_signal_handler(0, &original);
+        assert!(reinstall, "fresh install after uninstall must succeed");
+        uninstall_signal_handler();
+    }
 }

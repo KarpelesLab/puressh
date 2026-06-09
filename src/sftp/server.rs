@@ -11,12 +11,16 @@ use std::fs::{self, File, OpenOptions, ReadDir};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use super::extensions::{
+    ADVERTISED_EXTENSIONS, EXT_FSTATVFS, EXT_FSYNC, EXT_HARDLINK, EXT_POSIX_RENAME, EXT_STATVFS,
+};
 use super::packet::{self, read_packet, write_packet, Packet};
 use super::path::{is_inside, lexically_clean, resolve};
 use super::types::{
     Attrs, FxpStatus, NameEntry, SftpError, FXF_APPEND, FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC,
     FXF_WRITE, SFTP_VERSION,
 };
+use crate::format::Reader;
 
 /// Default cap on client-requested `set_len` values (1 GiB). See
 /// [`SftpServerOptions::max_set_len`].
@@ -182,11 +186,15 @@ impl SftpServerSession {
             }
             _ => return Err(SftpError::Protocol("sftp: expected INIT")),
         }
+        let extensions = ADVERTISED_EXTENSIONS
+            .iter()
+            .map(|(name, ver)| (name.as_bytes().to_vec(), ver.as_bytes().to_vec()))
+            .collect();
         write_packet(
             &mut t,
             &Packet::Version {
                 version: SFTP_VERSION,
-                extensions: vec![],
+                extensions,
             },
         )?;
 
@@ -262,11 +270,7 @@ impl SftpServerSession {
                 target_path,
                 link_path,
             } => self.op_symlink(id, target_path, link_path),
-            Packet::Extended { id, .. } => Ok(status_pkt(
-                id,
-                FxpStatus::OpUnsupported,
-                "extension not supported",
-            )),
+            Packet::Extended { id, request, data } => self.op_extended(id, request, data),
             // INIT/VERSION mid-stream, or responses from a peer that should
             // be sending requests: both are protocol violations.
             _ => Err(SftpError::Protocol("sftp: unexpected packet from client")),
@@ -747,6 +751,157 @@ impl SftpServerSession {
             let _ = (target_s, link);
             Ok(status_pkt(id, FxpStatus::OpUnsupported, "symlink"))
         }
+    }
+
+    fn op_extended(
+        &mut self,
+        id: u32,
+        request: Vec<u8>,
+        data: Vec<u8>,
+    ) -> Result<Packet, SftpError> {
+        // OpenSSH extension names are ASCII; non-UTF-8 ones can't match any
+        // known extension and fall through to the OpUnsupported tail.
+        let name = match std::str::from_utf8(&request) {
+            Ok(s) => s,
+            Err(_) => {
+                return Ok(status_pkt(
+                    id,
+                    FxpStatus::OpUnsupported,
+                    "unknown extension",
+                ));
+            }
+        };
+        match name {
+            EXT_POSIX_RENAME => self.op_ext_posix_rename(id, &data),
+            EXT_HARDLINK => self.op_ext_hardlink(id, &data),
+            EXT_FSYNC => self.op_ext_fsync(id, &data),
+            EXT_STATVFS => self.op_ext_statvfs(id, &data),
+            EXT_FSTATVFS => self.op_ext_fstatvfs(id, &data),
+            _ => Ok(status_pkt(
+                id,
+                FxpStatus::OpUnsupported,
+                "unknown extension",
+            )),
+        }
+    }
+
+    fn op_ext_posix_rename(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        self.require_writable()?;
+        let mut r = Reader::new(data);
+        let oldpath = r.read_string()?.to_vec();
+        let newpath = r.read_string()?.to_vec();
+        let from = self.resolve(&oldpath)?;
+        let to = self.resolve(&newpath)?;
+        // OpenSSH posix-rename intentionally overwrites the destination —
+        // that's the whole reason it exists alongside SFTP v3 RENAME.
+        fs::rename(&from, &to)?;
+        Ok(status_ok(id))
+    }
+
+    fn op_ext_hardlink(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        self.require_writable()?;
+        let mut r = Reader::new(data);
+        let oldpath = r.read_string()?.to_vec();
+        let newpath = r.read_string()?.to_vec();
+        let src = self.resolve(&oldpath)?;
+        let dst = self.resolve(&newpath)?;
+        // `std::fs::hard_link` follows symlinks at `src` on most platforms.
+        // When jailed, refuse if either path's final component is a symlink
+        // so a planted symlink can't be the lever to materialise an
+        // outside-the-jail inode reference inside the jail.
+        if self.opts.root.is_some() {
+            let src_md = fs::symlink_metadata(&src)?;
+            if src_md.file_type().is_symlink() {
+                return Err(SftpError::status_msg(
+                    FxpStatus::NoSuchFile,
+                    "symlink rejected",
+                ));
+            }
+        }
+        fs::hard_link(&src, &dst)?;
+        Ok(status_ok(id))
+    }
+
+    fn op_ext_fsync(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        let mut r = Reader::new(data);
+        let handle = r.read_string()?.to_vec();
+        let h = parse_handle(&handle)?;
+        let entry = self
+            .handles
+            .get(&h)
+            .ok_or_else(|| SftpError::status_msg(FxpStatus::Failure, "invalid handle"))?;
+        let file = match entry {
+            FileHandle::File { file, .. } => file,
+            _ => return Ok(status_pkt(id, FxpStatus::Failure, "handle is not a file")),
+        };
+        file.sync_all()?;
+        Ok(status_ok(id))
+    }
+
+    #[cfg(unix)]
+    fn op_ext_statvfs(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        let mut r = Reader::new(data);
+        let path = r.read_string()?.to_vec();
+        let p = self.resolve(&path)?;
+        let s = nix::sys::statvfs::statvfs(&p).map_err(|e| {
+            SftpError::status_msg(
+                super::extensions::fxp_status_from_errno(e),
+                "statvfs failed",
+            )
+        })?;
+        let reply = super::extensions::StatvfsReply::from_nix(&s);
+        Ok(Packet::ExtendedReply {
+            id,
+            data: reply.encode(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn op_ext_statvfs(&mut self, id: u32, _data: &[u8]) -> Result<Packet, SftpError> {
+        Ok(status_pkt(
+            id,
+            FxpStatus::OpUnsupported,
+            "statvfs not supported on this platform",
+        ))
+    }
+
+    #[cfg(unix)]
+    fn op_ext_fstatvfs(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        let mut r = Reader::new(data);
+        let handle = r.read_string()?.to_vec();
+        let h = parse_handle(&handle)?;
+        let entry = self
+            .handles
+            .get(&h)
+            .ok_or_else(|| SftpError::status_msg(FxpStatus::Failure, "invalid handle"))?;
+        // fstatvfs needs an `AsFd`. Both File and ReadDir implement it on
+        // Unix; on dir handles we already keep the ReadDir wrapper, but its
+        // AsFd impl isn't guaranteed across libc versions — fall back to
+        // statvfs(path) for directories.
+        let s = match entry {
+            FileHandle::File { file, .. } => nix::sys::statvfs::fstatvfs(file),
+            FileHandle::Dir { path, .. } => nix::sys::statvfs::statvfs(path),
+        }
+        .map_err(|e| {
+            SftpError::status_msg(
+                super::extensions::fxp_status_from_errno(e),
+                "fstatvfs failed",
+            )
+        })?;
+        let reply = super::extensions::StatvfsReply::from_nix(&s);
+        Ok(Packet::ExtendedReply {
+            id,
+            data: reply.encode(),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn op_ext_fstatvfs(&mut self, id: u32, _data: &[u8]) -> Result<Packet, SftpError> {
+        Ok(status_pkt(
+            id,
+            FxpStatus::OpUnsupported,
+            "fstatvfs not supported on this platform",
+        ))
     }
 }
 

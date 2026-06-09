@@ -12,8 +12,10 @@
 //! - [`path`] — virtual-cwd resolution with optional jail-root checking.
 //! - [`server`] — [`SftpServerSession`].
 //! - [`client`] — [`SftpClient`].
+//! - [`extensions`] — `*@openssh.com` SFTP extensions advertised by the server.
 
 pub mod client;
+pub mod extensions;
 pub mod packet;
 pub mod path;
 pub mod server;

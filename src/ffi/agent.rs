@@ -1,7 +1,3 @@
-// Migration-in-progress: drops in the follow-up "ffi/agent: migrate to
-// with_cstr" commit.
-#![allow(deprecated)]
-
 //! C ABI for the ssh-agent client. **Unix only** — mirrors the
 //! `cfg(unix)` gate on [`crate::agent`].
 //!
@@ -22,7 +18,7 @@ use std::slice;
 use std::sync::Mutex;
 
 use super::common::{
-    catch, cstr_to_str, map_error, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC,
+    catch, map_error, with_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC,
     PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK,
 };
 use crate::agent::{Agent, AgentIdentity};
@@ -73,11 +69,7 @@ pub unsafe extern "C" fn pcssh_agent_connect(
         // SAFETY: caller contract.
         unsafe { *out = ptr::null_mut() };
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        match Agent::connect(path_s) {
+        with_cstr(path, |path_s| match Agent::connect(path_s) {
             Ok(agent) => {
                 let boxed = Box::new(PcSshAgent {
                     inner: Mutex::new(agent),
@@ -88,7 +80,8 @@ pub unsafe extern "C" fn pcssh_agent_connect(
                 PCSSH_OK
             }
             Err(e) => map_error(&e),
-        }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 

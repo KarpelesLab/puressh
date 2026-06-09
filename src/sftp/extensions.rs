@@ -9,6 +9,10 @@
 //! `SSH_FXP_EXTENDED` packet arrives; unknown extension names collapse to
 //! `SSH_FX_OP_UNSUPPORTED`.
 
+// `FxpStatus` is only consumed by the `#[cfg(unix)]` errno-translation
+// helper below. On Windows the helper isn't compiled in, so importing
+// the type unconditionally trips `-D warnings` with "unused import".
+#[cfg(unix)]
 use super::types::FxpStatus;
 
 /// `posix-rename@openssh.com` — atomic `rename(2)`, overwriting destination.

@@ -856,8 +856,15 @@ Match exec true
     #[cfg(unix)]
     #[test]
     fn match_exec_enabled_runs_command() {
+        // Use the shell builtins `true` / `false` (not the `/bin/true`
+        // / `/bin/false` binaries) so the test is portable: macOS
+        // runners ship coreutils-style helpers at `/usr/bin/true` and
+        // recent macOS images don't carry `/bin/true` at all, so an
+        // absolute path here breaks `macos-latest` in CI. The `sh -c`
+        // wrapper this code routes through always resolves the
+        // builtins.
         let src = "\
-Match exec /bin/true
+Match exec true
   Port 4242
 ";
         let cfg = SshClientConfig::parse(src).unwrap().enable_match_exec(true);
@@ -865,7 +872,7 @@ Match exec /bin/true
         assert_eq!(cfg.lookup("anything").port, Some(4242));
 
         let src_false = "\
-Match exec /bin/false
+Match exec false
   Port 4242
 ";
         let cfg = SshClientConfig::parse(src_false)

@@ -1,7 +1,3 @@
-// Migration-in-progress: drops in the follow-up "ffi/client: migrate to
-// with_cstr" commit.
-#![allow(deprecated)]
-
 //! C ABI for the high-level SSH client: connect, authenticate, exec,
 //! free.
 //!
@@ -25,7 +21,7 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use super::common::{
-    catch, cstr_to_str, map_error, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
+    catch, map_error, with_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
     PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK,
 };
 use crate::auth::ClientCredential;
@@ -108,96 +104,98 @@ pub unsafe extern "C" fn pcssh_client_connect_ex(
         unsafe { *out = ptr::null_mut() };
 
         // SAFETY: caller upholds the contract on `host`.
-        let host_str = match unsafe { cstr_to_str(host) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-
-        // Resolve the policy enum into a `HostKeyPolicy` before opening
-        // a socket so a misconfigured caller fails fast.
-        let host_key_policy = match policy {
-            PCSSH_HOSTKEY_POLICY_ACCEPT_ANY => HostKeyPolicy::AcceptAny,
-            PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT => {
-                if fingerprint_b64.is_null() {
-                    return super::common::PCSSH_ERR_CONFIG;
-                }
-                // SAFETY: caller contract: NUL-terminated.
-                let fp_str = match unsafe { cstr_to_str(fingerprint_b64) } {
-                    Some(s) => s,
-                    None => return PCSSH_ERR_INVALID_ARGUMENT,
-                };
-                // Normalize: strip a "SHA256:" prefix if present, and trim any
-                // padding `=` so callers can pass either ssh-keygen's display
-                // form or raw base64.
-                let trimmed = fp_str
-                    .strip_prefix("SHA256:")
-                    .unwrap_or(fp_str)
-                    .trim_end_matches('=');
-                let raw = match crate::key::base64::decode(trimmed.as_bytes()) {
-                    Ok(v) => v,
-                    Err(_) => return super::common::PCSSH_ERR_CONFIG,
-                };
-                if raw.len() != 32 {
-                    return super::common::PCSSH_ERR_CONFIG;
-                }
-                let mut fp = [0u8; 32];
-                fp.copy_from_slice(&raw);
-                HostKeyPolicy::AcceptFingerprint(fp)
-            }
-            PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS => {
-                // KnownHosts requires a store handle; that path lives in
-                // ffi::known_hosts::pcssh_client_connect_known_hosts.
-                return super::common::PCSSH_ERR_CONFIG;
-            }
-            _ => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-
-        let addr = format!("{host_str}:{port}");
-        let addrs = match addr.to_socket_addrs() {
-            Ok(a) => a,
-            Err(_) => return PCSSH_ERR_CONNECT,
-        };
-
-        let timeout = if timeout_ms > 0 {
-            Some(Duration::from_millis(timeout_ms as u64))
-        } else {
-            None
-        };
-
-        let mut last_err: Option<Error> = None;
-        for sa in addrs {
-            // We have to rebuild the policy per loop iteration because
-            // `HostKeyPolicy` is not `Clone` (the `KnownHosts` variant
-            // holds an `Arc<Mutex<...>>` — but it's currently rejected
-            // above for the FFI path, so for `AcceptAny` / `AcceptFingerprint`
-            // we can just copy the bytes).
-            let policy_for_iter = match &host_key_policy {
-                HostKeyPolicy::AcceptAny => HostKeyPolicy::AcceptAny,
-                HostKeyPolicy::AcceptFingerprint(fp) => HostKeyPolicy::AcceptFingerprint(*fp),
-                HostKeyPolicy::KnownHosts(_) => unreachable!("rejected above"),
-            };
-            let cfg = Config {
-                host_key_policy: policy_for_iter,
-                timeout,
-            };
-            match Client::connect(sa, cfg) {
-                Ok(c) => {
-                    let boxed = Box::new(PcSshClient {
-                        inner: SharedClient::from(c),
+        with_cstr(host, |host_str| {
+            // Resolve the policy enum into a `HostKeyPolicy` before opening
+            // a socket so a misconfigured caller fails fast.
+            let host_key_policy = match policy {
+                PCSSH_HOSTKEY_POLICY_ACCEPT_ANY => HostKeyPolicy::AcceptAny,
+                PCSSH_HOSTKEY_POLICY_ACCEPT_FINGERPRINT => {
+                    if fingerprint_b64.is_null() {
+                        return super::common::PCSSH_ERR_CONFIG;
+                    }
+                    // SAFETY: caller contract: NUL-terminated.
+                    let fp_outcome = with_cstr(fingerprint_b64, |fp_str| {
+                        // Normalize: strip a "SHA256:" prefix if present, and trim any
+                        // padding `=` so callers can pass either ssh-keygen's display
+                        // form or raw base64.
+                        let trimmed = fp_str
+                            .strip_prefix("SHA256:")
+                            .unwrap_or(fp_str)
+                            .trim_end_matches('=');
+                        let raw = match crate::key::base64::decode(trimmed.as_bytes()) {
+                            Ok(v) => v,
+                            Err(_) => return Err(super::common::PCSSH_ERR_CONFIG),
+                        };
+                        if raw.len() != 32 {
+                            return Err(super::common::PCSSH_ERR_CONFIG);
+                        }
+                        let mut fp = [0u8; 32];
+                        fp.copy_from_slice(&raw);
+                        Ok(fp)
                     });
-                    // SAFETY: `out` is non-NULL and writable per caller contract.
-                    unsafe { *out = Box::into_raw(boxed) };
-                    return PCSSH_OK;
+                    let fp = match fp_outcome {
+                        Some(Ok(fp)) => fp,
+                        Some(Err(code)) => return code,
+                        None => return PCSSH_ERR_INVALID_ARGUMENT,
+                    };
+                    HostKeyPolicy::AcceptFingerprint(fp)
                 }
-                Err(e) => last_err = Some(e),
-            }
-        }
+                PCSSH_HOSTKEY_POLICY_KNOWN_HOSTS => {
+                    // KnownHosts requires a store handle; that path lives in
+                    // ffi::known_hosts::pcssh_client_connect_known_hosts.
+                    return super::common::PCSSH_ERR_CONFIG;
+                }
+                _ => return PCSSH_ERR_INVALID_ARGUMENT,
+            };
 
-        match last_err {
-            Some(Error::Io(_)) => PCSSH_ERR_CONNECT,
-            Some(e) => map_error(&e),
-            None => PCSSH_ERR_CONNECT,
-        }
+            let addr = format!("{host_str}:{port}");
+            let addrs = match addr.to_socket_addrs() {
+                Ok(a) => a,
+                Err(_) => return PCSSH_ERR_CONNECT,
+            };
+
+            let timeout = if timeout_ms > 0 {
+                Some(Duration::from_millis(timeout_ms as u64))
+            } else {
+                None
+            };
+
+            let mut last_err: Option<Error> = None;
+            for sa in addrs {
+                // We have to rebuild the policy per loop iteration because
+                // `HostKeyPolicy` is not `Clone` (the `KnownHosts` variant
+                // holds an `Arc<Mutex<...>>` — but it's currently rejected
+                // above for the FFI path, so for `AcceptAny` / `AcceptFingerprint`
+                // we can just copy the bytes).
+                let policy_for_iter = match &host_key_policy {
+                    HostKeyPolicy::AcceptAny => HostKeyPolicy::AcceptAny,
+                    HostKeyPolicy::AcceptFingerprint(fp) => HostKeyPolicy::AcceptFingerprint(*fp),
+                    HostKeyPolicy::KnownHosts(_) => unreachable!("rejected above"),
+                };
+                let cfg = Config {
+                    host_key_policy: policy_for_iter,
+                    timeout,
+                };
+                match Client::connect(sa, cfg) {
+                    Ok(c) => {
+                        let boxed = Box::new(PcSshClient {
+                            inner: SharedClient::from(c),
+                        });
+                        // SAFETY: `out` is non-NULL and writable per caller contract.
+                        unsafe { *out = Box::into_raw(boxed) };
+                        return PCSSH_OK;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+
+            match last_err {
+                Some(Error::Io(_)) => PCSSH_ERR_CONNECT,
+                Some(e) => map_error(&e),
+                None => PCSSH_ERR_CONNECT,
+            }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -264,26 +262,20 @@ pub unsafe extern "C" fn pcssh_client_auth_password(
         if client.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller upholds NUL termination + UTF-8.
-        let user_s = match unsafe { cstr_to_str(user) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller upholds NUL termination + UTF-8.
-        let pass_s = match unsafe { cstr_to_str(password) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: `client` is a non-NULL pointer we returned from
-        // `pcssh_client_connect`; the caller has not freed it.
-        let c = unsafe { &*client };
-        match c
-            .inner
-            .with_client(|cl| cl.authenticate_password(user_s, pass_s))
-        {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_error(&e),
-        }
+        // SAFETY: caller upholds NUL termination + UTF-8 for both strings.
+        super::common::with_two_cstr(user, password, |user_s, pass_s| {
+            // SAFETY: `client` is a non-NULL pointer we returned from
+            // `pcssh_client_connect`; the caller has not freed it.
+            let c = unsafe { &*client };
+            match c
+                .inner
+                .with_client(|cl| cl.authenticate_password(user_s, pass_s))
+            {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_error(&e),
+            }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -315,56 +307,54 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let user_s = match unsafe { cstr_to_str(user) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
+        with_cstr(user, |user_s| {
+            // SAFETY: caller guarantees at least `private_key_pem_len` readable bytes.
+            let pem_bytes =
+                unsafe { slice::from_raw_parts(private_key_pem as *const u8, private_key_pem_len) };
+            let pem_str = match core::str::from_utf8(pem_bytes) {
+                Ok(s) => s,
+                Err(_) => return PCSSH_ERR_INVALID_ARGUMENT,
+            };
 
-        // SAFETY: caller guarantees at least `private_key_pem_len` readable bytes.
-        let pem_bytes =
-            unsafe { slice::from_raw_parts(private_key_pem as *const u8, private_key_pem_len) };
-        let pem_str = match core::str::from_utf8(pem_bytes) {
-            Ok(s) => s,
-            Err(_) => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-
-        // Passphrase: NULL → None; empty C string → None; otherwise bytes
-        // up to NUL. Wrapped in `Zeroizing` so the heap copy is wiped on
-        // drop even on the error paths below (Finding #8).
-        let passphrase_opt: Option<Zeroizing<Vec<u8>>> = if passphrase.is_null() {
-            None
-        } else {
-            // SAFETY: caller contract: NUL-terminated.
-            let cs = unsafe { CStr::from_ptr(passphrase) };
-            let bytes = cs.to_bytes();
-            if bytes.is_empty() {
+            // Passphrase: NULL → None; empty C string → None; otherwise bytes
+            // up to NUL. Wrapped in `Zeroizing` so the heap copy is wiped on
+            // drop even on the error paths below (Finding #8).
+            let passphrase_opt: Option<Zeroizing<Vec<u8>>> = if passphrase.is_null() {
                 None
             } else {
-                Some(Zeroizing::new(bytes.to_vec()))
+                // SAFETY: caller contract: NUL-terminated.
+                let cs = unsafe { CStr::from_ptr(passphrase) };
+                let bytes = cs.to_bytes();
+                if bytes.is_empty() {
+                    None
+                } else {
+                    Some(Zeroizing::new(bytes.to_vec()))
+                }
+            };
+
+            let priv_key = match PrivateKey::parse_openssh_pem(
+                pem_str,
+                passphrase_opt.as_deref().map(|v| v.as_slice()),
+            ) {
+                Ok(k) => k,
+                Err(e) => return map_error(&e),
+            };
+            let hk = match priv_key.into_host_key() {
+                Ok(h) => h,
+                Err(e) => return map_error(&e),
+            };
+
+            // SAFETY: caller-supplied valid handle.
+            let c = unsafe { &*client };
+            match c
+                .inner
+                .with_client(|cl| cl.authenticate(user_s, vec![ClientCredential::PublicKey(hk)]))
+            {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_error(&e),
             }
-        };
-
-        let priv_key = match PrivateKey::parse_openssh_pem(
-            pem_str,
-            passphrase_opt.as_deref().map(|v| v.as_slice()),
-        ) {
-            Ok(k) => k,
-            Err(e) => return map_error(&e),
-        };
-        let hk = match priv_key.into_host_key() {
-            Ok(h) => h,
-            Err(e) => return map_error(&e),
-        };
-
-        // SAFETY: caller-supplied valid handle.
-        let c = unsafe { &*client };
-        match c
-            .inner
-            .with_client(|cl| cl.authenticate(user_s, vec![ClientCredential::PublicKey(hk)]))
-        {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_error(&e),
-        }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -413,44 +403,42 @@ pub unsafe extern "C" fn pcssh_client_exec(
         }
 
         // SAFETY: caller contract.
-        let cmd_s = match unsafe { cstr_to_str(command) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
+        with_cstr(command, |cmd_s| {
+            // SAFETY: valid handle.
+            let c = unsafe { &*client };
+            let out = match c.inner.with_client(|cl| cl.exec(cmd_s)) {
+                Ok(o) => o,
+                Err(e) => return map_error(&e),
+            };
 
-        // SAFETY: valid handle.
-        let c = unsafe { &*client };
-        let out = match c.inner.with_client(|cl| cl.exec(cmd_s)) {
-            Ok(o) => o,
-            Err(e) => return map_error(&e),
-        };
-
-        let need_out = out.stdout.len();
-        let need_err = out.stderr.len();
-        // SAFETY: out-pointers checked non-NULL above.
-        unsafe {
-            *stdout_out_len = need_out;
-            *stderr_out_len = need_err;
-            *exit_status_out = out.exit_status.map(|v| v as i32).unwrap_or(-1);
-        }
-
-        if need_out > stdout_cap || need_err > stderr_cap {
-            return PCSSH_ERR_BUFFER_TOO_SMALL;
-        }
-
-        if need_out > 0 {
-            // SAFETY: stdout_buf has at least `stdout_cap` >= need_out bytes.
+            let need_out = out.stdout.len();
+            let need_err = out.stderr.len();
+            // SAFETY: out-pointers checked non-NULL above.
             unsafe {
-                ptr::copy_nonoverlapping(out.stdout.as_ptr(), stdout_buf, need_out);
+                *stdout_out_len = need_out;
+                *stderr_out_len = need_err;
+                *exit_status_out = out.exit_status.map(|v| v as i32).unwrap_or(-1);
             }
-        }
-        if need_err > 0 {
-            // SAFETY: stderr_buf has at least `stderr_cap` >= need_err bytes.
-            unsafe {
-                ptr::copy_nonoverlapping(out.stderr.as_ptr(), stderr_buf, need_err);
+
+            if need_out > stdout_cap || need_err > stderr_cap {
+                return PCSSH_ERR_BUFFER_TOO_SMALL;
             }
-        }
-        PCSSH_OK
+
+            if need_out > 0 {
+                // SAFETY: stdout_buf has at least `stdout_cap` >= need_out bytes.
+                unsafe {
+                    ptr::copy_nonoverlapping(out.stdout.as_ptr(), stdout_buf, need_out);
+                }
+            }
+            if need_err > 0 {
+                // SAFETY: stderr_buf has at least `stderr_cap` >= need_err bytes.
+                unsafe {
+                    ptr::copy_nonoverlapping(out.stderr.as_ptr(), stderr_buf, need_err);
+                }
+            }
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 

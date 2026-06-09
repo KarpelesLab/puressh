@@ -254,6 +254,60 @@ int  pcssh_sftp_readlink(PcSshSftp *sftp, const char *path,
 int  pcssh_sftp_realpath(PcSshSftp *sftp, const char *path,
                          uint8_t *buf, size_t cap, size_t *out_len);
 
+/* ----- Bytes-path variants ---------------------------------------------- *
+ *
+ * SFTP paths on the wire are arbitrary octets — OpenSSH happily hands out
+ * filenames in Shift-JIS, Latin-1, or mixed-encoding directories. The
+ * cstr entry points above route every path through UTF-8 validation and
+ * reject non-UTF-8 with PCSSH_ERR_INVALID_ARGUMENT.
+ *
+ * The `_bytes` companions below accept a raw (ptr, len) pair so the
+ * library can hand the server exactly the bytes the peer sent. (NULL, 0)
+ * is accepted as the empty path; a NULL pointer with non-zero length
+ * yields PCSSH_ERR_INVALID_ARGUMENT before any dereference. All other
+ * behaviour mirrors the cstr cousin (output buffers, error codes,
+ * parent-handle liveness rules).
+ *
+ * `readdir` already returns the entry name as bytes (uint8_t name_buf),
+ * so there is no `_bytes` variant for it. `fstat` / `fsetstat` operate on
+ * file handles and take no path. */
+
+int  pcssh_sftp_open_file_bytes(PcSshSftp *sftp,
+                                const uint8_t *path_ptr, size_t path_len,
+                                uint32_t flags, uint32_t mode,
+                                PcSshSftpFile **out_file);
+int  pcssh_sftp_opendir_bytes(PcSshSftp *sftp,
+                              const uint8_t *path_ptr, size_t path_len,
+                              PcSshSftpDir **out_dir);
+int  pcssh_sftp_stat_bytes(PcSshSftp *sftp,
+                           const uint8_t *path_ptr, size_t path_len,
+                           PcSshSftpAttrs *out_attrs);
+int  pcssh_sftp_lstat_bytes(PcSshSftp *sftp,
+                            const uint8_t *path_ptr, size_t path_len,
+                            PcSshSftpAttrs *out_attrs);
+int  pcssh_sftp_setstat_bytes(PcSshSftp *sftp,
+                              const uint8_t *path_ptr, size_t path_len,
+                              const PcSshSftpAttrs *attrs);
+int  pcssh_sftp_mkdir_bytes(PcSshSftp *sftp,
+                            const uint8_t *path_ptr, size_t path_len,
+                            uint32_t mode);
+int  pcssh_sftp_rmdir_bytes(PcSshSftp *sftp,
+                            const uint8_t *path_ptr, size_t path_len);
+int  pcssh_sftp_remove_bytes(PcSshSftp *sftp,
+                             const uint8_t *path_ptr, size_t path_len);
+int  pcssh_sftp_rename_bytes(PcSshSftp *sftp,
+                             const uint8_t *old_ptr, size_t old_len,
+                             const uint8_t *new_ptr, size_t new_len);
+int  pcssh_sftp_symlink_bytes(PcSshSftp *sftp,
+                              const uint8_t *target_ptr,   size_t target_len,
+                              const uint8_t *linkpath_ptr, size_t linkpath_len);
+int  pcssh_sftp_readlink_bytes(PcSshSftp *sftp,
+                               const uint8_t *path_ptr, size_t path_len,
+                               uint8_t *buf, size_t cap, size_t *out_len);
+int  pcssh_sftp_realpath_bytes(PcSshSftp *sftp,
+                               const uint8_t *path_ptr, size_t path_len,
+                               uint8_t *buf, size_t cap, size_t *out_len);
+
 /* ----- known_hosts ------------------------------------------------------- */
 
 /* Opaque known_hosts store handle (in-memory OpenSSH-format store). */

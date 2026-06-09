@@ -1488,6 +1488,259 @@ pub unsafe extern "C" fn pcssh_sftp_rename_bytes(
     })
 }
 
+/// Bytes-path companion to [`pcssh_sftp_stat`]. Follows symlinks.
+///
+/// # Safety
+///
+/// - `sftp` must be a live handle.
+/// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
+///   readable bytes. `(NULL, 0)` is accepted as the empty path.
+/// - `out_attrs` must be non-NULL and writable.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_stat_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    out_attrs: *mut PcSshSftpAttrs,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || out_attrs.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        let mut attrs_out: Option<Attrs> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.stat(path) {
+            Ok(a) => {
+                attrs_out = Some(a);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        // SAFETY: out_attrs checked non-NULL above.
+        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
+        PCSSH_OK
+    })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_lstat`]. Does not follow the
+/// final symlink.
+///
+/// # Safety
+///
+/// As for [`pcssh_sftp_stat_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_lstat_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    out_attrs: *mut PcSshSftpAttrs,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || out_attrs.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        let mut attrs_out: Option<Attrs> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.lstat(path) {
+            Ok(a) => {
+                attrs_out = Some(a);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        // SAFETY: out_attrs checked non-NULL above.
+        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
+        PCSSH_OK
+    })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_setstat`].
+///
+/// # Safety
+///
+/// - `sftp` must be a live handle.
+/// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
+///   readable bytes. `(NULL, 0)` is accepted as the empty path.
+/// - `attrs` must be non-NULL and readable.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_setstat_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    attrs: *const PcSshSftpAttrs,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || attrs.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let a = unsafe { &*attrs };
+        let a_owned = attrs_from_c(a);
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| match sess.setstat(path, a_owned) {
+            Ok(()) => PCSSH_OK,
+            Err(e) => map_sftp_err(&e),
+        })
+    })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_symlink`]. Argument order matches
+/// the lib: `(target, link_path)`.
+///
+/// # Safety
+///
+/// - `sftp` must be a live handle.
+/// - For each non-zero `_len`, the matching `_ptr` must point to that many
+///   readable bytes. `(NULL, 0)` pairs are accepted as the empty path.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_symlink_bytes(
+    sftp: *mut PcSshSftp,
+    target_ptr: *const u8,
+    target_len: usize,
+    linkpath_ptr: *const u8,
+    linkpath_len: usize,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract.
+        let target = match unsafe { bytes_from_raw(target_ptr, target_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let linkpath = match unsafe { bytes_from_raw(linkpath_ptr, linkpath_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        with_parent(&s.inner, |sess| match sess.symlink(target, linkpath) {
+            Ok(()) => PCSSH_OK,
+            Err(e) => map_sftp_err(&e),
+        })
+    })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_readlink`]. The returned link
+/// target is also bytes (paths on the wire are arbitrary octets); it is
+/// written into the caller-supplied output buffer using the same
+/// `(buf, cap, out_len)` convention as the cstr variant.
+///
+/// # Safety
+///
+/// - `sftp` must be a live handle.
+/// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
+///   readable bytes. `(NULL, 0)` is accepted as the empty path.
+/// - `out_len` must be non-NULL and writable.
+/// - If `cap > 0` and the target is non-empty, `buf` must be non-NULL with
+///   `cap` writable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_readlink_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || out_len.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        let mut tgt_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.readlink(path) {
+            Ok(t) => {
+                tgt_out = Some(t);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let target = tgt_out.unwrap_or_default();
+        // SAFETY: out_len/buf/cap checked by helper.
+        unsafe { copy_to_caller_buf(&target, buf, cap, out_len) }
+    })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_realpath`]. The canonicalised
+/// path is bytes; it is written into the caller-supplied output buffer
+/// using the same `(buf, cap, out_len)` convention as the cstr variant.
+///
+/// # Safety
+///
+/// As for [`pcssh_sftp_readlink_bytes`].
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_realpath_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    buf: *mut u8,
+    cap: usize,
+    out_len: *mut usize,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || out_len.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        let mut canon_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&s.inner, |sess| match sess.realpath(path) {
+            Ok(t) => {
+                canon_out = Some(t);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let canon = canon_out.unwrap_or_default();
+        // SAFETY: out_len/buf/cap checked by helper.
+        unsafe { copy_to_caller_buf(&canon, buf, cap, out_len) }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1607,6 +1860,70 @@ mod tests {
         };
         assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
         assert!(out.is_null());
+    }
+
+    #[test]
+    fn bytes_stat_null_out_is_invalid_argument() {
+        // SAFETY: NULL out_attrs must produce INVALID_ARGUMENT before any
+        // dereference of the input path.
+        let rc = unsafe {
+            pcssh_sftp_stat_bytes(std::ptr::null_mut(), b"/".as_ptr(), 1, std::ptr::null_mut())
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn bytes_symlink_null_target_with_len_is_invalid_argument() {
+        // SAFETY: NULL target ptr with non-zero len short-circuits in the
+        // helper without dereference.
+        let rc = unsafe {
+            pcssh_sftp_symlink_bytes(std::ptr::null_mut(), std::ptr::null(), 3, b"l".as_ptr(), 1)
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn bytes_readlink_null_out_len_is_invalid_argument() {
+        // SAFETY: NULL out_len must produce INVALID_ARGUMENT.
+        let mut buf = [0u8; 4];
+        let rc = unsafe {
+            pcssh_sftp_readlink_bytes(
+                std::ptr::null_mut(),
+                b"/".as_ptr(),
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn bytes_realpath_null_sftp_is_invalid_argument() {
+        let mut len = 0usize;
+        let mut buf = [0u8; 8];
+        // SAFETY: NULL sftp must produce INVALID_ARGUMENT.
+        let rc = unsafe {
+            pcssh_sftp_realpath_bytes(
+                std::ptr::null_mut(),
+                b"/".as_ptr(),
+                1,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn bytes_setstat_null_attrs_is_invalid_argument() {
+        // SAFETY: NULL attrs must produce INVALID_ARGUMENT.
+        let rc = unsafe {
+            pcssh_sftp_setstat_bytes(std::ptr::null_mut(), b"/".as_ptr(), 1, std::ptr::null())
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
     }
 
     #[test]

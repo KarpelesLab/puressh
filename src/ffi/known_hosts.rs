@@ -1,7 +1,3 @@
-// Migration-in-progress: drops in the follow-up "ffi/known_hosts: migrate
-// to with_cstr" commit.
-#![allow(deprecated)]
-
 //! C ABI for the `KnownHosts` store: build, persist, lookup, mutate,
 //! plus a `pcssh_client_connect_known_hosts` policy variant that
 //! verifies the server host key against the store on connect.
@@ -24,7 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use super::client::PcSshClient;
 use super::common::{
-    catch, cstr_to_str, map_error, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
+    catch, map_error, with_cstr, with_two_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
     PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_ERR_IO, PCSSH_OK,
 };
 use crate::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
@@ -125,20 +121,19 @@ pub unsafe extern "C" fn pcssh_known_hosts_load(
         // SAFETY: caller contract.
         unsafe { *out = ptr::null_mut() };
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        let kh = match KnownHosts::load(path_s) {
-            Ok(k) => k,
-            Err(_) => return PCSSH_ERR_IO,
-        };
-        let boxed = PcSshKnownHosts {
-            inner: Arc::new(Mutex::new(kh)),
-        };
-        // SAFETY: out non-NULL.
-        unsafe { *out = Box::into_raw(Box::new(boxed)) };
-        PCSSH_OK
+        with_cstr(path, |path_s| {
+            let kh = match KnownHosts::load(path_s) {
+                Ok(k) => k,
+                Err(_) => return PCSSH_ERR_IO,
+            };
+            let boxed = PcSshKnownHosts {
+                inner: Arc::new(Mutex::new(kh)),
+            };
+            // SAFETY: out non-NULL.
+            unsafe { *out = Box::into_raw(Box::new(boxed)) };
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -159,20 +154,19 @@ pub unsafe extern "C" fn pcssh_known_hosts_save(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: kh non-NULL per check.
-        let h = unsafe { &*kh };
-        let g = match h.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return PCSSH_ERR_GENERIC,
-        };
-        match g.save(path_s) {
-            Ok(()) => PCSSH_OK,
-            Err(_) => PCSSH_ERR_IO,
-        }
+        with_cstr(path, |path_s| {
+            // SAFETY: kh non-NULL per check.
+            let h = unsafe { &*kh };
+            let g = match h.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return PCSSH_ERR_GENERIC,
+            };
+            match g.save(path_s) {
+                Ok(()) => PCSSH_OK,
+                Err(_) => PCSSH_ERR_IO,
+            }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -288,36 +282,30 @@ pub unsafe extern "C" fn pcssh_known_hosts_lookup(
         if key_blob.is_null() && key_blob_len != 0 {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller contract.
-        let host_s = match unsafe { cstr_to_str(host) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let alg_s = match unsafe { cstr_to_str(algorithm) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract; len=0 yields empty slice.
-        let blob = if key_blob_len == 0 {
-            &[][..]
-        } else {
-            unsafe { slice::from_raw_parts(key_blob, key_blob_len) }
-        };
-        // SAFETY: kh non-NULL.
-        let h = unsafe { &*kh };
-        let g = match h.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return PCSSH_ERR_GENERIC,
-        };
-        let r = match g.lookup(host_s, port, alg_s, blob) {
-            LookupResult::Match => PCSSH_KH_MATCH,
-            LookupResult::Mismatch { .. } => PCSSH_KH_MISMATCH,
-            LookupResult::Unknown => PCSSH_KH_UNKNOWN,
-        };
-        // SAFETY: out_result non-NULL.
-        unsafe { *out_result = r };
-        PCSSH_OK
+        // SAFETY: caller contract for both strings.
+        with_two_cstr(host, algorithm, |host_s, alg_s| {
+            // SAFETY: caller contract; len=0 yields empty slice.
+            let blob = if key_blob_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(key_blob, key_blob_len) }
+            };
+            // SAFETY: kh non-NULL.
+            let h = unsafe { &*kh };
+            let g = match h.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return PCSSH_ERR_GENERIC,
+            };
+            let r = match g.lookup(host_s, port, alg_s, blob) {
+                LookupResult::Match => PCSSH_KH_MATCH,
+                LookupResult::Mismatch { .. } => PCSSH_KH_MISMATCH,
+                LookupResult::Unknown => PCSSH_KH_UNKNOWN,
+            };
+            // SAFETY: out_result non-NULL.
+            unsafe { *out_result = r };
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -347,30 +335,24 @@ pub unsafe extern "C" fn pcssh_known_hosts_add(
         if key_blob.is_null() && key_blob_len != 0 {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller contract.
-        let host_s = match unsafe { cstr_to_str(host) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let alg_s = match unsafe { cstr_to_str(algorithm) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract; len=0 → empty.
-        let blob = if key_blob_len == 0 {
-            &[][..]
-        } else {
-            unsafe { slice::from_raw_parts(key_blob, key_blob_len) }
-        };
-        // SAFETY: kh non-NULL.
-        let h = unsafe { &*kh };
-        let mut g = match h.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return PCSSH_ERR_GENERIC,
-        };
-        g.add(host_s, port, alg_s, blob, hash_host != 0);
-        PCSSH_OK
+        // SAFETY: caller contract for both strings.
+        with_two_cstr(host, algorithm, |host_s, alg_s| {
+            // SAFETY: caller contract; len=0 → empty.
+            let blob = if key_blob_len == 0 {
+                &[][..]
+            } else {
+                unsafe { slice::from_raw_parts(key_blob, key_blob_len) }
+            };
+            // SAFETY: kh non-NULL.
+            let h = unsafe { &*kh };
+            let mut g = match h.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return PCSSH_ERR_GENERIC,
+            };
+            g.add(host_s, port, alg_s, blob, hash_host != 0);
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -393,22 +375,21 @@ pub unsafe extern "C" fn pcssh_known_hosts_remove(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let host_s = match unsafe { cstr_to_str(host) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: kh non-NULL.
-        let h = unsafe { &*kh };
-        let mut g = match h.inner.lock() {
-            Ok(g) => g,
-            Err(_) => return PCSSH_ERR_GENERIC,
-        };
-        let n = g.remove(host_s, port);
-        if !out_removed.is_null() {
-            // SAFETY: caller contract.
-            unsafe { *out_removed = n };
-        }
-        PCSSH_OK
+        with_cstr(host, |host_s| {
+            // SAFETY: kh non-NULL.
+            let h = unsafe { &*kh };
+            let mut g = match h.inner.lock() {
+                Ok(g) => g,
+                Err(_) => return PCSSH_ERR_GENERIC,
+            };
+            let n = g.remove(host_s, port);
+            if !out_removed.is_null() {
+                // SAFETY: caller contract.
+                unsafe { *out_removed = n };
+            }
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -491,101 +472,103 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
         if kh.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller contract.
-        let host_s = match unsafe { cstr_to_str(host) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
+        // Optional save_path: NULL keeps None; non-NULL must be valid UTF-8
+        // (the previous code returned PCSSH_ERR_INVALID_ARGUMENT on
+        // non-UTF-8, matching what `with_cstr` reports via `None`).
         let save_path_opt: Option<PathBuf> = if save_path.is_null() {
             None
         } else {
             // SAFETY: caller contract.
-            match unsafe { cstr_to_str(save_path) } {
-                Some(s) => Some(PathBuf::from(s)),
+            match with_cstr(save_path, |s| PathBuf::from(s)) {
+                Some(p) => Some(p),
                 None => return PCSSH_ERR_INVALID_ARGUMENT,
             }
         };
 
-        let timeout = if timeout_ms > 0 {
-            Some(std::time::Duration::from_millis(timeout_ms as u64))
-        } else {
-            None
-        };
+        // SAFETY: caller contract on `host`.
+        with_cstr(host, |host_s| {
+            let timeout = if timeout_ms > 0 {
+                Some(std::time::Duration::from_millis(timeout_ms as u64))
+            } else {
+                None
+            };
 
-        // Build TofuAction from the C side.
-        let on_unknown = match on_unknown {
-            PCSSH_TOFU_REJECT => TofuAction::Reject,
-            PCSSH_TOFU_ACCEPT => TofuAction::Accept,
-            PCSSH_TOFU_PROMPT => match prompt_cb {
-                Some(cb) => {
-                    // Capture the raw pointer as an integer so the closure
-                    // is Send + Sync. The caller promises the context is
-                    // live for the duration of the connect.
-                    let ctx_addr = prompt_ctx as usize;
-                    TofuAction::Prompt(Arc::new(
-                        move |host: &str, port: u16, alg: &str, blob: &[u8]| -> bool {
-                            let h_cs = match std::ffi::CString::new(host) {
-                                Ok(c) => c,
-                                Err(_) => return false,
-                            };
-                            let a_cs = match std::ffi::CString::new(alg) {
-                                Ok(c) => c,
-                                Err(_) => return false,
-                            };
-                            // SAFETY: function pointer validity + lifetime
-                            // upheld by the C caller per docs.
-                            let rc = unsafe {
-                                cb(
-                                    ctx_addr as *mut c_void,
-                                    h_cs.as_ptr(),
-                                    port,
-                                    a_cs.as_ptr(),
-                                    blob.as_ptr(),
-                                    blob.len(),
-                                )
-                            };
-                            rc != 0
-                        },
-                    ))
+            // Build TofuAction from the C side.
+            let on_unknown = match on_unknown {
+                PCSSH_TOFU_REJECT => TofuAction::Reject,
+                PCSSH_TOFU_ACCEPT => TofuAction::Accept,
+                PCSSH_TOFU_PROMPT => match prompt_cb {
+                    Some(cb) => {
+                        // Capture the raw pointer as an integer so the closure
+                        // is Send + Sync. The caller promises the context is
+                        // live for the duration of the connect.
+                        let ctx_addr = prompt_ctx as usize;
+                        TofuAction::Prompt(Arc::new(
+                            move |host: &str, port: u16, alg: &str, blob: &[u8]| -> bool {
+                                let h_cs = match std::ffi::CString::new(host) {
+                                    Ok(c) => c,
+                                    Err(_) => return false,
+                                };
+                                let a_cs = match std::ffi::CString::new(alg) {
+                                    Ok(c) => c,
+                                    Err(_) => return false,
+                                };
+                                // SAFETY: function pointer validity + lifetime
+                                // upheld by the C caller per docs.
+                                let rc = unsafe {
+                                    cb(
+                                        ctx_addr as *mut c_void,
+                                        h_cs.as_ptr(),
+                                        port,
+                                        a_cs.as_ptr(),
+                                        blob.as_ptr(),
+                                        blob.len(),
+                                    )
+                                };
+                                rc != 0
+                            },
+                        ))
+                    }
+                    None => return PCSSH_ERR_INVALID_ARGUMENT,
+                },
+                _ => return PCSSH_ERR_INVALID_ARGUMENT,
+            };
+
+            // SAFETY: kh non-NULL.
+            let kh_handle = unsafe { &*kh };
+            let store = Arc::clone(&kh_handle.inner);
+
+            let policy = KnownHostsPolicy {
+                store,
+                save_path: save_path_opt,
+                hash_new: hash_new != 0,
+                on_unknown,
+                // FFI callers that want loud-but-permissive mismatch can
+                // upgrade to a future pcssh_client_connect_known_hosts_ex
+                // taking an on_mismatch action; the default here matches
+                // OpenSSH's `StrictHostKeyChecking=yes` for mismatches.
+                on_mismatch: TofuAction::Reject,
+            };
+
+            let cfg = Config {
+                host_key_policy: HostKeyPolicy::KnownHosts(policy),
+                timeout,
+            };
+
+            match Client::connect_to_host(host_s, port, cfg) {
+                Ok(c) => {
+                    let boxed = Box::new(PcSshClient {
+                        inner: SharedClient::from(c),
+                    });
+                    // SAFETY: out_client non-NULL.
+                    unsafe { *out_client = Box::into_raw(boxed) };
+                    PCSSH_OK
                 }
-                None => return PCSSH_ERR_INVALID_ARGUMENT,
-            },
-            _ => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-
-        // SAFETY: kh non-NULL.
-        let kh_handle = unsafe { &*kh };
-        let store = Arc::clone(&kh_handle.inner);
-
-        let policy = KnownHostsPolicy {
-            store,
-            save_path: save_path_opt,
-            hash_new: hash_new != 0,
-            on_unknown,
-            // FFI callers that want loud-but-permissive mismatch can
-            // upgrade to a future pcssh_client_connect_known_hosts_ex
-            // taking an on_mismatch action; the default here matches
-            // OpenSSH's `StrictHostKeyChecking=yes` for mismatches.
-            on_mismatch: TofuAction::Reject,
-        };
-
-        let cfg = Config {
-            host_key_policy: HostKeyPolicy::KnownHosts(policy),
-            timeout,
-        };
-
-        match Client::connect_to_host(host_s, port, cfg) {
-            Ok(c) => {
-                let boxed = Box::new(PcSshClient {
-                    inner: SharedClient::from(c),
-                });
-                // SAFETY: out_client non-NULL.
-                unsafe { *out_client = Box::into_raw(boxed) };
-                PCSSH_OK
+                Err(Error::Io(_)) => PCSSH_ERR_CONNECT,
+                Err(e) => map_error(&e),
             }
-            Err(Error::Io(_)) => PCSSH_ERR_CONNECT,
-            Err(e) => map_error(&e),
-        }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 

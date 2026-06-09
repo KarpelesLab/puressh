@@ -784,8 +784,12 @@ impl KexRunner {
                 )
             }
             KexBackend::MlKem768X25519 => {
-                let out = MlKem768X25519Sha256::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = MlKem768X25519Sha256::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             // GEX takes a separate three-trip path via handle_gex_*; this
             // arm is unreachable thanks to the backend gate in `on_packet`.
@@ -892,8 +896,9 @@ impl KexRunner {
                     ClientStateInner::MlKem768X25519(s) => s,
                     _ => return Err(Error::Protocol("client state type mismatch")),
                 };
-                let out = MlKem768X25519Sha256::client_finish(*st, payload, verifier_ref, &ctx)?;
-                (out.k, out.h)
+                let mut out =
+                    MlKem768X25519Sha256::client_finish(*st, payload, verifier_ref, &ctx)?;
+                (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
             // GEX uses handle_gex_reply, not this path.
             KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),

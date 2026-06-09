@@ -5,6 +5,14 @@
 //! [`ConfigError::UnknownKeyword`]. This is deliberate: the scope is "config
 //! values that change observable behaviour", and silently dropping an
 //! unrecognised knob is worse than failing loudly.
+//!
+//! The file is a sequence of blocks. `Host <pattern>` opens a host-pattern
+//! block, `Match <criteria>` opens a Match block, and everything before the
+//! first block belongs to an implicit "global" Host * block. Settings inside a
+//! block apply when the block's selector matches the lookup target;
+//! [`SshClientConfig::lookup`] walks the blocks in order with OpenSSH's
+//! first-match-wins precedence (scalars) and cumulative-concatenation
+//! semantics (`IdentityFile`, `LocalForward`, `RemoteForward`).
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -12,6 +20,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::glob::{host_matches, HostPattern};
+use super::match_block::{all_match, parse_match_line, ExecPolicy, MatchCondition, MatchContext};
 use super::parser::{tokenize, ParsedLine};
 use super::ConfigError;
 
@@ -111,37 +120,129 @@ pub struct ClientOptions {
     pub log_level: Option<u8>,
 }
 
-/// One `Host` block in a parsed `ssh_config`.
+/// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
+/// block. Pre-block lines go into an implicit `Host *` block at index 0.
 #[derive(Clone, Debug)]
-struct HostBlock {
-    patterns: Vec<HostPattern>,
-    opts: ClientOptions,
+pub(crate) enum Block {
+    Host {
+        patterns: Vec<HostPattern>,
+        opts: ClientOptions,
+    },
+    Match {
+        conditions: Vec<MatchCondition>,
+        opts: ClientOptions,
+    },
+}
+
+impl Block {
+    fn opts(&self) -> &ClientOptions {
+        match self {
+            Block::Host { opts, .. } | Block::Match { opts, .. } => opts,
+        }
+    }
+    fn opts_mut(&mut self) -> &mut ClientOptions {
+        match self {
+            Block::Host { opts, .. } | Block::Match { opts, .. } => opts,
+        }
+    }
 }
 
 /// A parsed `ssh_config(5)` file.
 ///
 /// Use [`SshClientConfig::parse`] to construct one from text, then
-/// [`SshClientConfig::lookup`] to flatten the matching blocks for a target
-/// host. Pre-`Host` lines form an implicit "global" block applied to every
-/// host (OpenSSH's documented behaviour).
+/// [`SshClientConfig::lookup`] (or [`SshClientConfig::lookup_with`] for full
+/// `Match` evaluation) to flatten the matching blocks for a target host.
+/// Pre-`Host` lines form an implicit "global" block applied to every host
+/// (OpenSSH's documented behaviour).
 #[derive(Clone, Debug, Default)]
 pub struct SshClientConfig {
-    blocks: Vec<HostBlock>,
+    pub(crate) blocks: Vec<Block>,
+    /// Whether `Match exec` criteria are allowed to execute. Default `false`
+    /// (deny). Toggle with [`Self::enable_match_exec`].
+    enable_match_exec: bool,
 }
 
 impl SshClientConfig {
     /// Parse `src` (the contents of a `ssh_config` file) into an
-    /// [`SshClientConfig`].
+    /// [`SshClientConfig`]. `Match exec` evaluation is **off** by default;
+    /// see [`Self::enable_match_exec`].
     pub fn parse(src: &str) -> Result<Self, ConfigError> {
         let lines = tokenize(src)?;
-        // Implicit global block at index 0; the OpenSSH default semantics
-        // apply pre-`Host` lines to every host.
-        let mut blocks: Vec<HostBlock> = vec![HostBlock {
-            patterns: vec![HostPattern::Any],
-            opts: ClientOptions::default(),
-        }];
-        for line in lines {
-            if line.keyword == "host" {
+        let blocks = parse_blocks(lines)?;
+        Ok(SshClientConfig {
+            blocks,
+            enable_match_exec: false,
+        })
+    }
+
+    /// Permit `Match exec <cmd>` criteria to run `/bin/sh -c <cmd>` during
+    /// lookup. Off by default because evaluating arbitrary shell commands
+    /// during config resolution is a confused-deputy hazard: a config loaded
+    /// from an untrusted location could trigger arbitrary commands at the
+    /// privilege level of whoever called `lookup`. Callers that fully trust
+    /// the config source (e.g. a CLI tool loading the local user's
+    /// `~/.ssh/config`) can opt in.
+    pub fn enable_match_exec(mut self, allow: bool) -> Self {
+        self.enable_match_exec = allow;
+        self
+    }
+
+    /// `true` iff `Match exec` is currently permitted on this config.
+    pub fn is_match_exec_enabled(&self) -> bool {
+        self.enable_match_exec
+    }
+
+    /// Resolve the effective options for `host`, walking every matching
+    /// block in source order with OpenSSH **first-match-wins** semantics for
+    /// scalars and **concatenation** for cumulative list fields
+    /// (`IdentityFile`, `LocalForward`, `RemoteForward`).
+    ///
+    /// `Match` blocks that need a username (`Match user …` / `Match localuser
+    /// …`) will not match through this entry point — they require fields the
+    /// bare `host`-only API doesn't carry. Use [`Self::lookup_with`] when you
+    /// have that context.
+    pub fn lookup(&self, host: &str) -> ClientOptions {
+        self.lookup_with(MatchContext {
+            host,
+            original_host: None,
+            user: None,
+            local_user: None,
+        })
+    }
+
+    /// Like [`Self::lookup`] but supplies a full [`MatchContext`] so `Match`
+    /// blocks with `user` / `localuser` / `originalhost` criteria can match.
+    pub fn lookup_with(&self, ctx: MatchContext<'_>) -> ClientOptions {
+        let policy = if self.enable_match_exec {
+            ExecPolicy::Allow
+        } else {
+            ExecPolicy::Deny
+        };
+        let mut out = ClientOptions::default();
+        for block in &self.blocks {
+            let matches = match block {
+                Block::Host { patterns, .. } => host_matches(patterns, ctx.host),
+                Block::Match { conditions, .. } => all_match(conditions, &ctx, policy),
+            };
+            if matches {
+                merge_into(&mut out, block.opts());
+            }
+        }
+        out
+    }
+}
+
+/// Walk the tokenised stream and split it into [`Block`]s. Lines outside any
+/// explicit `Host` / `Match` block accumulate into the implicit `Host *`
+/// block at index 0.
+pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigError> {
+    let mut blocks: Vec<Block> = vec![Block::Host {
+        patterns: vec![HostPattern::Any],
+        opts: ClientOptions::default(),
+    }];
+    for line in lines {
+        match line.keyword.as_str() {
+            "host" => {
                 if line.args.is_empty() {
                     return Err(ConfigError::BadValue {
                         line: line.line_no,
@@ -149,37 +250,25 @@ impl SshClientConfig {
                         msg: "Host requires at least one pattern".into(),
                     });
                 }
-                blocks.push(HostBlock {
+                blocks.push(Block::Host {
                     patterns: HostPattern::parse_all(&line.args),
                     opts: ClientOptions::default(),
                 });
-                continue;
             }
-            if line.keyword == "match" {
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "ssh_config Match blocks not yet supported".into(),
+            "match" => {
+                let conditions = parse_match_line(&line.args, line.line_no)?;
+                blocks.push(Block::Match {
+                    conditions,
+                    opts: ClientOptions::default(),
                 });
             }
-            let current = blocks.last_mut().expect("global block always present");
-            apply_keyword(&mut current.opts, &line)?;
-        }
-        Ok(SshClientConfig { blocks })
-    }
-
-    /// Resolve the effective options for `host`, walking every matching
-    /// block in source order with OpenSSH **first-match-wins** semantics for
-    /// scalars and **concatenation** for cumulative list fields
-    /// (`IdentityFile`, `LocalForward`, `RemoteForward`).
-    pub fn lookup(&self, host: &str) -> ClientOptions {
-        let mut out = ClientOptions::default();
-        for block in &self.blocks {
-            if host_matches(&block.patterns, host) {
-                merge_into(&mut out, &block.opts);
+            _ => {
+                let current = blocks.last_mut().expect("global block always present");
+                apply_keyword(current.opts_mut(), &line)?;
             }
         }
-        out
     }
+    Ok(blocks)
 }
 
 /// Apply one parsed line to the in-progress [`ClientOptions`] of the current
@@ -583,16 +672,6 @@ Host *.example.com !secret.example.com
     }
 
     #[test]
-    fn match_block_unsupported() {
-        let src = "Match Host *\n  User foo\n";
-        let err = SshClientConfig::parse(src).unwrap_err();
-        match err {
-            ConfigError::Unsupported { line, .. } => assert_eq!(line, 1),
-            _ => panic!("wrong error: {err:?}"),
-        }
-    }
-
-    #[test]
     fn strict_host_key_values() {
         for (s, want) in [
             ("yes", StrictMode::Yes),
@@ -626,5 +705,198 @@ Host *.example.com !secret.example.com
         let src = "Host gw\n  Port=2222\n";
         let cfg = SshClientConfig::parse(src).unwrap();
         assert_eq!(cfg.lookup("gw").port, Some(2222));
+    }
+
+    // ----- Match-block tests --------------------------------------------
+
+    #[test]
+    fn match_host_glob() {
+        let src = "\
+Match host *.example.com
+  User alice
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("web.example.com").user.as_deref(), Some("alice"));
+        assert_eq!(cfg.lookup("web.other.com").user, None);
+    }
+
+    #[test]
+    fn match_negated_host() {
+        let src = "\
+Match host *.example.com,!internal.example.com
+  User alice
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("web.example.com").user.as_deref(), Some("alice"));
+        assert_eq!(cfg.lookup("internal.example.com").user, None);
+    }
+
+    #[test]
+    fn match_user_combined_with_host() {
+        let src = "\
+Match host *.example.com user alice
+  Port 2222
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        // No user supplied → does not match.
+        assert_eq!(cfg.lookup("web.example.com").port, None);
+        // Wrong user → does not match.
+        let ctx = MatchContext {
+            host: "web.example.com",
+            original_host: None,
+            user: Some("bob"),
+            local_user: None,
+        };
+        assert_eq!(cfg.lookup_with(ctx).port, None);
+        // Right user → matches.
+        let ctx = MatchContext {
+            host: "web.example.com",
+            original_host: None,
+            user: Some("alice"),
+            local_user: None,
+        };
+        assert_eq!(cfg.lookup_with(ctx).port, Some(2222));
+    }
+
+    #[test]
+    fn match_all_matches_everything() {
+        let src = "\
+Match all
+  Port 4242
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("anything").port, Some(4242));
+        assert_eq!(cfg.lookup("other").port, Some(4242));
+    }
+
+    #[test]
+    fn match_canonical_never_matches_in_first_pass() {
+        let src = "\
+Match canonical
+  Port 4242
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("anything").port, None);
+    }
+
+    #[test]
+    fn match_final_never_matches_in_first_pass() {
+        let src = "\
+Match final
+  Port 4242
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("anything").port, None);
+    }
+
+    #[test]
+    fn match_exec_disabled_by_default() {
+        // Even with a command that would succeed on every platform, the
+        // block must be silently skipped while the default policy is in
+        // effect.
+        let src = "\
+Match exec true
+  Port 4242
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert!(!cfg.is_match_exec_enabled());
+        assert_eq!(cfg.lookup("anything").port, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn match_exec_enabled_runs_command() {
+        let src = "\
+Match exec /bin/true
+  Port 4242
+";
+        let cfg = SshClientConfig::parse(src).unwrap().enable_match_exec(true);
+        assert!(cfg.is_match_exec_enabled());
+        assert_eq!(cfg.lookup("anything").port, Some(4242));
+
+        let src_false = "\
+Match exec /bin/false
+  Port 4242
+";
+        let cfg = SshClientConfig::parse(src_false)
+            .unwrap()
+            .enable_match_exec(true);
+        assert_eq!(cfg.lookup("anything").port, None);
+    }
+
+    #[test]
+    fn match_originalhost_uses_pre_substitution_name() {
+        let src = "\
+Match originalhost prod
+  Port 2200
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let ctx = MatchContext {
+            host: "10.0.0.1",
+            original_host: Some("prod"),
+            user: None,
+            local_user: None,
+        };
+        assert_eq!(cfg.lookup_with(ctx).port, Some(2200));
+    }
+
+    #[test]
+    fn match_localuser() {
+        let src = "\
+Match localuser alice
+  Port 2200
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let ctx = MatchContext {
+            host: "h",
+            original_host: None,
+            user: None,
+            local_user: Some("alice"),
+        };
+        assert_eq!(cfg.lookup_with(ctx).port, Some(2200));
+        let ctx = MatchContext {
+            host: "h",
+            original_host: None,
+            user: None,
+            local_user: Some("bob"),
+        };
+        assert_eq!(cfg.lookup_with(ctx).port, None);
+    }
+
+    #[test]
+    fn match_block_with_settings_parses() {
+        // Sanity: settings inside a Match block actually get applied when
+        // the block matches.
+        let src = "\
+Match host gw
+  HostName 10.0.0.1
+  Port 2222
+  User admin
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(eff.host_name.as_deref(), Some("10.0.0.1"));
+        assert_eq!(eff.port, Some(2222));
+        assert_eq!(eff.user.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn match_unknown_criterion_errors() {
+        let src = "Match address 1.2.3.4\n  Port 22\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        match err {
+            ConfigError::BadValue { line, .. } => assert_eq!(line, 1),
+            _ => panic!("wrong err: {err:?}"),
+        }
+    }
+
+    #[test]
+    fn match_empty_args_errors() {
+        let src = "Match\n  Port 22\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        match err {
+            ConfigError::BadValue { line, .. } => assert_eq!(line, 1),
+            _ => panic!("wrong err: {err:?}"),
+        }
     }
 }

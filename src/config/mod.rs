@@ -37,6 +37,7 @@ use alloc::string::String;
 pub mod client;
 pub mod glob;
 pub mod host_port;
+pub mod match_block;
 pub mod parser;
 pub mod server;
 
@@ -45,6 +46,7 @@ pub use client::{
 };
 pub use glob::HostPattern;
 pub use host_port::{parse_host_port, parse_host_port_pattern};
+pub use match_block::{MatchCondition, MatchContext};
 pub use server::SshServerConfig;
 
 /// Errors produced while parsing or evaluating an SSH config file.

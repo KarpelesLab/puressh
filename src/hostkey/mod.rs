@@ -70,6 +70,22 @@ pub trait HostKey {
 
     /// Sign `msg` and return the SSH wire-format signature blob.
     fn sign(&self, msg: &[u8]) -> crate::Result<Vec<u8>>;
+
+    /// If the server's `server-sig-algs` (RFC 8308 §3.1, comma-separated)
+    /// lets us upgrade this signer to a stronger same-key variant — most
+    /// commonly an `ssh-rsa` (SHA-1) signer being re-used under
+    /// `rsa-sha2-512` / `rsa-sha2-256` over the same RSA key material —
+    /// return the upgraded signer.
+    ///
+    /// The default is `None` — Ed25519, ECDSA, and already-SHA-2 RSA
+    /// signers have nothing stronger to switch to over the same key.
+    ///
+    /// Implementations MUST NOT downgrade (e.g. `rsa-sha2-512` → `…-256`)
+    /// from this hook; the auth layer relies on the caller's chosen
+    /// minimum.
+    fn upgraded_for(&self, _server_sig_algs: &str) -> Option<Box<dyn HostKey>> {
+        None
+    }
 }
 
 /// A host key able to verify SSH-formatted signatures.

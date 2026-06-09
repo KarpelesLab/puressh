@@ -189,35 +189,43 @@ impl ClientAuth {
                     });
                 }
             };
-            if !self.server_allows(&cred) {
-                continue;
+            // Method-level gating against the latest USERAUTH_FAILURE
+            // continuations (empty = no prior failure, all methods still on
+            // the table).
+            if !self.server_continuations.is_empty() {
+                let name = cred.method_name();
+                if !self.server_continuations.iter().any(|m| m == name) {
+                    continue;
+                }
             }
+            // RFC 8308 §3.1 publickey filtering. When the server advertised
+            // `server-sig-algs`, a publickey credential whose signature
+            // algorithm is not on the list is either upgraded to a
+            // same-key variant (e.g. `ssh-rsa` → `rsa-sha2-512`) or
+            // skipped entirely. If `server-sig-algs` was never sent we
+            // keep the credential as-is — the server told us nothing, so
+            // we fall back to old-OpenSSH behaviour and let it answer.
+            let cred = match (cred, self.server_sig_algs.as_ref()) {
+                (ClientCredential::PublicKey(hk), Some(allowed)) => {
+                    let algo = hk.algorithm();
+                    if allowed.iter().any(|a| a == algo) {
+                        ClientCredential::PublicKey(hk)
+                    } else {
+                        // Build the original csv back so the HostKey impl
+                        // can decide on its own (it already encodes the
+                        // "no downgrade" policy).
+                        let csv = allowed.join(",");
+                        match hk.upgraded_for(&csv) {
+                            Some(upgraded) => ClientCredential::PublicKey(upgraded),
+                            None => continue,
+                        }
+                    }
+                }
+                (other, _) => other,
+            };
             self.current = Some(cred);
             return self.emit_current_request();
         }
-    }
-
-    fn server_allows(&self, cred: &ClientCredential) -> bool {
-        // First gate: does the server advertise this *method* on the latest
-        // USERAUTH_FAILURE continuations? (Empty list = no prior failure
-        // observed yet, so all methods are still on the table.)
-        if !self.server_continuations.is_empty() {
-            let name = cred.method_name();
-            if !self.server_continuations.iter().any(|m| m == name) {
-                return false;
-            }
-        }
-        // Second gate (RFC 8308 §3.1): if the server advertised
-        // `server-sig-algs`, drop publickey credentials whose signature
-        // algorithm is not on it — saves a USERAUTH_REQUEST round-trip
-        // and skips the legacy `ssh-rsa` fallback on modern servers.
-        if let (ClientCredential::PublicKey(hk), Some(allowed)) = (cred, &self.server_sig_algs) {
-            let algo = hk.algorithm();
-            if !allowed.iter().any(|a| a == algo) {
-                return false;
-            }
-        }
-        true
     }
 
     fn emit_current_request(&mut self) -> Result<ClientStep> {

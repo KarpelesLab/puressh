@@ -15,6 +15,8 @@
 use super::HostKeyAlgorithm;
 
 #[cfg(feature = "alloc")]
+use alloc::boxed::Box;
+#[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 #[cfg(feature = "alloc")]
 use purecrypto::bignum::BoxedUint;
@@ -174,7 +176,7 @@ fn verify_rsa(
 }
 
 macro_rules! rsa_host_key {
-    ($name:ident, $hash:expr, $algname:expr, $doc:expr) => {
+    ($name:ident, $hash:expr, $algname:expr, $doc:expr, $upgrade:expr) => {
         #[cfg(feature = "alloc")]
         #[doc = $doc]
         pub struct $name {
@@ -217,6 +219,19 @@ macro_rules! rsa_host_key {
             pub fn modulus_bytes(&self) -> usize {
                 self.k
             }
+
+            /// Build a same-key variant of a sibling RSA host key type
+            /// (used by `upgraded_for` to promote `ssh-rsa` → `rsa-sha2-*`
+            /// over the same `(n, e[, d])` material).
+            #[doc(hidden)]
+            #[allow(dead_code)]
+            pub(crate) fn from_rsa_parts(
+                private: Option<BoxedRsaPrivateKey>,
+                public: BoxedRsaPublicKey,
+                k: usize,
+            ) -> Self {
+                Self { private, public, k }
+            }
         }
 
         #[cfg(feature = "alloc")]
@@ -235,6 +250,11 @@ macro_rules! rsa_host_key {
                     .as_ref()
                     .ok_or(Error::Crypto("rsa: no private key"))?;
                 sign_rsa($hash, sk, msg)
+            }
+
+            fn upgraded_for(&self, server_sig_algs: &str) -> Option<Box<dyn HostKey>> {
+                #[allow(clippy::redundant_closure_call)]
+                ($upgrade)(self, server_sig_algs)
             }
         }
 
@@ -260,23 +280,76 @@ macro_rules! rsa_host_key {
     };
 }
 
+/// Returns the preferred RSA SHA-2 algorithm name (`rsa-sha2-512` first,
+/// then `rsa-sha2-256`) that the server advertised in its
+/// `server-sig-algs`, or `None` if neither is available. Pure parsing —
+/// no side effects.
+#[cfg(feature = "alloc")]
+fn preferred_rsa_sha2(server_sig_algs: &str) -> Option<&'static str> {
+    let mut has_512 = false;
+    let mut has_256 = false;
+    for algo in server_sig_algs.split(',') {
+        match algo.trim() {
+            "rsa-sha2-512" => has_512 = true,
+            "rsa-sha2-256" => has_256 = true,
+            _ => {}
+        }
+    }
+    if has_512 {
+        Some(RsaSha2_512::NAME)
+    } else if has_256 {
+        Some(RsaSha2_256::NAME)
+    } else {
+        None
+    }
+}
+
+/// Clone an RSA host key's inner `(private, public, k)` triple so a
+/// sibling variant (e.g. SHA-1 → SHA-512 over the same key) can be
+/// constructed from the same material.
+#[cfg(feature = "alloc")]
+fn clone_rsa_parts(
+    private: &Option<BoxedRsaPrivateKey>,
+    public: &BoxedRsaPublicKey,
+    k: usize,
+) -> (Option<BoxedRsaPrivateKey>, BoxedRsaPublicKey, usize) {
+    (private.clone(), public.clone(), k)
+}
+
 rsa_host_key!(
     RsaSha1HostKey,
     RsaHash::Sha1,
     SshRsa::NAME,
-    "RSA host key signing with `ssh-rsa` (RSA + SHA-1)."
+    "RSA host key signing with `ssh-rsa` (RSA + SHA-1).",
+    (|this: &RsaSha1HostKey, sig_algs: &str| -> Option<Box<dyn HostKey>> {
+        let name = preferred_rsa_sha2(sig_algs)?;
+        let (private, public, k) = clone_rsa_parts(&this.private, &this.public, this.k);
+        match name {
+            "rsa-sha2-512" => Some(
+                Box::new(RsaSha2_512HostKey::from_rsa_parts(private, public, k))
+                    as Box<dyn HostKey>,
+            ),
+            "rsa-sha2-256" => Some(
+                Box::new(RsaSha2_256HostKey::from_rsa_parts(private, public, k))
+                    as Box<dyn HostKey>,
+            ),
+            _ => None,
+        }
+    })
 );
 rsa_host_key!(
     RsaSha2_256HostKey,
     RsaHash::Sha256,
     RsaSha2_256::NAME,
-    "RSA host key signing with `rsa-sha2-256` (RSA + SHA-256)."
+    "RSA host key signing with `rsa-sha2-256` (RSA + SHA-256).",
+    (|_: &RsaSha2_256HostKey, _: &str| -> Option<Box<dyn HostKey>> { None })
 );
 rsa_host_key!(
     RsaSha2_512HostKey,
     RsaHash::Sha512,
     RsaSha2_512::NAME,
-    "RSA host key signing with `rsa-sha2-512` (RSA + SHA-512)."
+    "RSA host key signing with `rsa-sha2-512` (RSA + SHA-512).",
+    (|_: &RsaSha2_512HostKey, _: &str| -> Option<Box<dyn HostKey>> { None })
 );
 
 #[cfg(all(test, feature = "alloc"))]
@@ -387,5 +460,76 @@ mod tests {
         let s1 = RsaSha1HostKey::from_public_components(n, e).unwrap();
         assert_eq!(s256.public_blob(), s512.public_blob());
         assert_eq!(s256.public_blob(), s1.public_blob());
+    }
+
+    #[test]
+    fn rsa_sha1_upgrades_to_sha512_when_server_advertises_it() {
+        let (n, e) = known_n_e();
+        let s1 = RsaSha1HostKey::from_public_components(n.clone(), e.clone()).unwrap();
+        let expected_blob = s1.public_blob();
+        let upgraded = s1
+            .upgraded_for("rsa-sha2-512,rsa-sha2-256,ssh-ed25519")
+            .expect("server advertises rsa-sha2-512, must upgrade");
+        assert_eq!(upgraded.algorithm(), "rsa-sha2-512");
+        // The public blob is identical for ssh-rsa / rsa-sha2-{256,512}
+        // (RFC 8332 §3) — proves we're reusing the same RSA key.
+        assert_eq!(upgraded.public_blob(), expected_blob);
+    }
+
+    #[test]
+    fn rsa_sha1_upgrades_to_sha256_when_only_256_advertised() {
+        let (n, e) = known_n_e();
+        let s1 = RsaSha1HostKey::from_public_components(n, e).unwrap();
+        let upgraded = s1
+            .upgraded_for("rsa-sha2-256,ssh-ed25519")
+            .expect("server advertises rsa-sha2-256, must upgrade");
+        assert_eq!(upgraded.algorithm(), "rsa-sha2-256");
+    }
+
+    #[test]
+    fn rsa_sha1_no_upgrade_when_server_only_offers_ssh_rsa() {
+        let (n, e) = known_n_e();
+        let s1 = RsaSha1HostKey::from_public_components(n, e).unwrap();
+        assert!(
+            s1.upgraded_for("ssh-rsa,ssh-ed25519").is_none(),
+            "no rsa-sha2-{{256,512}} on the server: must not upgrade",
+        );
+    }
+
+    #[test]
+    fn rsa_sha1_no_upgrade_when_server_sig_algs_empty() {
+        let (n, e) = known_n_e();
+        let s1 = RsaSha1HostKey::from_public_components(n, e).unwrap();
+        assert!(s1.upgraded_for("").is_none());
+    }
+
+    #[test]
+    fn rsa_sha1_prefers_sha512_over_sha256_when_both_advertised() {
+        // Order-independent: server can list them in any order, we still
+        // pick the strongest available.
+        let (n, e) = known_n_e();
+        let s1 = RsaSha1HostKey::from_public_components(n, e).unwrap();
+        let upgraded = s1
+            .upgraded_for("rsa-sha2-256,rsa-sha2-512")
+            .expect("must upgrade");
+        assert_eq!(upgraded.algorithm(), "rsa-sha2-512");
+    }
+
+    #[test]
+    fn rsa_sha2_256_signer_does_not_upgrade() {
+        let (n, e) = known_n_e();
+        let s256 = RsaSha2_256HostKey::from_public_components(n, e).unwrap();
+        // Even when the server advertises sha2-512, the typed
+        // RsaSha2_256HostKey deliberately stays put — the caller picked
+        // 256 explicitly, and the auth layer's exact-match path
+        // already keeps it as-is.
+        assert!(s256.upgraded_for("rsa-sha2-512").is_none());
+    }
+
+    #[test]
+    fn rsa_sha2_512_signer_does_not_upgrade() {
+        let (n, e) = known_n_e();
+        let s512 = RsaSha2_512HostKey::from_public_components(n, e).unwrap();
+        assert!(s512.upgraded_for("rsa-sha2-512,rsa-sha2-256").is_none());
     }
 }

@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::hostkey::{Ed25519HostKey, HostKey};
+use crate::hostkey::{Ed25519HostKey, HostKey, RsaSha1HostKey};
 
 use super::client::{ClientAuth, ClientCredential, ClientStep, KeyboardInteractiveResponder};
 use super::message::{
@@ -754,6 +754,139 @@ fn client_accepts_publickey_listed_in_server_sig_algs() {
         }
         _ => panic!("expected publickey probe"),
     }
+}
+
+#[test]
+fn ssh_rsa_credential_with_server_advertising_rsa_sha2_512_signs_with_512() {
+    // The user supplies an `ssh-rsa` (SHA-1) credential. The server's
+    // server-sig-algs lists only `rsa-sha2-{256,512}`. The old W4
+    // filter would have skipped this credential entirely; with the
+    // upgrade hook it should be promoted to `rsa-sha2-512` (the
+    // strongest variant the server advertises) and the publickey
+    // probe must go out under the new name.
+    use purecrypto::bignum::BoxedUint;
+    // Same vector the hostkey tests use — only the public components
+    // are needed to exercise the credential walk; the probe is sent
+    // before any sign() call.
+    let mut n_bytes = vec![0u8; 256];
+    n_bytes[0] = 0xc0;
+    for (i, b) in n_bytes.iter_mut().enumerate().skip(1) {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7) | 0x01;
+    }
+    let n = BoxedUint::from_be_bytes(&n_bytes);
+    let e = BoxedUint::from_u64(65537);
+    let rsa_sha1 = Box::new(RsaSha1HostKey::from_public_components(n, e).unwrap());
+
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.set_server_sig_algs("rsa-sha2-512,rsa-sha2-256");
+    c.add_credential(ClientCredential::PublicKey(rsa_sha1));
+
+    let _ = c.start();
+    let step = c
+        .on_packet(
+            &ServiceAccept {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let payload = match step {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected the upgraded publickey probe, got non-Send"),
+    };
+    let parsed = UserauthRequest::decode(&payload).unwrap();
+    match parsed.method {
+        AuthMethodPayload::PublicKey {
+            signature_present,
+            algorithm,
+            ..
+        } => {
+            assert!(!signature_present, "first publickey msg is a probe");
+            assert_eq!(
+                algorithm, "rsa-sha2-512",
+                "ssh-rsa credential must be upgraded to rsa-sha2-512",
+            );
+        }
+        _ => panic!("expected upgraded publickey probe"),
+    }
+}
+
+#[test]
+fn ssh_rsa_credential_upgrades_to_256_when_only_256_advertised() {
+    use purecrypto::bignum::BoxedUint;
+    let mut n_bytes = vec![0u8; 256];
+    n_bytes[0] = 0xc0;
+    for (i, b) in n_bytes.iter_mut().enumerate().skip(1) {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7) | 0x01;
+    }
+    let n = BoxedUint::from_be_bytes(&n_bytes);
+    let e = BoxedUint::from_u64(65537);
+    let rsa_sha1 = Box::new(RsaSha1HostKey::from_public_components(n, e).unwrap());
+
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.set_server_sig_algs("rsa-sha2-256,ssh-ed25519");
+    c.add_credential(ClientCredential::PublicKey(rsa_sha1));
+
+    let _ = c.start();
+    let step = c
+        .on_packet(
+            &ServiceAccept {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let payload = match step {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected probe"),
+    };
+    let parsed = UserauthRequest::decode(&payload).unwrap();
+    match parsed.method {
+        AuthMethodPayload::PublicKey { algorithm, .. } => {
+            assert_eq!(algorithm, "rsa-sha2-256");
+        }
+        _ => panic!("expected publickey"),
+    }
+}
+
+#[test]
+fn ssh_rsa_credential_skipped_when_server_advertises_neither_sha2() {
+    // Server lists only ssh-ed25519 — the RSA credential has no
+    // upgrade target and must be dropped, falling through to the
+    // password fallback rather than emitting an ssh-rsa probe.
+    use purecrypto::bignum::BoxedUint;
+    let mut n_bytes = vec![0u8; 256];
+    n_bytes[0] = 0xc0;
+    for (i, b) in n_bytes.iter_mut().enumerate().skip(1) {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7) | 0x01;
+    }
+    let n = BoxedUint::from_be_bytes(&n_bytes);
+    let e = BoxedUint::from_u64(65537);
+    let rsa_sha1 = Box::new(RsaSha1HostKey::from_public_components(n, e).unwrap());
+
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.set_server_sig_algs("ssh-ed25519");
+    c.add_credential(ClientCredential::PublicKey(rsa_sha1));
+    c.add_credential(ClientCredential::Password("hunter2".into()));
+
+    let _ = c.start();
+    let step = c
+        .on_packet(
+            &ServiceAccept {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        )
+        .unwrap();
+    let payload = match step {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected Send"),
+    };
+    let parsed = UserauthRequest::decode(&payload).unwrap();
+    assert!(
+        matches!(parsed.method, AuthMethodPayload::Password { .. }),
+        "expected password fallback after RSA credential dropped",
+    );
 }
 
 #[test]

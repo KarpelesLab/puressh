@@ -119,6 +119,34 @@ impl HostKey for AgentHostKey {
         }
         Ok(sig_blob)
     }
+
+    /// Upgrade an RSA-backed agent identity to a stronger hash when the
+    /// server's `server-sig-algs` permits it. For ssh-agent this is just
+    /// a different flag on the next SIGN request — the agent reuses the
+    /// same loaded RSA key.
+    ///
+    /// We only ever upgrade (never downgrade):
+    /// * `rsa-sha2-256` may become `rsa-sha2-512` when the server lists
+    ///   `rsa-sha2-512`.
+    /// * `rsa-sha2-512` stays put — it's already the strongest variant.
+    /// * Ed25519 / ECDSA agent identities have nothing to upgrade to.
+    fn upgraded_for(&self, server_sig_algs: &str) -> Option<Box<dyn HostKey>> {
+        if self.algorithm != "rsa-sha2-256" {
+            return None;
+        }
+        let advertises_512 = server_sig_algs
+            .split(',')
+            .any(|a| a.trim() == "rsa-sha2-512");
+        if !advertises_512 {
+            return None;
+        }
+        Some(Box::new(AgentHostKey {
+            agent: Arc::clone(&self.agent),
+            key_blob: self.key_blob.clone(),
+            algorithm: "rsa-sha2-512",
+            flags: SSH_AGENT_RSA_SHA2_512,
+        }))
+    }
 }
 
 /// Read the first SSH `string` (`uint32 length || bytes`) from `buf`.

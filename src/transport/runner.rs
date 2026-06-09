@@ -31,6 +31,7 @@ use crate::kex::{
 };
 use crate::mac::{mac_by_name, SshMac};
 use purecrypto::dh::{group14, group16, group18, DhGroup};
+use zeroize::Zeroizing;
 
 use super::ext_info::ExtInfo;
 use super::kex::Negotiated;
@@ -212,7 +213,11 @@ pub struct KexRunner {
     /// `H` of the first KEX on this connection.
     session_id: Option<Vec<u8>>,
     current_h: Option<Vec<u8>>,
-    current_k: Option<Vec<u8>>,
+    /// Shared secret `K` for the most recent KEX. Wrapped in `Zeroizing`
+    /// so the bytes are wiped from memory when this field is replaced or
+    /// the runner is dropped; KexOutput itself already wipes its own copy
+    /// via `ZeroizeOnDrop`, and we take ownership here via `mem::take`.
+    current_k: Option<Zeroizing<Vec<u8>>>,
     installed_keys: Option<InstalledKeys>,
     sent_newkeys: bool,
     peer_newkeys: bool,
@@ -716,34 +721,67 @@ impl KexRunner {
             i_s: &i_s,
         };
 
+        // `KexOutput` is `ZeroizeOnDrop`, so we can't move `k` / `h` out by
+        // partial destructure (E0509). `core::mem::take` swaps in an empty
+        // `Vec` and hands us the real bytes; when the surrounding `out`
+        // value is dropped, the now-empty `Vec` in `out.kex.k` is wiped
+        // harmlessly.
         let (reply_payload, k, h) = match backend {
             KexBackend::Curve25519 => {
-                let out = Curve25519Sha256::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = Curve25519Sha256::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::EcdhP256 => {
-                let out = EcdhSha2Nistp256::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = EcdhSha2Nistp256::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::EcdhP384 => {
-                let out = EcdhSha2Nistp384::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = EcdhSha2Nistp384::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::EcdhP521 => {
-                let out = EcdhSha2Nistp521::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = EcdhSha2Nistp521::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::Dh14 => {
-                let out = Group14Sha256::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = Group14Sha256::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::Dh16 => {
-                let out = Group16Sha512::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = Group16Sha512::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::Dh18 => {
-                let out = Group18Sha512::server_reply(rng, payload, hk, &ctx)?;
-                (out.payload, out.kex.k, out.kex.h)
+                let mut out = Group18Sha512::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
             }
             KexBackend::MlKem768X25519 => {
                 let out = MlKem768X25519Sha256::server_reply(rng, payload, hk, &ctx)?;
@@ -754,7 +792,7 @@ impl KexRunner {
             KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),
         };
 
-        self.current_k = Some(k);
+        self.current_k = Some(Zeroizing::new(k));
         self.current_h = Some(h);
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
@@ -798,21 +836,25 @@ impl KexRunner {
 
         let verifier_ref = verifier.ok_or(Error::Protocol("client requires host-key verifier"))?;
 
+        // `KexOutput` is `ZeroizeOnDrop`, so we can't move `k` / `h` out by
+        // partial destructure (E0509). `core::mem::take` swaps in an empty
+        // `Vec` and hands us the real bytes; the now-empty fields inside
+        // `out` are wiped harmlessly when `out` is dropped at end-of-arm.
         let (k, h) = match backend {
             KexBackend::Curve25519 => {
                 let st = match state {
                     ClientStateInner::Curve(s) => s,
                     _ => return Err(Error::Protocol("client state type mismatch")),
                 };
-                let out = Curve25519Sha256::client_finish(st, payload, verifier_ref, &ctx)?;
-                (out.k, out.h)
+                let mut out = Curve25519Sha256::client_finish(st, payload, verifier_ref, &ctx)?;
+                (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
             KexBackend::EcdhP256 | KexBackend::EcdhP384 | KexBackend::EcdhP521 => {
                 let st = match state {
                     ClientStateInner::Ecdh(s) => s,
                     _ => return Err(Error::Protocol("client state type mismatch")),
                 };
-                let out = match backend {
+                let mut out = match backend {
                     KexBackend::EcdhP256 => {
                         EcdhSha2Nistp256::client_finish(st, payload, verifier_ref, &ctx)?
                     }
@@ -824,14 +866,14 @@ impl KexRunner {
                     }
                     _ => unreachable!(),
                 };
-                (out.k, out.h)
+                (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
             KexBackend::Dh14 | KexBackend::Dh16 | KexBackend::Dh18 => {
                 let st = match state {
                     ClientStateInner::Dh(s) => s,
                     _ => return Err(Error::Protocol("client state type mismatch")),
                 };
-                let out = match backend {
+                let mut out = match backend {
                     KexBackend::Dh14 => {
                         Group14Sha256::client_finish(st, payload, verifier_ref, &ctx)?
                     }
@@ -843,7 +885,7 @@ impl KexRunner {
                     }
                     _ => unreachable!(),
                 };
-                (out.k, out.h)
+                (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
             KexBackend::MlKem768X25519 => {
                 let st = match state {
@@ -857,7 +899,7 @@ impl KexRunner {
             KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),
         };
 
-        self.current_k = Some(k);
+        self.current_k = Some(Zeroizing::new(k));
         self.current_h = Some(h);
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
@@ -931,10 +973,11 @@ impl KexRunner {
             i_c,
             i_s: &i_s,
         };
-        let out = GexSha256::server_reply(rng, request, &group, payload, hk, &ctx)?;
+        let mut out = GexSha256::server_reply(rng, request, &group, payload, hk, &ctx)?;
 
-        self.current_k = Some(out.kex.k);
-        self.current_h = Some(out.kex.h);
+        // KexOutput is ZeroizeOnDrop: take instead of moving fields out.
+        self.current_k = Some(Zeroizing::new(core::mem::take(&mut out.kex.k)));
+        self.current_h = Some(core::mem::take(&mut out.kex.h));
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
         }
@@ -973,10 +1016,11 @@ impl KexRunner {
             i_c: &i_c,
             i_s: &i_s,
         };
-        let out = GexSha256::client_finish(state, payload, verifier_ref, &ctx)?;
+        let mut out = GexSha256::client_finish(state, payload, verifier_ref, &ctx)?;
 
-        self.current_k = Some(out.k);
-        self.current_h = Some(out.h);
+        // KexOutput is ZeroizeOnDrop: take instead of moving fields out.
+        self.current_k = Some(Zeroizing::new(core::mem::take(&mut out.k)));
+        self.current_h = Some(core::mem::take(&mut out.h));
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
         }
@@ -1083,9 +1127,12 @@ impl KexRunner {
             .as_ref()
             .ok_or(Error::Protocol("missing negotiation"))?;
         let backend = self.backend.ok_or(Error::Protocol("missing backend"))?;
-        let k = self
+        // `Option::as_deref` on `Option<Zeroizing<Vec<u8>>>` would land at
+        // `&Vec<u8>`, not `&[u8]`; spell it out so we get the slice we want.
+        let k: &[u8] = self
             .current_k
-            .as_deref()
+            .as_ref()
+            .map(|z| z.as_slice())
             .ok_or(Error::Protocol("missing K"))?;
         let h = self
             .current_h

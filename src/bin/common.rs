@@ -57,12 +57,37 @@ pub fn resolve_user(cli_user: Option<&str>, user_in_host: Option<&str>) -> Resul
 }
 
 /// Split a `[user@]host` token. The host portion is whatever follows the
-/// last `@` — for an unadorned `host`, the user half is `None`.
+/// first `@` — for an unadorned `host`, the user half is `None`.
 pub fn parse_userhost(target: &str) -> (Option<String>, String) {
     match target.split_once('@') {
         Some((u, h)) => (Some(u.to_string()), h.to_string()),
         None => (None, target.to_string()),
     }
+}
+
+/// Split a `[user@]host[:port]` CLI target. The host half goes through
+/// [`puressh::config::parse_host_port`] so bracketed IPv6 literals
+/// (`[2001:db8::1]:22`) and bare IPv6 literals (`2001:db8::1`, no
+/// port) work. The returned port is `Some(p)` when the target carried
+/// an explicit port (either `host:port` or `[v6]:port`), and `None`
+/// when it didn't — callers decide whether `-p`/config/22 wins.
+///
+/// Returns `(user, host, port)`. `user` is `None` when the target had no
+/// `@`. Errors are stringified for the bin's existing error-reporting
+/// flow.
+pub fn parse_target(target: &str) -> Result<(Option<String>, String, Option<u16>), String> {
+    let (user, host_with_port) = parse_userhost(target);
+    if host_with_port.is_empty() {
+        return Err("empty host".into());
+    }
+    // We pass a sentinel default of 0 to parse_host_port and reconstruct
+    // the "was a port given?" bit afterwards. Port 0 is reserved for
+    // OS-assigned binds; it's never a meaningful connect target, so
+    // using it as the "no port given" marker is unambiguous.
+    let (host, port) =
+        puressh::config::parse_host_port(&host_with_port, 0).map_err(|e| format!("{e}"))?;
+    let port_opt = if port == 0 { None } else { Some(port) };
+    Ok((user, host, port_opt))
 }
 
 /// Split a `[user@]host:path` token used by `scp(1)` / `sftp(1)` local-or-
@@ -71,21 +96,44 @@ pub fn parse_userhost(target: &str) -> (Option<String>, String) {
 ///
 /// We deliberately accept colons in the path portion (after the first one)
 /// to match OpenSSH's behaviour; the caller decides whether to refuse them.
+///
+/// IPv6 literals must be bracketed in this position so the `:` separator
+/// is unambiguous: `[user@][2001:db8::1]:/etc/motd`. A bare v6 host
+/// (`2001:db8::1:/path`) is not accepted because there is no way to
+/// distinguish the address from the path. This matches OpenSSH `scp(1)`
+/// behaviour.
 pub fn parse_userhost_path(target: &str) -> Option<(Option<String>, String, String)> {
     // Refuse a bare absolute path (`/foo/bar:baz` is local, not remote).
     if target.starts_with('/') {
         return None;
     }
-    let (head, path) = target.split_once(':')?;
-    // A path token with no `@` and no `.` and no `/` in the head is
-    // ambiguous; we treat anything before the first `:` as the host (with
-    // optional `user@` prefix). This is OpenSSH's behaviour: `foo:bar` is
-    // a remote copy.
-    let (user, host) = parse_userhost(head);
+
+    // Pull the optional `user@` prefix off the front first. We split on
+    // the FIRST `@` because that matches the existing parse_userhost
+    // semantics; v6 in brackets does not contain `@`.
+    let (user, after_user) = parse_userhost(target);
+
+    // Now look for the host/path separator. With a bracketed v6, the `]`
+    // ends the host and the next char must be `:` then the path.
+    let (host, path) = if let Some(rest) = after_user.strip_prefix('[') {
+        // [host]:path — find the closing `]`. Everything in between is
+        // the host (taken verbatim, no v6 validation here because scp is
+        // happy to forward any string to its peer's resolver).
+        let close = rest.find(']')?;
+        let host = rest[..close].to_string();
+        let after_bracket = &rest[close + 1..];
+        let path = after_bracket.strip_prefix(':')?;
+        (host, path.to_string())
+    } else {
+        // Plain `host:path` — split on the first `:`.
+        let (h, p) = after_user.split_once(':')?;
+        (h.to_string(), p.to_string())
+    };
+
     if host.is_empty() {
         return None;
     }
-    Some((user, host, path.to_string()))
+    Some((user, host, path))
 }
 
 /// Read a passphrase from stdin (or `$SSH_ASKPASS` if set) without
@@ -942,6 +990,160 @@ pub fn expand_tilde(path: &str) -> String {
         }
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod target_tests {
+    //! Cross-platform tests for the `[user@]host[:port]` and
+    //! `[user@]host:path` CLI parsers. These don't need a tty so they're
+    //! not gated to `cfg(unix)` (unlike the signal-handler tests below,
+    //! which do).
+    use super::*;
+
+    #[test]
+    fn parse_target_plain_host_no_port() {
+        let (u, h, p) = parse_target("example.com").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "example.com");
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_target_user_at_host() {
+        let (u, h, p) = parse_target("alice@example.com").unwrap();
+        assert_eq!(u.as_deref(), Some("alice"));
+        assert_eq!(h, "example.com");
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_target_host_with_port() {
+        let (u, h, p) = parse_target("example.com:2222").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "example.com");
+        assert_eq!(p, Some(2222));
+    }
+
+    #[test]
+    fn parse_target_user_host_port() {
+        let (u, h, p) = parse_target("alice@example.com:2222").unwrap();
+        assert_eq!(u.as_deref(), Some("alice"));
+        assert_eq!(h, "example.com");
+        assert_eq!(p, Some(2222));
+    }
+
+    #[test]
+    fn parse_target_bare_v6() {
+        let (u, h, p) = parse_target("2001:db8::1").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_target_bracketed_v6_with_port() {
+        let (u, h, p) = parse_target("[2001:db8::1]:2222").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, Some(2222));
+    }
+
+    #[test]
+    fn parse_target_user_at_bracketed_v6() {
+        let (u, h, p) = parse_target("alice@[2001:db8::1]:2222").unwrap();
+        assert_eq!(u.as_deref(), Some("alice"));
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, Some(2222));
+    }
+
+    #[test]
+    fn parse_target_user_at_bare_v6() {
+        // Bare v6 after `user@` — the `@` split removes the user, then
+        // parse_host_port sees the bare v6 and accepts it.
+        let (u, h, p) = parse_target("alice@2001:db8::1").unwrap();
+        assert_eq!(u.as_deref(), Some("alice"));
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn parse_target_rejects_empty_host() {
+        assert!(parse_target("alice@").is_err());
+        assert!(parse_target("").is_err());
+    }
+
+    #[test]
+    fn parse_target_rejects_unmatched_bracket() {
+        assert!(parse_target("[2001:db8::1").is_err());
+    }
+
+    #[test]
+    fn parse_userhost_path_plain() {
+        let (u, h, p) = parse_userhost_path("alice@example.com:/etc/motd").unwrap();
+        assert_eq!(u.as_deref(), Some("alice"));
+        assert_eq!(h, "example.com");
+        assert_eq!(p, "/etc/motd");
+    }
+
+    #[test]
+    fn parse_userhost_path_no_user() {
+        let (u, h, p) = parse_userhost_path("example.com:/etc/motd").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "example.com");
+        assert_eq!(p, "/etc/motd");
+    }
+
+    #[test]
+    fn parse_userhost_path_local_rejects_absolute() {
+        // A bare absolute path is local, not remote.
+        assert!(parse_userhost_path("/etc/motd").is_none());
+    }
+
+    #[test]
+    fn parse_userhost_path_local_rejects_no_colon() {
+        // No `:` -> local path.
+        assert!(parse_userhost_path("relative/path").is_none());
+    }
+
+    #[test]
+    fn parse_userhost_path_bracketed_v6() {
+        let (u, h, p) = parse_userhost_path("[2001:db8::1]:/etc/motd").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, "/etc/motd");
+    }
+
+    #[test]
+    fn parse_userhost_path_user_at_bracketed_v6() {
+        let (u, h, p) = parse_userhost_path("alice@[2001:db8::1]:/etc/motd").unwrap();
+        assert_eq!(u.as_deref(), Some("alice"));
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, "/etc/motd");
+    }
+
+    #[test]
+    fn parse_userhost_path_preserves_colons_in_path() {
+        // Path may contain extra colons (Windows-style drive letters or
+        // SCP-of-SCP-style nested targets); only the first separator is
+        // used as the host/path boundary.
+        let (u, h, p) = parse_userhost_path("host:/a:b:c").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "host");
+        assert_eq!(p, "/a:b:c");
+    }
+
+    #[test]
+    fn parse_userhost_path_bracketed_v6_path_with_colons() {
+        let (u, h, p) = parse_userhost_path("[2001:db8::1]:/a:b").unwrap();
+        assert_eq!(u, None);
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, "/a:b");
+    }
+
+    #[test]
+    fn parse_userhost_path_bracketed_v6_unmatched_bracket() {
+        assert!(parse_userhost_path("[2001:db8::1/path").is_none());
+    }
 }
 
 #[cfg(all(test, unix))]

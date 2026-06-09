@@ -37,8 +37,8 @@ use puressh::sftp::{
 mod common;
 use common::{
     build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
-    load_identity, read_password_from_stdin, resolve_user, set_verbose, try_load_default_identity,
-    vlog, StrictMode,
+    load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
+    try_load_default_identity, vlog, StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -160,12 +160,13 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         return Err("missing host argument".into());
     }
     let target = positional.remove(0);
-    let (user_in_host, host) = match target.split_once('@') {
-        Some((u, h)) => (Some(u.to_string()), h.to_string()),
-        None => (None, target),
-    };
-    if host.is_empty() {
-        return Err("empty host".into());
+    // parse_target accepts `[user@]host[:port]` with bare /
+    // bracketed IPv6 (`2001:db8::1`, `[2001:db8::1]:22`). When the
+    // target carries an explicit `:port`, `-P` still wins if given
+    // (mirroring how `-p` works for ssh).
+    let (user_in_host, host, target_port) = parse_target(&target)?;
+    if port.is_none() {
+        port = target_port;
     }
 
     Ok(Cli {

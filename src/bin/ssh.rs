@@ -28,8 +28,8 @@ use puressh::client::{
 mod common;
 use common::{
     build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
-    load_identity, read_password_from_stdin, resolve_user, set_verbose, try_load_default_identity,
-    vlog, StrictMode,
+    load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
+    try_load_default_identity, vlog, StrictMode,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -118,23 +118,13 @@ struct Cli {
     command: Option<String>,
 }
 
-/// Parse one `-L` arg value: `LPORT:RHOST:RPORT`. `RHOST` may be a bare IPv4
-/// or hostname; bracketed IPv6 (`[::1]:80`) is NOT yet supported.
+/// Parse one `-L` arg value: `LPORT:RHOST:RPORT`. `RHOST` may be a bare
+/// IPv4 / hostname, a bare IPv6 literal, OR an RFC-3986 bracketed IPv6
+/// literal (`[2001:db8::1]`) — the bracketed form is needed for v6
+/// because the literal itself contains colons that the `:`-split below
+/// would otherwise mangle.
 fn parse_local_forward(s: &str) -> Result<LocalForward, String> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        return Err(format!("-L expects LPORT:RHOST:RPORT, got {s:?}"));
-    }
-    let listen_port: u16 = parts[0]
-        .parse()
-        .map_err(|_| format!("-L: invalid LPORT {:?}", parts[0]))?;
-    let remote_host = parts[1].to_string();
-    if remote_host.is_empty() {
-        return Err("-L: RHOST cannot be empty".into());
-    }
-    let remote_port: u16 = parts[2]
-        .parse()
-        .map_err(|_| format!("-L: invalid RPORT {:?}", parts[2]))?;
+    let (listen_port, remote_host, remote_port) = split_forward_triple(s, "-L")?;
     Ok(LocalForward {
         listen_port,
         remote_host,
@@ -142,27 +132,65 @@ fn parse_local_forward(s: &str) -> Result<LocalForward, String> {
     })
 }
 
-/// Parse one `-R` arg value: `RPORT:LHOST:LPORT`.
+/// Parse one `-R` arg value: `RPORT:LHOST:LPORT`. Same v6 rules as `-L`.
 fn parse_remote_forward(s: &str) -> Result<RemoteForward, String> {
-    let parts: Vec<&str> = s.splitn(3, ':').collect();
-    if parts.len() != 3 {
-        return Err(format!("-R expects RPORT:LHOST:LPORT, got {s:?}"));
-    }
-    let remote_port: u16 = parts[0]
-        .parse()
-        .map_err(|_| format!("-R: invalid RPORT {:?}", parts[0]))?;
-    let local_host = parts[1].to_string();
-    if local_host.is_empty() {
-        return Err("-R: LHOST cannot be empty".into());
-    }
-    let local_port: u16 = parts[2]
-        .parse()
-        .map_err(|_| format!("-R: invalid LPORT {:?}", parts[2]))?;
+    let (remote_port, local_host, local_port) = split_forward_triple(s, "-R")?;
     Ok(RemoteForward {
         remote_port,
         local_host,
         local_port,
     })
+}
+
+/// Common splitter for `-L` / `-R` triples: `PORT:HOST:PORT`. Handles a
+/// bracketed-IPv6 middle field by skipping past the `]` before looking
+/// for the second `:` separator. The `flag` argument is the originating
+/// CLI flag name (e.g. `"-L"`) for the error messages.
+fn split_forward_triple(s: &str, flag: &str) -> Result<(u16, String, u16), String> {
+    // First `:` ends the leading port. Always unambiguous — a port is
+    // numeric, no colons.
+    let (port1_str, after_p1) = s
+        .split_once(':')
+        .ok_or_else(|| format!("{flag} expects PORT:HOST:PORT, got {s:?}"))?;
+    let port1: u16 = port1_str
+        .parse()
+        .map_err(|_| format!("{flag}: invalid leading port {port1_str:?}"))?;
+
+    // Middle host field: bracketed v6 or plain.
+    let (host, after_host) = if let Some(rest) = after_p1.strip_prefix('[') {
+        // [v6]:port form — find the closing `]`. The host token is
+        // taken verbatim; we don't validate v6 here because the kernel
+        // will (TcpStream::connect) and a stricter check would just
+        // duplicate that work without catching anything user-meaningful.
+        let close = rest
+            .find(']')
+            .ok_or_else(|| format!("{flag}: missing `]` in {s:?}"))?;
+        let host = rest[..close].to_string();
+        let after = &rest[close + 1..];
+        let after = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("{flag}: expected `:port` after `]` in {s:?}"))?;
+        (host, after)
+    } else {
+        // Plain `host:port` — split on the FIRST `:`. A bare v6 with no
+        // brackets is ambiguous in this position (the colons of the
+        // address collide with the port separator); we require brackets
+        // for v6, matching OpenSSH's `-L` behaviour.
+        let (h, p) = after_p1
+            .split_once(':')
+            .ok_or_else(|| format!("{flag} expects PORT:HOST:PORT, got {s:?}"))?;
+        if h.is_empty() {
+            return Err(format!("{flag}: HOST cannot be empty"));
+        }
+        (h.to_string(), p)
+    };
+    if host.is_empty() {
+        return Err(format!("{flag}: HOST cannot be empty"));
+    }
+    let port2: u16 = after_host
+        .parse()
+        .map_err(|_| format!("{flag}: invalid trailing port {after_host:?}"))?;
+    Ok((port1, host, port2))
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -288,12 +316,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         return Err("missing host argument".into());
     }
     let target = positional.remove(0);
-    let (user_in_host, host) = match target.split_once('@') {
-        Some((u, h)) => (Some(u.to_string()), h.to_string()),
-        None => (None, target),
-    };
-    if host.is_empty() {
-        return Err("empty host".into());
+    // parse_target accepts `[user@]host[:port]` and handles bare /
+    // bracketed IPv6 literals (`2001:db8::1`, `[2001:db8::1]:22`).
+    // The returned port is `Some(p)` only when the target carried an
+    // explicit one — `-p` keeps wining over a missing target port.
+    let (user_in_host, host, target_port) = parse_target(&target)?;
+    // `-p` wins over a target-embedded port; an embedded port only
+    // takes effect if `-p` was not supplied.
+    if port.is_none() {
+        port = target_port;
     }
     let command = if positional.is_empty() {
         None
@@ -1222,5 +1253,74 @@ fn main() -> ExitCode {
             eprintln!("ssh: {msg}");
             ExitCode::from(255)
         }
+    }
+}
+
+#[cfg(test)]
+mod forward_tests {
+    use super::*;
+
+    #[test]
+    fn local_forward_plain() {
+        let f = parse_local_forward("8080:example.com:80").unwrap();
+        assert_eq!(f.listen_port, 8080);
+        assert_eq!(f.remote_host, "example.com");
+        assert_eq!(f.remote_port, 80);
+    }
+
+    #[test]
+    fn local_forward_v4() {
+        let f = parse_local_forward("8080:192.0.2.1:80").unwrap();
+        assert_eq!(f.remote_host, "192.0.2.1");
+        assert_eq!(f.remote_port, 80);
+    }
+
+    #[test]
+    fn local_forward_bracketed_v6() {
+        let f = parse_local_forward("8080:[2001:db8::1]:80").unwrap();
+        assert_eq!(f.listen_port, 8080);
+        assert_eq!(f.remote_host, "2001:db8::1");
+        assert_eq!(f.remote_port, 80);
+    }
+
+    #[test]
+    fn local_forward_bracketed_v6_loopback() {
+        let f = parse_local_forward("8080:[::1]:80").unwrap();
+        assert_eq!(f.remote_host, "::1");
+        assert_eq!(f.remote_port, 80);
+    }
+
+    #[test]
+    fn local_forward_rejects_missing_close_bracket() {
+        assert!(parse_local_forward("8080:[2001:db8::1:80").is_err());
+    }
+
+    #[test]
+    fn local_forward_rejects_missing_trailing_port() {
+        // `[v6]` with no `:port` afterwards.
+        assert!(parse_local_forward("8080:[2001:db8::1]").is_err());
+        assert!(parse_local_forward("8080:[2001:db8::1]junk").is_err());
+    }
+
+    #[test]
+    fn local_forward_rejects_too_few_fields() {
+        assert!(parse_local_forward("only-one-field").is_err());
+        assert!(parse_local_forward("80:hostonly").is_err());
+    }
+
+    #[test]
+    fn remote_forward_plain() {
+        let f = parse_remote_forward("9090:127.0.0.1:22").unwrap();
+        assert_eq!(f.remote_port, 9090);
+        assert_eq!(f.local_host, "127.0.0.1");
+        assert_eq!(f.local_port, 22);
+    }
+
+    #[test]
+    fn remote_forward_bracketed_v6() {
+        let f = parse_remote_forward("9090:[2001:db8::2]:22").unwrap();
+        assert_eq!(f.remote_port, 9090);
+        assert_eq!(f.local_host, "2001:db8::2");
+        assert_eq!(f.local_port, 22);
     }
 }

@@ -127,6 +127,64 @@ pub fn parse_host_port(s: &str, default_port: u16) -> Result<(String, u16), Conf
     Ok((s.to_string(), default_port))
 }
 
+/// Variant of [`parse_host_port`] that follows the OpenSSH `known_hosts`
+/// pattern grammar, where `[host]:port` brackets are permitted around
+/// *any* host (not only IPv6 literals). OpenSSH writes `[example.com]:2222`
+/// itself when adding a non-default-port entry — see `format_host_pattern`
+/// — so the matching reader has to accept the same shape.
+///
+/// Accepts:
+/// - `[host]:port` for any host (IPv6 literal, IPv4 dotted-quad, hostname);
+///   the bracketed portion is taken verbatim as the host.
+/// - `[host]` with no port suffix (host = bracketed content, port =
+///   `default_port`).
+/// - bare `host` (any string) → `(host, default_port)`.
+///
+/// Rejects:
+/// - missing close bracket: `[host`
+/// - garbage after close bracket: `[host]xyz`
+/// - empty port: `[host]:`
+/// - non-numeric port: `[host]:abc`
+///
+/// IMPORTANT: this function does **not** colon-split bare hostnames.
+/// `example.com:2222` returns `("example.com:2222", default_port)` — that
+/// matches the previous `known_hosts::store::split_host_port` semantics
+/// (a plain pattern with an embedded colon is taken verbatim, because
+/// known_hosts files have never used `host:port` outside the bracketed
+/// form). The bare form here is *strictly* a fall-through; use
+/// [`parse_host_port`] when colon-splitting is wanted.
+pub fn parse_host_port_pattern(s: &str, default_port: u16) -> Result<(String, u16), ConfigError> {
+    if let Some(rest) = s.strip_prefix('[') {
+        let close = rest.find(']').ok_or_else(|| ConfigError::BadValue {
+            line: 0,
+            keyword: "host_port".to_string(),
+            msg: alloc::format!("missing `]` in bracketed host {s:?}"),
+        })?;
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        let port = if after.is_empty() {
+            default_port
+        } else {
+            let port_str = after
+                .strip_prefix(':')
+                .ok_or_else(|| ConfigError::BadValue {
+                    line: 0,
+                    keyword: "host_port".to_string(),
+                    msg: alloc::format!("expected `:port` after `]` in {s:?}"),
+                })?;
+            port_str.parse::<u16>().map_err(|_| ConfigError::BadValue {
+                line: 0,
+                keyword: "host_port".to_string(),
+                msg: alloc::format!("bad port {port_str:?} in {s:?}"),
+            })?
+        };
+        return Ok((host.to_string(), port));
+    }
+    // Bare form: take verbatim with default port. Deliberately does NOT
+    // colon-split — see the doc above.
+    Ok((s.to_string(), default_port))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,5 +298,81 @@ mod tests {
     fn reject_empty_host_with_port() {
         // `:22` — port-only with no host.
         assert!(parse_host_port(":22", 22).is_err());
+    }
+
+    // ---- parse_host_port_pattern (known_hosts grammar) --------------------
+
+    #[test]
+    fn pattern_plain_host_uses_default_port() {
+        let (h, p) = parse_host_port_pattern("example.com", 22).unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 22);
+    }
+
+    #[test]
+    fn pattern_bracketed_hostname_with_port() {
+        // OpenSSH writes [host]:port for any host when port != 22.
+        let (h, p) = parse_host_port_pattern("[example.com]:2222", 22).unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 2222);
+    }
+
+    #[test]
+    fn pattern_bracketed_v4_with_port() {
+        let (h, p) = parse_host_port_pattern("[192.0.2.1]:2222", 22).unwrap();
+        assert_eq!(h, "192.0.2.1");
+        assert_eq!(p, 2222);
+    }
+
+    #[test]
+    fn pattern_bracketed_v6_with_port() {
+        let (h, p) = parse_host_port_pattern("[2001:db8::1]:2222", 22).unwrap();
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 2222);
+    }
+
+    #[test]
+    fn pattern_bracketed_no_port_defaults() {
+        let (h, p) = parse_host_port_pattern("[example.com]", 22).unwrap();
+        assert_eq!(h, "example.com");
+        assert_eq!(p, 22);
+    }
+
+    #[test]
+    fn pattern_bare_host_with_colon_taken_verbatim() {
+        // Preserves the old `known_hosts::store::split_host_port`
+        // behaviour: a plain (non-bracketed) pattern with an embedded
+        // colon is taken verbatim as the host, with the default port.
+        // This is by design — plain `host:2222` has never been a valid
+        // known_hosts pattern, and silently splitting it would change
+        // the lookup target and mask a host-key change.
+        let (h, p) = parse_host_port_pattern("example.com:2222", 22).unwrap();
+        assert_eq!(h, "example.com:2222");
+        assert_eq!(p, 22);
+    }
+
+    #[test]
+    fn pattern_bare_v6_uses_default_port() {
+        // A bare v6 in a known_hosts plain pattern is exactly how
+        // OpenSSH writes a port-22 v6 entry.
+        let (h, p) = parse_host_port_pattern("2001:db8::1", 22).unwrap();
+        assert_eq!(h, "2001:db8::1");
+        assert_eq!(p, 22);
+    }
+
+    #[test]
+    fn pattern_reject_missing_close_bracket() {
+        assert!(parse_host_port_pattern("[host", 22).is_err());
+    }
+
+    #[test]
+    fn pattern_reject_bad_port() {
+        assert!(parse_host_port_pattern("[host]:abc", 22).is_err());
+        assert!(parse_host_port_pattern("[host]:", 22).is_err());
+    }
+
+    #[test]
+    fn pattern_reject_garbage_after_close_bracket() {
+        assert!(parse_host_port_pattern("[host]xyz", 22).is_err());
     }
 }

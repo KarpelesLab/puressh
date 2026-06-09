@@ -387,19 +387,12 @@ fn host_field_matches(spec: &HostSpec, host: &str, port: u16) -> bool {
 /// Silently downgrading those to port 22 would mask a host-key change
 /// (subsequent lookups would target a different host record than the
 /// one the user wrote down).
+///
+/// Delegates to [`crate::config::parse_host_port_pattern`] (the
+/// known_hosts grammar variant: brackets allowed around any host, no
+/// colon-splitting of bare patterns). The `Err` cases (malformed
+/// bracket forms) are mapped to `None` to preserve the original
+/// `Option`-based contract.
 fn split_host_port(pat: &str) -> Option<(String, u16)> {
-    if let Some(stripped) = pat.strip_prefix('[') {
-        // Bracketed form: must have a closing `]` and either nothing or
-        // `:<u16>` after it.
-        let idx = stripped.rfind(']')?;
-        let host = stripped[..idx].to_string();
-        let after = &stripped[idx + 1..];
-        if after.is_empty() {
-            return Some((host, 22));
-        }
-        let rest = after.strip_prefix(':')?;
-        let port = rest.parse::<u16>().ok()?;
-        return Some((host, port));
-    }
-    Some((pat.to_string(), 22))
+    crate::config::parse_host_port_pattern(pat, 22).ok()
 }

@@ -342,6 +342,113 @@ fn marker_round_trips_through_save_load() {
     ));
 }
 
+#[test]
+fn lookup_ipv6_default_port_matches_bare_pattern() {
+    // OpenSSH writes a v6 entry with the default port (22) as a bare
+    // (unbracketed) pattern token, identical to a hostname entry. The
+    // store must match that bare pattern when the candidate is the same
+    // v6 host on port 22.
+    let mut kh = KnownHosts::new();
+    let key = ed25519_blob(20);
+    kh.add("2001:db8::1", 22, "ssh-ed25519", &key, false);
+    assert!(matches!(
+        kh.lookup("2001:db8::1", 22, "ssh-ed25519", &key),
+        LookupResult::Match
+    ));
+}
+
+#[test]
+fn lookup_ipv6_non_default_port_matches_bracketed_pattern() {
+    // For a non-default port the on-disk form is `[v6-literal]:port`.
+    // The lookup compares the bracketed pattern against the candidate
+    // (host, port) and must accept it.
+    let mut kh = KnownHosts::new();
+    let key = ed25519_blob(21);
+    kh.add("2001:db8::1", 2222, "ssh-ed25519", &key, false);
+    // Must match at the non-default port.
+    assert!(matches!(
+        kh.lookup("2001:db8::1", 2222, "ssh-ed25519", &key),
+        LookupResult::Match
+    ));
+    // Default-port lookup must NOT match — that's a different host record.
+    assert!(matches!(
+        kh.lookup("2001:db8::1", 22, "ssh-ed25519", &key),
+        LookupResult::Unknown
+    ));
+}
+
+#[test]
+fn ipv6_save_load_roundtrip_preserves_match() {
+    // Add a default-port v6 entry and a non-default-port v6 entry,
+    // save the file, load it again, and re-look up both. Verifies the
+    // wire format we produce is also the wire format we accept.
+    let dir = TestTempDir::new("v6-roundtrip");
+    let path = dir.child("known_hosts");
+    let k1 = ed25519_blob(30);
+    let k2 = ed25519_blob(31);
+
+    let mut kh = KnownHosts::new();
+    kh.add("2001:db8::1", 22, "ssh-ed25519", &k1, false);
+    kh.add("2001:db8::2", 2222, "ssh-ed25519", &k2, false);
+    kh.save(&path).expect("save");
+
+    let kh2 = KnownHosts::load(&path).expect("load");
+    assert!(matches!(
+        kh2.lookup("2001:db8::1", 22, "ssh-ed25519", &k1),
+        LookupResult::Match
+    ));
+    assert!(matches!(
+        kh2.lookup("2001:db8::2", 2222, "ssh-ed25519", &k2),
+        LookupResult::Match
+    ));
+}
+
+#[test]
+fn ipv6_hash_in_place_then_lookup_works() {
+    // hash_in_place is the path that runs `split_host_port` under the
+    // hood — it has to parse `[v6]:port` patterns correctly to compute
+    // the canonical hashed host. A v6 entry on a non-default port must
+    // survive the conversion and still match the candidate (host, port).
+    let mut kh = KnownHosts::new();
+    let key = ed25519_blob(32);
+    kh.add("2001:db8::1", 2222, "ssh-ed25519", &key, false);
+    kh.hash_in_place();
+    assert!(matches!(
+        kh.lookup("2001:db8::1", 2222, "ssh-ed25519", &key),
+        LookupResult::Match
+    ));
+    // Now confirm the on-disk shape is hashed (not the original bracket
+    // form) — proves the split_host_port → hash path actually fired.
+    let entries = kh.find("2001:db8::1", 2222);
+    assert_eq!(entries.len(), 1);
+    match &entries[0].host_spec {
+        HostSpec::Hashed(token) => assert!(token.starts_with("|1|")),
+        _ => panic!("expected hashed host_spec after hash_in_place"),
+    }
+}
+
+#[test]
+fn known_hosts_file_with_bracketed_v6_line_loads_and_matches() {
+    // Hand-write a known_hosts file with both forms and verify the
+    // parser + matcher accept them as a unit.
+    let dir = TestTempDir::new("v6-handwritten");
+    let path = dir.child("known_hosts");
+    let blob = crate::key::base64::decode(b"AAAA").unwrap();
+    let src = b"2001:db8::1 ssh-ed25519 AAAA\n\
+                [2001:db8::2]:2222 ssh-ed25519 AAAA\n";
+    std::fs::write(&path, src).unwrap();
+
+    let kh = KnownHosts::load(&path).expect("load");
+    assert!(matches!(
+        kh.lookup("2001:db8::1", 22, "ssh-ed25519", &blob),
+        LookupResult::Match
+    ));
+    assert!(matches!(
+        kh.lookup("2001:db8::2", 2222, "ssh-ed25519", &blob),
+        LookupResult::Match
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn save_produces_mode_0600_file() {

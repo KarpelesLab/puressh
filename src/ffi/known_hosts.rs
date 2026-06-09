@@ -1,3 +1,7 @@
+// Migration-in-progress: drops in the follow-up "ffi/known_hosts: migrate
+// to with_cstr" commit.
+#![allow(deprecated)]
+
 //! C ABI for the `KnownHosts` store: build, persist, lookup, mutate,
 //! plus a `pcssh_client_connect_known_hosts` policy variant that
 //! verifies the server host key against the store on connect.

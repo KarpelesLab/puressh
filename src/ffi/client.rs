@@ -1,3 +1,7 @@
+// Migration-in-progress: drops in the follow-up "ffi/client: migrate to
+// with_cstr" commit.
+#![allow(deprecated)]
+
 //! C ABI for the high-level SSH client: connect, authenticate, exec,
 //! free.
 //!

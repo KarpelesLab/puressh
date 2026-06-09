@@ -1,3 +1,7 @@
+// Migration-in-progress: drops in the follow-up "ffi/agent: migrate to
+// with_cstr" commit.
+#![allow(deprecated)]
+
 //! C ABI for the ssh-agent client. **Unix only** — mirrors the
 //! `cfg(unix)` gate on [`crate::agent`].
 //!

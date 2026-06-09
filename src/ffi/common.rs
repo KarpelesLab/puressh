@@ -68,10 +68,20 @@ pub(crate) fn map_error(err: &Error) -> c_int {
 /// Convert an FFI C string pointer into a `&str`. NULL or non-UTF-8
 /// yields `None`.
 ///
+/// **Deprecated**: the unbounded lifetime `'a` is a footgun — callers
+/// choose it, so a caller could in principle extend the `&str` past the
+/// underlying C string's actual validity. Use [`with_cstr`] instead,
+/// which structurally bounds the `&str` to the duration of a closure.
+///
 /// # Safety
 ///
 /// `ptr` must either be NULL or point to a NUL-terminated C string valid
 /// for the duration of the call.
+#[deprecated(
+    since = "0.0.0",
+    note = "use `with_cstr` — its closure bound makes the &str lifetime sound by construction"
+)]
+#[allow(dead_code)]
 pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     if ptr.is_null() {
         return None;
@@ -79,6 +89,46 @@ pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
     // SAFETY: caller guarantees NUL termination and lifetime.
     let cs = unsafe { CStr::from_ptr(ptr) };
     cs.to_str().ok()
+}
+
+/// Run `f` on the `&str` view of `ptr`. NULL or non-UTF-8 yields `None`
+/// (and `f` is not called).
+///
+/// Replacement for the older `cstr_to_str`. The closure bounds the
+/// `&str` lifetime to the duration of this call so a callee cannot
+/// accidentally extend the borrow past [`core::ffi::CStr::from_ptr`]'s
+/// validity.
+///
+/// # Safety
+///
+/// `ptr` must either be NULL or point to a NUL-terminated C string
+/// valid for the duration of the call.
+#[allow(dead_code)] // migration in progress; call sites land in follow-up commits.
+pub(crate) fn with_cstr<R>(ptr: *const c_char, f: impl FnOnce(&str) -> R) -> Option<R> {
+    if ptr.is_null() {
+        return None;
+    }
+    // SAFETY: caller's contract — same as the old `cstr_to_str` doc:
+    // non-NULL `ptr` is a NUL-terminated C string valid for the call.
+    let cstr = unsafe { core::ffi::CStr::from_ptr(ptr) };
+    let s = cstr.to_str().ok()?;
+    Some(f(s))
+}
+
+/// Like [`with_cstr`] but for two C strings. Both must be non-NULL and
+/// valid UTF-8, otherwise `None` and `f` is not called.
+///
+/// # Safety
+///
+/// Each of `a`, `b` must either be NULL or point to a NUL-terminated C
+/// string valid for the duration of the call.
+#[allow(dead_code)] // migration in progress; call sites land in follow-up commits.
+pub(crate) fn with_two_cstr<R>(
+    a: *const c_char,
+    b: *const c_char,
+    f: impl FnOnce(&str, &str) -> R,
+) -> Option<R> {
+    with_cstr(a, |a| with_cstr(b, |b| f(a, b))).flatten()
 }
 
 /// Run an FFI body inside `catch_unwind`, returning [`PCSSH_ERR_PANIC`]
@@ -184,5 +234,60 @@ mod tests {
         assert_eq!(rc, PCSSH_OK);
         let rc = catch(|| PCSSH_ERR_IO);
         assert_eq!(rc, PCSSH_ERR_IO);
+    }
+
+    #[test]
+    fn with_cstr_null_returns_none() {
+        // NULL pointer: closure must not run, result is `None`.
+        let called = std::cell::Cell::new(false);
+        let r: Option<i32> = with_cstr(core::ptr::null(), |_| {
+            called.set(true);
+            42
+        });
+        assert!(r.is_none());
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn with_cstr_ascii_calls_closure_with_str() {
+        let cs = std::ffi::CString::new("hello").unwrap();
+        let got = with_cstr(cs.as_ptr(), |s| s.to_owned());
+        assert_eq!(got.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn with_cstr_non_utf8_returns_none() {
+        // 0xFF, NUL — a single-byte string that's not valid UTF-8.
+        let bytes = b"\xff\0";
+        let cs = core::ffi::CStr::from_bytes_with_nul(bytes).unwrap();
+        let called = std::cell::Cell::new(false);
+        let r: Option<()> = with_cstr(cs.as_ptr(), |_| {
+            called.set(true);
+        });
+        assert!(r.is_none());
+        assert!(!called.get(), "closure must not run on non-UTF-8 input");
+    }
+
+    #[test]
+    fn with_two_cstr_both_null_returns_none() {
+        let r: Option<()> = with_two_cstr(core::ptr::null(), core::ptr::null(), |_, _| ());
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn with_two_cstr_one_null_returns_none() {
+        let cs = std::ffi::CString::new("x").unwrap();
+        let r: Option<()> = with_two_cstr(cs.as_ptr(), core::ptr::null(), |_, _| ());
+        assert!(r.is_none());
+        let r: Option<()> = with_two_cstr(core::ptr::null(), cs.as_ptr(), |_, _| ());
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn with_two_cstr_both_valid_calls_closure() {
+        let a = std::ffi::CString::new("alpha").unwrap();
+        let b = std::ffi::CString::new("beta").unwrap();
+        let got = with_two_cstr(a.as_ptr(), b.as_ptr(), |a, b| format!("{a}|{b}"));
+        assert_eq!(got.as_deref(), Some("alpha|beta"));
     }
 }

@@ -1,3 +1,7 @@
+// Migration-in-progress: drops in the follow-up "ffi/sftp: migrate to
+// with_cstr" commit.
+#![allow(deprecated)]
+
 //! C ABI for SFTP — full coverage of every `SftpClient` operation.
 //!
 //! SFTP runs as one session channel on the SSH connection. The

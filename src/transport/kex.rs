@@ -79,6 +79,7 @@ pub mod defaults {
     /// [`crate::transport::kexinit::negotiate`] picker also skips them when
     /// choosing a real KEX.
     pub const KEX: &[&str] = &[
+        "mlkem768x25519-sha256",
         "curve25519-sha256",
         "curve25519-sha256@libssh.org",
         "ecdh-sha2-nistp256",

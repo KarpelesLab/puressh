@@ -8,7 +8,6 @@
 use core::ffi::{c_char, c_int};
 use core::panic::AssertUnwindSafe;
 use core::ptr;
-use std::ffi::CStr;
 use std::panic::catch_unwind;
 
 use crate::error::Error;
@@ -65,45 +64,17 @@ pub(crate) fn map_error(err: &Error) -> c_int {
     }
 }
 
-/// Convert an FFI C string pointer into a `&str`. NULL or non-UTF-8
-/// yields `None`.
-///
-/// **Deprecated**: the unbounded lifetime `'a` is a footgun — callers
-/// choose it, so a caller could in principle extend the `&str` past the
-/// underlying C string's actual validity. Use [`with_cstr`] instead,
-/// which structurally bounds the `&str` to the duration of a closure.
-///
-/// # Safety
-///
-/// `ptr` must either be NULL or point to a NUL-terminated C string valid
-/// for the duration of the call.
-#[deprecated(
-    since = "0.0.0",
-    note = "use `with_cstr` — its closure bound makes the &str lifetime sound by construction"
-)]
-#[allow(dead_code)]
-pub(crate) unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> Option<&'a str> {
-    if ptr.is_null() {
-        return None;
-    }
-    // SAFETY: caller guarantees NUL termination and lifetime.
-    let cs = unsafe { CStr::from_ptr(ptr) };
-    cs.to_str().ok()
-}
-
 /// Run `f` on the `&str` view of `ptr`. NULL or non-UTF-8 yields `None`
 /// (and `f` is not called).
 ///
-/// Replacement for the older `cstr_to_str`. The closure bounds the
-/// `&str` lifetime to the duration of this call so a callee cannot
-/// accidentally extend the borrow past [`core::ffi::CStr::from_ptr`]'s
-/// validity.
+/// The closure bounds the `&str` lifetime to the duration of this call
+/// so a callee cannot accidentally extend the borrow past
+/// [`core::ffi::CStr::from_ptr`]'s validity.
 ///
 /// # Safety
 ///
 /// `ptr` must either be NULL or point to a NUL-terminated C string
 /// valid for the duration of the call.
-#[allow(dead_code)] // migration in progress; call sites land in follow-up commits.
 pub(crate) fn with_cstr<R>(ptr: *const c_char, f: impl FnOnce(&str) -> R) -> Option<R> {
     if ptr.is_null() {
         return None;
@@ -122,7 +93,6 @@ pub(crate) fn with_cstr<R>(ptr: *const c_char, f: impl FnOnce(&str) -> R) -> Opt
 ///
 /// Each of `a`, `b` must either be NULL or point to a NUL-terminated C
 /// string valid for the duration of the call.
-#[allow(dead_code)] // migration in progress; call sites land in follow-up commits.
 pub(crate) fn with_two_cstr<R>(
     a: *const c_char,
     b: *const c_char,
@@ -180,6 +150,7 @@ pub extern "C" fn pcssh_version() -> *const c_char {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::CStr;
 
     #[test]
     fn version_is_nul_terminated() {

@@ -36,6 +36,7 @@ use alloc::string::String;
 
 pub mod client;
 pub mod glob;
+pub mod host_port;
 pub mod parser;
 pub mod server;
 
@@ -43,6 +44,7 @@ pub use client::{
     ClientOptions, LocalForwardSpec, RemoteForwardSpec, RequestTty, SshClientConfig, StrictMode,
 };
 pub use glob::HostPattern;
+pub use host_port::parse_host_port;
 pub use server::SshServerConfig;
 
 /// Errors produced while parsing or evaluating an SSH config file.

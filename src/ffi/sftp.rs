@@ -1,7 +1,3 @@
-// Migration-in-progress: drops in the follow-up "ffi/sftp: migrate to
-// with_cstr" commit.
-#![allow(deprecated)]
-
 //! C ABI for SFTP — full coverage of every `SftpClient` operation.
 //!
 //! SFTP runs as one session channel on the SSH connection. The
@@ -38,8 +34,9 @@ use std::sync::{Arc, Mutex};
 
 use super::client::PcSshClient;
 use super::common::{
-    catch, cstr_to_str, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT,
-    PCSSH_ERR_INVALID_HANDLE, PCSSH_ERR_IO, PCSSH_ERR_PARSE, PCSSH_ERR_PROTOCOL, PCSSH_OK,
+    catch, with_cstr, with_two_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC,
+    PCSSH_ERR_INVALID_ARGUMENT, PCSSH_ERR_INVALID_HANDLE, PCSSH_ERR_IO, PCSSH_ERR_PARSE,
+    PCSSH_ERR_PROTOCOL, PCSSH_OK,
 };
 use crate::sftp::{Attrs, NameEntry, SftpError};
 use crate::shared::SftpSession;
@@ -347,47 +344,46 @@ pub unsafe extern "C" fn pcssh_sftp_open_file(
         // SAFETY: caller contract.
         unsafe { *out_file = ptr::null_mut() };
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        let attrs = if flags & PCSSH_SFTP_CREAT != 0 {
-            Attrs {
-                permissions: Some(mode),
-                ..Default::default()
-            }
-        } else {
-            Attrs::default()
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        let cell = s.inner.clone();
-        let mut handle_out: Option<Vec<u8>> = None;
-        let rc = with_parent(&cell, |sess| {
-            match sess.open(path_s.as_bytes(), flags, attrs) {
-                Ok(h) => {
-                    handle_out = Some(h);
-                    PCSSH_OK
+        with_cstr(path, |path_s| {
+            let attrs = if flags & PCSSH_SFTP_CREAT != 0 {
+                Attrs {
+                    permissions: Some(mode),
+                    ..Default::default()
                 }
-                Err(e) => map_sftp_err(&e),
+            } else {
+                Attrs::default()
+            };
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            let cell = s.inner.clone();
+            let mut handle_out: Option<Vec<u8>> = None;
+            let rc = with_parent(&cell, |sess| {
+                match sess.open(path_s.as_bytes(), flags, attrs) {
+                    Ok(h) => {
+                        handle_out = Some(h);
+                        PCSSH_OK
+                    }
+                    Err(e) => map_sftp_err(&e),
+                }
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-        });
-        if rc != PCSSH_OK {
-            return rc;
-        }
-        let handle = match handle_out {
-            Some(h) => h,
-            None => return PCSSH_ERR_GENERIC,
-        };
-        let boxed = Box::new(PcSshSftpFile {
-            sftp: cell,
-            handle,
-            offset: 0,
-            closed: false,
-        });
-        // SAFETY: out_file checked non-NULL above.
-        unsafe { *out_file = Box::into_raw(boxed) };
-        PCSSH_OK
+            let handle = match handle_out {
+                Some(h) => h,
+                None => return PCSSH_ERR_GENERIC,
+            };
+            let boxed = Box::new(PcSshSftpFile {
+                sftp: cell,
+                handle,
+                offset: 0,
+                closed: false,
+            });
+            // SAFETY: out_file checked non-NULL above.
+            unsafe { *out_file = Box::into_raw(boxed) };
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -618,36 +614,35 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
         // SAFETY: caller contract.
         unsafe { *out_dir = ptr::null_mut() };
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        let cell = s.inner.clone();
-        let mut handle_out: Option<Vec<u8>> = None;
-        let rc = with_parent(&cell, |sess| match sess.opendir(path_s.as_bytes()) {
-            Ok(h) => {
-                handle_out = Some(h);
-                PCSSH_OK
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            let cell = s.inner.clone();
+            let mut handle_out: Option<Vec<u8>> = None;
+            let rc = with_parent(&cell, |sess| match sess.opendir(path_s.as_bytes()) {
+                Ok(h) => {
+                    handle_out = Some(h);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
-        }
-        let handle = match handle_out {
-            Some(h) => h,
-            None => return PCSSH_ERR_GENERIC,
-        };
-        let boxed = Box::new(PcSshSftpDir {
-            sftp: cell,
-            handle,
-            closed: false,
-        });
-        // SAFETY: out_dir checked.
-        unsafe { *out_dir = Box::into_raw(boxed) };
-        PCSSH_OK
+            let handle = match handle_out {
+                Some(h) => h,
+                None => return PCSSH_ERR_GENERIC,
+            };
+            let boxed = Box::new(PcSshSftpDir {
+                sftp: cell,
+                handle,
+                closed: false,
+            });
+            // SAFETY: out_dir checked.
+            unsafe { *out_dir = Box::into_raw(boxed) };
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -801,26 +796,25 @@ pub unsafe extern "C" fn pcssh_sftp_stat(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        let mut attrs_out: Option<Attrs> = None;
-        let rc = with_parent(&s.inner, |sess| match sess.stat(path_s.as_bytes()) {
-            Ok(a) => {
-                attrs_out = Some(a);
-                PCSSH_OK
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            let mut attrs_out: Option<Attrs> = None;
+            let rc = with_parent(&s.inner, |sess| match sess.stat(path_s.as_bytes()) {
+                Ok(a) => {
+                    attrs_out = Some(a);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
-        }
-        // SAFETY: out_attrs checked.
-        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
-        PCSSH_OK
+            // SAFETY: out_attrs checked.
+            unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -840,26 +834,25 @@ pub unsafe extern "C" fn pcssh_sftp_lstat(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        let mut attrs_out: Option<Attrs> = None;
-        let rc = with_parent(&s.inner, |sess| match sess.lstat(path_s.as_bytes()) {
-            Ok(a) => {
-                attrs_out = Some(a);
-                PCSSH_OK
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            let mut attrs_out: Option<Attrs> = None;
+            let rc = with_parent(&s.inner, |sess| match sess.lstat(path_s.as_bytes()) {
+                Ok(a) => {
+                    attrs_out = Some(a);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
-        }
-        // SAFETY: out_attrs checked.
-        unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
-        PCSSH_OK
+            // SAFETY: out_attrs checked.
+            unsafe { *out_attrs = attrs_to_c(&attrs_out.unwrap_or_default()) };
+            PCSSH_OK
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -916,21 +909,20 @@ pub unsafe extern "C" fn pcssh_sftp_setstat(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let a = unsafe { &*attrs };
-        let a_owned = attrs_from_c(a);
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| {
-            match sess.setstat(path_s.as_bytes(), a_owned) {
-                Ok(()) => PCSSH_OK,
-                Err(e) => map_sftp_err(&e),
-            }
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let a = unsafe { &*attrs };
+            let a_owned = attrs_from_c(a);
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            with_parent(&s.inner, |sess| {
+                match sess.setstat(path_s.as_bytes(), a_owned) {
+                    Ok(()) => PCSSH_OK,
+                    Err(e) => map_sftp_err(&e),
+                }
+            })
         })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -984,22 +976,21 @@ pub unsafe extern "C" fn pcssh_sftp_mkdir(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        let attrs = Attrs {
-            permissions: Some(mode),
-            ..Default::default()
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| {
-            match sess.mkdir(path_s.as_bytes(), attrs) {
-                Ok(()) => PCSSH_OK,
-                Err(e) => map_sftp_err(&e),
-            }
+        with_cstr(path, |path_s| {
+            let attrs = Attrs {
+                permissions: Some(mode),
+                ..Default::default()
+            };
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            with_parent(&s.inner, |sess| {
+                match sess.mkdir(path_s.as_bytes(), attrs) {
+                    Ok(()) => PCSSH_OK,
+                    Err(e) => map_sftp_err(&e),
+                }
+            })
         })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -1015,16 +1006,15 @@ pub unsafe extern "C" fn pcssh_sftp_rmdir(sftp: *mut PcSshSftp, path: *const c_c
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| match sess.rmdir(path_s.as_bytes()) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            with_parent(&s.inner, |sess| match sess.rmdir(path_s.as_bytes()) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            })
         })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -1040,16 +1030,15 @@ pub unsafe extern "C" fn pcssh_sftp_remove(sftp: *mut PcSshSftp, path: *const c_
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| match sess.remove(path_s.as_bytes()) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            with_parent(&s.inner, |sess| match sess.remove(path_s.as_bytes()) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            })
         })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -1068,24 +1057,18 @@ pub unsafe extern "C" fn pcssh_sftp_rename(
         if sftp.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller contract.
-        let old_s = match unsafe { cstr_to_str(old_path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let new_s = match unsafe { cstr_to_str(new_path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| {
-            match sess.rename(old_s.as_bytes(), new_s.as_bytes()) {
-                Ok(()) => PCSSH_OK,
-                Err(e) => map_sftp_err(&e),
-            }
+        // SAFETY: caller contract for both paths.
+        with_two_cstr(old_path, new_path, |old_s, new_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            with_parent(&s.inner, |sess| {
+                match sess.rename(old_s.as_bytes(), new_s.as_bytes()) {
+                    Ok(()) => PCSSH_OK,
+                    Err(e) => map_sftp_err(&e),
+                }
+            })
         })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -1105,24 +1088,18 @@ pub unsafe extern "C" fn pcssh_sftp_symlink(
         if sftp.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller contract.
-        let tgt = match unsafe { cstr_to_str(target) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let lnk = match unsafe { cstr_to_str(link_path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        with_parent(&s.inner, |sess| {
-            match sess.symlink(tgt.as_bytes(), lnk.as_bytes()) {
-                Ok(()) => PCSSH_OK,
-                Err(e) => map_sftp_err(&e),
-            }
+        // SAFETY: caller contract for both paths.
+        with_two_cstr(target, link_path, |tgt, lnk| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            with_parent(&s.inner, |sess| {
+                match sess.symlink(tgt.as_bytes(), lnk.as_bytes()) {
+                    Ok(()) => PCSSH_OK,
+                    Err(e) => map_sftp_err(&e),
+                }
+            })
         })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -1146,26 +1123,25 @@ pub unsafe extern "C" fn pcssh_sftp_readlink(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        let mut tgt_out: Option<Vec<u8>> = None;
-        let rc = with_parent(&s.inner, |sess| match sess.readlink(path_s.as_bytes()) {
-            Ok(t) => {
-                tgt_out = Some(t);
-                PCSSH_OK
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            let mut tgt_out: Option<Vec<u8>> = None;
+            let rc = with_parent(&s.inner, |sess| match sess.readlink(path_s.as_bytes()) {
+                Ok(t) => {
+                    tgt_out = Some(t);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
-        }
-        let target = tgt_out.unwrap_or_default();
-        // SAFETY: out_len/buf/cap checked by helper.
-        unsafe { copy_to_caller_buf(&target, buf, cap, out_len) }
+            let target = tgt_out.unwrap_or_default();
+            // SAFETY: out_len/buf/cap checked by helper.
+            unsafe { copy_to_caller_buf(&target, buf, cap, out_len) }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 
@@ -1187,26 +1163,25 @@ pub unsafe extern "C" fn pcssh_sftp_realpath(
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
-        let path_s = match unsafe { cstr_to_str(path) } {
-            Some(s) => s,
-            None => return PCSSH_ERR_INVALID_ARGUMENT,
-        };
-        // SAFETY: caller contract.
-        let s = unsafe { &*sftp };
-        let mut canon_out: Option<Vec<u8>> = None;
-        let rc = with_parent(&s.inner, |sess| match sess.realpath(path_s.as_bytes()) {
-            Ok(t) => {
-                canon_out = Some(t);
-                PCSSH_OK
+        with_cstr(path, |path_s| {
+            // SAFETY: caller contract.
+            let s = unsafe { &*sftp };
+            let mut canon_out: Option<Vec<u8>> = None;
+            let rc = with_parent(&s.inner, |sess| match sess.realpath(path_s.as_bytes()) {
+                Ok(t) => {
+                    canon_out = Some(t);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
-        }
-        let canon = canon_out.unwrap_or_default();
-        // SAFETY: out_len/buf/cap checked by helper.
-        unsafe { copy_to_caller_buf(&canon, buf, cap, out_len) }
+            let canon = canon_out.unwrap_or_default();
+            // SAFETY: out_len/buf/cap checked by helper.
+            unsafe { copy_to_caller_buf(&canon, buf, cap, out_len) }
+        })
+        .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
 }
 

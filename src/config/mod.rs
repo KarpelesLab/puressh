@@ -37,6 +37,8 @@ use alloc::string::String;
 pub mod client;
 pub mod glob;
 pub mod host_port;
+#[cfg(feature = "std")]
+pub mod include;
 pub mod match_block;
 pub mod parser;
 pub mod server;

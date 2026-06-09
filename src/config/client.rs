@@ -166,9 +166,47 @@ impl SshClientConfig {
     /// Parse `src` (the contents of a `ssh_config` file) into an
     /// [`SshClientConfig`]. `Match exec` evaluation is **off** by default;
     /// see [`Self::enable_match_exec`].
+    ///
+    /// `Include` directives are not resolved by this entry point because
+    /// inline parsing has no filesystem context to anchor relative paths to.
+    /// Use [`Self::load`] (or [`Self::load_with_base`]) to parse a file with
+    /// Include support.
     pub fn parse(src: &str) -> Result<Self, ConfigError> {
         let lines = tokenize(src)?;
         let blocks = parse_blocks(lines)?;
+        Ok(SshClientConfig {
+            blocks,
+            enable_match_exec: false,
+        })
+    }
+
+    /// Read `path` from disk and parse it, resolving `Include` directives
+    /// recursively. Relative paths inside `Include` are anchored to the
+    /// directory of the file containing the directive; `~` expands to
+    /// `$HOME`; `*` / `?` globs are expanded against the filesystem.
+    /// Recursion is capped at [`super::include::MAX_INCLUDE_DEPTH`] hops.
+    #[cfg(feature = "std")]
+    pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ConfigError> {
+        let lines = super::include::tokenize_file_with_includes(path.as_ref(), 0)?;
+        let blocks = parse_blocks(lines)?;
+        Ok(SshClientConfig {
+            blocks,
+            enable_match_exec: false,
+        })
+    }
+
+    /// Like [`Self::load`] but parses an in-memory `src` while still
+    /// honouring `Include` directives relative to `base_dir`. Useful when
+    /// the config has been pre-read (e.g. from a memfd) but you still want
+    /// Include semantics anchored at a known directory.
+    #[cfg(feature = "std")]
+    pub fn load_with_base<P: AsRef<std::path::Path>>(
+        src: &str,
+        base_dir: P,
+    ) -> Result<Self, ConfigError> {
+        let lines = tokenize(src)?;
+        let expanded = super::include::expand_includes(lines, base_dir.as_ref(), 0)?;
+        let blocks = parse_blocks(expanded)?;
         Ok(SshClientConfig {
             blocks,
             enable_match_exec: false,
@@ -260,6 +298,18 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
                 blocks.push(Block::Match {
                     conditions,
                     opts: ClientOptions::default(),
+                });
+            }
+            "include" => {
+                // The Include-expansion pass runs before us when the caller
+                // uses SshClientConfig::load* (the std-only entry points). If
+                // we see an Include here, the user reached us via
+                // SshClientConfig::parse(&str), which has no filesystem
+                // context — refuse rather than silently drop.
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: "Include requires file-based loading; use SshClientConfig::load() instead"
+                        .into(),
                 });
             }
             _ => {
@@ -897,6 +947,163 @@ Match host gw
         match err {
             ConfigError::BadValue { line, .. } => assert_eq!(line, 1),
             _ => panic!("wrong err: {err:?}"),
+        }
+    }
+
+    // ----- Include-directive tests -------------------------------------
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn include_unsupported_in_string_parse() {
+        // parse(&str) cannot resolve Include — it should surface a friendly
+        // diagnostic rather than UnknownKeyword.
+        let src = "Include /etc/ssh/somefile\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        match err {
+            ConfigError::Unsupported { line, msg } => {
+                assert_eq!(line, 1);
+                assert!(msg.contains("Include"), "msg = {msg}");
+            }
+            _ => panic!("wrong err: {err:?}"),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    mod include_io {
+        use super::*;
+        use std::io::Write;
+        use std::path::PathBuf;
+
+        struct TempDir {
+            path: PathBuf,
+        }
+        impl TempDir {
+            fn new(prefix: &str) -> Self {
+                use std::time::{SystemTime, UNIX_EPOCH};
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let pid = std::process::id();
+                let path =
+                    std::env::temp_dir().join(format!("puressh-cfg-client-{prefix}-{pid}-{nanos}"));
+                std::fs::create_dir_all(&path).expect("create tempdir");
+                Self { path }
+            }
+            fn write(&self, name: &str, body: &str) -> PathBuf {
+                let p = self.path.join(name);
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent).expect("mkdir");
+                }
+                let mut f = std::fs::File::create(&p).expect("create file");
+                f.write_all(body.as_bytes()).expect("write file");
+                p
+            }
+        }
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+
+        #[test]
+        fn include_pulls_in_settings() {
+            let dir = TempDir::new("pull");
+            let leaf = dir.write("leaf.cfg", "Port 4242\n");
+            let root = dir.write(
+                "root.cfg",
+                &format!("Host gw\n  HostName 10.0.0.1\nInclude {}\n", leaf.display()),
+            );
+            let cfg = SshClientConfig::load(&root).unwrap();
+            // Include is inside the `Host gw` block — its Port applies to gw.
+            assert_eq!(cfg.lookup("gw").port, Some(4242));
+            assert_eq!(cfg.lookup("gw").host_name.as_deref(), Some("10.0.0.1"));
+        }
+
+        #[test]
+        fn include_glob_pulls_all_matches() {
+            let dir = TempDir::new("glob");
+            dir.write("conf.d/01.cfg", "Host gw\n  Port 2001\n");
+            dir.write("conf.d/02.cfg", "Host gw\n  User u2\n");
+            dir.write("conf.d/03.cfg", "Host gw\n  IdentityFile /tmp/k3\n");
+            dir.write("conf.d/skip.txt", "Host gw\n  Port 9999\n");
+            let root = dir.write(
+                "root.cfg",
+                &format!("Include {}/conf.d/*.cfg\n", dir.path.display()),
+            );
+            let cfg = SshClientConfig::load(&root).unwrap();
+            let eff = cfg.lookup("gw");
+            // First-match-wins on Port → 2001 (alphabetical 01.cfg sorts
+            // first under our deterministic sort).
+            assert_eq!(eff.port, Some(2001));
+            assert_eq!(eff.user.as_deref(), Some("u2"));
+            assert_eq!(eff.identity_files, vec!["/tmp/k3"]);
+        }
+
+        #[test]
+        fn include_relative_to_containing_file() {
+            // root.cfg lives in dir/; Include uses a bare filename, which
+            // must be resolved against dir/ (not the CWD).
+            let dir = TempDir::new("relative");
+            dir.write("sibling.cfg", "Host gw\n  Port 7777\n");
+            let root = dir.write("root.cfg", "Include sibling.cfg\n");
+            let cfg = SshClientConfig::load(&root).unwrap();
+            assert_eq!(cfg.lookup("gw").port, Some(7777));
+        }
+
+        #[test]
+        fn include_missing_file_warned_not_fatal() {
+            let dir = TempDir::new("missing");
+            let root = dir.write(
+                "root.cfg",
+                &format!(
+                    "Host gw\n  Port 22\nInclude {}/nope.cfg\n",
+                    dir.path.display()
+                ),
+            );
+            let cfg = SshClientConfig::load(&root).expect("missing include is non-fatal");
+            assert_eq!(cfg.lookup("gw").port, Some(22));
+        }
+
+        #[test]
+        fn include_circular_capped_at_16_depth() {
+            // file A includes file A → infinite loop guarded by depth cap.
+            let dir = TempDir::new("circ");
+            // Path-stable file under the temp dir.
+            let p = dir.path.join("loop.cfg");
+            let body = format!("Include {}\n", p.display());
+            std::fs::write(&p, body).expect("write loop.cfg");
+            let err = SshClientConfig::load(&p).unwrap_err();
+            match err {
+                ConfigError::Syntax { msg, .. } => {
+                    assert!(msg.contains("max depth"), "msg = {msg}");
+                }
+                _ => panic!("wrong err: {err:?}"),
+            }
+        }
+
+        #[test]
+        fn include_load_with_base_resolves_relative() {
+            let dir = TempDir::new("loadbase");
+            dir.write("inner.cfg", "Host gw\n  Port 9999\n");
+            let src = "Include inner.cfg\n";
+            let cfg = SshClientConfig::load_with_base(src, &dir.path).unwrap();
+            assert_eq!(cfg.lookup("gw").port, Some(9999));
+        }
+
+        #[test]
+        fn include_inside_match_block_only_applies_there() {
+            // The Include sits inside a Host block — its settings should be
+            // tagged onto that block, not bleed into a sibling block.
+            let dir = TempDir::new("inblock");
+            dir.write("only_gw.cfg", "Port 3300\n");
+            let root = dir.write(
+                "root.cfg",
+                "Host gw\n  Include only_gw.cfg\nHost other\n  Port 22\n",
+            );
+            let cfg = SshClientConfig::load(&root).unwrap();
+            assert_eq!(cfg.lookup("gw").port, Some(3300));
+            assert_eq!(cfg.lookup("other").port, Some(22));
         }
     }
 }

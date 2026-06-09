@@ -1185,6 +1185,171 @@ pub unsafe extern "C" fn pcssh_sftp_realpath(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Bytes-path variants
+//
+// SFTP paths on the wire are arbitrary octets, not UTF-8 — OpenSSH happily
+// hands out filenames in Shift-JIS, Latin-1, or mixed encodings within a
+// single directory. The cstr-based entry points above route every path
+// through `cstr_to_str`, which rejects non-UTF-8 with
+// `PCSSH_ERR_INVALID_ARGUMENT`; the `_bytes` companions below accept a raw
+// `(ptr, len)` pair so C callers can hand the library exactly the bytes the
+// peer sent. The underlying [`SftpSession`] API is bytes-native already, so
+// the bytes variants reach the wire with no lossy conversion in between.
+//
+// Conventions:
+//   - NULL pointer with non-zero length → `PCSSH_ERR_INVALID_ARGUMENT`.
+//   - NULL pointer with zero length     → treated as the empty path; the
+//     underlying SFTP server decides whether that is meaningful.
+//   - For two-path operations (rename, symlink) either invalid pair yields
+//     `PCSSH_ERR_INVALID_ARGUMENT`.
+//   - All other behaviour (output buffers, error mapping, parent-handle
+//     liveness) matches the cstr cousin exactly.
+// ---------------------------------------------------------------------------
+
+/// Materialise a `(ptr, len)` pair as a byte slice. Returns `Some(&[])`
+/// for `(NULL, 0)` so callers can treat that as the empty path; returns
+/// `None` when `ptr` is NULL with non-zero length.
+///
+/// # Safety
+///
+/// When `ptr` is non-NULL, the caller must guarantee that `ptr` points to
+/// at least `len` readable bytes and that the underlying buffer outlives
+/// the returned slice. The function itself performs no dereference beyond
+/// the slice construction.
+unsafe fn bytes_from_raw<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
+    if ptr.is_null() {
+        if len == 0 {
+            return Some(&[]);
+        }
+        return None;
+    }
+    // SAFETY: caller contract — ptr/len name a readable buffer of `len` octets.
+    Some(unsafe { core::slice::from_raw_parts(ptr, len) })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_open_file`]. Accepts the path as a
+/// raw `(ptr, len)` byte pair so non-UTF-8 filenames can be opened.
+///
+/// # Safety
+///
+/// - `sftp` must be a live handle.
+/// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
+///   readable bytes. `(NULL, 0)` is accepted as the empty path.
+/// - `out_file` must be non-NULL and writable.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_open_file_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    flags: u32,
+    mode: u32,
+    out_file: *mut *mut PcSshSftpFile,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || out_file.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: out_file checked non-NULL above.
+        unsafe { *out_file = ptr::null_mut() };
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        let attrs = if flags & PCSSH_SFTP_CREAT != 0 {
+            Attrs {
+                permissions: Some(mode),
+                ..Default::default()
+            }
+        } else {
+            Attrs::default()
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        let cell = s.inner.clone();
+        let mut handle_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&cell, |sess| match sess.open(path, flags, attrs) {
+            Ok(h) => {
+                handle_out = Some(h);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let handle = match handle_out {
+            Some(h) => h,
+            None => return PCSSH_ERR_GENERIC,
+        };
+        let boxed = Box::new(PcSshSftpFile {
+            sftp: cell,
+            handle,
+            offset: 0,
+            closed: false,
+        });
+        // SAFETY: out_file checked non-NULL above.
+        unsafe { *out_file = Box::into_raw(boxed) };
+        PCSSH_OK
+    })
+}
+
+/// Bytes-path companion to [`pcssh_sftp_opendir`].
+///
+/// # Safety
+///
+/// - `sftp` must be a live handle.
+/// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
+///   readable bytes. `(NULL, 0)` is accepted as the empty path.
+/// - `out_dir` must be non-NULL and writable.
+#[no_mangle]
+pub unsafe extern "C" fn pcssh_sftp_opendir_bytes(
+    sftp: *mut PcSshSftp,
+    path_ptr: *const u8,
+    path_len: usize,
+    out_dir: *mut *mut PcSshSftpDir,
+) -> c_int {
+    catch(|| {
+        if sftp.is_null() || out_dir.is_null() {
+            return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+        // SAFETY: out_dir checked non-NULL above.
+        unsafe { *out_dir = ptr::null_mut() };
+        // SAFETY: caller contract.
+        let path = match unsafe { bytes_from_raw(path_ptr, path_len) } {
+            Some(b) => b,
+            None => return PCSSH_ERR_INVALID_ARGUMENT,
+        };
+        // SAFETY: caller contract.
+        let s = unsafe { &*sftp };
+        let cell = s.inner.clone();
+        let mut handle_out: Option<Vec<u8>> = None;
+        let rc = with_parent(&cell, |sess| match sess.opendir(path) {
+            Ok(h) => {
+                handle_out = Some(h);
+                PCSSH_OK
+            }
+            Err(e) => map_sftp_err(&e),
+        });
+        if rc != PCSSH_OK {
+            return rc;
+        }
+        let handle = match handle_out {
+            Some(h) => h,
+            None => return PCSSH_ERR_GENERIC,
+        };
+        let boxed = Box::new(PcSshSftpDir {
+            sftp: cell,
+            handle,
+            closed: false,
+        });
+        // SAFETY: out_dir checked non-NULL above.
+        unsafe { *out_dir = Box::into_raw(boxed) };
+        PCSSH_OK
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1262,6 +1427,69 @@ mod tests {
             pcssh_sftp_file_free(std::ptr::null_mut());
             pcssh_sftp_dir_free(std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn bytes_from_raw_null_zero_is_empty_slice() {
+        // SAFETY: NULL+0 is the documented "empty path" sentinel.
+        let s = unsafe { bytes_from_raw(std::ptr::null(), 0) };
+        assert_eq!(s, Some(&[] as &[u8]));
+    }
+
+    #[test]
+    fn bytes_from_raw_null_with_len_is_none() {
+        // SAFETY: deliberately passing NULL with a non-zero len; the
+        // helper short-circuits before any dereference.
+        let s = unsafe { bytes_from_raw(std::ptr::null(), 5) };
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn bytes_from_raw_valid_returns_slice() {
+        let data: &[u8] = b"\x00\xff\x80abc";
+        // SAFETY: `data` outlives the borrow; pointer + len name a valid buffer.
+        let s = unsafe { bytes_from_raw(data.as_ptr(), data.len()) };
+        assert_eq!(s, Some(data));
+    }
+
+    #[test]
+    fn bytes_open_file_null_sftp_is_invalid_argument() {
+        let mut out: *mut PcSshSftpFile = std::ptr::null_mut();
+        // SAFETY: NULL sftp pointer must produce INVALID_ARGUMENT before
+        // any dereference happens.
+        let rc = unsafe {
+            pcssh_sftp_open_file_bytes(
+                std::ptr::null_mut(),
+                b"/tmp/x".as_ptr(),
+                6,
+                PCSSH_SFTP_READ,
+                0o644,
+                &mut out,
+            )
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+        assert!(out.is_null());
+    }
+
+    #[test]
+    fn bytes_opendir_null_out_is_invalid_argument() {
+        // SAFETY: NULL out_dir pointer must produce INVALID_ARGUMENT.
+        let rc = unsafe {
+            pcssh_sftp_opendir_bytes(std::ptr::null_mut(), b"/".as_ptr(), 1, std::ptr::null_mut())
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+    }
+
+    #[test]
+    fn bytes_from_raw_non_null_zero_len_is_empty() {
+        // A non-NULL pointer paired with len==0 is a zero-length slice;
+        // valid and produces an empty slice without dereferencing.
+        let dummy = 0u8;
+        // SAFETY: len==0 means no read happens; the pointer is non-NULL
+        // so we go through the slice-construction path with len 0, which
+        // is well-defined.
+        let s = unsafe { bytes_from_raw(&dummy as *const u8, 0) };
+        assert_eq!(s, Some(&[] as &[u8]));
     }
 
     /// `with_parent` returns `PCSSH_ERR_INVALID_HANDLE` when the cell has

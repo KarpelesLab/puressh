@@ -52,7 +52,7 @@ compcol = { version = "0.4.2", default-features = false, features = ["alloc", "z
 # for compound secrets. Kept default-on so `no_std + alloc` builds still get
 # secret-wiping for derived KDF output, password buffers carried across FFI,
 # and similar transient secrets. The crate itself is `no_std`-friendly.
-zeroize = { version = "1", default-features = false, features = ["alloc"] }
+zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
 
 # Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
 # set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it

@@ -527,3 +527,299 @@ fn large_file_round_trip() {
     drop(client);
     h.join().unwrap();
 }
+
+// --- OpenSSH SFTP extension tests ---
+
+use super::packet::{read_packet, write_packet, Packet};
+
+/// Drive an INIT/VERSION handshake on the given transport and return the
+/// extension list the server advertised.
+fn handshake(t: &mut UnixStream) -> Vec<(Vec<u8>, Vec<u8>)> {
+    write_packet(
+        t,
+        &Packet::Init {
+            version: super::types::SFTP_VERSION,
+            extensions: vec![],
+        },
+    )
+    .unwrap();
+    let body = read_packet(t).unwrap();
+    match Packet::decode(&body).unwrap() {
+        Packet::Version { extensions, .. } => extensions,
+        other => panic!("expected VERSION, got {other:?}"),
+    }
+}
+
+/// Build the raw payload for an extension request body (string fields after
+/// the extension name). Mirrors what an SFTP client would write into the
+/// `data` portion of `Packet::Extended`.
+fn ext_strings(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for p in parts {
+        out.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        out.extend_from_slice(p);
+    }
+    out
+}
+
+/// Round-trip one SSH_FXP_EXTENDED request and return the reply packet.
+fn ext_request(t: &mut UnixStream, request: &[u8], payload: &[u8]) -> Packet {
+    let pkt = Packet::Extended {
+        id: 42,
+        request: request.to_vec(),
+        data: payload.to_vec(),
+    };
+    write_packet(t, &pkt).unwrap();
+    let body = read_packet(t).unwrap();
+    Packet::decode(&body).unwrap()
+}
+
+#[test]
+fn version_advertises_openssh_extensions() {
+    let tmp = TempDir::new("ext-advertise");
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let exts = handshake(&mut b);
+    let names: Vec<String> = exts
+        .iter()
+        .map(|(k, _)| String::from_utf8_lossy(k).into_owned())
+        .collect();
+    for want in &[
+        "posix-rename@openssh.com",
+        "statvfs@openssh.com",
+        "fstatvfs@openssh.com",
+        "hardlink@openssh.com",
+        "fsync@openssh.com",
+    ] {
+        assert!(
+            names.iter().any(|n| n == want),
+            "missing {want} in advertised extensions: {names:?}"
+        );
+    }
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn posix_rename_overwrites_destination() {
+    let tmp = TempDir::new("posix-rename-overwrite");
+    fs::write(tmp.path().join("a"), b"alpha").unwrap();
+    fs::write(tmp.path().join("b"), b"beta-original").unwrap();
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"a", b"b"]);
+    let reply = ext_request(&mut b, b"posix-rename@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::Ok),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+    assert!(!tmp.path().join("a").exists());
+    assert_eq!(fs::read(tmp.path().join("b")).unwrap(), b"alpha");
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn posix_rename_outside_jail_rejected() {
+    let tmp = TempDir::new("posix-rename-jail");
+    let jail = tmp.path().to_path_buf();
+    fs::write(jail.join("inside"), b"x").unwrap();
+    let (a, mut b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"inside", b"../../tmp/escape"]);
+    let reply = ext_request(&mut b, b"posix-rename@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::PermissionDenied),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn hardlink_creates_second_inode_reference() {
+    use std::os::unix::fs::MetadataExt as _;
+    let tmp = TempDir::new("hardlink");
+    fs::write(tmp.path().join("orig"), b"shared").unwrap();
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"orig", b"linked"]);
+    let reply = ext_request(&mut b, b"hardlink@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::Ok),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+    let m1 = fs::metadata(tmp.path().join("orig")).unwrap();
+    let m2 = fs::metadata(tmp.path().join("linked")).unwrap();
+    assert_eq!(m1.ino(), m2.ino(), "expected same inode after hardlink");
+    assert!(m2.nlink() >= 2);
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn hardlink_outside_jail_rejected() {
+    let tmp = TempDir::new("hardlink-jail");
+    let jail = tmp.path().to_path_buf();
+    fs::write(jail.join("inside"), b"x").unwrap();
+    let (a, mut b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"inside", b"../../tmp/hardlink-escape"]);
+    let reply = ext_request(&mut b, b"hardlink@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::PermissionDenied),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn fsync_returns_ok_for_open_handle() {
+    let tmp = TempDir::new("fsync-ok");
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    // Open a file via raw packets (we already consumed the handshake here,
+    // so SftpClient::new wouldn't work on the same transport).
+    let open = Packet::Open {
+        id: 1,
+        path: b"f".to_vec(),
+        pflags: FXF_WRITE | FXF_CREAT,
+        attrs: Attrs::default(),
+    };
+    write_packet(&mut b, &open).unwrap();
+    let body = read_packet(&mut b).unwrap();
+    let handle = match Packet::decode(&body).unwrap() {
+        Packet::Handle { handle, .. } => handle,
+        other => panic!("expected HANDLE, got {other:?}"),
+    };
+
+    let write = Packet::Write {
+        id: 2,
+        handle: handle.clone(),
+        offset: 0,
+        data: b"some bytes".to_vec(),
+    };
+    write_packet(&mut b, &write).unwrap();
+    let _ = read_packet(&mut b).unwrap();
+
+    let payload = ext_strings(&[&handle]);
+    let reply = ext_request(&mut b, b"fsync@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::Ok),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn fsync_unknown_handle_rejected() {
+    let tmp = TempDir::new("fsync-bad");
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    let fake = 0xdeadbeefu64.to_le_bytes().to_vec();
+    let payload = ext_strings(&[&fake]);
+    let reply = ext_request(&mut b, b"fsync@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::Failure),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn statvfs_returns_filesystem_stats() {
+    let tmp = TempDir::new("statvfs");
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"."]);
+    let reply = ext_request(&mut b, b"statvfs@openssh.com", &payload);
+    let data = match reply {
+        Packet::ExtendedReply { data, .. } => data,
+        other => panic!("expected EXTENDED_REPLY, got {other:?}"),
+    };
+    assert_eq!(data.len(), 8 * 11, "statvfs reply must be 11 u64s");
+    // f_namemax is the eleventh u64.
+    let mut namemax_bytes = [0u8; 8];
+    namemax_bytes.copy_from_slice(&data[80..88]);
+    let namemax = u64::from_be_bytes(namemax_bytes);
+    assert!(namemax >= 64, "expected f_namemax >= 64, got {namemax}");
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn fstatvfs_returns_filesystem_stats() {
+    let tmp = TempDir::new("fstatvfs");
+    fs::write(tmp.path().join("f"), b"x").unwrap();
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    let open = Packet::Open {
+        id: 1,
+        path: b"f".to_vec(),
+        pflags: FXF_READ,
+        attrs: Attrs::default(),
+    };
+    write_packet(&mut b, &open).unwrap();
+    let body = read_packet(&mut b).unwrap();
+    let handle = match Packet::decode(&body).unwrap() {
+        Packet::Handle { handle, .. } => handle,
+        other => panic!("expected HANDLE, got {other:?}"),
+    };
+
+    let payload = ext_strings(&[&handle]);
+    let reply = ext_request(&mut b, b"fstatvfs@openssh.com", &payload);
+    let data = match reply {
+        Packet::ExtendedReply { data, .. } => data,
+        other => panic!("expected EXTENDED_REPLY, got {other:?}"),
+    };
+    assert_eq!(data.len(), 8 * 11);
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn unknown_extended_request_returns_op_unsupported() {
+    let tmp = TempDir::new("ext-unknown");
+    let (a, mut b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"whatever"]);
+    let reply = ext_request(&mut b, b"bogus@example.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::OpUnsupported),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+
+    drop(b);
+    h.join().unwrap();
+}

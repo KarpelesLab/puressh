@@ -43,6 +43,23 @@ use common::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Scrub bytes that are unsafe to emit to an interactive terminal.
+///
+/// SFTP `longname`/`filename`/`realpath` fields arrive as opaque,
+/// unvalidated bytes from the server. A malicious server can embed ANSI
+/// or OSC control sequences (e.g. `ESC[...m`, `ESC]0;...BEL`) that, when
+/// written verbatim to a TTY, rewrite the screen, retitle the window, or
+/// otherwise hijack the operator's terminal. Following OpenSSH sftp's
+/// `strnvis`/`ctrl` handling, replace every control byte — anything below
+/// `0x20` (including ESC `0x1b`, TAB `0x09`, CR/LF) and DEL `0x7f` — with
+/// a `?` placeholder. The `ls -l` long format uses spaces, not tabs, for
+/// column alignment, so scrubbing TAB does not disturb the layout.
+fn sanitize_terminal_bytes(src: &[u8]) -> Vec<u8> {
+    src.iter()
+        .map(|&b| if b < 0x20 || b == 0x7f { b'?' } else { b })
+        .collect()
+}
+
 const USAGE: &str =
     "usage: sftp [-v[v[v]]] [-F configfile] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
@@ -252,10 +269,16 @@ impl<T: Read + Write> Repl<T> {
             }
             match cmd[0] {
                 "quit" | "exit" | "bye" => return Ok(()),
-                "pwd" => println!(
-                    "Remote working directory: {}",
-                    String::from_utf8_lossy(&self.remote_cwd)
-                ),
+                "pwd" => {
+                    // `remote_cwd` is the server's `realpath` reply — opaque
+                    // peer-supplied bytes. Scrub control bytes before echoing
+                    // to the TTY (terminal escape injection).
+                    let safe = sanitize_terminal_bytes(&self.remote_cwd);
+                    println!(
+                        "Remote working directory: {}",
+                        String::from_utf8_lossy(&safe)
+                    );
+                }
                 "lpwd" => println!("Local working directory: {}", self.local_cwd.display()),
                 "cd" => {
                     if let Err(e) = self.cmd_cd(cmd.get(1).copied().unwrap_or("")) {
@@ -404,8 +427,13 @@ impl<T: Read + Write> Repl<T> {
         let mut out = stdout.lock();
         while let Some(batch) = self.sftp.readdir(&h).map_err(sftp_err_to_string)? {
             for e in batch {
-                // `longname` is server-formatted (typically ls -l).
-                let _ = out.write_all(&e.longname);
+                // `longname` is server-formatted (typically ls -l) and
+                // arrives as opaque, unvalidated bytes from the peer. A
+                // hostile server can embed ANSI/OSC escape sequences to
+                // hijack the operator's terminal, so scrub control bytes
+                // before writing them to the TTY (CVE-class: terminal
+                // escape injection; mirrors OpenSSH sftp's strnvis).
+                let _ = out.write_all(&sanitize_terminal_bytes(&e.longname));
                 let _ = out.write_all(b"\n");
             }
         }
@@ -671,5 +699,24 @@ fn main() -> ExitCode {
             eprintln!("sftp: {msg}");
             ExitCode::from(255)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal_bytes;
+
+    #[test]
+    fn strips_ansi_and_control_bytes() {
+        // ESC-based ANSI/OSC sequences and other control bytes are scrubbed.
+        let evil = b"\x1b[31mred\x1b]0;pwned\x07 file\x7f\nname\tcol\r";
+        let got = sanitize_terminal_bytes(evil);
+        assert_eq!(&got, b"?[31mred?]0;pwned? file??name?col?");
+    }
+
+    #[test]
+    fn preserves_printable_ascii() {
+        let s = b"-rw-r--r-- 1 user group 1024 Jan  1 00:00 hello.txt";
+        assert_eq!(sanitize_terminal_bytes(s), s.to_vec());
     }
 }

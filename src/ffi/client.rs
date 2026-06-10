@@ -417,7 +417,19 @@ pub unsafe extern "C" fn pcssh_client_exec(
             unsafe {
                 *stdout_out_len = need_out;
                 *stderr_out_len = need_err;
-                *exit_status_out = out.exit_status.map(|v| v as i32).unwrap_or(-1);
+                // Saturate the server-reported status into the non-negative
+                // i32 range. The header documents -1 as the sole "no status
+                // reported" sentinel, but a raw `v as i32` would alias a
+                // server status of 0xFFFF_FFFF onto -1 (and any value >=
+                // 0x8000_0000 onto an unexpected negative). Clamping to
+                // i32::MAX keeps -1 strictly meaning "no status", while
+                // still distinguishing a reported status from the sentinel.
+                // (A cleaner fix would widen the ABI to u32; we avoid that
+                // to preserve the existing C signature.)
+                *exit_status_out = out
+                    .exit_status
+                    .map(|v| v.min(0x7fff_ffff) as i32)
+                    .unwrap_or(-1);
             }
 
             if need_out > stdout_cap || need_err > stderr_cap {

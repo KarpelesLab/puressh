@@ -53,6 +53,17 @@ const MAX_AUTH_STEPS: usize = 64;
 const MAX_CONNECTION_STEPS: usize = 10_000_000;
 const MAX_DRAIN_STEPS: usize = 1_000_000;
 
+/// Cap on the number of application packets buffered in `deferred` while a
+/// re-KEX is in flight (RFC 4253 §7.3). A client can trigger a rekey and
+/// then flood `CHANNEL_DATA` without ever completing the exchange; without a
+/// bound the queue would grow until `MAX_CONNECTION_STEPS`, buffering
+/// millions of payloads. Whichever of count / aggregate bytes trips first
+/// aborts the connection with a protocol error.
+const MAX_DEFERRED_PACKETS: usize = 4096;
+/// Aggregate byte budget for the `deferred` rekey queue (see
+/// `MAX_DEFERRED_PACKETS`).
+const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
+
 /// Bound on the per-subsystem egress queue. Handlers self-throttle when
 /// the dispatcher can't ship `CHANNEL_DATA` fast enough (remote window
 /// exhausted).
@@ -1749,8 +1760,18 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         }
 
         // Application-layer packet. If we're mid-rekey, RFC §7.3 says we
-        // must NOT respond with channel traffic — buffer for later.
+        // must NOT respond with channel traffic — buffer for later. Bound the
+        // queue so a peer can't trigger a rekey, withhold its completion, and
+        // flood CHANNEL_DATA to exhaust memory.
         if runner.is_kexing() {
+            let deferred_bytes: usize = deferred.iter().map(Vec::len).sum();
+            if deferred.len() >= MAX_DEFERRED_PACKETS
+                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
+            {
+                return Err(Error::Protocol(
+                    "connection: deferred rekey packet queue overflow",
+                ));
+            }
             deferred.push(payload);
             continue;
         }

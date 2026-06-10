@@ -60,9 +60,38 @@ impl KnownHosts {
     }
 
     /// Parse the bytes of a `known_hosts` file.
+    ///
+    /// Parsing is done line-by-line over the raw bytes (split on `\n`,
+    /// with a trailing `\r` stripped) so a single non-UTF-8 byte anywhere
+    /// in the file cannot empty the whole store. Applying `from_utf8` to
+    /// the entire buffer and falling back to `""` on error would turn one
+    /// bad byte into zero loaded entries → every lookup returns `Unknown`
+    /// → host-key verification is silently disabled and a MITM key is
+    /// accepted/pinned via TOFU. Instead, each line that is valid UTF-8 is
+    /// parsed as usual; a line that is not valid UTF-8 is skipped (just
+    /// that line), matching OpenSSH's tolerance of individual bad lines.
     pub fn from_bytes(data: &[u8]) -> Self {
         let mut out = Self::new();
-        for raw in std::str::from_utf8(data).unwrap_or("").lines() {
+        // `split(b'\n')` yields a trailing empty element for a buffer that
+        // ends in `\n` (and for an empty buffer); `str::lines()` does not.
+        // Drop that single trailing empty element so a normally-terminated
+        // file doesn't gain a spurious blank line on save.
+        let mut parts = data.split(|&b| b == b'\n').peekable();
+        while let Some(line) = parts.next() {
+            if parts.peek().is_none() && line.is_empty() {
+                break;
+            }
+            // Strip a trailing `\r` so CRLF files parse the same as LF.
+            let line = match line.split_last() {
+                Some((b'\r', rest)) => rest,
+                _ => line,
+            };
+            // Skip only this line if it isn't valid UTF-8; do not abort
+            // parsing and do not empty the store.
+            let raw = match std::str::from_utf8(line) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
             match parse_line(raw) {
                 ParsedLine::Entry(e) => out.lines.push(Slot::Entry(e)),
                 ParsedLine::Verbatim(s) => out.lines.push(Slot::Verbatim(s)),
@@ -395,4 +424,70 @@ fn host_field_matches(spec: &HostSpec, host: &str, port: u16) -> bool {
 /// `Option`-based contract.
 fn split_host_port(pat: &str) -> Option<(String, u16)> {
     crate::config::parse_host_port_pattern(pat, 22).ok()
+}
+
+#[cfg(test)]
+mod store_tests {
+    use super::*;
+
+    /// A file containing one valid line, one line with an invalid UTF-8
+    /// byte, and another valid line must load BOTH valid entries — the bad
+    /// line is skipped, not the whole file. Previously a single non-UTF-8
+    /// byte emptied the entire store (every lookup → Unknown → silent TOFU
+    /// fail-open, accepting a MITM key).
+    #[test]
+    fn invalid_utf8_line_is_skipped_not_whole_file() {
+        // "AAAA" base64-decodes cleanly to a 3-byte blob, so these parse.
+        let mut data: Vec<u8> = Vec::new();
+        data.extend_from_slice(b"good1.example.com ssh-ed25519 AAAA\n");
+        // A line carrying a lone 0xFF byte — invalid UTF-8 anywhere.
+        data.extend_from_slice(b"bad.example.com ssh-ed25519 ");
+        data.push(0xFF);
+        data.push(b'\n');
+        data.extend_from_slice(b"good2.example.com ssh-ed25519 AAAA\n");
+
+        let kh = KnownHosts::from_bytes(&data);
+
+        // Both valid hosts must be known.
+        assert!(
+            matches!(
+                kh.lookup("good1.example.com", 22, "ssh-ed25519", &[0, 0, 0]),
+                LookupResult::Match
+            ),
+            "first valid entry should have loaded"
+        );
+        assert!(
+            matches!(
+                kh.lookup("good2.example.com", 22, "ssh-ed25519", &[0, 0, 0]),
+                LookupResult::Match
+            ),
+            "third valid entry should have loaded despite the bad middle line"
+        );
+        // The bad line contributed nothing.
+        assert!(
+            matches!(
+                kh.lookup("bad.example.com", 22, "ssh-ed25519", &[0, 0, 0]),
+                LookupResult::Unknown
+            ),
+            "the invalid-utf8 line must be skipped, not parsed"
+        );
+        // Exactly the two good entries were loaded.
+        let entries = kh
+            .lines
+            .iter()
+            .filter(|s| matches!(s, Slot::Entry(_)))
+            .count();
+        assert_eq!(entries, 2, "only the two valid lines should load");
+    }
+
+    /// A normally-terminated file (trailing `\n`) must not gain a spurious
+    /// blank line when round-tripped, matching the old `str::lines()`
+    /// behaviour.
+    #[test]
+    fn trailing_newline_does_not_add_blank_line() {
+        let src = b"example.com ssh-ed25519 AAAA\n";
+        let kh = KnownHosts::from_bytes(src);
+        let out = kh.to_bytes();
+        assert_eq!(out, src, "round-trip must not add a trailing blank line");
+    }
 }

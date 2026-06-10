@@ -1549,12 +1549,33 @@ impl Client {
                 opts.target_is_file = true;
             }
         }
+        // Residual CVE-2019-6111: when this is a single, non-recursive
+        // fetch of a literal path (no glob metacharacters), we know the
+        // exact basename the server is supposed to return. Pass it to the
+        // receiver so it can reject a server that pushes extra or renamed
+        // files. For recursive or glob requests the basename set is
+        // unpredictable, so we leave the receiver in its confinement-only
+        // mode (validate_name + guard_path).
+        let expected_name: Option<String> = if opts.recursive {
+            None
+        } else {
+            let base = remote_source.rsplit('/').next().unwrap_or(remote_source);
+            // Glob metacharacters mean the server legitimately chooses the
+            // names — don't pin a single expected basename in that case.
+            let is_glob = base.contains(['*', '?', '[']);
+            if base.is_empty() || is_glob {
+                None
+            } else {
+                Some(base.to_string())
+            }
+        };
         // Matches scp_send_to: single-channel helper, internal use.
         #[allow(deprecated)]
         let mut stream = self.exec_stream(&cmd)?;
         let result = (|| -> Result<()> {
             let mut recv = crate::scp::Receiver::new(&mut stream, local_dest, opts)
-                .map_err(|e| scp_proto(e, "scp_recv_from: handshake"))?;
+                .map_err(|e| scp_proto(e, "scp_recv_from: handshake"))?
+                .with_expected_name(expected_name.as_deref());
             recv.run().map_err(|e| scp_proto(e, "scp_recv_from: run"))?;
             Ok(())
         })();

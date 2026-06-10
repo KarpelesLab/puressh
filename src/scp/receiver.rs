@@ -62,6 +62,24 @@ pub struct Receiver<S: Read + Write> {
     /// hostile peers). Defaults to `Some(DEFAULT_MAX_FILE_SIZE)` (64 GiB);
     /// tune via [`Receiver::with_max_file_size`].
     max_file_size: Option<u64>,
+    /// Residual CVE-2019-6111 countermeasure. When the client issued a
+    /// *single, non-recursive* file fetch (`scp remote:onefile dest`), it
+    /// knows the exact basename it asked for, and a well-behaved server
+    /// must send back exactly that one file. A hostile/compromised server
+    /// could otherwise push EXTRA or DIFFERENTLY-named files (e.g.
+    /// `.bashrc`, `.profile`) into the destination directory, yielding
+    /// code execution on the victim's next login.
+    ///
+    /// When `Some(name)`, the receiver refuses any `C` record whose
+    /// basename differs from `name`, refuses any `D`/`E`, and refuses more
+    /// than one file in the whole transfer. `None` (recursive / glob /
+    /// multi-file fetches, where the client legitimately cannot predict the
+    /// names) keeps the prior behaviour — confinement is via
+    /// `validate_name` + `guard_path`.
+    expected_name: Option<String>,
+    /// Set once the first file has been received in `expected_name` mode,
+    /// so a second `C` can be rejected.
+    received_one: bool,
 }
 
 impl<S: Read + Write> Receiver<S> {
@@ -86,6 +104,8 @@ impl<S: Read + Write> Receiver<S> {
             pending_times: None,
             opts,
             max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
+            expected_name: None,
+            received_one: false,
         })
     }
 
@@ -94,6 +114,19 @@ impl<S: Read + Write> Receiver<S> {
     /// from a peer that advertises an absurd `C` header size).
     pub fn with_max_file_size(mut self, cap: Option<u64>) -> Self {
         self.max_file_size = cap;
+        self
+    }
+
+    /// Constrain the transfer to a single file with the given basename.
+    ///
+    /// Use this for a non-recursive `scp remote:onefile dest` where the
+    /// client knows exactly what it requested. The receiver then rejects
+    /// any `C` record whose basename differs, any directory header, and any
+    /// second file — closing the residual CVE-2019-6111 gap where a
+    /// malicious server pushes extra/renamed files into the destination
+    /// directory. Pass the basename only (no path components).
+    pub fn with_expected_name(mut self, name: Option<&str>) -> Self {
+        self.expected_name = name.map(|s| s.to_string());
         self
     }
 
@@ -219,6 +252,31 @@ impl<S: Read + Write> Receiver<S> {
     }
 
     fn recv_file(&mut self, mode: u32, size: u64, name: &str) -> Result<(), ScpError> {
+        // Residual CVE-2019-6111: in single-named-file mode the client
+        // knows the exact basename it requested. Refuse a server that sends
+        // a different basename, or that tries to push a second file, before
+        // we ack the `C` or touch the filesystem.
+        if let Some(expected) = self.expected_name.as_deref() {
+            if self.received_one {
+                let msg = "server sent more than one file for a single-file request";
+                let _ = write_fatal(&mut self.stream, msg);
+                return Err(ScpError::Unexpected(
+                    "server sent more than one file for a single-file request",
+                ));
+            }
+            // Compare on basename: `name` is already a bare filename
+            // (validate_name rejects path separators at parse time), but
+            // take the basename of `expected` defensively in case a caller
+            // passed a path.
+            let expected_base = expected.rsplit('/').next().unwrap_or(expected);
+            if name != expected_base {
+                let msg = "server sent a file with an unexpected name";
+                let _ = write_fatal(&mut self.stream, msg);
+                return Err(ScpError::Unexpected(
+                    "server sent a file with an unexpected name",
+                ));
+            }
+        }
         // Refuse oversized headers *before* we ack the `C` and start
         // streaming bytes from the peer. A sender that announces
         // `u64::MAX` would otherwise be allowed to fill the receiver's
@@ -294,6 +352,9 @@ impl<S: Read + Write> Receiver<S> {
         }
         // Ack the payload.
         write_ok(&mut self.stream)?;
+        // Mark that we've taken our one file (single-named-file mode); any
+        // further `C` will now be rejected.
+        self.received_one = true;
         Ok(())
     }
 
@@ -391,4 +452,119 @@ fn set_times(path: &Path, mtime: i64, atime: i64) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_times(_path: &Path, _mtime: i64, _atime: i64) -> std::io::Result<()> {
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod expected_name_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::thread;
+
+    fn fresh_tmp(label: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let dir =
+            std::env::temp_dir().join(format!("puressh-recv-named-{}-{}-{}", label, pid, n));
+        std::fs::create_dir_all(&dir).expect("tmp dir");
+        dir
+    }
+
+    struct DirGuard(PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A malicious server that announces a `C` record with a basename the
+    /// client never asked for must be refused before the file is written.
+    #[test]
+    fn rejects_mismatched_basename() {
+        let dst = fresh_tmp("mismatch");
+        let _g = DirGuard(dst.clone());
+
+        let (client_end, mut server_end) = UnixStream::pair().expect("socketpair");
+
+        let dst_thread = dst.clone();
+        let recv = thread::spawn(move || {
+            let mut r = Receiver::new(
+                client_end,
+                &dst_thread,
+                ScpRecvOptions {
+                    recursive: false,
+                    preserve_times: false,
+                    target_is_file: false,
+                },
+            )
+            .expect("recv new")
+            .with_expected_name(Some("wanted.txt"));
+            r.run()
+        });
+
+        // Server side: read the initial readiness ack, then push a file
+        // named `.bashrc` — NOT what the client asked for.
+        let mut ack = [0u8; 1];
+        server_end.read_exact(&mut ack).expect("initial ack");
+        assert_eq!(ack[0], 0x00);
+        server_end
+            .write_all(b"C0644 5 .bashrc\n")
+            .expect("write C header");
+        // We do NOT send payload — the receiver must bail at the header.
+
+        let result = recv.join().expect("join");
+        assert!(
+            matches!(result, Err(ScpError::Unexpected(_))),
+            "expected rejection, got {result:?}"
+        );
+        // The bogus file must not have been created.
+        assert!(!dst.join(".bashrc").exists());
+    }
+
+    /// A correctly-named single file is accepted in expected-name mode.
+    #[test]
+    fn accepts_expected_basename() {
+        let dst = fresh_tmp("match");
+        let _g = DirGuard(dst.clone());
+
+        let (client_end, mut server_end) = UnixStream::pair().expect("socketpair");
+
+        let dst_thread = dst.clone();
+        let recv = thread::spawn(move || {
+            let mut r = Receiver::new(
+                client_end,
+                &dst_thread,
+                ScpRecvOptions {
+                    recursive: false,
+                    preserve_times: false,
+                    target_is_file: false,
+                },
+            )
+            .expect("recv new")
+            .with_expected_name(Some("wanted.txt"));
+            r.run()
+        });
+
+        let mut ack = [0u8; 1];
+        server_end.read_exact(&mut ack).expect("initial ack");
+        // Send the correctly-named file.
+        server_end
+            .write_all(b"C0644 5 wanted.txt\n")
+            .expect("write C header");
+        // C-header ack from receiver.
+        server_end.read_exact(&mut ack).expect("C ack");
+        assert_eq!(ack[0], 0x00);
+        // Payload + trailing 0x00.
+        server_end.write_all(b"hello\x00").expect("payload");
+        // Payload ack.
+        server_end.read_exact(&mut ack).expect("payload ack");
+        assert_eq!(ack[0], 0x00);
+        // Close so the receiver's read_header returns None (EOF).
+        drop(server_end);
+
+        let result = recv.join().expect("join");
+        assert!(result.is_ok(), "expected ok, got {result:?}");
+        assert_eq!(std::fs::read(dst.join("wanted.txt")).unwrap(), b"hello");
+    }
 }

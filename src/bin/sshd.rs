@@ -2228,15 +2228,34 @@ mod imp {
             config = config.with_x11_forward(Arc::new(DefaultX11ForwardHandler::new()));
         }
 
-        // Drop privileges to the authenticated user *once per connection*
-        // (after PAM open, before any channel runs). Subsequent shell forks
-        // discover `already_matches(&info)` true and skip their own drop;
-        // SFTP threads run as the user in-process. The PAM session opened
-        // earlier (which needed root for pam_loginuid) stays valid; the
-        // eventual `pam_close_session` runs as the user, which works for
-        // every PAM module shipped by Linux distros today.
+        // Connection-level session open. Two steps, in this order, exactly
+        // once per connection:
+        //
+        //   1. pam.ensure() — pam_acct_mgmt + pam_open_session against
+        //      service `sshd`, run while we are still root so pam_loginuid /
+        //      pam_limits / pam_systemd (which need privilege) work, and so
+        //      EVERY session type (shell / exec / SFTP / SCP) is uniformly
+        //      gated by the authoritative account check. If PAM rejects the
+        //      account (expired/locked, /etc/nologin, pam_time, pam_access)
+        //      ensure() returns Err and we refuse the connection here —
+        //      before any privilege drop and before any handler runs.
+        //   2. drop_to_user() — drop to the authenticated user's uid/gid.
+        //      Subsequent shell forks discover `already_matches(&info)` true
+        //      and skip their own drop; SFTP/SCP run as the user in-process.
+        //
+        // The PAM session opened here stays valid for the connection's life;
+        // the eventual pam_close_session runs at teardown as the user, which
+        // works for every PAM module shipped by Linux distros today. The
+        // per-handler ensure() calls are now idempotent no-ops (the gate is
+        // once-guarded) and simply return the cached PAM env list.
         let debug = cli.debug;
-        config = config.on_session_open(move |user: &str| drop_to_user(user, debug));
+        let session_pam = pam_gate.clone();
+        config = config.on_session_open(move |user: &str| {
+            // PAM_TTY = "ssh" matches OpenSSH's value for the session-level
+            // gate; PTY shells later re-call ensure() (a no-op) for env.
+            session_pam.ensure(user, "ssh")?;
+            drop_to_user(user, debug)
+        });
 
         // Plumb finding-#1 (env allowlist) and finding-#2 (pre-auth
         // inactivity timeout) into the server config. with_accept_env

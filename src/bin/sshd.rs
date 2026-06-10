@@ -81,7 +81,8 @@ mod imp {
                          [--sftp-root PATH] [--no-scp] [--no-agent-forward] \
                          [--no-x11-forward] [--no-strict-modes] [--debug-commands] \
                          [--accept-env GLOB]... [--login-grace-time SECONDS] \
-                         [--max-startups N] [--per-source-max N]";
+                         [--max-startups N] [--per-source-max N] \
+                         [--permit-root-login yes|no|prohibit-password]";
 
     // -------------------------------------------------------------------------
     // PAM session gate.
@@ -300,6 +301,11 @@ mod imp {
         /// `--per-source-max N`: cap on simultaneous connections from any
         /// single peer IP (0 = unlimited).
         per_source_max: u32,
+        /// `--permit-root-login yes|no|prohibit-password`: whether the root
+        /// account (uid 0) may authenticate. Default (config/built-in) is
+        /// `prohibit-password`, which permits root by key since puressh has
+        /// no password auth; `no` blocks root entirely.
+        permit_root_login: Option<puressh::config::PermitRootLogin>,
     }
 
     /// OpenSSH precedence helper: returns the first `Some` of `cli`, `cfg`,
@@ -341,6 +347,7 @@ mod imp {
         let mut login_grace_time: Option<u32> = None;
         let mut max_startups: Option<u32> = None;
         let mut per_source_max: u32 = 10;
+        let mut permit_root_login: Option<puressh::config::PermitRootLogin> = None;
 
         let mut i = 0;
         while i < args.len() {
@@ -417,6 +424,24 @@ mod imp {
                         .parse::<u32>()
                         .map_err(|_| "invalid --per-source-max".to_string())?;
                 }
+                "--permit-root-login" => {
+                    use puressh::config::PermitRootLogin;
+                    i += 1;
+                    let v = args.get(i).ok_or("--permit-root-login requires a value")?;
+                    permit_root_login = Some(match v.to_ascii_lowercase().as_str() {
+                        "yes" | "true" | "on" => PermitRootLogin::Yes,
+                        "no" | "false" | "off" => PermitRootLogin::No,
+                        "prohibit-password" | "without-password" => {
+                            PermitRootLogin::ProhibitPassword
+                        }
+                        other => {
+                            return Err(format!(
+                                "invalid --permit-root-login {other:?} \
+                                 (expected yes, no, or prohibit-password)"
+                            ));
+                        }
+                    });
+                }
                 s if s.starts_with('-') => {
                     return Err(format!("unknown flag: {s}"));
                 }
@@ -447,6 +472,7 @@ mod imp {
             login_grace_time,
             max_startups,
             per_source_max,
+            permit_root_login,
         })
     }
 
@@ -556,6 +582,11 @@ mod imp {
     struct LocalAuthenticator {
         allowed_users: HashSet<String>,
         authorized_blobs: Vec<Vec<u8>>,
+        /// Requested usernames that resolve to the root account (uid 0),
+        /// precomputed from `AllowUsers` at startup. Checked against the
+        /// `PermitRootLogin` policy to gate root authentication.
+        root_users: HashSet<String>,
+        permit_root_login: puressh::config::PermitRootLogin,
         debug: bool,
     }
 
@@ -589,7 +620,13 @@ mod imp {
                     // it for every attempt keeps the two paths uniform.
                     let user_ok = self.allowed_users.contains(&user);
                     let blob_ok = self.authorized_blobs.contains(&public_blob);
-                    let allow = user_ok && blob_ok;
+                    // PermitRootLogin gate: if the requested user is the root
+                    // account (uid 0) and policy forbids it, deny regardless
+                    // of key match. Computed as an O(1) set lookup so the
+                    // accept/reject paths keep uniform timing.
+                    let root_denied =
+                        self.root_users.contains(&user) && !self.permit_root_login.permits_publickey();
+                    let allow = user_ok && blob_ok && !root_denied;
 
                     // probe_only attempts (no signature) only need
                     // user+blob to be acceptable so the client knows it
@@ -599,7 +636,11 @@ mod imp {
                             AuthDecision::Accept
                         } else {
                             if self.debug {
-                                if !user_ok {
+                                if root_denied {
+                                    eprintln!(
+                                        "sshd: auth publickey probe: root login denied by PermitRootLogin for {user}"
+                                    );
+                                } else if !user_ok {
                                     eprintln!(
                                         "sshd: auth publickey probe: user {user} not in allowed set"
                                     );
@@ -615,7 +656,11 @@ mod imp {
 
                     if !(allow && verified) {
                         if self.debug {
-                            if !user_ok {
+                            if root_denied {
+                                eprintln!(
+                                    "sshd: auth publickey: root login denied by PermitRootLogin for {user}"
+                                );
+                            } else if !user_ok {
                                 eprintln!("sshd: auth publickey: user {user} not in allowed set");
                             } else if !blob_ok {
                                 eprintln!(
@@ -659,6 +704,8 @@ mod imp {
     struct LocalAuthFactory {
         allowed_users: Arc<HashSet<String>>,
         authorized_blobs: Arc<Vec<Vec<u8>>>,
+        root_users: Arc<HashSet<String>>,
+        permit_root_login: puressh::config::PermitRootLogin,
         debug: bool,
     }
 
@@ -667,6 +714,8 @@ mod imp {
             Box::new(LocalAuthenticator {
                 allowed_users: (*self.allowed_users).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
+                root_users: (*self.root_users).clone(),
+                permit_root_login: self.permit_root_login,
                 debug: self.debug,
             })
         }
@@ -2192,9 +2241,39 @@ mod imp {
             allowed_user_list.into_iter().collect()
         };
 
+        // PermitRootLogin: CLI > config > built-in `prohibit-password`
+        // (OpenSSH's default; permits root-by-key since puressh has no
+        // password auth). Precompute which allowed usernames resolve to the
+        // root account (uid 0) so the authenticator gate is an O(1) lookup.
+        // The name "root" is always treated as root even if the passwd
+        // lookup fails; any other name is root only if it resolves to uid 0.
+        let permit_root_login = pick(
+            cli.permit_root_login,
+            sshd_cfg.permit_root_login,
+            puressh::config::PermitRootLogin::ProhibitPassword,
+        );
+        let root_users: HashSet<String> = allowed_users
+            .iter()
+            .filter(|name| {
+                name.as_str() == "root"
+                    || matches!(
+                        nix::unistd::User::from_name(name),
+                        Ok(Some(u)) if u.uid.as_raw() == 0
+                    )
+            })
+            .cloned()
+            .collect();
+        if cli.debug && !root_users.is_empty() {
+            eprintln!(
+                "sshd: PermitRootLogin={permit_root_login:?}; root-equivalent allowed users: {root_users:?}"
+            );
+        }
+
         let factory = Arc::new(LocalAuthFactory {
             allowed_users: Arc::new(allowed_users),
             authorized_blobs: Arc::new(authorized_blobs),
+            root_users: Arc::new(root_users),
+            permit_root_login,
             debug: cli.debug,
         });
 

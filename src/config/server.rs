@@ -13,6 +13,34 @@ use alloc::vec::Vec;
 use super::parser::{tokenize, ParsedLine};
 use super::ConfigError;
 
+/// `PermitRootLogin` policy.
+///
+/// puressh only implements public-key authentication, so the OpenSSH
+/// `password`-vs-`publickey` distinction collapses: `Yes` and
+/// `ProhibitPassword` both permit a root login by key, while `No` forbids
+/// the root account entirely. OpenSSH's fourth value,
+/// `forced-commands-only`, has no analogue here — puressh's
+/// `authorized_keys` parser carries no `command=` restriction — so it is
+/// rejected at parse time rather than silently behaving like `No`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermitRootLogin {
+    /// Root may log in (by key — the only method puressh offers).
+    Yes,
+    /// Root may never authenticate, regardless of `AllowUsers`/keys.
+    No,
+    /// Root may log in by public key but not by password. Equivalent to
+    /// `Yes` in puressh (no password auth exists); the OpenSSH default.
+    ProhibitPassword,
+}
+
+impl PermitRootLogin {
+    /// Whether the root account may authenticate via public key under this
+    /// policy. Only [`PermitRootLogin::No`] returns `false`.
+    pub fn permits_publickey(self) -> bool {
+        matches!(self, PermitRootLogin::Yes | PermitRootLogin::ProhibitPassword)
+    }
+}
+
 /// A parsed `sshd_config(5)` file.
 ///
 /// Every field is `Option`-typed (or an empty `Vec`) so the binary can apply
@@ -58,6 +86,10 @@ pub struct SshServerConfig {
     pub sftp_root: Option<String>,
     /// puressh-specific: `ScpEnabled` (yes/no).
     pub scp_enabled: Option<bool>,
+    /// `PermitRootLogin` — `yes` / `no` / `prohibit-password`
+    /// (alias `without-password`). `forced-commands-only` is rejected as
+    /// unsupported. Default (applied by the binary) is `prohibit-password`.
+    pub permit_root_login: Option<PermitRootLogin>,
 }
 
 impl SshServerConfig {
@@ -159,6 +191,9 @@ fn apply_keyword(opts: &mut SshServerConfig, line: &ParsedLine) -> Result<(), Co
         "scpenabled" => {
             opts.scp_enabled = Some(parse_yes_no(line)?);
         }
+        "permitrootlogin" => {
+            opts.permit_root_login = Some(parse_permit_root_login(line)?);
+        }
         _ => {
             return Err(ConfigError::UnknownKeyword {
                 line: line.line_no,
@@ -198,6 +233,26 @@ fn parse_yes_no(line: &ParsedLine) -> Result<bool, ConfigError> {
             line: line.line_no,
             keyword: line.keyword.clone(),
             msg: format!("expected yes/no, got {s:?}"),
+        }),
+    }
+}
+
+fn parse_permit_root_login(line: &ParsedLine) -> Result<PermitRootLogin, ConfigError> {
+    let s = one_arg(line)?.to_ascii_lowercase();
+    match s.as_str() {
+        "yes" | "true" | "on" => Ok(PermitRootLogin::Yes),
+        "no" | "false" | "off" => Ok(PermitRootLogin::No),
+        "prohibit-password" | "without-password" => Ok(PermitRootLogin::ProhibitPassword),
+        "forced-commands-only" => Err(ConfigError::Unsupported {
+            line: line.line_no,
+            msg: "PermitRootLogin forced-commands-only is not supported (puressh authorized_keys \
+                  has no command= restriction); use yes, no, or prohibit-password"
+                .into(),
+        }),
+        _ => Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: format!("expected yes/no/prohibit-password, got {s:?}"),
         }),
     }
 }
@@ -356,6 +411,35 @@ AllowUsers bob carol
             let cfg = SshServerConfig::parse(&src).unwrap();
             assert_eq!(cfg.login_grace_time, Some(want), "case {s:?}");
         }
+    }
+
+    #[test]
+    fn permit_root_login_values() {
+        for (s, want) in [
+            ("yes", PermitRootLogin::Yes),
+            ("no", PermitRootLogin::No),
+            ("prohibit-password", PermitRootLogin::ProhibitPassword),
+            ("without-password", PermitRootLogin::ProhibitPassword),
+        ] {
+            let src = format!("PermitRootLogin {s}\n");
+            let cfg = SshServerConfig::parse(&src).unwrap();
+            assert_eq!(cfg.permit_root_login, Some(want), "case {s:?}");
+        }
+        assert!(PermitRootLogin::Yes.permits_publickey());
+        assert!(PermitRootLogin::ProhibitPassword.permits_publickey());
+        assert!(!PermitRootLogin::No.permits_publickey());
+    }
+
+    #[test]
+    fn permit_root_login_forced_commands_unsupported() {
+        let err = SshServerConfig::parse("PermitRootLogin forced-commands-only\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { line: 1, .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn permit_root_login_bad_value() {
+        let err = SshServerConfig::parse("PermitRootLogin maybe\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { line: 1, .. }), "got {err:?}");
     }
 
     #[test]

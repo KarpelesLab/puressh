@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5](https://github.com/KarpelesLab/puressh/compare/v0.0.4...v0.0.5) - 2026-06-09
+
+### Other
+
+- macOS portable Match-exec test + Windows-clean FxpStatus gate
+- add bytes-path variants for stat/lstat/setstat/symlink/readlink/realpath + update header
+- add bytes-path variants for mkdir/rmdir/remove/rename
+- add bytes_from_raw helper + open_file_bytes/opendir_bytes
+- drop deprecated cstr_to_str
+- migrate to with_cstr
+- migrate to with_cstr
+- migrate to with_cstr
+- migrate to with_cstr
+- add with_cstr scope-bounded helper
+- implement ssh_config Include directive
+- implement ssh_config Match blocks
+- parse bracketed-IPv6 host arg
+- accept bracketed-IPv6 lines
+- add bracketed-IPv6 host:port helper
+- cover the OpenSSH @openssh.com extension handlers
+- implement OpenSSH @openssh.com extensions
+- auto-upgrade ssh-rsa signer to rsa-sha2-{256,512} via server-sig-algs
+- thread KexOutput mem::take through the MlKem768X25519 arms
+- ZeroizeOnDrop on KexOutput; rewrite runner destructures via mem::take
+- enable zeroize derive feature
+- enable purecrypto mlkem feature
+- implement mlkem768x25519-sha256 hybrid PQ KEX
+- register mlkem768x25519-sha256 in algorithm tables
+- replace two "checked above" unwraps with structurally panic-free forms
+- prefer server-sig-algs when available
+- route SSH_MSG_EXT_INFO at the legal slots
+- send/accept SSH_MSG_EXT_INFO at the legal moments
+- advertise + negotiate ext-info-{c,s} markers
+- add ext-info wire format + tests
+- ssh CLI: signal-safe termios restore for raw-mode guard
+- Zeroize K_1, K_2, and Poly1305 OTK locals
+- Zeroize raw DH/ECDH shared-secret scratch
+- clamp pcssh_sftp_read copy to caller cap
+- pcssh_sftp_free must wipe session even when mutex is poisoned
+- zero `*out` up-front in new/from_bytes constructors
+
 ## [0.0.4](https://github.com/KarpelesLab/puressh/compare/v0.0.3...v0.0.4) - 2026-06-03
 
 ### Other

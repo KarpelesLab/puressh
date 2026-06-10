@@ -9,6 +9,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use zeroize::Zeroize;
+
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer};
 
@@ -106,18 +108,80 @@ impl ServiceAccept {
     }
 }
 
+/// A cleartext secret (a password or kbd-interactive answer) whose backing
+/// bytes are wiped from memory when the value is dropped.
+///
+/// This wraps [`zeroize::Zeroizing<String>`] so the heap buffer is zeroized
+/// on `Drop` rather than left in freed memory. It keeps the ergonomics of a
+/// plain `String` for construction (`"pw".into()`, `String::into()`) and
+/// comparison (`secret == "pw"`), so it can be dropped into the existing
+/// public API without touching call sites that build it from `&str`.
+///
+/// `Debug` is redacted: it never renders the secret. Note that the
+/// `AuthMethodPayload`/`AuthAttempt` `Debug` impls already substitute
+/// `"<redacted>"` for these fields; this is belt-and-suspenders so a
+/// stray `{:?}` directly on a `SecretString` cannot leak either.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretString(zeroize::Zeroizing<String>);
+
+impl SecretString {
+    /// Borrow the secret bytes for wire encoding.
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+}
+
+impl From<String> for SecretString {
+    fn from(s: String) -> Self {
+        SecretString(zeroize::Zeroizing::new(s))
+    }
+}
+
+impl From<&str> for SecretString {
+    fn from(s: &str) -> Self {
+        SecretString(zeroize::Zeroizing::new(s.into()))
+    }
+}
+
+impl core::ops::Deref for SecretString {
+    type Target = str;
+    fn deref(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl PartialEq<&str> for SecretString {
+    fn eq(&self, other: &&str) -> bool {
+        self.0.as_str() == *other
+    }
+}
+
+impl PartialEq<str> for SecretString {
+    fn eq(&self, other: &str) -> bool {
+        self.0.as_str() == other
+    }
+}
+
+impl core::fmt::Debug for SecretString {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// Method-specific tail of a `SSH_MSG_USERAUTH_REQUEST` packet.
 ///
 /// `Debug` is implemented manually so the cleartext `password` /
 /// `new_password` fields of the `Password` variant are never rendered —
 /// they appear as `"<redacted>"`. The redaction protects against
-/// accidental leakage through `tracing` or ad-hoc `dbg!()` prints.
+/// accidental leakage through `tracing` or ad-hoc `dbg!()` prints. The
+/// secret fields are [`SecretString`], so their backing bytes are also
+/// zeroized when the payload is dropped.
 #[derive(Clone, PartialEq, Eq)]
 pub enum AuthMethodPayload {
     None,
     Password {
-        new_password: Option<String>,
-        password: String,
+        new_password: Option<SecretString>,
+        password: SecretString,
     },
     PublicKey {
         signature_present: bool,
@@ -264,9 +328,12 @@ impl UserauthRequest {
             }
             "password" => {
                 let change = r.read_bool()?;
-                let password = read_utf8(&mut r)?;
-                let new_password = if change {
-                    Some(read_utf8(&mut r)?)
+                // Convert straight into `SecretString` so the decoded
+                // cleartext is held in zeroize-on-drop storage from the
+                // moment it leaves the wire.
+                let password: SecretString = read_utf8(&mut r)?.into();
+                let new_password: Option<SecretString> = if change {
+                    Some(read_utf8(&mut r)?.into())
                 } else {
                     None
                 };
@@ -487,6 +554,17 @@ impl UserauthInfoRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserauthInfoResponse {
     pub responses: Vec<String>,
+}
+
+/// Keyboard-interactive responses frequently carry secrets (passwords,
+/// OTP codes). Wipe each response string on drop. The field type stays
+/// `Vec<String>` so the public API is unchanged.
+impl Drop for UserauthInfoResponse {
+    fn drop(&mut self) {
+        for resp in &mut self.responses {
+            resp.zeroize();
+        }
+    }
 }
 
 impl UserauthInfoResponse {

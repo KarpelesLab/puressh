@@ -8,8 +8,8 @@ use crate::error::{Error, Result};
 use crate::hostkey::{host_key_verify_by_name, HostKeyVerify};
 
 use super::message::{
-    encode_success, AuthMethodPayload, ServiceAccept, ServiceRequest, UserauthFailure,
-    UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
+    encode_success, AuthMethodPayload, SecretString, ServiceAccept, ServiceRequest,
+    UserauthFailure, UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
     SSH_MSG_SERVICE_REQUEST, SSH_MSG_USERAUTH_INFO_RESPONSE, SSH_MSG_USERAUTH_REQUEST,
 };
 
@@ -29,8 +29,10 @@ pub enum AuthAttempt {
     Password {
         /// Requested user name.
         user: String,
-        /// Plaintext password. **Not** rendered by the [`core::fmt::Debug`] impl.
-        password: String,
+        /// Plaintext password, held in zeroize-on-drop storage so its
+        /// bytes are wiped when the attempt is dropped. **Not** rendered by
+        /// the [`core::fmt::Debug`] impl.
+        password: SecretString,
     },
     /// `publickey` authentication.
     PublicKey {
@@ -234,12 +236,18 @@ impl ServerAuth {
                 if msg_type != SSH_MSG_USERAUTH_INFO_RESPONSE {
                     return Err(Error::Protocol("auth: expected INFO_RESPONSE"));
                 }
-                let resp = UserauthInfoResponse::decode(payload)?;
+                let mut resp = UserauthInfoResponse::decode(payload)?;
                 let user = self
                     .pending_user
                     .take()
                     .ok_or(Error::Protocol("auth: info response without pending user"))?;
-                let decision = self.auth.evaluate_interactive(&user, resp.responses);
+                // `core::mem::take` the responses out instead of moving the
+                // field (which `UserauthInfoResponse`'s zeroizing `Drop` impl
+                // forbids). The drained source leaves an empty Vec behind;
+                // ownership of the response strings passes to the
+                // authenticator via the `Vec<String>` trait API.
+                let responses = core::mem::take(&mut resp.responses);
+                let decision = self.auth.evaluate_interactive(&user, responses);
                 self.state = State::AwaitingRequest;
                 self.apply_decision(decision, &user)
             }

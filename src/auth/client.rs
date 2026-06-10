@@ -8,8 +8,8 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 
 use super::message::{
-    AuthMethodPayload, ServiceAccept, ServiceRequest, UserauthBanner, UserauthFailure,
-    UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
+    AuthMethodPayload, SecretString, ServiceAccept, ServiceRequest, UserauthBanner,
+    UserauthFailure, UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
     SSH_MSG_SERVICE_ACCEPT, SSH_MSG_USERAUTH_BANNER, SSH_MSG_USERAUTH_FAILURE,
     SSH_MSG_USERAUTH_PK_OK, SSH_MSG_USERAUTH_SUCCESS,
 };
@@ -25,8 +25,9 @@ pub trait KeyboardInteractiveResponder: Send {
 pub enum ClientCredential {
     /// `none` — used as a probe to learn allowed methods.
     None,
-    /// Plaintext password.
-    Password(String),
+    /// Plaintext password, held in zeroize-on-drop storage so its bytes
+    /// are wiped when the credential is dropped.
+    Password(SecretString),
     /// Publickey — signs the request with the private side.
     PublicKey(Box<dyn crate::hostkey::HostKey>),
     /// Keyboard-interactive — defers prompt answering to a responder.
@@ -238,6 +239,11 @@ impl ClientAuth {
             ClientCredential::Password(pw) => (
                 AuthMethodPayload::Password {
                     new_password: None,
+                    // `pw` is borrowed from `self.current`, so we still
+                    // clone here — but `SecretString::clone` produces a
+                    // zeroize-on-drop copy, so the per-request duplicate is
+                    // wiped when the request payload is dropped rather than
+                    // leaking the password into freed heap memory.
                     password: pw.clone(),
                 },
                 State::AwaitingPasswordResult,

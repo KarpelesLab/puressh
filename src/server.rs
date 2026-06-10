@@ -58,6 +58,17 @@ const MAX_DRAIN_STEPS: usize = 1_000_000;
 /// exhausted).
 const SUBSYSTEM_EGRESS_BACKLOG: usize = 32;
 
+/// High-water mark on a shell's held-over stdout (`pending_stdout`). When a
+/// client stops reading, the remote window stays exhausted and unsent shell
+/// output accumulates here. Without a cap, `drain_shells` would keep pulling
+/// fresh bytes from the PTY/pipe every tick and grow this buffer unbounded —
+/// an authenticated memory-exhaustion DoS. Once the backlog reaches this
+/// ceiling we stop reading from the shell; reads resume on the next tick
+/// after a window adjustment drains the buffer back below the mark. Mirrors
+/// the spirit of `SUBSYSTEM_EGRESS_BACKLOG` (a few-MiB egress ceiling) in a
+/// byte-counted form appropriate to the raw stdout buffer.
+const SHELL_EGRESS_BACKLOG: usize = 4 * 1024 * 1024;
+
 /// Maximum number of `"env"` channel requests we'll accept on a single
 /// session channel. A peer can ship `env` requests for free before any
 /// `shell` / `exec` / `subsystem` claim — without a cap, tens of
@@ -1793,8 +1804,15 @@ fn drain_shells<R: RngCore + CryptoRng>(
             let leftover = core::mem::take(&mut rt.pending_stdout);
             emit_channel_data(stream, codec, rng, conn, ch, &leftover, rt)?;
         }
+        // Back-pressure: if the held-over stdout is still at/over the high-
+        // water mark after the flush attempt (remote window exhausted because
+        // the client stopped reading), do NOT pull more from the shell this
+        // tick. The PTY/pipe blocks the user's program instead of letting us
+        // buffer unbounded. Reads resume automatically on a later tick once a
+        // window adjustment drains `pending_stdout` below the mark. We still
+        // ran the exit poll below so a shell that finishes is reaped.
         let mut pulled = 0usize;
-        while pulled < 64 * 1024 {
+        while rt.pending_stdout.len() < SHELL_EGRESS_BACKLOG && pulled < 64 * 1024 {
             if let Some(sess) = rt.session.as_mut() {
                 let n = sess.read(&mut buf)?;
                 if n == 0 {

@@ -160,7 +160,16 @@ pub fn format_host_pattern(host: &str, port: u16) -> String {
 /// The standard OpenSSH semantics: a line matches if **any** non-negated
 /// pattern matches and **no** negated pattern matches. Pattern-list
 /// evaluation is in [`patterns_match`].
-pub fn pattern_match(pattern: &str, host: &str, port: u16) -> bool {
+///
+/// NOTE: this function is intentionally **not public**. Its `negated ^ raw`
+/// result is a footgun in isolation — a single non-matching *negated*
+/// pattern (e.g. `pattern_match("!evil.com", "good.com", 22)`) reports
+/// `true`, which only makes sense inside the pattern-*list* evaluation in
+/// [`patterns_match`] (where a negated match *rejects* the whole list). It
+/// is kept private so callers cannot mistake a single-pattern "match" for a
+/// host-acceptance decision; use [`patterns_match`] instead.
+#[cfg(test)]
+fn pattern_match(pattern: &str, host: &str, port: u16) -> bool {
     let (negated, pat) = if let Some(rest) = pattern.strip_prefix('!') {
         (true, rest)
     } else {

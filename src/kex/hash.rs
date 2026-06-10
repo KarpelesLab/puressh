@@ -3,6 +3,7 @@
 use alloc::vec::Vec;
 
 use purecrypto::hash::Digest;
+use zeroize::{Zeroize, Zeroizing};
 
 /// Builder for the SSH key-exchange "exchange hash" `H`.
 ///
@@ -127,8 +128,8 @@ pub fn derive<D: Digest>(
     session_id: &[u8],
     letter: u8,
     out_len: usize,
-) -> Vec<u8> {
-    let mut out: Vec<u8> = Vec::with_capacity(out_len);
+) -> Zeroizing<Vec<u8>> {
+    let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(out_len));
     if out_len == 0 {
         return out;
     }
@@ -147,6 +148,10 @@ pub fn derive<D: Digest>(
         let next = h2.finalize();
         out.extend_from_slice(next.as_ref());
     }
+    // The final hash block usually over-produces; `Vec::truncate` drops the
+    // excess length but leaves those key bytes in the backing buffer. Wipe the
+    // tail explicitly before shrinking so no derived key material lingers.
+    out[out_len..].zeroize();
     out.truncate(out_len);
     out
 }

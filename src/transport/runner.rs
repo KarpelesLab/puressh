@@ -31,7 +31,7 @@ use crate::kex::{
 };
 use crate::mac::{mac_by_name, SshMac};
 use purecrypto::dh::{group14, group16, group18, DhGroup};
-use zeroize::Zeroizing;
+use zeroize::{Zeroizing, ZeroizeOnDrop};
 
 use super::ext_info::ExtInfo;
 use super::kex::Negotiated;
@@ -62,22 +62,36 @@ pub struct KexAdvance {
 /// Stored on the runner so callers can inspect what was installed; the runner
 /// already pushed this material into the [`PacketCodec`] before returning the
 /// completion flag from [`KexRunner::on_packet`].
-#[derive(Debug, Clone)]
+///
+/// Holds live cipher/IV/MAC key material: [`Debug`] is redacted so keys never
+/// reach logs, and the secret `Vec` fields are wiped on drop via
+/// [`ZeroizeOnDrop`]. Not `Clone` — duplicating live keys is never needed and
+/// would multiply the copies that must be wiped.
+#[derive(ZeroizeOnDrop)]
 pub struct DirKeys {
     /// Negotiated cipher name (e.g. `aes256-ctr`).
+    #[zeroize(skip)]
     pub cipher: String,
     /// IV / nonce bytes; length matches `CipherSpec::iv_len`.
     pub iv: Vec<u8>,
     /// Cipher key bytes; length matches `CipherSpec::key_len`.
     pub key: Vec<u8>,
     /// Negotiated MAC name, empty when the cipher is AEAD.
+    #[zeroize(skip)]
     pub mac: String,
     /// MAC key bytes; empty when the cipher is AEAD.
     pub mac_key: Vec<u8>,
 }
 
+impl core::fmt::Debug for DirKeys {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Redacted on purpose: key/iv/mac_key are live secrets.
+        f.debug_struct("DirKeys").finish_non_exhaustive()
+    }
+}
+
 /// Both directions' worth of derived keys.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct InstalledKeys {
     /// Client to server direction.
     pub c2s: DirKeys,
@@ -1216,19 +1230,28 @@ fn derive_for_direction(
     } else {
         let mac_spec = crate::mac::by_name(mac).ok_or(Error::Unsupported("MAC in negotiation"))?;
         let mk = kdf(backend, k, h, sid, mac_letter, mac_spec.key_len);
-        (mac.to_string(), mk)
+        (mac.to_string(), mk.to_vec())
     };
+    // `kdf` hands back `Zeroizing<Vec<u8>>`; DirKeys owns the live copy (wiped
+    // by its own ZeroizeOnDrop) while these temporaries are wiped on drop.
 
     Ok(DirKeys {
         cipher: cipher.to_string(),
-        iv,
-        key,
+        iv: iv.to_vec(),
+        key: key.to_vec(),
         mac: mac_name,
         mac_key,
     })
 }
 
-fn kdf(backend: KexBackend, k: &[u8], h: &[u8], sid: &[u8], letter: u8, n: usize) -> Vec<u8> {
+fn kdf(
+    backend: KexBackend,
+    k: &[u8],
+    h: &[u8],
+    sid: &[u8],
+    letter: u8,
+    n: usize,
+) -> Zeroizing<Vec<u8>> {
     match backend {
         KexBackend::Curve25519
         | KexBackend::EcdhP256
@@ -1242,7 +1265,13 @@ fn kdf(backend: KexBackend, k: &[u8], h: &[u8], sid: &[u8], letter: u8, n: usize
     }
 }
 
-fn derive_with<D: Digest>(k: &[u8], h: &[u8], sid: &[u8], letter: u8, n: usize) -> Vec<u8> {
+fn derive_with<D: Digest>(
+    k: &[u8],
+    h: &[u8],
+    sid: &[u8],
+    letter: u8,
+    n: usize,
+) -> Zeroizing<Vec<u8>> {
     crate::kex::derive::<D>(k, h, sid, letter, n)
 }
 

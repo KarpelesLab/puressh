@@ -21,8 +21,17 @@
 //! The shared secret is `K = SHA256(K_PQ || K_ECDH)` where `K_PQ` is the
 //! 32-byte ML-KEM-768 shared secret and `K_ECDH` is the raw 32-byte X25519
 //! shared secret. The exchange hash `H` is the SHA-256 of
-//! `V_C || V_S || I_C || I_S || K_S || C_INIT || S_REPLY || K` with `K`
-//! encoded as an SSH `mpint`.
+//! `V_C || V_S || I_C || I_S || K_S || C_INIT || S_REPLY || K`.
+//!
+//! Unlike `curve25519-sha256` and the ECDH KEX methods (which encode `K` as
+//! an SSH `mpint`), the hybrid method mandates that `K` be encoded as an SSH
+//! `string`: a 4-byte big-endian length (32) followed by the raw SHA-256
+//! digest bytes — no leading-zero stripping and no sign byte. This matches
+//! OpenSSH's `kexmlkem768x25519.c` (>= 9.9) and the hybrid-KEX spec; using
+//! `mpint` here would differ from OpenSSH whenever the digest's top byte has
+//! its high bit set (or has leading zeros), breaking interop ~50% of the
+//! time with a host-key signature failure. The same `string` encoding of `K`
+//! is fed to both `H` and the RFC 4253 §7.2 key-derivation function.
 //!
 //! Failures from ML-KEM (which never *errors* — implicit rejection produces
 //! a random shared secret on invalid input, per FIPS 203 §7.3) and from
@@ -44,7 +53,7 @@ use zeroize::Zeroizing;
 use super::common::{
     KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY,
 };
-use super::hash::{mpint_bytes, ExchangeHash};
+use super::hash::ExchangeHash;
 use super::Kex;
 use crate::error::{Error, Result};
 use crate::format::Reader;
@@ -114,6 +123,19 @@ fn combine_secrets(
     let digest = h.finalize();
     let mut out = Zeroizing::new([0u8; 32]);
     out.copy_from_slice(digest.as_ref());
+    out
+}
+
+/// Encode the 32-byte hybrid shared secret `K` as an SSH `string`: a 4-byte
+/// big-endian length (always 32) followed by the raw digest bytes.
+///
+/// This is the framing fed to the RFC 4253 §7.2 KDF. Unlike `mpint`, there is
+/// no leading-zero stripping and no `0x00` sign byte — the wire bytes are the
+/// digest verbatim, matching OpenSSH's `mlkem768x25519-sha256`.
+fn k_string_bytes(k: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 32);
+    out.extend_from_slice(&(k.len() as u32).to_be_bytes());
+    out.extend_from_slice(k);
     out
 }
 
@@ -190,7 +212,7 @@ impl MlKem768X25519Sha256 {
 
         // Both half-secrets land on the stack in Zeroizing buffers so they
         // are wiped when this function returns. Only the combined hash
-        // (also Zeroizing while we work with it) is fed into K's mpint
+        // (also Zeroizing while we work with it) is fed into K's string
         // encoding; the raw half-secrets never leave this frame.
         let mut k_pq_raw = Zeroizing::new([0u8; SHARED_SECRET_BYTES]);
         let (ct, k_pq_bytes) = ek.encapsulate(rng);
@@ -221,7 +243,8 @@ impl MlKem768X25519Sha256 {
         eh.write_string(&k_s);
         eh.write_string(c_init);
         eh.write_string(&s_reply);
-        eh.write_mpint(&*k_combined);
+        // K is encoded as an SSH `string` (not `mpint`) for the hybrid method.
+        eh.write_string(&*k_combined);
         let h = eh.finalize();
 
         let sig = host_key.sign(&h)?;
@@ -235,7 +258,7 @@ impl MlKem768X25519Sha256 {
         payload.extend_from_slice(&(sig.len() as u32).to_be_bytes());
         payload.extend_from_slice(&sig);
 
-        let k = mpint_bytes(&*k_combined);
+        let k = k_string_bytes(&k_combined);
         Ok(ServerReplyOut {
             payload,
             kex: KexOutput { k, h },
@@ -295,12 +318,13 @@ impl MlKem768X25519Sha256 {
         eh.write_string(k_s);
         eh.write_string(&state.c_init);
         eh.write_string(s_reply);
-        eh.write_mpint(&*k_combined);
+        // K is encoded as an SSH `string` (not `mpint`) for the hybrid method.
+        eh.write_string(&*k_combined);
         let h = eh.finalize();
 
         verifier.verify(&h, sig)?;
 
-        let k = mpint_bytes(&*k_combined);
+        let k = k_string_bytes(&k_combined);
         Ok(KexOutput { k, h })
     }
 }
@@ -370,9 +394,70 @@ mod tests {
         assert_eq!(client_out.h, reply.kex.h);
         // SHA-256 output — sanity that we did not accidentally use a wider hash.
         assert_eq!(client_out.h.len(), 32);
+
+        // K must be SSH-`string`-framed for the KDF (mlkem768x25519-sha256):
+        // a 4-byte BE length of exactly 32 followed by the raw digest bytes —
+        // never mpint-stripped/sign-extended. Length is always 4 + 32 = 36.
+        assert_eq!(client_out.k.len(), 4 + 32);
+        assert_eq!(&client_out.k[..4], &32u32.to_be_bytes());
+        // The 32 payload bytes are the verbatim digest with no leading 0x00
+        // sign byte even when the first digest byte has its high bit set.
+        // (Verify framing is "string" by reconstructing it.)
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&32u32.to_be_bytes());
+        expected.extend_from_slice(&client_out.k[4..]);
+        assert_eq!(client_out.k, expected);
+
         // Smoke that LOCAL_VERSION is still exported, since reachability of
         // the transport module surfaces if the feature gating drifts.
         assert!(!LOCAL_VERSION.is_empty());
+    }
+
+    #[test]
+    fn k_string_framing_keeps_high_bit_byte() {
+        // Lock in `string` (not `mpint`) framing deterministically with a
+        // fixed K whose first byte has the high bit set (0x80). An mpint
+        // encoding would prepend a 0x00 sign byte (length 33); a string
+        // encoding keeps the 32 bytes verbatim (length 32).
+        let mut k = [0u8; 32];
+        k[0] = 0x80;
+        k[31] = 0x01;
+        let framed = k_string_bytes(&k);
+
+        // 4-byte length must be exactly 32 (no sign byte added).
+        assert_eq!(framed.len(), 4 + 32);
+        assert_eq!(&framed[..4], &32u32.to_be_bytes());
+        // Payload is the raw bytes, high bit preserved, no leading 0x00.
+        assert_eq!(framed[4], 0x80);
+        assert_eq!(&framed[4..], &k[..]);
+
+        // Contrast with mpint framing, which would differ for this input.
+        let as_mpint = super::super::hash::mpint_bytes(&k);
+        assert_ne!(framed, as_mpint);
+        // mpint prepends a sign byte -> length 33.
+        assert_eq!(&as_mpint[..4], &33u32.to_be_bytes());
+    }
+
+    #[test]
+    fn k_string_framing_keeps_leading_zero_byte() {
+        // A K with a leading zero byte followed by a byte whose high bit is
+        // clear: mpint strips the zero (length 31, no sign byte re-added),
+        // whereas string keeps all 32 bytes. Confirms no leading-zero
+        // stripping.
+        let mut k = [0u8; 32];
+        k[1] = 0x7F;
+        k[31] = 0xCD;
+        let framed = k_string_bytes(&k);
+
+        assert_eq!(framed.len(), 4 + 32);
+        assert_eq!(&framed[..4], &32u32.to_be_bytes());
+        assert_eq!(framed[4], 0x00);
+        assert_eq!(&framed[4..], &k[..]);
+
+        let as_mpint = super::super::hash::mpint_bytes(&k);
+        assert_ne!(framed, as_mpint);
+        // mpint dropped the leading zero -> magnitude length 31.
+        assert_eq!(&as_mpint[..4], &31u32.to_be_bytes());
     }
 
     #[test]

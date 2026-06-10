@@ -387,6 +387,13 @@ fn decode_cleartext(buf: &[u8]) -> Result<Option<(Vec<u8>, usize)>> {
     if !(4..=255).contains(&pad_len) {
         return Err(Error::BadPadding);
     }
+    // `pad_len` is attacker-controlled (buf[4]) and validated only against the
+    // 4..=255 range above; without this guard `4 + packet_length - pad_len`
+    // underflows when pad_len > packet_length, panicking (debug) or producing
+    // an out-of-bounds slice (release). Reachable pre-NEWKEYS by any peer/MITM.
+    if pad_len + 1 > packet_length as usize {
+        return Err(Error::BadPadding);
+    }
     let payload_end = 4 + packet_length as usize - pad_len;
     if payload_end < 5 {
         return Err(Error::BadPadding);
@@ -878,6 +885,20 @@ mod tests {
         frame.push(3u8);
         frame.extend_from_slice(&[0u8; 8]);
         frame.extend_from_slice(&[0u8; 3]);
+        let mut codec = PacketCodec::new();
+        assert!(matches!(codec.decode(&frame), Err(Error::BadPadding)));
+    }
+
+    #[test]
+    fn cleartext_pad_len_exceeding_packet_length_rejected() {
+        // packet_length = 12, pad_len = 255. (packet_length + 4) = 16 is a
+        // multiple of 8 and total >= MIN_TOTAL_LEN, so the frame passes the
+        // earlier checks and reaches the padding logic. Without the guard,
+        // 4 + 12 - 255 underflows and panics; we expect Err(BadPadding).
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&12u32.to_be_bytes());
+        frame.push(255u8);
+        frame.extend_from_slice(&[0u8; 11]);
         let mut codec = PacketCodec::new();
         assert!(matches!(codec.decode(&frame), Err(Error::BadPadding)));
     }

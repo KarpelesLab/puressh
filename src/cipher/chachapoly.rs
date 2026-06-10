@@ -14,7 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 
-#[derive(Clone)]
+// No `Clone`: the wrapped ChaCha20 states carry live keystream position;
+// cloning would let two encryptors reuse keystream under the same key.
 pub struct ChaChaPoly {
     payload_key: ChaCha20,
     length_key: ChaCha20,

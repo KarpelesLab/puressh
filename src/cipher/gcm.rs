@@ -10,13 +10,13 @@ use purecrypto::cipher::{Aes128Gcm, Aes256Gcm, Gcm, TagMismatch};
 
 use crate::error::{Error, Result};
 
-#[derive(Clone)]
 pub(crate) enum AesGcm {
     Aes128(Gcm<Aes128>),
     Aes256(Gcm<Aes256>),
 }
 
-#[derive(Clone)]
+// No `Clone`: GcmState carries the live invocation counter; cloning it would
+// let two encryptors reuse the same (key, nonce) pair — catastrophic for GCM.
 pub struct GcmState {
     cipher: AesGcm,
     fixed: [u8; 4],

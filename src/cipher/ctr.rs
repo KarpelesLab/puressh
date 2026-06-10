@@ -4,7 +4,8 @@ use purecrypto::cipher::{Aes128, Aes192, Aes256, Ctr};
 
 use crate::error::{Error, Result};
 
-#[derive(Clone)]
+// No `Clone`: each variant holds a live CTR keystream position; cloning would
+// resume the same counter twice and reuse keystream under the same key.
 pub enum AesCtr {
     Aes128(Ctr<Aes128>),
     Aes192(Ctr<Aes192>),

@@ -74,7 +74,7 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 Disable defaults for `no_std`:
 
 ```toml
-puressh = { version = "0.0.4", default-features = false, features = ["alloc"] }
+puressh = { version = "0.0.5", default-features = false, features = ["alloc"] }
 ```
 
 ## Quick start

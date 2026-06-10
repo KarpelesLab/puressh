@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 use alloc::boxed::Box;
 
 use purecrypto::hash::{HmacSha256, HmacSha512};
+use zeroize::ZeroizeOnDrop;
 
 /// SSH-side identifier and key/tag geometry for a MAC.
 #[derive(Debug, Clone, Copy)]
@@ -92,8 +93,10 @@ pub trait SshMac {
     fn verify(&self, seq: u32, msg: &[u8], tag: &[u8]) -> Result<()>;
 }
 
+#[derive(ZeroizeOnDrop)]
 struct HmacSha256Mac {
     key: [u8; 32],
+    #[zeroize(skip)]
     etm: bool,
 }
 
@@ -133,8 +136,10 @@ impl SshMac for HmacSha256Mac {
     }
 }
 
+#[derive(ZeroizeOnDrop)]
 struct HmacSha512Mac {
     key: [u8; 64],
+    #[zeroize(skip)]
     etm: bool,
 }
 

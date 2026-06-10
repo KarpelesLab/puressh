@@ -70,7 +70,14 @@ impl RekeyPolicy {
     }
 
     fn seq_exceeded(&self, codec: &PacketCodec) -> bool {
-        codec.seq_in >= self.max_seq || codec.seq_out >= self.max_seq
+        // Measure packets since the current KEX epoch's baseline rather than
+        // the absolute counter. When strict-kex is off the sequence numbers
+        // run continuously across re-KEXes (RFC 4253 §6.4); using the absolute
+        // value would leave `seq >= max_seq` true forever after the first
+        // crossing and re-trigger a KEX on every packet (storm).
+        let in_epoch = codec.seq_in.wrapping_sub(codec.seq_in_base);
+        let out_epoch = codec.seq_out.wrapping_sub(codec.seq_out_base);
+        in_epoch >= self.max_seq || out_epoch >= self.max_seq
     }
 }
 

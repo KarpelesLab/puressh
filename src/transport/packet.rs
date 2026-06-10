@@ -91,6 +91,14 @@ pub struct PacketCodec {
     pub bytes_out: u64,
     /// Total on-wire bytes decoded since this codec was created.
     pub bytes_in: u64,
+    /// Value of [`seq_in`](Self::seq_in) at the start of the current KEX epoch
+    /// (last key install). Lets the rekey scheduler measure packets *this
+    /// epoch* even when strict-kex is off and the counter runs continuously,
+    /// so a `max_seq` crossing triggers exactly one re-KEX, not a storm.
+    pub seq_in_base: u32,
+    /// Value of [`seq_out`](Self::seq_out) at the start of the current KEX
+    /// epoch. Counterpart to [`seq_in_base`](Self::seq_in_base).
+    pub seq_out_base: u32,
     outbound: CipherSlot,
     inbound: CipherSlot,
     /// Cached first decrypted block when peeking at the length field of an
@@ -119,6 +127,8 @@ impl PacketCodec {
             seq_out: 0,
             bytes_out: 0,
             bytes_in: 0,
+            seq_in_base: 0,
+            seq_out_base: 0,
             outbound: CipherSlot::None,
             inbound: CipherSlot::None,
             pending_first_block: None,
@@ -157,6 +167,26 @@ impl PacketCodec {
         self.inbound = classify(cipher, mac)?;
         self.pending_first_block = None;
         Ok(())
+    }
+
+    /// Mark the start of a new re-key epoch when new keys are installed at
+    /// NEWKEYS. Two things happen:
+    ///
+    /// * [`bytes_in`](Self::bytes_in) / [`bytes_out`](Self::bytes_out) reset to
+    ///   zero so they measure traffic *since the last KEX* (RFC 4253 §9), not
+    ///   the codec's whole lifetime. Cumulative counters would stay above
+    ///   `max_bytes` forever after the first crossing, making `should_rekey`
+    ///   fire on every subsequent packet (rekey storm).
+    /// * [`seq_in_base`](Self::seq_in_base) / [`seq_out_base`](Self::seq_out_base)
+    ///   snapshot the current sequence numbers, giving the scheduler an
+    ///   epoch-relative baseline so a `max_seq` crossing triggers exactly one
+    ///   re-KEX even when strict-kex is off (sequence numbers stay continuous
+    ///   in that case per RFC 4253 §6.4 — they are deliberately not reset).
+    pub fn reset_rekey_epoch(&mut self) {
+        self.bytes_in = 0;
+        self.bytes_out = 0;
+        self.seq_in_base = self.seq_in;
+        self.seq_out_base = self.seq_out;
     }
 
     /// Reset both sequence counters to zero. Used by the strict-kex

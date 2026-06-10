@@ -1123,6 +1123,12 @@ impl KexRunner {
         if self.strict_kex {
             codec.reset_sequence_numbers();
         }
+
+        // RFC 4253 §9: byte counters measure traffic since the last KEX, and
+        // the rekey scheduler uses an epoch-relative seq baseline. Open a new
+        // epoch here, AFTER any strict-kex seq reset, so cumulative counters
+        // can't keep `should_rekey` firing on every packet (rekey storm).
+        codec.reset_rekey_epoch();
         Ok(())
     }
 

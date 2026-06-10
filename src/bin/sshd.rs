@@ -1690,6 +1690,20 @@ mod imp {
                     }
                 }
 
+                // Scrub the daemon's inherited environment before layering
+                // the PAM + login + channel vars. Without this the whole
+                // sshd environment (the parent's PATH, any operator-set
+                // vars, etc.) leaks into the user's interactive login shell.
+                // Mirrors the exec path's `cmd.env_clear()`. `clearenv`
+                // runs in the single-threaded post-fork child and only
+                // resets the environ pointer — no allocation — so it is
+                // safe in the fork→exec window.
+                // SAFETY: single-threaded post-fork child; clearenv just
+                // empties the process environment.
+                unsafe {
+                    libc::clearenv();
+                }
+
                 // Apply PAM environment (now layered with HOME/USER/
                 // LOGNAME/SHELL via apply_login_envs above). `setenv`
                 // isn't strictly async-signal-safe per POSIX, but

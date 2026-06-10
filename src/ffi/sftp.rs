@@ -117,6 +117,17 @@ pub struct PcSshSftpDir {
     handle: Vec<u8>,
     /// True once `pcssh_sftp_closedir` has been called.
     closed: bool,
+    /// Entries already fetched from the server but not yet handed to the
+    /// caller. `SftpSession::readdir` returns a whole server chunk per
+    /// round-trip; we cache the chunk here and drain it one entry per
+    /// `pcssh_sftp_readdir` call so no entries are dropped. Entries are
+    /// served from the front; an entry is only removed once it has been
+    /// successfully copied into the caller's buffers.
+    cache: std::collections::VecDeque<NameEntry>,
+    /// True once the server has signalled end-of-directory (a `readdir`
+    /// returning `None`). Once set and `cache` is empty, every subsequent
+    /// call reports EOF without another round-trip.
+    eof: bool,
 }
 
 /// Lock the parent cell and call `f` on the live session. Returns
@@ -637,6 +648,8 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
                 sftp: cell,
                 handle,
                 closed: false,
+                cache: std::collections::VecDeque::new(),
+                eof: false,
             });
             // SAFETY: out_dir checked.
             unsafe { *out_dir = Box::into_raw(boxed) };
@@ -651,11 +664,12 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
 /// on EOF (i.e. no more entries), or a negative code on error. The
 /// implementation maintains an internal buffer of entries between calls
 /// — one wire round-trip per server-side chunk, then the cached entries
-/// are drained one-at-a-time.
+/// are drained one-at-a-time. No entries are dropped: every entry the
+/// server returns is eventually handed to the caller.
 ///
-/// **Note**: the current implementation does *not* cache; it requests
-/// one chunk per call and returns the first entry from each chunk. A
-/// future revision may add the cache to amortise wire round-trips.
+/// On [`PCSSH_ERR_BUFFER_TOO_SMALL`] the entry is left in the cache and
+/// `*name_len` / `*longname_len` are set to the required sizes, so the
+/// caller can retry the same entry with larger buffers.
 ///
 /// # Safety
 ///
@@ -685,22 +699,36 @@ pub unsafe extern "C" fn pcssh_sftp_readdir(
         if d.closed {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        let handle = d.handle.clone();
-        let mut chunk_out: Option<Option<Vec<NameEntry>>> = None;
-        let rc = with_parent(&d.sftp, |sess| match sess.readdir(&handle) {
-            Ok(c) => {
-                chunk_out = Some(c);
-                PCSSH_OK
+        // Refill the per-handle cache from the server when it's empty. A
+        // single `readdir` returns a whole server chunk; we keep all of it
+        // and serve one entry per call so no entries are dropped (the prior
+        // implementation discarded everything past the first entry of each
+        // chunk). Keep requesting until we have an entry or the server
+        // signals end-of-directory.
+        while d.cache.is_empty() && !d.eof {
+            let handle = d.handle.clone();
+            let mut chunk_out: Option<Option<Vec<NameEntry>>> = None;
+            let rc = with_parent(&d.sftp, |sess| match sess.readdir(&handle) {
+                Ok(c) => {
+                    chunk_out = Some(c);
+                    PCSSH_OK
+                }
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
             }
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
+            match chunk_out.unwrap_or(None) {
+                Some(v) => d.cache.extend(v),
+                None => d.eof = true,
+            }
         }
-        let chunk = chunk_out.unwrap_or(None);
-        let entry: Option<NameEntry> = chunk.and_then(|mut v| v.drain(..1).next());
-        let Some(e) = entry else {
-            // EOF.
+
+        // Peek the front entry WITHOUT removing it, so a too-small caller
+        // buffer (PCSSH_ERR_BUFFER_TOO_SMALL) leaves the entry in place for
+        // a retry with larger buffers — rather than silently dropping it.
+        let Some(e) = d.cache.front() else {
+            // Cache empty and EOF reached: signal end-of-directory.
             // SAFETY: out_attrs non-NULL.
             unsafe { *out_attrs = PcSshSftpAttrs::default() };
             // SAFETY: out lens non-NULL.
@@ -710,17 +738,32 @@ pub unsafe extern "C" fn pcssh_sftp_readdir(
             }
             return PCSSH_OK;
         };
-        // SAFETY: out_attrs non-NULL.
-        unsafe { *out_attrs = attrs_to_c(&e.attrs) };
-        // Reuse copy_to_caller_buf for each byte field; bail on the first
-        // truncation. The caller can call again with bigger buffers.
+
+        // Bounds-check BOTH caller buffers before consuming the entry.
+        // `copy_to_caller_buf` always writes the required length into the
+        // `*_len` out-params (even on truncation), so the caller learns how
+        // big a buffer to allocate.
         // SAFETY: pointer/cap checked by the helper.
-        let rc = unsafe { copy_to_caller_buf(&e.filename, name_buf, name_cap, name_len) };
-        if rc != PCSSH_OK {
-            return rc;
+        let rc_name = unsafe { copy_to_caller_buf(&e.filename, name_buf, name_cap, name_len) };
+        if rc_name != PCSSH_OK {
+            return rc_name;
         }
         // SAFETY: pointer/cap checked by the helper.
-        unsafe { copy_to_caller_buf(&e.longname, longname_buf, longname_cap, longname_len) }
+        let rc_long =
+            unsafe { copy_to_caller_buf(&e.longname, longname_buf, longname_cap, longname_len) };
+        if rc_long != PCSSH_OK {
+            // The filename fit but the longname didn't. We have NOT yet
+            // consumed the entry, so the caller can retry with a bigger
+            // longname buffer and still receive this entry.
+            return rc_long;
+        }
+
+        // Both fields copied successfully — now it's safe to consume the
+        // entry and publish its attributes.
+        // SAFETY: out_attrs non-NULL.
+        unsafe { *out_attrs = attrs_to_c(&e.attrs) };
+        d.cache.pop_front();
+        PCSSH_OK
     })
 }
 
@@ -1343,6 +1386,8 @@ pub unsafe extern "C" fn pcssh_sftp_opendir_bytes(
             sftp: cell,
             handle,
             closed: false,
+            cache: std::collections::VecDeque::new(),
+            eof: false,
         });
         // SAFETY: out_dir checked non-NULL above.
         unsafe { *out_dir = Box::into_raw(boxed) };

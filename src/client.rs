@@ -490,6 +490,23 @@ pub struct Client {
     /// `single_connection`, `auth_protocol`, `auth_cookie`, `screen` —
     /// captured at toggle time.
     request_x11: Option<X11ReqArgs>,
+    /// Outstanding reverse-forward grants: the set of `(bind_address,
+    /// bind_port)` pairs for which [`Self::request_tcpip_forward`] succeeded
+    /// and which have not been cancelled via [`Self::cancel_tcpip_forward`].
+    ///
+    /// Used as a defence-in-depth filter in [`serve`](Self::serve): a
+    /// server-initiated `forwarded-tcpip` channel-open must correlate to a
+    /// forward the client actually requested. Because the server may echo a
+    /// bind address that differs textually from the one requested (e.g.
+    /// `0.0.0.0` for an empty/`localhost` request) and `bind_port == 0`
+    /// resolves to a server-assigned port, the matching here is
+    /// deliberately conservative: the library only *rejects* a
+    /// `forwarded-tcpip` open when there are **zero** outstanding grants —
+    /// i.e. an unsolicited forward when the client never asked for any.
+    /// Callers that need exact per-binding correlation (as the shipped
+    /// `ssh` binary does) should keep doing it in their
+    /// `on_forwarded_tcpip` callback.
+    tcpip_forward_grants: Vec<(String, u16)>,
 }
 
 /// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
@@ -536,6 +553,7 @@ impl Client {
             target_port: 0,
             request_auth_agent: false,
             request_x11: None,
+            tcpip_forward_grants: Vec::new(),
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -575,6 +593,7 @@ impl Client {
             target_port: port,
             request_auth_agent: false,
             request_x11: None,
+            tcpip_forward_grants: Vec::new(),
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -1617,7 +1636,7 @@ impl Client {
         );
         self.write_payload(&payload)?;
         let data = self.await_global_reply("tcpip-forward")?;
-        if bind_port == 0 {
+        let granted_port = if bind_port == 0 {
             let mut r = crate::format::Reader::new(&data);
             let p = r
                 .read_u32()
@@ -1627,10 +1646,15 @@ impl Client {
                     "tcpip-forward: server returned out-of-range port",
                 ));
             }
-            Ok(p as u16)
+            p as u16
         } else {
-            Ok(bind_port)
-        }
+            bind_port
+        };
+        // Record the grant so `serve` can refuse unsolicited
+        // `forwarded-tcpip` opens (see `tcpip_forward_grants`).
+        self.tcpip_forward_grants
+            .push((bind_address.to_string(), granted_port));
+        Ok(granted_port)
     }
 
     /// Send a `cancel-tcpip-forward` global request (RFC 4254 §7.1) and
@@ -1647,6 +1671,22 @@ impl Client {
         );
         self.write_payload(&payload)?;
         let _ = self.await_global_reply("cancel-tcpip-forward")?;
+        // Drop the matching grant so a later unsolicited forward is refused.
+        // Match on (address, port); if the exact pair isn't found (e.g. the
+        // caller cancelled by assigned port under a different address
+        // spelling), fall back to dropping one grant for the same port.
+        if let Some(idx) = self
+            .tcpip_forward_grants
+            .iter()
+            .position(|(a, p)| a == bind_address && *p == bind_port)
+            .or_else(|| {
+                self.tcpip_forward_grants
+                    .iter()
+                    .position(|(_, p)| *p == bind_port)
+            })
+        {
+            self.tcpip_forward_grants.swap_remove(idx);
+        }
         Ok(())
     }
 
@@ -2907,6 +2947,25 @@ fn serve_dispatch_packet(
                 orig_host,
                 orig_port,
             } => {
+                // Defence-in-depth: a `forwarded-tcpip` open must correlate
+                // to a forward the client actually requested. We reject the
+                // open if there are zero outstanding `tcpip-forward` grants
+                // (an unsolicited forward when none were requested). This is
+                // deliberately conservative — the server may echo a bind
+                // address/port that doesn't textually match the request, so
+                // a stricter per-binding match could reject legitimate
+                // forwards. Callers needing exact correlation should also
+                // check `origin` in their callback.
+                if client.tcpip_forward_grants.is_empty() {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "no tcpip-forward requested",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                    return Ok(());
+                }
                 if let Some(cb) = handlers.on_forwarded_tcpip.clone() {
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;

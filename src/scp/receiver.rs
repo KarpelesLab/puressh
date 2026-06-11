@@ -465,8 +465,7 @@ mod expected_name_tests {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::SeqCst);
         let pid = std::process::id();
-        let dir =
-            std::env::temp_dir().join(format!("puressh-recv-named-{}-{}-{}", label, pid, n));
+        let dir = std::env::temp_dir().join(format!("puressh-recv-named-{}-{}-{}", label, pid, n));
         std::fs::create_dir_all(&dir).expect("tmp dir");
         dir
     }

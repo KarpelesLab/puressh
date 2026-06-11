@@ -31,7 +31,7 @@ use crate::kex::{
 };
 use crate::mac::{mac_by_name, SshMac};
 use purecrypto::dh::{group14, group16, group18, DhGroup};
-use zeroize::{Zeroizing, ZeroizeOnDrop};
+use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::ext_info::ExtInfo;
 use super::kex::Negotiated;

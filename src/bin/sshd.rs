@@ -1633,6 +1633,43 @@ mod imp {
         Ok(())
     }
 
+    /// Empty the process environment in the post-fork child, before the
+    /// PAM / login / channel vars are layered back on. POSIX has no portable
+    /// `clearenv()`: glibc/Linux provides it, but macOS and the BSDs do not,
+    /// so on those we point libc's `environ` at an empty, NUL-terminated list
+    /// (a single pointer write — async-signal-safe in the fork→exec window).
+    /// A subsequent `setenv()` allocates a fresh environ from there.
+    ///
+    /// # Safety
+    /// Must run in the single-threaded post-fork child only.
+    unsafe fn clear_environ() {
+        #[cfg(target_os = "linux")]
+        {
+            libc::clearenv();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // A 'static, never-mutated empty environ (just the terminator).
+            // Raw pointers aren't `Sync`, so wrap the array in a newtype we
+            // assert `Sync` for — sound because it is read-only.
+            struct EnvironList([*const libc::c_char; 1]);
+            unsafe impl Sync for EnvironList {}
+            static EMPTY: EnvironList = EnvironList([core::ptr::null()]);
+            let empty = EMPTY.0.as_ptr() as *mut *mut libc::c_char;
+            #[cfg(target_os = "macos")]
+            {
+                *libc::_NSGetEnviron() = empty;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                extern "C" {
+                    static mut environ: *mut *mut libc::c_char;
+                }
+                core::ptr::write(core::ptr::addr_of_mut!(environ), empty);
+            }
+        }
+    }
+
     /// Build a `puressh::Error` from a `nix::errno::Errno` by wrapping the
     /// raw OS error as an `io::Error`. Avoids leaking nix types through the
     /// trait surface.
@@ -1770,14 +1807,14 @@ mod imp {
                 // the PAM + login + channel vars. Without this the whole
                 // sshd environment (the parent's PATH, any operator-set
                 // vars, etc.) leaks into the user's interactive login shell.
-                // Mirrors the exec path's `cmd.env_clear()`. `clearenv`
-                // runs in the single-threaded post-fork child and only
-                // resets the environ pointer — no allocation — so it is
-                // safe in the fork→exec window.
-                // SAFETY: single-threaded post-fork child; clearenv just
+                // Mirrors the exec path's `cmd.env_clear()`. Runs in the
+                // single-threaded post-fork child and only resets the environ
+                // pointer — no allocation — so it is safe in the fork→exec
+                // window.
+                // SAFETY: single-threaded post-fork child; clear_environ just
                 // empties the process environment.
                 unsafe {
-                    libc::clearenv();
+                    clear_environ();
                 }
 
                 // Apply PAM environment (now layered with HOME/USER/
@@ -2365,7 +2402,9 @@ mod imp {
             // startup) so it reflects the current database.
             if resolves_to_root(user) && !permit_root_login.permits_publickey() {
                 if debug {
-                    eprintln!("sshd: refusing session for root user {user}: PermitRootLogin forbids it");
+                    eprintln!(
+                        "sshd: refusing session for root user {user}: PermitRootLogin forbids it"
+                    );
                 }
                 return Err(puressh::Error::Io(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,

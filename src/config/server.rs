@@ -37,7 +37,10 @@ impl PermitRootLogin {
     /// Whether the root account may authenticate via public key under this
     /// policy. Only [`PermitRootLogin::No`] returns `false`.
     pub fn permits_publickey(self) -> bool {
-        matches!(self, PermitRootLogin::Yes | PermitRootLogin::ProhibitPassword)
+        matches!(
+            self,
+            PermitRootLogin::Yes | PermitRootLogin::ProhibitPassword
+        )
     }
 }
 
@@ -433,13 +436,19 @@ AllowUsers bob carol
     #[test]
     fn permit_root_login_forced_commands_unsupported() {
         let err = SshServerConfig::parse("PermitRootLogin forced-commands-only\n").unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 1, .. }), "got {err:?}");
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 1, .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]
     fn permit_root_login_bad_value() {
         let err = SshServerConfig::parse("PermitRootLogin maybe\n").unwrap_err();
-        assert!(matches!(err, ConfigError::BadValue { line: 1, .. }), "got {err:?}");
+        assert!(
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
+            "got {err:?}"
+        );
     }
 
     #[test]

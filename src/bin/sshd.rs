@@ -582,11 +582,13 @@ mod imp {
     struct LocalAuthenticator {
         allowed_users: HashSet<String>,
         authorized_blobs: Vec<Vec<u8>>,
-        /// Requested usernames that resolve to the root account (uid 0),
-        /// precomputed from `AllowUsers` at startup. Checked against the
-        /// `PermitRootLogin` policy to gate root authentication.
-        root_users: HashSet<String>,
         permit_root_login: puressh::config::PermitRootLogin,
+        /// Per-connection memoization of `resolves_to_root(user)`. The
+        /// passwd lookup happens at auth (login) time, not daemon startup,
+        /// so it reflects the current database; the cache only avoids
+        /// re-resolving the same username across this connection's repeated
+        /// attempts (probe then signature, multiple offered keys).
+        root_uid0_cache: std::collections::HashMap<String, bool>,
         debug: bool,
     }
 
@@ -620,12 +622,23 @@ mod imp {
                     // it for every attempt keeps the two paths uniform.
                     let user_ok = self.allowed_users.contains(&user);
                     let blob_ok = self.authorized_blobs.contains(&public_blob);
-                    // PermitRootLogin gate: if the requested user is the root
-                    // account (uid 0) and policy forbids it, deny regardless
-                    // of key match. Computed as an O(1) set lookup so the
-                    // accept/reject paths keep uniform timing.
-                    let root_denied =
-                        self.root_users.contains(&user) && !self.permit_root_login.permits_publickey();
+                    // PermitRootLogin gate: if the requested user resolves to
+                    // the root account (uid 0) and policy forbids it, deny
+                    // regardless of key match. The username is resolved at
+                    // login time (memoized per connection) rather than from a
+                    // daemon-startup snapshot, so a uid-0 alias added after
+                    // startup is still caught. Resolved for every requested
+                    // user (not only allowed ones) so the lookup doesn't add a
+                    // user-enumeration timing signal.
+                    let is_root = match self.root_uid0_cache.get(&user) {
+                        Some(&r) => r,
+                        None => {
+                            let r = resolves_to_root(&user);
+                            self.root_uid0_cache.insert(user.clone(), r);
+                            r
+                        }
+                    };
+                    let root_denied = is_root && !self.permit_root_login.permits_publickey();
                     let allow = user_ok && blob_ok && !root_denied;
 
                     // probe_only attempts (no signature) only need
@@ -704,7 +717,6 @@ mod imp {
     struct LocalAuthFactory {
         allowed_users: Arc<HashSet<String>>,
         authorized_blobs: Arc<Vec<Vec<u8>>>,
-        root_users: Arc<HashSet<String>>,
         permit_root_login: puressh::config::PermitRootLogin,
         debug: bool,
     }
@@ -714,8 +726,8 @@ mod imp {
             Box::new(LocalAuthenticator {
                 allowed_users: (*self.allowed_users).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
-                root_users: (*self.root_users).clone(),
                 permit_root_login: self.permit_root_login,
+                root_uid0_cache: std::collections::HashMap::new(),
                 debug: self.debug,
             })
         }
@@ -1173,6 +1185,21 @@ mod imp {
             shell_str,
             argv0_c,
         })
+    }
+
+    /// Whether `name` resolves to the root account (uid 0) in the passwd
+    /// database *right now*. The literal name `root` always counts (so the
+    /// policy holds even if the passwd lookup transiently fails); any other
+    /// name is root only if it currently maps to uid 0 — this catches
+    /// uid-0 aliases like `toor`. Resolved at login time, never cached
+    /// across connections, so it can't go stale against the daemon's
+    /// lifetime.
+    fn resolves_to_root(name: &str) -> bool {
+        name == "root"
+            || matches!(
+                nix::unistd::User::from_name(name),
+                Ok(Some(u)) if u.uid.as_raw() == 0
+            )
     }
 
     /// Layer login env vars (HOME/USER/LOGNAME/SHELL) on top of the
@@ -2243,36 +2270,22 @@ mod imp {
 
         // PermitRootLogin: CLI > config > built-in `prohibit-password`
         // (OpenSSH's default; permits root-by-key since puressh has no
-        // password auth). Precompute which allowed usernames resolve to the
-        // root account (uid 0) so the authenticator gate is an O(1) lookup.
-        // The name "root" is always treated as root even if the passwd
-        // lookup fails; any other name is root only if it resolves to uid 0.
+        // password auth). The root-account check itself happens at login
+        // time — in the authenticator during userauth, plus a backstop in the
+        // on_session_open gate — resolving the requested username against the
+        // live passwd database rather than a daemon-startup snapshot.
         let permit_root_login = pick(
             cli.permit_root_login,
             sshd_cfg.permit_root_login,
             puressh::config::PermitRootLogin::ProhibitPassword,
         );
-        let root_users: HashSet<String> = allowed_users
-            .iter()
-            .filter(|name| {
-                name.as_str() == "root"
-                    || matches!(
-                        nix::unistd::User::from_name(name),
-                        Ok(Some(u)) if u.uid.as_raw() == 0
-                    )
-            })
-            .cloned()
-            .collect();
-        if cli.debug && !root_users.is_empty() {
-            eprintln!(
-                "sshd: PermitRootLogin={permit_root_login:?}; root-equivalent allowed users: {root_users:?}"
-            );
+        if cli.debug {
+            eprintln!("sshd: PermitRootLogin={permit_root_login:?}");
         }
 
         let factory = Arc::new(LocalAuthFactory {
             allowed_users: Arc::new(allowed_users),
             authorized_blobs: Arc::new(authorized_blobs),
-            root_users: Arc::new(root_users),
             permit_root_login,
             debug: cli.debug,
         });
@@ -2344,6 +2357,21 @@ mod imp {
         let debug = cli.debug;
         let session_pam = pam_gate.clone();
         config = config.on_session_open(move |user: &str| {
+            // PermitRootLogin backstop, evaluated at login time before we
+            // open a PAM session or drop privilege. The authenticator already
+            // denies root during userauth; this re-checks against the live
+            // passwd database so a uid-0 login cannot proceed even if it
+            // reached session-open by some other path. Resolved here (not at
+            // startup) so it reflects the current database.
+            if resolves_to_root(user) && !permit_root_login.permits_publickey() {
+                if debug {
+                    eprintln!("sshd: refusing session for root user {user}: PermitRootLogin forbids it");
+                }
+                return Err(puressh::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "root login not permitted",
+                )));
+            }
             // PAM_TTY = "ssh" matches OpenSSH's value for the session-level
             // gate; PTY shells later re-call ensure() (a no-op) for env.
             session_pam.ensure(user, "ssh")?;

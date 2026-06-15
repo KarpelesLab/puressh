@@ -130,6 +130,14 @@ pub struct ClientOptions {
     pub host_key_algorithms: Option<Vec<String>>,
     /// `PubkeyAcceptedAlgorithms` — resolved publickey-auth signature list.
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
+    /// `ProxyCommand` — shell command (with `%h`/`%p`/`%r`/`%%` tokens
+    /// un-expanded) to spawn and use as the connection transport. The
+    /// literal `none` clears it back to `None`.
+    pub proxy_command: Option<String>,
+    /// `ProxyJump` — comma-separated `[user@]host[:port]` jump-host chain
+    /// to tunnel the connection through. The literal `none` clears it.
+    /// Takes precedence over [`Self::proxy_command`] when both are set.
+    pub proxy_jump: Option<String>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -424,6 +432,30 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                 "PubkeyAcceptedAlgorithms",
             )?);
         }
+        "proxycommand" => {
+            // The whole rest of the line is the command. The literal `none`
+            // (case-insensitive) disables any inherited ProxyCommand.
+            if args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "ProxyCommand requires a command (or 'none')".into(),
+                });
+            }
+            if args.len() == 1 && args[0].eq_ignore_ascii_case("none") {
+                opts.proxy_command = None;
+            } else {
+                opts.proxy_command = Some(args.join(" "));
+            }
+        }
+        "proxyjump" => {
+            let v = one_arg(line)?;
+            if v.eq_ignore_ascii_case("none") {
+                opts.proxy_jump = None;
+            } else {
+                opts.proxy_jump = Some(v);
+            }
+        }
         "casignaturealgorithms" => {
             // Certificate-based authentication is not implemented; reject
             // rather than silently ignore so a security-relevant directive
@@ -474,6 +506,8 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(kex_algorithms);
     take_scalar!(host_key_algorithms);
     take_scalar!(pubkey_accepted_algorithms);
+    take_scalar!(proxy_command);
+    take_scalar!(proxy_jump);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.local_forwards
@@ -737,6 +771,67 @@ Host gw
             }
             other => panic!("expected BadValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn proxy_command_parses() {
+        let src = "\
+Host gw
+  ProxyCommand /usr/bin/nc -X connect -x proxy:3128 %h %p
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(
+            eff.proxy_command.as_deref(),
+            Some("/usr/bin/nc -X connect -x proxy:3128 %h %p")
+        );
+    }
+
+    #[test]
+    fn proxy_command_none_clears() {
+        let src = "\
+Host gw
+  ProxyCommand none
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("gw").proxy_command, None);
+    }
+
+    #[test]
+    fn proxy_command_empty_errors() {
+        // `ProxyCommand` with no argument is a config error.
+        let src = "ProxyCommand\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        match err {
+            ConfigError::BadValue { line, keyword, .. } => {
+                assert_eq!(line, 1);
+                assert_eq!(keyword, "proxycommand");
+            }
+            other => panic!("expected BadValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn proxy_jump_parses() {
+        let src = "\
+Host target
+  ProxyJump user@bastion:2222,hop2
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(
+            cfg.lookup("target").proxy_jump.as_deref(),
+            Some("user@bastion:2222,hop2")
+        );
+    }
+
+    #[test]
+    fn proxy_jump_none_clears() {
+        let src = "\
+Host target
+  ProxyJump none
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("target").proxy_jump, None);
     }
 
     #[test]

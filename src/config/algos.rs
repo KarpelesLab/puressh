@@ -33,6 +33,7 @@
 //! builders after override resolution, so a user `-`/replace can never strip
 //! the Terrapin (CVE-2023-48795) mitigation.
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
@@ -160,7 +161,7 @@ pub fn resolve_algo_list(
     }
 
     let known = known_names(cat);
-    let is_known = |name: &str| known.iter().any(|k| *k == name);
+    let is_known = |name: &str| known.contains(&name);
 
     let result: Vec<String> = match modifier {
         // `-glob,...` — remove matching entries from the defaults. Tokens are
@@ -189,7 +190,7 @@ pub fn resolve_algo_list(
                 .map(|s| s.to_string())
                 .collect();
             for t in tokens {
-                if !out.iter().any(|e| *e == t) {
+                if !out.contains(&t) {
                     out.push(t);
                 }
             }
@@ -229,7 +230,7 @@ pub fn resolve_algo_list(
                         format!("unknown algorithm {t:?}"),
                     ));
                 }
-                if !out.iter().any(|e| *e == t) {
+                if !out.contains(&t) {
                     out.push(t);
                 }
             }
@@ -402,16 +403,8 @@ mod tests {
 
     #[test]
     fn hostkey_known_names_exclude_bare_ssh_rsa() {
-        assert!(
-            !known_names(AlgoCategory::HostKey)
-                .iter()
-                .any(|n| *n == "ssh-rsa")
-        );
-        assert!(
-            known_names(AlgoCategory::HostKey)
-                .iter()
-                .any(|n| *n == "ssh-ed25519")
-        );
+        assert!(!known_names(AlgoCategory::HostKey).contains(&"ssh-rsa"));
+        assert!(known_names(AlgoCategory::HostKey).contains(&"ssh-ed25519"));
     }
 
     #[test]

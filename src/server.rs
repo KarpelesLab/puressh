@@ -2968,7 +2968,7 @@ fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
     let host_key: Vec<String> = match &cfg.host_key_algorithms {
         Some(pref) => pref
             .iter()
-            .filter(|p| have.iter().any(|h| *h == p.as_str()))
+            .filter(|p| have.contains(&p.as_str()))
             .cloned()
             .collect(),
         None => have.iter().map(|s| s.to_string()).collect(),

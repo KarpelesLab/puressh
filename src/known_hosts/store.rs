@@ -7,8 +7,8 @@ use std::path::Path;
 use purecrypto::rng::{OsRng, RngCore};
 
 use super::format::{
-    format_entry, format_host_pattern, parse_line, patterns_match, Entry, HostSpec, Marker,
-    ParsedLine,
+    Entry, HostSpec, Marker, ParsedLine, format_entry, format_host_pattern, parse_line,
+    patterns_match,
 };
 use super::hash::{check_hashed, hash_new, parse_hashed};
 
@@ -193,16 +193,15 @@ impl KnownHosts {
         // Pass 1: any `@revoked` line whose host AND key matches refuses
         // the candidate unconditionally.
         for slot in &self.lines {
-            if let Slot::Entry(e) = slot {
-                if e.marker == Some(Marker::Revoked)
-                    && host_field_matches(&e.host_spec, host, port)
-                    && e.key_type == key_type
-                    && e.key_blob == key_blob
-                {
-                    return LookupResult::Mismatch {
-                        expected: vec![(e.key_type.clone(), e.key_blob.clone())],
-                    };
-                }
+            if let Slot::Entry(e) = slot
+                && e.marker == Some(Marker::Revoked)
+                && host_field_matches(&e.host_spec, host, port)
+                && e.key_type == key_type
+                && e.key_blob == key_blob
+            {
+                return LookupResult::Mismatch {
+                    expected: vec![(e.key_type.clone(), e.key_blob.clone())],
+                };
             }
         }
 
@@ -268,11 +267,11 @@ impl KnownHosts {
     pub fn remove(&mut self, host: &str, port: u16) -> usize {
         let mut removed = 0usize;
         for slot in self.lines.iter_mut() {
-            if let Slot::Entry(e) = slot {
-                if host_field_matches(&e.host_spec, host, port) {
-                    removed += 1;
-                    *slot = Slot::Removed;
-                }
+            if let Slot::Entry(e) = slot
+                && host_field_matches(&e.host_spec, host, port)
+            {
+                removed += 1;
+                *slot = Slot::Removed;
             }
         }
         removed

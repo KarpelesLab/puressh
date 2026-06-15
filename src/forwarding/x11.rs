@@ -343,8 +343,8 @@ pub fn splice_to_tcp_display_callback(
 /// Supported forms:
 /// - `":<N>"` / `":<N>.<screen>"` → Unix socket at `/tmp/.X11-unix/X<N>`.
 /// - `"<host>:<N>"` / `"<host>:<N>.<screen>"` → TCP on `<host>:<6000+N>`.
-pub fn splice_to_local_display_callback(
-) -> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>> {
+pub fn splice_to_local_display_callback()
+-> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>> {
     let raw = std::env::var("DISPLAY").ok()?;
     if raw.is_empty() {
         return None;

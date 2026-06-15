@@ -30,12 +30,12 @@ use crate::channel::{
     SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
 };
 use crate::error::{Error, Result};
-use crate::hostkey::{host_key_verify_by_name, HostKey, HostKeyVerify};
+use crate::hostkey::{HostKey, HostKeyVerify, host_key_verify_by_name};
 use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
 pub use crate::stream::{ChannelEgress, ChannelStream};
-use crate::transport::kex::{defaults, KexAlgorithms};
-use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
+use crate::transport::kex::{KexAlgorithms, defaults};
+use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
 use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
 
 /// Maximum line length when reading the peer's identification banner.
@@ -606,10 +606,10 @@ impl Client {
         // RFC 8308 §3.1: if the server told us which signature algorithms
         // it will accept on a publickey auth, propagate that to the auth
         // driver so we skip credentials it would reject anyway.
-        if let Some(ext) = self.runner.peer_ext_info() {
-            if let Some(algs) = ext.server_sig_algs.as_deref() {
-                auth.set_server_sig_algs(algs);
-            }
+        if let Some(ext) = self.runner.peer_ext_info()
+            && let Some(algs) = ext.server_sig_algs.as_deref()
+        {
+            auth.set_server_sig_algs(algs);
         }
         for c in credentials {
             auth.add_credential(c);
@@ -1744,12 +1744,11 @@ impl Client {
 
             // Per-tick: process any outbound open requests from external
             // threads (ssh -L listener accepts, etc.).
-            if !self.runner.is_kexing() {
-                if let Some(rx) = handlers.cmd_rx.as_ref() {
-                    if let Err(e) = serve_drain_commands(self, rx, &mut pending_opens) {
-                        break Err(e);
-                    }
-                }
+            if !self.runner.is_kexing()
+                && let Some(rx) = handlers.cmd_rx.as_ref()
+                && let Err(e) = serve_drain_commands(self, rx, &mut pending_opens)
+            {
+                break Err(e);
             }
 
             // Per-tick: ship pending egress from each runtime onto the wire,
@@ -1777,10 +1776,9 @@ impl Client {
                 && self
                     .rekey_policy
                     .should_rekey(&self.codec, self.last_kex, Instant::now())
+                && let Err(e) = self.initiate_rekey()
             {
-                if let Err(e) = self.initiate_rekey() {
-                    break Err(e);
-                }
+                break Err(e);
             }
 
             let payload = match self.read_one_packet_maybe_timeout() {
@@ -2367,13 +2365,7 @@ pub fn encode_termios_modes(t: &libc::termios) -> Vec<u8> {
     // Input modes. Wire value is 0 (clear) or non-zero (set) per the
     // RFC; we use 1 for set so the peer sees a tidy boolean.
     let iflag = t.c_iflag;
-    let bit_i = |mask: libc::tcflag_t| -> u32 {
-        if iflag & mask != 0 {
-            1
-        } else {
-            0
-        }
-    };
+    let bit_i = |mask: libc::tcflag_t| -> u32 { if iflag & mask != 0 { 1 } else { 0 } };
     push(IGNPAR, bit_i(libc::IGNPAR));
     push(PARMRK, bit_i(libc::PARMRK));
     push(INPCK, bit_i(libc::INPCK));
@@ -2388,13 +2380,7 @@ pub fn encode_termios_modes(t: &libc::termios) -> Vec<u8> {
 
     // Local modes.
     let lflag = t.c_lflag;
-    let bit_l = |mask: libc::tcflag_t| -> u32 {
-        if lflag & mask != 0 {
-            1
-        } else {
-            0
-        }
-    };
+    let bit_l = |mask: libc::tcflag_t| -> u32 { if lflag & mask != 0 { 1 } else { 0 } };
     push(ISIG, bit_l(libc::ISIG));
     push(ICANON, bit_l(libc::ICANON));
     push(ECHO, bit_l(libc::ECHO));
@@ -2409,13 +2395,7 @@ pub fn encode_termios_modes(t: &libc::termios) -> Vec<u8> {
 
     // Output modes.
     let oflag = t.c_oflag;
-    let bit_o = |mask: libc::tcflag_t| -> u32 {
-        if oflag & mask != 0 {
-            1
-        } else {
-            0
-        }
-    };
+    let bit_o = |mask: libc::tcflag_t| -> u32 { if oflag & mask != 0 { 1 } else { 0 } };
     push(OPOST, bit_o(libc::OPOST));
     push(ONLCR, bit_o(libc::ONLCR));
     push(OCRNL, bit_o(libc::OCRNL));
@@ -3109,11 +3089,11 @@ fn serve_dispatch_packet(
             }
         }
         ChannelEvent::Close { channel } => {
-            if let Some(ch) = client.conn.channel(channel) {
-                if !ch.local_closed {
-                    let p = client.conn.send_close(channel)?;
-                    client.write_payload(&p)?;
-                }
+            if let Some(ch) = client.conn.channel(channel)
+                && !ch.local_closed
+            {
+                let p = client.conn.send_close(channel)?;
+                client.write_payload(&p)?;
             }
             // Dropping the runtime closes `ingress_tx`; the handler thread's
             // next `Read` returns `Ok(0)` and the thread exits.

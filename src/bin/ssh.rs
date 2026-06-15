@@ -27,9 +27,9 @@ use puressh::client::{
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
-    load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
-    try_load_default_identity, vlog, StrictMode,
+    StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
+    expand_tilde, load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
+    try_load_default_identity, vlog,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -405,10 +405,10 @@ fn run() -> Result<i32, String> {
             X11Forward::Untrusted
         });
     }
-    if cli.verbose == 0 {
-        if let Some(level) = cfg_block.log_level {
-            set_verbose(level);
-        }
+    if cli.verbose == 0
+        && let Some(level) = cfg_block.log_level
+    {
+        set_verbose(level);
     }
 
     // CLI `-l user` > config `User` > `user@host` syntax > $USER.

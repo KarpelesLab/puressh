@@ -68,8 +68,11 @@ fn parse_then_save_roundtrips_lines_verbatim() {
     assert!(out_str.contains("# tail comment"));
     assert!(out_str.contains("example.com ssh-ed25519 AAAA my-comment"));
     assert!(out_str.contains("[example.com]:2222 ssh-rsa AAAB"));
-    assert!(out_str
-        .contains("|1|salt+salt+salt+salt+salt+s=|hash+hash+hash+hash+hash+ha= ssh-ed25519 AAAC"));
+    assert!(
+        out_str.contains(
+            "|1|salt+salt+salt+salt+salt+s=|hash+hash+hash+hash+hash+ha= ssh-ed25519 AAAC"
+        )
+    );
 }
 
 #[test]

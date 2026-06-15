@@ -202,19 +202,19 @@ fn receiver_refuses_directory_without_recursive() {
 fn validate_rejects_leading_dash() {
     // Direct protocol-level check — Sender::send_file would refuse a
     // path whose basename starts with '-' via write_header → validate_name.
-    use super::protocol::{validate_name, ScpError};
+    use super::protocol::{ScpError, validate_name};
     assert!(matches!(validate_name("-rf"), Err(ScpError::BadName(_))));
 }
 
 #[test]
 fn validate_rejects_dot_name() {
-    use super::protocol::{validate_name, ScpError};
+    use super::protocol::{ScpError, validate_name};
     assert!(matches!(validate_name("."), Err(ScpError::BadName(_))));
 }
 
 #[test]
 fn validate_rejects_dotdot_name() {
-    use super::protocol::{validate_name, ScpError};
+    use super::protocol::{ScpError, validate_name};
     assert!(matches!(validate_name(".."), Err(ScpError::BadName(_))));
 }
 

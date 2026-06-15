@@ -12,8 +12,8 @@ use std::io::{Read, Write};
 use crate::format::{Reader, Writer};
 
 use super::types::{
-    Attrs, FxpStatus, NameEntry, SftpError, ATTR_ACMODTIME, ATTR_EXTENDED, ATTR_PERMISSIONS,
-    ATTR_SIZE, ATTR_UIDGID,
+    ATTR_ACMODTIME, ATTR_EXTENDED, ATTR_PERMISSIONS, ATTR_SIZE, ATTR_UIDGID, Attrs, FxpStatus,
+    NameEntry, SftpError,
 };
 
 /// `SSH_FXP_INIT` — client → server handshake.

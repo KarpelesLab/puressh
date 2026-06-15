@@ -12,7 +12,7 @@ use std::thread;
 
 use super::client::SftpClient;
 use super::server::{SftpServerOptions, SftpServerSession};
-use super::types::{Attrs, FxpStatus, SftpError, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE};
+use super::types::{Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE, FxpStatus, SftpError};
 
 struct TempDir(PathBuf);
 
@@ -530,7 +530,7 @@ fn large_file_round_trip() {
 
 // --- OpenSSH SFTP extension tests ---
 
-use super::packet::{read_packet, write_packet, Packet};
+use super::packet::{Packet, read_packet, write_packet};
 
 /// Drive an INIT/VERSION handshake on the given transport and return the
 /// extension list the server advertised.

@@ -1,8 +1,8 @@
 [package]
 name = "puressh"
 version = "0.0.5"
-edition = "2021"
-rust-version = "1.95"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "A pure-Rust SSH (Secure Shell) protocol library, in the spirit of libssh, built on purecrypto."
 repository = "https://github.com/KarpelesLab/puressh"

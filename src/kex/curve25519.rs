@@ -11,11 +11,11 @@ use purecrypto::hash::Sha256;
 use purecrypto::rng::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
+use super::Kex;
 use super::common::{
     KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_ECDH_INIT, SSH_MSG_KEX_ECDH_REPLY,
 };
-use super::hash::{mpint_bytes, ExchangeHash};
-use super::Kex;
+use super::hash::{ExchangeHash, mpint_bytes};
 use crate::error::{Error, Result};
 use crate::format::Reader;
 use crate::hostkey::HostKeyVerify;

@@ -116,7 +116,7 @@ pub(crate) fn catch<F: FnOnce() -> c_int>(f: F) -> c_int {
 ///
 /// Returns NULL for codes the library does not recognise. The returned
 /// pointer is owned by the library and must not be freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pcssh_error_message(code: c_int) -> *const c_char {
     let s: &'static [u8] = match code {
         PCSSH_OK => b"ok\0",
@@ -141,7 +141,7 @@ pub extern "C" fn pcssh_error_message(code: c_int) -> *const c_char {
 /// Build-time version string (matches `CARGO_PKG_VERSION`).
 ///
 /// Returns a static, NUL-terminated UTF-8 pointer owned by the library.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn pcssh_version() -> *const c_char {
     static VERSION: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
     VERSION.as_ptr() as *const c_char

@@ -10,8 +10,8 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::parser::{tokenize, ParsedLine};
 use super::ConfigError;
+use super::parser::{ParsedLine, tokenize};
 
 /// `PermitRootLogin` policy.
 ///

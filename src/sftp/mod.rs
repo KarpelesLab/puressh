@@ -27,7 +27,7 @@ mod tests;
 pub use client::SftpClient;
 pub use server::{SftpServerOptions, SftpServerSession};
 pub use types::{
-    Attrs, FxpStatus, NameEntry, SftpError, ATTR_ACMODTIME, ATTR_EXTENDED, ATTR_PERMISSIONS,
-    ATTR_SIZE, ATTR_UIDGID, FXF_APPEND, FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC, FXF_WRITE,
-    SFTP_VERSION,
+    ATTR_ACMODTIME, ATTR_EXTENDED, ATTR_PERMISSIONS, ATTR_SIZE, ATTR_UIDGID, Attrs, FXF_APPEND,
+    FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC, FXF_WRITE, FxpStatus, NameEntry, SFTP_VERSION,
+    SftpError,
 };

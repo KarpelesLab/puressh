@@ -29,13 +29,13 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use puressh::Error;
 #[cfg(unix)]
 use puressh::agent::{Agent, AgentHostKey};
 use puressh::auth::ClientCredential;
 use puressh::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
-use puressh::Error;
 use zeroize::Zeroizing;
 
 // `StrictMode` lives in the lib so the config parser and the binaries share
@@ -562,10 +562,10 @@ fn try_ssh_askpass() -> std::io::Result<Option<Zeroizing<String>>> {
     // -> always if SSH_ASKPASS is set, `never` -> never. We treat any
     // other value (including unset) as `prefer`, mirroring how the
     // helper is typically wired up.
-    if let Some(req) = std::env::var_os("SSH_ASKPASS_REQUIRE") {
-        if req == "never" {
-            return Ok(None);
-        }
+    if let Some(req) = std::env::var_os("SSH_ASKPASS_REQUIRE")
+        && req == "never"
+    {
+        return Ok(None);
     }
     let mut cmd = std::process::Command::new(askpass);
     cmd.arg("password: ");
@@ -984,10 +984,10 @@ pub fn expand_tilde(path: &str) -> String {
     if path == "~" {
         return std::env::var("HOME").unwrap_or_else(|_| "~".into());
     }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return format!("{home}/{rest}");
-        }
+    if let Some(rest) = path.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
     }
     path.to_string()
 }

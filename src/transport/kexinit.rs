@@ -351,7 +351,7 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::kex::{defaults, KexAlgorithms};
+    use crate::transport::kex::{KexAlgorithms, defaults};
 
     fn defaults_algorithms() -> KexAlgorithms<'static> {
         KexAlgorithms {

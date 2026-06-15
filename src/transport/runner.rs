@@ -18,24 +18,24 @@ use alloc::vec::Vec;
 use purecrypto::hash::{Digest, Sha256, Sha384, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
 
-use crate::cipher::{cipher_by_name, SshCipher};
+use crate::cipher::{SshCipher, cipher_by_name};
 use crate::compress::{compress_by_name, decompress_by_name};
 use crate::error::{Error, Result};
 use crate::hostkey::{HostKey, HostKeyVerify};
 use crate::kex::{
+    KexContext,
     curve25519::Curve25519Sha256,
     dh::{GexClientState, GexRequest, GexSha256, Group14Sha256, Group16Sha512, Group18Sha512},
     ecdh::{EcdhSha2Nistp256, EcdhSha2Nistp384, EcdhSha2Nistp521},
     mlkem768x25519::MlKem768X25519Sha256,
-    KexContext,
 };
-use crate::mac::{mac_by_name, SshMac};
-use purecrypto::dh::{group14, group16, group18, DhGroup};
+use crate::mac::{SshMac, mac_by_name};
+use purecrypto::dh::{DhGroup, group14, group16, group18};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::ext_info::ExtInfo;
 use super::kex::Negotiated;
-use super::kexinit::{negotiate, KexInit, NegotiatedOwned, SSH_MSG_NEWKEYS};
+use super::kexinit::{KexInit, NegotiatedOwned, SSH_MSG_NEWKEYS, negotiate};
 use super::packet::PacketCodec;
 
 /// Whose end of the connection this runner represents.
@@ -1279,7 +1279,7 @@ fn derive_with<D: Digest>(
 mod tests {
     use super::*;
     use crate::hostkey::Ed25519HostKey;
-    use crate::transport::kex::{defaults, KexAlgorithms};
+    use crate::transport::kex::{KexAlgorithms, defaults};
     use crate::transport::version::LOCAL_VERSION;
     use purecrypto::rng::OsRng;
 

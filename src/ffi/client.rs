@@ -21,8 +21,8 @@ use std::time::Duration;
 use zeroize::Zeroizing;
 
 use super::common::{
-    catch, map_error, with_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
-    PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK,
+    PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK, catch,
+    map_error, with_cstr,
 };
 use crate::auth::ClientCredential;
 use crate::client::{Client, Config, HostKeyPolicy};
@@ -87,7 +87,7 @@ pub struct PcSshClient {
 ///   `*mut PcSshClient`.
 /// - `fingerprint_b64`, when policy is `ACCEPT_FINGERPRINT`, must be
 ///   NUL-terminated.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_connect_ex(
     host: *const c_char,
     port: u16,
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn pcssh_client_connect_ex(
 /// - `host` must be NUL-terminated, valid UTF-8.
 /// - `out` must be non-NULL and point to writable storage for one
 ///   `*mut PcSshClient`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_connect(
     host: *const c_char,
     port: u16,
@@ -252,7 +252,7 @@ pub unsafe extern "C" fn pcssh_client_connect(
 ///
 /// `client`, `user`, `password` must all be non-NULL. `user` and
 /// `password` must be NUL-terminated, valid UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_auth_password(
     client: *mut PcSshClient,
     user: *const c_char,
@@ -294,7 +294,7 @@ pub unsafe extern "C" fn pcssh_client_auth_password(
 /// - `user` must be NUL-terminated valid UTF-8.
 /// - `private_key_pem` must point to at least `private_key_pem_len` bytes.
 /// - `passphrase`, if non-NULL, must be NUL-terminated.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_auth_publickey(
     client: *mut PcSshClient,
     user: *const c_char,
@@ -378,7 +378,7 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
 ///   writable bytes.
 /// - All `_out` pointers must be non-NULL and writable.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_exec(
     client: *mut PcSshClient,
     command: *const c_char,
@@ -463,7 +463,7 @@ pub unsafe extern "C" fn pcssh_client_exec(
 ///
 /// `client` must either be NULL, or a pointer previously returned by
 /// `pcssh_client_connect` that has not already been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_free(client: *mut PcSshClient) {
     if client.is_null() {
         return;

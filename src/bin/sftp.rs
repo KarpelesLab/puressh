@@ -30,15 +30,15 @@ use std::process::ExitCode;
 use puressh::auth::ClientCredential;
 use puressh::client::{Client, Config};
 use puressh::sftp::{
-    Attrs, FxpStatus, SftpClient, SftpError, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE,
+    Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE, FxpStatus, SftpClient, SftpError,
 };
 
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
-    load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
-    try_load_default_identity, vlog, StrictMode,
+    StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
+    expand_tilde, load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
+    try_load_default_identity, vlog,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -60,8 +60,7 @@ fn sanitize_terminal_bytes(src: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-const USAGE: &str =
-    "usage: sftp [-v[v[v]]] [-F configfile] [-P port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: sftp [-v[v[v]]] [-F configfile] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] [user@]host";
@@ -543,10 +542,10 @@ fn run() -> Result<i32, String> {
 
     let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
     let cfg_block = ssh_cfg.lookup(&cli.host);
-    if cli.verbose == 0 {
-        if let Some(level) = cfg_block.log_level {
-            set_verbose(level);
-        }
+    if cli.verbose == 0
+        && let Some(level) = cfg_block.log_level
+    {
+        set_verbose(level);
     }
     let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
     let user = resolve_user(cli_user.as_deref(), cli.user_in_host.as_deref())?;

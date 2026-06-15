@@ -19,10 +19,10 @@ use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::glob::{host_matches, HostPattern};
-use super::match_block::{all_match, parse_match_line, ExecPolicy, MatchCondition, MatchContext};
-use super::parser::{tokenize, ParsedLine};
 use super::ConfigError;
+use super::glob::{HostPattern, host_matches};
+use super::match_block::{ExecPolicy, MatchCondition, MatchContext, all_match, parse_match_line};
+use super::parser::{ParsedLine, tokenize};
 
 /// `StrictHostKeyChecking` value — maps OpenSSH's keyword set to puressh's
 /// TOFU policy. Re-exported as `puressh::config::StrictMode` and re-exported

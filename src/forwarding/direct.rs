@@ -10,9 +10,9 @@
 
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 

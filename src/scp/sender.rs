@@ -13,7 +13,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::protocol::{read_ack, write_header, write_payload_term, Header, ScpError};
+use super::protocol::{Header, ScpError, read_ack, write_header, write_payload_term};
 
 /// Knobs for [`Sender`].
 #[derive(Default, Clone, Copy)]

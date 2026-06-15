@@ -9,8 +9,8 @@ use crate::hostkey::{Ed25519HostKey, HostKey, RsaSha1HostKey};
 
 use super::client::{ClientAuth, ClientCredential, ClientStep, KeyboardInteractiveResponder};
 use super::message::{
-    encode_success, AuthMethodPayload, ServiceAccept, UserauthBanner, UserauthFailure,
-    UserauthInfoRequest, UserauthPkOk, UserauthRequest,
+    AuthMethodPayload, ServiceAccept, UserauthBanner, UserauthFailure, UserauthInfoRequest,
+    UserauthPkOk, UserauthRequest, encode_success,
 };
 use super::server::{AuthAttempt, AuthDecision, Authenticator, ServerAuth, ServerStep};
 

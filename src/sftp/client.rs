@@ -8,8 +8,8 @@
 
 use std::io::{Read, Write};
 
-use super::packet::{read_packet, write_packet, Packet};
-use super::types::{Attrs, FxpStatus, NameEntry, SftpError, SFTP_VERSION};
+use super::packet::{Packet, read_packet, write_packet};
+use super::types::{Attrs, FxpStatus, NameEntry, SFTP_VERSION, SftpError};
 
 /// Borrowing SFTP v3 client over any `Read+Write` transport.
 pub struct SftpClient<T: Read + Write> {

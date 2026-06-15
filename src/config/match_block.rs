@@ -22,8 +22,8 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use super::glob::{host_matches, HostPattern};
 use super::ConfigError;
+use super::glob::{HostPattern, host_matches};
 
 /// One criterion on a `Match` line.
 ///

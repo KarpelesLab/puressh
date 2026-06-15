@@ -132,10 +132,10 @@ impl DefaultAgentForwardHandler {
         if let Some(d) = &self.parent_dir {
             return d.clone();
         }
-        if let Ok(d) = std::env::var("XDG_RUNTIME_DIR") {
-            if !d.is_empty() {
-                return PathBuf::from(d);
-            }
+        if let Ok(d) = std::env::var("XDG_RUNTIME_DIR")
+            && !d.is_empty()
+        {
+            return PathBuf::from(d);
         }
         PathBuf::from("/tmp")
     }
@@ -159,13 +159,13 @@ impl AgentForwardHandler for DefaultAgentForwardHandler {
         // bail immediately rather than letting `bind` walk the symlink. A
         // regular-file collision is still safe — `bind` will refuse it with
         // EADDRINUSE / EEXIST, which propagates up as an error.
-        if let Ok(meta) = std::fs::symlink_metadata(&socket_path) {
-            if meta.file_type().is_symlink() {
-                return Err(crate::error::Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "agent-forward: refusing to bind over a symlink at the per-session socket path",
-                )));
-            }
+        if let Ok(meta) = std::fs::symlink_metadata(&socket_path)
+            && meta.file_type().is_symlink()
+        {
+            return Err(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "agent-forward: refusing to bind over a symlink at the per-session socket path",
+            )));
         }
 
         let listener = UnixListener::bind(&socket_path)?;
@@ -382,9 +382,10 @@ mod tests {
         let handle = h.setup("u", ctx).expect("setup");
         let path = handle.auth_sock_path.clone();
         assert!(path.exists(), "socket should exist on disk after setup");
-        assert!(path
-            .to_string_lossy()
-            .starts_with(&format!("{}/puressh-agent.", dir.path().display())));
+        assert!(
+            path.to_string_lossy()
+                .starts_with(&format!("{}/puressh-agent.", dir.path().display()))
+        );
         // Drop the handle; the listener thread should exit and the file
         // should be unlinked.
         drop(handle);

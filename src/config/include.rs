@@ -31,9 +31,9 @@ use alloc::vec::Vec;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::glob::HostPattern;
-use super::parser::{tokenize, ParsedLine};
 use super::ConfigError;
+use super::glob::HostPattern;
+use super::parser::{ParsedLine, tokenize};
 
 /// Maximum number of nested `Include` files. OpenSSH uses the same value.
 pub const MAX_INCLUDE_DEPTH: usize = 16;
@@ -152,11 +152,11 @@ fn expand_tilde(path: &str) -> PathBuf {
         if let Some(home) = home_dir() {
             return home;
         }
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(mut home) = home_dir() {
-            home.push(rest);
-            return home;
-        }
+    } else if let Some(rest) = path.strip_prefix("~/")
+        && let Some(mut home) = home_dir()
+    {
+        home.push(rest);
+        return home;
     }
     PathBuf::from(path)
 }
@@ -164,10 +164,10 @@ fn expand_tilde(path: &str) -> PathBuf {
 /// `$HOME` on Unix, `%USERPROFILE%` on Windows. Returns `None` if neither is
 /// set.
 fn home_dir() -> Option<PathBuf> {
-    if let Some(h) = std::env::var_os("HOME") {
-        if !h.is_empty() {
-            return Some(PathBuf::from(h));
-        }
+    if let Some(h) = std::env::var_os("HOME")
+        && !h.is_empty()
+    {
+        return Some(PathBuf::from(h));
     }
     #[cfg(windows)]
     {
@@ -352,7 +352,9 @@ mod tests {
 
     #[test]
     fn expand_tilde_replaces_leading_tilde() {
-        std::env::set_var("HOME", "/tmp/fake-home");
+        // SAFETY: single-threaded unit test; no other thread reads the env
+        // concurrently. `set_var` is `unsafe` as of edition 2024.
+        unsafe { std::env::set_var("HOME", "/tmp/fake-home") };
         let p = expand_tilde("~/foo");
         assert_eq!(p, PathBuf::from("/tmp/fake-home/foo"));
         let bare = expand_tilde("~");

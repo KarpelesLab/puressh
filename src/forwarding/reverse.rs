@@ -477,14 +477,15 @@ mod tests {
         // Names that aren't literal IPs (or the documented shortcuts) get
         // refused without ever touching the network. The server then
         // turns that into REQUEST_FAILURE.
-        assert!(h
-            .bind(
+        assert!(
+            h.bind(
                 "u",
                 "not-an-ip-or-name",
                 0,
                 ForwardContext::for_test_no_opens(),
             )
-            .is_err());
+            .is_err()
+        );
     }
 
     #[test]
@@ -495,9 +496,10 @@ mod tests {
         let port = h
             .bind("u", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
             .expect("loopback bind allowed");
-        assert!(h
-            .bind("u", "0.0.0.0", 0, ForwardContext::for_test_no_opens())
-            .is_err());
+        assert!(
+            h.bind("u", "0.0.0.0", 0, ForwardContext::for_test_no_opens())
+                .is_err()
+        );
         // Filter refusal must NOT silently bind something; the binding
         // count must still be 1 (the loopback bind we made above).
         assert_eq!(h.binding_count(), 1);
@@ -509,9 +511,10 @@ mod tests {
         // Refuse everyone but "alice".
         let h = DefaultTcpipForwardHandler::new()
             .with_allow_filter(|user, _addr, _port| user == "alice");
-        assert!(h
-            .bind("bob", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
-            .is_err());
+        assert!(
+            h.bind("bob", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+                .is_err()
+        );
         let port = h
             .bind("alice", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
             .expect("alice bind allowed");
@@ -523,12 +526,14 @@ mod tests {
     #[test]
     fn default_constructor_is_deny_all() {
         let h = DefaultTcpipForwardHandler::new();
-        assert!(h
-            .bind("u", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
-            .is_err());
-        assert!(h
-            .bind("u", "0.0.0.0", 0, ForwardContext::for_test_no_opens())
-            .is_err());
+        assert!(
+            h.bind("u", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+                .is_err()
+        );
+        assert!(
+            h.bind("u", "0.0.0.0", 0, ForwardContext::for_test_no_opens())
+                .is_err()
+        );
         assert_eq!(h.binding_count(), 0);
     }
 
@@ -589,8 +594,9 @@ mod tests {
     #[test]
     fn permit_localhost_only_refuses_non_loopback_literal() {
         let h = DefaultTcpipForwardHandler::permit_localhost_only();
-        assert!(h
-            .bind("u", "192.0.2.1", 0, ForwardContext::for_test_no_opens(),)
-            .is_err());
+        assert!(
+            h.bind("u", "192.0.2.1", 0, ForwardContext::for_test_no_opens(),)
+                .is_err()
+        );
     }
 }

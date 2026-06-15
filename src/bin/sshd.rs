@@ -54,11 +54,11 @@ mod imp {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use nix::errno::Errno;
-    use nix::fcntl::{fcntl, FcntlArg, OFlag};
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
     use nix::libc;
-    use nix::sys::signal::{kill, signal, SigHandler, Signal};
-    use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-    use nix::unistd::{execvp, fork, ForkResult, Pid};
+    use nix::sys::signal::{SigHandler, Signal, kill, signal};
+    use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
+    use nix::unistd::{ForkResult, Pid, execvp, fork};
 
     use puressh::auth::{AuthAttempt, AuthDecision, Authenticator};
     use puressh::hostkey::HostKey;
@@ -67,9 +67,9 @@ mod imp {
         Receiver as ScpReceiver, ScpRecvOptions, ScpSendOptions, Sender as ScpSender,
     };
     use puressh::server::{
-        handle_session, AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult,
-        ExecStreamHandler, PtySpec, SessionEnv, ShellExitStatus, ShellHandler, ShellSession,
-        SubsystemHandler, HARD_BLOCKED_ENV_NAMES,
+        AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult, ExecStreamHandler,
+        HARD_BLOCKED_ENV_NAMES, PtySpec, SessionEnv, ShellExitStatus, ShellHandler, ShellSession,
+        SubsystemHandler, handle_session,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -973,11 +973,7 @@ mod imp {
         // SAFETY: `user.as_ptr()` is a valid NUL-terminated string for the
         // duration of the call (CStr's invariant).
         let rc = unsafe { libc::initgroups(user.as_ptr(), gid.as_raw() as _) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Errno::last())
-        }
+        if rc == 0 { Ok(()) } else { Err(Errno::last()) }
     }
 
     /// Drop every supplementary group from the calling process.
@@ -998,11 +994,7 @@ mod imp {
         // SAFETY: `count=0` with a null/dangling pointer is the documented
         // way to clear the supplementary group list on Linux and macOS.
         let rc = unsafe { libc::setgroups(0, core::ptr::null()) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(Errno::last())
-        }
+        if rc == 0 { Ok(()) } else { Err(Errno::last()) }
     }
 
     /// Confirm the calling process really dropped to `(uid, gid)`. Any
@@ -1643,29 +1635,31 @@ mod imp {
     /// # Safety
     /// Must run in the single-threaded post-fork child only.
     unsafe fn clear_environ() {
-        #[cfg(target_os = "linux")]
-        {
-            libc::clearenv();
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // A 'static, never-mutated empty environ (just the terminator).
-            // Raw pointers aren't `Sync`, so wrap the array in a newtype we
-            // assert `Sync` for — sound because it is read-only.
-            struct EnvironList([*const libc::c_char; 1]);
-            unsafe impl Sync for EnvironList {}
-            static EMPTY: EnvironList = EnvironList([core::ptr::null()]);
-            let empty = EMPTY.0.as_ptr() as *mut *mut libc::c_char;
-            #[cfg(target_os = "macos")]
+        unsafe {
+            #[cfg(target_os = "linux")]
             {
-                *libc::_NSGetEnviron() = empty;
+                libc::clearenv();
             }
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(target_os = "linux"))]
             {
-                extern "C" {
-                    static mut environ: *mut *mut libc::c_char;
+                // A 'static, never-mutated empty environ (just the terminator).
+                // Raw pointers aren't `Sync`, so wrap the array in a newtype we
+                // assert `Sync` for — sound because it is read-only.
+                struct EnvironList([*const libc::c_char; 1]);
+                unsafe impl Sync for EnvironList {}
+                static EMPTY: EnvironList = EnvironList([core::ptr::null()]);
+                let empty = EMPTY.0.as_ptr() as *mut *mut libc::c_char;
+                #[cfg(target_os = "macos")]
+                {
+                    *libc::_NSGetEnviron() = empty;
                 }
-                core::ptr::write(core::ptr::addr_of_mut!(environ), empty);
+                #[cfg(not(target_os = "macos"))]
+                {
+                    unsafe extern "C" {
+                        static mut environ: *mut *mut libc::c_char;
+                    }
+                    core::ptr::write(core::ptr::addr_of_mut!(environ), empty);
+                }
             }
         }
     }
@@ -2157,12 +2151,12 @@ mod imp {
 
     impl Drop for OnIpScope {
         fn drop(&mut self) {
-            if let Ok(mut m) = per_ip_counts().lock() {
-                if let Some(c) = m.get_mut(&self.ip) {
-                    *c = c.saturating_sub(1);
-                    if *c == 0 {
-                        m.remove(&self.ip);
-                    }
+            if let Ok(mut m) = per_ip_counts().lock()
+                && let Some(c) = m.get_mut(&self.ip)
+            {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    m.remove(&self.ip);
                 }
             }
         }

@@ -18,8 +18,8 @@ use std::slice;
 use std::sync::Mutex;
 
 use super::common::{
-    catch, map_error, with_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC,
-    PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK,
+    PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK, catch,
+    map_error, with_cstr,
 };
 use crate::agent::{Agent, AgentIdentity};
 
@@ -57,7 +57,7 @@ pub struct PcSshAgent {
 ///
 /// - `path` must be NUL-terminated, valid UTF-8.
 /// - `out` must be non-NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_connect(
     path: *const c_char,
     out: *mut *mut PcSshAgent,
@@ -92,7 +92,7 @@ pub unsafe extern "C" fn pcssh_agent_connect(
 /// # Safety
 ///
 /// `out` must be non-NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_connect_env(out: *mut *mut PcSshAgent) -> c_int {
     catch(|| {
         if out.is_null() {
@@ -124,7 +124,7 @@ pub unsafe extern "C" fn pcssh_agent_connect_env(out: *mut *mut PcSshAgent) -> c
 ///
 /// - `agent` must be a valid handle.
 /// - `out_count` must be non-NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_identity_count(
     agent: *mut PcSshAgent,
     out_count: *mut usize,
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn pcssh_agent_identity_count(
 /// # Safety
 ///
 /// `agent` must be a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_refresh_identities(agent: *mut PcSshAgent) -> c_int {
     catch(|| {
         if agent.is_null() {
@@ -200,7 +200,7 @@ pub unsafe extern "C" fn pcssh_agent_refresh_identities(agent: *mut PcSshAgent) 
 /// - Each `_buf` may be NULL only if its `_cap` is 0.
 /// - Each `_len` must be non-NULL.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_identity(
     agent: *mut PcSshAgent,
     index: usize,
@@ -293,7 +293,7 @@ pub unsafe extern "C" fn pcssh_agent_identity(
 /// - `sig_buf` may be NULL only if `sig_cap` is 0.
 /// - `sig_len` must be non-NULL.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_sign(
     agent: *mut PcSshAgent,
     key_blob: *const u8,
@@ -359,7 +359,7 @@ pub unsafe extern "C" fn pcssh_agent_sign(
 ///
 /// `agent` must either be NULL or a pointer previously returned by a
 /// `pcssh_agent_*` constructor that has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_agent_free(agent: *mut PcSshAgent) {
     if agent.is_null() {
         return;

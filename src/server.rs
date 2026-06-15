@@ -26,8 +26,8 @@
 use std::collections::BTreeMap;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -41,8 +41,8 @@ use crate::channel::{
 use crate::error::{Error, Result};
 use crate::format::Writer;
 use crate::hostkey::HostKey;
-use crate::transport::kex::{defaults, KexAlgorithms};
-use crate::transport::rekey::{is_kex_msg, RekeyPolicy};
+use crate::transport::kex::{KexAlgorithms, defaults};
+use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
 use crate::transport::{ExtInfo, KexInit, KexRunner, PacketCodec, Role, VersionExchange};
 
 const MAX_BANNER_LINE: usize = 1024;
@@ -320,7 +320,7 @@ pub trait SubsystemHandler: Send + Sync {
     /// thread so subsequent client `"env"` requests don't race the
     /// running subsystem.
     fn handle(&self, user: &str, env: &SessionEnv, name: &str, stream: ChannelStream)
-        -> Result<()>;
+    -> Result<()>;
 }
 
 /// Server-side hook called when a client sends an `"exec"` channel request,
@@ -356,7 +356,7 @@ pub trait ExecStreamHandler: Send + Sync {
     /// emitting `EOF`+`Close` automatically. `env` is a snapshot of the
     /// session-level environment at the time of the claim.
     fn run(&self, user: &str, env: &SessionEnv, command: &str, stream: ChannelStream)
-        -> Result<()>;
+    -> Result<()>;
 }
 
 /// Decoded `direct-tcpip` channel-open request (RFC 4254 §7.2).
@@ -1258,12 +1258,12 @@ fn drive_server_kex<R: RngCore + CryptoRng>(
         }
         let payload = read_one_packet(stream, codec, inbox)?;
 
-        if selected_host_key.is_none() {
-            if let Some(neg) = runner.negotiated() {
-                selected_host_key = pick_host_key(&cfg.host_keys, &neg.host_key);
-                if selected_host_key.is_none() {
-                    return Err(Error::Protocol("kex: no host key for negotiated algorithm"));
-                }
+        if selected_host_key.is_none()
+            && let Some(neg) = runner.negotiated()
+        {
+            selected_host_key = pick_host_key(&cfg.host_keys, &neg.host_key);
+            if selected_host_key.is_none() {
+                return Err(Error::Protocol("kex: no host key for negotiated algorithm"));
             }
         }
 
@@ -1847,12 +1847,11 @@ fn drain_shells<R: RngCore + CryptoRng>(
             }
         }
         // Poll for exit without blocking; cache the status for finalize_*.
-        if rt.exited.is_none() {
-            if let Some(sess) = rt.session.as_mut() {
-                if let Some(status) = sess.try_exit() {
-                    rt.exited = Some(status);
-                }
-            }
+        if rt.exited.is_none()
+            && let Some(sess) = rt.session.as_mut()
+            && let Some(status) = sess.try_exit()
+        {
+            rt.exited = Some(status);
         }
     }
     Ok(())
@@ -2273,21 +2272,21 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             // EAGAIN-equivalent (`Ok(0)`) just drops the byte for this tick;
             // a well-behaved client retries by sending more stdin later. A
             // hard write error tears the session down.
-            if let Some(rt) = shells.get_mut(&channel) {
-                if let Some(sess) = rt.session.as_mut() {
-                    let mut off = 0usize;
-                    let mut retries = 0u32;
-                    while off < data.len() {
-                        let n = sess.write(&data[off..])?;
-                        if n == 0 {
-                            retries += 1;
-                            if retries > 4 {
-                                break;
-                            }
-                            continue;
+            if let Some(rt) = shells.get_mut(&channel)
+                && let Some(sess) = rt.session.as_mut()
+            {
+                let mut off = 0usize;
+                let mut retries = 0u32;
+                while off < data.len() {
+                    let n = sess.write(&data[off..])?;
+                    if n == 0 {
+                        retries += 1;
+                        if retries > 4 {
+                            break;
                         }
-                        off += n;
+                        continue;
                     }
+                    off += n;
                 }
             }
             // Subsystem ingress: hand the chunk to the handler thread. The
@@ -2307,10 +2306,10 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             }
         }
         ChannelEvent::Eof { channel } => {
-            if let Some(rt) = shells.get_mut(&channel) {
-                if let Some(sess) = rt.session.as_mut() {
-                    let _ = sess.close_stdin();
-                }
+            if let Some(rt) = shells.get_mut(&channel)
+                && let Some(sess) = rt.session.as_mut()
+            {
+                let _ = sess.close_stdin();
             }
             if let Some(rt) = subsystems.get_mut(&channel) {
                 // None = EOF marker; the handler's `Read::read` returns
@@ -2319,11 +2318,11 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             }
         }
         ChannelEvent::Close { channel } => {
-            if let Some(ch) = conn.channel(channel) {
-                if !ch.local_closed {
-                    let p = conn.send_close(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
-                }
+            if let Some(ch) = conn.channel(channel)
+                && !ch.local_closed
+            {
+                let p = conn.send_close(channel)?;
+                write_payload(stream, codec, rng, &p)?;
             }
             // Drop the runtime so the backend can reap its child / close fds.
             shells.remove(&channel);
@@ -2482,42 +2481,41 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             // `claims` returns true we set up the runtime + spawn the
             // handler thread the same way `ChannelRequest::Subsystem`
             // below does.
-            if let Some(handler) = cfg.exec_stream_handler.clone() {
-                if handler.claims(&command) {
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
-                    let (egress_tx, egress_rx) =
-                        mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
-                    let cs = ChannelStream::new(ingress_rx, egress_tx);
-                    let user_owned = user.to_string();
-                    let command_owned = command.clone();
-                    let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
-                    let handler_for_thread = handler;
-                    thread::spawn(move || {
-                        // Errors swallowed: the stream auto-emits
-                        // EOF + Close on drop, so the peer sees teardown.
-                        let _ =
-                            handler_for_thread.run(&user_owned, &env_snapshot, &command_owned, cs);
-                    });
-                    subsystems.insert(
-                        channel,
-                        SubsystemRuntime {
-                            ingress_tx,
-                            egress_rx,
-                            pending_data: Vec::new(),
-                            pending_eof: false,
-                            pending_close: false,
-                            eof_sent: false,
-                            close_sent: false,
-                        },
-                    );
-                    if want_reply {
-                        let p = conn.send_request_success(channel)?;
-                        write_payload(stream, codec, rng, &p)?;
-                    }
-                    return Ok(());
+            if let Some(handler) = cfg.exec_stream_handler.clone()
+                && handler.claims(&command)
+            {
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                let cs = ChannelStream::new(ingress_rx, egress_tx);
+                let user_owned = user.to_string();
+                let command_owned = command.clone();
+                let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
+                let handler_for_thread = handler;
+                thread::spawn(move || {
+                    // Errors swallowed: the stream auto-emits
+                    // EOF + Close on drop, so the peer sees teardown.
+                    let _ = handler_for_thread.run(&user_owned, &env_snapshot, &command_owned, cs);
+                });
+                subsystems.insert(
+                    channel,
+                    SubsystemRuntime {
+                        ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+                if want_reply {
+                    let p = conn.send_request_success(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
                 }
-                // Not claimed — fall through to the buffered CommandHandler.
+                return Ok(());
             }
+            // Not claimed — fall through to the buffered CommandHandler.
             let env_ref = envs.get(&channel).unwrap_or(&empty_env);
             let result = cfg.command_handler.handle(user, env_ref, &command);
             if want_reply {
@@ -2623,10 +2621,10 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
         } => {
             // window-change is `want_reply = false` per RFC 4254 §6.7, so
             // we never reply — just propagate to the backend best-effort.
-            if let Some(rt) = shells.get_mut(&channel) {
-                if let Some(sess) = rt.session.as_mut() {
-                    let _ = sess.resize(cols, rows, px_w, px_h);
-                }
+            if let Some(rt) = shells.get_mut(&channel)
+                && let Some(sess) = rt.session.as_mut()
+            {
+                let _ = sess.resize(cols, rows, px_w, px_h);
             }
         }
         ChannelRequest::Env { name, value } => {
@@ -3208,10 +3206,11 @@ mod tests {
             if let Some(s) = st.exit_now.take() {
                 return Some(s);
             }
-            if st.closed_stdin && st.stdout.is_empty() {
-                if let Some(s) = st.exit_on_stdin_close.take() {
-                    return Some(s);
-                }
+            if st.closed_stdin
+                && st.stdout.is_empty()
+                && let Some(s) = st.exit_on_stdin_close.take()
+            {
+                return Some(s);
             }
             None
         }

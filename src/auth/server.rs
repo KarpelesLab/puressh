@@ -5,12 +5,12 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
-use crate::hostkey::{host_key_verify_by_name, HostKeyVerify};
+use crate::hostkey::{HostKeyVerify, host_key_verify_by_name};
 
 use super::message::{
-    encode_success, AuthMethodPayload, SecretString, ServiceAccept, ServiceRequest,
-    UserauthFailure, UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
-    SSH_MSG_SERVICE_REQUEST, SSH_MSG_USERAUTH_INFO_RESPONSE, SSH_MSG_USERAUTH_REQUEST,
+    AuthMethodPayload, SSH_MSG_SERVICE_REQUEST, SSH_MSG_USERAUTH_INFO_RESPONSE,
+    SSH_MSG_USERAUTH_REQUEST, SecretString, ServiceAccept, ServiceRequest, UserauthFailure,
+    UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest, encode_success,
 };
 
 /// A single authentication attempt presented by the client.

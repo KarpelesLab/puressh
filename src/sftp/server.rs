@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 use super::extensions::{
     ADVERTISED_EXTENSIONS, EXT_FSTATVFS, EXT_FSYNC, EXT_HARDLINK, EXT_POSIX_RENAME, EXT_STATVFS,
 };
-use super::packet::{self, read_packet, write_packet, Packet};
+use super::packet::{self, Packet, read_packet, write_packet};
 use super::path::{is_inside, lexically_clean, resolve};
 use super::types::{
-    Attrs, FxpStatus, NameEntry, SftpError, FXF_APPEND, FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC,
-    FXF_WRITE, SFTP_VERSION,
+    Attrs, FXF_APPEND, FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC, FXF_WRITE, FxpStatus, NameEntry,
+    SFTP_VERSION, SftpError,
 };
 use crate::format::Reader;
 
@@ -1005,7 +1005,7 @@ fn apply_attrs(
     }
     #[cfg(unix)]
     {
-        use nix::sys::stat::{fchmodat, FchmodatFlags, Mode};
+        use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::fs::PermissionsExt;
         if let Some(mode) = a.permissions {
@@ -1085,13 +1085,7 @@ fn format_long_name(name: &[u8], a: &Attrs) -> Vec<u8> {
         0o140000 => 's',
         _ => '-',
     };
-    let perm = |bit: u32, ch: char| -> char {
-        if mode & bit != 0 {
-            ch
-        } else {
-            '-'
-        }
-    };
+    let perm = |bit: u32, ch: char| -> char { if mode & bit != 0 { ch } else { '-' } };
     let p = format!(
         "{}{}{}{}{}{}{}{}{}{}",
         kind_ch,

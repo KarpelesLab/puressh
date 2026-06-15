@@ -8,20 +8,20 @@
 use alloc::vec::Vec;
 
 use purecrypto::bignum::BoxedUint;
-use purecrypto::dh::{group14, group16, group18, DhGroup, DhPrivateKey, DhPublicKey};
+use purecrypto::dh::{DhGroup, DhPrivateKey, DhPublicKey, group14, group16, group18};
 use purecrypto::hash::{Digest, Sha256, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
+use super::Kex;
 use super::common::{
     KexContext, KexInitOut, KexOutput, SSH_MSG_KEX_DH_GEX_GROUP, SSH_MSG_KEX_DH_GEX_INIT,
     SSH_MSG_KEX_DH_GEX_REPLY, SSH_MSG_KEX_DH_GEX_REQUEST, SSH_MSG_KEX_ECDH_INIT,
     SSH_MSG_KEX_ECDH_REPLY,
 };
-use super::hash::{mpint_bytes, ExchangeHash};
-use super::Kex;
+use super::hash::{ExchangeHash, mpint_bytes};
 use crate::error::{Error, Result};
-use crate::format::{read_mpint, Reader};
+use crate::format::{Reader, read_mpint};
 use crate::hostkey::HostKeyVerify;
 
 /// `diffie-hellman-group14-sha256` — RFC 3526 2048-bit group, SHA-256.

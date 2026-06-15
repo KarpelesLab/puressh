@@ -32,15 +32,14 @@ use puressh::scp::{ScpRecvOptions, ScpSendOptions};
 #[path = "common.rs"]
 mod common;
 use common::{
-    build_host_key_policy, connect_agent_credentials, default_identity_paths, expand_tilde,
-    load_identity, parse_userhost_path, read_password_from_stdin, resolve_user, set_verbose,
-    try_load_default_identity, vlog, StrictMode,
+    StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
+    expand_tilde, load_identity, parse_userhost_path, read_password_from_stdin, resolve_user,
+    set_verbose, try_load_default_identity, vlog,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str =
-    "usage: scp [-v[v[v]]] [-r] [-p] [-F configfile] [-P port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: scp [-v[v[v]]] [-r] [-p] [-F configfile] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \

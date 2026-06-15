@@ -15,7 +15,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
-use super::protocol::{read_header, read_payload_term, write_fatal, write_ok, Header, ScpError};
+use super::protocol::{Header, ScpError, read_header, read_payload_term, write_fatal, write_ok};
 
 /// Default cap on a single incoming file's payload size: 64 GiB. See
 /// [`Receiver::with_max_file_size`].
@@ -217,7 +217,7 @@ impl<S: Read + Write> Receiver<S> {
         }
         #[cfg(unix)]
         {
-            use nix::sys::stat::{fchmodat, FchmodatFlags, Mode};
+            use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
             // Use `fchmodat(AT_SYMLINK_NOFOLLOW)` instead of
             // `fs::set_permissions`, which under the hood does a
             // path-based `chmod(2)` that *follows* symlinks. The
@@ -241,10 +241,10 @@ impl<S: Read + Write> Receiver<S> {
             // anyway. The TOCTOU concern is Unix-specific.
             let _ = mode;
         }
-        if let Some((mtime, atime)) = self.pending_times.take() {
-            if self.opts.preserve_times {
-                let _ = set_times(&target, mtime, atime);
-            }
+        if let Some((mtime, atime)) = self.pending_times.take()
+            && self.opts.preserve_times
+        {
+            let _ = set_times(&target, mtime, atime);
         }
         self.stack.push(target);
         write_ok(&mut self.stream)?;
@@ -281,12 +281,12 @@ impl<S: Read + Write> Receiver<S> {
         // streaming bytes from the peer. A sender that announces
         // `u64::MAX` would otherwise be allowed to fill the receiver's
         // disk until ENOSPC. Default cap is generous (64 GiB).
-        if let Some(cap) = self.max_file_size {
-            if size > cap {
-                let msg = "file size exceeds configured maximum";
-                let _ = write_fatal(&mut self.stream, msg);
-                return Err(ScpError::Unexpected("file size exceeds configured maximum"));
-            }
+        if let Some(cap) = self.max_file_size
+            && size > cap
+        {
+            let msg = "file size exceeds configured maximum";
+            let _ = write_fatal(&mut self.stream, msg);
+            return Err(ScpError::Unexpected("file size exceeds configured maximum"));
         }
         let target = self.resolve_file_target(name);
         self.guard_path(&target)?;
@@ -339,16 +339,16 @@ impl<S: Read + Write> Receiver<S> {
         // closing the window entirely.
         #[cfg(unix)]
         {
-            use nix::sys::stat::{fchmod, Mode};
+            use nix::sys::stat::{Mode, fchmod};
             let mode_bits = Mode::from_bits_truncate((mode & 0o7777) as nix::libc::mode_t);
             let _ = fchmod(&f, mode_bits);
         }
         #[cfg(not(unix))]
         let _ = mode;
-        if let Some((mtime, atime)) = self.pending_times.take() {
-            if self.opts.preserve_times {
-                let _ = set_times(&target, mtime, atime);
-            }
+        if let Some((mtime, atime)) = self.pending_times.take()
+            && self.opts.preserve_times
+        {
+            let _ = set_times(&target, mtime, atime);
         }
         // Ack the payload.
         write_ok(&mut self.stream)?;

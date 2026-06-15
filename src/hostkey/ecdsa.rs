@@ -19,7 +19,7 @@ use super::{HostKey, HostKeyVerify};
 #[cfg(feature = "alloc")]
 use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
-use crate::format::{read_mpint, write_mpint, Reader, Writer};
+use crate::format::{Reader, Writer, read_mpint, write_mpint};
 
 /// `ecdsa-sha2-nistp256`.
 pub struct EcdsaP256;

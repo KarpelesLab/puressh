@@ -8,17 +8,17 @@ use alloc::vec::Vec;
 use crate::error::{Error, Result};
 
 use super::message::{
-    AuthMethodPayload, SecretString, ServiceAccept, ServiceRequest, UserauthBanner,
-    UserauthFailure, UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
-    SSH_MSG_SERVICE_ACCEPT, SSH_MSG_USERAUTH_BANNER, SSH_MSG_USERAUTH_FAILURE,
-    SSH_MSG_USERAUTH_PK_OK, SSH_MSG_USERAUTH_SUCCESS,
+    AuthMethodPayload, SSH_MSG_SERVICE_ACCEPT, SSH_MSG_USERAUTH_BANNER, SSH_MSG_USERAUTH_FAILURE,
+    SSH_MSG_USERAUTH_PK_OK, SSH_MSG_USERAUTH_SUCCESS, SecretString, ServiceAccept, ServiceRequest,
+    UserauthBanner, UserauthFailure, UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk,
+    UserauthRequest,
 };
 
 /// Callback hook for keyboard-interactive (RFC 4256).
 pub trait KeyboardInteractiveResponder: Send {
     /// Produce one response per prompt in `prompts`.
     fn respond(&mut self, name: &str, instruction: &str, prompts: &[(String, bool)])
-        -> Vec<String>;
+    -> Vec<String>;
 }
 
 /// A credential the client offers in turn.

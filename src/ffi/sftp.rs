@@ -34,9 +34,9 @@ use std::sync::{Arc, Mutex};
 
 use super::client::PcSshClient;
 use super::common::{
-    catch, with_cstr, with_two_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC,
-    PCSSH_ERR_INVALID_ARGUMENT, PCSSH_ERR_INVALID_HANDLE, PCSSH_ERR_IO, PCSSH_ERR_PARSE,
-    PCSSH_ERR_PROTOCOL, PCSSH_OK,
+    PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT,
+    PCSSH_ERR_INVALID_HANDLE, PCSSH_ERR_IO, PCSSH_ERR_PARSE, PCSSH_ERR_PROTOCOL, PCSSH_OK, catch,
+    with_cstr, with_two_cstr,
 };
 use crate::sftp::{Attrs, NameEntry, SftpError};
 use crate::shared::SftpSession;
@@ -264,7 +264,7 @@ unsafe fn copy_to_caller_buf(src: &[u8], buf: *mut u8, cap: usize, out_len: *mut
 /// - `client` must be a valid `PcSshClient` returned by
 ///   `pcssh_client_connect` and not yet freed.
 /// - `out_sftp` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_open(
     client: *mut PcSshClient,
     out_sftp: *mut *mut PcSshSftp,
@@ -297,7 +297,7 @@ pub unsafe extern "C" fn pcssh_sftp_open(
 ///
 /// `sftp` must either be NULL or a pointer returned by `pcssh_sftp_open`
 /// not yet freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_free(sftp: *mut PcSshSftp) {
     if sftp.is_null() {
         return;
@@ -340,7 +340,7 @@ pub unsafe extern "C" fn pcssh_sftp_free(sftp: *mut PcSshSftp) {
 /// - `sftp` must be a live handle.
 /// - `path` must be NUL-terminated UTF-8.
 /// - `out_file` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_open_file(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -406,7 +406,7 @@ pub unsafe extern "C" fn pcssh_sftp_open_file(
 /// - `file` must be live and not yet closed.
 /// - `out_len` must be non-NULL and writable.
 /// - If `cap > 0`, `buf` must be non-NULL with `cap` writable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_read(
     file: *mut PcSshSftpFile,
     buf: *mut u8,
@@ -471,7 +471,7 @@ pub unsafe extern "C" fn pcssh_sftp_read(
 ///
 /// - `file` must be live and not yet closed.
 /// - If `len > 0`, `buf` must be non-NULL with `len` readable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_write(
     file: *mut PcSshSftpFile,
     buf: *const u8,
@@ -514,7 +514,7 @@ pub unsafe extern "C" fn pcssh_sftp_write(
 /// # Safety
 ///
 /// `file` must be a live handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_seek(file: *mut PcSshSftpFile, offset: u64) -> c_int {
     catch(|| {
         if file.is_null() {
@@ -532,7 +532,7 @@ pub unsafe extern "C" fn pcssh_sftp_seek(file: *mut PcSshSftpFile, offset: u64) 
 /// # Safety
 ///
 /// `file` must be live; `out_offset` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_tell(file: *mut PcSshSftpFile, out_offset: *mut u64) -> c_int {
     catch(|| {
         if file.is_null() || out_offset.is_null() {
@@ -551,7 +551,7 @@ pub unsafe extern "C" fn pcssh_sftp_tell(file: *mut PcSshSftpFile, out_offset: *
 /// # Safety
 ///
 /// `file` must be live (not yet freed).
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_close_file(file: *mut PcSshSftpFile) -> c_int {
     catch(|| {
         if file.is_null() {
@@ -579,7 +579,7 @@ pub unsafe extern "C" fn pcssh_sftp_close_file(file: *mut PcSshSftpFile) -> c_in
 /// `file` must be NULL or a pointer returned by `pcssh_sftp_open_file`,
 /// not yet freed. The parent `PcSshSftp` may already be freed — the
 /// shared cell detects that and skips the wire close in that case.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_file_free(file: *mut PcSshSftpFile) {
     if file.is_null() {
         return;
@@ -612,7 +612,7 @@ pub unsafe extern "C" fn pcssh_sftp_file_free(file: *mut PcSshSftpFile) {
 ///
 /// - `sftp` must be live; `path` NUL-terminated UTF-8.
 /// - `out_dir` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_opendir(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -679,7 +679,7 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
 ///   `name_cap > 0`, `name_buf` must point to `name_cap` writable bytes;
 ///   same for the longname pair.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_readdir(
     dir: *mut PcSshSftpDir,
     name_buf: *mut u8,
@@ -772,7 +772,7 @@ pub unsafe extern "C" fn pcssh_sftp_readdir(
 /// # Safety
 ///
 /// `dir` must be live.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_closedir(dir: *mut PcSshSftpDir) -> c_int {
     catch(|| {
         if dir.is_null() {
@@ -799,7 +799,7 @@ pub unsafe extern "C" fn pcssh_sftp_closedir(dir: *mut PcSshSftpDir) -> c_int {
 ///
 /// `dir` must be NULL or a `pcssh_sftp_opendir` return not yet freed.
 /// The parent `PcSshSftp` may already be freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_dir_free(dir: *mut PcSshSftpDir) {
     if dir.is_null() {
         return;
@@ -828,7 +828,7 @@ pub unsafe extern "C" fn pcssh_sftp_dir_free(dir: *mut PcSshSftpDir) {
 /// # Safety
 ///
 /// `sftp` live, `path` NUL-terminated UTF-8, `out_attrs` non-NULL writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_stat(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -866,7 +866,7 @@ pub unsafe extern "C" fn pcssh_sftp_stat(
 /// # Safety
 ///
 /// As for [`pcssh_sftp_stat`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_lstat(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -904,7 +904,7 @@ pub unsafe extern "C" fn pcssh_sftp_lstat(
 /// # Safety
 ///
 /// `file` live, `out_attrs` non-NULL writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_fstat(
     file: *mut PcSshSftpFile,
     out_attrs: *mut PcSshSftpAttrs,
@@ -941,7 +941,7 @@ pub unsafe extern "C" fn pcssh_sftp_fstat(
 /// # Safety
 ///
 /// `sftp` live, `path` NUL-terminated UTF-8, `attrs` non-NULL and readable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_setstat(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -974,7 +974,7 @@ pub unsafe extern "C" fn pcssh_sftp_setstat(
 /// # Safety
 ///
 /// `file` live, `attrs` non-NULL readable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_fsetstat(
     file: *mut PcSshSftpFile,
     attrs: *const PcSshSftpAttrs,
@@ -1008,7 +1008,7 @@ pub unsafe extern "C" fn pcssh_sftp_fsetstat(
 /// # Safety
 ///
 /// `sftp` live, `path` NUL-terminated UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_mkdir(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -1042,7 +1042,7 @@ pub unsafe extern "C" fn pcssh_sftp_mkdir(
 /// # Safety
 ///
 /// `sftp` live, `path` NUL-terminated UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_rmdir(sftp: *mut PcSshSftp, path: *const c_char) -> c_int {
     catch(|| {
         if sftp.is_null() {
@@ -1066,7 +1066,7 @@ pub unsafe extern "C" fn pcssh_sftp_rmdir(sftp: *mut PcSshSftp, path: *const c_c
 /// # Safety
 ///
 /// `sftp` live, `path` NUL-terminated UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_remove(sftp: *mut PcSshSftp, path: *const c_char) -> c_int {
     catch(|| {
         if sftp.is_null() {
@@ -1090,7 +1090,7 @@ pub unsafe extern "C" fn pcssh_sftp_remove(sftp: *mut PcSshSftp, path: *const c_
 /// # Safety
 ///
 /// `sftp` live, both paths NUL-terminated UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_rename(
     sftp: *mut PcSshSftp,
     old_path: *const c_char,
@@ -1121,7 +1121,7 @@ pub unsafe extern "C" fn pcssh_sftp_rename(
 /// # Safety
 ///
 /// `sftp` live, both paths NUL-terminated UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_symlink(
     sftp: *mut PcSshSftp,
     target: *const c_char,
@@ -1153,7 +1153,7 @@ pub unsafe extern "C" fn pcssh_sftp_symlink(
 /// `sftp` live, `path` NUL-terminated UTF-8, `out_len` non-NULL writable;
 /// if `cap > 0` and the target is non-empty, `buf` non-NULL with `cap`
 /// writable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_readlink(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -1193,7 +1193,7 @@ pub unsafe extern "C" fn pcssh_sftp_readlink(
 /// # Safety
 ///
 /// As for [`pcssh_sftp_readlink`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_realpath(
     sftp: *mut PcSshSftp,
     path: *const c_char,
@@ -1280,7 +1280,7 @@ unsafe fn bytes_from_raw<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
 /// - `out_file` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_open_file_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1346,7 +1346,7 @@ pub unsafe extern "C" fn pcssh_sftp_open_file_bytes(
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
 /// - `out_dir` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_opendir_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1402,7 +1402,7 @@ pub unsafe extern "C" fn pcssh_sftp_opendir_bytes(
 /// - `sftp` must be a live handle.
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_mkdir_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1438,7 +1438,7 @@ pub unsafe extern "C" fn pcssh_sftp_mkdir_bytes(
 /// - `sftp` must be a live handle.
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_rmdir_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1469,7 +1469,7 @@ pub unsafe extern "C" fn pcssh_sftp_rmdir_bytes(
 /// - `sftp` must be a live handle.
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_remove_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1502,7 +1502,7 @@ pub unsafe extern "C" fn pcssh_sftp_remove_bytes(
 /// - `sftp` must be a live handle.
 /// - For each non-zero `_len`, the matching `_ptr` must point to that many
 ///   readable bytes. `(NULL, 0)` pairs are accepted as the empty path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_rename_bytes(
     sftp: *mut PcSshSftp,
     old_ptr: *const u8,
@@ -1541,7 +1541,7 @@ pub unsafe extern "C" fn pcssh_sftp_rename_bytes(
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
 /// - `out_attrs` must be non-NULL and writable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_stat_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1582,7 +1582,7 @@ pub unsafe extern "C" fn pcssh_sftp_stat_bytes(
 /// # Safety
 ///
 /// As for [`pcssh_sftp_stat_bytes`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_lstat_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1625,7 +1625,7 @@ pub unsafe extern "C" fn pcssh_sftp_lstat_bytes(
 /// - If `path_len > 0`, `path_ptr` must point to at least `path_len`
 ///   readable bytes. `(NULL, 0)` is accepted as the empty path.
 /// - `attrs` must be non-NULL and readable.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_setstat_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1661,7 +1661,7 @@ pub unsafe extern "C" fn pcssh_sftp_setstat_bytes(
 /// - `sftp` must be a live handle.
 /// - For each non-zero `_len`, the matching `_ptr` must point to that many
 ///   readable bytes. `(NULL, 0)` pairs are accepted as the empty path.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_symlink_bytes(
     sftp: *mut PcSshSftp,
     target_ptr: *const u8,
@@ -1705,7 +1705,7 @@ pub unsafe extern "C" fn pcssh_sftp_symlink_bytes(
 /// - `out_len` must be non-NULL and writable.
 /// - If `cap > 0` and the target is non-empty, `buf` must be non-NULL with
 ///   `cap` writable bytes.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_readlink_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,
@@ -1749,7 +1749,7 @@ pub unsafe extern "C" fn pcssh_sftp_readlink_bytes(
 /// # Safety
 ///
 /// As for [`pcssh_sftp_readlink_bytes`].
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_sftp_realpath_bytes(
     sftp: *mut PcSshSftp,
     path_ptr: *const u8,

@@ -9,9 +9,9 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 use super::protocol::{
-    decode_identities_answer, decode_sign_response, encode_request_identities, encode_sign_request,
     IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER,
-    SSH_AGENT_SIGN_RESPONSE,
+    SSH_AGENT_SIGN_RESPONSE, decode_identities_answer, decode_sign_response,
+    encode_request_identities, encode_sign_request,
 };
 
 /// Default per-call socket timeout. Agents are nearly always

@@ -7,7 +7,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use purecrypto::bignum::{inv_mod_boxed, BoxedUint};
+use purecrypto::bignum::{BoxedUint, inv_mod_boxed};
 use purecrypto::cipher::{Aes256, Ctr};
 use purecrypto::der::Reader as DerReader;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
@@ -19,9 +19,9 @@ use purecrypto::rng::{CryptoRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use zeroize::Zeroizing;
 
-use super::{base64, PrivateKey, PublicKey, MAGIC};
+use super::{MAGIC, PrivateKey, PublicKey, base64};
 use crate::error::{Error, Result};
-use crate::format::{write_mpint, Writer};
+use crate::format::{Writer, write_mpint};
 
 /// Selectable ECDSA curve for [`PrivateKey::generate_ecdsa`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

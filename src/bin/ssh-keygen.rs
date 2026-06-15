@@ -19,8 +19,8 @@ use std::process::ExitCode;
 
 use purecrypto::rng::{OsRng, RngCore};
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
-use puressh::known_hosts::format::format_entry;
 use puressh::known_hosts::KnownHosts;
+use puressh::known_hosts::format::format_entry;
 use zeroize::Zeroizing;
 
 /// Open a file with `create_new` semantics, applying the requested Unix mode
@@ -170,29 +170,29 @@ fn read_to_string(path: &str) -> Result<String, String> {
 
 fn write_private(path: &str, contents: &str) -> Result<(), String> {
     let p = Path::new(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            // Detect whether `parent` already existed so we know whether
-            // we are responsible for tightening its mode. We only touch
-            // the leaf directory we just created — never anything we
-            // inherit from the user (e.g. $HOME).
-            let existed_before = parent.exists();
-            fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
-            #[cfg(unix)]
-            {
-                if !existed_before {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    // 0o700 matches OpenSSH's expectation for ~/.ssh:
-                    // owner-only traversal so directory listings (and
-                    // therefore the set of identities present) cannot
-                    // be enumerated by other local users.
-                    let _ = fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-                }
+    if let Some(parent) = p.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        // Detect whether `parent` already existed so we know whether
+        // we are responsible for tightening its mode. We only touch
+        // the leaf directory we just created — never anything we
+        // inherit from the user (e.g. $HOME).
+        let existed_before = parent.exists();
+        fs::create_dir_all(parent).map_err(|e| format!("mkdir {parent:?}: {e}"))?;
+        #[cfg(unix)]
+        {
+            if !existed_before {
+                use std::os::unix::fs::PermissionsExt as _;
+                // 0o700 matches OpenSSH's expectation for ~/.ssh:
+                // owner-only traversal so directory listings (and
+                // therefore the set of identities present) cannot
+                // be enumerated by other local users.
+                let _ = fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
-            #[cfg(not(unix))]
-            {
-                let _ = existed_before; // silence unused warning
-            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = existed_before; // silence unused warning
         }
     }
     if p.exists() {
@@ -363,7 +363,7 @@ fn run_generate(args: &Args) -> Result<i32, String> {
                 _ => {
                     return Err(format!(
                         "ecdsa: unsupported bit length {bits} (256|384|521)"
-                    ))
+                    ));
                 }
             };
             PrivateKey::generate_ecdsa(&mut rng, curve, comment)

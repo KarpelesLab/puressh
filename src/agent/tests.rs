@@ -4,8 +4,8 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixListener;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,8 +13,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use super::client::Agent;
 use super::host_key::AgentHostKey;
 use super::protocol::{
-    encode_message, IdentityEntry, SSH_AGENTC_REQUEST_IDENTITIES, SSH_AGENTC_SIGN_REQUEST,
-    SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE,
+    IdentityEntry, SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE,
+    SSH_AGENTC_REQUEST_IDENTITIES, SSH_AGENTC_SIGN_REQUEST, encode_message,
 };
 use crate::format::{Reader, Writer};
 use crate::hostkey::HostKey;
@@ -220,10 +220,11 @@ fn connect_env_returns_none_when_unset() {
     let saved = std::env::var_os("SSH_AUTH_SOCK");
     // SAFETY: tests in this binary do not race on env vars — we
     // mutate around our single call and restore at the end.
-    std::env::remove_var("SSH_AUTH_SOCK");
+    // `remove_var`/`set_var` are `unsafe` as of edition 2024.
+    unsafe { std::env::remove_var("SSH_AUTH_SOCK") };
     let r = Agent::connect_env().expect("connect_env");
     assert!(r.is_none());
     if let Some(v) = saved {
-        std::env::set_var("SSH_AUTH_SOCK", v);
+        unsafe { std::env::set_var("SSH_AUTH_SOCK", v) };
     }
 }

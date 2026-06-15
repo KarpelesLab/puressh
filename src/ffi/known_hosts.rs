@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 
 use super::client::PcSshClient;
 use super::common::{
-    catch, map_error, with_cstr, with_two_cstr, PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT,
-    PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_ERR_IO, PCSSH_OK,
+    PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT,
+    PCSSH_ERR_IO, PCSSH_OK, catch, map_error, with_cstr, with_two_cstr,
 };
 use crate::client::{Client, Config, HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use crate::error::Error;
@@ -83,7 +83,7 @@ pub type PcSshTofuPromptCb = Option<
 ///
 /// `out` must be non-NULL and point to writable storage for one
 /// `*mut PcSshKnownHosts`.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_new(out: *mut *mut PcSshKnownHosts) -> c_int {
     catch(|| {
         if out.is_null() {
@@ -109,7 +109,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_new(out: *mut *mut PcSshKnownHosts) -
 ///
 /// - `path` must be NUL-terminated, valid UTF-8.
 /// - `out` must be non-NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_load(
     path: *const c_char,
     out: *mut *mut PcSshKnownHosts,
@@ -144,7 +144,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_load(
 ///
 /// - `kh` must be a valid handle returned by `pcssh_known_hosts_*`.
 /// - `path` must be NUL-terminated, valid UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_save(
     kh: *const PcSshKnownHosts,
     path: *const c_char,
@@ -176,7 +176,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_save(
 ///
 /// - `buf` must point to at least `len` readable bytes.
 /// - `out` must be non-NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_from_bytes(
     buf: *const u8,
     len: usize,
@@ -218,7 +218,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_from_bytes(
 /// - `kh` must be a valid handle.
 /// - `buf` may be NULL only if `cap == 0`.
 /// - `out_len` must be non-NULL.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_to_bytes(
     kh: *const PcSshKnownHosts,
     buf: *mut u8,
@@ -265,7 +265,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_to_bytes(
 /// - `key_blob` must point to at least `key_blob_len` readable bytes.
 /// - `out_result` must be non-NULL.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_lookup(
     kh: *const PcSshKnownHosts,
     host: *const c_char,
@@ -318,7 +318,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_lookup(
 /// - `host`, `algorithm` must be NUL-terminated valid UTF-8.
 /// - `key_blob` must point to at least `key_blob_len` readable bytes.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_add(
     kh: *mut PcSshKnownHosts,
     host: *const c_char,
@@ -363,7 +363,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_add(
 ///
 /// - `kh` must be a valid handle.
 /// - `host` must be NUL-terminated valid UTF-8.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_remove(
     kh: *mut PcSshKnownHosts,
     host: *const c_char,
@@ -399,7 +399,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_remove(
 /// # Safety
 ///
 /// `kh` must be a valid handle.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_hash_in_place(kh: *mut PcSshKnownHosts) -> c_int {
     catch(|| {
         if kh.is_null() {
@@ -422,7 +422,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_hash_in_place(kh: *mut PcSshKnownHost
 ///
 /// `kh` must either be NULL, or a pointer previously returned by a
 /// `pcssh_known_hosts_*` constructor that has not been freed.
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_known_hosts_free(kh: *mut PcSshKnownHosts) {
     if kh.is_null() {
         return;
@@ -450,7 +450,7 @@ pub unsafe extern "C" fn pcssh_known_hosts_free(kh: *mut PcSshKnownHosts) {
 /// - `kh` must be a valid handle.
 /// - `out_client` must be non-NULL.
 #[allow(clippy::too_many_arguments)]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
     host: *const c_char,
     port: u16,

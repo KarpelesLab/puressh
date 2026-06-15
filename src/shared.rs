@@ -85,7 +85,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::channel::{ChannelEvent, ChannelOpen, ChannelRequest};
-use crate::client::{io_err, Client};
+use crate::client::{Client, io_err};
 use crate::error::{Error, Result};
 use crate::sftp::{SftpClient, SftpError};
 
@@ -814,10 +814,10 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
         _ => None,
     };
     stash_event(&mut g.queues, ev);
-    if let Some(ch) = target {
-        if let Some(cv) = g.notifiers.get(&ch) {
-            cv.notify_all();
-        }
+    if let Some(ch) = target
+        && let Some(cv) = g.notifiers.get(&ch)
+    {
+        cv.notify_all();
     }
 }
 

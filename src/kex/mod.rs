@@ -15,7 +15,7 @@ pub use common::{KexContext, KexInitOut, KexOutput};
 pub use curve25519::Curve25519Sha256;
 pub use dh::{GexClientState, GexRequest, GexSha256, Group14Sha256, Group16Sha512, Group18Sha512};
 pub use ecdh::{EcdhSha2Nistp256, EcdhSha2Nistp384, EcdhSha2Nistp521};
-pub use hash::{derive, mpint_bytes, ExchangeHash};
+pub use hash::{ExchangeHash, derive, mpint_bytes};
 pub use mlkem768x25519::MlKem768X25519Sha256;
 
 /// Trait implemented by each KEX algorithm module.

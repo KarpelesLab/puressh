@@ -110,12 +110,12 @@ impl HostKey for AgentHostKey {
         // Sanity-check that the agent returned a signature blob whose
         // inner algorithm matches what we advertised; otherwise the
         // userauth verifier on the far side will reject the signature.
-        if let Some(algo) = first_string(&sig_blob) {
-            if algo != self.algorithm {
-                return Err(crate::error::Error::Protocol(
-                    "agent: signature algorithm mismatch",
-                ));
-            }
+        if let Some(algo) = first_string(&sig_blob)
+            && algo != self.algorithm
+        {
+            return Err(crate::error::Error::Protocol(
+                "agent: signature algorithm mismatch",
+            ));
         }
         Ok(sig_blob)
     }

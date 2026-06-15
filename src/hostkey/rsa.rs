@@ -30,7 +30,7 @@ use super::{HostKey, HostKeyVerify};
 #[cfg(feature = "alloc")]
 use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
-use crate::format::{read_mpint, write_mpint, Reader, Writer};
+use crate::format::{Reader, Writer, read_mpint, write_mpint};
 
 /// `ssh-rsa` (RSA-SHA1, legacy).
 pub struct SshRsa;

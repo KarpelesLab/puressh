@@ -184,8 +184,10 @@ pub fn resolve_algo_list(
                     ));
                 }
             }
-            let mut out: Vec<String> =
-                default_list(cat).into_iter().map(|s| s.to_string()).collect();
+            let mut out: Vec<String> = default_list(cat)
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
             for t in tokens {
                 if !out.iter().any(|e| *e == t) {
                     out.push(t);
@@ -257,16 +259,20 @@ mod tests {
 
     #[test]
     fn bare_list_replaces() {
-        let got = resolve_algo_list(AlgoCategory::Cipher, &args("aes128-ctr,aes256-ctr"), 1, "Ciphers")
-            .unwrap();
+        let got = resolve_algo_list(
+            AlgoCategory::Cipher,
+            &args("aes128-ctr,aes256-ctr"),
+            1,
+            "Ciphers",
+        )
+        .unwrap();
         assert_eq!(got, vec!["aes128-ctr", "aes256-ctr"]);
     }
 
     #[test]
     fn append_modifier() {
         let defaults = default_list(AlgoCategory::Mac);
-        let got =
-            resolve_algo_list(AlgoCategory::Mac, &args("+hmac-sha2-256"), 1, "MACs").unwrap();
+        let got = resolve_algo_list(AlgoCategory::Mac, &args("+hmac-sha2-256"), 1, "MACs").unwrap();
         // The default list is preserved, hmac-sha2-256 was already in it so
         // it is not duplicated.
         assert_eq!(got.len(), defaults.len());
@@ -276,21 +282,15 @@ mod tests {
     #[test]
     fn append_modifier_adds_new() {
         // Build a default list without one entry, then re-append it.
-        let got = resolve_algo_list(
-            AlgoCategory::Cipher,
-            &args("+aes128-ctr"),
-            1,
-            "Ciphers",
-        )
-        .unwrap();
+        let got =
+            resolve_algo_list(AlgoCategory::Cipher, &args("+aes128-ctr"), 1, "Ciphers").unwrap();
         let count = got.iter().filter(|c| *c == "aes128-ctr").count();
         assert_eq!(count, 1, "append must not duplicate an existing entry");
     }
 
     #[test]
     fn remove_glob() {
-        let got =
-            resolve_algo_list(AlgoCategory::Cipher, &args("-aes*"), 1, "Ciphers").unwrap();
+        let got = resolve_algo_list(AlgoCategory::Cipher, &args("-aes*"), 1, "Ciphers").unwrap();
         assert!(got.iter().all(|c| !c.starts_with("aes")));
         assert!(got.iter().any(|c| c == "chacha20-poly1305@openssh.com"));
     }
@@ -310,13 +310,8 @@ mod tests {
 
     #[test]
     fn prepend_modifier() {
-        let got = resolve_algo_list(
-            AlgoCategory::Cipher,
-            &args("^aes128-ctr"),
-            1,
-            "Ciphers",
-        )
-        .unwrap();
+        let got =
+            resolve_algo_list(AlgoCategory::Cipher, &args("^aes128-ctr"), 1, "Ciphers").unwrap();
         assert_eq!(got[0], "aes128-ctr");
         // The rest of the defaults follow, minus the duplicate we moved up.
         assert_eq!(got.len(), default_list(AlgoCategory::Cipher).len());
@@ -330,7 +325,10 @@ mod tests {
             ConfigError::BadValue { line, keyword, msg } => {
                 assert_eq!(line, 7);
                 assert_eq!(keyword, "Ciphers");
-                assert!(msg.contains("aes999-ctr"), "msg should name the token: {msg}");
+                assert!(
+                    msg.contains("aes999-ctr"),
+                    "msg should name the token: {msg}"
+                );
             }
             other => panic!("expected BadValue, got {other:?}"),
         }
@@ -338,7 +336,8 @@ mod tests {
 
     #[test]
     fn append_unknown_rejected() {
-        let err = resolve_algo_list(AlgoCategory::Mac, &args("+hmac-bogus"), 3, "MACs").unwrap_err();
+        let err =
+            resolve_algo_list(AlgoCategory::Mac, &args("+hmac-bogus"), 3, "MACs").unwrap_err();
         assert!(matches!(err, ConfigError::BadValue { line: 3, .. }));
     }
 
@@ -381,12 +380,16 @@ mod tests {
     fn kex_markers_never_user_visible() {
         // The strict-kex markers are not in the known/default kex names, so a
         // user cannot name them and they cannot be removed.
-        assert!(!known_names(AlgoCategory::Kex)
-            .iter()
-            .any(|n| is_strict_kex_marker(n)));
-        assert!(!default_list(AlgoCategory::Kex)
-            .iter()
-            .any(|n| is_strict_kex_marker(n)));
+        assert!(
+            !known_names(AlgoCategory::Kex)
+                .iter()
+                .any(|n| is_strict_kex_marker(n))
+        );
+        assert!(
+            !default_list(AlgoCategory::Kex)
+                .iter()
+                .any(|n| is_strict_kex_marker(n))
+        );
         let err = resolve_algo_list(
             AlgoCategory::Kex,
             &args("kex-strict-c-v00@openssh.com"),
@@ -399,8 +402,16 @@ mod tests {
 
     #[test]
     fn hostkey_known_names_exclude_bare_ssh_rsa() {
-        assert!(!known_names(AlgoCategory::HostKey).iter().any(|n| *n == "ssh-rsa"));
-        assert!(known_names(AlgoCategory::HostKey).iter().any(|n| *n == "ssh-ed25519"));
+        assert!(
+            !known_names(AlgoCategory::HostKey)
+                .iter()
+                .any(|n| *n == "ssh-rsa")
+        );
+        assert!(
+            known_names(AlgoCategory::HostKey)
+                .iter()
+                .any(|n| *n == "ssh-ed25519")
+        );
     }
 
     #[test]

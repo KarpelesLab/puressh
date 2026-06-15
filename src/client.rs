@@ -3446,8 +3446,12 @@ mod tests {
         assert_eq!(advert.ciphers_s2c, want_ciphers);
         // The kex list ends with both strict-kex markers.
         let n = advert.kex.len();
-        assert!(crate::transport::kex::is_strict_kex_marker(&advert.kex[n - 1]));
-        assert!(crate::transport::kex::is_strict_kex_marker(&advert.kex[n - 2]));
+        assert!(crate::transport::kex::is_strict_kex_marker(
+            &advert.kex[n - 1]
+        ));
+        assert!(crate::transport::kex::is_strict_kex_marker(
+            &advert.kex[n - 2]
+        ));
     }
 
     #[test]
@@ -3460,10 +3464,12 @@ mod tests {
         assert_eq!(advert.ciphers_c2s, vec!["aes128-ctr".to_string()]);
         assert_eq!(advert.ciphers_s2c, vec!["aes128-ctr".to_string()]);
         // Markers regained even though we overrode an unrelated category.
-        assert!(advert
-            .kex
-            .iter()
-            .any(|k| crate::transport::kex::is_strict_kex_marker(k)));
+        assert!(
+            advert
+                .kex
+                .iter()
+                .any(|k| crate::transport::kex::is_strict_kex_marker(k))
+        );
     }
 
     #[test]
@@ -3492,8 +3498,8 @@ mod tests {
             ciphers: Some(vec!["aes128-ctr".to_string()]),
             ..Default::default()
         };
-        let client = build_default_kexinit(&mut OsRng, &client_over)
-            .with_ext_info_marker(Role::Client);
+        let client =
+            build_default_kexinit(&mut OsRng, &client_over).with_ext_info_marker(Role::Client);
         let server = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
         let neg = negotiate(&client, &server).expect("should negotiate");
         assert_eq!(neg.cipher_c2s, "aes128-ctr");

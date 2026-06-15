@@ -468,7 +468,10 @@ HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
             cfg.ciphers.as_deref(),
             Some(&["aes256-ctr".to_string(), "aes128-ctr".to_string()][..])
         );
-        assert_eq!(cfg.macs.as_deref(), Some(&["hmac-sha2-512".to_string()][..]));
+        assert_eq!(
+            cfg.macs.as_deref(),
+            Some(&["hmac-sha2-512".to_string()][..])
+        );
         assert_eq!(
             cfg.kex_algorithms.as_deref(),
             Some(&["curve25519-sha256".to_string()][..])

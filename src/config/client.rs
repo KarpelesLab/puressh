@@ -707,7 +707,10 @@ Host gw
             eff.ciphers.as_deref(),
             Some(&["aes128-ctr".to_string(), "aes256-ctr".to_string()][..])
         );
-        assert_eq!(eff.macs.as_deref(), Some(&["hmac-sha2-256".to_string()][..]));
+        assert_eq!(
+            eff.macs.as_deref(),
+            Some(&["hmac-sha2-256".to_string()][..])
+        );
         assert_eq!(
             eff.kex_algorithms.as_deref(),
             Some(&["curve25519-sha256".to_string()][..])
@@ -754,7 +757,10 @@ Host *
 ";
         let cfg = SshClientConfig::parse(src).unwrap();
         let eff = cfg.lookup("gw");
-        assert_eq!(eff.ciphers.as_deref(), Some(&["aes128-ctr".to_string()][..]));
+        assert_eq!(
+            eff.ciphers.as_deref(),
+            Some(&["aes128-ctr".to_string()][..])
+        );
     }
 
     #[test]

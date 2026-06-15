@@ -3121,8 +3121,8 @@ mod tests {
     use super::*;
     use crate::auth::{AuthAttempt, AuthDecision, Authenticator};
     use crate::client::{Client, Config as ClientConfig, HostKeyPolicy};
-    use crate::transport::kex::KexAlgorithms;
     use crate::hostkey::Ed25519HostKey;
+    use crate::transport::kex::KexAlgorithms;
     use std::sync::Mutex;
     use std::time::Duration;
 

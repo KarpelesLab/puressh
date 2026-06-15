@@ -324,6 +324,38 @@ fn coerce_to_loopback(bind_address: &str, port: u16) -> Result<SocketAddr> {
     }
 }
 
+/// Rewrite a client-requested `tcpip-forward` bind address according to the
+/// resolved [`crate::config::ServerGatewayPorts`] policy, before it is handed
+/// to the handler's `bind`:
+///
+/// - `No` (also the default when `policy` is `None`): force the listener onto
+///   loopback — any wildcard / loopback request becomes `127.0.0.1`, an IPv6
+///   wildcard / loopback becomes `::1`, and any other literal is left as-is
+///   for the handler's own policy to accept or refuse.
+/// - `Yes`: bind on all interfaces — a loopback / empty request is widened to
+///   `0.0.0.0` (`::` is preserved); any explicit address is honoured.
+/// - `ClientSpecified`: honour the client's address verbatim.
+///
+/// Returns the (possibly rewritten) bind address as an owned string.
+pub fn apply_gateway_ports(
+    policy: Option<crate::config::ServerGatewayPorts>,
+    bind_address: &str,
+) -> String {
+    use crate::config::ServerGatewayPorts as GP;
+    match policy.unwrap_or(GP::No) {
+        GP::ClientSpecified => bind_address.to_string(),
+        GP::No => match bind_address {
+            "" | "0.0.0.0" | "127.0.0.1" | "localhost" => "127.0.0.1".to_string(),
+            "::" | "::1" => "::1".to_string(),
+            other => other.to_string(),
+        },
+        GP::Yes => match bind_address {
+            "" | "127.0.0.1" | "localhost" => "0.0.0.0".to_string(),
+            other => other.to_string(),
+        },
+    }
+}
+
 impl TcpipForwardHandler for DefaultTcpipForwardHandler {
     fn bind(
         &self,

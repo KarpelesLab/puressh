@@ -23,7 +23,7 @@
 
 #![cfg(feature = "std")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
@@ -36,7 +36,7 @@ use purecrypto::rng::{CryptoRng, OsRng, RngCore};
 use crate::auth::{Authenticator, ServerAuth, ServerStep};
 use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
-    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+    SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, SSH_OPEN_RESOURCE_SHORTAGE,
 };
 use crate::error::{Error, Result};
 use crate::format::Writer;
@@ -846,6 +846,11 @@ pub struct Config {
     /// connection (post-auth) for every user uniformly. `None` ⇒ groups are
     /// unknown, so any group-dependent criterion never matches.
     pub group_resolver: Option<GroupResolver>,
+    /// `Compression` (sshd_config) — startup-only. `Some(Compression::No)`
+    /// strips any zlib names from the server's advertised compression list;
+    /// `yes` / `delayed` / `None` leave the built-in advert (currently
+    /// `none`-only, since puressh does not yet implement SSH-layer zlib).
+    pub compression: Option<crate::config::Compression>,
 }
 
 /// Resolver from a user name to its supplementary group names. Boxed so the
@@ -865,6 +870,35 @@ pub struct EffectivePolicy {
     /// `X11Forwarding` — when `Some(false)`, `x11-req` is refused even if an
     /// X11 handler is attached.
     pub x11_forwarding: Option<bool>,
+    /// `MaxSessions` — cap on simultaneously-open `session` channels. `None`
+    /// ⇒ no cap.
+    pub max_sessions: Option<u32>,
+    /// `AllowTcpForwarding` — which TCP forwarding directions are permitted.
+    /// `None` ⇒ default-allow (subject to a handler being attached).
+    pub allow_tcp_forwarding: Option<crate::config::TcpForwarding>,
+    /// `PermitOpen` — allowed `direct-tcpip` destinations. `None` ⇒ any;
+    /// `Some(vec![])` ⇒ none.
+    pub permit_open: Option<Vec<crate::config::HostPort>>,
+    /// `PermitListen` — allowed `tcpip-forward` bind targets. `None` ⇒ any;
+    /// `Some(vec![])` ⇒ none.
+    pub permit_listen: Option<Vec<crate::config::HostPort>>,
+    /// `GatewayPorts` — bind-interface policy for remote forwards. `None` ⇒
+    /// default (`no`).
+    pub gateway_ports: Option<crate::config::ServerGatewayPorts>,
+    /// `ForceCommand` — overrides the client's exec/shell command. The
+    /// original command is exposed as `SSH_ORIGINAL_COMMAND`.
+    pub force_command: Option<String>,
+    /// `ChrootDirectory` — SFTP root override (only honoured for the SFTP
+    /// path). `None` ⇒ none.
+    pub chroot_directory: Option<String>,
+    /// `ClientAliveInterval` in seconds. `None`/`0` ⇒ keepalive disabled.
+    pub client_alive_interval: Option<u32>,
+    /// `ClientAliveCountMax` — unanswered keepalives tolerated. `None` ⇒
+    /// default 3.
+    pub client_alive_count_max: Option<u32>,
+    /// `PrintMotd` — print `/etc/motd` for interactive shells. `None` ⇒
+    /// default (no).
+    pub print_motd: Option<bool>,
 }
 
 impl EffectivePolicy {
@@ -873,6 +907,16 @@ impl EffectivePolicy {
         EffectivePolicy {
             allow_agent_forwarding: None,
             x11_forwarding: None,
+            max_sessions: None,
+            allow_tcp_forwarding: None,
+            permit_open: None,
+            permit_listen: None,
+            gateway_ports: None,
+            force_command: None,
+            chroot_directory: None,
+            client_alive_interval: None,
+            client_alive_count_max: None,
+            print_motd: None,
         }
     }
 
@@ -886,6 +930,36 @@ impl EffectivePolicy {
     /// resolved to `X11Forwarding no`).
     fn x11_forwarding_allowed(&self) -> bool {
         self.x11_forwarding != Some(false)
+    }
+
+    /// True iff `direct-tcpip` (`ssh -L`) opens are permitted by
+    /// `AllowTcpForwarding`. Default-allow when unset.
+    fn local_forwarding_allowed(&self) -> bool {
+        self.allow_tcp_forwarding.is_none_or(|p| p.local_allowed())
+    }
+
+    /// True iff `tcpip-forward` (`ssh -R`) requests are permitted by
+    /// `AllowTcpForwarding`. Default-allow when unset.
+    fn remote_forwarding_allowed(&self) -> bool {
+        self.allow_tcp_forwarding.is_none_or(|p| p.remote_allowed())
+    }
+
+    /// True iff a `direct-tcpip` open to `(host, port)` is permitted by
+    /// `PermitOpen`. Unset ⇒ any; empty list ⇒ none.
+    fn permit_open_allows(&self, host: &str, port: u16) -> bool {
+        match &self.permit_open {
+            None => true,
+            Some(list) => list.iter().any(|e| e.matches(host, port)),
+        }
+    }
+
+    /// True iff a `tcpip-forward` bind to `(host, port)` is permitted by
+    /// `PermitListen`. Unset ⇒ any; empty list ⇒ none.
+    fn permit_listen_allows(&self, host: &str, port: u16) -> bool {
+        match &self.permit_listen {
+            None => true,
+            Some(list) => list.iter().any(|e| e.matches(host, port)),
+        }
     }
 }
 
@@ -1001,6 +1075,7 @@ impl Config {
             host_key_algorithms: None,
             policy: None,
             group_resolver: None,
+            compression: None,
         }
     }
 
@@ -1551,6 +1626,16 @@ fn resolve_effective_policy(
     EffectivePolicy {
         allow_agent_forwarding: opts.allow_agent_forwarding,
         x11_forwarding: opts.x11_forwarding,
+        max_sessions: opts.max_sessions,
+        allow_tcp_forwarding: opts.allow_tcp_forwarding,
+        permit_open: opts.permit_open,
+        permit_listen: opts.permit_listen,
+        gateway_ports: opts.gateway_ports,
+        force_command: opts.force_command,
+        chroot_directory: opts.chroot_directory,
+        client_alive_interval: opts.client_alive_interval,
+        client_alive_count_max: opts.client_alive_count_max,
+        print_motd: opts.print_motd,
     }
 }
 
@@ -1808,6 +1893,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // least one session channel requests `x11-req`.
     let mut x11_forward = X11ForwardConn::new();
     let mut polling_active = false;
+    let mut extras = ConnExtras::new();
     let result = do_connection_loop(
         stream,
         codec,
@@ -1832,6 +1918,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         &mut agent_forward,
         &mut x11_forward,
         &mut polling_active,
+        &mut extras,
     );
     // On teardown — successful or otherwise — release every binding so the
     // TCP listener threads inside the handler exit cleanly.
@@ -1859,6 +1946,35 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         let _ = reply.send(Err(Error::Protocol("x11: connection torn down")));
     }
     result
+}
+
+/// Per-connection bookkeeping for the W7 session/forwarding policy gates that
+/// the dispatcher needs to mutate across calls: the set of currently-open
+/// `session` channels (for `MaxSessions`) and the server-keepalive state (for
+/// `ClientAliveInterval` / `ClientAliveCountMax`).
+struct ConnExtras {
+    /// Local ids of `session` channels currently open. `len()` is the live
+    /// session count checked against `MaxSessions`.
+    session_channels: BTreeSet<u32>,
+    /// Last instant we observed inbound traffic from the peer (reset on every
+    /// packet read). Drives the keepalive timer.
+    last_activity: Instant,
+    /// Last instant we sent a `keepalive@openssh.com` request.
+    last_keepalive: Instant,
+    /// Number of keepalive requests sent without a matching reply.
+    missed_keepalives: u32,
+}
+
+impl ConnExtras {
+    fn new() -> Self {
+        let now = Instant::now();
+        ConnExtras {
+            session_channels: BTreeSet::new(),
+            last_activity: now,
+            last_keepalive: now,
+            missed_keepalives: 0,
+        }
+    }
 }
 
 /// Helper trait to drain a `BTreeMap` in-place without using the unstable
@@ -1906,6 +2022,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
     agent_forward: &mut AgentForwardConn,
     x11_forward: &mut X11ForwardConn,
     polling_active: &mut bool,
+    extras: &mut ConnExtras,
 ) -> Result<()> {
     loop {
         *steps += 1;
@@ -1930,6 +2047,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                 user,
                 &payload,
                 any_channel_opened,
+                extras,
                 shells,
                 subsystems,
                 envs,
@@ -1955,11 +2073,16 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // `x11` channel-opens asynchronously and needs the 50 ms polling
         // tick to flush them.
         let any_x11_fwd_alive = !x11_forward.active.is_empty();
+        // ClientAliveInterval: the keepalive timer needs the loop to spin on
+        // the 50 ms tick even when nothing else is draining, so it can notice
+        // a silent peer and emit `keepalive@openssh.com`.
+        let keepalive_enabled = effective.client_alive_interval.is_some_and(|i| i > 0);
         let want_polling = any_shell_alive
             || any_subsystem_alive
             || any_forward_alive
             || any_agent_fwd_alive
-            || any_x11_fwd_alive;
+            || any_x11_fwd_alive
+            || keepalive_enabled;
         if want_polling && !*polling_active {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
             *polling_active = true;
@@ -1978,6 +2101,30 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             forward.drain_pending(stream, codec, rng, conn)?;
             agent_forward.drain_pending(stream, codec, rng, conn)?;
             x11_forward.drain_pending(stream, codec, rng, conn)?;
+        }
+
+        // ClientAliveInterval / ClientAliveCountMax (OpenSSH server keepalive).
+        // After `interval` seconds with no inbound traffic, send a
+        // `keepalive@openssh.com` global request (want_reply) and bump the
+        // missed counter; the peer's REQUEST_SUCCESS/FAILURE resets it. After
+        // CountMax unanswered probes, drop the connection.
+        if keepalive_enabled && !runner.is_kexing() {
+            let interval = Duration::from_secs(effective.client_alive_interval.unwrap_or(0) as u64);
+            let count_max = effective.client_alive_count_max.unwrap_or(3);
+            let now = Instant::now();
+            if now.duration_since(extras.last_activity) >= interval
+                && now.duration_since(extras.last_keepalive) >= interval
+            {
+                if extras.missed_keepalives >= count_max {
+                    return Err(Error::Protocol(
+                        "client keepalive: ClientAliveCountMax exceeded",
+                    ));
+                }
+                let p = conn.send_global_request(crate::channel::GlobalRequest::Keepalive, true);
+                write_payload(stream, codec, rng, &p)?;
+                extras.last_keepalive = now;
+                extras.missed_keepalives = extras.missed_keepalives.saturating_add(1);
+            }
         }
 
         if *any_channel_opened
@@ -2011,6 +2158,12 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         };
 
         let msg = payload.first().copied().unwrap_or(0);
+
+        // Any inbound packet proves the peer is alive: reset the keepalive
+        // activity clock and clear the unanswered-probe counter (a reply to our
+        // keepalive arrives as REQUEST_SUCCESS/FAILURE, but any traffic counts).
+        extras.last_activity = Instant::now();
+        extras.missed_keepalives = 0;
 
         // RFC 8308 §2.3: client may send a single SSH_MSG_EXT_INFO at the
         // post-NEWKEYS slot of the first KEX. Anywhere else it is a protocol
@@ -2083,6 +2236,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             user,
             &payload,
             any_channel_opened,
+            extras,
             shells,
             subsystems,
             envs,
@@ -2361,6 +2515,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     user: &str,
     payload: &[u8],
     any_channel_opened: &mut bool,
+    extras: &mut ConnExtras,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
     envs: &mut BTreeMap<u32, SessionEnv>,
@@ -2472,12 +2627,28 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
         ChannelEvent::OpenRequest { channel, kind } => match kind {
             ChannelOpen::Session => {
                 *any_channel_opened = true;
-                let p = conn.accept_open(channel)?;
-                write_payload(stream, codec, rng, &p)?;
-                // Allocate an empty per-channel env bag. Client `"env"`
-                // requests append to it; handlers read it on `exec` / `shell`
-                // / `subsystem` dispatch.
-                envs.insert(channel, SessionEnv::new());
+                // MaxSessions (capability ceiling): reject the open with
+                // resource-shortage once the live session-channel count would
+                // exceed the cap. `0` ⇒ no sessions at all.
+                if let Some(cap) = effective.max_sessions
+                    && extras.session_channels.len() as u64 >= cap as u64
+                {
+                    let p = conn.reject_open(
+                        channel,
+                        SSH_OPEN_RESOURCE_SHORTAGE,
+                        "MaxSessions limit reached",
+                        "",
+                    )?;
+                    write_payload(stream, codec, rng, &p)?;
+                } else {
+                    let p = conn.accept_open(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+                    extras.session_channels.insert(channel);
+                    // Allocate an empty per-channel env bag. Client `"env"`
+                    // requests append to it; handlers read it on `exec` /
+                    // `shell` / `subsystem` dispatch.
+                    envs.insert(channel, SessionEnv::new());
+                }
             }
             ChannelOpen::DirectTcpip {
                 dest_host,
@@ -2485,7 +2656,31 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 orig_host,
                 orig_port,
             } => {
-                if let Some(handler) = cfg.direct_tcpip_handler.clone() {
+                // AllowTcpForwarding / PermitOpen capability ceiling. A
+                // policy that forbids local forwarding, or whose PermitOpen
+                // list excludes this destination, rejects the open even when
+                // a direct-tcpip handler is attached.
+                let forwarding_ok = effective.local_forwarding_allowed();
+                // PermitOpen entries carry u16 ports; a dest_port outside that
+                // range can never match a configured entry (and is only
+                // permitted when PermitOpen is unset / `any`).
+                let dest_ok = u16::try_from(dest_port)
+                    .map(|p| effective.permit_open_allows(&dest_host, p))
+                    .unwrap_or_else(|_| effective.permit_open.is_none());
+                if !forwarding_ok || !dest_ok {
+                    let reason = if !forwarding_ok {
+                        "local forwarding administratively prohibited"
+                    } else {
+                        "direct-tcpip destination not permitted by PermitOpen"
+                    };
+                    let p = conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        reason,
+                        "",
+                    )?;
+                    write_payload(stream, codec, rng, &p)?;
+                } else if let Some(handler) = cfg.direct_tcpip_handler.clone() {
                     // Accept first, then hand off to the handler thread. The
                     // dispatcher routes subsequent Data/Eof/Close into the
                     // SubsystemRuntime mpsc just like for subsystems.
@@ -2625,6 +2820,8 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             // thread's next `Read` returns `Ok(0)` and the thread exits.
             subsystems.remove(&channel);
             envs.remove(&channel);
+            // Decrement the MaxSessions counter if this was a session channel.
+            extras.session_channels.remove(&channel);
             // Tear down any agent-forward listener bound to this session
             // channel. The handle's `Drop` impl stops the accept thread and
             // unlinks the on-disk socket.
@@ -2639,7 +2836,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             want_reply,
         } => {
             handle_global_request(
-                stream, codec, rng, conn, cfg, user, request, want_reply, forward,
+                stream, codec, rng, conn, cfg, effective, user, request, want_reply, forward,
             )?;
         }
         _ => {}
@@ -2654,6 +2851,7 @@ fn handle_global_request<R: RngCore + CryptoRng>(
     rng: &mut R,
     conn: &mut ConnectionState,
     cfg: &Config,
+    effective: &EffectivePolicy,
     user: &str,
     request: crate::channel::GlobalRequest,
     want_reply: bool,
@@ -2666,27 +2864,38 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             bind_address,
             bind_port,
         } => {
+            // AllowTcpForwarding / PermitListen / GatewayPorts capability
+            // ceiling. `remote` forwarding disabled, or a bind target outside
+            // PermitListen, fails the request without touching the kernel.
+            // GatewayPorts rewrites the bind address the handler will use.
+            let policy_ok = effective.remote_forwarding_allowed()
+                && (bind_port > u16::MAX as u32
+                    || effective.permit_listen_allows(&bind_address, bind_port as u16));
+            let effective_bind = crate::forwarding::reverse::apply_gateway_ports(
+                effective.gateway_ports,
+                &bind_address,
+            );
             // Refuse non-uint16 ports up front (the spec allows uint32 on the
             // wire but only 0..=65535 are meaningful).
-            let bound = if bind_port > u16::MAX as u32 {
+            let bound = if !policy_ok || bind_port > u16::MAX as u32 {
                 None
             } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
                 let ctx = ForwardContext::new(forward.req_tx.clone());
                 handler
-                    .bind(user, &bind_address, bind_port as u16, ctx)
+                    .bind(user, &effective_bind, bind_port as u16, ctx)
                     .ok()
             } else {
                 None
             };
             if !want_reply {
                 if let Some(port) = bound {
-                    forward.owned_bindings.push((bind_address, port));
+                    forward.owned_bindings.push((effective_bind, port));
                 }
                 return Ok(());
             }
             match bound {
                 Some(port) => {
-                    forward.owned_bindings.push((bind_address, port));
+                    forward.owned_bindings.push((effective_bind, port));
                     // When the client asked for port 0 the spec requires us
                     // to echo back the assigned port as a `uint32` tail.
                     let tail = if bind_port == 0 {
@@ -2709,16 +2918,22 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             bind_address,
             bind_port,
         } => {
+            // Rewrite the same way `bind` did so unbind targets the address the
+            // handler actually bound under the GatewayPorts policy.
+            let effective_bind = crate::forwarding::reverse::apply_gateway_ports(
+                effective.gateway_ports,
+                &bind_address,
+            );
             let ok = if bind_port > u16::MAX as u32 {
                 false
             } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
                 let r = handler
-                    .unbind(user, &bind_address, bind_port as u16)
+                    .unbind(user, &effective_bind, bind_port as u16)
                     .is_ok();
                 if r {
                     forward
                         .owned_bindings
-                        .retain(|(a, p)| !(a == &bind_address && *p == bind_port as u16));
+                        .retain(|(a, p)| !(a == &effective_bind && *p == bind_port as u16));
                 }
                 r
             } else {
@@ -2769,6 +2984,23 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     let empty_env = SessionEnv::new();
     match request {
         ChannelRequest::Exec { command } => {
+            // ForceCommand (capability ceiling): when set, the client's
+            // command is replaced by the forced one and exposed verbatim via
+            // SSH_ORIGINAL_COMMAND. `internal-sftp` routes the session into
+            // the in-process SFTP subsystem instead of running a command.
+            let command = if let Some(forced) = effective.force_command.as_deref() {
+                envs.entry(channel)
+                    .or_default()
+                    .insert("SSH_ORIGINAL_COMMAND".to_string(), command.clone());
+                if forced.eq_ignore_ascii_case("internal-sftp") {
+                    return route_internal_sftp(
+                        stream, codec, rng, conn, cfg, user, channel, want_reply, subsystems, envs,
+                    );
+                }
+                forced.to_string()
+            } else {
+                command
+            };
             // First-chance overlay: ask the ExecStreamHandler (if any)
             // whether it wants to claim this command. The decision must
             // happen synchronously — we can't take back a `request_success`
@@ -2882,6 +3114,59 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             }
         }
         ChannelRequest::Shell => {
+            // ForceCommand on an interactive shell: OpenSSH runs the forced
+            // command instead of the login shell, with an empty
+            // SSH_ORIGINAL_COMMAND. `internal-sftp` routes to SFTP; any other
+            // forced command runs through the buffered command handler.
+            if let Some(forced) = effective.force_command.as_deref() {
+                envs.entry(channel)
+                    .or_default()
+                    .insert("SSH_ORIGINAL_COMMAND".to_string(), String::new());
+                if forced.eq_ignore_ascii_case("internal-sftp") {
+                    return route_internal_sftp(
+                        stream, codec, rng, conn, cfg, user, channel, want_reply, subsystems, envs,
+                    );
+                }
+                let env_ref = envs.get(&channel).unwrap_or(&empty_env);
+                let result = cfg.command_handler.handle(user, env_ref, forced);
+                if want_reply {
+                    let p = conn.send_request_success(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
+                drain_send(
+                    stream,
+                    codec,
+                    rng,
+                    inbox,
+                    conn,
+                    channel,
+                    &result.stdout,
+                    None,
+                )?;
+                drain_send(
+                    stream,
+                    codec,
+                    rng,
+                    inbox,
+                    conn,
+                    channel,
+                    &result.stderr,
+                    Some(SSH_EXTENDED_DATA_STDERR),
+                )?;
+                let p = conn.send_request(
+                    channel,
+                    ChannelRequest::ExitStatus {
+                        code: result.exit_status,
+                    },
+                    false,
+                )?;
+                write_payload(stream, codec, rng, &p)?;
+                let p = conn.send_eof(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+                let p = conn.send_close(channel)?;
+                write_payload(stream, codec, rng, &p)?;
+                return Ok(());
+            }
             if let Some(handler) = cfg.shell_handler.clone() {
                 let rt = shells.entry(channel).or_insert_with(ShellRuntime::new);
                 let pty = rt.pending_pty.take();
@@ -3110,6 +3395,56 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     Ok(())
 }
 
+/// Route a session into the in-process SFTP subsystem, used by
+/// `ForceCommand internal-sftp`. Mirrors the `ChannelRequest::Subsystem`
+/// dispatch with a fixed `"sftp"` name: spawns the subsystem handler on its
+/// own thread bound to a freshly-registered [`SubsystemRuntime`]. If no
+/// subsystem handler is attached the request fails.
+#[allow(clippy::too_many_arguments)]
+fn route_internal_sftp<R: RngCore + CryptoRng>(
+    stream: &mut TcpStream,
+    codec: &mut PacketCodec,
+    rng: &mut R,
+    conn: &mut ConnectionState,
+    cfg: &Config,
+    user: &str,
+    channel: u32,
+    want_reply: bool,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    envs: &mut BTreeMap<u32, SessionEnv>,
+) -> Result<()> {
+    if let Some(handler) = cfg.subsystem_handler.clone() {
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+        let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+        let cs = ChannelStream::new(ingress_rx, egress_tx);
+        let user_owned = user.to_string();
+        let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
+        thread::spawn(move || {
+            let _ = handler.handle(&user_owned, &env_snapshot, "sftp", cs);
+        });
+        subsystems.insert(
+            channel,
+            SubsystemRuntime {
+                ingress_tx,
+                egress_rx,
+                pending_data: Vec::new(),
+                pending_eof: false,
+                pending_close: false,
+                eof_sent: false,
+                close_sent: false,
+            },
+        );
+        if want_reply {
+            let p = conn.send_request_success(channel)?;
+            write_payload(stream, codec, rng, &p)?;
+        }
+    } else if want_reply {
+        let p = conn.send_request_failure(channel)?;
+        write_payload(stream, codec, rng, &p)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drain_send<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
@@ -3262,7 +3597,21 @@ fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
 
     let ciphers = owned_or_default(&cfg.ciphers, defaults::CIPHERS);
     let macs = owned_or_default(&cfg.macs, defaults::MACS);
-    let comp: Vec<String> = defaults::COMP.iter().map(|s| s.to_string()).collect();
+    // `Compression no` strips any zlib names from the advert. puressh only
+    // advertises `none` today, so this is a defensive no-op; it becomes
+    // load-bearing once SSH-layer zlib is added to `defaults::COMP`.
+    // `yes` / `delayed` keep the default advert.
+    let comp: Vec<String> = defaults::COMP
+        .iter()
+        .filter(|name| {
+            if cfg.compression == Some(crate::config::Compression::No) {
+                !name.contains("zlib")
+            } else {
+                true
+            }
+        })
+        .map(|s| s.to_string())
+        .collect();
 
     let algs = KexAlgorithmsOwned {
         kex,

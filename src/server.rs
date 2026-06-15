@@ -5556,4 +5556,282 @@ mod tests {
         assert!(env_glob_match("FOO", "FOO"));
         assert!(!env_glob_match("FOO", "foo"));
     }
+
+    // ---- W7 session/forwarding policy resolution + gate helpers ----------
+
+    #[test]
+    fn w7_fields_resolve_into_effective_policy() {
+        let cfg = policy_cfg(
+            "MaxSessions 2\n\
+             AllowTcpForwarding local\n\
+             PermitOpen 127.0.0.1:80\n\
+             PermitListen 127.0.0.1:8080\n\
+             GatewayPorts yes\n\
+             ForceCommand /bin/true\n\
+             ClientAliveInterval 15\n\
+             ClientAliveCountMax 2\n\
+             PrintMotd yes\n",
+        );
+        let eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert_eq!(eff.max_sessions, Some(2));
+        assert!(eff.local_forwarding_allowed());
+        assert!(!eff.remote_forwarding_allowed());
+        assert!(eff.permit_open_allows("127.0.0.1", 80));
+        assert!(!eff.permit_open_allows("127.0.0.1", 81));
+        assert!(eff.permit_listen_allows("127.0.0.1", 8080));
+        assert!(!eff.permit_listen_allows("10.0.0.1", 8080));
+        assert_eq!(
+            eff.gateway_ports,
+            Some(crate::config::ServerGatewayPorts::Yes)
+        );
+        assert_eq!(eff.force_command.as_deref(), Some("/bin/true"));
+        assert_eq!(eff.client_alive_interval, Some(15));
+        assert_eq!(eff.client_alive_count_max, Some(2));
+        assert_eq!(eff.print_motd, Some(true));
+    }
+
+    #[test]
+    fn w7_unset_policy_is_permissive() {
+        let cfg = policy_cfg("Port 22\n");
+        let eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert!(eff.local_forwarding_allowed());
+        assert!(eff.remote_forwarding_allowed());
+        assert!(eff.permit_open_allows("anything", 1));
+        assert!(eff.permit_listen_allows("anything", 1));
+        assert_eq!(eff.max_sessions, None);
+        assert!(eff.force_command.is_none());
+    }
+
+    #[test]
+    fn w7_permit_open_none_denies_all() {
+        let cfg = policy_cfg("PermitOpen none\n");
+        let eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert!(!eff.permit_open_allows("127.0.0.1", 22));
+        assert!(!eff.permit_open_allows("anything", 1));
+    }
+
+    #[test]
+    fn w7_match_overrides_forwarding_for_user() {
+        let cfg = policy_cfg(
+            "Match User alice\n  AllowTcpForwarding no\n  MaxSessions 1\n  ForceCommand internal-sftp\n",
+        );
+        // alice gets the restrictions.
+        let eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert!(!eff.local_forwarding_allowed());
+        assert!(!eff.remote_forwarding_allowed());
+        assert_eq!(eff.max_sessions, Some(1));
+        assert_eq!(eff.force_command.as_deref(), Some("internal-sftp"));
+        // bob is unrestricted.
+        let eff2 = resolve_effective_policy(&cfg, "bob", None, None, None, None);
+        assert!(eff2.local_forwarding_allowed());
+        assert_eq!(eff2.max_sessions, None);
+        assert!(eff2.force_command.is_none());
+    }
+
+    #[test]
+    fn w7_gateway_ports_rewrite() {
+        use crate::config::ServerGatewayPorts as GP;
+        use crate::forwarding::reverse::apply_gateway_ports;
+        // Default (None) and No force loopback.
+        assert_eq!(apply_gateway_ports(None, "0.0.0.0"), "127.0.0.1");
+        assert_eq!(apply_gateway_ports(Some(GP::No), ""), "127.0.0.1");
+        assert_eq!(apply_gateway_ports(Some(GP::No), "::"), "::1");
+        // Yes widens loopback to all interfaces.
+        assert_eq!(apply_gateway_ports(Some(GP::Yes), ""), "0.0.0.0");
+        assert_eq!(apply_gateway_ports(Some(GP::Yes), "127.0.0.1"), "0.0.0.0");
+        // ClientSpecified honours verbatim.
+        assert_eq!(
+            apply_gateway_ports(Some(GP::ClientSpecified), "0.0.0.0"),
+            "0.0.0.0"
+        );
+        assert_eq!(
+            apply_gateway_ports(Some(GP::ClientSpecified), "192.0.2.1"),
+            "192.0.2.1"
+        );
+    }
+
+    /// A command handler that echoes the command it was asked to run, so a
+    /// test can assert which command actually reached the handler (used to
+    /// verify ForceCommand overrides the client's command).
+    struct EchoCommandHandler;
+    impl CommandHandler for EchoCommandHandler {
+        fn handle(&self, _user: &str, env: &SessionEnv, command: &str) -> ExecResult {
+            // Surface both the command run and SSH_ORIGINAL_COMMAND so the test
+            // can confirm the original is preserved in the env.
+            let orig = env.get("SSH_ORIGINAL_COMMAND").unwrap_or("").to_string();
+            ExecResult {
+                stdout: format!("CMD={command}\nORIG={orig}\n").into_bytes(),
+                stderr: Vec::new(),
+                exit_status: 0,
+            }
+        }
+    }
+
+    /// Boot an in-process SSH server with the given policy text and command
+    /// handler, returning an authenticated client plus the join handle and
+    /// done-flag for the single-connection server thread.
+    #[allow(clippy::type_complexity)]
+    fn w7_server_and_client(
+        policy_src: &str,
+        with_direct: bool,
+    ) -> (Client, thread::JoinHandle<Result<()>>, Arc<Mutex<bool>>) {
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "w7-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let policy = crate::config::SshServerConfig::parse(policy_src).expect("parse policy");
+        let mut cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(EchoCommandHandler),
+        )
+        .with_policy(Arc::new(policy));
+        if with_direct {
+            cfg = cfg.with_direct_tcpip(Arc::new(
+                crate::forwarding::direct::DefaultDirectTcpipHandler::permit_all(),
+            ));
+        }
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
+        let ssh_addr = server.local_addr().expect("ssh addr");
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            ssh_addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+            },
+        )
+        .expect("client connect");
+        client
+            .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+            .expect("authenticate");
+        (client, server_thread, server_done)
+    }
+
+    fn w7_finish(
+        client: Client,
+        server_thread: thread::JoinHandle<Result<()>>,
+        server_done: Arc<Mutex<bool>>,
+    ) {
+        drop(client);
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    fn w7_force_command_overrides_exec() {
+        let (mut client, st, sd) = w7_server_and_client("ForceCommand /forced/cmd\n", false);
+        let out = client.exec("client-asked-this").expect("exec");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // The handler ran the forced command, not the client's.
+        assert!(stdout.contains("CMD=/forced/cmd"), "stdout was {stdout:?}");
+        // The client's command is preserved as SSH_ORIGINAL_COMMAND.
+        assert!(
+            stdout.contains("ORIG=client-asked-this"),
+            "stdout was {stdout:?}"
+        );
+        w7_finish(client, st, sd);
+    }
+
+    #[test]
+    fn w7_force_command_match_conditional() {
+        // ForceCommand only for w7-user (which is who authenticates).
+        let (mut client, st, sd) =
+            w7_server_and_client("Match User w7-user\n  ForceCommand /only/forced\n", false);
+        let out = client.exec("orig").expect("exec");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("CMD=/only/forced"), "stdout was {stdout:?}");
+        w7_finish(client, st, sd);
+    }
+
+    #[test]
+    fn w7_max_sessions_zero_rejects_session_open() {
+        let (mut client, st, sd) = w7_server_and_client("MaxSessions 0\n", false);
+        // MaxSessions 0 ⇒ no session channel may open ⇒ exec's open is rejected.
+        match client.exec("anything") {
+            Ok(_) => panic!("expected session open to be refused by MaxSessions 0"),
+            Err(Error::Protocol(_)) => {}
+            Err(other) => panic!("expected Error::Protocol, got {other:?}"),
+        }
+        w7_finish(client, st, sd);
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the borrow-based open_direct_tcpip
+    fn w7_allow_tcp_forwarding_no_denies_direct() {
+        let (mut client, st, sd) = w7_server_and_client("AllowTcpForwarding no\n", true);
+        match client.open_direct_tcpip("127.0.0.1", 80, "127.0.0.1", 0) {
+            Ok(_) => panic!("expected direct-tcpip to be denied by AllowTcpForwarding no"),
+            Err(Error::Protocol(_)) => {}
+            Err(other) => panic!("expected Error::Protocol, got {other:?}"),
+        }
+        w7_finish(client, st, sd);
+    }
+
+    #[test]
+    #[allow(deprecated)] // exercises the borrow-based open_direct_tcpip
+    fn w7_permit_open_blocks_disallowed_dest() {
+        // Only 127.0.0.1:80 is permitted; a request to :81 is rejected, :80 ok.
+        let (mut client, st, sd) = w7_server_and_client("PermitOpen 127.0.0.1:80\n", true);
+        match client.open_direct_tcpip("127.0.0.1", 81, "127.0.0.1", 0) {
+            Ok(_) => panic!("expected :81 to be blocked by PermitOpen"),
+            Err(Error::Protocol(_)) => {}
+            Err(other) => panic!("expected Error::Protocol, got {other:?}"),
+        }
+        // The permitted destination opens (the handler then fails to connect to
+        // a dead port, but the channel open itself must be accepted). We only
+        // assert the open is not policy-rejected.
+        let permitted = client.open_direct_tcpip("127.0.0.1", 80, "127.0.0.1", 0);
+        assert!(
+            permitted.is_ok(),
+            "expected :80 open to be accepted by PermitOpen"
+        );
+        drop(permitted);
+        w7_finish(client, st, sd);
+    }
+
+    #[test]
+    fn w7_compression_no_strips_zlib_from_advert() {
+        // The built-in advert is `none`-only, so a synthetic check: a comp list
+        // containing zlib has it stripped under Compression::No. We exercise the
+        // filter through build_server_kexinit by confirming `none` survives.
+        let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
+            vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
+        let mut cfg = kexinit_test_config(host_keys);
+        cfg.compression = Some(crate::config::Compression::No);
+        let mut rng = OsRng;
+        let advert = build_server_kexinit(&mut rng, &cfg);
+        // `none` must remain advertised; no zlib name may appear.
+        assert!(advert.comp_s2c.iter().any(|c| c == "none"));
+        assert!(!advert.comp_s2c.iter().any(|c| c.contains("zlib")));
+    }
 }

@@ -57,6 +57,18 @@ struct LocalForward {
     remote_port: u16,
 }
 
+/// Parsed `-D [bind:]port` spec — client binds a SOCKS proxy listener;
+/// each accepted SOCKS CONNECT becomes a `direct-tcpip` channel to the
+/// SOCKS-requested target. Mirrors [`LocalForward`] but the destination is
+/// chosen per-connection by the SOCKS client rather than fixed up front.
+#[derive(Clone, Debug)]
+struct DynamicForward {
+    /// Local bind address (already resolved through GatewayPorts).
+    bind_addr: String,
+    /// Local port to bind the SOCKS listener on.
+    listen_port: u16,
+}
+
 /// Parsed `-X` / `-Y` mode. `Untrusted` corresponds to `-X` (untrusted X11
 /// forwarding); `Trusted` to `-Y`. In v0 both modes emit identical wire
 /// arguments (`single_connection=false`, screen 0, generated cookie). The
@@ -98,6 +110,17 @@ struct Cli {
     identities_only: Option<bool>,
     locals: Vec<LocalForward>,
     remotes: Vec<RemoteForward>,
+    /// `-D [bind:]port`: SOCKS dynamic-forward listeners (bind addr not yet
+    /// resolved through GatewayPorts — that happens in `run`).
+    dynamics_raw: Vec<puressh::config::DynamicForwardSpec>,
+    /// `-o Compression={yes,no}`. `None` when not supplied on the CLI.
+    compression: Option<bool>,
+    /// `-t` (force PTY) / `-T` (disable PTY) / `-o RequestTTY=…`. `None`
+    /// when neither was supplied; the config `RequestTTY` then wins.
+    request_tty: Option<puressh::config::RequestTty>,
+    /// Raw `KEY VALUE` lines for `-o` options not consumed into a dedicated
+    /// Cli field; parsed in `run` as a highest-priority synthetic block.
+    extra_o: Vec<String>,
     no_command: bool,
     /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
     /// Repeated single `-v`s also stack and saturate at 3. Drives
@@ -134,6 +157,45 @@ fn parse_local_forward(s: &str) -> Result<LocalForward, String> {
         remote_host,
         remote_port,
     })
+}
+
+/// Parse one `-D` arg value: `[bind_address:]port`. Reuses the config-layer
+/// `[bind:]port` splitter so `-D 1080`, `-D 127.0.0.1:1080`, and
+/// `-D [::1]:1080` all parse identically to a `DynamicForward` keyword.
+fn parse_dynamic_forward(s: &str) -> Result<puressh::config::DynamicForwardSpec, String> {
+    // `[bind]:port` (bracketed v6) or `[bind:]port`.
+    if let Some(rest) = s.strip_prefix('[') {
+        let (addr, port) = rest
+            .split_once("]:")
+            .ok_or_else(|| format!("-D: malformed bracketed bind:port {s:?}"))?;
+        let listen_port = port
+            .parse::<u16>()
+            .map_err(|_| format!("-D: bad port in {s:?}"))?;
+        return Ok(puressh::config::DynamicForwardSpec {
+            bind_addr: Some(addr.to_string()),
+            listen_port,
+        });
+    }
+    match s.rsplit_once(':') {
+        Some((addr, port)) => {
+            let listen_port = port
+                .parse::<u16>()
+                .map_err(|_| format!("-D: bad port in {s:?}"))?;
+            Ok(puressh::config::DynamicForwardSpec {
+                bind_addr: Some(addr.to_string()),
+                listen_port,
+            })
+        }
+        None => {
+            let listen_port = s
+                .parse::<u16>()
+                .map_err(|_| format!("-D expects [bind:]port, got {s:?}"))?;
+            Ok(puressh::config::DynamicForwardSpec {
+                bind_addr: None,
+                listen_port,
+            })
+        }
+    }
 }
 
 /// Parse one `-R` arg value: `RPORT:LHOST:LPORT`. Same v6 rules as `-L`.
@@ -208,6 +270,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut identities_only: Option<bool> = None;
     let mut locals: Vec<LocalForward> = Vec::new();
     let mut remotes: Vec<RemoteForward> = Vec::new();
+    let mut dynamics_raw: Vec<puressh::config::DynamicForwardSpec> = Vec::new();
+    let mut compression: Option<bool> = None;
+    let mut request_tty: Option<puressh::config::RequestTty> = None;
+    let mut extra_o: Vec<String> = Vec::new();
     let mut no_command = false;
     let mut agent_forward = false;
     let mut x11_forward: Option<X11Forward> = None;
@@ -252,6 +318,24 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 i += 1;
                 let v = args.get(i).ok_or("-R requires a value")?;
                 remotes.push(parse_remote_forward(v)?);
+            }
+            "-D" => {
+                i += 1;
+                let v = args.get(i).ok_or("-D requires a value")?;
+                dynamics_raw.push(parse_dynamic_forward(v)?);
+            }
+            // `-C` enables compression (OpenSSH's flag form of
+            // `Compression yes`). There is no flag to turn it off.
+            "-C" => {
+                compression = Some(true);
+            }
+            // `-t` forces PTY allocation; `-T` disables it. These map onto
+            // RequestTTY Force / No and win over the config keyword.
+            "-t" => {
+                request_tty = Some(puressh::config::RequestTty::Force);
+            }
+            "-T" => {
+                request_tty = Some(puressh::config::RequestTty::No);
             }
             "-N" => {
                 no_command = true;
@@ -309,8 +393,28 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         identities_only =
                             Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
                     }
-                    other => {
-                        return Err(format!("unsupported -o option: {other}={val}"));
+                    "compression" => {
+                        compression = Some(match val.to_ascii_lowercase().as_str() {
+                            "yes" | "on" | "true" => true,
+                            "no" | "off" | "false" => false,
+                            other => return Err(format!("unknown Compression={other}")),
+                        });
+                    }
+                    "requesttty" => {
+                        request_tty = Some(match val.to_ascii_lowercase().as_str() {
+                            "no" => puressh::config::RequestTty::No,
+                            "yes" => puressh::config::RequestTty::Yes,
+                            "force" => puressh::config::RequestTty::Force,
+                            "auto" => puressh::config::RequestTty::Auto,
+                            other => return Err(format!("unknown RequestTTY={other}")),
+                        });
+                    }
+                    // Every other recognised ssh_config keyword is routed
+                    // through the real config parser (as a highest-priority
+                    // synthetic block) so `-o KEY=VAL` honours the same strict
+                    // validation as the file. Collected here; applied in run().
+                    _ => {
+                        extra_o.push(format!("{k} {val}"));
                     }
                 }
             }
@@ -351,8 +455,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         known_hosts_path,
         hash_known_hosts,
         identities_only,
+        extra_o,
         locals,
         remotes,
+        dynamics_raw,
+        compression,
+        request_tty,
         no_command,
         agent_forward,
         x11_forward,
@@ -362,6 +470,73 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         user_in_host,
         command,
     })
+}
+
+/// Merge the `-o KEY=VALUE` options collected in [`Cli::extra_o`] into the
+/// resolved config block. We parse them as a standalone synthetic config so
+/// each honours the real strict parser (rejecting unknown keywords and bad
+/// values exactly as the file would), then overlay every field the synthetic
+/// block actually set on top of `cfg_block` — giving `-o` the highest
+/// precedence, matching OpenSSH.
+fn apply_extra_o(
+    cfg_block: &mut puressh::config::ClientOptions,
+    extra_o: &[String],
+) -> Result<(), String> {
+    if extra_o.is_empty() {
+        return Ok(());
+    }
+    let src = extra_o.join("\n");
+    let parsed = puressh::config::SshClientConfig::parse(&src).map_err(|e| format!("-o: {e}"))?;
+    let o = parsed.lookup("*");
+    // Scalars: a `Some` in the synthetic block wins.
+    macro_rules! overlay {
+        ($($f:ident),* $(,)?) => { $( if o.$f.is_some() { cfg_block.$f = o.$f.clone(); } )* };
+    }
+    overlay!(
+        host_name,
+        port,
+        user,
+        identities_only,
+        strict_host_key,
+        user_known_hosts,
+        hash_known_hosts,
+        forward_agent,
+        forward_x11,
+        forward_x11_trusted,
+        request_tty,
+        log_level,
+        ciphers,
+        macs,
+        kex_algorithms,
+        host_key_algorithms,
+        pubkey_accepted_algorithms,
+        proxy_command,
+        proxy_jump,
+        compression,
+        connect_timeout,
+        server_alive_interval,
+        server_alive_count_max,
+        tcp_keep_alive,
+        add_keys_to_agent,
+        preferred_authentications,
+        pubkey_authentication,
+        number_of_password_prompts,
+        batch_mode,
+        exit_on_forward_failure,
+        clear_all_forwardings,
+        gateway_ports,
+        address_family,
+        bind_address,
+        identity_agent,
+    );
+    // Cumulative lists: append whatever the -o block contributed.
+    cfg_block.identity_files.extend(o.identity_files);
+    cfg_block.local_forwards.extend(o.local_forwards);
+    cfg_block.remote_forwards.extend(o.remote_forwards);
+    cfg_block.dynamic_forwards.extend(o.dynamic_forwards);
+    cfg_block.set_env.extend(o.set_env);
+    cfg_block.send_env.extend(o.send_env);
+    Ok(())
 }
 
 /// One parsed `ProxyJump` hop: `[user@]host[:port]`.
@@ -401,6 +576,22 @@ fn collect_credentials(
     cli_identities: &[String],
     identities_only: bool,
 ) -> Vec<ClientCredential> {
+    // `PubkeyAuthentication no` (or a PreferredAuthentications list that omits
+    // publickey) disables publickey credentials entirely — return nothing so
+    // the auth driver falls straight to password.
+    if cfg_block.pubkey_authentication == Some(false) {
+        vlog(1, "PubkeyAuthentication no: skipping publickey credentials");
+        return Vec::new();
+    }
+    if let Some(prefs) = cfg_block.preferred_authentications.as_ref()
+        && !prefs.iter().any(|m| m == "publickey")
+    {
+        vlog(
+            1,
+            "PreferredAuthentications excludes publickey: skipping publickey credentials",
+        );
+        return Vec::new();
+    }
     let mut credentials: Vec<ClientCredential> = Vec::new();
     if !identities_only {
         match connect_agent_credentials() {
@@ -478,6 +669,7 @@ fn authenticate_client(
     client: &mut Client,
     user: &str,
     credentials: Vec<ClientCredential>,
+    cfg_block: &puressh::config::ClientOptions,
 ) -> Result<(), String> {
     let authed = if !credentials.is_empty() {
         vlog(
@@ -504,17 +696,59 @@ fn authenticate_client(
         );
         false
     };
-
-    if !authed {
-        // Password reader honors $SSH_ASKPASS and suppresses terminal echo
-        // on Unix via termios (see src/bin/common.rs).
-        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
-        client
-            .authenticate_password(user, &password)
-            .map_err(|e| format!("Auth failed: {e}"))?;
-        vlog(1, &format!("authenticated as {user} via password"));
+    if authed {
+        return Ok(());
     }
-    Ok(())
+
+    // Whether password auth is permitted: BatchMode disables it outright;
+    // PreferredAuthentications must include "password"; NumberOfPasswordPrompts
+    // 0 also disables it.
+    let batch = cfg_block.batch_mode == Some(true);
+    let password_allowed_by_prefs = cfg_block
+        .preferred_authentications
+        .as_ref()
+        .map(|p| p.iter().any(|m| m == "password"))
+        .unwrap_or(true);
+    // OpenSSH default is 3 attempts.
+    let max_prompts = cfg_block.number_of_password_prompts.unwrap_or(3);
+
+    if batch {
+        return Err(
+            "Auth failed: BatchMode is on and publickey auth did not succeed (no password prompt)"
+                .into(),
+        );
+    }
+    if !password_allowed_by_prefs {
+        return Err(
+            "Auth failed: publickey auth did not succeed and PreferredAuthentications excludes password"
+                .into(),
+        );
+    }
+    if max_prompts == 0 {
+        return Err(
+            "Auth failed: publickey auth did not succeed and NumberOfPasswordPrompts is 0".into(),
+        );
+    }
+
+    // Up to `max_prompts` interactive password attempts. The reader honors
+    // $SSH_ASKPASS and suppresses terminal echo on Unix (see common.rs).
+    let mut last_err = String::from("no attempt made");
+    for attempt in 1..=max_prompts {
+        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
+        match client.authenticate_password(user, &password) {
+            Ok(()) => {
+                vlog(1, &format!("authenticated as {user} via password"));
+                return Ok(());
+            }
+            Err(e) => {
+                last_err = format!("{e}");
+                if attempt < max_prompts {
+                    eprintln!("Permission denied, please try again.");
+                }
+            }
+        }
+    }
+    Err(format!("Auth failed: {last_err}"))
 }
 
 /// Build the [`Config`] for a host from its resolved ssh_config block:
@@ -523,7 +757,12 @@ fn config_for_host(
     cfg_block: &puressh::config::ClientOptions,
     cli: &Cli,
 ) -> Result<Config, String> {
-    let strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    let mut strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    // BatchMode never prompts. An interactive `ask` would block forever
+    // under BatchMode, so OpenSSH promotes it to `yes` (refuse unknown).
+    if cfg_block.batch_mode == Some(true) && strict == StrictMode::Ask {
+        strict = StrictMode::Yes;
+    }
     let known_hosts_path = cli
         .known_hosts_path
         .clone()
@@ -539,6 +778,10 @@ fn config_for_host(
             kex_algorithms: cfg_block.kex_algorithms.clone(),
             host_key_algorithms: cfg_block.host_key_algorithms.clone(),
             pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
+            // -o Compression / config Compression. The keyword is rejected
+            // up front (in run()) when the `compress` feature is absent, so
+            // by the time we get here Some(true) is honourable.
+            compression: cli.compression.or(cfg_block.compression),
         },
     })
 }
@@ -588,13 +831,153 @@ fn connect_jump_chain(
         // ProxyJump hops authenticate with config/agent/default identities
         // only — the CLI `-i` list belongs to the final target.
         let credentials = collect_credentials(&block, &[], block.identities_only.unwrap_or(false));
-        authenticate_client(&mut hop_client, &user, credentials)
+        authenticate_client(&mut hop_client, &user, credentials, &block)
             .map_err(|e| format!("proxyjump hop {}: {e}", idx + 1))?;
         vlog(1, &format!("proxyjump hop {}: authenticated", idx + 1));
 
         current = Some(hop_client.into());
     }
     current.ok_or_else(|| "ProxyJump: no hops".into())
+}
+
+/// Build the environment to forward to the server: `SetEnv` literals
+/// (first-wins on duplicate names) plus `SendEnv` patterns matched against
+/// the local process environment.
+fn build_session_env(cfg_block: &puressh::config::ClientOptions) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    // SetEnv: literal NAME=VALUE; first occurrence of a name wins.
+    for (name, value) in &cfg_block.set_env {
+        if seen.insert(name.clone()) {
+            out.push((name.clone(), value.clone()));
+        }
+    }
+    // SendEnv: forward matching local env vars. Patterns use glob-style `*`
+    // / `?` (OpenSSH semantics). A name already set via SetEnv is not
+    // overwritten.
+    if !cfg_block.send_env.is_empty() {
+        let env: Vec<(String, String)> = std::env::vars().collect();
+        for pat in &cfg_block.send_env {
+            for (name, value) in &env {
+                if !seen.contains(name) && send_env_matches(pat, name) {
+                    seen.insert(name.clone());
+                    out.push((name.clone(), value.clone()));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Match a `SendEnv` pattern against an environment-variable name. Supports
+/// `*` (any run) and `?` (one char), matching OpenSSH's pattern syntax. The
+/// match is anchored (the whole name must match).
+fn send_env_matches(pattern: &str, name: &str) -> bool {
+    fn rec(p: &[u8], n: &[u8]) -> bool {
+        match p.first() {
+            None => n.is_empty(),
+            Some(b'*') => rec(&p[1..], n) || (!n.is_empty() && rec(p, &n[1..])),
+            Some(b'?') => !n.is_empty() && rec(&p[1..], &n[1..]),
+            Some(&c) => !n.is_empty() && n[0] == c && rec(&p[1..], &n[1..]),
+        }
+    }
+    rec(pattern.as_bytes(), name.as_bytes())
+}
+
+/// Honour `AddKeysToAgent yes`: push each `-i` / config / default identity
+/// the user supplied into the running ssh-agent so later sessions can reuse
+/// it without re-reading the file. Best-effort and Unix-only (the agent
+/// client is `cfg(unix)`); failures warn but never abort the session.
+#[cfg(unix)]
+fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli) {
+    if cfg_block.add_keys_to_agent != Some(true) {
+        return;
+    }
+    use puressh::agent::Agent;
+    let mut agent = match Agent::connect_env() {
+        Ok(Some(a)) => a,
+        Ok(None) => {
+            eprintln!("warning: AddKeysToAgent: no agent at $SSH_AUTH_SOCK; skipping");
+            return;
+        }
+        Err(e) => {
+            eprintln!("warning: AddKeysToAgent: agent connect: {e}");
+            return;
+        }
+    };
+    // Collect the identity file paths the same way collect_credentials does,
+    // minus the agent's own identities (which are already loaded).
+    let mut paths: Vec<String> = cli.identities.clone();
+    for p in &cfg_block.identity_files {
+        paths.push(expand_tilde(p));
+    }
+    for p in default_identity_paths() {
+        paths.push(p.to_string_lossy().into_owned());
+    }
+    for path in paths {
+        // Missing / unreadable files are normal for the default identity
+        // list; load_identity already logs read errors, so skip silently.
+        if let Ok(pk) = load_identity(&path) {
+            match agent.add_identity(&pk) {
+                Ok(()) => vlog(1, &format!("AddKeysToAgent: added {path}")),
+                Err(e) => eprintln!("warning: AddKeysToAgent: add {path}: {e}"),
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn maybe_add_keys_to_agent(_cfg_block: &puressh::config::ClientOptions, _cli: &Cli) {}
+
+/// Decide whether the one-shot `exec` path should allocate a PTY, honouring
+/// `RequestTTY` (CLI `-t`/`-T`/`-o RequestTTY` over the config keyword):
+///   - Force / Yes ⇒ always (even for a remote command);
+///   - No ⇒ never;
+///   - Auto / unset ⇒ only when local stdin is a tty.
+#[cfg(unix)]
+fn want_exec_pty(cli: &Cli, cfg_block: &puressh::config::ClientOptions) -> bool {
+    use puressh::config::RequestTty::*;
+    match cli.request_tty.or(cfg_block.request_tty) {
+        Some(Force) | Some(Yes) => true,
+        Some(No) => false,
+        Some(Auto) | None => stdin_is_tty(),
+    }
+}
+
+/// Honour `IdentityAgent`. `none` clears `$SSH_AUTH_SOCK` so no agent is
+/// consulted; a path overrides it (expanding the `SSH_AUTH_SOCK` /
+/// `$SSH_AUTH_SOCK` token to the inherited value and `~`). When unset, the
+/// inherited `$SSH_AUTH_SOCK` stands. `identities_only` is informational
+/// (the agent is skipped for credentials anyway) but we still set the env so
+/// AddKeysToAgent targets the right socket.
+fn apply_identity_agent(
+    setting: Option<&puressh::config::IdentityAgent>,
+    _identities_only: bool,
+) {
+    use puressh::config::IdentityAgent;
+    match setting {
+        None => {}
+        Some(IdentityAgent::None) => {
+            // SAFETY: single-threaded at this point (before any forwarding
+            // threads spawn); removing an env var is sound here.
+            unsafe {
+                std::env::remove_var("SSH_AUTH_SOCK");
+            }
+        }
+        Some(IdentityAgent::Path(p)) => {
+            // Expand the SSH_AUTH_SOCK token (OpenSSH allows referencing the
+            // inherited socket) and `~`.
+            let inherited = std::env::var("SSH_AUTH_SOCK").unwrap_or_default();
+            let expanded = p
+                .replace("$SSH_AUTH_SOCK", &inherited)
+                .replace("SSH_AUTH_SOCK", &inherited);
+            let expanded = expand_tilde(&expanded);
+            // SAFETY: see above — still single-threaded.
+            unsafe {
+                std::env::set_var("SSH_AUTH_SOCK", &expanded);
+            }
+        }
+    }
 }
 
 fn run() -> Result<i32, String> {
@@ -617,7 +1000,32 @@ fn run() -> Result<i32, String> {
     // values then take precedence over the block; the block over built-in
     // defaults (OpenSSH's documented order).
     let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
-    let cfg_block = ssh_cfg.lookup(&cli.host);
+    let mut cfg_block = ssh_cfg.lookup(&cli.host);
+    // `-o KEY=VALUE` overlays the matched block at the highest precedence,
+    // re-using the strict config parser for validation.
+    apply_extra_o(&mut cfg_block, &cli.extra_o)?;
+
+    // Compression requires the `compress` feature. Reject up front (rather
+    // than silently advertising `none`) so the directive can never look like
+    // it took effect when the build can't honour it.
+    let want_compression = cli.compression.or(cfg_block.compression) == Some(true);
+    if want_compression && !cfg!(feature = "compress") {
+        return Err(
+            "Compression yes requested but this build lacks the `compress` feature".into(),
+        );
+    }
+
+    // `ClearAllForwardings yes` discards every forward gathered so far —
+    // CLI `-L/-R/-D` and the config's own forward lists — before we add the
+    // config-derived ones below. Matches OpenSSH: the cleared state wins.
+    if cfg_block.clear_all_forwardings == Some(true) {
+        cli.locals.clear();
+        cli.remotes.clear();
+        cli.dynamics_raw.clear();
+        cfg_block.local_forwards.clear();
+        cfg_block.remote_forwards.clear();
+        cfg_block.dynamic_forwards.clear();
+    }
 
     // Append ssh_config-supplied forwards alongside `-L` / `-R` from the CLI.
     // (Both lists are additive; OpenSSH treats `LocalForward` entries the
@@ -634,6 +1042,22 @@ fn run() -> Result<i32, String> {
             remote_port: rf.remote_port,
             local_host: rf.local_host.clone(),
             local_port: rf.local_port,
+        });
+    }
+    // DynamicForward: gather `-D` and config entries, resolving each
+    // listener's bind address through GatewayPorts.
+    let gateway = cfg_block
+        .gateway_ports
+        .unwrap_or(puressh::config::GatewayPorts::No);
+    let mut dynamics: Vec<DynamicForward> = Vec::new();
+    for d in cli
+        .dynamics_raw
+        .iter()
+        .chain(cfg_block.dynamic_forwards.iter())
+    {
+        dynamics.push(DynamicForward {
+            bind_addr: resolve_bind_addr(gateway, d.bind_addr.as_deref()),
+            listen_port: d.listen_port,
         });
     }
     // `ForwardAgent yes` / `ForwardX11 yes` flip the CLI-side toggles if the
@@ -747,17 +1171,50 @@ fn run() -> Result<i32, String> {
         }
     } else {
         // ---- direct TCP ----
-        // Use connect_to_host so KnownHosts can look the host up by its
-        // user-supplied name.
+        // Dial through dial_tcp so ConnectTimeout / BindAddress /
+        // AddressFamily / TCPKeepAlive take real effect, then run the client
+        // over the configured socket via connect_via (which still threads
+        // connect_host through so KnownHosts looks the host up by name).
         vlog(1, &format!("connecting to {connect_host}:{port}"));
-        let client = Client::connect_to_host(connect_host.as_str(), port, cfg)
+        let sock = dial_tcp(&connect_host, port, &cfg_block)?;
+        let client = Client::connect_via(Box::new(sock), connect_host.as_str(), port, cfg)
             .map_err(|e| format!("connect: {e}"))?;
         vlog(1, &format!("connected to {connect_host}:{port}"));
         client
     };
 
+    // IdentityAgent overrides which agent socket we consult. `none` disables
+    // the agent entirely; a path (with the `SSH_AUTH_SOCK` token expanded)
+    // replaces $SSH_AUTH_SOCK for the agent-backed credential lookup and any
+    // AddKeysToAgent push below. We do this by adjusting the process env so
+    // the existing agent helpers (which read $SSH_AUTH_SOCK) pick it up.
+    apply_identity_agent(cfg_block.identity_agent.as_ref(), identities_only);
+
     let credentials = collect_credentials(&cfg_block, &cli.identities, identities_only);
-    authenticate_client(&mut client, &user, credentials)?;
+    authenticate_client(&mut client, &user, credentials, &cfg_block)?;
+
+    // AddKeysToAgent yes: push the supplied identities into the local agent.
+    maybe_add_keys_to_agent(&cfg_block, &cli);
+
+    // SetEnv / SendEnv: arm the env requests the session-channel helpers send
+    // after each channel open.
+    let session_env = build_session_env(&cfg_block);
+    if !session_env.is_empty() {
+        vlog(
+            1,
+            &format!("forwarding {} environment variable(s)", session_env.len()),
+        );
+        client.set_session_env(session_env);
+    }
+
+    // ServerAliveInterval / ServerAliveCountMax drive the serve loop's
+    // keepalive. No-op on the one-shot exec path (which doesn't serve).
+    if let Some(interval) = cfg_block.server_alive_interval
+        && interval > 0
+    {
+        let count_max = cfg_block.server_alive_count_max.unwrap_or(3);
+        client.set_keepalive(interval, count_max);
+    }
 
     // If any port-forwarding was requested, switch over to the multi-channel
     // serve loop instead of the single-shot exec/shell path. Mixing exec with
@@ -771,12 +1228,13 @@ fn run() -> Result<i32, String> {
     let want_forwarding = cli.no_command
         || !cli.remotes.is_empty()
         || !cli.locals.is_empty()
+        || !dynamics.is_empty()
         || cli.agent_forward
         || cli.x11_forward.is_some();
     if want_forwarding {
         if cli.command.is_some() {
             return Err(
-                "running a command alongside -A/-L/-R/-N/-X/-Y is not yet supported; \
+                "running a command alongside -A/-D/-L/-R/-N/-X/-Y is not yet supported; \
                         invoke ssh twice or wire the forward without a command"
                     .into(),
             );
@@ -784,15 +1242,29 @@ fn run() -> Result<i32, String> {
         if cli.no_command
             && cli.remotes.is_empty()
             && cli.locals.is_empty()
+            && dynamics.is_empty()
             && !cli.agent_forward
             && cli.x11_forward.is_none()
         {
-            return Err("-N requires at least one of -A, -L, -R, -X, -Y".into());
+            return Err("-N requires at least one of -A, -D, -L, -R, -X, -Y".into());
         }
-        return run_forwarding(client, &cli);
+        let exit_on_forward_failure = cfg_block.exit_on_forward_failure == Some(true);
+        let gateway = cfg_block
+            .gateway_ports
+            .unwrap_or(puressh::config::GatewayPorts::No);
+        return run_forwarding(client, &cli, &dynamics, exit_on_forward_failure, gateway);
     }
 
-    if let Some(command) = cli.command {
+    if let Some(command) = cli.command.clone() {
+        // RequestTTY Force/Yes allocates a PTY even for a remote command.
+        #[cfg(unix)]
+        {
+            if want_exec_pty(&cli, &cfg_block) {
+                let (cols, rows, px_w, px_h) = query_window_size();
+                let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
+                client.set_request_pty(Some((term, cols, rows, px_w, px_h, Vec::new())));
+            }
+        }
         let out = client.exec(&command).map_err(|e| format!("exec: {e}"))?;
         let _ = std::io::stdout().write_all(&out.stdout);
         let _ = std::io::stderr().write_all(&out.stderr);
@@ -806,7 +1278,17 @@ fn run() -> Result<i32, String> {
     let shared: puressh::shared::SharedClient = client.into();
     #[cfg(unix)]
     {
-        if stdin_is_tty() {
+        // RequestTTY decides PTY allocation for the interactive shell:
+        //   Force/Yes ⇒ PTY even when stdin isn't a tty;
+        //   No        ⇒ no PTY (line-buffered pipe shell);
+        //   Auto/unset⇒ PTY iff stdin is a tty (the historical default).
+        use puressh::config::RequestTty::*;
+        let use_pty = match cli.request_tty.or(cfg_block.request_tty) {
+            Some(Force) | Some(Yes) => true,
+            Some(No) => false,
+            Some(Auto) | None => stdin_is_tty(),
+        };
+        if use_pty {
             run_interactive_pty_shell(shared)
         } else {
             run_interactive_pipe_shell(shared)
@@ -1177,6 +1659,252 @@ fn spawn_splice_to_tcp(stream: ChannelStream, tcp: TcpStream) {
     });
 }
 
+/// Resolve a client-side listener bind address per `GatewayPorts`:
+///   - `No` (default): always loopback (`127.0.0.1`), ignoring any spec.
+///   - `Yes`: all interfaces (`0.0.0.0`), ignoring any spec.
+///   - `ClientSpecified`: honour the address spelled out in the forward
+///     spec, falling back to loopback when none was given.
+fn resolve_bind_addr(gateway: puressh::config::GatewayPorts, spec: Option<&str>) -> String {
+    use puressh::config::GatewayPorts::*;
+    match gateway {
+        No => "127.0.0.1".to_string(),
+        Yes => "0.0.0.0".to_string(),
+        ClientSpecified => spec.unwrap_or("127.0.0.1").to_string(),
+    }
+}
+
+/// Open a configured TCP connection to `host:port`, honouring
+/// `ConnectTimeout`, `BindAddress`, `AddressFamily`, and `TCPKeepAlive`.
+///
+/// Returns a `TcpStream` ready to hand to [`Client::connect_via`]. Used for
+/// the direct-TCP path so these socket-level keywords take real effect
+/// (the library's `connect_to_host` uses a plain `TcpStream::connect`).
+fn dial_tcp(
+    host: &str,
+    port: u16,
+    cfg_block: &puressh::config::ClientOptions,
+) -> Result<TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    use puressh::config::AddressFamily;
+
+    // Resolve and filter by AddressFamily.
+    let family = cfg_block.address_family.unwrap_or(AddressFamily::Any);
+    let mut addrs: Vec<std::net::SocketAddr> = (host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {host}:{port}: {e}"))?
+        .filter(|a| match family {
+            AddressFamily::Any => true,
+            AddressFamily::Inet => a.is_ipv4(),
+            AddressFamily::Inet6 => a.is_ipv6(),
+        })
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!(
+            "no addresses for {host}:{port} in the requested address family"
+        ));
+    }
+
+    let timeout = cfg_block
+        .connect_timeout
+        .map(|s| std::time::Duration::from_secs(s as u64));
+
+    // Try each candidate address until one connects.
+    let mut last_err: Option<String> = None;
+    for addr in addrs.drain(..) {
+        let sock = match connect_one(addr, cfg_block.bind_address.as_deref(), timeout) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        // TCPKeepAlive: default yes (OpenSSH default). Only set SO_KEEPALIVE
+        // off when explicitly disabled.
+        if cfg_block.tcp_keep_alive != Some(false) {
+            set_so_keepalive(&sock, true)?;
+        }
+        let _ = sock.set_nodelay(true);
+        return Ok(sock);
+    }
+    Err(last_err.unwrap_or_else(|| format!("could not connect to {host}:{port}")))
+}
+
+/// Connect to a single resolved address, optionally binding a local source
+/// address (`BindAddress`) and applying a connect timeout (`ConnectTimeout`).
+fn connect_one(
+    addr: std::net::SocketAddr,
+    bind_address: Option<&str>,
+    timeout: Option<std::time::Duration>,
+) -> Result<TcpStream, String> {
+    if let Some(bind) = bind_address {
+        // A local source bind requires the two-step socket2-style dance,
+        // which std doesn't expose directly. Use a TcpSocket-free approach
+        // via libc on Unix; on other platforms BindAddress is unsupported.
+        return connect_bound(addr, bind, timeout);
+    }
+    match timeout {
+        Some(t) => TcpStream::connect_timeout(&addr, t)
+            .map_err(|e| format!("connect {addr} (timeout {}s): {e}", t.as_secs())),
+        None => TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}")),
+    }
+}
+
+/// Bind a local source address before connecting (`BindAddress`). Unix-only:
+/// uses libc `socket`/`bind`/`connect` since `std` has no source-address
+/// API. On non-Unix this returns an error rather than silently ignoring the
+/// directive.
+#[cfg(unix)]
+fn connect_bound(
+    addr: std::net::SocketAddr,
+    bind: &str,
+    timeout: Option<std::time::Duration>,
+) -> Result<TcpStream, String> {
+    use std::net::ToSocketAddrs;
+    use std::os::unix::io::FromRawFd;
+
+    // Resolve the bind address (port 0 = ephemeral) in the same family as
+    // the target.
+    let bind_addr = (bind, 0u16)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve BindAddress {bind}: {e}"))?
+        .find(|a| a.is_ipv4() == addr.is_ipv4())
+        .ok_or_else(|| format!("BindAddress {bind} has no address matching the target family"))?;
+
+    let domain = if addr.is_ipv4() {
+        nix::libc::AF_INET
+    } else {
+        nix::libc::AF_INET6
+    };
+    // SAFETY: standard socket(2) call; fd ownership transferred to TcpStream
+    // via from_raw_fd below (or closed on the error paths).
+    let fd = unsafe { nix::libc::socket(domain, nix::libc::SOCK_STREAM, 0) };
+    if fd < 0 {
+        return Err(format!(
+            "socket(): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Wrap immediately so any early return closes the fd via Drop.
+    let stream = unsafe { TcpStream::from_raw_fd(fd) };
+
+    let (bind_storage, bind_len) = sockaddr_bytes(&bind_addr);
+    // SAFETY: bind_storage/len describe a valid sockaddr for this fd's family.
+    let rc = unsafe {
+        nix::libc::bind(
+            fd,
+            bind_storage.as_ptr() as *const nix::libc::sockaddr,
+            bind_len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "bind {bind_addr}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    let (target_storage, target_len) = sockaddr_bytes(&addr);
+    // SAFETY: same contract as bind; connect blocks (no timeout fd dance).
+    let rc = unsafe {
+        nix::libc::connect(
+            fd,
+            target_storage.as_ptr() as *const nix::libc::sockaddr,
+            target_len,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "connect {addr}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // ConnectTimeout with a bound source address would need non-blocking
+    // connect + poll; we keep the simple blocking path and apply the timeout
+    // as a read/write timeout instead so a wedged peer still unblocks.
+    if let Some(t) = timeout {
+        let _ = stream.set_read_timeout(Some(t));
+        let _ = stream.set_write_timeout(Some(t));
+    }
+    Ok(stream)
+}
+
+#[cfg(not(unix))]
+fn connect_bound(
+    _addr: std::net::SocketAddr,
+    _bind: &str,
+    _timeout: Option<std::time::Duration>,
+) -> Result<TcpStream, String> {
+    Err("BindAddress is only supported on Unix".into())
+}
+
+/// Encode a `SocketAddr` into a `sockaddr_storage` byte buffer + length for
+/// the raw libc `bind`/`connect` calls.
+#[cfg(unix)]
+fn sockaddr_bytes(addr: &std::net::SocketAddr) -> (Vec<u8>, nix::libc::socklen_t) {
+    match addr {
+        std::net::SocketAddr::V4(v4) => {
+            let mut sa: nix::libc::sockaddr_in = unsafe { core::mem::zeroed() };
+            sa.sin_family = nix::libc::AF_INET as nix::libc::sa_family_t;
+            sa.sin_port = v4.port().to_be();
+            sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            let len = core::mem::size_of::<nix::libc::sockaddr_in>() as nix::libc::socklen_t;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &sa as *const _ as *const u8,
+                    core::mem::size_of::<nix::libc::sockaddr_in>(),
+                )
+                .to_vec()
+            };
+            (bytes, len)
+        }
+        std::net::SocketAddr::V6(v6) => {
+            let mut sa: nix::libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+            sa.sin6_family = nix::libc::AF_INET6 as nix::libc::sa_family_t;
+            sa.sin6_port = v6.port().to_be();
+            sa.sin6_addr.s6_addr = v6.ip().octets();
+            let len = core::mem::size_of::<nix::libc::sockaddr_in6>() as nix::libc::socklen_t;
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &sa as *const _ as *const u8,
+                    core::mem::size_of::<nix::libc::sockaddr_in6>(),
+                )
+                .to_vec()
+            };
+            (bytes, len)
+        }
+    }
+}
+
+/// Set `SO_KEEPALIVE` on a connected socket (`TCPKeepAlive`). Unix uses libc
+/// `setsockopt`; other platforms reject the directive rather than ignore it.
+#[cfg(unix)]
+fn set_so_keepalive(sock: &TcpStream, on: bool) -> Result<(), String> {
+    use std::os::unix::io::AsRawFd;
+    let val: nix::libc::c_int = if on { 1 } else { 0 };
+    // SAFETY: standard setsockopt on a valid fd with a correctly-sized int.
+    let rc = unsafe {
+        nix::libc::setsockopt(
+            sock.as_raw_fd(),
+            nix::libc::SOL_SOCKET,
+            nix::libc::SO_KEEPALIVE,
+            &val as *const _ as *const nix::libc::c_void,
+            core::mem::size_of::<nix::libc::c_int>() as nix::libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "setsockopt(SO_KEEPALIVE): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_so_keepalive(_sock: &TcpStream, _on: bool) -> Result<(), String> {
+    Err("TCPKeepAlive is only supported on Unix".into())
+}
+
 /// Drive the multi-channel forwarding loop: register every `-R` binding on the
 /// server, install an `on_forwarded_tcpip` callback that dials the user's
 /// local destination per accepted connection, then enter
@@ -1184,7 +1912,26 @@ fn spawn_splice_to_tcp(stream: ChannelStream, tcp: TcpStream) {
 ///
 /// Returns an exit code matching OpenSSH's `-N -R` behaviour: 0 on a clean
 /// peer disconnect, 255 on protocol error.
-fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
+fn run_forwarding(
+    mut client: Client,
+    cli: &Cli,
+    dynamics: &[DynamicForward],
+    exit_on_forward_failure: bool,
+    gateway: puressh::config::GatewayPorts,
+) -> Result<i32, String> {
+    // `ExitOnForwardFailure yes` turns a failed bind / grant into a hard
+    // abort; otherwise we warn and carry on (OpenSSH's default).
+    macro_rules! forward_fail {
+        ($($arg:tt)*) => {{
+            let msg = format!($($arg)*);
+            if exit_on_forward_failure {
+                return Err(msg);
+            } else {
+                eprintln!("ssh: {msg}");
+            }
+        }};
+    }
+
     // Map "(bound_address, bound_port) → (local_host, local_port)" so the
     // callback can look up the right local destination for each incoming
     // forward. The bound address echoed by the server is "127.0.0.1" since
@@ -1192,9 +1939,13 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
     let mut routes: std::collections::BTreeMap<(String, u16), (String, u16)> =
         std::collections::BTreeMap::new();
     for r in &cli.remotes {
-        let bound_port = client
-            .request_tcpip_forward("127.0.0.1", r.remote_port)
-            .map_err(|e| format!("tcpip-forward 127.0.0.1:{}: {e}", r.remote_port))?;
+        let bound_port = match client.request_tcpip_forward("127.0.0.1", r.remote_port) {
+            Ok(p) => p,
+            Err(e) => {
+                forward_fail!("tcpip-forward 127.0.0.1:{}: {e}", r.remote_port);
+                continue;
+            }
+        };
         eprintln!(
             "ssh: -R 127.0.0.1:{}:{}:{} active",
             bound_port, r.local_host, r.local_port,
@@ -1204,6 +1955,7 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
             (r.local_host.clone(), r.local_port),
         );
     }
+    let _ = gateway; // -R always binds loopback server-side in this release.
 
     let routes = Arc::new(Mutex::new(routes));
     let routes_for_cb = Arc::clone(&routes);
@@ -1335,22 +2087,36 @@ fn run_forwarding(mut client: Client, cli: &Cli) -> Result<i32, String> {
         None
     };
 
-    // -L: bind every configured local-forward listener and hand each one a
+    // -L / -D: bind every local-forward and SOCKS listener, handing each a
     // clone of the ServeContext so its accept thread can open `direct-tcpip`
-    // through the running serve loop.
-    let ctx_opt: Option<ServeContext> = if cli.locals.is_empty() {
+    // through the running serve loop. Both forward kinds share one context.
+    // The bind address comes from GatewayPorts (loopback by default).
+    let bind_ip = resolve_bind_addr(gateway, None);
+    let ctx_opt: Option<ServeContext> = if cli.locals.is_empty() && dynamics.is_empty() {
         None
     } else {
         let (h, ctx) = handlers.with_serve_context();
         handlers = h;
         for l in &cli.locals {
-            let listener = TcpListener::bind(("127.0.0.1", l.listen_port))
-                .map_err(|e| format!("-L bind 127.0.0.1:{}: {e}", l.listen_port))?;
-            eprintln!(
-                "ssh: -L 127.0.0.1:{}:{}:{} active",
-                l.listen_port, l.remote_host, l.remote_port,
-            );
-            spawn_local_forward_listener(listener, l.clone(), ctx.clone());
+            match TcpListener::bind((bind_ip.as_str(), l.listen_port)) {
+                Ok(listener) => {
+                    eprintln!(
+                        "ssh: -L {}:{}:{}:{} active",
+                        bind_ip, l.listen_port, l.remote_host, l.remote_port,
+                    );
+                    spawn_local_forward_listener(listener, l.clone(), ctx.clone());
+                }
+                Err(e) => forward_fail!("-L bind {bind_ip}:{}: {e}", l.listen_port),
+            }
+        }
+        for d in dynamics {
+            match TcpListener::bind((d.bind_addr.as_str(), d.listen_port)) {
+                Ok(listener) => {
+                    eprintln!("ssh: -D {}:{} (SOCKS) active", d.bind_addr, d.listen_port);
+                    spawn_dynamic_forward_listener(listener, d.listen_port, ctx.clone());
+                }
+                Err(e) => forward_fail!("-D bind {}:{}: {e}", d.bind_addr, d.listen_port),
+            }
         }
         Some(ctx)
     };
@@ -1408,6 +2174,60 @@ fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: 
                     }
                 };
             spawn_splice_to_tcp(stream, tcp);
+        }
+    });
+}
+
+/// Per-`-D` SOCKS accept loop. Each accepted TCP connection runs the SOCKS
+/// handshake ([`puressh::forwarding::socks::handshake`]) to learn the CONNECT
+/// target, opens a `direct-tcpip` channel to it through the serve loop,
+/// writes the SOCKS success/failure reply, then splices the channel against
+/// the socket. BIND / UDP / bad-auth requests are rejected in-handshake and
+/// the connection dropped.
+fn spawn_dynamic_forward_listener(listener: TcpListener, listen_port: u16, ctx: ServeContext) {
+    use puressh::forwarding::socks;
+    thread::spawn(move || {
+        for accept in listener.incoming() {
+            let mut tcp = match accept {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ssh: -D accept on :{listen_port}: {e}");
+                    continue;
+                }
+            };
+            let ctx = ctx.clone();
+            // One thread per connection: the SOCKS handshake reads from the
+            // socket and must not block the accept loop.
+            thread::spawn(move || {
+                let target = match socks::handshake(&mut tcp) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        // Unsupported/protocol errors already wrote any reply
+                        // the protocol allows; just log and drop.
+                        eprintln!("ssh: -D handshake: {e}");
+                        return;
+                    }
+                };
+                let orig = tcp
+                    .peer_addr()
+                    .map(|a| (a.ip().to_string(), a.port()))
+                    .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
+                match ctx.open_direct_tcpip(&target.host, target.port, &orig.0, orig.1) {
+                    Ok(stream) => {
+                        if socks::write_reply(&mut tcp, target.version, true).is_err() {
+                            return;
+                        }
+                        spawn_splice_to_tcp(stream, tcp);
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "ssh: -D direct-tcpip {}:{}: {e}",
+                            target.host, target.port
+                        );
+                        let _ = socks::write_reply(&mut tcp, target.version, false);
+                    }
+                }
+            });
         }
     });
 }

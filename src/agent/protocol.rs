@@ -14,6 +14,8 @@ use crate::format::{Reader, Writer};
 pub const SSH_AGENT_FAILURE: u8 = 5;
 /// `SSH_AGENT_SUCCESS` — generic OK for unit ops that don't return data.
 pub const SSH_AGENT_SUCCESS: u8 = 6;
+/// Client → agent: add a private identity (`SSH_AGENTC_ADD_IDENTITY`).
+pub const SSH_AGENTC_ADD_IDENTITY: u8 = 17;
 /// Client → agent: list loaded identities.
 pub const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
 /// Agent → client: response to [`SSH_AGENTC_REQUEST_IDENTITIES`].

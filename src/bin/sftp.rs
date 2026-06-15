@@ -572,6 +572,7 @@ fn run() -> Result<i32, String> {
             kex_algorithms: cfg_block.kex_algorithms.clone(),
             host_key_algorithms: cfg_block.host_key_algorithms.clone(),
             pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
+            compression: cfg_block.compression,
         },
     };
     vlog(1, &format!("connecting to {connect_host}:{port}"));

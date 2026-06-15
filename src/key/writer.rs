@@ -232,6 +232,76 @@ impl PrivateKey {
     }
 }
 
+impl PrivateKey {
+    /// Encode the body of an `SSH_AGENTC_ADD_IDENTITY` request
+    /// (`PROTOCOL.agent` §4.2): `string key-type` followed by the
+    /// type-specific private-key fields and the trailing `string comment`.
+    ///
+    /// This is the same per-type field layout as the OpenSSH private-key
+    /// inner block (see [`encode_inner_block`]) but **without** the leading
+    /// check-ints or the trailing block padding — the agent frame is not an
+    /// encrypted blob, so neither applies. The caller wraps the returned
+    /// bytes in an agent message frame (`encode_message`).
+    pub fn to_agent_add_body(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        match self {
+            PrivateKey::Ed25519 {
+                seed,
+                public,
+                comment,
+            } => {
+                w.write_string(b"ssh-ed25519");
+                w.write_string(public);
+                let mut sk = [0u8; 64];
+                sk[..32].copy_from_slice(seed);
+                sk[32..].copy_from_slice(public);
+                w.write_string(&sk);
+                w.write_string(comment.as_bytes());
+            }
+            PrivateKey::EcdsaP256 { d, point, comment } => {
+                w.write_string(b"ecdsa-sha2-nistp256");
+                w.write_string(b"nistp256");
+                w.write_string(point);
+                write_mpint(&mut w, d);
+                w.write_string(comment.as_bytes());
+            }
+            PrivateKey::EcdsaP384 { d, point, comment } => {
+                w.write_string(b"ecdsa-sha2-nistp384");
+                w.write_string(b"nistp384");
+                w.write_string(point);
+                write_mpint(&mut w, d);
+                w.write_string(comment.as_bytes());
+            }
+            PrivateKey::EcdsaP521 { d, point, comment } => {
+                w.write_string(b"ecdsa-sha2-nistp521");
+                w.write_string(b"nistp521");
+                w.write_string(point);
+                write_mpint(&mut w, d);
+                w.write_string(comment.as_bytes());
+            }
+            PrivateKey::Rsa {
+                n,
+                e,
+                d,
+                p,
+                q,
+                iqmp,
+                comment,
+            } => {
+                w.write_string(b"ssh-rsa");
+                write_mpint(&mut w, n);
+                write_mpint(&mut w, e);
+                write_mpint(&mut w, d);
+                write_mpint(&mut w, iqmp);
+                write_mpint(&mut w, p);
+                write_mpint(&mut w, q);
+                w.write_string(comment.as_bytes());
+            }
+        }
+        w.into_vec()
+    }
+}
+
 fn encode_inner_block<R: CryptoRng + RngCore>(
     rng: &mut R,
     pk: &PrivateKey,

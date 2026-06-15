@@ -222,6 +222,13 @@ pub struct AlgoOverrides {
     /// `PubkeyAcceptedAlgorithms` — signature algorithms for our own
     /// publickey credentials. Consumed by the userauth driver, not KEXINIT.
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
+    /// `Compression` — `Some(true)` advertises `zlib@openssh.com` ahead of
+    /// `none` in both directions; `Some(false)` / `None` advertises `none`
+    /// only. Honouring `Some(true)` requires the `compress` feature; the
+    /// `ssh` binary rejects the keyword up front when the feature is absent,
+    /// and the builder degrades to `none` defensively if it somehow slips
+    /// through.
+    pub compression: Option<bool>,
 }
 
 impl Config {
@@ -547,6 +554,24 @@ pub struct Client {
     /// `single_connection`, `auth_protocol`, `auth_cookie`, `screen` —
     /// captured at toggle time.
     request_x11: Option<X11ReqArgs>,
+    /// Environment variables to emit as `env` channel requests on every
+    /// subsequent session-channel helper, between the open and the matching
+    /// shell/exec request. Populated from `SetEnv` / `SendEnv`. Each pair is
+    /// sent with `want_reply = false` (matching OpenSSH); the server applies
+    /// its `AcceptEnv` filter silently.
+    session_env: Vec<(String, String)>,
+    /// Keepalive policy for [`Self::serve`]: `Some((interval, count_max))`
+    /// sends a `keepalive@openssh.com` global request (with `want_reply`)
+    /// after `interval` of silence, tearing the connection down once
+    /// `count_max` probes go unanswered (`ServerAliveInterval` /
+    /// `ServerAliveCountMax`). `None` ⇒ no keepalive.
+    keepalive: Option<(Duration, u32)>,
+    /// When `Some`, the next `exec` helper allocates a PTY before issuing the
+    /// `exec` request — used by `RequestTTY force`/`yes` so a remote command
+    /// runs under a terminal. Carries the `pty-req` wire arguments. The
+    /// interactive shell path passes its PTY parameters directly, so this
+    /// toggle is only consulted by [`Self::exec`].
+    request_pty: Option<PtyReqArgs>,
     /// Outstanding reverse-forward grants: the set of `(bind_address,
     /// bind_port)` pairs for which [`Self::request_tcpip_forward`] succeeded
     /// and which have not been cancelled via [`Self::cancel_tcpip_forward`].
@@ -574,6 +599,18 @@ struct X11ReqArgs {
     auth_protocol: String,
     auth_cookie: String,
     screen: u32,
+}
+
+/// Wire arguments captured by [`Client::set_request_pty`] and emitted as the
+/// body of a `pty-req` channel request ahead of an `exec` (RequestTTY force).
+#[derive(Clone)]
+struct PtyReqArgs {
+    term: String,
+    cols: u32,
+    rows: u32,
+    px_w: u32,
+    px_h: u32,
+    modes: Vec<u8>,
 }
 
 impl Client {
@@ -653,6 +690,9 @@ impl Client {
             target_port: port,
             request_auth_agent: false,
             request_x11: None,
+            session_env: Vec::new(),
+            keepalive: None,
+            request_pty: None,
             tcpip_forward_grants: Vec::new(),
         };
         me.host_key_policy = cfg.host_key_policy;
@@ -925,6 +965,88 @@ impl Client {
         Ok(())
     }
 
+    /// Set the environment variables emitted as `env` channel requests on
+    /// every subsequent session-channel helper ([`Self::exec`],
+    /// [`Self::exec_stream`], [`Self::shell_with_stdin`]).
+    ///
+    /// Populated from `SetEnv` (literal pairs) and `SendEnv` (local env vars
+    /// matched by pattern, resolved by the caller). Each pair is sent with
+    /// `want_reply = false`, matching OpenSSH; whether the server accepts a
+    /// given variable is governed by its `AcceptEnv` policy and is not
+    /// observable here. Sticky: stays set until replaced.
+    pub fn set_session_env(&mut self, env: Vec<(String, String)>) {
+        self.session_env = env;
+    }
+
+    /// Internal: emit one `env` request per [`Self::set_session_env`] entry.
+    /// Called by every session-channel helper between OpenConfirmed and the
+    /// matching shell/exec request.
+    pub(crate) fn maybe_send_env(&mut self, channel: u32) -> Result<()> {
+        for (name, value) in self.session_env.clone() {
+            let p = self.conn.send_request(
+                channel,
+                ChannelRequest::Env { name, value },
+                false,
+            )?;
+            self.write_payload(&p)?;
+        }
+        Ok(())
+    }
+
+    /// Configure server-keepalive probing for [`Self::serve`]
+    /// (`ServerAliveInterval` / `ServerAliveCountMax`).
+    ///
+    /// `interval_secs == 0` disables keepalive. Otherwise the serve loop
+    /// sends a `keepalive@openssh.com` global request (with `want_reply`)
+    /// after `interval_secs` of socket silence and tears the connection down
+    /// once `count_max` consecutive probes go unanswered. Has no effect on
+    /// the one-shot [`Self::exec`] path (which doesn't run the serve loop).
+    pub fn set_keepalive(&mut self, interval_secs: u32, count_max: u32) {
+        self.keepalive = if interval_secs == 0 {
+            None
+        } else {
+            Some((Duration::from_secs(interval_secs as u64), count_max.max(1)))
+        };
+    }
+
+    /// Arm a `pty-req` to be emitted ahead of the next [`Self::exec`]'s
+    /// `exec` request, so a remote command runs under a pseudo-terminal
+    /// (`RequestTTY force` / `yes`). Pass `None` to clear.
+    ///
+    /// The interactive shell path allocates its PTY directly via
+    /// [`crate::shared::SharedClient::shell_stream`]; this toggle exists for
+    /// the one-shot `exec` path only.
+    pub fn set_request_pty(&mut self, args: Option<(String, u32, u32, u32, u32, Vec<u8>)>) {
+        self.request_pty = args.map(|(term, cols, rows, px_w, px_h, modes)| PtyReqArgs {
+            term,
+            cols,
+            rows,
+            px_w,
+            px_h,
+            modes,
+        });
+    }
+
+    /// Internal: emit `pty-req` if [`Self::set_request_pty`] armed one.
+    pub(crate) fn maybe_send_pty_req(&mut self, channel: u32) -> Result<()> {
+        if let Some(args) = self.request_pty.clone() {
+            let p = self.conn.send_request(
+                channel,
+                ChannelRequest::PtyReq {
+                    term: args.term,
+                    cols: args.cols,
+                    rows: args.rows,
+                    px_w: args.px_w,
+                    px_h: args.px_h,
+                    modes: args.modes,
+                },
+                false,
+            )?;
+            self.write_payload(&p)?;
+        }
+        Ok(())
+    }
+
     /// Run a remote command, draining stdout/stderr and capturing the exit
     /// status (or signal). Returns once the server has closed the channel.
     pub fn exec(&mut self, command: &str) -> Result<ExecOutput> {
@@ -952,6 +1074,8 @@ impl Client {
 
         self.maybe_send_auth_agent_req(local_id)?;
         self.maybe_send_x11_req(local_id)?;
+        self.maybe_send_env(local_id)?;
+        self.maybe_send_pty_req(local_id)?;
 
         let exec_req = self.conn.send_request(
             local_id,
@@ -1475,6 +1599,8 @@ impl Client {
 
         self.maybe_send_auth_agent_req(local_id)?;
         self.maybe_send_x11_req(local_id)?;
+        self.maybe_send_env(local_id)?;
+        self.maybe_send_pty_req(local_id)?;
 
         let exec_req = self.conn.send_request(
             local_id,
@@ -1785,10 +1911,38 @@ impl Client {
         // forwarded connections). Reverted on return.
         let _ = self.stream.set_read_timeout(Some(SERVE_POLL_INTERVAL));
         let mut steps = 0usize;
+        // Keepalive bookkeeping (ServerAliveInterval / ServerAliveCountMax).
+        // `last_activity` advances on every inbound packet; `probes_pending`
+        // counts unanswered keepalives. Both are inert when keepalive is off.
+        let mut last_activity = Instant::now();
+        let mut probes_pending: u32 = 0;
         let result = loop {
             steps += 1;
             if steps > MAX_SERVE_STEPS {
                 break Err(Error::Protocol("serve: step cap exceeded"));
+            }
+
+            // Keepalive: after `interval` of silence, probe the peer. After
+            // `count_max` unanswered probes, treat the connection as dead.
+            if let Some((interval, count_max)) = self.keepalive
+                && !self.runner.is_kexing()
+                && last_activity.elapsed() >= interval
+            {
+                if probes_pending >= count_max {
+                    break Err(Error::Protocol(
+                        "serve: server keepalive timed out (ServerAliveCountMax exceeded)",
+                    ));
+                }
+                let probe = self
+                    .conn
+                    .send_global_request(crate::channel::GlobalRequest::Keepalive, true);
+                if let Err(e) = self.write_payload(&probe) {
+                    break Err(e);
+                }
+                probes_pending += 1;
+                // Reset the silence timer so we space probes by `interval`
+                // rather than spamming once the threshold is first crossed.
+                last_activity = Instant::now();
             }
 
             // Drain deferred app payloads first (collected while a re-KEX
@@ -1851,6 +2005,13 @@ impl Client {
                 Ok(None) => continue, // tick; re-enter drain/stop checks
                 Err(e) => break Err(e),
             };
+            // Any inbound packet — including the keepalive's own
+            // REQUEST_SUCCESS/FAILURE reply — proves the peer is alive, so
+            // clear the probe counter and restart the silence timer.
+            if self.keepalive.is_some() {
+                probes_pending = 0;
+                last_activity = Instant::now();
+            }
             if let Err(e) =
                 serve_dispatch_packet(self, &handlers, &mut runtimes, &mut pending_opens, &payload)
             {
@@ -2670,7 +2831,18 @@ fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexIn
     let ciphers = owned_or_default(&over.ciphers, defaults::CIPHERS);
     let macs = owned_or_default(&over.macs, defaults::MACS);
     let host_key = owned_or_default(&over.host_key_algorithms, defaults::HOST_KEY);
-    let comp: Vec<String> = defaults::COMP.iter().map(|s| s.to_string()).collect();
+    // Compression preference. `Compression yes` advertises
+    // `zlib@openssh.com` ahead of `none` so we still negotiate a session
+    // with a server that lacks zlib. The delayed-zlib variant only starts
+    // compressing post-auth (see ConnectionState::activate_compress), which
+    // matches OpenSSH. Honoured only with the `compress` feature compiled
+    // in; without it, even an explicit request degrades to `none` because
+    // the codec has no zlib implementation to install.
+    let comp: Vec<String> = if cfg!(feature = "compress") && over.compression == Some(true) {
+        vec!["zlib@openssh.com".to_string(), "none".to_string()]
+    } else {
+        defaults::COMP.iter().map(|s| s.to_string()).collect()
+    };
 
     let algs = KexAlgorithmsOwned {
         kex,
@@ -3202,9 +3374,21 @@ fn serve_dispatch_packet(
             // next `Read` returns `Ok(0)` and the thread exits.
             runtimes.remove(&channel);
         }
+        // The peer may send its own keepalive (or any other global request)
+        // at us; per RFC 4254 §4 a request we don't act on still needs a
+        // REQUEST_FAILURE when want_reply is set, which is exactly what
+        // OpenSSH's keepalive probe expects back. Reading the packet already
+        // refreshed our own keepalive timer above.
+        ChannelEvent::GlobalRequest {
+            want_reply: true, ..
+        } => {
+            let p = client.conn.send_global_failure();
+            client.write_payload(&p)?;
+        }
         // Other events (OpenConfirmed/Failed for opens *we* initiated,
-        // Request, etc.) aren't expected on a connection that's only
-        // accepting forwarded-tcpip. Silently drop.
+        // Request, GlobalSuccess/GlobalFailure for our keepalive probes,
+        // etc.) need no action here — the keepalive bookkeeping in `serve`
+        // already cleared on the inbound read. Silently drop.
         _ => {}
     }
     Ok(())

@@ -677,6 +677,7 @@ fn open_session_under_lock(g: &mut Inner, what: &'static str) -> Result<u32> {
 
     g.client.maybe_send_auth_agent_req(local_id)?;
     g.client.maybe_send_x11_req(local_id)?;
+    g.client.maybe_send_env(local_id)?;
     g.queues.entry(local_id).or_default();
     Ok(local_id)
 }

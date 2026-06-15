@@ -10,8 +10,8 @@ use crate::error::{Error, Result};
 
 use super::protocol::{
     IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER,
-    SSH_AGENT_SIGN_RESPONSE, decode_identities_answer, decode_sign_response,
-    encode_request_identities, encode_sign_request,
+    SSH_AGENT_SUCCESS, SSH_AGENT_SIGN_RESPONSE, SSH_AGENTC_ADD_IDENTITY, decode_identities_answer,
+    decode_sign_response, encode_message, encode_request_identities, encode_sign_request,
 };
 
 /// Default per-call socket timeout. Agents are nearly always
@@ -157,6 +157,24 @@ impl Agent {
             return Err(Error::Protocol("agent: unexpected sign-reply type"));
         }
         decode_sign_response(&body)
+    }
+
+    /// Add a private identity to the agent (`SSH_AGENTC_ADD_IDENTITY`,
+    /// `PROTOCOL.agent` §4.2) — the wire half of `AddKeysToAgent yes`.
+    ///
+    /// The agent stores the key in memory and will offer it for subsequent
+    /// `sign` requests. Returns `Ok(())` on `SSH_AGENT_SUCCESS`, and a
+    /// protocol error on `SSH_AGENT_FAILURE` (e.g. the agent refuses to add
+    /// keys, or doesn't support the key type).
+    pub fn add_identity(&mut self, key: &crate::key::PrivateKey) -> Result<()> {
+        let body = key.to_agent_add_body();
+        self.write_frame(&encode_message(SSH_AGENTC_ADD_IDENTITY, &body))?;
+        let (msg_type, _) = self.read_frame()?;
+        match msg_type {
+            SSH_AGENT_SUCCESS => Ok(()),
+            SSH_AGENT_FAILURE => Err(Error::Protocol("agent: failure adding identity")),
+            _ => Err(Error::Protocol("agent: unexpected reply to add-identity")),
+        }
     }
 
     fn write_frame(&mut self, frame: &[u8]) -> Result<()> {

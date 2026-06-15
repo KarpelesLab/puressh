@@ -643,6 +643,17 @@ impl SharedClient {
         let mut g = lock_or_poison(&self.inner)?;
         Ok(f(&mut g.client))
     }
+
+    /// Set the session-env list the next channel-open will forward via `env`
+    /// requests. Used by the mux master to honour a client's forwarded
+    /// environment before opening that client's channel. Poisoning is
+    /// swallowed (best-effort): a failed env set still lets the open proceed
+    /// with no forwarded env rather than aborting the session.
+    pub fn with_session_env(&self, env: Vec<(String, String)>) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.client.set_session_env(env);
+        }
+    }
 }
 
 /// Open a session channel under an already-held lock guard. Returns the

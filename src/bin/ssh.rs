@@ -1092,6 +1092,40 @@ fn run() -> Result<i32, String> {
 
     let cfg = config_for_host(&cfg_block, &cli)?;
 
+    // ---- Connection multiplexing (ControlMaster/ControlPath/ControlPersist) ----
+    // Resolve the control settings once. The honoring is Unix-only; the
+    // resolved values just sit unused on other platforms.
+    #[cfg(unix)]
+    let mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user);
+    #[cfg(unix)]
+    if let Some(ref dec) = mux_decision {
+        use puressh::config::ControlMaster;
+        // Client role: if master is auto/no and a live master answers, attach
+        // to it and run the session as a new channel — no second TCP/KEX/auth.
+        if matches!(dec.master, ControlMaster::Auto | ControlMaster::No) {
+            match puressh::mux::probe_master(&dec.path) {
+                puressh::mux::ProbeOutcome::Live => {
+                    // Forwards/-N can't ride a mux SESSION channel (phase 1).
+                    if want_any_forwarding(&cli, &dynamics) {
+                        return Err(
+                            "-L/-R/-D/-N/-A/-X forwarding is not supported over a multiplexed \
+                             (ControlMaster) connection in this release; run without \
+                             ControlMaster or against a non-master ssh"
+                                .into(),
+                        );
+                    }
+                    vlog(1, &format!("mux: reusing master at {}", dec.path.display()));
+                    return run_mux_client(&cli, &cfg_block, &dec.path);
+                }
+                puressh::mux::ProbeOutcome::Stale | puressh::mux::ProbeOutcome::Absent => {
+                    // No live master: fall through to a normal connection.
+                    // Under auto/yes we'll become the master after auth.
+                    vlog(1, "mux: no live master, connecting normally");
+                }
+            }
+        }
+    }
+
     // Decide the connection transport for the final target:
     //   ProxyJump (CLI -J > config ProxyJump) tunnels through jump hosts;
     //   ProxyCommand spawns a helper process; otherwise a direct TCP socket.
@@ -1263,6 +1297,15 @@ fn run() -> Result<i32, String> {
                 client.set_request_pty(Some((term, cols, rows, px_w, px_h, Vec::new())));
             }
         }
+        // Master role: if we should become a ControlMaster, move into a
+        // SharedClient and serve the socket while running this exec as the
+        // foreground session. Otherwise the cheap borrow-based exec path.
+        #[cfg(unix)]
+        if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
+            let shared: puressh::shared::SharedClient = client.into();
+            let cmd = command.clone();
+            return become_master(dec, shared, move |s| run_exec_shared(s, &cmd));
+        }
         let out = client.exec(&command).map_err(|e| format!("exec: {e}"))?;
         let _ = std::io::stdout().write_all(&out.stdout);
         let _ = std::io::stderr().write_all(&out.stderr);
@@ -1286,6 +1329,18 @@ fn run() -> Result<i32, String> {
             Some(No) => false,
             Some(Auto) | None => stdin_is_tty(),
         };
+        // Master role: serve the control socket while running this shell as
+        // the foreground session.
+        if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
+            return become_master(dec, shared, move |s| {
+                if use_pty {
+                    run_interactive_pty_shell_on(s)
+                } else {
+                    run_interactive_pipe_shell_on(s)
+                }
+                .unwrap_or(255)
+            });
+        }
         if use_pty {
             run_interactive_pty_shell(shared)
         } else {
@@ -1305,6 +1360,223 @@ fn run() -> Result<i32, String> {
                 .into(),
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Connection multiplexing (ControlMaster / ControlPath / ControlPersist)
+// ---------------------------------------------------------------------------
+
+/// Resolved per-host mux settings (Unix-only honoring).
+#[cfg(unix)]
+struct MuxDecision {
+    /// Concrete control-socket path (token/`~`-expanded, length-checked).
+    path: PathBuf,
+    /// The configured (or defaulted) ControlMaster role.
+    master: puressh::config::ControlMaster,
+    /// Whether this invocation should become the master after connecting
+    /// (auto/yes, and no live master already present).
+    become_master: bool,
+    /// ControlPersist policy translated for the mux master.
+    persist: puressh::mux::Persist,
+}
+
+/// Resolve ControlMaster/ControlPath/ControlPersist into a [`MuxDecision`].
+/// Returns `None` when multiplexing is disabled (no `ControlPath`, or
+/// `ControlMaster no` with no path — i.e. nothing to do).
+#[cfg(unix)]
+fn resolve_mux(
+    cfg_block: &puressh::config::ClientOptions,
+    connect_host: &str,
+    port: u16,
+    user: &str,
+) -> Option<MuxDecision> {
+    use puressh::config::{ControlMaster, ControlPersist};
+    let template = cfg_block.control_path.as_deref()?;
+    let master = cfg_block.control_master.unwrap_or(ControlMaster::No);
+    // ControlMaster no + a path still permits *attaching* as a client; only
+    // skip entirely when there is no path. (Handled by the `?` above.)
+    let localhost = puressh::mux::local_hostname();
+    let path = puressh::mux::expand_control_path(
+        template,
+        &localhost,
+        connect_host,
+        port,
+        user,
+        expand_tilde,
+    );
+    let persist = match cfg_block.control_persist {
+        Some(ControlPersist::No) | None => puressh::mux::Persist::No,
+        Some(ControlPersist::Yes) => puressh::mux::Persist::Yes,
+        Some(ControlPersist::Seconds(n)) => puressh::mux::Persist::Seconds(n),
+    };
+    // Become master only for auto/yes (the live-master check happens at the
+    // call site; if a live master answered we'd have taken the client path).
+    let become_master = matches!(master, ControlMaster::Auto | ControlMaster::Yes);
+    Some(MuxDecision {
+        path,
+        master,
+        become_master,
+        persist,
+    })
+}
+
+/// Whether any forwarding / no-command session was requested — these cannot
+/// ride a mux SESSION channel in phase 1.
+#[cfg(unix)]
+fn want_any_forwarding(cli: &Cli, dynamics: &[DynamicForward]) -> bool {
+    cli.no_command
+        || !cli.locals.is_empty()
+        || !cli.remotes.is_empty()
+        || !dynamics.is_empty()
+        || cli.agent_forward
+        || cli.x11_forward.is_some()
+}
+
+/// Attach to a live master at `path` and run the requested session over it.
+#[cfg(unix)]
+fn run_mux_client(
+    cli: &Cli,
+    cfg_block: &puressh::config::ClientOptions,
+    path: &std::path::Path,
+) -> Result<i32, String> {
+    use puressh::config::RequestTty::*;
+    let env = build_session_env(cfg_block);
+    let (want_pty, term, cols, rows) = if cli.command.is_some() {
+        // Exec: PTY only if RequestTTY Force/Yes (mirrors want_exec_pty).
+        if want_exec_pty(cli, cfg_block) {
+            let (c, r, _, _) = query_window_size();
+            (true, term_env(), c, r)
+        } else {
+            (false, String::new(), 0, 0)
+        }
+    } else {
+        // Interactive: PTY iff RequestTTY says so / stdin is a tty.
+        let use_pty = match cli.request_tty.or(cfg_block.request_tty) {
+            Some(Force) | Some(Yes) => true,
+            Some(No) => false,
+            Some(Auto) | None => stdin_is_tty(),
+        };
+        if use_pty {
+            let (c, r, _, _) = query_window_size();
+            (true, term_env(), c, r)
+        } else {
+            (false, String::new(), 0, 0)
+        }
+    };
+    let req = puressh::mux::SessionRequest {
+        want_pty,
+        term,
+        cols,
+        rows,
+        env,
+        command: cli.command.clone(),
+    };
+
+    // Put the local terminal in raw mode for an interactive PTY session so
+    // keystrokes reach the remote unprocessed (mirrors the direct path).
+    let _raw_guard = if want_pty {
+        let mut t: nix::libc::termios = unsafe { core::mem::zeroed() };
+        if unsafe { nix::libc::tcgetattr(0, &mut t) } == 0 {
+            Some(common::TermiosRawGuard::install(&t))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Resize watcher only for PTY sessions.
+    let resize: Option<Arc<dyn Fn() -> (u32, u32) + Send + Sync>> = if want_pty {
+        Some(Arc::new(|| {
+            let (c, r, _, _) = query_window_size();
+            (c, r)
+        }))
+    } else {
+        None
+    };
+
+    puressh::mux::run_client(path, &req, resize).map_err(|e| format!("mux client: {e}"))
+}
+
+/// `$TERM` with the usual `xterm` fallback.
+#[cfg(unix)]
+fn term_env() -> String {
+    std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string())
+}
+
+/// Become the ControlMaster: bind the socket and serve clients while running
+/// `foreground` as this invocation's own session.
+#[cfg(unix)]
+fn become_master<F>(
+    dec: &MuxDecision,
+    shared: puressh::shared::SharedClient,
+    foreground: F,
+) -> Result<i32, String>
+where
+    F: FnOnce(&puressh::shared::SharedClient) -> i32 + Send + 'static,
+{
+    vlog(
+        1,
+        &format!("mux: becoming master at {}", dec.path.display()),
+    );
+    let cfg = puressh::mux::MasterConfig {
+        control_path: dec.path.clone(),
+        persist: dec.persist,
+    };
+    puressh::mux::run_master(cfg, shared, foreground)
+}
+
+/// Run a one-shot `command` over a `SharedClient`, splicing the channel's
+/// stdout/stderr to the local stdout/stderr. Used by the ControlMaster
+/// foreground exec path (the borrow-based `Client::exec` is consumed by the
+/// SharedClient conversion).
+#[cfg(unix)]
+fn run_exec_shared(shared: &puressh::shared::SharedClient, command: &str) -> i32 {
+    let mut stream = match shared.exec_stream(command) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("exec: {e}");
+            return 255;
+        }
+    };
+    let channel_id = stream.channel_id();
+    let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+
+    // stderr drainer thread.
+    let err_shared = shared.clone();
+    let t_err = thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        let mut stderr = std::io::stderr();
+        loop {
+            match err_shared.channel_recv_stderr(channel_id, &mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if stderr.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = stderr.flush();
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut buf = [0u8; 32 * 1024];
+    let mut stdout = std::io::stdout();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stdout.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                let _ = stdout.flush();
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = t_err.join();
+    stream.exit_status().unwrap_or(255)
 }
 
 /// `isatty(0)` — true if stdin is connected to a terminal. We only
@@ -1328,6 +1600,14 @@ fn stdin_is_tty() -> bool {
 ///   5. wait for the I/O threads to finish, then read exit-status
 #[cfg(unix)]
 fn run_interactive_pty_shell(shared: puressh::shared::SharedClient) -> Result<i32, String> {
+    run_interactive_pty_shell_on(&shared)
+}
+
+/// `&`-taking variant of [`run_interactive_pty_shell`] so the ControlMaster
+/// foreground closure (which only borrows the `SharedClient`) can run the same
+/// interactive session while the accept loop holds its own clone.
+#[cfg(unix)]
+fn run_interactive_pty_shell_on(shared: &puressh::shared::SharedClient) -> Result<i32, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // 1. Geometry.
@@ -1493,6 +1773,13 @@ fn run_interactive_pty_shell(shared: puressh::shared::SharedClient) -> Result<i3
 /// `echo cmd | ssh host`-style usage.
 #[cfg(unix)]
 fn run_interactive_pipe_shell(shared: puressh::shared::SharedClient) -> Result<i32, String> {
+    run_interactive_pipe_shell_on(&shared)
+}
+
+/// `&`-taking variant of [`run_interactive_pipe_shell`] (see
+/// [`run_interactive_pty_shell_on`]).
+#[cfg(unix)]
+fn run_interactive_pipe_shell_on(shared: &puressh::shared::SharedClient) -> Result<i32, String> {
     let stream = shared
         .shell_stream_no_pty()
         .map_err(|e| format!("shell: {e}"))?;

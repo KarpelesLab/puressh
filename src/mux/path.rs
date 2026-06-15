@@ -108,10 +108,10 @@ pub fn local_hostname() -> String {
 /// applying `~`/token expansion and the `sun_path` length fallback.
 ///
 /// `tilde` expands a leading `~`/`~/` (pass the binary's `expand_tilde`). If
-/// the expanded path's byte length exceeds [`SUN_PATH_MAX`], it is replaced by
-/// `<parent>/ssh-mux-<sha256hex>` so the socket can actually be bound; the
-/// hash is taken over the *full* expanded path so distinct long paths stay
-/// distinct.
+/// the expanded path's byte length exceeds the conservative `sun_path` limit,
+/// it is replaced by `<parent>/ssh-mux-<sha256hex>` so the socket can actually
+/// be bound; the hash is taken over the *full* expanded path so distinct long
+/// paths stay distinct.
 pub fn expand_control_path(
     template: &str,
     localhost: &str,

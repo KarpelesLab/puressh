@@ -40,6 +40,20 @@ pub use path::{
     connection_hash, expand_control_path, expand_tokens_with_hash, local_hostname, socket_path_for,
 };
 
+// The master / client *roles* drive a real connection and need
+// `SharedClient` (master side) / blocking socket I/O. They live behind the
+// `multichannel` feature; the codec + path helpers above stay available with
+// just `client` so the lib still compiles in `multichannel`-off builds.
+#[cfg(feature = "multichannel")]
+mod server;
+#[cfg(feature = "multichannel")]
+pub use server::{MasterConfig, Persist, run_master};
+
+#[cfg(feature = "multichannel")]
+mod client;
+#[cfg(feature = "multichannel")]
+pub use client::{ProbeOutcome, SessionRequest, probe_master, run_client};
+
 /// Read exactly one framed message from `r`, blocking until a full frame is
 /// available. Returns `Ok(None)` on a clean EOF *between* frames (the peer
 /// closed without starting a new frame).

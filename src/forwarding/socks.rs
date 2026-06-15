@@ -344,7 +344,19 @@ mod tests {
         // greeting: VER, NMETHODS=1, METHOD=no-auth
         // request : VER, CONNECT, RSV, ATYP=IPv4, 1.2.3.4, port 0x0050 (80)
         let req = vec![
-            SOCKS5, 1, METHOD_NO_AUTH, SOCKS5, CMD_CONNECT, 0x00, ATYP_IPV4, 1, 2, 3, 4, 0x00, 0x50,
+            SOCKS5,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS5,
+            CMD_CONNECT,
+            0x00,
+            ATYP_IPV4,
+            1,
+            2,
+            3,
+            4,
+            0x00,
+            0x50,
         ];
         let mut s = MockStream::new(req);
         let t = handshake(&mut s).unwrap();
@@ -358,7 +370,15 @@ mod tests {
     #[test]
     fn socks5_connect_domain() {
         let host = b"example.com";
-        let mut req = vec![SOCKS5, 1, METHOD_NO_AUTH, SOCKS5, CMD_CONNECT, 0x00, ATYP_DOMAIN];
+        let mut req = vec![
+            SOCKS5,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS5,
+            CMD_CONNECT,
+            0x00,
+            ATYP_DOMAIN,
+        ];
         req.push(host.len() as u8);
         req.extend_from_slice(host);
         req.extend_from_slice(&443u16.to_be_bytes());
@@ -370,7 +390,15 @@ mod tests {
 
     #[test]
     fn socks5_connect_ipv6() {
-        let mut req = vec![SOCKS5, 1, METHOD_NO_AUTH, SOCKS5, CMD_CONNECT, 0x00, ATYP_IPV6];
+        let mut req = vec![
+            SOCKS5,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS5,
+            CMD_CONNECT,
+            0x00,
+            ATYP_IPV6,
+        ];
         let addr = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
         req.extend_from_slice(&addr.octets());
         req.extend_from_slice(&8080u16.to_be_bytes());
@@ -393,8 +421,19 @@ mod tests {
     #[test]
     fn socks5_rejects_bind() {
         let req = vec![
-            SOCKS5, 1, METHOD_NO_AUTH, SOCKS5, 0x02, /* BIND */
-            0x00, ATYP_IPV4, 1, 2, 3, 4, 0, 80,
+            SOCKS5,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS5,
+            0x02, /* BIND */
+            0x00,
+            ATYP_IPV4,
+            1,
+            2,
+            3,
+            4,
+            0,
+            80,
         ];
         let mut s = MockStream::new(req);
         let err = handshake(&mut s).unwrap_err();
@@ -407,8 +446,19 @@ mod tests {
     #[test]
     fn socks5_rejects_udp() {
         let req = vec![
-            SOCKS5, 1, METHOD_NO_AUTH, SOCKS5, 0x03, /* UDP ASSOCIATE */
-            0x00, ATYP_IPV4, 0, 0, 0, 0, 0, 0,
+            SOCKS5,
+            1,
+            METHOD_NO_AUTH,
+            SOCKS5,
+            0x03, /* UDP ASSOCIATE */
+            0x00,
+            ATYP_IPV4,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
         ];
         let mut s = MockStream::new(req);
         assert!(matches!(handshake(&mut s), Err(SocksError::Unsupported(_))));
@@ -463,7 +513,10 @@ mod tests {
     fn reply_v5_success_shape() {
         let mut out = Vec::new();
         write_reply(&mut out, SocksVersion::V5, true).unwrap();
-        assert_eq!(out, vec![SOCKS5, REP_SUCCESS, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            out,
+            vec![SOCKS5, REP_SUCCESS, 0, ATYP_IPV4, 0, 0, 0, 0, 0, 0]
+        );
     }
 
     #[test]

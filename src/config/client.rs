@@ -557,7 +557,20 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             }
         }
         "compression" => {
-            opts.compression = Some(parse_yes_no(line)?);
+            let on = parse_yes_no(line)?;
+            // `Compression yes` requires the `compress` feature: without it
+            // the codec has no zlib implementation, so honouring the keyword
+            // is impossible. Reject at parse time rather than silently
+            // advertising `none` (strict mode — no parse-and-ignore).
+            if on && !cfg!(feature = "compress") {
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: "Compression yes requires the `compress` feature, which is not \
+                          compiled in"
+                        .into(),
+                });
+            }
+            opts.compression = Some(on);
         }
         "setenv" => {
             // OpenSSH accepts one or more NAME=VALUE tokens on a SetEnv line.
@@ -1344,12 +1357,23 @@ Host *.example.com !secret.example.com
 
     // ----- W4 modern-keyword tests --------------------------------------
 
+    #[cfg(feature = "compress")]
     #[test]
-    fn compression_parses() {
+    fn compression_parses_with_feature() {
         let cfg = SshClientConfig::parse("Compression yes\n").unwrap();
         assert_eq!(cfg.lookup("h").compression, Some(true));
         let cfg = SshClientConfig::parse("Compression no\n").unwrap();
         assert_eq!(cfg.lookup("h").compression, Some(false));
+    }
+
+    #[cfg(not(feature = "compress"))]
+    #[test]
+    fn compression_yes_unsupported_without_feature() {
+        // `Compression no` still parses (nothing to honour); `yes` rejects.
+        let cfg = SshClientConfig::parse("Compression no\n").unwrap();
+        assert_eq!(cfg.lookup("h").compression, Some(false));
+        let err = SshClientConfig::parse("Compression yes\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { .. }));
     }
 
     #[test]
@@ -1443,8 +1467,8 @@ Host *.example.com !secret.example.com
 
     #[test]
     fn preferred_authentications_only_unimplementable_unsupported() {
-        let err =
-            SshClientConfig::parse("PreferredAuthentications gssapi-with-mic,hostbased\n").unwrap_err();
+        let err = SshClientConfig::parse("PreferredAuthentications gssapi-with-mic,hostbased\n")
+            .unwrap_err();
         assert!(matches!(err, ConfigError::Unsupported { .. }));
     }
 
@@ -1462,8 +1486,7 @@ Host *.example.com !secret.example.com
 
     #[test]
     fn number_of_password_prompts_and_batchmode() {
-        let cfg =
-            SshClientConfig::parse("NumberOfPasswordPrompts 1\nBatchMode yes\n").unwrap();
+        let cfg = SshClientConfig::parse("NumberOfPasswordPrompts 1\nBatchMode yes\n").unwrap();
         let eff = cfg.lookup("h");
         assert_eq!(eff.number_of_password_prompts, Some(1));
         assert_eq!(eff.batch_mode, Some(true));
@@ -1471,10 +1494,8 @@ Host *.example.com !secret.example.com
 
     #[test]
     fn exit_on_forward_failure_and_clear_all() {
-        let cfg = SshClientConfig::parse(
-            "ExitOnForwardFailure yes\nClearAllForwardings yes\n",
-        )
-        .unwrap();
+        let cfg =
+            SshClientConfig::parse("ExitOnForwardFailure yes\nClearAllForwardings yes\n").unwrap();
         let eff = cfg.lookup("h");
         assert_eq!(eff.exit_on_forward_failure, Some(true));
         assert_eq!(eff.clear_all_forwardings, Some(true));

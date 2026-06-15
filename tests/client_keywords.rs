@@ -123,7 +123,12 @@ fn spawn_server<H: CommandHandler + 'static>(
         })
     });
 
-    let mut cfg = ServerConfig::new(vec![host_key], factory, vec!["publickey"], Arc::new(handler));
+    let mut cfg = ServerConfig::new(
+        vec![host_key],
+        factory,
+        vec!["publickey"],
+        Arc::new(handler),
+    );
     if with_direct_tcpip {
         cfg = cfg.with_direct_tcpip(Arc::new(DefaultDirectTcpipHandler::permit_all()));
     }

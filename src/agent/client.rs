@@ -10,7 +10,7 @@ use crate::error::{Error, Result};
 
 use super::protocol::{
     IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER,
-    SSH_AGENT_SUCCESS, SSH_AGENT_SIGN_RESPONSE, SSH_AGENTC_ADD_IDENTITY, decode_identities_answer,
+    SSH_AGENT_SIGN_RESPONSE, SSH_AGENT_SUCCESS, SSH_AGENTC_ADD_IDENTITY, decode_identities_answer,
     decode_sign_response, encode_message, encode_request_identities, encode_sign_request,
 };
 

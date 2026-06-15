@@ -950,10 +950,7 @@ fn want_exec_pty(cli: &Cli, cfg_block: &puressh::config::ClientOptions) -> bool 
 /// inherited `$SSH_AUTH_SOCK` stands. `identities_only` is informational
 /// (the agent is skipped for credentials anyway) but we still set the env so
 /// AddKeysToAgent targets the right socket.
-fn apply_identity_agent(
-    setting: Option<&puressh::config::IdentityAgent>,
-    _identities_only: bool,
-) {
+fn apply_identity_agent(setting: Option<&puressh::config::IdentityAgent>, _identities_only: bool) {
     use puressh::config::IdentityAgent;
     match setting {
         None => {}
@@ -1010,9 +1007,7 @@ fn run() -> Result<i32, String> {
     // it took effect when the build can't honour it.
     let want_compression = cli.compression.or(cfg_block.compression) == Some(true);
     if want_compression && !cfg!(feature = "compress") {
-        return Err(
-            "Compression yes requested but this build lacks the `compress` feature".into(),
-        );
+        return Err("Compression yes requested but this build lacks the `compress` feature".into());
     }
 
     // `ClearAllForwardings yes` discards every forward gathered so far —
@@ -1684,8 +1679,8 @@ fn dial_tcp(
     port: u16,
     cfg_block: &puressh::config::ClientOptions,
 ) -> Result<TcpStream, String> {
-    use std::net::ToSocketAddrs;
     use puressh::config::AddressFamily;
+    use std::net::ToSocketAddrs;
 
     // Resolve and filter by AddressFamily.
     let family = cfg_block.address_family.unwrap_or(AddressFamily::Any);
@@ -1779,10 +1774,7 @@ fn connect_bound(
     // via from_raw_fd below (or closed on the error paths).
     let fd = unsafe { nix::libc::socket(domain, nix::libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        return Err(format!(
-            "socket(): {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(format!("socket(): {}", std::io::Error::last_os_error()));
     }
     // Wrap immediately so any early return closes the fd via Drop.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
@@ -2220,10 +2212,7 @@ fn spawn_dynamic_forward_listener(listener: TcpListener, listen_port: u16, ctx: 
                         spawn_splice_to_tcp(stream, tcp);
                     }
                     Err(e) => {
-                        eprintln!(
-                            "ssh: -D direct-tcpip {}:{}: {e}",
-                            target.host, target.port
-                        );
+                        eprintln!("ssh: -D direct-tcpip {}:{}: {e}", target.host, target.port);
                         let _ = socks::write_reply(&mut tcp, target.version, false);
                     }
                 }

@@ -983,11 +983,9 @@ impl Client {
     /// matching shell/exec request.
     pub(crate) fn maybe_send_env(&mut self, channel: u32) -> Result<()> {
         for (name, value) in self.session_env.clone() {
-            let p = self.conn.send_request(
-                channel,
-                ChannelRequest::Env { name, value },
-                false,
-            )?;
+            let p = self
+                .conn
+                .send_request(channel, ChannelRequest::Env { name, value }, false)?;
             self.write_payload(&p)?;
         }
         Ok(())

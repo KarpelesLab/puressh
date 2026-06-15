@@ -118,6 +118,8 @@ struct Cli {
     compression: Option<bool>,
     /// `-t` (force PTY) / `-T` (disable PTY) / `-o RequestTTY=…`. `None`
     /// when neither was supplied; the config `RequestTTY` then wins.
+    /// Only consumed by the (unix-only) interactive/pty session path.
+    #[cfg_attr(not(unix), allow(dead_code))]
     request_tty: Option<puressh::config::RequestTty>,
     /// Raw `KEY VALUE` lines for `-o` options not consumed into a dedicated
     /// Cli field; parsed in `run` as a highest-priority synthetic block.

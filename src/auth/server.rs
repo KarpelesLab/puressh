@@ -159,6 +159,13 @@ pub struct ServerAuth {
     /// accept-everything authenticator silently letting unauthenticated
     /// clients in via the bare-probe `"none"` method.
     allow_none: bool,
+    /// `MaxAuthTries` (OpenSSH): disconnect after this many failed attempts.
+    /// `None` ⇒ unlimited (the historical behaviour, modulo `MAX_AUTH_STEPS`
+    /// in the server loop).
+    max_auth_tries: Option<u32>,
+    /// Count of failed attempts so far (each USERAUTH_FAILURE without partial
+    /// success). Compared against `max_auth_tries`.
+    failed_attempts: u32,
 }
 
 impl ServerAuth {
@@ -180,7 +187,17 @@ impl ServerAuth {
             state: State::AwaitingServiceRequest,
             pending_user: None,
             allow_none: false,
+            max_auth_tries: None,
+            failed_attempts: 0,
         }
+    }
+
+    /// Set the `MaxAuthTries` limit. After this many failed attempts the
+    /// driver emits [`ServerStep::Disconnect`] instead of another
+    /// USERAUTH_FAILURE. `None` (the default) means unlimited.
+    pub fn set_max_auth_tries(&mut self, max: Option<u32>) -> &mut Self {
+        self.max_auth_tries = max;
+        self
     }
 
     /// Opt in to letting the [`Authenticator`] see `AuthAttempt::None`.
@@ -393,12 +410,99 @@ impl ServerAuth {
         }
     }
 
+    #[cfg(test)]
+    fn failed_attempts(&self) -> u32 {
+        self.failed_attempts
+    }
+
     fn emit_failure(&mut self) -> Result<ServerStep> {
+        // A USERAUTH_FAILURE (without partial success) is a failed attempt;
+        // count it and disconnect once MaxAuthTries is exceeded. OpenSSH
+        // counts the attempt then drops the connection on the *next* failure
+        // past the limit; we disconnect as soon as the count exceeds the
+        // limit so a limit of N permits exactly N failed attempts.
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+        if let Some(max) = self.max_auth_tries
+            && self.failed_attempts > max
+        {
+            self.state = State::Done;
+            return Ok(ServerStep::Disconnect("Too many authentication failures"));
+        }
         let cont: Vec<String> = self.accepted_methods.iter().map(|s| (*s).into()).collect();
         let failure = UserauthFailure {
             continuations: cont,
             partial_success: false,
         };
         Ok(ServerStep::Send(failure.encode()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::message::{AuthMethodPayload, SecretString, ServiceRequest, UserauthRequest};
+
+    struct RejectAll;
+    impl Authenticator for RejectAll {
+        fn evaluate(&mut self, _attempt: AuthAttempt) -> AuthDecision {
+            AuthDecision::Reject
+        }
+    }
+
+    fn service_req() -> Vec<u8> {
+        ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode()
+    }
+
+    fn password_req() -> Vec<u8> {
+        UserauthRequest {
+            user: "alice".into(),
+            service: "ssh-connection".into(),
+            method: AuthMethodPayload::Password {
+                password: SecretString::from("wrong"),
+                new_password: None,
+            },
+        }
+        .encode()
+    }
+
+    #[test]
+    fn max_auth_tries_disconnects() {
+        let mut sa = ServerAuth::new(vec![1, 2, 3], vec!["password"], Box::new(RejectAll));
+        sa.set_max_auth_tries(Some(2));
+        // Service request → accept.
+        assert!(matches!(
+            sa.on_packet(&service_req()).unwrap(),
+            ServerStep::Send(_)
+        ));
+        // First two failures emit USERAUTH_FAILURE.
+        assert!(matches!(
+            sa.on_packet(&password_req()).unwrap(),
+            ServerStep::Send(_)
+        ));
+        assert!(matches!(
+            sa.on_packet(&password_req()).unwrap(),
+            ServerStep::Send(_)
+        ));
+        assert_eq!(sa.failed_attempts(), 2);
+        // Third failure exceeds the limit ⇒ Disconnect.
+        assert!(matches!(
+            sa.on_packet(&password_req()).unwrap(),
+            ServerStep::Disconnect(_)
+        ));
+    }
+
+    #[test]
+    fn no_limit_keeps_failing() {
+        let mut sa = ServerAuth::new(vec![1], vec!["password"], Box::new(RejectAll));
+        sa.on_packet(&service_req()).unwrap();
+        for _ in 0..10 {
+            assert!(matches!(
+                sa.on_packet(&password_req()).unwrap(),
+                ServerStep::Send(_)
+            ));
+        }
     }
 }

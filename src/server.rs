@@ -834,6 +834,59 @@ pub struct Config {
     /// keys can actually produce, so naming an algorithm we have no key for
     /// is a no-op rather than an error.
     pub host_key_algorithms: Option<Vec<String>>,
+    /// Parsed `sshd_config` policy (global options + `Match` blocks). When
+    /// set, it is resolved per-connection — twice — to gate capabilities:
+    /// once pre-auth with an address-only context (auth method set + banner),
+    /// once post-auth with the user/groups context (an [`EffectivePolicy`]).
+    /// `None` ⇒ no policy gating beyond [`Self::allowed_auth_methods`] (the
+    /// historical behaviour).
+    pub policy: Option<Arc<crate::config::SshServerConfig>>,
+    /// Resolves an authenticated user's supplementary group names for
+    /// `Match group` / `AllowGroups` / `DenyGroups`. Called once per
+    /// connection (post-auth) for every user uniformly. `None` ⇒ groups are
+    /// unknown, so any group-dependent criterion never matches.
+    pub group_resolver: Option<GroupResolver>,
+}
+
+/// Resolver from a user name to its supplementary group names. Boxed so the
+/// binary can plug in an OS-backed implementation (e.g. `getgrouplist`)
+/// without the library taking a `nix`/`libc` dependency.
+pub type GroupResolver = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
+/// Per-connection capability ceiling resolved from the `sshd_config` policy
+/// after authentication. Built once per connection from the matching global +
+/// `Match` options and consulted at the existing channel-dispatch points; it
+/// never rebuilds handlers, it only gates the maximal set attached at startup.
+#[derive(Debug, Clone)]
+pub struct EffectivePolicy {
+    /// `AllowAgentForwarding` — when `Some(false)`, `auth-agent-req` is
+    /// refused even if an agent-forward handler is attached.
+    pub allow_agent_forwarding: Option<bool>,
+    /// `X11Forwarding` — when `Some(false)`, `x11-req` is refused even if an
+    /// X11 handler is attached.
+    pub x11_forwarding: Option<bool>,
+}
+
+impl EffectivePolicy {
+    /// A policy that gates nothing (used when no `sshd_config` policy is set).
+    pub fn unrestricted() -> Self {
+        EffectivePolicy {
+            allow_agent_forwarding: None,
+            x11_forwarding: None,
+        }
+    }
+
+    /// True iff agent forwarding is permitted (default-allow unless the policy
+    /// resolved to `AllowAgentForwarding no`).
+    fn agent_forwarding_allowed(&self) -> bool {
+        self.allow_agent_forwarding != Some(false)
+    }
+
+    /// True iff X11 forwarding is permitted (default-allow unless the policy
+    /// resolved to `X11Forwarding no`).
+    fn x11_forwarding_allowed(&self) -> bool {
+        self.x11_forwarding != Some(false)
+    }
 }
 
 /// Environment variable names that no [`Config::accept_env`] glob may
@@ -946,7 +999,25 @@ impl Config {
             macs: None,
             kex_algorithms: None,
             host_key_algorithms: None,
+            policy: None,
+            group_resolver: None,
         }
+    }
+
+    /// Attach a parsed `sshd_config` policy. The policy is resolved
+    /// per-connection (pre- and post-auth) to gate the auth method set,
+    /// banner, and forwarding capabilities. Without it, only
+    /// [`Self::allowed_auth_methods`] applies.
+    pub fn with_policy(mut self, policy: Arc<crate::config::SshServerConfig>) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// Attach a [`GroupResolver`] used by `Match group` / `AllowGroups` /
+    /// `DenyGroups`. Invoked once per connection (post-auth) for every user.
+    pub fn with_group_resolver(mut self, resolver: GroupResolver) -> Self {
+        self.group_resolver = Some(resolver);
+        self
     }
 
     /// Override the advertised crypto-algorithm preference lists (from
@@ -1113,17 +1184,17 @@ impl Server {
     /// Accept one connection and handle it on the current thread, blocking
     /// until the session closes. Intended for single-connection test harnesses.
     pub fn accept_one(&mut self) -> Result<()> {
-        let (stream, _peer) = self.listener.accept()?;
-        handle_session(stream, self.cfg.clone())
+        let (stream, peer) = self.listener.accept()?;
+        handle_session_with_peer(stream, peer, self.cfg.clone())
     }
 
     /// Accept connections forever, spawning a fresh thread per connection.
     pub fn serve(&mut self) -> Result<()> {
         loop {
-            let (stream, _peer) = self.listener.accept()?;
+            let (stream, peer) = self.listener.accept()?;
             let cfg = self.cfg.clone();
             thread::spawn(move || {
-                let _ = handle_session(stream, cfg);
+                let _ = handle_session_with_peer(stream, peer, cfg);
             });
         }
     }
@@ -1136,7 +1207,26 @@ impl Server {
 /// example, an `sshd` that `fork()`s before invoking this so the daemon
 /// can be restarted independently of live sessions.
 pub fn handle_session(stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
-    handle_connection_inner(stream, cfg)
+    // Derive the peer from the socket itself so the historical entry point
+    // keeps working; callers that already have the accepted peer address
+    // should prefer `handle_session_with_peer` to avoid the extra syscall.
+    let peer = stream
+        .peer_addr()
+        .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 0)));
+    handle_session_with_peer(stream, peer, cfg)
+}
+
+/// Like [`handle_session`] but takes the already-known peer address (as
+/// returned by `TcpListener::accept`). The peer address and the socket's
+/// local address feed the per-connection `sshd_config` `Match` resolution
+/// (`Match address` / `localaddress` / `localport`).
+pub fn handle_session_with_peer(
+    stream: TcpStream,
+    peer: SocketAddr,
+    cfg: Arc<Config>,
+) -> Result<()> {
+    let local = stream.local_addr().ok();
+    handle_connection_inner(stream, peer, local, cfg)
 }
 
 /// Normalize a pre-auth I/O outcome into something the caller can treat
@@ -1157,7 +1247,12 @@ fn map_preauth_timeout<T>(r: Result<T>) -> Result<T> {
     }
 }
 
-fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()> {
+fn handle_connection_inner(
+    mut stream: TcpStream,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+    cfg: Arc<Config>,
+) -> Result<()> {
     stream.set_nodelay(true)?;
 
     // RFC 4252 / OpenSSH "LoginGraceTime": cap the time the peer can
@@ -1193,6 +1288,15 @@ fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()
     ))?;
     let mut last_kex = Instant::now();
 
+    // Phase 1 (pre-auth): resolve the policy with an address-only context.
+    // This yields the auth method set advertised to the client and an
+    // address-matched banner. `None` policy ⇒ fall back to the static
+    // `allowed_auth_methods` and no banner.
+    let peer_ip = ip_string(&peer);
+    let local_ip = local.and_then(|a| ip_string(&a));
+    let local_port = local.map(|a| a.port());
+    let preauth = resolve_preauth_policy(&cfg, peer_ip.as_deref(), local_ip.as_deref(), local_port);
+
     let user = map_preauth_timeout(do_server_auth(
         &mut stream,
         &mut codec,
@@ -1200,6 +1304,7 @@ fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()
         &mut inbox,
         &cfg,
         session_id,
+        &preauth,
     ))?;
 
     // Past userauth-success: lift the grace timeout. The connection
@@ -1221,6 +1326,18 @@ fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()
     // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
     codec.activate_compress();
 
+    // Phase 2 (post-auth): resolve the policy with the full user/groups
+    // context to build the per-connection capability ceiling.
+    let groups = resolve_user_groups(&cfg, &user);
+    let effective = resolve_effective_policy(
+        &cfg,
+        &user,
+        groups.as_deref(),
+        peer_ip.as_deref(),
+        local_ip.as_deref(),
+        local_port,
+    );
+
     let rekey_policy = cfg.rekey_policy;
     let r = do_connection_phase(
         &mut stream,
@@ -1234,6 +1351,7 @@ fn handle_connection_inner(mut stream: TcpStream, cfg: Arc<Config>) -> Result<()
         &v_s,
         &mut last_kex,
         &rekey_policy,
+        &effective,
     );
 
     let _ = send_disconnect(
@@ -1320,6 +1438,122 @@ fn drive_server_kex<R: RngCore + CryptoRng>(
     }
 }
 
+/// The textual form of a socket address's IP (no port). Returns `None` for
+/// the unspecified placeholder so a `Match address` never matches a missing
+/// address.
+fn ip_string(addr: &SocketAddr) -> Option<String> {
+    let ip = addr.ip();
+    if ip.is_unspecified() {
+        None
+    } else {
+        Some(ip.to_string())
+    }
+}
+
+/// Pre-auth (Phase 1) resolution result: the auth method set to advertise and
+/// the banner text (if any) to send before the userauth loop.
+struct PreAuthPolicy {
+    /// Auth methods to advertise. Empty ⇒ guaranteed lockout (every attempt
+    /// fails) — this is how `PubkeyAuthentication no` is honoured.
+    methods: Vec<&'static str>,
+    /// Resolved `MaxAuthTries`, if the policy set one.
+    max_auth_tries: Option<u32>,
+    /// Resolved (address-matched) banner text, if any.
+    banner: Option<String>,
+}
+
+/// Phase 1: resolve the policy with an address-only context. Without a policy
+/// this reproduces the historical behaviour (static `allowed_auth_methods`,
+/// no banner, no MaxAuthTries).
+fn resolve_preauth_policy(
+    cfg: &Config,
+    address: Option<&str>,
+    local_address: Option<&str>,
+    local_port: Option<u16>,
+) -> PreAuthPolicy {
+    let Some(policy) = cfg.policy.as_ref() else {
+        return PreAuthPolicy {
+            methods: cfg.allowed_auth_methods.clone(),
+            max_auth_tries: None,
+            banner: None,
+        };
+    };
+    let ctx = crate::config::MatchContext {
+        host: "",
+        address,
+        local_address,
+        local_port,
+        ..crate::config::MatchContext::default()
+    };
+    let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
+    let methods = resolve_auth_methods(&cfg.allowed_auth_methods, &opts);
+    let banner = opts
+        .banner
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    PreAuthPolicy {
+        methods,
+        max_auth_tries: opts.max_auth_tries,
+        banner,
+    }
+}
+
+/// Compute the advertised auth method set from the static config default and
+/// the resolved policy options. Public-key is the only honorable method, so:
+///
+/// - `PubkeyAuthentication no` ⇒ drop `publickey` ⇒ empty set (lockout).
+/// - `AuthenticationMethods` naming only non-publickey alternatives ⇒ the
+///   parser already rejected those at load; an `any` / `publickey` value
+///   leaves the set unchanged.
+fn resolve_auth_methods(
+    base: &[&'static str],
+    opts: &crate::config::ServerOptions,
+) -> Vec<&'static str> {
+    let mut methods: Vec<&'static str> = base.to_vec();
+    if opts.pubkey_authentication == Some(false) {
+        methods.retain(|m| *m != "publickey");
+    }
+    methods
+}
+
+/// Resolve `user`'s supplementary group names via the configured
+/// [`GroupResolver`], if any. Called once per connection for *every* user
+/// uniformly (no early-out for unknown users) so the lookup cannot become a
+/// user-enumeration timing oracle. `None` ⇒ no resolver configured.
+fn resolve_user_groups(cfg: &Config, user: &str) -> Option<Vec<String>> {
+    cfg.group_resolver.as_ref().map(|r| r(user))
+}
+
+/// Phase 2: resolve the policy with the full user/groups context into the
+/// per-connection [`EffectivePolicy`]. Without a policy this returns
+/// [`EffectivePolicy::unrestricted`].
+fn resolve_effective_policy(
+    cfg: &Config,
+    user: &str,
+    groups: Option<&[String]>,
+    address: Option<&str>,
+    local_address: Option<&str>,
+    local_port: Option<u16>,
+) -> EffectivePolicy {
+    let Some(policy) = cfg.policy.as_ref() else {
+        return EffectivePolicy::unrestricted();
+    };
+    let ctx = crate::config::MatchContext {
+        host: "",
+        user: Some(user),
+        groups,
+        address,
+        local_address,
+        local_port,
+        ..crate::config::MatchContext::default()
+    };
+    let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
+    EffectivePolicy {
+        allow_agent_forwarding: opts.allow_agent_forwarding,
+        x11_forwarding: opts.x11_forwarding,
+    }
+}
+
 fn do_server_auth<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
     codec: &mut PacketCodec,
@@ -1327,10 +1561,22 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     inbox: &mut Vec<u8>,
     cfg: &Config,
     session_id: Vec<u8>,
+    preauth: &PreAuthPolicy,
 ) -> Result<String> {
-    let methods = cfg.allowed_auth_methods.clone();
+    let methods = preauth.methods.clone();
     let auth_impl = cfg.authenticator.build();
     let mut server_auth = ServerAuth::new(session_id, methods, auth_impl);
+    server_auth.set_max_auth_tries(preauth.max_auth_tries);
+
+    // Address-matched banner (USERAUTH_BANNER), sent before the first
+    // USERAUTH_REQUEST per RFC 4252 §5.4. User-matched banners are deferred.
+    if let Some(text) = preauth.banner.as_deref() {
+        let banner = crate::auth::message::UserauthBanner {
+            message: text.to_string(),
+            language: String::new(),
+        };
+        write_payload(stream, codec, rng, &banner.encode())?;
+    }
 
     for _ in 0..MAX_AUTH_STEPS {
         let payload = read_one_packet(stream, codec, inbox)?;
@@ -1533,6 +1779,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     v_s: &[u8],
     last_kex: &mut Instant,
     rekey_policy: &RekeyPolicy,
+    effective: &EffectivePolicy,
 ) -> Result<()> {
     let mut conn = ConnectionState::new();
     let mut any_channel_opened = false;
@@ -1573,6 +1820,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         v_s,
         last_kex,
         rekey_policy,
+        effective,
         &mut conn,
         &mut any_channel_opened,
         &mut steps,
@@ -1646,6 +1894,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
     v_s: &[u8],
     last_kex: &mut Instant,
     rekey_policy: &RekeyPolicy,
+    effective: &EffectivePolicy,
     conn: &mut ConnectionState,
     any_channel_opened: &mut bool,
     steps: &mut usize,
@@ -1677,6 +1926,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                 inbox,
                 conn,
                 cfg,
+                effective,
                 user,
                 &payload,
                 any_channel_opened,
@@ -1829,6 +2079,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             inbox,
             conn,
             cfg,
+            effective,
             user,
             &payload,
             any_channel_opened,
@@ -2106,6 +2357,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     inbox: &mut Vec<u8>,
     conn: &mut ConnectionState,
     cfg: &Config,
+    effective: &EffectivePolicy,
     user: &str,
     payload: &[u8],
     any_channel_opened: &mut bool,
@@ -2298,6 +2550,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 inbox,
                 conn,
                 cfg,
+                effective,
                 user,
                 channel,
                 request,
@@ -2499,6 +2752,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
     inbox: &mut Vec<u8>,
     conn: &mut ConnectionState,
     cfg: &Config,
+    effective: &EffectivePolicy,
     user: &str,
     channel: u32,
     request: ChannelRequest,
@@ -2769,7 +3023,9 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             // the handle stays in `agent_forward.active` until the channel
             // closes, at which point its `Drop` impl tears the listener
             // down and unlinks the socket.
-            if let Some(handler) = cfg.agent_forward_handler.clone() {
+            if effective.agent_forwarding_allowed()
+                && let Some(handler) = cfg.agent_forward_handler.clone()
+            {
                 let ctx = AgentForwardContext::new(agent_forward.req_tx.clone());
                 match handler.setup(user, ctx) {
                     Ok(handle) => {
@@ -2808,7 +3064,9 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             // child shells / exec see it. The handle stays in
             // `x11_forward.active` until the channel closes; its `Drop`
             // impl stops the accept thread.
-            if let Some(handler) = cfg.x11_forward_handler.clone() {
+            if effective.x11_forwarding_allowed()
+                && let Some(handler) = cfg.x11_forward_handler.clone()
+            {
                 let ctx = X11ForwardContext::new(x11_forward.req_tx.clone());
                 match handler.setup(
                     user,
@@ -4826,6 +5084,112 @@ mod tests {
         assert!(!env_name_accepted("MC_ALL", &allow));
         // Empty name (defensive).
         assert!(!env_name_accepted("", &allow));
+    }
+
+    // ---- per-connection policy resolution (W5/W6) ------------------------
+
+    fn policy_cfg(src: &str) -> Config {
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(fresh_seed()));
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(|| -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: "x".into(),
+                allowed_blob: Vec::new(),
+            })
+        });
+        let policy = crate::config::SshServerConfig::parse(src).expect("parse policy");
+        Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        )
+        .with_policy(Arc::new(policy))
+    }
+
+    #[test]
+    fn pubkey_auth_no_locks_out_method_set() {
+        // Global PubkeyAuthentication no ⇒ the resolved pre-auth method set is
+        // empty (publickey, the only honorable method, is dropped).
+        let cfg = policy_cfg("PubkeyAuthentication no\n");
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert!(
+            pre.methods.is_empty(),
+            "expected lockout, got {:?}",
+            pre.methods
+        );
+
+        // Without the policy the method set is the static default.
+        let cfg2 = policy_cfg("PubkeyAuthentication yes\n");
+        let pre2 = resolve_preauth_policy(&cfg2, Some("203.0.113.5"), None, None);
+        assert_eq!(pre2.methods, vec!["publickey"]);
+    }
+
+    #[test]
+    fn match_address_gates_pubkey_via_block() {
+        // publickey is dropped only for peers in 192.0.2.0/24.
+        let cfg = policy_cfg("Match Address 192.0.2.0/24\n  PubkeyAuthentication no\n");
+        let inside = resolve_preauth_policy(&cfg, Some("192.0.2.9"), None, None);
+        assert!(inside.methods.is_empty());
+        let outside = resolve_preauth_policy(&cfg, Some("198.51.100.1"), None, None);
+        assert_eq!(outside.methods, vec!["publickey"]);
+    }
+
+    #[test]
+    fn match_localport_in_effective_policy() {
+        let cfg =
+            policy_cfg("Match LocalPort 2222\n  X11Forwarding no\n  AllowAgentForwarding no\n");
+        let eff = resolve_effective_policy(&cfg, "alice", None, None, None, Some(2222));
+        assert_eq!(eff.x11_forwarding, Some(false));
+        assert!(!eff.x11_forwarding_allowed());
+        assert!(!eff.agent_forwarding_allowed());
+        // Different port ⇒ block does not apply, defaults allow.
+        let eff2 = resolve_effective_policy(&cfg, "alice", None, None, None, Some(22));
+        assert_eq!(eff2.x11_forwarding, None);
+        assert!(eff2.x11_forwarding_allowed());
+        assert!(eff2.agent_forwarding_allowed());
+    }
+
+    #[test]
+    fn match_group_in_effective_policy() {
+        let cfg = policy_cfg("Match Group dev\n  X11Forwarding no\n");
+        let groups = vec!["dev".to_string()];
+        let eff = resolve_effective_policy(&cfg, "alice", Some(&groups), None, None, None);
+        assert_eq!(eff.x11_forwarding, Some(false));
+        // No groups ⇒ block never matches.
+        let eff2 = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert_eq!(eff2.x11_forwarding, None);
+    }
+
+    #[test]
+    fn max_auth_tries_flows_into_preauth() {
+        let cfg = policy_cfg("MaxAuthTries 3\n");
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, Some(3));
+    }
+
+    #[test]
+    fn no_policy_is_unrestricted() {
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(fresh_seed()));
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(|| -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: "x".into(),
+                allowed_blob: Vec::new(),
+            })
+        });
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        );
+        let pre = resolve_preauth_policy(&cfg, Some("1.2.3.4"), None, None);
+        assert_eq!(pre.methods, vec!["publickey"]);
+        assert!(pre.banner.is_none());
+        let eff = resolve_effective_policy(&cfg, "u", None, None, None, None);
+        assert!(eff.agent_forwarding_allowed());
+        assert!(eff.x11_forwarding_allowed());
     }
 
     #[test]

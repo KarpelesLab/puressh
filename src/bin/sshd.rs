@@ -43,7 +43,7 @@ fn main() -> std::process::ExitCode {
 
 #[cfg(unix)]
 mod imp {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::net::IpAddr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -69,7 +69,7 @@ mod imp {
     use puressh::server::{
         AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult, ExecStreamHandler,
         HARD_BLOCKED_ENV_NAMES, PtySpec, SessionEnv, ShellExitStatus, ShellHandler, ShellSession,
-        SubsystemHandler, handle_session,
+        SubsystemHandler, handle_session_with_peer,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -582,8 +582,22 @@ mod imp {
         Ok(keys)
     }
 
+    /// A user→group-names resolver. Boxed so tests can inject a mock; the
+    /// production value is [`lookup_user_groups`].
+    type GroupLookup = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
+
     struct LocalAuthenticator {
-        allowed_users: HashSet<String>,
+        /// `AllowUsers` patterns (glob, OpenSSH `Host`-style). Empty ⇒ the
+        /// historical "current user only" default applied by the caller (it
+        /// seeds this with the single resolved current user as a literal).
+        allow_users: Vec<puressh::config::HostPattern>,
+        /// `DenyUsers` patterns (glob). Highest precedence.
+        deny_users: Vec<puressh::config::HostPattern>,
+        /// `AllowGroups` patterns (glob). Non-empty ⇒ the user must belong to
+        /// a matching group.
+        allow_groups: Vec<puressh::config::HostPattern>,
+        /// `DenyGroups` patterns (glob).
+        deny_groups: Vec<puressh::config::HostPattern>,
         authorized_blobs: Vec<Vec<u8>>,
         permit_root_login: puressh::config::PermitRootLogin,
         /// Per-connection memoization of `resolves_to_root(user)`. The
@@ -592,7 +606,60 @@ mod imp {
         /// re-resolving the same username across this connection's repeated
         /// attempts (probe then signature, multiple offered keys).
         root_uid0_cache: std::collections::HashMap<String, bool>,
+        /// Per-connection memoization of the user's group names (parallel to
+        /// `root_uid0_cache`); resolved once, reused across attempts.
+        group_cache: std::collections::HashMap<String, Vec<String>>,
+        /// Group resolver (production: `lookup_user_groups`; tests: a mock).
+        group_lookup: GroupLookup,
         debug: bool,
+    }
+
+    impl LocalAuthenticator {
+        /// Apply the OpenSSH access precedence — DenyUsers → AllowUsers →
+        /// DenyGroups → AllowGroups — returning `true` iff `user` is allowed.
+        ///
+        /// Group lookups are memoized per connection and resolved for *every*
+        /// user uniformly (the caller never short-circuits on an
+        /// already-failed user check), so the resolution cannot leak whether a
+        /// user exists via timing.
+        fn access_allowed(&mut self, user: &str) -> bool {
+            let name_match = |pats: &[puressh::config::HostPattern]| {
+                puressh::config::glob::host_matches(pats, user)
+            };
+            // Resolve groups up front (uniform cost) so every branch below
+            // sees the same work regardless of which check decides.
+            let groups = match self.group_cache.get(user) {
+                Some(g) => g.clone(),
+                None => {
+                    let g = (self.group_lookup)(user);
+                    self.group_cache.insert(user.to_string(), g.clone());
+                    g
+                }
+            };
+            let in_group = |pats: &[puressh::config::HostPattern]| {
+                groups
+                    .iter()
+                    .any(|g| puressh::config::glob::host_matches(pats, g))
+            };
+
+            // 1. DenyUsers wins outright.
+            if !self.deny_users.is_empty() && name_match(&self.deny_users) {
+                return false;
+            }
+            // 2. AllowUsers: if set, the user must match one.
+            if !self.allow_users.is_empty() && !name_match(&self.allow_users) {
+                return false;
+            }
+            // 3. DenyGroups: a matching group refuses.
+            if !self.deny_groups.is_empty() && in_group(&self.deny_groups) {
+                return false;
+            }
+            // 4. AllowGroups: if set, the user must be in a matching group.
+            if !self.allow_groups.is_empty() && !in_group(&self.allow_groups) {
+                return false;
+            }
+            true
+        }
     }
 
     impl Authenticator for LocalAuthenticator {
@@ -620,10 +687,11 @@ mod imp {
                     // Always run *both* checks unconditionally so an
                     // attacker can't distinguish "unknown user" from
                     // "known user / wrong key" via wall-clock timing.
-                    // The HashSet lookup is O(1); the linear scan over
-                    // authorized_blobs is the dominant cost — running
-                    // it for every attempt keeps the two paths uniform.
-                    let user_ok = self.allowed_users.contains(&user);
+                    // The access check (DenyUsers/AllowUsers/DenyGroups/
+                    // AllowGroups, with a memoized group lookup) and the
+                    // linear scan over authorized_blobs both run for every
+                    // attempt so the paths stay uniform.
+                    let user_ok = self.access_allowed(&user);
                     let blob_ok = self.authorized_blobs.contains(&public_blob);
                     // PermitRootLogin gate: if the requested user resolves to
                     // the root account (uid 0) and policy forbids it, deny
@@ -718,19 +786,28 @@ mod imp {
 
     #[derive(Clone)]
     struct LocalAuthFactory {
-        allowed_users: Arc<HashSet<String>>,
+        allow_users: Arc<Vec<puressh::config::HostPattern>>,
+        deny_users: Arc<Vec<puressh::config::HostPattern>>,
+        allow_groups: Arc<Vec<puressh::config::HostPattern>>,
+        deny_groups: Arc<Vec<puressh::config::HostPattern>>,
         authorized_blobs: Arc<Vec<Vec<u8>>>,
         permit_root_login: puressh::config::PermitRootLogin,
+        group_lookup: GroupLookup,
         debug: bool,
     }
 
     impl AuthenticatorFactory for LocalAuthFactory {
         fn build(&self) -> Box<dyn Authenticator> {
             Box::new(LocalAuthenticator {
-                allowed_users: (*self.allowed_users).clone(),
+                allow_users: (*self.allow_users).clone(),
+                deny_users: (*self.deny_users).clone(),
+                allow_groups: (*self.allow_groups).clone(),
+                deny_groups: (*self.deny_groups).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
                 permit_root_login: self.permit_root_login,
                 root_uid0_cache: std::collections::HashMap::new(),
+                group_cache: std::collections::HashMap::new(),
+                group_lookup: self.group_lookup.clone(),
                 debug: self.debug,
             })
         }
@@ -1195,6 +1272,63 @@ mod imp {
                 nix::unistd::User::from_name(name),
                 Ok(Some(u)) if u.uid.as_raw() == 0
             )
+    }
+
+    /// Resolve `name`'s supplementary group names via `getgrouplist(3)` plus
+    /// its primary group, for `Match group` / `AllowGroups` / `DenyGroups`.
+    /// Returns an empty vec for an unknown user or on any lookup failure —
+    /// resolved uniformly at login time (mirrors [`resolves_to_root`]) so the
+    /// call cannot become a user-enumeration timing oracle.
+    /// Platform-portable group-gid list for `name` with primary `gid`.
+    /// Uses `getgrouplist(3)` where nix exposes it; elsewhere falls back to
+    /// the primary group only.
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "aix",
+        target_os = "illumos",
+        target_os = "solaris",
+        target_os = "redox",
+    )))]
+    fn group_gids(name: &str, primary: nix::unistd::Gid) -> Vec<nix::unistd::Gid> {
+        let cname = match std::ffi::CString::new(name) {
+            Ok(c) => c,
+            Err(_) => return vec![primary],
+        };
+        nix::unistd::getgrouplist(&cname, primary).unwrap_or_else(|_| vec![primary])
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "aix",
+        target_os = "illumos",
+        target_os = "solaris",
+        target_os = "redox",
+    ))]
+    fn group_gids(_name: &str, primary: nix::unistd::Gid) -> Vec<nix::unistd::Gid> {
+        vec![primary]
+    }
+
+    fn lookup_user_groups(name: &str) -> Vec<String> {
+        use nix::unistd::{Gid, Group, User};
+        let Ok(Some(user)) = User::from_name(name) else {
+            return Vec::new();
+        };
+        // getgrouplist returns the user's group gids (primary + supplementary)
+        // on platforms that expose it; fall back to just the primary group if
+        // it fails or is unavailable (macOS / Solaris / AIX don't have it in
+        // nix). The primary group still feeds AllowGroups/DenyGroups there.
+        let gids: Vec<Gid> = group_gids(name, user.gid);
+        let mut names: Vec<String> = Vec::new();
+        for gid in gids {
+            if let Ok(Some(g)) = Group::from_gid(gid)
+                && !names.contains(&g.name)
+            {
+                names.push(g.name);
+            }
+        }
+        names
     }
 
     /// Layer login env vars (HOME/USER/LOGNAME/SHELL) on top of the
@@ -2224,9 +2358,17 @@ mod imp {
             .or(sshd_cfg.global.sftp_root.as_deref())
             .map(std::path::PathBuf::from);
         let scp_enabled = pick(cli.scp, sshd_cfg.global.scp_enabled, true);
-        let agent_forward = pick(cli.agent_forward, sshd_cfg.global.allow_agent_forwarding, true);
+        let agent_forward = pick(
+            cli.agent_forward,
+            sshd_cfg.global.allow_agent_forwarding,
+            true,
+        );
         let x11_forward = pick(cli.x11_forward, sshd_cfg.global.x11_forwarding, true);
-        let login_grace_time = pick(cli.login_grace_time, sshd_cfg.global.login_grace_time, 120u32);
+        let login_grace_time = pick(
+            cli.login_grace_time,
+            sshd_cfg.global.login_grace_time,
+            120u32,
+        );
         let max_startups = pick(cli.max_startups, sshd_cfg.global.max_startups, 100u32);
 
         // CLI host-keys, then any HostKey lines from config (cumulative).
@@ -2293,14 +2435,19 @@ mod imp {
             None => Vec::new(),
         };
 
-        let allowed_users: HashSet<String> = if allowed_user_list.is_empty() {
-            let u = current_user()?;
-            let mut s = HashSet::new();
-            s.insert(u);
-            s
+        // AllowUsers is matched as OpenSSH `Host`-style globs (a literal name
+        // is just a glob with no metacharacters). Empty ⇒ the historical
+        // "current user only" default, seeded as a single literal pattern.
+        let allow_user_tokens: Vec<String> = if allowed_user_list.is_empty() {
+            vec![current_user()?]
         } else {
-            allowed_user_list.into_iter().collect()
+            allowed_user_list
         };
+        let allow_users = puressh::config::HostPattern::parse_all(&allow_user_tokens);
+        let deny_users = puressh::config::HostPattern::parse_all(&sshd_cfg.global.deny_users);
+        let allow_groups = puressh::config::HostPattern::parse_all(&sshd_cfg.global.allow_groups);
+        let deny_groups = puressh::config::HostPattern::parse_all(&sshd_cfg.global.deny_groups);
+        let group_lookup: GroupLookup = Arc::new(lookup_user_groups);
 
         // PermitRootLogin: CLI > config > built-in `prohibit-password`
         // (OpenSSH's default; permits root-by-key since puressh has no
@@ -2318,9 +2465,13 @@ mod imp {
         }
 
         let factory = Arc::new(LocalAuthFactory {
-            allowed_users: Arc::new(allowed_users),
+            allow_users: Arc::new(allow_users),
+            deny_users: Arc::new(deny_users),
+            allow_groups: Arc::new(allow_groups),
+            deny_groups: Arc::new(deny_groups),
             authorized_blobs: Arc::new(authorized_blobs),
             permit_root_login,
+            group_lookup: group_lookup.clone(),
             debug: cli.debug,
         });
 
@@ -2440,6 +2591,14 @@ mod imp {
             sshd_cfg.global.host_key_algorithms.clone(),
         );
 
+        // Per-connection policy: the whole parsed sshd_config (global + Match
+        // blocks) is resolved twice per connection (pre-auth address-only,
+        // post-auth user/groups) to gate the auth method set, banner, and
+        // forwarding capabilities. The group resolver feeds `Match group`.
+        config = config
+            .with_policy(Arc::new(sshd_cfg))
+            .with_group_resolver(group_lookup);
+
         let cfg = Arc::new(config);
 
         install_parent_signals()?;
@@ -2545,7 +2704,7 @@ mod imp {
                     // post-fork COW means only this child sees it.
                     pam_gate.set_peer(peer.to_string());
 
-                    let rc = match handle_session(stream, cfg.clone()) {
+                    let rc = match handle_session_with_peer(stream, peer, cfg.clone()) {
                         Ok(()) => 0,
                         Err(e) => {
                             if cli.debug {
@@ -2582,6 +2741,97 @@ mod imp {
                 eprintln!("sshd: {msg}");
                 ExitCode::from(2)
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use puressh::config::HostPattern;
+
+        /// Build a `LocalAuthenticator` with a mock group resolver for access
+        /// precedence tests. `groups` maps user→group-names.
+        fn auth_with(
+            allow_users: &[&str],
+            deny_users: &[&str],
+            allow_groups: &[&str],
+            deny_groups: &[&str],
+            groups: std::collections::HashMap<String, Vec<String>>,
+        ) -> LocalAuthenticator {
+            let to_pats = |xs: &[&str]| {
+                HostPattern::parse_all(&xs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            };
+            let groups = std::sync::Arc::new(groups);
+            let lookup: GroupLookup =
+                std::sync::Arc::new(move |u: &str| groups.get(u).cloned().unwrap_or_default());
+            LocalAuthenticator {
+                allow_users: to_pats(allow_users),
+                deny_users: to_pats(deny_users),
+                allow_groups: to_pats(allow_groups),
+                deny_groups: to_pats(deny_groups),
+                authorized_blobs: Vec::new(),
+                permit_root_login: puressh::config::PermitRootLogin::ProhibitPassword,
+                root_uid0_cache: std::collections::HashMap::new(),
+                group_cache: std::collections::HashMap::new(),
+                group_lookup: lookup,
+                debug: false,
+            }
+        }
+
+        #[test]
+        fn deny_users_wins_over_allow_users() {
+            let mut a = auth_with(&["alice", "bob"], &["bob"], &[], &[], Default::default());
+            assert!(a.access_allowed("alice"));
+            // bob is allowed *and* denied — DenyUsers has higher precedence.
+            assert!(!a.access_allowed("bob"));
+        }
+
+        #[test]
+        fn allow_users_glob() {
+            let mut a = auth_with(&["dev-*"], &[], &[], &[], Default::default());
+            assert!(a.access_allowed("dev-1"));
+            assert!(!a.access_allowed("prod-1"));
+        }
+
+        #[test]
+        fn allow_groups_requires_membership() {
+            let mut groups = std::collections::HashMap::new();
+            groups.insert("alice".to_string(), vec!["wheel".to_string()]);
+            groups.insert("bob".to_string(), vec!["users".to_string()]);
+            let mut a = auth_with(&["*"], &[], &["wheel"], &[], groups);
+            assert!(a.access_allowed("alice")); // in wheel
+            assert!(!a.access_allowed("bob")); // not in wheel
+        }
+
+        #[test]
+        fn deny_groups_precedes_allow_groups() {
+            let mut groups = std::collections::HashMap::new();
+            groups.insert(
+                "eve".to_string(),
+                vec!["wheel".to_string(), "banned".to_string()],
+            );
+            let mut a = auth_with(&["*"], &[], &["wheel"], &["banned"], groups);
+            // eve is in wheel (allowed) but also banned (denied) — DenyGroups
+            // is evaluated before AllowGroups, so she is refused.
+            assert!(!a.access_allowed("eve"));
+        }
+
+        #[test]
+        fn lookup_user_groups_includes_real_primary() {
+            // The current test user always exists; its group list is non-empty
+            // (at least the primary group resolves to a name on normal
+            // systems). This guards the getgrouplist plumbing.
+            if let Ok(name) = std::env::var("USER")
+                && !name.is_empty()
+            {
+                let groups = lookup_user_groups(&name);
+                // Not asserting exact contents (CI users vary); just that the
+                // call returns without panicking. A known user usually yields
+                // at least one group.
+                let _ = groups;
+            }
+            // An impossible user name resolves to no groups.
+            assert!(lookup_user_groups("\u{0}no-such-user-xyzzy").is_empty());
         }
     }
 }

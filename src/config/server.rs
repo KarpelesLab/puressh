@@ -54,18 +54,18 @@ impl PermitRootLogin {
     }
 }
 
-/// `PubkeyAuthentication` / `PasswordAuthentication` policy honoured by the
-/// auth layer. Each is `Option`; `None` ⇒ inherit / built-in default.
+/// One block of `sshd_config(5)` options.
 ///
-/// The values that can actually take effect are constrained by puressh only
-/// implementing public-key auth — see the per-keyword notes on
-/// [`apply_keyword`].
+/// Every field is `Option`-typed (or an empty `Vec`) so the binary can apply
+/// OpenSSH precedence — CLI flag > config file > built-in default — using a
+/// `pick(cli, cfg, default)` helper, and so [`SshServerConfig::resolve`] can
+/// merge blocks with first-match-wins scalars and concatenated lists.
 ///
-/// One block of `sshd_config(5)` options. Every field is `Option`-typed (or
-/// an empty `Vec`) so the binary can apply OpenSSH precedence — CLI flag >
-/// config file > built-in default — using a `pick(cli, cfg, default)` helper,
-/// and so [`SshServerConfig::resolve`] can merge blocks with first-match-wins
-/// scalars and concatenated lists.
+/// Auth/access keywords are constrained by puressh implementing only
+/// public-key authentication: `PasswordAuthentication yes`,
+/// `KbdInteractiveAuthentication yes`, multi-factor `AuthenticationMethods`,
+/// and `PermitEmptyPasswords yes` are rejected at parse time rather than
+/// silently accepted.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerOptions {
     /// `Port` — default 22 (OpenSSH default; puressh's CLI default differs).
@@ -825,14 +825,20 @@ Match LocalPort 2222
     fn match_password_auth_yes_unsupported() {
         let src = "Match User alice\n  PasswordAuthentication yes\n";
         let err = SshServerConfig::parse(src).unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 2, .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 2, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
     fn match_host_on_server_unsupported() {
         let src = "Match Host example.com\n  X11Forwarding no\n";
         let err = SshServerConfig::parse(src).unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 1, .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 1, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -840,7 +846,10 @@ Match LocalPort 2222
         // Port is valid at file scope but not inside a Match block.
         let src = "Match User alice\n  Port 2222\n";
         let err = SshServerConfig::parse(src).unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 2, .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 2, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -865,8 +874,14 @@ Banner /etc/ssh/banner
             Some(&["publickey".to_string()][..])
         );
         assert_eq!(cfg.max_auth_tries, Some(3));
-        assert_eq!(cfg.deny_users, vec!["baduser".to_string(), "eve*".to_string()]);
-        assert_eq!(cfg.allow_groups, vec!["wheel".to_string(), "admins".to_string()]);
+        assert_eq!(
+            cfg.deny_users,
+            vec!["baduser".to_string(), "eve*".to_string()]
+        );
+        assert_eq!(
+            cfg.allow_groups,
+            vec!["wheel".to_string(), "admins".to_string()]
+        );
         assert_eq!(cfg.deny_groups, vec!["nologin".to_string()]);
         assert_eq!(cfg.banner.as_deref(), Some("/etc/ssh/banner"));
     }
@@ -874,9 +889,15 @@ Banner /etc/ssh/banner
     #[test]
     fn authentication_methods_multifactor_unsupported() {
         let err = SshServerConfig::parse("AuthenticationMethods publickey,password\n").unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 1, .. }), "{err:?}");
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 1, .. }),
+            "{err:?}"
+        );
         let err2 = SshServerConfig::parse("AuthenticationMethods password\n").unwrap_err();
-        assert!(matches!(err2, ConfigError::Unsupported { line: 1, .. }), "{err2:?}");
+        assert!(
+            matches!(err2, ConfigError::Unsupported { line: 1, .. }),
+            "{err2:?}"
+        );
         // `any` and bare `publickey` are accepted.
         assert!(SshServerConfig::parse("AuthenticationMethods any\n").is_ok());
     }

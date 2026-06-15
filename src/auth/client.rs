@@ -424,3 +424,113 @@ impl ClientAuth {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hostkey::HostKey;
+
+    /// A test double for [`HostKey`]: reports a fixed algorithm name and,
+    /// optionally, upgrades to another name when `upgraded_for` is asked and
+    /// the target appears in the supplied csv. No real crypto involved.
+    struct FakeHostKey {
+        algo: &'static str,
+        upgrade_to: Option<&'static str>,
+    }
+
+    impl HostKey for FakeHostKey {
+        fn algorithm(&self) -> &'static str {
+            self.algo
+        }
+        fn public_blob(&self) -> Vec<u8> {
+            alloc::vec![0xab, 0xcd]
+        }
+        fn sign(&self, _msg: &[u8]) -> Result<Vec<u8>> {
+            Ok(alloc::vec![0u8; 4])
+        }
+        fn upgraded_for(&self, server_sig_algs: &str) -> Option<Box<dyn HostKey>> {
+            let target = self.upgrade_to?;
+            if server_sig_algs.split(',').any(|a| a == target) {
+                Some(Box::new(FakeHostKey {
+                    algo: target,
+                    upgrade_to: None,
+                }))
+            } else {
+                None
+            }
+        }
+    }
+
+    fn service_accept() -> Vec<u8> {
+        ServiceAccept {
+            service: "ssh-userauth".into(),
+        }
+        .encode()
+    }
+
+    /// Run start() + SERVICE_ACCEPT and return the algorithm of the first
+    /// publickey request emitted, or None if the driver gave up (Failed).
+    fn first_pubkey_algo(mut auth: ClientAuth) -> Option<String> {
+        let _ = auth.start();
+        match auth.on_packet(&service_accept()).expect("service accept") {
+            ClientStep::Send(p) => {
+                let req = UserauthRequest::decode(&p).expect("decode request");
+                match req.method {
+                    AuthMethodPayload::PublicKey { algorithm, .. } => Some(algorithm),
+                    _ => None,
+                }
+            }
+            ClientStep::Failed { .. } => None,
+            _ => panic!("unexpected step from service-accept"),
+        }
+    }
+
+    #[test]
+    fn pubkey_accepted_skips_excluded_credential() {
+        let mut auth = ClientAuth::new("u", Vec::new());
+        auth.set_pubkey_accepted(alloc::vec!["ssh-ed25519".to_string()]);
+        // The only credential is an ECDSA key, not on the accept list and with
+        // no upgrade path -> the driver must skip it and report Failed.
+        auth.add_credential(ClientCredential::PublicKey(Box::new(FakeHostKey {
+            algo: "ecdsa-sha2-nistp256",
+            upgrade_to: None,
+        })));
+        assert_eq!(first_pubkey_algo(auth), None);
+    }
+
+    #[test]
+    fn pubkey_accepted_keeps_listed_credential() {
+        let mut auth = ClientAuth::new("u", Vec::new());
+        auth.set_pubkey_accepted(alloc::vec!["ssh-ed25519".to_string()]);
+        auth.add_credential(ClientCredential::PublicKey(Box::new(FakeHostKey {
+            algo: "ssh-ed25519",
+            upgrade_to: None,
+        })));
+        assert_eq!(first_pubkey_algo(auth).as_deref(), Some("ssh-ed25519"));
+    }
+
+    #[test]
+    fn pubkey_accepted_upgrades_ssh_rsa_to_sha2_512() {
+        let mut auth = ClientAuth::new("u", Vec::new());
+        // Client policy accepts only rsa-sha2-512; the credential is a legacy
+        // ssh-rsa signer that knows how to upgrade itself to rsa-sha2-512.
+        auth.set_pubkey_accepted(alloc::vec!["rsa-sha2-512".to_string()]);
+        auth.add_credential(ClientCredential::PublicKey(Box::new(FakeHostKey {
+            algo: "ssh-rsa",
+            upgrade_to: Some("rsa-sha2-512"),
+        })));
+        assert_eq!(first_pubkey_algo(auth).as_deref(), Some("rsa-sha2-512"));
+    }
+
+    #[test]
+    fn no_pubkey_policy_keeps_credential_as_is() {
+        // Without a PubkeyAcceptedAlgorithms policy, the credential passes
+        // through untouched (old-OpenSSH behaviour).
+        let mut auth = ClientAuth::new("u", Vec::new());
+        auth.add_credential(ClientCredential::PublicKey(Box::new(FakeHostKey {
+            algo: "ssh-rsa",
+            upgrade_to: None,
+        })));
+        assert_eq!(first_pubkey_algo(auth).as_deref(), Some("ssh-rsa"));
+    }
+}

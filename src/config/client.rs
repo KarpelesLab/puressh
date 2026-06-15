@@ -692,6 +692,72 @@ Host gw
     }
 
     #[test]
+    fn algorithm_keywords_parse() {
+        let src = "\
+Host gw
+  Ciphers aes128-ctr,aes256-ctr
+  MACs hmac-sha2-256
+  KexAlgorithms curve25519-sha256
+  HostKeyAlgorithms ssh-ed25519
+  PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(
+            eff.ciphers.as_deref(),
+            Some(&["aes128-ctr".to_string(), "aes256-ctr".to_string()][..])
+        );
+        assert_eq!(eff.macs.as_deref(), Some(&["hmac-sha2-256".to_string()][..]));
+        assert_eq!(
+            eff.kex_algorithms.as_deref(),
+            Some(&["curve25519-sha256".to_string()][..])
+        );
+        assert_eq!(
+            eff.host_key_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string()][..])
+        );
+        assert_eq!(
+            eff.pubkey_accepted_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string(), "rsa-sha2-512".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn unknown_cipher_rejected_with_line() {
+        let src = "Host gw\n  Ciphers totally-bogus\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        match err {
+            ConfigError::BadValue { line, keyword, msg } => {
+                assert_eq!(line, 2);
+                assert_eq!(keyword, "Ciphers");
+                assert!(msg.contains("totally-bogus"));
+            }
+            other => panic!("expected BadValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn casignaturealgorithms_unsupported() {
+        let src = "Host gw\n  CASignatureAlgorithms ssh-ed25519\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { line: 2, .. }));
+    }
+
+    #[test]
+    fn algorithms_first_match_wins() {
+        // First matching block's Ciphers wins; a later block does not append.
+        let src = "\
+Host gw
+  Ciphers aes128-ctr
+Host *
+  Ciphers aes256-ctr
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(eff.ciphers.as_deref(), Some(&["aes128-ctr".to_string()][..]));
+    }
+
+    #[test]
     fn global_block_applies() {
         let src = "\
 User globaluser

@@ -3646,6 +3646,75 @@ mod tests {
         assert_eq!(neg.host_key, "ssh-ed25519");
     }
 
+    #[test]
+    fn server_cipher_override_replaces_and_keeps_kex_markers() {
+        let mut rng = OsRng;
+        let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
+            vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
+        let cfg = kexinit_test_config(host_keys).with_algorithms(
+            Some(vec!["aes256-ctr".to_string()]),
+            None,
+            None,
+            None,
+        );
+        let advert = build_server_kexinit(&mut rng, &cfg);
+        assert_eq!(advert.ciphers_c2s, vec!["aes256-ctr".to_string()]);
+        // strict-kex markers preserved.
+        let markers = advert
+            .kex
+            .iter()
+            .filter(|k| is_strict_kex_marker(k))
+            .count();
+        assert_eq!(markers, 2);
+    }
+
+    #[test]
+    fn server_hostkey_override_intersects_with_loaded_keys() {
+        let mut rng = OsRng;
+        // Only an ed25519 key is loaded.
+        let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
+            vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
+        // Override prefers rsa first then ed25519; rsa is dropped (no key).
+        let cfg = kexinit_test_config(host_keys).with_algorithms(
+            None,
+            None,
+            None,
+            Some(vec!["rsa-sha2-512".to_string(), "ssh-ed25519".to_string()]),
+        );
+        let advert = build_server_kexinit(&mut rng, &cfg);
+        assert_eq!(advert.server_host_key, vec!["ssh-ed25519".to_string()]);
+    }
+
+    #[test]
+    fn server_hostkey_override_excluding_ed25519_is_honoured() {
+        let mut rng = OsRng;
+        // Only ed25519 loaded, but the operator explicitly excludes it by
+        // naming only rsa. The intersection is empty AND ed25519 is excluded,
+        // so the fallback net must NOT re-add it.
+        let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
+            vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
+        let cfg = kexinit_test_config(host_keys).with_algorithms(
+            None,
+            None,
+            None,
+            Some(vec!["rsa-sha2-512".to_string()]),
+        );
+        let advert = build_server_kexinit(&mut rng, &cfg);
+        assert!(
+            advert.server_host_key.is_empty(),
+            "explicit ed25519 exclusion must not be overridden by the fallback net"
+        );
+    }
+
+    #[test]
+    fn server_no_override_falls_back_to_ed25519_when_no_keys() {
+        let mut rng = OsRng;
+        // No keys at all and no override -> the ed25519 net kicks in.
+        let cfg = kexinit_test_config(Vec::new());
+        let advert = build_server_kexinit(&mut rng, &cfg);
+        assert_eq!(advert.server_host_key, vec!["ssh-ed25519".to_string()]);
+    }
+
     /// A subsystem handler that reads bytes from the channel until EOF and
     /// writes them back uppercased. Used by [`loopback_subsystem_roundtrip`]
     /// to exercise the `dispatch_app_packet` subsystem path end-to-end

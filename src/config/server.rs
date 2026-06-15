@@ -455,6 +455,62 @@ AllowUsers bob carol
     }
 
     #[test]
+    fn algorithm_keywords_parse() {
+        let src = "\
+Port 22
+Ciphers aes256-ctr,aes128-ctr
+MACs hmac-sha2-512
+KexAlgorithms curve25519-sha256
+HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
+";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        assert_eq!(
+            cfg.ciphers.as_deref(),
+            Some(&["aes256-ctr".to_string(), "aes128-ctr".to_string()][..])
+        );
+        assert_eq!(cfg.macs.as_deref(), Some(&["hmac-sha2-512".to_string()][..]));
+        assert_eq!(
+            cfg.kex_algorithms.as_deref(),
+            Some(&["curve25519-sha256".to_string()][..])
+        );
+        assert_eq!(
+            cfg.host_key_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string(), "rsa-sha2-512".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn unknown_mac_rejected_with_line() {
+        let src = "Port 22\nMACs hmac-bogus\n";
+        let err = SshServerConfig::parse(src).unwrap_err();
+        match err {
+            ConfigError::BadValue { line, keyword, msg } => {
+                assert_eq!(line, 2);
+                assert_eq!(keyword, "MACs");
+                assert!(msg.contains("hmac-bogus"));
+            }
+            other => panic!("expected BadValue, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_casignaturealgorithms_unsupported() {
+        let src = "Port 22\nCASignatureAlgorithms ssh-ed25519\n";
+        let err = SshServerConfig::parse(src).unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { line: 2, .. }));
+    }
+
+    #[test]
+    fn kex_remove_modifier_keeps_nonempty() {
+        // `-` removes by glob from the defaults; the result must be non-empty.
+        let src = "Port 22\nKexAlgorithms -diffie-hellman-group*\n";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        let kex = cfg.kex_algorithms.unwrap();
+        assert!(kex.iter().all(|k| !k.starts_with("diffie-hellman-group")));
+        assert!(kex.iter().any(|k| k == "curve25519-sha256"));
+    }
+
+    #[test]
     fn login_grace_time_units() {
         for (s, want) in [
             ("30", 30u32),

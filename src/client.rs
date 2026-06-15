@@ -3436,4 +3436,88 @@ mod tests {
         // The server thread may have errored after our connect dropped — that's fine.
         let _ = server.join();
     }
+
+    #[test]
+    fn client_advert_no_overrides_matches_defaults() {
+        let advert = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
+        // Ciphers/MACs/host-key advertise the built-in defaults.
+        let want_ciphers: Vec<String> = defaults::CIPHERS.iter().map(|s| s.to_string()).collect();
+        assert_eq!(advert.ciphers_c2s, want_ciphers);
+        assert_eq!(advert.ciphers_s2c, want_ciphers);
+        // The kex list ends with both strict-kex markers.
+        let n = advert.kex.len();
+        assert!(crate::transport::kex::is_strict_kex_marker(&advert.kex[n - 1]));
+        assert!(crate::transport::kex::is_strict_kex_marker(&advert.kex[n - 2]));
+    }
+
+    #[test]
+    fn client_cipher_override_replaces_and_keeps_markers() {
+        let over = AlgoOverrides {
+            ciphers: Some(vec!["aes128-ctr".to_string()]),
+            ..Default::default()
+        };
+        let advert = build_default_kexinit(&mut OsRng, &over);
+        assert_eq!(advert.ciphers_c2s, vec!["aes128-ctr".to_string()]);
+        assert_eq!(advert.ciphers_s2c, vec!["aes128-ctr".to_string()]);
+        // Markers regained even though we overrode an unrelated category.
+        assert!(advert
+            .kex
+            .iter()
+            .any(|k| crate::transport::kex::is_strict_kex_marker(k)));
+    }
+
+    #[test]
+    fn client_kex_override_reappends_markers() {
+        let over = AlgoOverrides {
+            // A single real kex; markers must still come back.
+            kex_algorithms: Some(vec!["curve25519-sha256".to_string()]),
+            ..Default::default()
+        };
+        let advert = build_default_kexinit(&mut OsRng, &over);
+        assert_eq!(advert.kex[0], "curve25519-sha256");
+        let markers = advert
+            .kex
+            .iter()
+            .filter(|k| crate::transport::kex::is_strict_kex_marker(k))
+            .count();
+        assert_eq!(markers, 2, "both strict-kex markers must be re-appended");
+    }
+
+    #[test]
+    fn restricted_client_ciphers_negotiate_against_default_server() {
+        use crate::transport::kexinit::negotiate;
+        // Client restricts ciphers to a single CTR suite; server advertises
+        // defaults. Negotiation must pick the client's restricted choice.
+        let client_over = AlgoOverrides {
+            ciphers: Some(vec!["aes128-ctr".to_string()]),
+            ..Default::default()
+        };
+        let client = build_default_kexinit(&mut OsRng, &client_over)
+            .with_ext_info_marker(Role::Client);
+        let server = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
+        let neg = negotiate(&client, &server).expect("should negotiate");
+        assert_eq!(neg.cipher_c2s, "aes128-ctr");
+        assert_eq!(neg.cipher_s2c, "aes128-ctr");
+        // Strict-kex survives an unrelated cipher override on the client.
+        assert!(neg.strict_kex_enabled);
+    }
+
+    #[test]
+    fn disjoint_ciphers_fail_with_no_common_algorithm() {
+        use crate::transport::kexinit::negotiate;
+        let client_over = AlgoOverrides {
+            ciphers: Some(vec!["aes128-ctr".to_string()]),
+            ..Default::default()
+        };
+        let server_over = AlgoOverrides {
+            ciphers: Some(vec!["aes256-ctr".to_string()]),
+            ..Default::default()
+        };
+        let client = build_default_kexinit(&mut OsRng, &client_over);
+        let server = build_default_kexinit(&mut OsRng, &server_over);
+        assert!(matches!(
+            negotiate(&client, &server),
+            Err(Error::NoCommonAlgorithm(_))
+        ));
+    }
 }

@@ -93,6 +93,41 @@ pub enum IdentityAgent {
     Path(String),
 }
 
+/// `ControlMaster` value — controls connection-multiplexing role.
+///
+/// `ask` / `autoask` would prompt the user for permission before
+/// reusing/establishing a master. puressh has no interactive confirmation
+/// path for this decision, so both are rejected at parse time as
+/// [`ConfigError::Unsupported`] rather than silently downgraded to `yes`
+/// (which would defeat the user's explicit request to be asked).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlMaster {
+    /// `no` (default): never multiplex. Open a fresh connection.
+    No,
+    /// `yes`: become the master. Fails if the `ControlPath` socket already
+    /// has a live master answering.
+    Yes,
+    /// `auto`: reuse an existing master if the socket answers; otherwise
+    /// connect normally and become the master.
+    Auto,
+}
+
+/// `ControlPersist` value — how long a master lingers after its foreground
+/// session ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlPersist {
+    /// `no`: the master exits as soon as its own foreground session ends
+    /// (still serving any clients that attached, but tearing down once the
+    /// initiating session finishes — matches OpenSSH `no`).
+    No,
+    /// `yes`: the master persists indefinitely after the foreground session
+    /// ends, until explicitly stopped (or the process exits).
+    Yes,
+    /// `<N>` (or `<N>[smh]`): linger N seconds after the last client
+    /// detaches, then unlink the socket and exit.
+    Seconds(u64),
+}
+
 /// One `DynamicForward` entry — a local SOCKS proxy listener. Wire form
 /// `[bind:]port`, e.g. `1080` or `127.0.0.1:1080`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -238,6 +273,15 @@ pub struct ClientOptions {
     pub bind_address: Option<String>,
     /// `IdentityAgent` — agent-socket override (or `none`).
     pub identity_agent: Option<IdentityAgent>,
+    /// `ControlMaster` — connection-multiplexing role (no/yes/auto).
+    pub control_master: Option<ControlMaster>,
+    /// `ControlPath` — Unix-domain control-socket path with `%`-token and
+    /// `~` expansion deferred to the honoring site. The literal `none`
+    /// (case-insensitive) is stored as `None` to disable multiplexing.
+    pub control_path: Option<String>,
+    /// `ControlPersist` — how long the master lingers after its foreground
+    /// session ends (no/yes/`<N>[smh]`).
+    pub control_persist: Option<ControlPersist>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -718,6 +762,46 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                 IdentityAgent::Path(v)
             });
         }
+        "controlmaster" => {
+            let s = one_arg(line)?.to_ascii_lowercase();
+            opts.control_master = Some(match s.as_str() {
+                "no" | "false" | "off" => ControlMaster::No,
+                "yes" | "true" | "on" => ControlMaster::Yes,
+                "auto" => ControlMaster::Auto,
+                // `ask` / `autoask` need an interactive confirmation path
+                // we don't have. Reject rather than silently treat as
+                // `yes` — the user explicitly asked to be prompted.
+                "ask" | "autoask" => {
+                    return Err(ConfigError::Unsupported {
+                        line: line.line_no,
+                        msg: "ControlMaster ask/autoask requires interactive confirmation, \
+                              which is not implemented"
+                            .into(),
+                    });
+                }
+                other => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected no/yes/auto, got {other:?}"),
+                    });
+                }
+            });
+        }
+        "controlpath" => {
+            // The whole rest of the line (after token re-join) is the path;
+            // `%`-token and `~` expansion happen at the honoring site.
+            // `none` (case-insensitive) disables multiplexing.
+            let v = one_arg(line)?;
+            if v.eq_ignore_ascii_case("none") {
+                opts.control_path = None;
+            } else {
+                opts.control_path = Some(v);
+            }
+        }
+        "controlpersist" => {
+            opts.control_persist = Some(parse_control_persist(line)?);
+        }
         "casignaturealgorithms" => {
             // Certificate-based authentication is not implemented; reject
             // rather than silently ignore so a security-relevant directive
@@ -786,6 +870,9 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(address_family);
     take_scalar!(bind_address);
     take_scalar!(identity_agent);
+    take_scalar!(control_master);
+    take_scalar!(control_path);
+    take_scalar!(control_persist);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.local_forwards
@@ -897,6 +984,45 @@ fn parse_dynamic_forward(line: &ParsedLine) -> Result<DynamicForwardSpec, Config
         bind_addr,
         listen_port,
     })
+}
+
+/// Parse a `ControlPersist` value: `yes` / `no` / `<N>` / `<N>[smh]`.
+///
+/// A bare integer is seconds. A trailing `s`/`m`/`h` suffix scales to
+/// seconds (`m` ⇒ ×60, `h` ⇒ ×3600). A literal `0` means "no persist"
+/// (≡ `no`), matching OpenSSH. Overflow on the multiply is rejected.
+fn parse_control_persist(line: &ParsedLine) -> Result<ControlPersist, ConfigError> {
+    let s = one_arg(line)?.to_ascii_lowercase();
+    match s.as_str() {
+        "no" | "false" | "off" => return Ok(ControlPersist::No),
+        "yes" | "true" | "on" => return Ok(ControlPersist::Yes),
+        _ => {}
+    }
+    let bad = |msg: String| ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg,
+    };
+    let (digits, scale): (&str, u64) = match s.as_bytes().last() {
+        Some(b's') => (&s[..s.len() - 1], 1),
+        Some(b'm') => (&s[..s.len() - 1], 60),
+        Some(b'h') => (&s[..s.len() - 1], 3600),
+        _ => (s.as_str(), 1),
+    };
+    if digits.is_empty() {
+        return Err(bad(format!("expected yes/no/<N>[smh], got {s:?}")));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| bad(format!("expected yes/no/<N>[smh], got {s:?}")))?;
+    let secs = n
+        .checked_mul(scale)
+        .ok_or_else(|| bad("ControlPersist duration overflows".into()))?;
+    if secs == 0 {
+        Ok(ControlPersist::No)
+    } else {
+        Ok(ControlPersist::Seconds(secs))
+    }
 }
 
 fn parse_yes_no(line: &ParsedLine) -> Result<bool, ConfigError> {
@@ -1571,6 +1697,67 @@ Match host *.example.com
         let cfg = SshClientConfig::parse(src).unwrap();
         assert_eq!(cfg.lookup("web.example.com").user.as_deref(), Some("alice"));
         assert_eq!(cfg.lookup("web.other.com").user, None);
+    }
+
+    #[test]
+    fn control_master_values() {
+        let cfg = SshClientConfig::parse("Host h\n  ControlMaster auto\n").unwrap();
+        assert_eq!(cfg.lookup("h").control_master, Some(ControlMaster::Auto));
+        let cfg = SshClientConfig::parse("Host h\n  ControlMaster yes\n").unwrap();
+        assert_eq!(cfg.lookup("h").control_master, Some(ControlMaster::Yes));
+        let cfg = SshClientConfig::parse("Host h\n  ControlMaster no\n").unwrap();
+        assert_eq!(cfg.lookup("h").control_master, Some(ControlMaster::No));
+    }
+
+    #[test]
+    fn control_master_ask_unsupported() {
+        let err = SshClientConfig::parse("Host h\n  ControlMaster ask\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { .. }));
+        let err = SshClientConfig::parse("Host h\n  ControlMaster autoask\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn control_master_bad_value() {
+        let err = SshClientConfig::parse("Host h\n  ControlMaster maybe\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+    }
+
+    #[test]
+    fn control_path_none_disables() {
+        let cfg = SshClientConfig::parse("Host h\n  ControlPath none\n").unwrap();
+        assert_eq!(cfg.lookup("h").control_path, None);
+        let cfg = SshClientConfig::parse("Host h\n  ControlPath ~/.ssh/cm-%r@%h:%p\n").unwrap();
+        assert_eq!(
+            cfg.lookup("h").control_path.as_deref(),
+            Some("~/.ssh/cm-%r@%h:%p")
+        );
+    }
+
+    #[test]
+    fn control_persist_values() {
+        let p = |s: &str| {
+            SshClientConfig::parse(&format!("Host h\n  ControlPersist {s}\n"))
+                .unwrap()
+                .lookup("h")
+                .control_persist
+        };
+        assert_eq!(p("no"), Some(ControlPersist::No));
+        assert_eq!(p("yes"), Some(ControlPersist::Yes));
+        assert_eq!(p("30"), Some(ControlPersist::Seconds(30)));
+        assert_eq!(p("30s"), Some(ControlPersist::Seconds(30)));
+        assert_eq!(p("5m"), Some(ControlPersist::Seconds(300)));
+        assert_eq!(p("2h"), Some(ControlPersist::Seconds(7200)));
+        // `0` collapses to No, matching OpenSSH.
+        assert_eq!(p("0"), Some(ControlPersist::No));
+    }
+
+    #[test]
+    fn control_persist_bad_value() {
+        let err = SshClientConfig::parse("Host h\n  ControlPersist soon\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+        let err = SshClientConfig::parse("Host h\n  ControlPersist 10x\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
     }
 
     #[test]

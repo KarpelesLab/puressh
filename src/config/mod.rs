@@ -45,8 +45,8 @@ pub mod parser;
 pub mod server;
 
 pub use client::{
-    AddressFamily, ClientOptions, DynamicForwardSpec, GatewayPorts, IdentityAgent,
-    LocalForwardSpec, RemoteForwardSpec, RequestTty, SshClientConfig, StrictMode,
+    AddressFamily, ClientOptions, ControlMaster, ControlPersist, DynamicForwardSpec, GatewayPorts,
+    IdentityAgent, LocalForwardSpec, RemoteForwardSpec, RequestTty, SshClientConfig, StrictMode,
 };
 pub use glob::HostPattern;
 pub use host_port::{parse_host_port, parse_host_port_pattern};

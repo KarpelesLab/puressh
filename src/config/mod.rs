@@ -50,8 +50,8 @@ pub use client::{
 };
 pub use glob::HostPattern;
 pub use host_port::{parse_host_port, parse_host_port_pattern};
-pub use match_block::{MatchCondition, MatchContext};
-pub use server::{PermitRootLogin, SshServerConfig};
+pub use match_block::{AddressKind, AddressPattern, MatchCondition, MatchContext};
+pub use server::{PermitRootLogin, ServerMatchBlock, ServerOptions, SshServerConfig};
 
 /// Errors produced while parsing or evaluating an SSH config file.
 #[derive(Debug, Clone, PartialEq, Eq)]

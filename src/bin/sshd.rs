@@ -315,15 +315,18 @@ mod imp {
         cli.or(cfg).unwrap_or(default)
     }
 
-    /// Read and parse a single `sshd_config`-format file. There is no default
-    /// search path on the server side: distros disagree on where the file
-    /// lives, and the user explicitly opts in via `-f`.
+    /// Read and parse a single `sshd_config`-format file, resolving any
+    /// `Include` directives recursively. There is no default search path on
+    /// the server side: distros disagree on where the file lives, and the
+    /// user explicitly opts in via `-f`. Relative includes resolve against the
+    /// directory of the file being parsed (and, for the system entry point at
+    /// `/etc/ssh/...`, that is `/etc/ssh`).
     fn load_server_config(
         path: &std::path::Path,
     ) -> Result<puressh::config::SshServerConfig, String> {
-        let src =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        puressh::config::SshServerConfig::parse(&src)
+        let lines = puressh::config::include::tokenize_file_with_includes(path, 0)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        puressh::config::SshServerConfig::from_lines(lines)
             .map_err(|e| format!("{}: {e}", path.display()))
     }
 
@@ -2211,24 +2214,24 @@ mod imp {
         };
 
         // Resolve effective values: CLI > config > built-in default.
-        let port = pick(cli.port, sshd_cfg.port, 2222u16);
-        let strict_modes = pick(cli.strict_modes, sshd_cfg.strict_modes, true);
-        let sftp_enabled = pick(cli.sftp, sshd_cfg.sftp_enabled, true);
-        let sftp_read_only = pick(cli.sftp_read_only, sshd_cfg.sftp_read_only, false);
+        let port = pick(cli.port, sshd_cfg.global.port, 2222u16);
+        let strict_modes = pick(cli.strict_modes, sshd_cfg.global.strict_modes, true);
+        let sftp_enabled = pick(cli.sftp, sshd_cfg.global.sftp_enabled, true);
+        let sftp_read_only = pick(cli.sftp_read_only, sshd_cfg.global.sftp_read_only, false);
         let sftp_root: Option<std::path::PathBuf> = cli
             .sftp_root
             .as_deref()
-            .or(sshd_cfg.sftp_root.as_deref())
+            .or(sshd_cfg.global.sftp_root.as_deref())
             .map(std::path::PathBuf::from);
-        let scp_enabled = pick(cli.scp, sshd_cfg.scp_enabled, true);
-        let agent_forward = pick(cli.agent_forward, sshd_cfg.allow_agent_forwarding, true);
-        let x11_forward = pick(cli.x11_forward, sshd_cfg.x11_forwarding, true);
-        let login_grace_time = pick(cli.login_grace_time, sshd_cfg.login_grace_time, 120u32);
-        let max_startups = pick(cli.max_startups, sshd_cfg.max_startups, 100u32);
+        let scp_enabled = pick(cli.scp, sshd_cfg.global.scp_enabled, true);
+        let agent_forward = pick(cli.agent_forward, sshd_cfg.global.allow_agent_forwarding, true);
+        let x11_forward = pick(cli.x11_forward, sshd_cfg.global.x11_forwarding, true);
+        let login_grace_time = pick(cli.login_grace_time, sshd_cfg.global.login_grace_time, 120u32);
+        let max_startups = pick(cli.max_startups, sshd_cfg.global.max_startups, 100u32);
 
         // CLI host-keys, then any HostKey lines from config (cumulative).
         let mut host_key_files = cli.host_key_files.clone();
-        host_key_files.extend(sshd_cfg.host_key_files.iter().cloned());
+        host_key_files.extend(sshd_cfg.global.host_key_files.iter().cloned());
         if host_key_files.is_empty() {
             return Err(
                 "at least one -h host_key_file (or HostKey in sshd_config) is required".into(),
@@ -2238,20 +2241,20 @@ mod imp {
         let authorized_keys_file = cli
             .authorized_keys_file
             .clone()
-            .or_else(|| sshd_cfg.authorized_keys_file.clone());
+            .or_else(|| sshd_cfg.global.authorized_keys_file.clone());
 
         // CLI `-u`, then `AllowUsers` from config (cumulative across blocks).
         let mut allowed_user_list = cli.allowed_users.clone();
-        allowed_user_list.extend(sshd_cfg.allow_users.iter().cloned());
+        allowed_user_list.extend(sshd_cfg.global.allow_users.iter().cloned());
 
         // Likewise `--accept-env` ++ `AcceptEnv`.
         let mut accept_env = cli.accept_env.clone();
-        accept_env.extend(sshd_cfg.accept_env.iter().cloned());
+        accept_env.extend(sshd_cfg.global.accept_env.iter().cloned());
 
         // Pick the bind address. We support a single listener for v1; warn
         // if more than one ListenAddress / -b was supplied.
         let mut bind_specs = cli.listen_addresses.clone();
-        bind_specs.extend(sshd_cfg.listen_addresses.iter().cloned());
+        bind_specs.extend(sshd_cfg.global.listen_addresses.iter().cloned());
         if bind_specs.len() > 1 {
             eprintln!(
                 "sshd: warning: {} ListenAddress entries supplied; binding only the first \
@@ -2307,7 +2310,7 @@ mod imp {
         // live passwd database rather than a daemon-startup snapshot.
         let permit_root_login = pick(
             cli.permit_root_login,
-            sshd_cfg.permit_root_login,
+            sshd_cfg.global.permit_root_login,
             puressh::config::PermitRootLogin::ProhibitPassword,
         );
         if cli.debug {
@@ -2431,10 +2434,10 @@ mod imp {
         // order and intersected with the loaded host keys; the strict-kex
         // markers are re-appended by the server regardless of KexAlgorithms.
         config = config.with_algorithms(
-            sshd_cfg.ciphers.clone(),
-            sshd_cfg.macs.clone(),
-            sshd_cfg.kex_algorithms.clone(),
-            sshd_cfg.host_key_algorithms.clone(),
+            sshd_cfg.global.ciphers.clone(),
+            sshd_cfg.global.macs.clone(),
+            sshd_cfg.global.kex_algorithms.clone(),
+            sshd_cfg.global.host_key_algorithms.clone(),
         );
 
         let cfg = Arc::new(config);

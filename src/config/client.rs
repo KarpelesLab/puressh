@@ -365,6 +365,7 @@ impl SshClientConfig {
             original_host: None,
             user: None,
             local_user: None,
+            ..MatchContext::default()
         })
     }
 
@@ -1598,6 +1599,7 @@ Match host *.example.com user alice
             original_host: None,
             user: Some("bob"),
             local_user: None,
+            ..MatchContext::default()
         };
         assert_eq!(cfg.lookup_with(ctx).port, None);
         // Right user → matches.
@@ -1606,6 +1608,7 @@ Match host *.example.com user alice
             original_host: None,
             user: Some("alice"),
             local_user: None,
+            ..MatchContext::default()
         };
         assert_eq!(cfg.lookup_with(ctx).port, Some(2222));
     }
@@ -1695,6 +1698,7 @@ Match originalhost prod
             original_host: Some("prod"),
             user: None,
             local_user: None,
+            ..MatchContext::default()
         };
         assert_eq!(cfg.lookup_with(ctx).port, Some(2200));
     }
@@ -1711,6 +1715,7 @@ Match localuser alice
             original_host: None,
             user: None,
             local_user: Some("alice"),
+            ..MatchContext::default()
         };
         assert_eq!(cfg.lookup_with(ctx).port, Some(2200));
         let ctx = MatchContext {
@@ -1718,6 +1723,7 @@ Match localuser alice
             original_host: None,
             user: None,
             local_user: Some("bob"),
+            ..MatchContext::default()
         };
         assert_eq!(cfg.lookup_with(ctx).port, None);
     }

@@ -19,11 +19,153 @@
 //!   we don't perform `CanonicalizeHostname` (they only fire on the
 //!   post-canonicalisation pass).
 
+use core::net::IpAddr;
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::ConfigError;
-use super::glob::{HostPattern, host_matches};
+use super::glob::{HostPattern, glob_match, host_matches};
+
+/// One entry in a `Match address` / `Match localaddress` pattern list.
+///
+/// OpenSSH accepts three textual forms per entry, each optionally negated with
+/// a leading `!`:
+///
+/// - a CIDR range (`192.0.2.0/24`, `2001:db8::/32`) — matched numerically;
+/// - a bare address (`192.0.2.7`, `::1`) — treated as a `/32` (v4) or `/128`
+///   (v6) CIDR;
+/// - a textual glob (`192.0.2.*`, `10.?.?.?`) — matched against the address's
+///   string form when it contains `*` / `?`. This is the documented OpenSSH
+///   fallback for hosts whose address can't be parsed as a CIDR.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressPattern {
+    /// Whether a match on `kind` *excludes* the address (`!`-prefixed).
+    pub negated: bool,
+    /// The matchable body.
+    pub kind: AddressKind,
+}
+
+/// The body of an [`AddressPattern`] (after stripping any `!`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddressKind {
+    /// A numeric CIDR: base address plus prefix length in bits.
+    Cidr {
+        /// Network base address.
+        base: IpAddr,
+        /// Prefix length in bits (`0..=32` for v4, `0..=128` for v6).
+        prefix: u8,
+    },
+    /// A textual glob applied to the address's string form.
+    Glob(String),
+}
+
+impl AddressPattern {
+    /// Parse one comma-list entry. Never fails: an entry that is neither a
+    /// valid CIDR nor a bare address is recorded as a [`AddressKind::Glob`],
+    /// matching OpenSSH's "fall back to textual matching" behaviour.
+    pub fn parse(token: &str) -> Self {
+        let (negated, body) = match token.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, token),
+        };
+        let kind = parse_address_kind(body);
+        AddressPattern { negated, kind }
+    }
+}
+
+/// Parse the body (no `!`) of an address pattern into a [`AddressKind`].
+fn parse_address_kind(body: &str) -> AddressKind {
+    if let Some((addr_s, prefix_s)) = body.split_once('/') {
+        if let (Ok(base), Ok(prefix)) = (addr_s.parse::<IpAddr>(), prefix_s.parse::<u8>()) {
+            let max = if base.is_ipv4() { 32 } else { 128 };
+            if prefix <= max {
+                return AddressKind::Cidr { base, prefix };
+            }
+        }
+        // Malformed CIDR → fall back to a textual glob over the raw entry.
+        return AddressKind::Glob(body.to_string());
+    }
+    if let Ok(base) = body.parse::<IpAddr>() {
+        let prefix = if base.is_ipv4() { 32 } else { 128 };
+        return AddressKind::Cidr { base, prefix };
+    }
+    AddressKind::Glob(body.to_string())
+}
+
+/// Parse a comma-separated `Match address` argument into a list of patterns.
+fn parse_address_list(s: &str) -> Vec<AddressPattern> {
+    s.split(',')
+        .filter(|t| !t.is_empty())
+        .map(AddressPattern::parse)
+        .collect()
+}
+
+/// Whether the two addresses share the same family and `addr` falls inside
+/// the `base`/`prefix` network. Mixed families never match.
+fn cidr_contains(base: IpAddr, prefix: u8, addr: IpAddr) -> bool {
+    match (base, addr) {
+        (IpAddr::V4(b), IpAddr::V4(a)) => {
+            let bits = u32::from(b);
+            let abits = u32::from(a);
+            if prefix == 0 {
+                return true;
+            }
+            if prefix > 32 {
+                return false;
+            }
+            let mask = u32::MAX.checked_shl(32 - prefix as u32).unwrap_or(0);
+            (bits & mask) == (abits & mask)
+        }
+        (IpAddr::V6(b), IpAddr::V6(a)) => {
+            let bits = u128::from(b);
+            let abits = u128::from(a);
+            if prefix == 0 {
+                return true;
+            }
+            if prefix > 128 {
+                return false;
+            }
+            let mask = u128::MAX.checked_shl(128 - prefix as u32).unwrap_or(0);
+            (bits & mask) == (abits & mask)
+        }
+        _ => false,
+    }
+}
+
+/// Evaluate an address pattern list against a textual address, OpenSSH style:
+/// at least one positive entry matches AND no negative entry matches. An empty
+/// list never matches.
+///
+/// CIDR / bare-address entries are matched numerically (so `192.0.2.0/24`
+/// matches `192.0.2.7`); glob entries are matched against the textual form.
+pub fn address_matches(patterns: &[AddressPattern], addr_str: &str) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let parsed = addr_str.parse::<IpAddr>().ok();
+    let mut any_positive = false;
+    let mut positive_hit = false;
+    for p in patterns {
+        let hit = match &p.kind {
+            AddressKind::Cidr { base, prefix } => {
+                matches!(parsed, Some(a) if cidr_contains(*base, *prefix, a))
+            }
+            AddressKind::Glob(g) => glob_match(g, addr_str),
+        };
+        if p.negated {
+            if hit {
+                return false;
+            }
+        } else {
+            any_positive = true;
+            if !positive_hit && hit {
+                positive_hit = true;
+            }
+        }
+    }
+    any_positive && positive_hit
+}
 
 /// One criterion on a `Match` line.
 ///
@@ -42,6 +184,23 @@ pub enum MatchCondition {
     /// `Match localuser <pattern-list>` — matches against the **local**
     /// process username (the `getuid()` → name).
     LocalUser(Vec<HostPattern>),
+    /// `Match group <pattern-list>` — **server-side**. Matches iff one of the
+    /// authenticated user's group names matches the pattern list. Has no
+    /// meaning client-side ([`MatchContext::groups`] is `None` there, so it
+    /// never matches).
+    Group(Vec<HostPattern>),
+    /// `Match address <cidr/glob-list>` — **server-side**. Matches the peer's
+    /// remote IP against a comma-separated list of CIDR ranges
+    /// (`192.0.2.0/24`, `2001:db8::/32`), bare addresses, or `*`/`?` globs on
+    /// the textual form. Each entry may be negated with a leading `!`.
+    Address(Vec<AddressPattern>),
+    /// `Match localaddress <cidr/glob-list>` — **server-side**. Like
+    /// [`MatchCondition::Address`] but matches the address the connection was
+    /// accepted *on* (`local_addr()`).
+    LocalAddress(Vec<AddressPattern>),
+    /// `Match localport <port-list>` — **server-side**. Matches the local
+    /// (listening) port against a comma-separated list of port numbers.
+    LocalPort(Vec<u16>),
     /// `Match exec <cmd>` — `/bin/sh -c <cmd>` with exit status 0 = match.
     /// Treated as "never matches" unless `enable_match_exec` is set on the
     /// loader; see the security note in the module docs.
@@ -78,6 +237,20 @@ pub struct MatchContext<'a> {
     pub user: Option<&'a str>,
     /// Local OS user name, if known.
     pub local_user: Option<&'a str>,
+    /// **Server-side**: the peer's remote IP address (textual form), if
+    /// known. `None` ⇒ `Match address` never matches.
+    pub address: Option<&'a str>,
+    /// **Server-side**: the local (accepting) IP address, if known. `None` ⇒
+    /// `Match localaddress` never matches.
+    pub local_address: Option<&'a str>,
+    /// **Server-side**: the local (listening) port, if known. `None` ⇒
+    /// `Match localport` never matches.
+    pub local_port: Option<u16>,
+    /// **Server-side**: the authenticated user's group names, if resolved.
+    /// `None` ⇒ `Match group` never matches (mirrors the user/localuser
+    /// convention — a criterion that depends on a missing field is treated as
+    /// not-matching, never as a silent wildcard).
+    pub groups: Option<&'a [String]>,
 }
 
 impl MatchContext<'_> {
@@ -97,6 +270,35 @@ pub fn parse_match_line(
     args: &[String],
     line_no: usize,
 ) -> Result<Vec<MatchCondition>, ConfigError> {
+    parse_match_line_impl(args, line_no, MatchSide::Client)
+}
+
+/// Server-side variant of [`parse_match_line`]. Recognises the additional
+/// `group`, `address`, `localaddress`, and `localport` criteria, and rejects
+/// the client-only criteria (`host`, `originalhost`, `localuser`) plus
+/// `rdomain` / `connection` as [`ConfigError::Unsupported`] — they have no
+/// server-side meaning in puressh.
+pub fn parse_match_line_server(
+    args: &[String],
+    line_no: usize,
+) -> Result<Vec<MatchCondition>, ConfigError> {
+    parse_match_line_impl(args, line_no, MatchSide::Server)
+}
+
+/// Which file (`ssh_config` vs `sshd_config`) a `Match` line came from. The
+/// recognised criteria differ between the two sides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MatchSide {
+    Client,
+    Server,
+}
+
+fn parse_match_line_impl(
+    args: &[String],
+    line_no: usize,
+    side: MatchSide,
+) -> Result<Vec<MatchCondition>, ConfigError> {
+    let server = side == MatchSide::Server;
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -114,15 +316,26 @@ pub fn parse_match_line(
                 out.push(MatchCondition::Final);
                 i += 1;
             }
+            // Server-invalid criteria — `Host`/`OriginalHost`/`LocalUser` are
+            // meaningless on the daemon side (the server is the host); reject
+            // them rather than silently never-matching so a misplaced client
+            // directive in sshd_config is loud.
+            "host" | "originalhost" | "localuser" if server => {
+                return Err(ConfigError::Unsupported {
+                    line: line_no,
+                    msg: alloc::format!("Match {kw} is not valid in sshd_config"),
+                });
+            }
+            // sshd accepts these criteria but puressh has no notion of routing
+            // domains or a generic connection tuple.
+            "rdomain" | "connection" => {
+                return Err(ConfigError::Unsupported {
+                    line: line_no,
+                    msg: alloc::format!("Match {kw} is not supported"),
+                });
+            }
             "host" | "originalhost" | "user" | "localuser" => {
-                if i + 1 >= args.len() {
-                    return Err(ConfigError::BadValue {
-                        line: line_no,
-                        keyword: "match".to_string(),
-                        msg: alloc::format!("Match {kw} requires a pattern-list argument"),
-                    });
-                }
-                let patterns = parse_match_pattern_list(&args[i + 1]);
+                let patterns = take_pattern_list(args, &mut i, &kw, line_no)?;
                 let cond = match kw.as_str() {
                     "host" => MatchCondition::Host(patterns),
                     "originalhost" => MatchCondition::OriginalHost(patterns),
@@ -131,7 +344,39 @@ pub fn parse_match_line(
                     _ => unreachable!(),
                 };
                 out.push(cond);
-                i += 2;
+            }
+            "group" if server => {
+                let patterns = take_pattern_list(args, &mut i, &kw, line_no)?;
+                out.push(MatchCondition::Group(patterns));
+            }
+            "address" | "localaddress" if server => {
+                let raw = take_raw_arg(args, &mut i, &kw, line_no)?;
+                let patterns = parse_address_list(&raw);
+                if kw == "address" {
+                    out.push(MatchCondition::Address(patterns));
+                } else {
+                    out.push(MatchCondition::LocalAddress(patterns));
+                }
+            }
+            "localport" if server => {
+                let raw = take_raw_arg(args, &mut i, &kw, line_no)?;
+                let mut ports = Vec::new();
+                for p in raw.split(',').filter(|t| !t.is_empty()) {
+                    let port = p.parse::<u16>().map_err(|_| ConfigError::BadValue {
+                        line: line_no,
+                        keyword: "match".to_string(),
+                        msg: alloc::format!("Match localport: bad port {p:?}"),
+                    })?;
+                    ports.push(port);
+                }
+                if ports.is_empty() {
+                    return Err(ConfigError::BadValue {
+                        line: line_no,
+                        keyword: "match".to_string(),
+                        msg: "Match localport requires at least one port".into(),
+                    });
+                }
+                out.push(MatchCondition::LocalPort(ports));
             }
             "exec" => {
                 if i + 1 >= args.len() {
@@ -166,6 +411,37 @@ pub fn parse_match_line(
         });
     }
     Ok(out)
+}
+
+/// Consume the single argument following `args[*i]` and return it raw,
+/// advancing `*i` past both the keyword and the argument.
+fn take_raw_arg(
+    args: &[String],
+    i: &mut usize,
+    kw: &str,
+    line_no: usize,
+) -> Result<String, ConfigError> {
+    if *i + 1 >= args.len() {
+        return Err(ConfigError::BadValue {
+            line: line_no,
+            keyword: "match".to_string(),
+            msg: alloc::format!("Match {kw} requires an argument"),
+        });
+    }
+    let v = args[*i + 1].clone();
+    *i += 2;
+    Ok(v)
+}
+
+/// Consume the pattern-list argument following `args[*i]`, advancing `*i`.
+fn take_pattern_list(
+    args: &[String],
+    i: &mut usize,
+    kw: &str,
+    line_no: usize,
+) -> Result<Vec<HostPattern>, ConfigError> {
+    let raw = take_raw_arg(args, i, kw, line_no)?;
+    Ok(parse_match_pattern_list(&raw))
 }
 
 /// A `Match` pattern-list is comma-separated (unlike `Host`, which is
@@ -211,6 +487,23 @@ pub fn evaluate(cond: &MatchCondition, ctx: &MatchContext<'_>, policy: ExecPolic
         },
         MatchCondition::LocalUser(patterns) => match ctx.local_user {
             Some(u) => host_matches(patterns, u),
+            None => false,
+        },
+        MatchCondition::Group(patterns) => match ctx.groups {
+            // Matches iff any of the user's groups is matched by the list.
+            Some(groups) => groups.iter().any(|g| host_matches(patterns, g)),
+            None => false,
+        },
+        MatchCondition::Address(patterns) => match ctx.address {
+            Some(a) => address_matches(patterns, a),
+            None => false,
+        },
+        MatchCondition::LocalAddress(patterns) => match ctx.local_address {
+            Some(a) => address_matches(patterns, a),
+            None => false,
+        },
+        MatchCondition::LocalPort(ports) => match ctx.local_port {
+            Some(p) => ports.contains(&p),
             None => false,
         },
         MatchCondition::Exec(cmd) => match policy {
@@ -269,6 +562,7 @@ mod tests {
             original_host: None,
             user: None,
             local_user: None,
+            ..MatchContext::default()
         }
     }
 
@@ -351,5 +645,114 @@ mod tests {
     fn parse_match_pattern_list_skips_empties() {
         let pats = parse_match_pattern_list("a,,b");
         assert_eq!(pats.len(), 2);
+    }
+
+    // ---- server-side criteria --------------------------------------------
+
+    #[test]
+    fn server_parses_address_group_localport() {
+        let args = vec![
+            "address".to_string(),
+            "192.0.2.0/24,!192.0.2.7".to_string(),
+            "group".to_string(),
+            "admin,wheel".to_string(),
+            "localport".to_string(),
+            "22,2222".to_string(),
+        ];
+        let conds = parse_match_line_server(&args, 1).unwrap();
+        assert_eq!(conds.len(), 3);
+        assert!(matches!(conds[0], MatchCondition::Address(_)));
+        assert!(matches!(conds[1], MatchCondition::Group(_)));
+        assert!(matches!(&conds[2], MatchCondition::LocalPort(p) if p == &[22, 2222]));
+    }
+
+    #[test]
+    fn server_rejects_client_only_criteria() {
+        for kw in ["host", "originalhost", "localuser"] {
+            let args = vec![kw.to_string(), "x".to_string()];
+            let err = parse_match_line_server(&args, 3).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Unsupported { line: 3, .. }),
+                "{kw}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_rejects_rdomain_connection() {
+        for kw in ["rdomain", "connection"] {
+            let args = vec![kw.to_string(), "x".to_string()];
+            let err = parse_match_line_server(&args, 5).unwrap_err();
+            assert!(matches!(err, ConfigError::Unsupported { line: 5, .. }));
+        }
+    }
+
+    #[test]
+    fn client_still_rejects_server_criteria() {
+        // `address` is a server criterion; the client parser must still treat
+        // it as an unknown criterion (BadValue), preserving prior behaviour.
+        let args = vec!["address".to_string(), "1.2.3.4".to_string()];
+        let err = parse_match_line(&args, 1).unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { line: 1, .. }));
+    }
+
+    #[test]
+    fn address_cidr_v4_match() {
+        let pats = parse_address_list("192.0.2.0/24");
+        assert!(address_matches(&pats, "192.0.2.7"));
+        assert!(!address_matches(&pats, "192.0.3.7"));
+    }
+
+    #[test]
+    fn address_bare_v4_is_host_route() {
+        let pats = parse_address_list("192.0.2.7");
+        assert!(address_matches(&pats, "192.0.2.7"));
+        assert!(!address_matches(&pats, "192.0.2.8"));
+    }
+
+    #[test]
+    fn address_negation() {
+        let pats = parse_address_list("192.0.2.0/24,!192.0.2.7");
+        assert!(address_matches(&pats, "192.0.2.1"));
+        assert!(!address_matches(&pats, "192.0.2.7"));
+    }
+
+    #[test]
+    fn address_v6_cidr() {
+        let pats = parse_address_list("2001:db8::/32");
+        assert!(address_matches(&pats, "2001:db8::1"));
+        assert!(!address_matches(&pats, "2001:dba::1"));
+        // Mixed family never matches.
+        assert!(!address_matches(&pats, "192.0.2.1"));
+    }
+
+    #[test]
+    fn address_glob_fallback() {
+        let pats = parse_address_list("192.0.2.*");
+        assert!(address_matches(&pats, "192.0.2.55"));
+        assert!(!address_matches(&pats, "192.0.3.55"));
+    }
+
+    #[test]
+    fn address_zero_prefix_matches_family() {
+        let pats = parse_address_list("0.0.0.0/0");
+        assert!(address_matches(&pats, "8.8.8.8"));
+        assert!(!address_matches(&pats, "::1"));
+    }
+
+    #[test]
+    fn evaluate_group_any_member() {
+        let conds =
+            parse_match_line_server(&["group".to_string(), "wheel".to_string()], 1).unwrap();
+        let groups = vec!["users".to_string(), "wheel".to_string()];
+        let c = MatchContext {
+            host: "h",
+            groups: Some(&groups),
+            ..MatchContext::default()
+        };
+        assert!(all_match(&conds, &c, ExecPolicy::Deny));
+        // No groups in context ⇒ never matches.
+        let c2 = ctx("h");
+        assert!(!all_match(&conds, &c2, ExecPolicy::Deny));
     }
 }

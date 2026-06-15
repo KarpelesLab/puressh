@@ -238,7 +238,7 @@ impl PrivateKey {
     /// type-specific private-key fields and the trailing `string comment`.
     ///
     /// This is the same per-type field layout as the OpenSSH private-key
-    /// inner block (see [`encode_inner_block`]) but **without** the leading
+    /// inner block (see `encode_inner_block`) but **without** the leading
     /// check-ints or the trailing block padding — the agent frame is not an
     /// encrypted blob, so neither applies. The caller wraps the returned
     /// bytes in an agent message frame (`encode_message`).

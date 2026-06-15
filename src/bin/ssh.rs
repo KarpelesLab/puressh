@@ -787,7 +787,7 @@ fn config_for_host(
     })
 }
 
-/// Walk the ProxyJump chain, returning the [`SharedClient`] for the *last*
+/// Walk the ProxyJump chain, returning the `SharedClient` for the *last*
 /// jump host. The caller opens a `direct-tcpip` channel from it to the final
 /// target and runs the real session over that. Each hop re-runs
 /// `ssh_cfg.lookup(hop.host)` for its own identities / known_hosts / user;

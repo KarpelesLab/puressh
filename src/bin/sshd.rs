@@ -2347,15 +2347,40 @@ mod imp {
             None => puressh::config::SshServerConfig::default(),
         };
 
+        // LogLevel (sshd_config): VERBOSE/DEBUG* (level >= 1) turns on the same
+        // verbose diagnostics as `-d`, so the config keyword actually controls
+        // output. `-d` always wins (it can't be turned back off). Rebind `cli`
+        // so every downstream `cli.debug` reflects the effective level.
+        let log_level = sshd_cfg.global.log_level.unwrap_or(0);
+        let cli = {
+            let mut c = cli;
+            c.debug = c.debug || log_level >= 1;
+            c
+        };
+
         // Resolve effective values: CLI > config > built-in default.
         let port = pick(cli.port, sshd_cfg.global.port, 2222u16);
         let strict_modes = pick(cli.strict_modes, sshd_cfg.global.strict_modes, true);
-        let sftp_enabled = pick(cli.sftp, sshd_cfg.global.sftp_enabled, true);
+        // SFTP is on when either the puressh `SftpEnabled` knob OR the standard
+        // `Subsystem sftp internal-sftp` line enables it (CLI still wins).
+        let sftp_enabled = pick(
+            cli.sftp,
+            sshd_cfg
+                .global
+                .sftp_enabled
+                .or(sshd_cfg.global.subsystem_sftp),
+            true,
+        );
         let sftp_read_only = pick(cli.sftp_read_only, sshd_cfg.global.sftp_read_only, false);
+        // SFTP root precedence: CLI `--sftp-root` > puressh `SftpRoot` >
+        // standard `ChrootDirectory` (the latter is the OpenSSH spelling and
+        // is honoured only for the in-process SFTP path — a real chroot for
+        // shell/exec is out of scope, which the config parser keeps honest).
         let sftp_root: Option<std::path::PathBuf> = cli
             .sftp_root
             .as_deref()
             .or(sshd_cfg.global.sftp_root.as_deref())
+            .or(sshd_cfg.global.chroot_directory.as_deref())
             .map(std::path::PathBuf::from);
         let scp_enabled = pick(cli.scp, sshd_cfg.global.scp_enabled, true);
         let agent_forward = pick(
@@ -2591,6 +2616,34 @@ mod imp {
             sshd_cfg.global.host_key_algorithms.clone(),
         );
 
+        // RekeyLimit (startup-only): map the parsed thresholds onto the
+        // server's RekeyPolicy. `default`/unset bytes keep the built-in cap;
+        // an explicit time threshold replaces the duration. (No-op on builds
+        // without the `std` feature, where max_duration does not exist.)
+        if let Some(rk) = sshd_cfg.global.rekey_limit {
+            let mut policy = config.rekey_policy;
+            if let Some(b) = rk.max_bytes {
+                policy.max_bytes = b;
+            }
+            #[cfg(feature = "std")]
+            if let Some(secs) = rk.max_seconds {
+                policy.max_duration = std::time::Duration::from_secs(secs as u64);
+            }
+            config.rekey_policy = policy;
+        }
+
+        // Compression (startup-only): `no` strips zlib from the KEXINIT advert.
+        config.compression = sshd_cfg.global.compression;
+
+        // AddressFamily (startup-only): restrict the listener family.
+        let address_family = sshd_cfg.global.address_family;
+        // PidFile (startup-only): write our PID after bind unless `none`.
+        let pid_file = if sshd_cfg.global.pid_file_set {
+            sshd_cfg.global.pid_file.clone()
+        } else {
+            None
+        };
+
         // Per-connection policy: the whole parsed sshd_config (global + Match
         // blocks) is resolved twice per connection (pre-auth address-only,
         // post-auth user/groups) to gate the auth method set, banner, and
@@ -2604,8 +2657,33 @@ mod imp {
         install_parent_signals()?;
 
         let addr = bind_addr;
+        // AddressFamily filter: refuse to bind an address of the wrong family
+        // rather than silently ignoring the directive.
+        if let Some(af) = address_family {
+            let parsed: Option<std::net::IpAddr> = addr
+                .rsplit_once(':')
+                .and_then(|(h, _)| h.trim_matches(['[', ']']).parse().ok());
+            let mismatch = match (af, parsed) {
+                (puressh::config::ServerAddressFamily::Inet, Some(ip)) => ip.is_ipv6(),
+                (puressh::config::ServerAddressFamily::Inet6, Some(ip)) => ip.is_ipv4(),
+                _ => false,
+            };
+            if mismatch {
+                return Err(format!(
+                    "bind {addr}: AddressFamily {af:?} excludes this listener address"
+                )
+                .into());
+            }
+        }
         let listener =
             std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+
+        // PidFile: write our PID now that the listener is up.
+        if let Some(path) = pid_file.as_deref() {
+            if let Err(e) = std::fs::write(path, format!("{}\n", std::process::id())) {
+                eprintln!("sshd: warning: could not write PidFile {path}: {e}");
+            }
+        }
 
         eprintln!(
             "puressh sshd listening on {addr} (pid {})",

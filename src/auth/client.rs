@@ -95,6 +95,13 @@ pub struct ClientAuth {
     /// present, publickey credentials whose `HostKey::algorithm()` is
     /// not in this list are skipped before we even probe the server.
     server_sig_algs: Option<Vec<String>>,
+    /// `PubkeyAcceptedAlgorithms` from `ssh_config` (RFC-independent, our
+    /// local policy). When present, a publickey credential whose signature
+    /// algorithm is not on this list is upgraded to an acceptable same-key
+    /// variant (e.g. `ssh-rsa` → `rsa-sha2-512`) or skipped. Applied
+    /// *before* the server `server-sig-algs` filter — the client's own
+    /// policy takes precedence over what the server is willing to verify.
+    pubkey_accepted: Option<Vec<String>>,
 }
 
 impl ClientAuth {
@@ -111,6 +118,7 @@ impl ClientAuth {
             last_partial_success: false,
             state: State::Initial,
             server_sig_algs: None,
+            pubkey_accepted: None,
         }
     }
 
@@ -131,6 +139,15 @@ impl ClientAuth {
             .filter(|s| !s.is_empty())
             .collect();
         self.server_sig_algs = Some(algs);
+    }
+
+    /// Install the local `PubkeyAcceptedAlgorithms` policy (already resolved
+    /// from `ssh_config`). When set, a publickey credential whose signature
+    /// algorithm is not on the list is upgraded to an acceptable same-key
+    /// variant or skipped — applied before the server's `server-sig-algs`
+    /// filter so the client's own policy is the stricter gate.
+    pub fn set_pubkey_accepted(&mut self, algs: Vec<String>) {
+        self.pubkey_accepted = Some(algs);
     }
 
     /// Build the very first outbound payload: SERVICE_REQUEST("ssh-userauth").
@@ -199,6 +216,27 @@ impl ClientAuth {
                     continue;
                 }
             }
+            // Local `PubkeyAcceptedAlgorithms` policy (from ssh_config),
+            // applied BEFORE the server's `server-sig-algs`. A publickey
+            // credential whose signature algorithm is not on our own accept
+            // list is upgraded to a same-key variant we do accept, or
+            // skipped. Non-publickey credentials and the unset case pass
+            // through untouched.
+            let cred = match (cred, self.pubkey_accepted.as_ref()) {
+                (ClientCredential::PublicKey(hk), Some(allowed)) => {
+                    let algo = hk.algorithm();
+                    if allowed.iter().any(|a| a == algo) {
+                        ClientCredential::PublicKey(hk)
+                    } else {
+                        let csv = allowed.join(",");
+                        match hk.upgraded_for(&csv) {
+                            Some(upgraded) => ClientCredential::PublicKey(upgraded),
+                            None => continue,
+                        }
+                    }
+                }
+                (other, _) => other,
+            };
             // RFC 8308 §3.1 publickey filtering. When the server advertised
             // `server-sig-algs`, a publickey credential whose signature
             // algorithm is not on the list is either upgraded to a

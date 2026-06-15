@@ -2426,6 +2426,17 @@ mod imp {
             config = config.with_login_grace_time(std::time::Duration::ZERO);
         }
 
+        // Crypto-algorithm overrides from sshd_config (already strict-validated
+        // by the config parser). HostKeyAlgorithms is used as a preference
+        // order and intersected with the loaded host keys; the strict-kex
+        // markers are re-appended by the server regardless of KexAlgorithms.
+        config = config.with_algorithms(
+            sshd_cfg.ciphers.clone(),
+            sshd_cfg.macs.clone(),
+            sshd_cfg.kex_algorithms.clone(),
+            sshd_cfg.host_key_algorithms.clone(),
+        );
+
         let cfg = Arc::new(config);
 
         install_parent_signals()?;

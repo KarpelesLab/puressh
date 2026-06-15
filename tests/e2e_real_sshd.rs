@@ -138,6 +138,7 @@ fn exec_against_real_sshd() {
         Config {
             host_key_policy: HostKeyPolicy::AcceptAny,
             timeout: Some(Duration::from_secs(10)),
+            algorithms: Default::default(),
         },
     )
     .expect("connect");

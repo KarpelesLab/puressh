@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use puressh::auth::ClientCredential;
-use puressh::client::{Client, Config};
+use puressh::client::{AlgoOverrides, Client, Config};
 use puressh::scp::{ScpRecvOptions, ScpSendOptions};
 
 #[path = "common.rs"]
@@ -238,6 +238,13 @@ fn open_authenticated(
     let cfg = Config {
         host_key_policy: policy,
         timeout: None,
+        algorithms: AlgoOverrides {
+            ciphers: cfg_block.ciphers.clone(),
+            macs: cfg_block.macs.clone(),
+            kex_algorithms: cfg_block.kex_algorithms.clone(),
+            host_key_algorithms: cfg_block.host_key_algorithms.clone(),
+            pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
+        },
     };
     vlog(1, &format!("connecting to {connect_host}:{port}"));
     let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)

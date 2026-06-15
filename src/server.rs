@@ -41,9 +41,11 @@ use crate::channel::{
 use crate::error::{Error, Result};
 use crate::format::Writer;
 use crate::hostkey::HostKey;
-use crate::transport::kex::{KexAlgorithms, defaults};
+use crate::transport::kex::{defaults, is_strict_kex_marker};
 use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
-use crate::transport::{ExtInfo, KexInit, KexRunner, PacketCodec, Role, VersionExchange};
+use crate::transport::{
+    ExtInfo, KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
+};
 
 const MAX_BANNER_LINE: usize = 1024;
 const MAX_BANNER_LINES: usize = 256;
@@ -820,6 +822,18 @@ pub struct Config {
     /// window has the connection dropped with `Error::Io`/`TimedOut`.
     /// Defaults to 120 seconds. Set to [`Duration::ZERO`] to disable.
     pub login_grace_time: Duration,
+    /// `Ciphers` override (sshd_config) — advertised cipher preference list
+    /// for both directions. `None` ⇒ built-in default.
+    pub ciphers: Option<Vec<String>>,
+    /// `MACs` override — advertised MAC preference list.
+    pub macs: Option<Vec<String>>,
+    /// `KexAlgorithms` override — advertised key-exchange list (no markers).
+    pub kex_algorithms: Option<Vec<String>>,
+    /// `HostKeyAlgorithms` override — preferred order for the advertised
+    /// host-key algorithms. Intersected with the algorithms the loaded host
+    /// keys can actually produce, so naming an algorithm we have no key for
+    /// is a no-op rather than an error.
+    pub host_key_algorithms: Option<Vec<String>>,
 }
 
 /// Environment variable names that no [`Config::accept_env`] glob may
@@ -928,7 +942,35 @@ impl Config {
             rekey_policy: RekeyPolicy::default(),
             accept_env: Vec::new(),
             login_grace_time: Duration::from_secs(120),
+            ciphers: None,
+            macs: None,
+            kex_algorithms: None,
+            host_key_algorithms: None,
         }
+    }
+
+    /// Override the advertised crypto-algorithm preference lists (from
+    /// `sshd_config`: `Ciphers`, `MACs`, `KexAlgorithms`,
+    /// `HostKeyAlgorithms`). Each argument is an already-resolved list (list
+    /// modifiers applied, names validated) or `None` to keep the built-in
+    /// default for that category.
+    ///
+    /// The strict-kex markers are re-appended by the KEXINIT builder
+    /// regardless of any `KexAlgorithms` override; `HostKeyAlgorithms` is
+    /// used as a preference order and then intersected with the host-key
+    /// algorithms the loaded keys can actually produce.
+    pub fn with_algorithms(
+        mut self,
+        ciphers: Option<Vec<String>>,
+        macs: Option<Vec<String>>,
+        kex_algorithms: Option<Vec<String>>,
+        host_key_algorithms: Option<Vec<String>>,
+    ) -> Self {
+        self.ciphers = ciphers;
+        self.macs = macs;
+        self.kex_algorithms = kex_algorithms;
+        self.host_key_algorithms = host_key_algorithms;
+        self
     }
 
     /// Replace the env-request allow-list. Each entry is a name pattern
@@ -1216,7 +1258,7 @@ fn do_server_kex<R: RngCore + CryptoRng>(
     // First KEX only: advertise ext-info-s so the client may send us
     // SSH_MSG_EXT_INFO (RFC 8308 §2.1). Re-KEX paths use the un-marked
     // builder via KexRunner::restart, which scrubs the marker.
-    let advert = build_server_kexinit(rng, &cfg.host_keys).with_ext_info_marker(Role::Server);
+    let advert = build_server_kexinit(rng, cfg).with_ext_info_marker(Role::Server);
     let mut runner = KexRunner::new(Role::Server, advert);
     // Queue our outbound EXT_INFO; the runner emits it after NEWKEYS on the
     // first KEX iff the client also advertised the marker.
@@ -1702,7 +1744,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // when no KEX is currently in flight (one side starts; the other will
         // respond when it sees the SSH_MSG_KEXINIT).
         if !runner.is_kexing() && rekey_policy.should_rekey(codec, *last_kex, Instant::now()) {
-            let advert = build_server_kexinit(rng, &cfg.host_keys);
+            let advert = build_server_kexinit(rng, cfg);
             let adv = runner.restart(rng, advert)?;
             for p in adv.outbound {
                 write_payload(stream, codec, rng, &p)?;
@@ -1737,7 +1779,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // Phase::Completed — handle that by emitting our own KEXINIT first.
         if is_kex_msg(msg) {
             if msg == 20 && !runner.is_kexing() {
-                let advert = build_server_kexinit(rng, &cfg.host_keys);
+                let advert = build_server_kexinit(rng, cfg);
                 let adv = runner.restart(rng, advert)?;
                 for p in adv.outbound {
                     write_payload(stream, codec, rng, &p)?;
@@ -2888,12 +2930,19 @@ fn server_ext_info() -> ExtInfo {
     )
 }
 
-fn build_server_kexinit<R: RngCore>(
-    rng: &mut R,
-    host_keys: &[Box<dyn HostKey + Send + Sync>],
-) -> KexInit {
-    // Filter advertised host-key algorithms to only those we can actually
-    // produce signatures for. Preserve the default order for predictability.
+/// Helper: owned list from an override, or the given default slice.
+fn owned_or_default(over: &Option<Vec<String>>, default: &[&str]) -> Vec<String> {
+    match over {
+        Some(v) => v.clone(),
+        None => default.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
+    let host_keys = &cfg.host_keys;
+    // The set of host-key algorithms we can actually produce signatures for,
+    // in the default preference order (used both as the default advert and as
+    // the intersection mask for a HostKeyAlgorithms override).
     let mut have: Vec<&'static str> = Vec::new();
     for n in defaults::HOST_KEY {
         if host_keys.iter().any(|k| k.algorithm() == *n) {
@@ -2910,25 +2959,68 @@ fn build_server_kexinit<R: RngCore>(
             have.push(*n);
         }
     }
-    if have.is_empty() {
-        have.push("ssh-ed25519");
+
+    // Resolve the advertised host-key list. With a HostKeyAlgorithms
+    // override, use the override as the preference *order* but keep only the
+    // algorithms we can produce (intersection) — naming one we have no key
+    // for is a silent no-op, and the override CAN intentionally exclude an
+    // algorithm we hold a key for.
+    let host_key: Vec<String> = match &cfg.host_key_algorithms {
+        Some(pref) => pref
+            .iter()
+            .filter(|p| have.iter().any(|h| *h == p.as_str()))
+            .cloned()
+            .collect(),
+        None => have.iter().map(|s| s.to_string()).collect(),
+    };
+    // Last-ditch net: if we ended up advertising nothing (no usable keys, or
+    // an override that intersected to empty), fall back to ed25519 — BUT only
+    // when the operator did not explicitly exclude it via an override. An
+    // explicit HostKeyAlgorithms that omits ssh-ed25519 must be honoured.
+    let ed25519_excluded = cfg
+        .host_key_algorithms
+        .as_ref()
+        .is_some_and(|pref| !pref.iter().any(|p| p == "ssh-ed25519"));
+    let host_key = if host_key.is_empty() && !ed25519_excluded {
+        alloc::vec!["ssh-ed25519".to_string()]
+    } else {
+        host_key
+    };
+
+    // Real (non-marker) kex default order; markers are re-appended after the
+    // (possibly overridden) list so a KexAlgorithms override can never strip
+    // the Terrapin (CVE-2023-48795) mitigation.
+    let default_kex: Vec<&str> = defaults::KEX
+        .iter()
+        .copied()
+        .filter(|n| !is_strict_kex_marker(n))
+        .collect();
+    let mut kex = owned_or_default(&cfg.kex_algorithms, &default_kex);
+    for marker in defaults::KEX.iter().filter(|n| is_strict_kex_marker(n)) {
+        if !kex.iter().any(|k| k == marker) {
+            kex.push((*marker).to_string());
+        }
     }
 
-    let algs = KexAlgorithms {
-        kex: defaults::KEX,
-        server_host_key: &have,
-        ciphers_c2s: defaults::CIPHERS,
-        ciphers_s2c: defaults::CIPHERS,
-        macs_c2s: defaults::MACS,
-        macs_s2c: defaults::MACS,
-        comp_c2s: defaults::COMP,
-        comp_s2c: defaults::COMP,
-        lang_c2s: &[],
-        lang_s2c: &[],
+    let ciphers = owned_or_default(&cfg.ciphers, defaults::CIPHERS);
+    let macs = owned_or_default(&cfg.macs, defaults::MACS);
+    let comp: Vec<String> = defaults::COMP.iter().map(|s| s.to_string()).collect();
+
+    let algs = KexAlgorithmsOwned {
+        kex,
+        server_host_key: host_key,
+        ciphers_c2s: ciphers.clone(),
+        ciphers_s2c: ciphers,
+        macs_c2s: macs.clone(),
+        macs_s2c: macs,
+        comp_c2s: comp.clone(),
+        comp_s2c: comp,
+        lang_c2s: Vec::new(),
+        lang_s2c: Vec::new(),
     };
     let mut cookie = [0u8; 16];
     rng.fill_bytes(&mut cookie);
-    KexInit::from_algorithms(&algs, cookie)
+    KexInit::from_algorithms_owned(algs, cookie)
 }
 
 fn read_peer_version(stream: &mut TcpStream) -> Result<Vec<u8>> {
@@ -3029,6 +3121,7 @@ mod tests {
     use super::*;
     use crate::auth::{AuthAttempt, AuthDecision, Authenticator};
     use crate::client::{Client, Config as ClientConfig, HostKeyPolicy};
+    use crate::transport::kex::KexAlgorithms;
     use crate::hostkey::Ed25519HostKey;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -3085,6 +3178,24 @@ mod tests {
         let mut s = [0u8; 32];
         OsRng.fill_bytes(&mut s);
         s
+    }
+
+    /// Build a minimal server [`Config`] wrapping `host_keys` for tests that
+    /// only exercise [`build_server_kexinit`]. The authenticator / handler
+    /// are placeholders that are never invoked by the KEX path.
+    fn kexinit_test_config(host_keys: Vec<Box<dyn HostKey + Send + Sync>>) -> Config {
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(|| -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: String::new(),
+                allowed_blob: Vec::new(),
+            })
+        });
+        Config::new(
+            host_keys,
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        )
     }
 
     /// Shared in-memory state behind one [`MemoryShellSession`]. The test
@@ -3276,6 +3387,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -3366,6 +3478,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -3452,6 +3565,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -3489,7 +3603,8 @@ mod tests {
         let mut rng = OsRng;
         let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
             vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
-        let advert = build_server_kexinit(&mut rng, &host_keys);
+        let cfg = kexinit_test_config(host_keys);
+        let advert = build_server_kexinit(&mut rng, &cfg);
         let mut runner = KexRunner::new(Role::Server, advert.clone());
 
         // Build a minimal compatible client KEXINIT (all the same names, one
@@ -3636,6 +3751,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -3724,6 +3840,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -3890,6 +4007,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -4064,6 +4182,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -4156,6 +4275,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -4247,6 +4367,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -4399,6 +4520,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");
@@ -4508,6 +4630,7 @@ mod tests {
             ClientConfig {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
             },
         )
         .expect("client connect");

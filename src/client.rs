@@ -639,6 +639,11 @@ impl Client {
     /// Try every credential in order until one succeeds or all are refused.
     pub fn authenticate(&mut self, user: &str, credentials: Vec<ClientCredential>) -> Result<()> {
         let mut auth = ClientAuth::new(user, self.session_id.clone());
+        // Local PubkeyAcceptedAlgorithms policy from ssh_config, applied
+        // before any server-sig-algs filtering.
+        if let Some(accepted) = self.algo_overrides.pubkey_accepted_algorithms.clone() {
+            auth.set_pubkey_accepted(accepted);
+        }
         // RFC 8308 §3.1: if the server told us which signature algorithms
         // it will accept on a publickey auth, propagate that to the auth
         // driver so we skip credentials it would reject anyway.
@@ -3424,6 +3429,7 @@ mod tests {
         let cfg = Config {
             host_key_policy: HostKeyPolicy::AcceptFingerprint([0xffu8; 32]),
             timeout: None,
+            algorithms: Default::default(),
         };
         let err = Client::connect(addr, cfg).err().expect("must fail");
         assert!(matches!(err, Error::HostKeyRejected));

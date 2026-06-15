@@ -53,5 +53,9 @@ pub mod agent;
 pub mod direct;
 #[cfg(feature = "server")]
 pub mod reverse;
+// SOCKS dynamic-forward (`ssh -D`) is purely client-side and TCP-only, so it
+// is gated on the `client` feature and stays portable across platforms.
+#[cfg(feature = "client")]
+pub mod socks;
 #[cfg(unix)]
 pub mod x11;

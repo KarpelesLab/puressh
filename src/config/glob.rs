@@ -84,7 +84,7 @@ pub fn host_matches(patterns: &[HostPattern], host: &str) -> bool {
 /// exponentially on adversarial patterns like `*a*a*a*a*a*…`, which is a
 /// ReDoS vector when patterns originate from `Host`/`Match` config lines
 /// in an untrusted ssh_config.
-fn glob_match(pattern: &str, name: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, name: &str) -> bool {
     let p = pattern.as_bytes();
     let n = name.as_bytes();
     let mut pi = 0usize;

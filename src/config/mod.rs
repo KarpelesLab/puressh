@@ -34,6 +34,7 @@
 
 use alloc::string::String;
 
+pub mod algos;
 pub mod client;
 pub mod glob;
 pub mod host_port;

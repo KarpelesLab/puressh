@@ -53,6 +53,22 @@ pub use ed25519::Ed25519HostKey;
 #[cfg(feature = "alloc")]
 pub use rsa::{RsaSha1HostKey, RsaSha2_256HostKey, RsaSha2_512HostKey};
 
+/// Host-key / public-key signature algorithm names this build can verify
+/// via [`host_key_verify_by_name`], in descending preference order.
+///
+/// This is the canonical list config keywords (`HostKeyAlgorithms`,
+/// `PubkeyAcceptedAlgorithms`) validate against. Legacy bare `ssh-rsa`
+/// (SHA-1) is intentionally absent: it is gated behind the process-wide
+/// [`set_allow_rsa_sha1`] atomic and is not a default-acceptable name.
+pub const HOST_KEY_VERIFY_NAMES: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+];
+
 /// A signature algorithm exposed to the rest of the crate.
 pub trait HostKeyAlgorithm {
     /// SSH algorithm name (e.g. `"ssh-ed25519"`, `"rsa-sha2-256"`).

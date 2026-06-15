@@ -38,9 +38,10 @@ const USAGE: &str = "usage: ssh [-v[v[v]]] [-F configfile] [-p port] [-i identit
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
-                     [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] \
+                     [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] [-D [bind:]port] \
                      [-J [user@]host[:port][,...]] \
-                     [-N] [-A] [-X] [-Y] \
+                     [-C] [-t] [-T] [-N] [-A] [-X] [-Y] \
+                     [-o ssh_config_keyword=value] \
                      [user@]host [command...]";
 
 /// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;

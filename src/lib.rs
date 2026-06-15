@@ -56,6 +56,16 @@ pub mod client;
 #[cfg(all(unix, feature = "client"))]
 pub mod proc_transport;
 
+// Client connection multiplexing (`ControlMaster` / `ControlPath` /
+// `ControlPersist`) over a Unix-domain control socket. Unix-only and gated on
+// `client` (which pulls in `std`); the master/accept side additionally needs
+// `multichannel` for `SharedClient` and is gated again inside the module. The
+// codec + path helpers compile with just `client`, so Windows and
+// no_std+alloc builds skip the whole module via its inner
+// `#![cfg(all(unix, feature = "client"))]`.
+#[cfg(all(unix, feature = "client"))]
+pub mod mux;
+
 #[cfg(feature = "multichannel")]
 pub mod shared;
 

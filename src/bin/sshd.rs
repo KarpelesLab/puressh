@@ -2671,18 +2671,17 @@ mod imp {
             if mismatch {
                 return Err(format!(
                     "bind {addr}: AddressFamily {af:?} excludes this listener address"
-                )
-                .into());
+                ));
             }
         }
         let listener =
             std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
 
         // PidFile: write our PID now that the listener is up.
-        if let Some(path) = pid_file.as_deref() {
-            if let Err(e) = std::fs::write(path, format!("{}\n", std::process::id())) {
-                eprintln!("sshd: warning: could not write PidFile {path}: {e}");
-            }
+        if let Some(path) = pid_file.as_deref()
+            && let Err(e) = std::fs::write(path, format!("{}\n", std::process::id()))
+        {
+            eprintln!("sshd: warning: could not write PidFile {path}: {e}");
         }
 
         eprintln!(

@@ -150,6 +150,143 @@ pub struct ServerOptions {
     /// or the literal `none` (stored as `None`). The send is wired through the
     /// auth layer (global / address-matched banners).
     pub banner: Option<String>,
+    /// `MaxSessions` — cap on the number of open `session` channels per
+    /// connection. `0` ⇒ no sessions may be opened. `None` ⇒ no cap.
+    pub max_sessions: Option<u32>,
+    /// `AllowTcpForwarding` — which TCP forwarding directions are permitted.
+    /// `None` ⇒ default-allow (the historical behaviour, modulo whether a
+    /// handler is even attached).
+    pub allow_tcp_forwarding: Option<TcpForwarding>,
+    /// `PermitOpen` — destinations a `direct-tcpip` (`ssh -L`) request may
+    /// target. `None` ⇒ unset (any). `Some(vec![])` ⇒ `none` (deny all).
+    pub permit_open: Option<Vec<HostPort>>,
+    /// `PermitListen` — bind targets a `tcpip-forward` (`ssh -R`) request may
+    /// ask for. `None` ⇒ unset (any). `Some(vec![])` ⇒ `none` (deny all).
+    pub permit_listen: Option<Vec<HostPort>>,
+    /// `GatewayPorts` — whether remote-forward binds may use a non-loopback
+    /// interface. `None` ⇒ default (`no`).
+    pub gateway_ports: Option<GatewayPorts>,
+    /// `ForceCommand` — overrides the client's requested command/shell with
+    /// this one; the original command is exposed via `SSH_ORIGINAL_COMMAND`.
+    /// The literal `internal-sftp` routes to the in-process SFTP subsystem.
+    /// `None` ⇒ no forced command.
+    pub force_command: Option<String>,
+    /// `ChrootDirectory` — chroot for the session. Only honoured for the
+    /// SFTP path (mapped onto the SFTP root); a real chroot for shell/exec is
+    /// out of scope. `None` ⇒ no chroot.
+    pub chroot_directory: Option<String>,
+    /// `ClientAliveInterval` in seconds — server keepalive cadence. `0`/`None`
+    /// ⇒ disabled.
+    pub client_alive_interval: Option<u32>,
+    /// `ClientAliveCountMax` — number of unanswered keepalives tolerated before
+    /// the connection is dropped. `None` ⇒ default 3.
+    pub client_alive_count_max: Option<u32>,
+    /// `PrintMotd` (yes/no) — print `/etc/motd` for interactive shells.
+    /// `None` ⇒ default (no).
+    pub print_motd: Option<bool>,
+    /// `Compression` — `no` / `yes` / `delayed`. `None` ⇒ default (`delayed`).
+    pub compression: Option<Compression>,
+    /// `RekeyLimit` — parsed `<bytes>[ <time>]` re-key thresholds. `None` ⇒
+    /// default. The flags inside distinguish `default`/`none`.
+    pub rekey_limit: Option<RekeyLimit>,
+    /// `AddressFamily` — restrict the listener address family. `None` ⇒ any.
+    pub address_family: Option<AddressFamily>,
+    /// `PidFile` — path to write the daemon PID to, or `None` for the literal
+    /// `none`. Distinguished from "unset" by `pid_file_set`.
+    pub pid_file: Option<String>,
+    /// True iff a `PidFile` line was seen (so the binary can tell `none`
+    /// (`pid_file == None`, `pid_file_set == true`) from "unset").
+    pub pid_file_set: bool,
+    /// `Subsystem sftp internal-sftp` ⇒ enables the in-process SFTP handler
+    /// (the standard `sshd_config` spelling; `SftpEnabled` remains a working
+    /// alias). External-command subsystems are rejected at parse time.
+    pub subsystem_sftp: Option<bool>,
+}
+
+/// `AllowTcpForwarding` policy: which forwarding directions are permitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TcpForwarding {
+    /// `no` — neither direction.
+    No,
+    /// `yes` / `all` — both directions.
+    All,
+    /// `local` — only `direct-tcpip` (`ssh -L`).
+    Local,
+    /// `remote` — only `tcpip-forward` (`ssh -R`).
+    Remote,
+}
+
+impl TcpForwarding {
+    /// Whether `direct-tcpip` (local, `ssh -L`) forwarding is allowed.
+    pub fn local_allowed(self) -> bool {
+        matches!(self, TcpForwarding::All | TcpForwarding::Local)
+    }
+    /// Whether `tcpip-forward` (remote, `ssh -R`) forwarding is allowed.
+    pub fn remote_allowed(self) -> bool {
+        matches!(self, TcpForwarding::All | TcpForwarding::Remote)
+    }
+}
+
+/// `GatewayPorts` policy for remote-forward binds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayPorts {
+    /// `no` — force the listener onto loopback regardless of the client's ask.
+    No,
+    /// `yes` — bind on all interfaces.
+    Yes,
+    /// `clientspecified` — honour the client's requested bind address.
+    ClientSpecified,
+}
+
+/// `Compression` policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compression {
+    /// `no` — never offer zlib.
+    No,
+    /// `yes` — offer zlib immediately.
+    Yes,
+    /// `delayed` — offer zlib only post-auth (the OpenSSH default).
+    Delayed,
+}
+
+/// `AddressFamily` policy restricting the listener's address family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// `any` — both IPv4 and IPv6.
+    Any,
+    /// `inet` — IPv4 only.
+    Inet,
+    /// `inet6` — IPv6 only.
+    Inet6,
+}
+
+/// One `host:port` entry for `PermitOpen` / `PermitListen`. A `None` port (or
+/// `host` of `*`) is a wildcard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPort {
+    /// Host literal, or `*` for any host.
+    pub host: String,
+    /// Port, or `None` for any port (`*`).
+    pub port: Option<u16>,
+}
+
+impl HostPort {
+    /// True iff this entry permits a request for `(host, port)`. A `*` host
+    /// matches any host; a `None` port matches any port.
+    pub fn matches(&self, host: &str, port: u16) -> bool {
+        let host_ok = self.host == "*" || self.host == host;
+        let port_ok = self.port.is_none_or(|p| p == port);
+        host_ok && port_ok
+    }
+}
+
+/// Parsed `RekeyLimit` thresholds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RekeyLimit {
+    /// Byte threshold. `None` ⇒ `default`/unset for bytes.
+    pub max_bytes: Option<u64>,
+    /// Time threshold in seconds. `None` ⇒ no time-based rekey.
+    pub max_seconds: Option<u32>,
 }
 
 /// One `Match` block from an `sshd_config(5)` file: the parsed conditions
@@ -267,6 +404,27 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(authentication_methods);
     take_scalar!(max_auth_tries);
     take_scalar!(banner);
+    take_scalar!(max_sessions);
+    take_scalar!(allow_tcp_forwarding);
+    take_scalar!(permit_open);
+    take_scalar!(permit_listen);
+    take_scalar!(gateway_ports);
+    take_scalar!(force_command);
+    take_scalar!(chroot_directory);
+    take_scalar!(client_alive_interval);
+    take_scalar!(client_alive_count_max);
+    take_scalar!(print_motd);
+    take_scalar!(compression);
+    take_scalar!(rekey_limit);
+    take_scalar!(address_family);
+    take_scalar!(subsystem_sftp);
+    // `pid_file` is startup-only (rejected inside Match), so it can only ever
+    // come from the global block; merge it first-match-wins anyway for
+    // robustness, carrying the "was it set" flag alongside.
+    if !dst.pid_file_set && src.pid_file_set {
+        dst.pid_file = src.pid_file.clone();
+        dst.pid_file_set = true;
+    }
     dst.listen_addresses
         .extend(src.listen_addresses.iter().cloned());
     dst.host_key_files
@@ -295,6 +453,8 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "maxstartups",
         "strictmodes",
         "include",
+        "subsystem",
+        "permittunnel",
     ];
     if INVALID_IN_MATCH.contains(&line.keyword.as_str()) {
         return Err(ConfigError::Unsupported {
@@ -565,6 +725,110 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 opts.banner = Some(s);
             }
         }
+        "maxsessions" => {
+            let s = one_arg(line)?;
+            opts.max_sessions = Some(s.parse::<u32>().map_err(|_| ConfigError::BadValue {
+                line: line.line_no,
+                keyword: kw.to_string(),
+                msg: format!("expected an integer, got {s:?}"),
+            })?);
+        }
+        "allowtcpforwarding" => {
+            opts.allow_tcp_forwarding = Some(parse_tcp_forwarding(line)?);
+        }
+        "permitopen" => {
+            opts.permit_open = Some(parse_host_port_list(line)?);
+        }
+        "permitlisten" => {
+            opts.permit_listen = Some(parse_host_port_list(line)?);
+        }
+        "gatewayports" => {
+            opts.gateway_ports = Some(parse_gateway_ports(line)?);
+        }
+        "forcecommand" => {
+            // OpenSSH joins all tokens after the keyword into one command
+            // line. An empty value is meaningless (would force "no command").
+            if line.args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected a command".into(),
+                });
+            }
+            opts.force_command = Some(line.args.join(" "));
+        }
+        "chrootdirectory" => {
+            let s = one_arg(line)?;
+            if s.eq_ignore_ascii_case("none") {
+                opts.chroot_directory = None;
+            } else {
+                opts.chroot_directory = Some(s);
+            }
+        }
+        "clientaliveinterval" => {
+            opts.client_alive_interval = Some(parse_duration_seconds(line)?);
+        }
+        "clientalivecountmax" => {
+            let s = one_arg(line)?;
+            opts.client_alive_count_max =
+                Some(s.parse::<u32>().map_err(|_| ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: format!("expected an integer, got {s:?}"),
+                })?);
+        }
+        "printmotd" => {
+            opts.print_motd = Some(parse_yes_no(line)?);
+        }
+        "compression" => {
+            opts.compression = Some(parse_compression(line)?);
+        }
+        "rekeylimit" => {
+            opts.rekey_limit = Some(parse_rekey_limit(line)?);
+        }
+        "addressfamily" => {
+            opts.address_family = Some(parse_address_family(line)?);
+        }
+        "pidfile" => {
+            let s = one_arg(line)?;
+            opts.pid_file_set = true;
+            if s.eq_ignore_ascii_case("none") {
+                opts.pid_file = None;
+            } else {
+                opts.pid_file = Some(s);
+            }
+        }
+        "subsystem" => {
+            // Standard form: `Subsystem <name> <command>`. Only the in-process
+            // `sftp` → `internal-sftp` mapping is supported; an external
+            // command subsystem cannot be honoured.
+            if line.args.len() < 2 {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected `Subsystem <name> <command>`".into(),
+                });
+            }
+            let name = line.args[0].to_ascii_lowercase();
+            let command = &line.args[1];
+            if name == "sftp" && command.eq_ignore_ascii_case("internal-sftp") {
+                opts.subsystem_sftp = Some(true);
+            } else {
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: format!(
+                        "Subsystem {name:?}: only `sftp internal-sftp` is supported \
+                         (external-command subsystems are not)"
+                    ),
+                });
+            }
+        }
+        "permittunnel" => {
+            return Err(ConfigError::Unsupported {
+                line: line.line_no,
+                msg: "PermitTunnel: tun/tap device forwarding is not supported".into(),
+            });
+        }
         _ => {
             return Err(ConfigError::UnknownKeyword {
                 line: line.line_no,
@@ -573,6 +837,195 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
     }
     Ok(())
+}
+
+/// Parse an `AllowTcpForwarding` value: `yes` / `no` / `all` / `local` /
+/// `remote`.
+fn parse_tcp_forwarding(line: &ParsedLine) -> Result<TcpForwarding, ConfigError> {
+    let s = one_arg(line)?.to_ascii_lowercase();
+    match s.as_str() {
+        "yes" | "all" => Ok(TcpForwarding::All),
+        "no" => Ok(TcpForwarding::No),
+        "local" => Ok(TcpForwarding::Local),
+        "remote" => Ok(TcpForwarding::Remote),
+        _ => Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: format!("expected yes/no/all/local/remote, got {s:?}"),
+        }),
+    }
+}
+
+/// Parse a `GatewayPorts` value: `no` / `yes` / `clientspecified`.
+fn parse_gateway_ports(line: &ParsedLine) -> Result<GatewayPorts, ConfigError> {
+    let s = one_arg(line)?.to_ascii_lowercase();
+    match s.as_str() {
+        "no" => Ok(GatewayPorts::No),
+        "yes" => Ok(GatewayPorts::Yes),
+        "clientspecified" => Ok(GatewayPorts::ClientSpecified),
+        _ => Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: format!("expected no/yes/clientspecified, got {s:?}"),
+        }),
+    }
+}
+
+/// Parse a `Compression` value: `no` / `yes` / `delayed`.
+fn parse_compression(line: &ParsedLine) -> Result<Compression, ConfigError> {
+    let s = one_arg(line)?.to_ascii_lowercase();
+    match s.as_str() {
+        "no" | "false" | "off" => Ok(Compression::No),
+        "yes" | "true" | "on" => Ok(Compression::Yes),
+        "delayed" => Ok(Compression::Delayed),
+        _ => Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: format!("expected no/yes/delayed, got {s:?}"),
+        }),
+    }
+}
+
+/// Parse an `AddressFamily` value: `any` / `inet` / `inet6`.
+fn parse_address_family(line: &ParsedLine) -> Result<AddressFamily, ConfigError> {
+    let s = one_arg(line)?.to_ascii_lowercase();
+    match s.as_str() {
+        "any" => Ok(AddressFamily::Any),
+        "inet" => Ok(AddressFamily::Inet),
+        "inet6" => Ok(AddressFamily::Inet6),
+        _ => Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: format!("expected any/inet/inet6, got {s:?}"),
+        }),
+    }
+}
+
+/// Parse a `PermitOpen` / `PermitListen` argument list into [`HostPort`]
+/// entries. `any` ⇒ no restriction (returned as a single wildcard entry);
+/// `none` ⇒ deny all (returned as an empty vec). A malformed `host:port` is a
+/// [`ConfigError::BadValue`].
+fn parse_host_port_list(line: &ParsedLine) -> Result<Vec<HostPort>, ConfigError> {
+    if line.args.is_empty() {
+        return Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: "expected at least one host:port (or any/none)".into(),
+        });
+    }
+    // `any` / `none` are only meaningful as the sole argument.
+    if line.args.len() == 1 {
+        let only = line.args[0].to_ascii_lowercase();
+        if only == "any" {
+            return Ok(alloc::vec![HostPort {
+                host: "*".into(),
+                port: None,
+            }]);
+        }
+        if only == "none" {
+            return Ok(Vec::new());
+        }
+    }
+    let mut out = Vec::with_capacity(line.args.len());
+    for spec in &line.args {
+        out.push(parse_host_port(spec, line)?);
+    }
+    Ok(out)
+}
+
+/// Parse one `host:port` token. Accepts `host:port`, `host:*`, `*:port`,
+/// `[v6]:port`. A bare host with no colon is rejected (OpenSSH requires a
+/// port). Returns [`ConfigError::BadValue`] on a malformed entry.
+fn parse_host_port(spec: &str, line: &ParsedLine) -> Result<HostPort, ConfigError> {
+    let bad = || ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: format!("malformed host:port entry {spec:?}"),
+    };
+    // Bracketed IPv6 literal: [::1]:22
+    let (host, port_str) = if let Some(rest) = spec.strip_prefix('[') {
+        let close = rest.find(']').ok_or_else(bad)?;
+        let host = &rest[..close];
+        let after = &rest[close + 1..];
+        let port = after.strip_prefix(':').ok_or_else(bad)?;
+        (host.to_string(), port)
+    } else {
+        // Split on the LAST colon so bare IPv6 without brackets still fails
+        // cleanly (it would have multiple colons → ambiguous → reject).
+        let colon = spec.rfind(':').ok_or_else(bad)?;
+        let host = &spec[..colon];
+        let port = &spec[colon + 1..];
+        // Reject bare IPv6 (additional colons in the host part).
+        if host.contains(':') {
+            return Err(bad());
+        }
+        (host.to_string(), port)
+    };
+    if host.is_empty() {
+        return Err(bad());
+    }
+    let port = if port_str == "*" {
+        None
+    } else {
+        Some(port_str.parse::<u16>().map_err(|_| bad())?)
+    };
+    Ok(HostPort { host, port })
+}
+
+/// Parse a `RekeyLimit` value: `<bytes>[ <time>]` where `<bytes>` accepts
+/// `K`/`M`/`G` suffixes (or `default`/`none`), and `<time>` is an OpenSSH
+/// duration (or `none`).
+fn parse_rekey_limit(line: &ParsedLine) -> Result<RekeyLimit, ConfigError> {
+    if line.args.is_empty() || line.args.len() > 2 {
+        return Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: "expected `<bytes>[ <time>]`".into(),
+        });
+    }
+    let bytes_tok = line.args[0].to_ascii_lowercase();
+    let max_bytes = match bytes_tok.as_str() {
+        "default" | "none" => None,
+        other => Some(parse_size_bytes(other, line)?),
+    };
+    let max_seconds = match line.args.get(1) {
+        None => None,
+        Some(t) => {
+            if t.eq_ignore_ascii_case("none") {
+                None
+            } else {
+                Some(parse_duration_str(t, line)?)
+            }
+        }
+    };
+    Ok(RekeyLimit {
+        max_bytes,
+        max_seconds,
+    })
+}
+
+/// Parse a size with an optional `K`/`M`/`G` suffix (binary multiples), e.g.
+/// `512`, `1K`, `2M`, `1G`.
+fn parse_size_bytes(s: &str, line: &ParsedLine) -> Result<u64, ConfigError> {
+    let bad = || ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: format!("bad size value {s:?}"),
+    };
+    let bytes = s.as_bytes();
+    if bytes.is_empty() {
+        return Err(bad());
+    }
+    let last = bytes[bytes.len() - 1];
+    let (digits, mult): (&str, u64) = match last.to_ascii_lowercase() {
+        b'k' => (&s[..s.len() - 1], 1024),
+        b'm' => (&s[..s.len() - 1], 1024 * 1024),
+        b'g' => (&s[..s.len() - 1], 1024 * 1024 * 1024),
+        _ if last.is_ascii_digit() => (s, 1),
+        _ => return Err(bad()),
+    };
+    let n: u64 = digits.parse().map_err(|_| bad())?;
+    n.checked_mul(mult).ok_or_else(bad)
 }
 
 fn one_arg(line: &ParsedLine) -> Result<String, ConfigError> {
@@ -647,6 +1100,13 @@ fn parse_log_level(line: &ParsedLine) -> Result<u8, ConfigError> {
 /// integer (interpreted as seconds). Returns the total in seconds.
 fn parse_duration_seconds(line: &ParsedLine) -> Result<u32, ConfigError> {
     let s = one_arg(line)?;
+    parse_duration_str(&s, line)
+}
+
+/// Parse a single OpenSSH duration token (e.g. `30s`, `5m`, `2h`, or a bare
+/// integer of seconds) into total seconds. Shared by `LoginGraceTime`,
+/// `ClientAliveInterval`, and the time field of `RekeyLimit`.
+fn parse_duration_str(s: &str, line: &ParsedLine) -> Result<u32, ConfigError> {
     let bytes = s.as_bytes();
     let mut total: u64 = 0;
     let mut acc: u64 = 0;
@@ -1053,5 +1513,229 @@ ScpEnabled yes
         assert_eq!(cfg.sftp_read_only, Some(false));
         assert_eq!(cfg.sftp_root.as_deref(), Some("/var/sftp"));
         assert_eq!(cfg.scp_enabled, Some(true));
+    }
+
+    // ---- W7 session / forwarding / policy keywords -----------------------
+
+    #[test]
+    fn session_forwarding_keywords_parse() {
+        let src = "\
+MaxSessions 4
+AllowTcpForwarding local
+PermitOpen 127.0.0.1:80 example.com:443
+PermitListen 127.0.0.1:8080
+GatewayPorts clientspecified
+ForceCommand /usr/bin/uptime --pretty
+ChrootDirectory /var/jail
+ClientAliveInterval 30
+ClientAliveCountMax 2
+PrintMotd yes
+Compression delayed
+RekeyLimit 512M 1h
+AddressFamily inet
+PidFile /run/sshd.pid
+Subsystem sftp internal-sftp
+";
+        let cfg = SshServerConfig::parse(src).unwrap().global;
+        assert_eq!(cfg.max_sessions, Some(4));
+        assert_eq!(cfg.allow_tcp_forwarding, Some(TcpForwarding::Local));
+        let open = cfg.permit_open.unwrap();
+        assert_eq!(open.len(), 2);
+        assert!(open[0].matches("127.0.0.1", 80));
+        assert!(open[1].matches("example.com", 443));
+        assert!(!open[0].matches("127.0.0.1", 81));
+        assert_eq!(cfg.permit_listen.unwrap()[0].port, Some(8080));
+        assert_eq!(cfg.gateway_ports, Some(GatewayPorts::ClientSpecified));
+        assert_eq!(
+            cfg.force_command.as_deref(),
+            Some("/usr/bin/uptime --pretty")
+        );
+        assert_eq!(cfg.chroot_directory.as_deref(), Some("/var/jail"));
+        assert_eq!(cfg.client_alive_interval, Some(30));
+        assert_eq!(cfg.client_alive_count_max, Some(2));
+        assert_eq!(cfg.print_motd, Some(true));
+        assert_eq!(cfg.compression, Some(Compression::Delayed));
+        assert_eq!(
+            cfg.rekey_limit,
+            Some(RekeyLimit {
+                max_bytes: Some(512 * 1024 * 1024),
+                max_seconds: Some(3600),
+            })
+        );
+        assert_eq!(cfg.address_family, Some(AddressFamily::Inet));
+        assert!(cfg.pid_file_set);
+        assert_eq!(cfg.pid_file.as_deref(), Some("/run/sshd.pid"));
+        assert_eq!(cfg.subsystem_sftp, Some(true));
+    }
+
+    #[test]
+    fn permit_open_any_and_none() {
+        let any = SshServerConfig::parse("PermitOpen any\n")
+            .unwrap()
+            .global
+            .permit_open
+            .unwrap();
+        assert!(any[0].matches("anything", 9999));
+        let none = SshServerConfig::parse("PermitOpen none\n")
+            .unwrap()
+            .global
+            .permit_open
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn permit_open_malformed_bad_value() {
+        // Bare host with no port.
+        let err = SshServerConfig::parse("PermitOpen justhost\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
+            "{err:?}"
+        );
+        // Non-numeric port.
+        let err2 = SshServerConfig::parse("PermitOpen host:abc\n").unwrap_err();
+        assert!(
+            matches!(err2, ConfigError::BadValue { line: 1, .. }),
+            "{err2:?}"
+        );
+        // PermitListen shares the parser.
+        let err3 = SshServerConfig::parse("PermitListen :\n").unwrap_err();
+        assert!(
+            matches!(err3, ConfigError::BadValue { line: 1, .. }),
+            "{err3:?}"
+        );
+    }
+
+    #[test]
+    fn permit_open_ipv6_bracketed() {
+        let cfg = SshServerConfig::parse("PermitOpen [::1]:22\n")
+            .unwrap()
+            .global
+            .permit_open
+            .unwrap();
+        assert_eq!(cfg[0].host, "::1");
+        assert_eq!(cfg[0].port, Some(22));
+    }
+
+    #[test]
+    fn force_command_empty_bad_value() {
+        let err = SshServerConfig::parse("ForceCommand\n").unwrap_err();
+        // Empty arg list ⇒ BadValue (the tokenizer drops a keyword-only line
+        // before it reaches apply_keyword in some shapes; accept either the
+        // BadValue from our arm or an unknown-shape error, but a value-less
+        // line must not silently succeed).
+        assert!(
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn permit_tunnel_unsupported() {
+        let err = SshServerConfig::parse("PermitTunnel yes\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn external_subsystem_unsupported() {
+        let err =
+            SshServerConfig::parse("Subsystem sftp /usr/lib/openssh/sftp-server\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn subsystem_missing_command_bad_value() {
+        let err = SshServerConfig::parse("Subsystem sftp\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn chroot_none_clears() {
+        let cfg = SshServerConfig::parse("ChrootDirectory none\n")
+            .unwrap()
+            .global;
+        assert_eq!(cfg.chroot_directory, None);
+    }
+
+    #[test]
+    fn rekey_limit_default_and_none() {
+        let d = SshServerConfig::parse("RekeyLimit default\n")
+            .unwrap()
+            .global
+            .rekey_limit
+            .unwrap();
+        assert_eq!(d.max_bytes, None);
+        assert_eq!(d.max_seconds, None);
+        let n = SshServerConfig::parse("RekeyLimit 1G none\n")
+            .unwrap()
+            .global
+            .rekey_limit
+            .unwrap();
+        assert_eq!(n.max_bytes, Some(1024 * 1024 * 1024));
+        assert_eq!(n.max_seconds, None);
+    }
+
+    #[test]
+    fn rekey_limit_bad_value() {
+        let err = SshServerConfig::parse("RekeyLimit 5X\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn startup_keywords_rejected_in_match() {
+        for kw in [
+            "AddressFamily inet",
+            "PidFile /x",
+            "Compression no",
+            "RekeyLimit 1G",
+            "Subsystem sftp internal-sftp",
+            "PermitTunnel yes",
+        ] {
+            let src = format!("Match User alice\n  {kw}\n");
+            let err = SshServerConfig::parse(&src).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Unsupported { line: 2, .. }),
+                "expected reject for {kw:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn session_keywords_match_overridable() {
+        // MaxSessions / AllowTcpForwarding / ForceCommand etc. are valid in a
+        // Match block and resolve per-connection.
+        let src = "\
+MaxSessions 10
+Match User alice
+  MaxSessions 1
+  AllowTcpForwarding no
+  ForceCommand internal-sftp
+";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        let base = cfg.resolve(&MatchContext::default(), ExecPolicy::Deny);
+        assert_eq!(base.max_sessions, Some(10));
+        assert_eq!(base.allow_tcp_forwarding, None);
+        let ctx = MatchContext {
+            host: "h",
+            user: Some("alice"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&ctx, ExecPolicy::Deny);
+        // First-match-wins: global set MaxSessions 10 first, so it stays.
+        assert_eq!(eff.max_sessions, Some(10));
+        assert_eq!(eff.allow_tcp_forwarding, Some(TcpForwarding::No));
+        assert_eq!(eff.force_command.as_deref(), Some("internal-sftp"));
     }
 }

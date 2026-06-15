@@ -51,7 +51,15 @@ pub use client::{
 pub use glob::HostPattern;
 pub use host_port::{parse_host_port, parse_host_port_pattern};
 pub use match_block::{AddressKind, AddressPattern, MatchCondition, MatchContext};
-pub use server::{PermitRootLogin, ServerMatchBlock, ServerOptions, SshServerConfig};
+pub use server::{
+    Compression, HostPort, PermitRootLogin, RekeyLimit, ServerMatchBlock, ServerOptions,
+    SshServerConfig, TcpForwarding,
+};
+// `AddressFamily` and `GatewayPorts` already exist as client-config types in
+// this module's namespace; the server variants live behind `config::server::`
+// to avoid the name clash. Re-export the server ones under disambiguated names
+// for callers that want them at the top level.
+pub use server::{AddressFamily as ServerAddressFamily, GatewayPorts as ServerGatewayPorts};
 
 /// Errors produced while parsing or evaluating an SSH config file.
 #[derive(Debug, Clone, PartialEq, Eq)]

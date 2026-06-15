@@ -40,6 +40,29 @@ use crate::transport::{
     KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
 };
 
+/// Abstraction over the byte transport a [`Client`] runs on. The default is
+/// a plain [`TcpStream`], but a client can also run over a proxied channel
+/// (ProxyJump's `direct-tcpip` stream) or a spawned helper process's pipes
+/// (ProxyCommand) — anything that is `Read + Write + Send` and can toggle a
+/// read timeout.
+///
+/// `set_read_timeout` mirrors [`TcpStream::set_read_timeout`]: `None` clears
+/// it (blocking reads). Transports that cannot honour a timeout (e.g. a pipe
+/// to a child process) may implement it as a no-op `Ok(())` — callers that
+/// rely on a real timeout (the serve / forwarding poll loops) must not be
+/// driven over such a transport.
+pub trait Transport: Read + Write + Send {
+    /// Set the read timeout on the underlying transport. See
+    /// [`TcpStream::set_read_timeout`].
+    fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Transport for TcpStream {
+    fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, t)
+    }
+}
+
 /// Maximum line length when reading the peer's identification banner.
 const MAX_BANNER_LINE: usize = 1024;
 /// Maximum number of banner lines we'll skim through before giving up.
@@ -477,7 +500,7 @@ struct ServeRuntime {
 
 /// A blocking SSH client.
 pub struct Client {
-    stream: TcpStream,
+    stream: Box<dyn Transport>,
     codec: PacketCodec,
     pub(crate) conn: ConnectionState,
     session_id: Vec<u8>,
@@ -563,36 +586,7 @@ impl Client {
             stream.set_write_timeout(Some(t))?;
         }
         stream.set_nodelay(true)?;
-
-        // The runner is bootstrapped inside `do_version_and_kex`; we install
-        // a placeholder advert here just so the struct field is initialised
-        // (it's replaced immediately).
-        let mut rng = OsRng;
-        let placeholder_advert = build_default_kexinit(&mut rng, &cfg.algorithms);
-        let mut me = Self {
-            stream,
-            codec: PacketCodec::new(),
-            conn: ConnectionState::new(),
-            session_id: Vec::new(),
-            inbox: Vec::new(),
-            rng,
-            runner: KexRunner::new(Role::Client, placeholder_advert),
-            v_c: Vec::new(),
-            v_s: Vec::new(),
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            algo_overrides: cfg.algorithms.clone(),
-            last_kex: Instant::now(),
-            rekey_policy: RekeyPolicy::default(),
-            deferred: Vec::new(),
-            target_host: String::new(),
-            target_port: 0,
-            request_auth_agent: false,
-            request_x11: None,
-            tcpip_forward_grants: Vec::new(),
-        };
-        me.host_key_policy = cfg.host_key_policy;
-        me.do_version_and_kex()?;
-        Ok(me)
+        Self::from_transport(Box::new(stream), "", 0, cfg)
     }
 
     /// Like [`Self::connect`], but threads the user-supplied host name and
@@ -607,7 +601,37 @@ impl Client {
             stream.set_write_timeout(Some(t))?;
         }
         stream.set_nodelay(true)?;
+        Self::from_transport(Box::new(stream), host, port, cfg)
+    }
 
+    /// Run a client over an arbitrary [`Transport`] (rather than a fresh
+    /// [`TcpStream`]). Used by ProxyJump (a `direct-tcpip` channel to the
+    /// next hop) and ProxyCommand (pipes to a spawned helper). `host`/`port`
+    /// name the *target reached through* the transport so per-hop host-key
+    /// checks (`KnownHosts`) key off the right name. The caller is
+    /// responsible for any timeouts on the transport.
+    pub fn connect_via(
+        stream: Box<dyn Transport>,
+        host: &str,
+        port: u16,
+        cfg: Config,
+    ) -> Result<Self> {
+        Self::from_transport(stream, host, port, cfg)
+    }
+
+    /// Shared construction: build the [`Client`] struct over `stream`,
+    /// recording `host`/`port` for host-key lookups, then run version
+    /// exchange + KEX. `host` may be empty (e.g. plain `connect`), in which
+    /// case `KnownHosts` policy degrades to AcceptAny.
+    fn from_transport(
+        stream: Box<dyn Transport>,
+        host: &str,
+        port: u16,
+        cfg: Config,
+    ) -> Result<Self> {
+        // The runner is bootstrapped inside `do_version_and_kex`; we install
+        // a placeholder advert here just so the struct field is initialised
+        // (it's replaced immediately).
         let mut rng = OsRng;
         let placeholder_advert = build_default_kexinit(&mut rng, &cfg.algorithms);
         let mut me = Self {

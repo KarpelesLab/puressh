@@ -85,7 +85,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::channel::{ChannelEvent, ChannelOpen, ChannelRequest};
-use crate::client::{Client, io_err};
+use crate::client::{Client, Transport, io_err};
 use crate::error::{Error, Result};
 use crate::sftp::{SftpClient, SftpError};
 
@@ -1174,6 +1174,17 @@ impl Write for OwnedChannelStream {
         // write_payload uses write_all on the underlying socket; no
         // user-level buffering to flush.
         Ok(())
+    }
+}
+
+impl Transport for OwnedChannelStream {
+    /// Forward the read timeout to the *jump* client's underlying TCP
+    /// socket (the SharedClient this channel rides on). A timeout there
+    /// bounds how long a blocking pump on this channel can park, which is
+    /// what the serve / forwarding poll loops on a client running *over*
+    /// this channel rely on.
+    fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+        self.shared.set_read_timeout(t).map_err(io_err)
     }
 }
 

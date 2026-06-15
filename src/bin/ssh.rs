@@ -39,6 +39,7 @@ const USAGE: &str = "usage: ssh [-v[v[v]]] [-F configfile] [-p port] [-i identit
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
                      [-o IdentitiesOnly={yes,no}] \
                      [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] \
+                     [-J [user@]host[:port][,...]] \
                      [-N] [-A] [-X] [-Y] \
                      [user@]host [command...]";
 
@@ -113,6 +114,9 @@ struct Cli {
     /// `ClientHandlers::on_x11`. `None` = no X11; in v0 `-X` and `-Y`
     /// both set the same wire arguments (no untrusted cookie minting).
     x11_forward: Option<X11Forward>,
+    /// `-J [user@]host[:port][,…]`: ProxyJump chain. `None` when the flag
+    /// wasn't supplied; the ssh_config `ProxyJump` then wins.
+    proxy_jump: Option<String>,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -207,6 +211,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut no_command = false;
     let mut agent_forward = false;
     let mut x11_forward: Option<X11Forward> = None;
+    let mut proxy_jump: Option<String> = None;
     let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
@@ -250,6 +255,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             "-N" => {
                 no_command = true;
+            }
+            "-J" => {
+                i += 1;
+                let v = args.get(i).ok_or("-J requires a value")?.clone();
+                proxy_jump = Some(v);
             }
             "-A" => {
                 agent_forward = true;
@@ -346,11 +356,245 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         no_command,
         agent_forward,
         x11_forward,
+        proxy_jump,
         verbose,
         host,
         user_in_host,
         command,
     })
+}
+
+/// One parsed `ProxyJump` hop: `[user@]host[:port]`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JumpHop {
+    user: Option<String>,
+    host: String,
+    /// `None` ⇒ fall back to the hop's ssh_config `Port`, then 22.
+    port: Option<u16>,
+}
+
+/// Parse a comma-separated `ProxyJump` value into hops. Each hop is
+/// `[user@]host[:port]`. Rejects empty hops and an empty list.
+fn parse_jump_hops(spec: &str) -> Result<Vec<JumpHop>, String> {
+    let mut hops = Vec::new();
+    for raw in spec.split(',') {
+        let token = raw.trim();
+        if token.is_empty() {
+            return Err(format!("ProxyJump: empty hop in {spec:?}"));
+        }
+        let (user, host, port) = parse_target(token)?;
+        hops.push(JumpHop { user, host, port });
+    }
+    if hops.is_empty() {
+        return Err("ProxyJump: no hops".into());
+    }
+    Ok(hops)
+}
+
+/// Collect publickey credentials for a host: agent identities (unless
+/// `IdentitiesOnly`), then the `-i` CLI identities, then the matching
+/// ssh_config block's `IdentityFile`s, then the OpenSSH default identities
+/// under `~/.ssh/`. Mirrors OpenSSH's ordering. `cli_identities` is empty
+/// for ProxyJump hops (the `-i` flag targets the final host only).
+fn collect_credentials(
+    cfg_block: &puressh::config::ClientOptions,
+    cli_identities: &[String],
+    identities_only: bool,
+) -> Vec<ClientCredential> {
+    let mut credentials: Vec<ClientCredential> = Vec::new();
+    if !identities_only {
+        match connect_agent_credentials() {
+            Ok(mut from_agent) => {
+                if !from_agent.is_empty() {
+                    vlog(
+                        1,
+                        &format!("agent contributed {} identities", from_agent.len()),
+                    );
+                }
+                credentials.append(&mut from_agent);
+            }
+            Err(e) => eprintln!("warning: agent: {e}"),
+        }
+    }
+    for id_path in cli_identities {
+        let pk = match load_identity(id_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
+        match pk.into_host_key() {
+            Ok(hk) => {
+                vlog(1, &format!("identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
+            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
+        }
+    }
+    for id_path_raw in &cfg_block.identity_files {
+        let id_path = expand_tilde(id_path_raw);
+        let pk = match load_identity(&id_path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
+        match pk.into_host_key() {
+            Ok(hk) => {
+                vlog(1, &format!("config identity {id_path}: loaded"));
+                credentials.push(ClientCredential::PublicKey(hk));
+            }
+            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
+        }
+    }
+    if !identities_only {
+        for path in default_identity_paths() {
+            match try_load_default_identity(&path) {
+                Ok(Some(pk)) => match pk.into_host_key() {
+                    Ok(hk) => {
+                        vlog(1, &format!("default identity {}: loaded", path.display()));
+                        credentials.push(ClientCredential::PublicKey(hk));
+                    }
+                    Err(e) => {
+                        eprintln!("warning: default identity {}: {e}", path.display());
+                    }
+                },
+                Ok(None) => {
+                    vlog(2, &format!("default identity {}: skipped", path.display()));
+                }
+                Err(msg) => eprintln!("warning: {msg}"),
+            }
+        }
+    }
+    credentials
+}
+
+/// Authenticate `client` as `user` with `credentials`: try publickey, then
+/// fall back to an interactive password prompt. Used for the final target
+/// and for every ProxyJump hop.
+fn authenticate_client(
+    client: &mut Client,
+    user: &str,
+    credentials: Vec<ClientCredential>,
+) -> Result<(), String> {
+    let authed = if !credentials.is_empty() {
+        vlog(
+            1,
+            &format!(
+                "attempting publickey auth with {} credentials",
+                credentials.len()
+            ),
+        );
+        match client.authenticate(user, credentials) {
+            Ok(()) => {
+                vlog(1, &format!("authenticated as {user} via publickey"));
+                true
+            }
+            Err(e) => {
+                eprintln!("publickey auth: {e}");
+                false
+            }
+        }
+    } else {
+        vlog(
+            1,
+            "no publickey credentials available; falling back to password",
+        );
+        false
+    };
+
+    if !authed {
+        // Password reader honors $SSH_ASKPASS and suppresses terminal echo
+        // on Unix via termios (see src/bin/common.rs).
+        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
+        client
+            .authenticate_password(user, &password)
+            .map_err(|e| format!("Auth failed: {e}"))?;
+        vlog(1, &format!("authenticated as {user} via password"));
+    }
+    Ok(())
+}
+
+/// Build the [`Config`] for a host from its resolved ssh_config block:
+/// host-key policy + crypto-algorithm overrides.
+fn config_for_host(
+    cfg_block: &puressh::config::ClientOptions,
+    cli: &Cli,
+) -> Result<Config, String> {
+    let strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    let known_hosts_path = cli
+        .known_hosts_path
+        .clone()
+        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
+    let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
+    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
+    Ok(Config {
+        host_key_policy: policy,
+        timeout: None,
+        algorithms: AlgoOverrides {
+            ciphers: cfg_block.ciphers.clone(),
+            macs: cfg_block.macs.clone(),
+            kex_algorithms: cfg_block.kex_algorithms.clone(),
+            host_key_algorithms: cfg_block.host_key_algorithms.clone(),
+            pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
+        },
+    })
+}
+
+/// Walk the ProxyJump chain, returning the [`SharedClient`] for the *last*
+/// jump host. The caller opens a `direct-tcpip` channel from it to the final
+/// target and runs the real session over that. Each hop re-runs
+/// `ssh_cfg.lookup(hop.host)` for its own identities / known_hosts / user;
+/// host-key checking runs per hop (a rejection at any hop aborts).
+fn connect_jump_chain(
+    hops: &[JumpHop],
+    ssh_cfg: &puressh::config::SshClientConfig,
+    cli: &Cli,
+) -> Result<puressh::shared::SharedClient, String> {
+    let mut current: Option<puressh::shared::SharedClient> = None;
+    for (idx, hop) in hops.iter().enumerate() {
+        let block = ssh_cfg.lookup(&hop.host);
+        let connect_host = block.host_name.clone().unwrap_or_else(|| hop.host.clone());
+        let port = hop.port.or(block.port).unwrap_or(22);
+        // Hop user: `user@` in the hop spec wins over the hop's config User,
+        // then the local user. CLI `-l` targets the final host, not hops.
+        let user = resolve_user(block.user.as_deref(), hop.user.as_deref())?;
+        let cfg = config_for_host(&block, cli)?;
+
+        vlog(
+            1,
+            &format!(
+                "proxyjump hop {}: connecting to {connect_host}:{port}",
+                idx + 1
+            ),
+        );
+        let mut hop_client = match &current {
+            // First hop: direct TCP.
+            None => Client::connect_to_host(connect_host.as_str(), port, cfg)
+                .map_err(|e| format!("proxyjump hop {}: connect: {e}", idx + 1))?,
+            // Subsequent hop: tunnel a direct-tcpip channel through the
+            // previous hop and run the client over it.
+            Some(prev) => {
+                let ch = prev
+                    .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
+                    .map_err(|e| format!("proxyjump hop {}: open channel: {e}", idx + 1))?;
+                Client::connect_via(Box::new(ch), connect_host.as_str(), port, cfg)
+                    .map_err(|e| format!("proxyjump hop {}: handshake: {e}", idx + 1))?
+            }
+        };
+
+        // ProxyJump hops authenticate with config/agent/default identities
+        // only — the CLI `-i` list belongs to the final target.
+        let credentials = collect_credentials(&block, &[], block.identities_only.unwrap_or(false));
+        authenticate_client(&mut hop_client, &user, credentials)
+            .map_err(|e| format!("proxyjump hop {}: {e}", idx + 1))?;
+        vlog(1, &format!("proxyjump hop {}: authenticated", idx + 1));
+
+        current = Some(hop_client.into());
+    }
+    current.ok_or_else(|| "ProxyJump: no hops".into())
 }
 
 fn run() -> Result<i32, String> {
@@ -415,12 +659,6 @@ fn run() -> Result<i32, String> {
     let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
     let user = resolve_user(cli_user.as_deref(), cli.user_in_host.as_deref())?;
 
-    let strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
-    let known_hosts_path = cli
-        .known_hosts_path
-        .clone()
-        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
-    let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
     let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
     let port = common::pick(cli.port, cfg_block.port, 22);
     // `HostName` rewrites the connect target; the original `cli.host` is
@@ -430,141 +668,96 @@ fn run() -> Result<i32, String> {
         .clone()
         .unwrap_or_else(|| cli.host.clone());
 
-    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
-    // Thread the resolved crypto-algorithm overrides from the matching
-    // ssh_config block into the connection. Each is already strict-validated
-    // by the config parser (list modifiers applied, unknown names rejected).
-    let cfg = Config {
-        host_key_policy: policy,
-        timeout: None,
-        algorithms: AlgoOverrides {
-            ciphers: cfg_block.ciphers.clone(),
-            macs: cfg_block.macs.clone(),
-            kex_algorithms: cfg_block.kex_algorithms.clone(),
-            host_key_algorithms: cfg_block.host_key_algorithms.clone(),
-            pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
-        },
-    };
+    let cfg = config_for_host(&cfg_block, &cli)?;
 
-    // Use connect_to_host so KnownHosts can look the host up by its
-    // user-supplied name.
-    vlog(1, &format!("connecting to {connect_host}:{port}"));
-    let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)
-        .map_err(|e| format!("connect: {e}"))?;
-    vlog(1, &format!("connected to {connect_host}:{port}"));
-
-    // Collect publickey credentials. Per OpenSSH default, agent identities
-    // come first (when `$SSH_AUTH_SOCK` is set and `IdentitiesOnly=no`),
-    // then `-i` identity files in command-line order, then the OpenSSH
-    // default identities under `~/.ssh/` (`id_ed25519`, `id_ecdsa`,
-    // `id_rsa`). `IdentitiesOnly=yes` suppresses both the agent and the
-    // defaults, mirroring OpenSSH.
-    let mut credentials: Vec<ClientCredential> = Vec::new();
-    if !identities_only {
-        match connect_agent_credentials() {
-            Ok(mut from_agent) => {
-                if !from_agent.is_empty() {
-                    vlog(
-                        1,
-                        &format!("agent contributed {} identities", from_agent.len()),
-                    );
-                }
-                credentials.append(&mut from_agent);
-            }
-            Err(e) => eprintln!("warning: agent: {e}"),
-        }
-    }
-    for id_path in &cli.identities {
-        let pk = match load_identity(id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
-        }
-    }
-    // Also load identities listed in the matching ssh_config block.
-    for id_path_raw in &cfg_block.identity_files {
-        let id_path = expand_tilde(id_path_raw);
-        let pk = match load_identity(&id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("config identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
-        }
-    }
-    if !identities_only {
-        for path in default_identity_paths() {
-            match try_load_default_identity(&path) {
-                Ok(Some(pk)) => match pk.into_host_key() {
-                    Ok(hk) => {
-                        vlog(1, &format!("default identity {}: loaded", path.display()));
-                        credentials.push(ClientCredential::PublicKey(hk));
-                    }
-                    Err(e) => {
-                        eprintln!("warning: default identity {}: {e}", path.display());
-                    }
-                },
-                Ok(None) => {
-                    vlog(2, &format!("default identity {}: skipped", path.display()));
-                }
-                Err(msg) => eprintln!("warning: {msg}"),
-            }
-        }
+    // Decide the connection transport for the final target:
+    //   ProxyJump (CLI -J > config ProxyJump) tunnels through jump hosts;
+    //   ProxyCommand spawns a helper process; otherwise a direct TCP socket.
+    // ProxyJump beats ProxyCommand when both are configured (warn).
+    let proxy_jump = cli
+        .proxy_jump
+        .clone()
+        .or_else(|| cfg_block.proxy_jump.clone());
+    let proxy_command = cfg_block.proxy_command.clone();
+    if proxy_jump.is_some() && proxy_command.is_some() {
+        eprintln!("warning: both ProxyJump and ProxyCommand set; using ProxyJump");
     }
 
-    let authed = if !credentials.is_empty() {
+    let mut client = if let Some(spec) = proxy_jump {
+        // ---- ProxyJump ----
+        let hops = parse_jump_hops(&spec)?;
+        vlog(1, &format!("proxyjump: {} hop(s)", hops.len()));
+        let last = connect_jump_chain(&hops, &ssh_cfg, &cli)?;
+        // Final hop: open a direct-tcpip channel from the last jump host to
+        // the real target and run the client over it. Host/port flow through
+        // so the target's host-key check runs against its own known_hosts.
         vlog(
             1,
-            &format!(
-                "attempting publickey auth with {} credentials",
-                credentials.len()
-            ),
+            &format!("proxyjump: opening channel to target {connect_host}:{port}"),
         );
-        match client.authenticate(&user, credentials) {
-            Ok(()) => {
-                vlog(1, &format!("authenticated as {user} via publickey"));
-                true
+        let ch = last
+            .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
+            .map_err(|e| format!("proxyjump: open channel to target: {e}"))?;
+        let client = Client::connect_via(Box::new(ch), connect_host.as_str(), port, cfg)
+            .map_err(|e| format!("proxyjump: target handshake: {e}"))?;
+        // `ch` (now inside `client`) holds a clone of `last`'s SharedClient,
+        // so the jump chain stays alive for the lifetime of the session even
+        // after `last` drops here.
+        drop(last);
+        vlog(
+            1,
+            &format!("connected to {connect_host}:{port} via ProxyJump"),
+        );
+        client
+    } else if let Some(cmd_raw) = proxy_command {
+        // ---- ProxyCommand (Unix only) ----
+        #[cfg(unix)]
+        {
+            // Phase-1 restriction: the pipe transport's read-timeout toggle
+            // is a no-op, so the serve / forwarding poll loops can't run over
+            // it. Reject -L/-R/-N (and config-derived forwards) up front.
+            if cli.no_command
+                || !cli.locals.is_empty()
+                || !cli.remotes.is_empty()
+                || !cfg_block.local_forwards.is_empty()
+                || !cfg_block.remote_forwards.is_empty()
+            {
+                return Err(
+                    "ProxyCommand does not support -L/-R/-N forwarding in this release; \
+                     use a single exec or an interactive shell"
+                        .into(),
+                );
             }
-            Err(e) => {
-                eprintln!("publickey auth: {e}");
-                false
-            }
+            let cmd = puressh::proc_transport::expand_tokens(&cmd_raw, &connect_host, port, &user);
+            vlog(1, &format!("proxycommand: spawning {cmd:?}"));
+            let proc = puressh::proc_transport::ProcTransport::spawn(&cmd)
+                .map_err(|e| format!("ProxyCommand: spawn failed: {e}"))?;
+            let client = Client::connect_via(Box::new(proc), connect_host.as_str(), port, cfg)
+                .map_err(|e| format!("ProxyCommand: handshake: {e}"))?;
+            vlog(
+                1,
+                &format!("connected to {connect_host}:{port} via ProxyCommand"),
+            );
+            client
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = cmd_raw;
+            return Err("ProxyCommand is only supported on Unix".into());
         }
     } else {
-        vlog(
-            1,
-            "no publickey credentials available; falling back to password",
-        );
-        false
+        // ---- direct TCP ----
+        // Use connect_to_host so KnownHosts can look the host up by its
+        // user-supplied name.
+        vlog(1, &format!("connecting to {connect_host}:{port}"));
+        let client = Client::connect_to_host(connect_host.as_str(), port, cfg)
+            .map_err(|e| format!("connect: {e}"))?;
+        vlog(1, &format!("connected to {connect_host}:{port}"));
+        client
     };
 
-    if !authed {
-        // Password reader honors $SSH_ASKPASS and suppresses terminal echo
-        // on Unix via termios (see src/bin/common.rs). On Windows / when the
-        // tty layer is unavailable, the user is warned and a plain read is
-        // used as a last resort.
-        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
-        client
-            .authenticate_password(&user, &password)
-            .map_err(|e| format!("Auth failed: {e}"))?;
-        vlog(1, &format!("authenticated as {user} via password"));
-    }
+    let credentials = collect_credentials(&cfg_block, &cli.identities, identities_only);
+    authenticate_client(&mut client, &user, credentials)?;
 
     // If any port-forwarding was requested, switch over to the multi-channel
     // serve loop instead of the single-shot exec/shell path. Mixing exec with

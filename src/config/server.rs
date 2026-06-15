@@ -11,6 +11,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use super::ConfigError;
+use super::algos::{AlgoCategory, resolve_algo_list};
 use super::parser::{ParsedLine, tokenize};
 
 /// `PermitRootLogin` policy.
@@ -93,6 +94,15 @@ pub struct SshServerConfig {
     /// (alias `without-password`). `forced-commands-only` is rejected as
     /// unsupported. Default (applied by the binary) is `prohibit-password`.
     pub permit_root_login: Option<PermitRootLogin>,
+    /// `Ciphers` — resolved cipher preference list (strict-validated, list
+    /// modifiers applied). `None` ⇒ built-in default.
+    pub ciphers: Option<Vec<String>>,
+    /// `MACs` — resolved MAC preference list.
+    pub macs: Option<Vec<String>>,
+    /// `KexAlgorithms` — resolved key-exchange preference list (no markers).
+    pub kex_algorithms: Option<Vec<String>>,
+    /// `HostKeyAlgorithms` — resolved server host-key preference list.
+    pub host_key_algorithms: Option<Vec<String>>,
 }
 
 impl SshServerConfig {
@@ -196,6 +206,46 @@ fn apply_keyword(opts: &mut SshServerConfig, line: &ParsedLine) -> Result<(), Co
         }
         "permitrootlogin" => {
             opts.permit_root_login = Some(parse_permit_root_login(line)?);
+        }
+        "ciphers" => {
+            opts.ciphers = Some(resolve_algo_list(
+                AlgoCategory::Cipher,
+                &line.args,
+                line.line_no,
+                "Ciphers",
+            )?);
+        }
+        "macs" => {
+            opts.macs = Some(resolve_algo_list(
+                AlgoCategory::Mac,
+                &line.args,
+                line.line_no,
+                "MACs",
+            )?);
+        }
+        "kexalgorithms" => {
+            opts.kex_algorithms = Some(resolve_algo_list(
+                AlgoCategory::Kex,
+                &line.args,
+                line.line_no,
+                "KexAlgorithms",
+            )?);
+        }
+        "hostkeyalgorithms" => {
+            opts.host_key_algorithms = Some(resolve_algo_list(
+                AlgoCategory::HostKey,
+                &line.args,
+                line.line_no,
+                "HostKeyAlgorithms",
+            )?);
+        }
+        "casignaturealgorithms" => {
+            // Certificate-based host/user keys are not implemented; reject so
+            // a security-relevant directive cannot appear to take effect.
+            return Err(ConfigError::Unsupported {
+                line: line.line_no,
+                msg: "CASignatureAlgorithms: certificate authentication is not supported".into(),
+            });
         }
         _ => {
             return Err(ConfigError::UnknownKeyword {
@@ -390,11 +440,14 @@ AllowUsers bob carol
 
     #[test]
     fn unknown_keyword_errors() {
-        let src = "Port 22\nKexAlgorithms curve25519-sha256\n";
+        // `Tunnel` is a real OpenSSH keyword this parser does not implement;
+        // `KexAlgorithms` is now recognised, so it can no longer serve as the
+        // "unknown keyword" fixture.
+        let src = "Port 22\nTunnel yes\n";
         let err = SshServerConfig::parse(src).unwrap_err();
         match err {
             ConfigError::UnknownKeyword { keyword, line } => {
-                assert_eq!(keyword, "kexalgorithms");
+                assert_eq!(keyword, "tunnel");
                 assert_eq!(line, 2);
             }
             _ => panic!("wrong error: {err:?}"),

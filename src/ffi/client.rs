@@ -175,6 +175,7 @@ pub unsafe extern "C" fn pcssh_client_connect_ex(
                 let cfg = Config {
                     host_key_policy: policy_for_iter,
                     timeout,
+                    algorithms: Default::default(),
                 };
                 match Client::connect(sa, cfg) {
                     Ok(c) => {

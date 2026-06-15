@@ -20,6 +20,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use super::ConfigError;
+use super::algos::{AlgoCategory, resolve_algo_list};
 use super::glob::{HostPattern, host_matches};
 use super::match_block::{ExecPolicy, MatchCondition, MatchContext, all_match, parse_match_line};
 use super::parser::{ParsedLine, tokenize};
@@ -118,6 +119,17 @@ pub struct ClientOptions {
     pub request_tty: Option<RequestTty>,
     /// `LogLevel`: 0 = QUIET/INFO, 1 = VERBOSE/DEBUG1, 2 = DEBUG2, 3 = DEBUG3.
     pub log_level: Option<u8>,
+    /// `Ciphers` — resolved cipher preference list (strict-validated, with
+    /// list modifiers already applied). `None` ⇒ built-in default.
+    pub ciphers: Option<Vec<String>>,
+    /// `MACs` — resolved MAC preference list.
+    pub macs: Option<Vec<String>>,
+    /// `KexAlgorithms` — resolved key-exchange preference list (no markers).
+    pub kex_algorithms: Option<Vec<String>>,
+    /// `HostKeyAlgorithms` — resolved server host-key preference list.
+    pub host_key_algorithms: Option<Vec<String>>,
+    /// `PubkeyAcceptedAlgorithms` — resolved publickey-auth signature list.
+    pub pubkey_accepted_algorithms: Option<Vec<String>>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -372,6 +384,55 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "loglevel" => {
             opts.log_level = Some(parse_log_level(line)?);
         }
+        "ciphers" => {
+            opts.ciphers = Some(resolve_algo_list(
+                AlgoCategory::Cipher,
+                args,
+                line.line_no,
+                "Ciphers",
+            )?);
+        }
+        "macs" => {
+            opts.macs = Some(resolve_algo_list(
+                AlgoCategory::Mac,
+                args,
+                line.line_no,
+                "MACs",
+            )?);
+        }
+        "kexalgorithms" => {
+            opts.kex_algorithms = Some(resolve_algo_list(
+                AlgoCategory::Kex,
+                args,
+                line.line_no,
+                "KexAlgorithms",
+            )?);
+        }
+        "hostkeyalgorithms" => {
+            opts.host_key_algorithms = Some(resolve_algo_list(
+                AlgoCategory::HostKey,
+                args,
+                line.line_no,
+                "HostKeyAlgorithms",
+            )?);
+        }
+        "pubkeyacceptedalgorithms" | "pubkeyacceptedkeytypes" => {
+            opts.pubkey_accepted_algorithms = Some(resolve_algo_list(
+                AlgoCategory::PubkeyAccepted,
+                args,
+                line.line_no,
+                "PubkeyAcceptedAlgorithms",
+            )?);
+        }
+        "casignaturealgorithms" => {
+            // Certificate-based authentication is not implemented; reject
+            // rather than silently ignore so a security-relevant directive
+            // can never appear to take effect.
+            return Err(ConfigError::Unsupported {
+                line: line.line_no,
+                msg: "CASignatureAlgorithms: certificate authentication is not supported".into(),
+            });
+        }
         _ => {
             return Err(ConfigError::UnknownKeyword {
                 line: line.line_no,
@@ -405,6 +466,14 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(forward_x11_trusted);
     take_scalar!(request_tty);
     take_scalar!(log_level);
+    // Algorithm overrides are first-match-wins scalars: the whole resolved
+    // list from the earliest matching block wins (OpenSSH semantics — a
+    // later block's Ciphers does not append to an earlier block's).
+    take_scalar!(ciphers);
+    take_scalar!(macs);
+    take_scalar!(kex_algorithms);
+    take_scalar!(host_key_algorithms);
+    take_scalar!(pubkey_accepted_algorithms);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.local_forwards

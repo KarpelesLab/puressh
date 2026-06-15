@@ -67,6 +67,37 @@ pub struct KexInit {
     pub first_kex_packet_follows: bool,
 }
 
+/// Owned counterpart of [`KexAlgorithms`](super::KexAlgorithms).
+///
+/// The borrowed `KexAlgorithms<'a>` is the right shape for the built-in
+/// `&'static` default lists, but config-driven algorithm overrides produce
+/// owned `Vec<String>` lists that have no `'static` lifetime to borrow from.
+/// This struct carries those owned lists straight into
+/// [`KexInit::from_algorithms_owned`] without an intermediate borrow.
+#[derive(Debug, Clone, Default)]
+pub struct KexAlgorithmsOwned {
+    /// Key-exchange algorithms.
+    pub kex: Vec<String>,
+    /// Server host-key algorithms.
+    pub server_host_key: Vec<String>,
+    /// Ciphers, client->server.
+    pub ciphers_c2s: Vec<String>,
+    /// Ciphers, server->client.
+    pub ciphers_s2c: Vec<String>,
+    /// MACs, client->server.
+    pub macs_c2s: Vec<String>,
+    /// MACs, server->client.
+    pub macs_s2c: Vec<String>,
+    /// Compression, client->server.
+    pub comp_c2s: Vec<String>,
+    /// Compression, server->client.
+    pub comp_s2c: Vec<String>,
+    /// Languages, client->server.
+    pub lang_c2s: Vec<String>,
+    /// Languages, server->client.
+    pub lang_s2c: Vec<String>,
+}
+
 impl KexInit {
     /// Build a `KexInit` from a borrowed [`KexAlgorithms`](super::KexAlgorithms)
     /// plus a random cookie.
@@ -83,6 +114,26 @@ impl KexInit {
             comp_s2c: collect(algs.comp_s2c),
             lang_c2s: collect(algs.lang_c2s),
             lang_s2c: collect(algs.lang_s2c),
+            first_kex_packet_follows: false,
+        }
+    }
+
+    /// Build a `KexInit` by consuming an owned [`KexAlgorithmsOwned`] plus a
+    /// random cookie. Used by the config-override path, where the advertised
+    /// lists are computed `Vec<String>`s rather than `&'static` slices.
+    pub fn from_algorithms_owned(algs: KexAlgorithmsOwned, cookie: [u8; 16]) -> Self {
+        Self {
+            cookie,
+            kex: algs.kex,
+            server_host_key: algs.server_host_key,
+            ciphers_c2s: algs.ciphers_c2s,
+            ciphers_s2c: algs.ciphers_s2c,
+            macs_c2s: algs.macs_c2s,
+            macs_s2c: algs.macs_s2c,
+            comp_c2s: algs.comp_c2s,
+            comp_s2c: algs.comp_s2c,
+            lang_c2s: algs.lang_c2s,
+            lang_s2c: algs.lang_s2c,
             first_kex_packet_follows: false,
         }
     }

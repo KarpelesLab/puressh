@@ -34,9 +34,11 @@ use crate::hostkey::{HostKey, HostKeyVerify, host_key_verify_by_name};
 use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
 pub use crate::stream::{ChannelEgress, ChannelStream};
-use crate::transport::kex::{KexAlgorithms, defaults};
+use crate::transport::kex::{defaults, is_strict_kex_marker};
 use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
-use crate::transport::{KexInit, KexRunner, PacketCodec, Role, VersionExchange};
+use crate::transport::{
+    KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
+};
 
 /// Maximum line length when reading the peer's identification banner.
 const MAX_BANNER_LINE: usize = 1024;
@@ -170,6 +172,33 @@ pub struct Config {
     pub host_key_policy: HostKeyPolicy,
     /// Optional per-operation socket timeout.
     pub timeout: Option<Duration>,
+    /// Optional overrides for the advertised crypto-algorithm preference
+    /// lists, populated from `ssh_config` (`Ciphers`, `MACs`,
+    /// `KexAlgorithms`, `HostKeyAlgorithms`, `PubkeyAcceptedAlgorithms`).
+    /// `None` everywhere ⇒ use the built-in defaults.
+    pub algorithms: AlgoOverrides,
+}
+
+/// Per-connection overrides for the advertised algorithm preference lists.
+///
+/// Each `None` field falls back to the built-in default for that category.
+/// The strict-kex signalling markers are NOT represented here — they are
+/// re-appended unconditionally by the KEXINIT builder after override
+/// resolution, so a `KexAlgorithms` override can never disable the Terrapin
+/// (CVE-2023-48795) mitigation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AlgoOverrides {
+    /// `Ciphers` — applied to both directions.
+    pub ciphers: Option<Vec<String>>,
+    /// `MACs` — applied to both directions.
+    pub macs: Option<Vec<String>>,
+    /// `KexAlgorithms` — real (non-marker) kex methods.
+    pub kex_algorithms: Option<Vec<String>>,
+    /// `HostKeyAlgorithms` — server host-key algorithms we will accept.
+    pub host_key_algorithms: Option<Vec<String>>,
+    /// `PubkeyAcceptedAlgorithms` — signature algorithms for our own
+    /// publickey credentials. Consumed by the userauth driver, not KEXINIT.
+    pub pubkey_accepted_algorithms: Option<Vec<String>>,
 }
 
 impl Config {
@@ -181,6 +210,7 @@ impl Config {
         Self {
             host_key_policy: HostKeyPolicy::AcceptAny,
             timeout: None,
+            algorithms: AlgoOverrides::default(),
         }
     }
 
@@ -193,6 +223,7 @@ impl Config {
         Self {
             host_key_policy: HostKeyPolicy::KnownHosts(KnownHostsPolicy::strict(store)),
             timeout: None,
+            algorithms: AlgoOverrides::default(),
         }
     }
 }
@@ -462,6 +493,9 @@ pub struct Client {
     v_s: Vec<u8>,
     /// Host-key policy retained so re-key replies can be re-verified.
     host_key_policy: HostKeyPolicy,
+    /// Algorithm-preference overrides from config. Retained so re-keys
+    /// re-advertise the same (overridden) lists as the initial KEX.
+    algo_overrides: AlgoOverrides,
     /// Wall-clock instant the most recent KEX completed.
     last_kex: Instant,
     /// Thresholds that trigger a re-KEX.
@@ -534,7 +568,7 @@ impl Client {
         // a placeholder advert here just so the struct field is initialised
         // (it's replaced immediately).
         let mut rng = OsRng;
-        let placeholder_advert = build_default_kexinit(&mut rng);
+        let placeholder_advert = build_default_kexinit(&mut rng, &cfg.algorithms);
         let mut me = Self {
             stream,
             codec: PacketCodec::new(),
@@ -546,6 +580,7 @@ impl Client {
             v_c: Vec::new(),
             v_s: Vec::new(),
             host_key_policy: HostKeyPolicy::AcceptAny,
+            algo_overrides: cfg.algorithms.clone(),
             last_kex: Instant::now(),
             rekey_policy: RekeyPolicy::default(),
             deferred: Vec::new(),
@@ -574,7 +609,7 @@ impl Client {
         stream.set_nodelay(true)?;
 
         let mut rng = OsRng;
-        let placeholder_advert = build_default_kexinit(&mut rng);
+        let placeholder_advert = build_default_kexinit(&mut rng, &cfg.algorithms);
         let mut me = Self {
             stream,
             codec: PacketCodec::new(),
@@ -586,6 +621,7 @@ impl Client {
             v_c: Vec::new(),
             v_s: Vec::new(),
             host_key_policy: HostKeyPolicy::AcceptAny,
+            algo_overrides: cfg.algorithms.clone(),
             last_kex: Instant::now(),
             rekey_policy: RekeyPolicy::default(),
             deferred: Vec::new(),
@@ -1875,7 +1911,8 @@ impl Client {
 
         // First KEX only: advertise ext-info-c so the server is allowed to
         // send us SSH_MSG_EXT_INFO with server-sig-algs (RFC 8308 §2.1).
-        let advert = build_default_kexinit(&mut self.rng).with_ext_info_marker(Role::Client);
+        let advert = build_default_kexinit(&mut self.rng, &self.algo_overrides)
+            .with_ext_info_marker(Role::Client);
         self.runner = KexRunner::new(Role::Client, advert);
         let initial = self.runner.start(&mut self.rng)?;
         for p in initial.outbound {
@@ -2059,7 +2096,7 @@ impl Client {
     /// Send our own SSH_MSG_KEXINIT to start a re-KEX. Caller must ensure
     /// the runner is currently in `Phase::Completed`.
     fn initiate_rekey(&mut self) -> Result<()> {
-        let advert = build_default_kexinit(&mut self.rng);
+        let advert = build_default_kexinit(&mut self.rng, &self.algo_overrides);
         let adv = self.runner.restart(&mut self.rng, advert)?;
         for p in adv.outbound {
             self.write_payload(&p)?;
@@ -2568,22 +2605,59 @@ fn print_mismatch_banner(
     );
 }
 
-fn build_default_kexinit<R: RngCore>(rng: &mut R) -> KexInit {
-    let algs = KexAlgorithms {
-        kex: defaults::KEX,
-        server_host_key: defaults::HOST_KEY,
-        ciphers_c2s: defaults::CIPHERS,
-        ciphers_s2c: defaults::CIPHERS,
-        macs_c2s: defaults::MACS,
-        macs_s2c: defaults::MACS,
-        comp_c2s: defaults::COMP,
-        comp_s2c: defaults::COMP,
-        lang_c2s: &[],
-        lang_s2c: &[],
+/// Helper: turn an `Option<Vec<String>>` override into an owned list,
+/// falling back to the given default slice when `None`.
+fn owned_or_default(over: &Option<Vec<String>>, default: &[&str]) -> Vec<String> {
+    match over {
+        Some(v) => v.clone(),
+        None => default.iter().map(|s| s.to_string()).collect(),
+    }
+}
+
+/// Build the client's advertised KEXINIT, applying any config algorithm
+/// overrides over the built-in defaults.
+///
+/// The strict-kex signalling markers (`kex-strict-{c,s}-v00@openssh.com`)
+/// are re-appended here, *after* the (possibly user-supplied) kex list, so a
+/// `KexAlgorithms` override can never strip the Terrapin (CVE-2023-48795)
+/// mitigation. The non-marker default order is taken from `defaults::KEX`.
+fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexInit {
+    // Real (non-marker) kex default order.
+    let default_kex: Vec<&str> = defaults::KEX
+        .iter()
+        .copied()
+        .filter(|n| !is_strict_kex_marker(n))
+        .collect();
+
+    let mut kex = owned_or_default(&over.kex_algorithms, &default_kex);
+    // Re-append the strict-kex markers in their canonical trailing order,
+    // skipping any that somehow already slipped in.
+    for marker in defaults::KEX.iter().filter(|n| is_strict_kex_marker(n)) {
+        if !kex.iter().any(|k| k == marker) {
+            kex.push((*marker).to_string());
+        }
+    }
+
+    let ciphers = owned_or_default(&over.ciphers, defaults::CIPHERS);
+    let macs = owned_or_default(&over.macs, defaults::MACS);
+    let host_key = owned_or_default(&over.host_key_algorithms, defaults::HOST_KEY);
+    let comp: Vec<String> = defaults::COMP.iter().map(|s| s.to_string()).collect();
+
+    let algs = KexAlgorithmsOwned {
+        kex,
+        server_host_key: host_key,
+        ciphers_c2s: ciphers.clone(),
+        ciphers_s2c: ciphers,
+        macs_c2s: macs.clone(),
+        macs_s2c: macs,
+        comp_c2s: comp.clone(),
+        comp_s2c: comp,
+        lang_c2s: Vec::new(),
+        lang_s2c: Vec::new(),
     };
     let mut cookie = [0u8; 16];
     rng.fill_bytes(&mut cookie);
-    KexInit::from_algorithms(&algs, cookie)
+    KexInit::from_algorithms_owned(algs, cookie)
 }
 
 fn build_verifier(
@@ -3188,6 +3262,7 @@ mod tests {
         // KnownHosts policy and an empty target_host. The KEX runner /
         // reply payload don't get inspected because the host check
         // fires first.
+        use crate::transport::kex::KexAlgorithms;
         use crate::transport::{KexInit, KexRunner};
         let store = Arc::new(Mutex::new(KnownHosts::new()));
         let policy = HostKeyPolicy::KnownHosts(KnownHostsPolicy::strict(store));
@@ -3255,7 +3330,7 @@ mod tests {
             let v_s = LOCAL_VERSION.as_bytes().to_vec();
 
             let mut codec = PacketCodec::new();
-            let advert = build_default_kexinit(&mut OsRng);
+            let advert = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
             let mut runner = KexRunner::new(Role::Server, advert);
 
             let mut inbox: Vec<u8> = Vec::new();

@@ -553,6 +553,7 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
             let cfg = Config {
                 host_key_policy: HostKeyPolicy::KnownHosts(policy),
                 timeout,
+                algorithms: Default::default(),
             };
 
             match Client::connect_to_host(host_s, port, cfg) {

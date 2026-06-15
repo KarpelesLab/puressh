@@ -56,6 +56,53 @@ pub enum RequestTty {
     Auto,
 }
 
+/// `AddressFamily` value — filters the addresses a hostname resolves to
+/// before we attempt a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AddressFamily {
+    /// `any`: no filtering (default).
+    Any,
+    /// `inet`: IPv4 only.
+    Inet,
+    /// `inet6`: IPv6 only.
+    Inet6,
+}
+
+/// `GatewayPorts` value — controls the bind address of client-side
+/// `-L` / `-D` listeners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayPorts {
+    /// `no`: bind loopback (`127.0.0.1`) only (default).
+    No,
+    /// `yes`: bind all interfaces (`0.0.0.0`).
+    Yes,
+    /// `clientspecified`: honour the bind address spelled out in the
+    /// forward spec; fall back to loopback when none was given.
+    ClientSpecified,
+}
+
+/// `IdentityAgent` value — overrides which ssh-agent socket the client
+/// talks to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdentityAgent {
+    /// `none`: never consult an agent.
+    None,
+    /// A filesystem path to the agent socket. The literal token
+    /// `SSH_AUTH_SOCK` (and `$SSH_AUTH_SOCK`) is preserved verbatim here
+    /// and expanded against the environment at the honoring site.
+    Path(String),
+}
+
+/// One `DynamicForward` entry — a local SOCKS proxy listener. Wire form
+/// `[bind:]port`, e.g. `1080` or `127.0.0.1:1080`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicForwardSpec {
+    /// Local bind address; `None` ⇒ loopback (subject to `GatewayPorts`).
+    pub bind_addr: Option<String>,
+    /// Local port the SOCKS listener binds.
+    pub listen_port: u16,
+}
+
 /// One `LocalForward` entry. Wire form `[bind:]port host:hostport`, e.g.
 /// `8080 example.com:80` or `127.0.0.1:8080 example.com:80`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -138,6 +185,59 @@ pub struct ClientOptions {
     /// to tunnel the connection through. The literal `none` clears it.
     /// Takes precedence over [`Self::proxy_command`] when both are set.
     pub proxy_jump: Option<String>,
+    /// `Compression` (yes/no). `Some(true)` advertises
+    /// `zlib@openssh.com` ahead of `none`. Requires the `compress`
+    /// feature at honoring time.
+    pub compression: Option<bool>,
+    /// `SetEnv` — literal `NAME=VALUE` pairs to send via `env` requests
+    /// (cumulative across matching blocks; later duplicates of a name are
+    /// dropped at honoring time per first-wins).
+    pub set_env: Vec<(String, String)>,
+    /// `SendEnv` — environment-variable name patterns; matching local env
+    /// vars are forwarded via `env` requests (cumulative).
+    pub send_env: Vec<String>,
+    /// `ConnectTimeout` — TCP connect timeout in seconds. `0` is rejected.
+    pub connect_timeout: Option<u32>,
+    /// `ServerAliveInterval` — seconds between keepalive probes when the
+    /// connection is otherwise idle. `0` (or unset) ⇒ disabled.
+    pub server_alive_interval: Option<u32>,
+    /// `ServerAliveCountMax` — number of unanswered keepalives tolerated
+    /// before the connection is torn down (default 3 at honoring time).
+    pub server_alive_count_max: Option<u32>,
+    /// `TCPKeepAlive` (yes/no) — toggles SO_KEEPALIVE on the socket.
+    pub tcp_keep_alive: Option<bool>,
+    /// `AddKeysToAgent` — `Some(true)`/`Some(false)`. `confirm`/`ask` are
+    /// rejected at parse time (Unsupported).
+    pub add_keys_to_agent: Option<bool>,
+    /// `PreferredAuthentications` — ordered, comma-separated auth-method
+    /// list. Only `publickey`/`password`/`keyboard-interactive`/`none`
+    /// are accepted; a list naming none of the implementable methods is
+    /// rejected at parse time.
+    pub preferred_authentications: Option<Vec<String>>,
+    /// `PubkeyAuthentication` (yes/no) — gates publickey credentials.
+    pub pubkey_authentication: Option<bool>,
+    /// `NumberOfPasswordPrompts` — cap on interactive password attempts
+    /// (default 3). `0` disables password auth.
+    pub number_of_password_prompts: Option<u32>,
+    /// `BatchMode` (yes/no) — never prompt; treat `ask` strict policy as
+    /// `yes` and disable password auth.
+    pub batch_mode: Option<bool>,
+    /// `ExitOnForwardFailure` (yes/no) — abort the connection if any
+    /// requested forward fails to bind / be granted.
+    pub exit_on_forward_failure: Option<bool>,
+    /// `ClearAllForwardings` (yes/no) — discard all local/remote/dynamic
+    /// forwards collected so far before connecting.
+    pub clear_all_forwardings: Option<bool>,
+    /// `DynamicForward` entries — SOCKS proxy listeners (cumulative).
+    pub dynamic_forwards: Vec<DynamicForwardSpec>,
+    /// `GatewayPorts` — bind-address policy for `-L`/`-D` listeners.
+    pub gateway_ports: Option<GatewayPorts>,
+    /// `AddressFamily` — restrict resolved addresses to a family.
+    pub address_family: Option<AddressFamily>,
+    /// `BindAddress` — local source address to bind before connecting.
+    pub bind_address: Option<String>,
+    /// `IdentityAgent` — agent-socket override (or `none`).
+    pub identity_agent: Option<IdentityAgent>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -456,6 +556,154 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                 opts.proxy_jump = Some(v);
             }
         }
+        "compression" => {
+            opts.compression = Some(parse_yes_no(line)?);
+        }
+        "setenv" => {
+            // OpenSSH accepts one or more NAME=VALUE tokens on a SetEnv line.
+            if args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "SetEnv requires at least one NAME=VALUE".into(),
+                });
+            }
+            for tok in args {
+                let (name, value) = tok.split_once('=').ok_or_else(|| ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: format!("expected NAME=VALUE, got {tok:?}"),
+                })?;
+                if name.is_empty() {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("empty variable name in {tok:?}"),
+                    });
+                }
+                opts.set_env.push((name.to_string(), value.to_string()));
+            }
+        }
+        "sendenv" => {
+            if args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "SendEnv requires at least one pattern".into(),
+                });
+            }
+            for pat in args {
+                opts.send_env.push(pat.clone());
+            }
+        }
+        "connecttimeout" => {
+            let secs = parse_u32(line)?;
+            if secs == 0 {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "ConnectTimeout must be a positive number of seconds".into(),
+                });
+            }
+            opts.connect_timeout = Some(secs);
+        }
+        "serveraliveinterval" => {
+            opts.server_alive_interval = Some(parse_u32(line)?);
+        }
+        "serveralivecountmax" => {
+            opts.server_alive_count_max = Some(parse_u32(line)?);
+        }
+        "tcpkeepalive" => {
+            opts.tcp_keep_alive = Some(parse_yes_no(line)?);
+        }
+        "addkeystoagent" => {
+            // OpenSSH accepts yes/no/confirm/ask. We can honour yes/no
+            // (push or don't push the loaded key to the agent); the
+            // interactive confirm/ask variants need a UI we don't have,
+            // so reject rather than silently downgrade.
+            let s = one_arg(line)?.to_ascii_lowercase();
+            match s.as_str() {
+                "yes" | "true" | "on" => opts.add_keys_to_agent = Some(true),
+                "no" | "false" | "off" => opts.add_keys_to_agent = Some(false),
+                "confirm" | "ask" => {
+                    return Err(ConfigError::Unsupported {
+                        line: line.line_no,
+                        msg: "AddKeysToAgent confirm/ask requires interactive confirmation, \
+                              which is not implemented"
+                            .into(),
+                    });
+                }
+                other => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected yes/no/confirm/ask, got {other:?}"),
+                    });
+                }
+            }
+        }
+        "preferredauthentications" => {
+            opts.preferred_authentications = Some(parse_preferred_auth(line)?);
+        }
+        "pubkeyauthentication" => {
+            opts.pubkey_authentication = Some(parse_yes_no(line)?);
+        }
+        "numberofpasswordprompts" => {
+            opts.number_of_password_prompts = Some(parse_u32(line)?);
+        }
+        "batchmode" => {
+            opts.batch_mode = Some(parse_yes_no(line)?);
+        }
+        "exitonforwardfailure" => {
+            opts.exit_on_forward_failure = Some(parse_yes_no(line)?);
+        }
+        "clearallforwardings" => {
+            opts.clear_all_forwardings = Some(parse_yes_no(line)?);
+        }
+        "dynamicforward" => {
+            opts.dynamic_forwards.push(parse_dynamic_forward(line)?);
+        }
+        "gatewayports" => {
+            let s = one_arg(line)?.to_ascii_lowercase();
+            opts.gateway_ports = Some(match s.as_str() {
+                "no" | "false" | "off" => GatewayPorts::No,
+                "yes" | "true" | "on" => GatewayPorts::Yes,
+                "clientspecified" => GatewayPorts::ClientSpecified,
+                other => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected no/yes/clientspecified, got {other:?}"),
+                    });
+                }
+            });
+        }
+        "addressfamily" => {
+            let s = one_arg(line)?.to_ascii_lowercase();
+            opts.address_family = Some(match s.as_str() {
+                "any" => AddressFamily::Any,
+                "inet" => AddressFamily::Inet,
+                "inet6" => AddressFamily::Inet6,
+                other => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected any/inet/inet6, got {other:?}"),
+                    });
+                }
+            });
+        }
+        "bindaddress" => {
+            opts.bind_address = Some(one_arg(line)?);
+        }
+        "identityagent" => {
+            let v = one_arg(line)?;
+            opts.identity_agent = Some(if v.eq_ignore_ascii_case("none") {
+                IdentityAgent::None
+            } else {
+                IdentityAgent::Path(v)
+            });
+        }
         "casignaturealgorithms" => {
             // Certificate-based authentication is not implemented; reject
             // rather than silently ignore so a security-relevant directive
@@ -508,12 +756,32 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(pubkey_accepted_algorithms);
     take_scalar!(proxy_command);
     take_scalar!(proxy_jump);
+    take_scalar!(compression);
+    take_scalar!(connect_timeout);
+    take_scalar!(server_alive_interval);
+    take_scalar!(server_alive_count_max);
+    take_scalar!(tcp_keep_alive);
+    take_scalar!(add_keys_to_agent);
+    take_scalar!(preferred_authentications);
+    take_scalar!(pubkey_authentication);
+    take_scalar!(number_of_password_prompts);
+    take_scalar!(batch_mode);
+    take_scalar!(exit_on_forward_failure);
+    take_scalar!(clear_all_forwardings);
+    take_scalar!(gateway_ports);
+    take_scalar!(address_family);
+    take_scalar!(bind_address);
+    take_scalar!(identity_agent);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.local_forwards
         .extend(src.local_forwards.iter().cloned());
     dst.remote_forwards
         .extend(src.remote_forwards.iter().cloned());
+    dst.dynamic_forwards
+        .extend(src.dynamic_forwards.iter().cloned());
+    dst.set_env.extend(src.set_env.iter().cloned());
+    dst.send_env.extend(src.send_env.iter().cloned());
 }
 
 fn one_arg(line: &ParsedLine) -> Result<String, ConfigError> {
@@ -533,6 +801,87 @@ fn parse_u16(line: &ParsedLine) -> Result<u16, ConfigError> {
         line: line.line_no,
         keyword: line.keyword.clone(),
         msg: format!("expected a port number, got {s:?}"),
+    })
+}
+
+fn parse_u32(line: &ParsedLine) -> Result<u32, ConfigError> {
+    let s = one_arg(line)?;
+    s.parse::<u32>().map_err(|_| ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: format!("expected a non-negative integer, got {s:?}"),
+    })
+}
+
+/// Parse a `PreferredAuthentications` list. OpenSSH takes a comma-separated
+/// list of method names. We recognise the standard set but only honour the
+/// ones the client implements; a list that names *none* of the
+/// implementable methods is rejected so the directive can never look like it
+/// took effect while silently leaving no usable method.
+fn parse_preferred_auth(line: &ParsedLine) -> Result<Vec<String>, ConfigError> {
+    // The list may arrive as one comma-joined token or several whitespace-
+    // separated tokens; normalise both.
+    let mut methods: Vec<String> = Vec::new();
+    for tok in &line.args {
+        for m in tok.split(',') {
+            let m = m.trim();
+            if !m.is_empty() {
+                methods.push(m.to_ascii_lowercase());
+            }
+        }
+    }
+    if methods.is_empty() {
+        return Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: "PreferredAuthentications requires at least one method".into(),
+        });
+    }
+    // Known OpenSSH method names. `gssapi-with-mic` / `hostbased` are
+    // understood-but-unimplemented: we tolerate them in the list (so a
+    // shared config doesn't break) but they contribute nothing usable.
+    const KNOWN: &[&str] = &[
+        "publickey",
+        "password",
+        "keyboard-interactive",
+        "none",
+        "gssapi-with-mic",
+        "hostbased",
+    ];
+    const IMPLEMENTED: &[&str] = &["publickey", "password", "none"];
+    for m in &methods {
+        if !KNOWN.contains(&m.as_str()) {
+            return Err(ConfigError::BadValue {
+                line: line.line_no,
+                keyword: line.keyword.clone(),
+                msg: format!("unknown authentication method {m:?}"),
+            });
+        }
+    }
+    if !methods.iter().any(|m| IMPLEMENTED.contains(&m.as_str())) {
+        return Err(ConfigError::Unsupported {
+            line: line.line_no,
+            msg: "PreferredAuthentications names only methods this client does not \
+                  implement (publickey/password are the supported methods)"
+                .into(),
+        });
+    }
+    Ok(methods)
+}
+
+/// Parse a `DynamicForward` argument: a single `[bind:]port` token.
+fn parse_dynamic_forward(line: &ParsedLine) -> Result<DynamicForwardSpec, ConfigError> {
+    if line.args.len() != 1 {
+        return Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: format!("expected 1 token ([bind:]port), got {}", line.args.len()),
+        });
+    }
+    let (bind_addr, listen_port) = split_bind_port(&line.args[0], line)?;
+    Ok(DynamicForwardSpec {
+        bind_addr,
+        listen_port,
     })
 }
 
@@ -991,6 +1340,202 @@ Host *.example.com !secret.example.com
         let src = "Host gw\n  Port=2222\n";
         let cfg = SshClientConfig::parse(src).unwrap();
         assert_eq!(cfg.lookup("gw").port, Some(2222));
+    }
+
+    // ----- W4 modern-keyword tests --------------------------------------
+
+    #[test]
+    fn compression_parses() {
+        let cfg = SshClientConfig::parse("Compression yes\n").unwrap();
+        assert_eq!(cfg.lookup("h").compression, Some(true));
+        let cfg = SshClientConfig::parse("Compression no\n").unwrap();
+        assert_eq!(cfg.lookup("h").compression, Some(false));
+    }
+
+    #[test]
+    fn set_env_parses_multiple() {
+        let src = "Host gw\n  SetEnv FOO=bar BAZ=qux\n  SetEnv LANG=C\n";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(
+            eff.set_env,
+            vec![
+                ("FOO".to_string(), "bar".to_string()),
+                ("BAZ".to_string(), "qux".to_string()),
+                ("LANG".to_string(), "C".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_env_rejects_missing_equals() {
+        let err = SshClientConfig::parse("SetEnv NOTANENV\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+    }
+
+    #[test]
+    fn send_env_parses() {
+        let src = "Host gw\n  SendEnv LANG LC_*\n  SendEnv TERM\n";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        assert_eq!(cfg.lookup("gw").send_env, vec!["LANG", "LC_*", "TERM"]);
+    }
+
+    #[test]
+    fn connect_timeout_parses_and_rejects_zero() {
+        let cfg = SshClientConfig::parse("ConnectTimeout 10\n").unwrap();
+        assert_eq!(cfg.lookup("h").connect_timeout, Some(10));
+        let err = SshClientConfig::parse("ConnectTimeout 0\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+    }
+
+    #[test]
+    fn server_alive_parses() {
+        let src = "ServerAliveInterval 15\nServerAliveCountMax 4\n";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("h");
+        assert_eq!(eff.server_alive_interval, Some(15));
+        assert_eq!(eff.server_alive_count_max, Some(4));
+    }
+
+    #[test]
+    fn tcp_keep_alive_parses() {
+        let cfg = SshClientConfig::parse("TCPKeepAlive no\n").unwrap();
+        assert_eq!(cfg.lookup("h").tcp_keep_alive, Some(false));
+    }
+
+    #[test]
+    fn add_keys_to_agent_yes_no() {
+        assert_eq!(
+            SshClientConfig::parse("AddKeysToAgent yes\n")
+                .unwrap()
+                .lookup("h")
+                .add_keys_to_agent,
+            Some(true)
+        );
+        assert_eq!(
+            SshClientConfig::parse("AddKeysToAgent no\n")
+                .unwrap()
+                .lookup("h")
+                .add_keys_to_agent,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn add_keys_to_agent_confirm_unsupported() {
+        for v in ["confirm", "ask"] {
+            let err = SshClientConfig::parse(&format!("AddKeysToAgent {v}\n")).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Unsupported { .. }),
+                "expected Unsupported for {v}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preferred_authentications_parses_and_orders() {
+        let cfg = SshClientConfig::parse("PreferredAuthentications password,publickey\n").unwrap();
+        assert_eq!(
+            cfg.lookup("h").preferred_authentications.as_deref(),
+            Some(&["password".to_string(), "publickey".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn preferred_authentications_only_unimplementable_unsupported() {
+        let err =
+            SshClientConfig::parse("PreferredAuthentications gssapi-with-mic,hostbased\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn preferred_authentications_unknown_method_rejected() {
+        let err = SshClientConfig::parse("PreferredAuthentications quantum\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+    }
+
+    #[test]
+    fn pubkey_authentication_parses() {
+        let cfg = SshClientConfig::parse("PubkeyAuthentication no\n").unwrap();
+        assert_eq!(cfg.lookup("h").pubkey_authentication, Some(false));
+    }
+
+    #[test]
+    fn number_of_password_prompts_and_batchmode() {
+        let cfg =
+            SshClientConfig::parse("NumberOfPasswordPrompts 1\nBatchMode yes\n").unwrap();
+        let eff = cfg.lookup("h");
+        assert_eq!(eff.number_of_password_prompts, Some(1));
+        assert_eq!(eff.batch_mode, Some(true));
+    }
+
+    #[test]
+    fn exit_on_forward_failure_and_clear_all() {
+        let cfg = SshClientConfig::parse(
+            "ExitOnForwardFailure yes\nClearAllForwardings yes\n",
+        )
+        .unwrap();
+        let eff = cfg.lookup("h");
+        assert_eq!(eff.exit_on_forward_failure, Some(true));
+        assert_eq!(eff.clear_all_forwardings, Some(true));
+    }
+
+    #[test]
+    fn dynamic_forward_parses() {
+        let src = "Host gw\n  DynamicForward 1080\n  DynamicForward 127.0.0.1:1081\n";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(eff.dynamic_forwards.len(), 2);
+        assert_eq!(eff.dynamic_forwards[0].bind_addr, None);
+        assert_eq!(eff.dynamic_forwards[0].listen_port, 1080);
+        assert_eq!(
+            eff.dynamic_forwards[1].bind_addr.as_deref(),
+            Some("127.0.0.1")
+        );
+        assert_eq!(eff.dynamic_forwards[1].listen_port, 1081);
+    }
+
+    #[test]
+    fn gateway_ports_parses() {
+        for (s, want) in [
+            ("no", GatewayPorts::No),
+            ("yes", GatewayPorts::Yes),
+            ("clientspecified", GatewayPorts::ClientSpecified),
+        ] {
+            let cfg = SshClientConfig::parse(&format!("GatewayPorts {s}\n")).unwrap();
+            assert_eq!(cfg.lookup("h").gateway_ports, Some(want));
+        }
+    }
+
+    #[test]
+    fn address_family_parses() {
+        for (s, want) in [
+            ("any", AddressFamily::Any),
+            ("inet", AddressFamily::Inet),
+            ("inet6", AddressFamily::Inet6),
+        ] {
+            let cfg = SshClientConfig::parse(&format!("AddressFamily {s}\n")).unwrap();
+            assert_eq!(cfg.lookup("h").address_family, Some(want));
+        }
+        let err = SshClientConfig::parse("AddressFamily ipx\n").unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+    }
+
+    #[test]
+    fn bind_address_parses() {
+        let cfg = SshClientConfig::parse("BindAddress 10.0.0.5\n").unwrap();
+        assert_eq!(cfg.lookup("h").bind_address.as_deref(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn identity_agent_parses() {
+        let cfg = SshClientConfig::parse("IdentityAgent none\n").unwrap();
+        assert_eq!(cfg.lookup("h").identity_agent, Some(IdentityAgent::None));
+        let cfg = SshClientConfig::parse("IdentityAgent /run/agent.sock\n").unwrap();
+        assert_eq!(
+            cfg.lookup("h").identity_agent,
+            Some(IdentityAgent::Path("/run/agent.sock".to_string()))
+        );
     }
 
     // ----- Match-block tests --------------------------------------------

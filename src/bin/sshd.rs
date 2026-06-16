@@ -586,13 +586,101 @@ mod imp {
     /// production value is [`lookup_user_groups`].
     type GroupLookup = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 
+    /// One `AllowUsers`/`DenyUsers` token. A bare token (`alice`, `!bob`,
+    /// `dev-*`) constrains the username only; a `user@host` token additionally
+    /// constrains the connection's peer address. OpenSSH negation (`!`) applies
+    /// to the whole token and is stored separately from the globs so a `user`
+    /// or `host` half can each carry the `*`/`?` grammar.
+    #[derive(Clone)]
+    struct UserHostPattern {
+        /// True iff the token had a leading `!` (a match *excludes*).
+        negated: bool,
+        /// Username glob (the part before `@`, or the whole token).
+        user: puressh::config::HostPattern,
+        /// Host glob (the part after `@`), or `None` for a bare-user token.
+        host: Option<puressh::config::HostPattern>,
+    }
+
+    impl UserHostPattern {
+        /// Parse one whitespace-separated `AllowUsers`/`DenyUsers` token.
+        fn parse(token: &str) -> Self {
+            let (negated, body) = match token.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, token),
+            };
+            match body.split_once('@') {
+                Some((user, host)) => UserHostPattern {
+                    negated,
+                    // The `!` already lives on the compound token; the inner
+                    // globs are always positive patterns.
+                    user: puressh::config::HostPattern::parse(user),
+                    host: Some(puressh::config::HostPattern::parse(host)),
+                },
+                None => UserHostPattern {
+                    negated,
+                    user: puressh::config::HostPattern::parse(body),
+                    host: None,
+                },
+            }
+        }
+
+        fn parse_all(tokens: &[String]) -> Vec<UserHostPattern> {
+            tokens.iter().map(|t| UserHostPattern::parse(t)).collect()
+        }
+
+        /// True iff this token's positive globs match `(user, peer)`. The host
+        /// half (if present) is matched against `peer`; a `user@host` token
+        /// with no known peer address never matches.
+        fn positive_match(&self, user: &str, peer: Option<&str>) -> bool {
+            let user_ok =
+                puressh::config::glob::host_matches(core::slice::from_ref(&self.user), user);
+            if !user_ok {
+                return false;
+            }
+            match &self.host {
+                None => true,
+                Some(h) => match peer {
+                    Some(p) => puressh::config::glob::host_matches(core::slice::from_ref(h), p),
+                    None => false,
+                },
+            }
+        }
+    }
+
+    /// OpenSSH list semantics over [`UserHostPattern`]s: the list matches
+    /// `(user, peer)` iff at least one positive token matches AND no negative
+    /// token matches. An empty list never matches (the caller treats "empty
+    /// AllowUsers" as "no restriction", handled separately).
+    fn user_host_list_matches(
+        patterns: &[UserHostPattern],
+        user: &str,
+        peer: Option<&str>,
+    ) -> bool {
+        let mut any_positive = false;
+        let mut positive_hit = false;
+        for p in patterns {
+            if p.negated {
+                if p.positive_match(user, peer) {
+                    return false;
+                }
+            } else {
+                any_positive = true;
+                if p.positive_match(user, peer) {
+                    positive_hit = true;
+                }
+            }
+        }
+        any_positive && positive_hit
+    }
+
     struct LocalAuthenticator {
-        /// `AllowUsers` patterns (glob, OpenSSH `Host`-style). Empty ⇒ the
-        /// historical "current user only" default applied by the caller (it
-        /// seeds this with the single resolved current user as a literal).
-        allow_users: Vec<puressh::config::HostPattern>,
-        /// `DenyUsers` patterns (glob). Highest precedence.
-        deny_users: Vec<puressh::config::HostPattern>,
+        /// `AllowUsers` patterns (`user[@host]`, OpenSSH `Host`-style globs).
+        /// Empty ⇒ the historical "current user only" default applied by the
+        /// caller (it seeds this with the single resolved current user as a
+        /// literal).
+        allow_users: Vec<UserHostPattern>,
+        /// `DenyUsers` patterns (`user[@host]`). Highest precedence.
+        deny_users: Vec<UserHostPattern>,
         /// `AllowGroups` patterns (glob). Non-empty ⇒ the user must belong to
         /// a matching group.
         allow_groups: Vec<puressh::config::HostPattern>,
@@ -611,6 +699,11 @@ mod imp {
         group_cache: std::collections::HashMap<String, Vec<String>>,
         /// Group resolver (production: `lookup_user_groups`; tests: a mock).
         group_lookup: GroupLookup,
+        /// Resolved peer address (IP/hostname) for this connection, used by the
+        /// host half of `AllowUsers`/`DenyUsers` `user@host` patterns. `None`
+        /// when the address is the unspecified placeholder (e.g. an in-process
+        /// test transport); a `user@host` rule never matches a `None` peer.
+        peer: Option<String>,
         debug: bool,
     }
 
@@ -618,14 +711,15 @@ mod imp {
         /// Apply the OpenSSH access precedence — DenyUsers → AllowUsers →
         /// DenyGroups → AllowGroups — returning `true` iff `user` is allowed.
         ///
+        /// `AllowUsers`/`DenyUsers` `user@host` tokens additionally match the
+        /// host half against this connection's resolved peer address.
+        ///
         /// Group lookups are memoized per connection and resolved for *every*
         /// user uniformly (the caller never short-circuits on an
         /// already-failed user check), so the resolution cannot leak whether a
         /// user exists via timing.
         fn access_allowed(&mut self, user: &str) -> bool {
-            let name_match = |pats: &[puressh::config::HostPattern]| {
-                puressh::config::glob::host_matches(pats, user)
-            };
+            let peer = self.peer.as_deref();
             // Resolve groups up front (uniform cost) so every branch below
             // sees the same work regardless of which check decides.
             let groups = match self.group_cache.get(user) {
@@ -643,11 +737,13 @@ mod imp {
             };
 
             // 1. DenyUsers wins outright.
-            if !self.deny_users.is_empty() && name_match(&self.deny_users) {
+            if !self.deny_users.is_empty() && user_host_list_matches(&self.deny_users, user, peer) {
                 return false;
             }
             // 2. AllowUsers: if set, the user must match one.
-            if !self.allow_users.is_empty() && !name_match(&self.allow_users) {
+            if !self.allow_users.is_empty()
+                && !user_host_list_matches(&self.allow_users, user, peer)
+            {
                 return false;
             }
             // 3. DenyGroups: a matching group refuses.
@@ -786,8 +882,8 @@ mod imp {
 
     #[derive(Clone)]
     struct LocalAuthFactory {
-        allow_users: Arc<Vec<puressh::config::HostPattern>>,
-        deny_users: Arc<Vec<puressh::config::HostPattern>>,
+        allow_users: Arc<Vec<UserHostPattern>>,
+        deny_users: Arc<Vec<UserHostPattern>>,
         allow_groups: Arc<Vec<puressh::config::HostPattern>>,
         deny_groups: Arc<Vec<puressh::config::HostPattern>>,
         authorized_blobs: Arc<Vec<Vec<u8>>>,
@@ -796,8 +892,8 @@ mod imp {
         debug: bool,
     }
 
-    impl AuthenticatorFactory for LocalAuthFactory {
-        fn build(&self) -> Box<dyn Authenticator> {
+    impl LocalAuthFactory {
+        fn build_inner(&self, peer: Option<&str>) -> Box<dyn Authenticator> {
             Box::new(LocalAuthenticator {
                 allow_users: (*self.allow_users).clone(),
                 deny_users: (*self.deny_users).clone(),
@@ -808,8 +904,19 @@ mod imp {
                 root_uid0_cache: std::collections::HashMap::new(),
                 group_cache: std::collections::HashMap::new(),
                 group_lookup: self.group_lookup.clone(),
+                peer: peer.map(str::to_string),
                 debug: self.debug,
             })
+        }
+    }
+
+    impl AuthenticatorFactory for LocalAuthFactory {
+        fn build(&self) -> Box<dyn Authenticator> {
+            self.build_inner(None)
+        }
+
+        fn build_with_peer(&self, peer: Option<&str>) -> Box<dyn Authenticator> {
+            self.build_inner(peer)
         }
     }
 
@@ -2468,8 +2575,8 @@ mod imp {
         } else {
             allowed_user_list
         };
-        let allow_users = puressh::config::HostPattern::parse_all(&allow_user_tokens);
-        let deny_users = puressh::config::HostPattern::parse_all(&sshd_cfg.global.deny_users);
+        let allow_users = UserHostPattern::parse_all(&allow_user_tokens);
+        let deny_users = UserHostPattern::parse_all(&sshd_cfg.global.deny_users);
         let allow_groups = puressh::config::HostPattern::parse_all(&sshd_cfg.global.allow_groups);
         let deny_groups = puressh::config::HostPattern::parse_all(&sshd_cfg.global.deny_groups);
         let group_lookup: GroupLookup = Arc::new(lookup_user_groups);
@@ -2835,6 +2942,22 @@ mod imp {
             deny_groups: &[&str],
             groups: std::collections::HashMap<String, Vec<String>>,
         ) -> LocalAuthenticator {
+            auth_with_peer(allow_users, deny_users, allow_groups, deny_groups, groups, None)
+        }
+
+        /// Like [`auth_with`] but pins the connection's resolved peer address,
+        /// so `AllowUsers`/`DenyUsers` `user@host` tokens can be exercised.
+        fn auth_with_peer(
+            allow_users: &[&str],
+            deny_users: &[&str],
+            allow_groups: &[&str],
+            deny_groups: &[&str],
+            groups: std::collections::HashMap<String, Vec<String>>,
+            peer: Option<&str>,
+        ) -> LocalAuthenticator {
+            let to_uh = |xs: &[&str]| {
+                UserHostPattern::parse_all(&xs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            };
             let to_pats = |xs: &[&str]| {
                 HostPattern::parse_all(&xs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
             };
@@ -2842,8 +2965,8 @@ mod imp {
             let lookup: GroupLookup =
                 std::sync::Arc::new(move |u: &str| groups.get(u).cloned().unwrap_or_default());
             LocalAuthenticator {
-                allow_users: to_pats(allow_users),
-                deny_users: to_pats(deny_users),
+                allow_users: to_uh(allow_users),
+                deny_users: to_uh(deny_users),
                 allow_groups: to_pats(allow_groups),
                 deny_groups: to_pats(deny_groups),
                 authorized_blobs: Vec::new(),
@@ -2851,6 +2974,7 @@ mod imp {
                 root_uid0_cache: std::collections::HashMap::new(),
                 group_cache: std::collections::HashMap::new(),
                 group_lookup: lookup,
+                peer: peer.map(str::to_string),
                 debug: false,
             }
         }
@@ -2891,6 +3015,94 @@ mod imp {
             // eve is in wheel (allowed) but also banned (denied) — DenyGroups
             // is evaluated before AllowGroups, so she is refused.
             assert!(!a.access_allowed("eve"));
+        }
+
+        // ---- F8: AllowUsers/DenyUsers user@host -----------------------------
+
+        #[test]
+        fn allow_users_at_host_matches_peer() {
+            // alice only from 10.* hosts.
+            let mut a = auth_with_peer(
+                &["alice@10.*"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("10.1.2.3"),
+            );
+            assert!(a.access_allowed("alice"));
+            assert!(!a.access_allowed("bob")); // wrong user
+
+            // Same rule, peer outside the host glob ⇒ denied.
+            let mut b = auth_with_peer(
+                &["alice@10.*"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.168.0.1"),
+            );
+            assert!(!b.access_allowed("alice"));
+
+            // A user@host rule with no known peer never matches.
+            let mut c = auth_with_peer(&["alice@10.*"], &[], &[], &[], Default::default(), None);
+            assert!(!c.access_allowed("alice"));
+        }
+
+        #[test]
+        fn allow_users_mixed_bare_and_at_host() {
+            // bob matches by bare username from any host; alice only from 10.*.
+            let mut a = auth_with_peer(
+                &["bob", "alice@10.*"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("203.0.113.9"),
+            );
+            assert!(a.access_allowed("bob")); // bare token, host-independent
+            assert!(!a.access_allowed("alice")); // alice only from 10.*
+        }
+
+        #[test]
+        fn deny_users_at_host_blocks_by_peer() {
+            // eve is allowed by the wildcard, but denied from the evil range.
+            let mut a = auth_with_peer(
+                &["*"],
+                &["eve@10.6.6.*"],
+                &[],
+                &[],
+                Default::default(),
+                Some("10.6.6.66"),
+            );
+            assert!(!a.access_allowed("eve"));
+            // Same eve from a different host is fine.
+            let mut b = auth_with_peer(
+                &["*"],
+                &["eve@10.6.6.*"],
+                &[],
+                &[],
+                Default::default(),
+                Some("10.0.0.1"),
+            );
+            assert!(b.access_allowed("eve"));
+        }
+
+        #[test]
+        fn user_host_pattern_parse() {
+            let p = UserHostPattern::parse("alice@1.2.3.4");
+            assert!(!p.negated);
+            assert!(p.positive_match("alice", Some("1.2.3.4")));
+            assert!(!p.positive_match("alice", Some("1.2.3.5")));
+            assert!(!p.positive_match("bob", Some("1.2.3.4")));
+
+            let neg = UserHostPattern::parse("!alice@1.2.3.4");
+            assert!(neg.negated);
+            assert!(neg.positive_match("alice", Some("1.2.3.4")));
+
+            let bare = UserHostPattern::parse("dev-*");
+            assert!(bare.host.is_none());
+            assert!(bare.positive_match("dev-1", None));
         }
 
         #[test]

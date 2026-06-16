@@ -489,15 +489,12 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 });
             }
             for u in &line.args {
-                // The `user@host` form needs the peer address at match time;
-                // not wired yet, so reject loudly rather than match the whole
-                // literal (which would never match a bare username).
-                if u.contains('@') {
-                    return Err(ConfigError::Unsupported {
-                        line: line.line_no,
-                        msg: "AllowUsers user@host form is not supported".into(),
-                    });
-                }
+                // The `user@host` form is matched against the connection's
+                // resolved peer address at login time (see the binary's
+                // `LocalAuthenticator`); a bare token matches the username
+                // alone. Reject only a malformed half (empty user or host) so
+                // a typo can't silently widen the rule.
+                validate_user_at_host(u, kw, line.line_no)?;
                 opts.allow_users.push(u.clone());
             }
         }
@@ -671,12 +668,7 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 });
             }
             for u in &line.args {
-                if u.contains('@') {
-                    return Err(ConfigError::Unsupported {
-                        line: line.line_no,
-                        msg: "DenyUsers user@host form is not supported".into(),
-                    });
-                }
+                validate_user_at_host(u, kw, line.line_no)?;
                 opts.deny_users.push(u.clone());
             }
         }
@@ -1028,6 +1020,24 @@ fn parse_size_bytes(s: &str, line: &ParsedLine) -> Result<u64, ConfigError> {
     n.checked_mul(mult).ok_or_else(bad)
 }
 
+/// Validate an `AllowUsers`/`DenyUsers` token. A bare token is a username
+/// glob; a `user@host` token additionally constrains the connection's peer
+/// address (matched at login time by the binary's authenticator). Reject a
+/// token with an empty user or host half, or with more than one `@`, so a
+/// malformed rule fails loudly rather than silently matching nothing.
+fn validate_user_at_host(token: &str, keyword: &str, line_no: usize) -> Result<(), ConfigError> {
+    if let Some((user, host)) = token.split_once('@')
+        && (user.is_empty() || host.is_empty() || host.contains('@'))
+    {
+        return Err(ConfigError::BadValue {
+            line: line_no,
+            keyword: keyword.to_string(),
+            msg: format!("malformed user@host pattern {token:?}"),
+        });
+    }
+    Ok(())
+}
+
 fn one_arg(line: &ParsedLine) -> Result<String, ConfigError> {
     if line.args.len() != 1 {
         return Err(ConfigError::BadValue {
@@ -1370,9 +1380,29 @@ Banner /etc/ssh/banner
     }
 
     #[test]
-    fn allow_users_at_host_unsupported() {
-        let err = SshServerConfig::parse("AllowUsers alice@1.2.3.4\n").unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 1, .. }));
+    fn allow_users_at_host_accepted() {
+        // The `user@host` form is now honoured (matched against the peer
+        // address at login time), so it parses and is stored verbatim.
+        let cfg = SshServerConfig::parse("AllowUsers alice@1.2.3.4 bob\n").unwrap();
+        assert_eq!(
+            cfg.global.allow_users,
+            vec!["alice@1.2.3.4".to_string(), "bob".to_string()]
+        );
+        // A malformed half is still a hard error.
+        assert!(matches!(
+            SshServerConfig::parse("AllowUsers @1.2.3.4\n").unwrap_err(),
+            ConfigError::BadValue { line: 1, .. }
+        ));
+        assert!(matches!(
+            SshServerConfig::parse("AllowUsers alice@\n").unwrap_err(),
+            ConfigError::BadValue { line: 1, .. }
+        ));
+        // DenyUsers honours the same form.
+        let cfg = SshServerConfig::parse("DenyUsers eve@*.evil.example\n").unwrap();
+        assert_eq!(
+            cfg.global.deny_users,
+            vec!["eve@*.evil.example".to_string()]
+        );
     }
 
     #[test]

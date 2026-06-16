@@ -273,6 +273,17 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
             let _ = write_frame(&mut ctrl, &Frame::AliveOk);
             return;
         }
+        Frame::OpenDirectTcpip {
+            dest_host,
+            dest_port,
+            orig_host,
+            orig_port,
+        } => {
+            handle_direct_tcpip(
+                ctrl, shared, state, &dest_host, dest_port, &orig_host, orig_port,
+            );
+            return;
+        }
         _ => return,
     };
 
@@ -305,6 +316,49 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
     };
 
     // Count this as a live client for the duration of the splice.
+    state.live_clients.fetch_add(1, Ordering::SeqCst);
+    *state.last_idle.lock().unwrap() = None;
+    splice(ctrl, chan, &shared);
+    state.live_clients.fetch_sub(1, Ordering::SeqCst);
+    if state.live_clients.load(Ordering::SeqCst) == 0 {
+        *state.last_idle.lock().unwrap() = Some(Instant::now());
+    }
+}
+
+/// Serve an `OpenDirectTcpip` request: dial `dest_host:dest_port` *through the
+/// server* over the master's SSH connection, reply OK/FAIL, then splice the
+/// resulting channel against the control socket exactly like a session (the
+/// mux client pumps the local TCP socket's bytes as `StdinData` and writes
+/// `StdoutData` back to it).
+#[allow(clippy::too_many_arguments)]
+fn handle_direct_tcpip(
+    mut ctrl: UnixStream,
+    shared: SharedClient,
+    state: Arc<MasterState>,
+    dest_host: &str,
+    dest_port: u32,
+    orig_host: &str,
+    orig_port: u32,
+) {
+    let chan =
+        match shared.open_direct_tcpip(dest_host, dest_port as u16, orig_host, orig_port as u16) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = write_frame(
+                    &mut ctrl,
+                    &Frame::OpenFail {
+                        reason: format!("direct-tcpip {dest_host}:{dest_port}: {e}"),
+                    },
+                );
+                return;
+            }
+        };
+    if write_frame(&mut ctrl, &Frame::OpenOk).is_err() {
+        return;
+    }
+
+    // Count this as a live client for the duration of the splice so the
+    // ControlPersist reaper keeps the master alive while a forward is active.
     state.live_clients.fetch_add(1, Ordering::SeqCst);
     *state.last_idle.lock().unwrap() = None;
     splice(ctrl, chan, &shared);

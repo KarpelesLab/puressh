@@ -282,3 +282,151 @@ fn control_persist_seconds_master_exits_after_idle() {
     drop(srv.accepts);
     let _ = srv.handle.join();
 }
+
+/// Like [`spawn_server`] but permits `direct-tcpip` so a mux client can carry
+/// `ssh -L` / `-D` forwards over the master's connection.
+fn spawn_server_direct_tcpip(banner: &[u8]) -> TestServer {
+    use puressh::forwarding::direct::DefaultDirectTcpipHandler;
+    let host_seed = fresh_seed();
+    let client_seed = fresh_seed();
+    let host_key: Box<dyn HostKey + Send + Sync> = Box::new(Ed25519HostKey::from_seed(host_seed));
+    let allowed_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+    let user = "mux-user".to_string();
+    let accepts = Arc::new(AtomicUsize::new(0));
+
+    let auth_user = user.clone();
+    let auth_blob = allowed_blob.clone();
+    let auth_count = accepts.clone();
+    let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+        Box::new(CountingAuth {
+            user: auth_user.clone(),
+            blob: auth_blob.clone(),
+            accepts: auth_count.clone(),
+        })
+    });
+
+    let cfg = ServerConfig::new(
+        vec![host_key],
+        factory,
+        vec!["publickey"],
+        Arc::new(BannerHandler {
+            out: banner.to_vec(),
+        }),
+    )
+    .with_direct_tcpip(Arc::new(DefaultDirectTcpipHandler::permit_all()));
+
+    let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind server");
+    let addr = server.local_addr().expect("server addr");
+    let handle = thread::spawn(move || {
+        let _ = server.accept_one();
+    });
+
+    TestServer {
+        addr,
+        client_seed,
+        user,
+        accepts,
+        handle,
+    }
+}
+
+/// A tiny loopback echo server — the `-L` forward destination. Returns its
+/// port and a join handle.
+fn spawn_echo_server() -> (u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+/// `ssh -L` over a mux client: stand up a master, then use the `open_forward`
+/// and `splice_forward` mux entry points (the exact calls the `ssh` binary's
+/// `run_mux_forwarding` makes) to tunnel a TCP connection to a loopback echo
+/// server through the master's SSH connection, without a second auth.
+#[test]
+fn local_forward_over_mux_client() {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    let srv = spawn_server_direct_tcpip(b"unused\n");
+    let shared = connect_and_auth(&srv);
+    assert_eq!(srv.accepts.load(Ordering::SeqCst), 1, "one auth at master");
+
+    let (echo_port, echo_handle) = spawn_echo_server();
+
+    let sock = unique_socket_path("lforward");
+    let release = Arc::new(AtomicBool::new(false));
+    let fg_release = release.clone();
+    let cfg = MasterConfig {
+        control_path: sock.clone(),
+        persist: Persist::No,
+    };
+    let master = thread::spawn(move || {
+        puressh::mux::run_master(cfg, shared, move |_s| {
+            while !fg_release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            0
+        })
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if puressh::mux::probe_master(&sock) == ProbeOutcome::Live {
+            break;
+        }
+        assert!(Instant::now() < deadline, "master never came up");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // Simulate one accepted `-L` connection via a loopback socket pair.
+    let acceptor = TcpListener::bind("127.0.0.1:0").expect("bind local -L");
+    let local_port = acceptor.local_addr().unwrap().port();
+    let client_side = TcpStream::connect(("127.0.0.1", local_port)).expect("connect local -L");
+    let (server_side, _) = acceptor.accept().expect("accept local -L");
+
+    // Forward worker: open_forward to the echo server, splice the accepted
+    // socket against the forward.
+    let mux_path = sock.clone();
+    let worker = thread::spawn(move || {
+        let fwd = puressh::mux::open_forward(&mux_path, "127.0.0.1", echo_port, "127.0.0.1", 0)
+            .expect("open_forward over mux");
+        let _ = puressh::mux::splice_forward(fwd, server_side);
+    });
+
+    let mut client_side = client_side;
+    client_side.write_all(b"mux -L works").expect("write");
+    let mut buf = [0u8; 12];
+    client_side.read_exact(&mut buf).expect("read echo");
+    assert_eq!(&buf, b"mux -L works");
+
+    assert_eq!(
+        srv.accepts.load(Ordering::SeqCst),
+        1,
+        "mux forward must not trigger a second auth"
+    );
+
+    drop(client_side);
+    let _ = worker.join();
+    release.store(true, Ordering::SeqCst);
+    let _ = master.join().expect("master thread");
+    let _ = echo_handle.join();
+    drop(srv.accepts);
+    let _ = srv.handle.join();
+}

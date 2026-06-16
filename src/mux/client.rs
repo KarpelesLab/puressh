@@ -45,6 +45,147 @@ pub struct SessionRequest {
     pub command: Option<String>,
 }
 
+/// Open a `direct-tcpip` forward through a running master and return the
+/// connected control socket, already past HELLO + OPEN_OK, ready to splice
+/// against a local TCP socket.
+///
+/// This is the mux-carrier equivalent of [`crate::client::ServeContext::open_direct_tcpip`]:
+/// the master dials `dest_host:dest_port` over its SSH connection and, on
+/// success, byte-splices the resulting channel against the returned socket
+/// using the same `StdinData`/`StdoutData`/`Eof` frames a session uses. The
+/// caller drives that splice with [`splice_forward`].
+///
+/// `orig_host`/`orig_port` are the informational originator address echoed in
+/// the channel open (typically the local accept peer for `ssh -L`/`-D`).
+pub fn open_forward(
+    path: &Path,
+    dest_host: &str,
+    dest_port: u16,
+    orig_host: &str,
+    orig_port: u16,
+) -> Result<UnixStream, MuxError> {
+    let mut sock = UnixStream::connect(path).map_err(MuxError::Io)?;
+
+    write_frame(
+        &mut sock,
+        &Frame::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
+    match read_frame(&mut sock)? {
+        Some(Frame::Hello { version }) if version == PROTOCOL_VERSION => {}
+        Some(Frame::Hello { version }) => {
+            return Err(MuxError::VersionMismatch {
+                ours: PROTOCOL_VERSION,
+                theirs: version,
+            });
+        }
+        _ => return Err(MuxError::Unexpected("expected HELLO from master")),
+    }
+
+    write_frame(
+        &mut sock,
+        &Frame::OpenDirectTcpip {
+            dest_host: dest_host.to_string(),
+            dest_port: dest_port as u32,
+            orig_host: orig_host.to_string(),
+            orig_port: orig_port as u32,
+        },
+    )?;
+
+    match read_frame(&mut sock)? {
+        Some(Frame::OpenOk) => Ok(sock),
+        Some(Frame::OpenFail { reason }) => Err(MuxError::ForwardFailed(reason)),
+        _ => Err(MuxError::Unexpected(
+            "expected OPEN_OK/OPEN_FAIL from master",
+        )),
+    }
+}
+
+/// Splice a mux forward control socket (from [`open_forward`]) against a local
+/// byte stream `local` (e.g. an accepted `ssh -L` TCP socket): local→master is
+/// sent as `StdinData`, master→local arrives as `StdoutData`, and either side's
+/// EOF tears the pair down. Blocks until the forward closes.
+///
+/// `local` must be cloneable into independent read/write halves (the splicing
+/// uses one thread per direction); a `TcpStream` satisfies this via `try_clone`.
+pub fn splice_forward<S>(sock: UnixStream, local: S) -> Result<(), MuxError>
+where
+    S: Read + Write + TryCloneStream + Send + 'static,
+{
+    let local_read = local.try_clone_stream().map_err(MuxError::Io)?;
+    let mut local_write = local;
+
+    let sock_read = sock.try_clone().map_err(MuxError::Io)?;
+    let sock_write = Arc::new(std::sync::Mutex::new(sock));
+
+    // local → master: read local bytes, frame them as StdinData.
+    let up_write = sock_write.clone();
+    let t_up = thread::spawn(move || {
+        let mut local_read = local_read;
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match local_read.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut g = match up_write.lock() {
+                        Ok(g) => g,
+                        Err(_) => break,
+                    };
+                    if write_frame(&mut *g, &Frame::StdinData(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        // Half-close upstream.
+        if let Ok(mut g) = up_write.lock() {
+            let _ = write_frame(&mut *g, &Frame::Eof);
+        }
+    });
+
+    // master → local: read StdoutData frames, write to the local socket.
+    let mut sock_read = sock_read;
+    loop {
+        match read_frame(&mut sock_read) {
+            Ok(Some(Frame::StdoutData(d))) => {
+                if local_write.write_all(&d).is_err() {
+                    break;
+                }
+                let _ = local_write.flush();
+            }
+            Ok(Some(Frame::Eof)) | Ok(None) => break,
+            Ok(Some(_)) => { /* ignore stray control frames */ }
+            Err(_) => break,
+        }
+    }
+
+    // Tear down: shut the control socket so the upstream thread's next frame
+    // write fails fast, then join it.
+    if let Ok(g) = sock_write.lock() {
+        let _ = g.shutdown(std::net::Shutdown::Both);
+    }
+    let _ = t_up.join();
+    Ok(())
+}
+
+/// A byte stream whose read/write halves can be split for bidirectional
+/// splicing. Implemented for [`std::net::TcpStream`] (via `try_clone`).
+pub trait TryCloneStream {
+    /// Clone the stream into an independent handle over the same connection.
+    fn try_clone_stream(&self) -> io::Result<Self>
+    where
+        Self: Sized;
+}
+
+impl TryCloneStream for std::net::TcpStream {
+    fn try_clone_stream(&self) -> io::Result<Self> {
+        self.try_clone()
+    }
+}
+
 /// Probe `path` for a live master: connect, send `HELLO`, and expect a
 /// compatible `HELLO` back within a short timeout.
 ///

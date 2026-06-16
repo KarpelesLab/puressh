@@ -1105,16 +1105,38 @@ fn run() -> Result<i32, String> {
         if matches!(dec.master, ControlMaster::Auto | ControlMaster::No) {
             match puressh::mux::probe_master(&dec.path) {
                 puressh::mux::ProbeOutcome::Live => {
-                    // Forwards/-N can't ride a mux SESSION channel (phase 1).
-                    if want_any_forwarding(&cli, &dynamics) {
+                    // `-L` / `-D` ride the mux carrier: each accepted local
+                    // connection opens its own OPEN_DIRECT_TCPIP control
+                    // connection to the master, which dials the destination
+                    // over its SSH connection. `-R` (needs master-side
+                    // listener management) and `-A`/`-X`/`-Y` (need
+                    // master-side session callbacks) stay unsupported over a
+                    // mux client.
+                    if !cli.remotes.is_empty() {
+                        return Err("-R remote forwarding is not supported over a multiplexed \
+                             (ControlMaster) connection; the master owns listener \
+                             management. Run -R without ControlMaster."
+                            .into());
+                    }
+                    if cli.agent_forward || cli.x11_forward.is_some() {
+                        return Err("-A/-X/-Y forwarding is not supported over a multiplexed \
+                             (ControlMaster) connection; these need a master-side \
+                             session channel. Run without ControlMaster."
+                            .into());
+                    }
+                    vlog(1, &format!("mux: reusing master at {}", dec.path.display()));
+                    if !cli.locals.is_empty() || !dynamics.is_empty() {
+                        // `-N` alongside `-L`/`-D` over mux is fine: we just
+                        // serve the listeners and never open a session.
+                        return run_mux_forwarding(&cli, &dynamics, &dec.path);
+                    }
+                    if cli.no_command {
                         return Err(
-                            "-L/-R/-D/-N/-A/-X forwarding is not supported over a multiplexed \
-                             (ControlMaster) connection in this release; run without \
-                             ControlMaster or against a non-master ssh"
+                            "-N over a multiplexed (ControlMaster) connection requires at \
+                             least one of -L or -D (the only forwards a mux client can carry)"
                                 .into(),
                         );
                     }
-                    vlog(1, &format!("mux: reusing master at {}", dec.path.display()));
                     return run_mux_client(&cli, &cfg_block, &dec.path);
                 }
                 puressh::mux::ProbeOutcome::Stale | puressh::mux::ProbeOutcome::Absent => {
@@ -1169,21 +1191,10 @@ fn run() -> Result<i32, String> {
         // ---- ProxyCommand (Unix only) ----
         #[cfg(unix)]
         {
-            // Phase-1 restriction: the pipe transport's read-timeout toggle
-            // is a no-op, so the serve / forwarding poll loops can't run over
-            // it. Reject -L/-R/-N (and config-derived forwards) up front.
-            if cli.no_command
-                || !cli.locals.is_empty()
-                || !cli.remotes.is_empty()
-                || !cfg_block.local_forwards.is_empty()
-                || !cfg_block.remote_forwards.is_empty()
-            {
-                return Err(
-                    "ProxyCommand does not support -L/-R/-N forwarding in this release; \
-                     use a single exec or an interactive shell"
-                        .into(),
-                );
-            }
+            // `ProcTransport` now honours `set_read_timeout` (O_NONBLOCK fd +
+            // poll-with-deadline read), so the serve / forwarding poll loops
+            // tick correctly over the pipe carrier. `-L`/`-R`/`-D`/`-N` are
+            // therefore supported here, same as a direct connection.
             let cmd = puressh::proc_transport::expand_tokens(&cmd_raw, &connect_host, port, &user);
             vlog(1, &format!("proxycommand: spawning {cmd:?}"));
             let proc = puressh::proc_transport::ProcTransport::spawn(&cmd)
@@ -1420,16 +1431,139 @@ fn resolve_mux(
     })
 }
 
-/// Whether any forwarding / no-command session was requested — these cannot
-/// ride a mux SESSION channel in phase 1.
+/// Serve `-L` / `-D` listeners over a live ControlMaster: bind every local
+/// and SOCKS listener, and for each accepted connection open an
+/// `OPEN_DIRECT_TCPIP` control connection to the master, which dials the
+/// destination over its SSH connection and splices the result back. Blocks
+/// forever (Ctrl-C to quit), mirroring `ssh -N -L`/`-D`.
 #[cfg(unix)]
-fn want_any_forwarding(cli: &Cli, dynamics: &[DynamicForward]) -> bool {
-    cli.no_command
-        || !cli.locals.is_empty()
-        || !cli.remotes.is_empty()
-        || !dynamics.is_empty()
-        || cli.agent_forward
-        || cli.x11_forward.is_some()
+fn run_mux_forwarding(
+    cli: &Cli,
+    dynamics: &[DynamicForward],
+    path: &std::path::Path,
+) -> Result<i32, String> {
+    use puressh::forwarding::socks;
+
+    let mut bound_any = false;
+
+    // -L: each accepted TCP connection → one direct-tcpip forward to the
+    // fixed remote_host:remote_port.
+    for l in &cli.locals {
+        let bind_ip = "127.0.0.1";
+        let listener = TcpListener::bind((bind_ip, l.listen_port))
+            .map_err(|e| format!("-L bind {bind_ip}:{}: {e}", l.listen_port))?;
+        eprintln!(
+            "ssh: -L {}:{}:{} active (via ControlMaster)",
+            l.listen_port, l.remote_host, l.remote_port
+        );
+        bound_any = true;
+        let spec = l.clone();
+        let mux_path = path.to_path_buf();
+        thread::spawn(move || {
+            for accept in listener.incoming() {
+                let tcp = match accept {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("ssh: -L accept on {bind_ip}:{}: {e}", spec.listen_port);
+                        continue;
+                    }
+                };
+                let orig = tcp
+                    .peer_addr()
+                    .map(|a| (a.ip().to_string(), a.port()))
+                    .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
+                let mux_path = mux_path.clone();
+                let spec = spec.clone();
+                thread::spawn(move || {
+                    match puressh::mux::open_forward(
+                        &mux_path,
+                        &spec.remote_host,
+                        spec.remote_port,
+                        &orig.0,
+                        orig.1,
+                    ) {
+                        Ok(sock) => {
+                            let _ = puressh::mux::splice_forward(sock, tcp);
+                        }
+                        Err(e) => eprintln!(
+                            "ssh: -L direct-tcpip {}:{} over mux: {e}",
+                            spec.remote_host, spec.remote_port
+                        ),
+                    }
+                });
+            }
+        });
+    }
+
+    // -D: each accepted TCP connection runs the SOCKS handshake, then opens a
+    // direct-tcpip forward to the SOCKS-requested target through the master.
+    for d in dynamics {
+        let listener = TcpListener::bind((d.bind_addr.as_str(), d.listen_port))
+            .map_err(|e| format!("-D bind {}:{}: {e}", d.bind_addr, d.listen_port))?;
+        eprintln!(
+            "ssh: -D {}:{} (SOCKS) active (via ControlMaster)",
+            d.bind_addr, d.listen_port
+        );
+        bound_any = true;
+        let listen_port = d.listen_port;
+        let mux_path = path.to_path_buf();
+        thread::spawn(move || {
+            for accept in listener.incoming() {
+                let mut tcp = match accept {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("ssh: -D accept on :{listen_port}: {e}");
+                        continue;
+                    }
+                };
+                let mux_path = mux_path.clone();
+                thread::spawn(move || {
+                    let target = match socks::handshake(&mut tcp) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            eprintln!("ssh: -D handshake: {e}");
+                            return;
+                        }
+                    };
+                    let orig = tcp
+                        .peer_addr()
+                        .map(|a| (a.ip().to_string(), a.port()))
+                        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
+                    match puressh::mux::open_forward(
+                        &mux_path,
+                        &target.host,
+                        target.port,
+                        &orig.0,
+                        orig.1,
+                    ) {
+                        Ok(sock) => {
+                            if socks::write_reply(&mut tcp, target.version, true).is_err() {
+                                return;
+                            }
+                            let _ = puressh::mux::splice_forward(sock, tcp);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "ssh: -D direct-tcpip {}:{} over mux: {e}",
+                                target.host, target.port
+                            );
+                            let _ = socks::write_reply(&mut tcp, target.version, false);
+                        }
+                    }
+                });
+            }
+        });
+    }
+
+    if !bound_any {
+        return Err("mux forwarding: no -L or -D listeners to serve".into());
+    }
+
+    // Park forever: the listener threads do the work. OpenSSH's `-N` blocks
+    // until interrupted; we mirror that.
+    loop {
+        thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// Attach to a live master at `path` and run the requested session over it.

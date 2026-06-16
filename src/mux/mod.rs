@@ -52,7 +52,10 @@ pub use server::{MasterConfig, Persist, run_master};
 #[cfg(feature = "multichannel")]
 mod client;
 #[cfg(feature = "multichannel")]
-pub use client::{ProbeOutcome, SessionRequest, probe_master, run_client};
+pub use client::{
+    ProbeOutcome, SessionRequest, TryCloneStream, open_forward, probe_master, run_client,
+    splice_forward,
+};
 
 /// Read exactly one framed message from `r`, blocking until a full frame is
 /// available. Returns `Ok(None)` on a clean EOF *between* frames (the peer

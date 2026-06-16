@@ -30,6 +30,9 @@ const T_EXIT_SIGNAL: u8 = 9;
 const T_ALIVE_CHECK: u8 = 10;
 const T_ALIVE_OK: u8 = 11;
 const T_EXIT_REQUEST: u8 = 12;
+const T_OPEN_DIRECT_TCPIP: u8 = 13;
+const T_OPEN_OK: u8 = 14;
+const T_OPEN_FAIL: u8 = 15;
 
 /// A decoded mux control-socket message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,6 +88,30 @@ pub enum Frame {
     AliveOk,
     /// Client → master: ask the master to shut down (`ssh -O exit`).
     ExitRequest,
+    /// Client → master: open a `direct-tcpip` channel on the master's SSH
+    /// connection (the mux carrier for `ssh -L` / `ssh -D`). The master dials
+    /// `dest_host:dest_port` *through the server* and, on success, splices the
+    /// resulting channel against this control connection using the same
+    /// `StdinData`/`StdoutData`/`Eof` frames a session uses.
+    OpenDirectTcpip {
+        /// Destination host the *server* should connect to.
+        dest_host: String,
+        /// Destination port the server should connect to.
+        dest_port: u32,
+        /// Informational originator address echoed in the channel open.
+        orig_host: String,
+        /// Informational originator port echoed in the channel open.
+        orig_port: u32,
+    },
+    /// Master → client: the requested channel open succeeded; byte splicing
+    /// follows. Sent in reply to [`Frame::OpenDirectTcpip`].
+    OpenOk,
+    /// Master → client: the requested channel open failed. `reason` is a
+    /// human-readable diagnostic. Sent in reply to [`Frame::OpenDirectTcpip`].
+    OpenFail {
+        /// Human-readable failure reason.
+        reason: String,
+    },
 }
 
 impl Frame {
@@ -162,6 +189,23 @@ impl Frame {
             Frame::AliveCheck => out.push(T_ALIVE_CHECK),
             Frame::AliveOk => out.push(T_ALIVE_OK),
             Frame::ExitRequest => out.push(T_EXIT_REQUEST),
+            Frame::OpenDirectTcpip {
+                dest_host,
+                dest_port,
+                orig_host,
+                orig_port,
+            } => {
+                out.push(T_OPEN_DIRECT_TCPIP);
+                put_str(out, dest_host);
+                out.extend_from_slice(&dest_port.to_be_bytes());
+                put_str(out, orig_host);
+                out.extend_from_slice(&orig_port.to_be_bytes());
+            }
+            Frame::OpenOk => out.push(T_OPEN_OK),
+            Frame::OpenFail { reason } => {
+                out.push(T_OPEN_FAIL);
+                put_str(out, reason);
+            }
         }
     }
 
@@ -226,6 +270,20 @@ impl Frame {
             T_ALIVE_CHECK => Frame::AliveCheck,
             T_ALIVE_OK => Frame::AliveOk,
             T_EXIT_REQUEST => Frame::ExitRequest,
+            T_OPEN_DIRECT_TCPIP => {
+                let dest_host = r.str()?;
+                let dest_port = r.u32()?;
+                let orig_host = r.str()?;
+                let orig_port = r.u32()?;
+                Frame::OpenDirectTcpip {
+                    dest_host,
+                    dest_port,
+                    orig_host,
+                    orig_port,
+                }
+            }
+            T_OPEN_OK => Frame::OpenOk,
+            T_OPEN_FAIL => Frame::OpenFail { reason: r.str()? },
             other => return Err(MuxError::UnknownType(other)),
         };
         // Variants with fixed-length payloads must consume the whole body;
@@ -277,6 +335,9 @@ pub enum MuxError {
     /// The peer sent an unexpected frame for the current protocol state
     /// (e.g. a non-`HELLO` first frame).
     Unexpected(&'static str),
+    /// The master refused an `OpenDirectTcpip` (`ssh -L`/`-D` over mux); the
+    /// payload is the master's human-readable reason.
+    ForwardFailed(String),
 }
 
 impl fmt::Display for MuxError {
@@ -292,6 +353,7 @@ impl fmt::Display for MuxError {
                 )
             }
             MuxError::Unexpected(s) => write!(f, "mux unexpected frame: {s}"),
+            MuxError::ForwardFailed(s) => write!(f, "mux forward refused: {s}"),
         }
     }
 }
@@ -412,6 +474,22 @@ mod tests {
         round_trip(Frame::AliveCheck);
         round_trip(Frame::AliveOk);
         round_trip(Frame::ExitRequest);
+        round_trip(Frame::OpenDirectTcpip {
+            dest_host: "example.com".into(),
+            dest_port: 443,
+            orig_host: "127.0.0.1".into(),
+            orig_port: 51234,
+        });
+        round_trip(Frame::OpenDirectTcpip {
+            dest_host: "2001:db8::1".into(),
+            dest_port: 0,
+            orig_host: String::new(),
+            orig_port: 0,
+        });
+        round_trip(Frame::OpenOk);
+        round_trip(Frame::OpenFail {
+            reason: "connect refused".into(),
+        });
     }
 
     #[test]

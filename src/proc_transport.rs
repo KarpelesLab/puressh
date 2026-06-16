@@ -13,8 +13,12 @@
 #![cfg(all(unix, feature = "client"))]
 
 use std::io::{self, Read, Write};
+use std::os::fd::AsFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use nix::fcntl::{FcntlArg, OFlag, fcntl};
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::client::Transport;
 
@@ -61,10 +65,28 @@ pub fn expand_tokens(s: &str, host: &str, port: u16, user: &str) -> String {
 /// Writes go to the child's stdin; reads come from its stdout. The child's
 /// stderr is inherited so any diagnostics surface on the terminal. The
 /// child is killed (and reaped) on drop.
+///
+/// # Read timeouts over a pipe
+///
+/// A plain anonymous pipe has no `SO_RCVTIMEO`-style knob, so the serve /
+/// forwarding poll loops (which expect [`Transport::set_read_timeout`] to
+/// produce a periodic [`io::ErrorKind::WouldBlock`] tick) historically could
+/// not run over a `ProxyCommand`. We give them one anyway: the child's stdout
+/// fd is switched to `O_NONBLOCK`, and [`Transport::set_read_timeout`] records
+/// a deadline. With a timeout set, [`Read::read`] uses `poll(2)` to wait up to
+/// the deadline for readability and translates the empty-poll case into
+/// `WouldBlock` — exactly the signal the serve loop already handles for a
+/// `TcpStream` read timeout. With no timeout the read blocks (via an infinite
+/// `poll`) so the blocking KEX / userauth phases behave as before.
 pub struct ProcTransport {
     child: Child,
     stdin: ChildStdin,
     stdout: ChildStdout,
+    /// Current read timeout. `None` ⇒ block until data (or EOF). `Some(d)` ⇒
+    /// each `read` waits at most `d` for readability, then returns
+    /// `WouldBlock`. The stdout fd is always `O_NONBLOCK`; this field only
+    /// decides how long `poll(2)` waits before giving up.
+    read_timeout: Option<Duration>,
 }
 
 impl ProcTransport {
@@ -89,17 +111,74 @@ impl ProcTransport {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("ProxyCommand: child stdout not captured"))?;
+        // Put the read side into non-blocking mode up front: every read goes
+        // through `poll(2)` + a non-blocking `read`, regardless of whether a
+        // timeout is currently armed (a `None` timeout polls with no deadline).
+        set_nonblocking(&stdout)?;
         Ok(Self {
             child,
             stdin,
             stdout,
+            read_timeout: None,
         })
     }
 }
 
+/// Flip `O_NONBLOCK` on for `fd` via `fcntl(F_GETFL)` + `fcntl(F_SETFL)`.
+fn set_nonblocking<F: AsFd>(fd: &F) -> io::Result<()> {
+    let borrowed = fd.as_fd();
+    let cur = fcntl(borrowed, FcntlArg::F_GETFL).map_err(io::Error::from)?;
+    let flags = OFlag::from_bits_truncate(cur) | OFlag::O_NONBLOCK;
+    fcntl(borrowed, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
+    Ok(())
+}
+
 impl Read for ProcTransport {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.stdout.read(buf)
+        // The fd is O_NONBLOCK, so a bare `read` returns `WouldBlock` instead
+        // of parking. We wrap it in `poll(2)` to get the wait semantics the
+        // serve loop expects:
+        //   * `read_timeout = None`  → poll with no deadline (block for data).
+        //   * `read_timeout = Some`  → poll up to the deadline, surfacing
+        //     `WouldBlock` if nothing arrives so the caller can tick.
+        let deadline = self.read_timeout.map(|d| Instant::now() + d);
+        loop {
+            // Compute the remaining poll budget for this iteration.
+            let timeout: PollTimeout = match deadline {
+                None => PollTimeout::NONE,
+                Some(end) => {
+                    let now = Instant::now();
+                    if now >= end {
+                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                    }
+                    let remaining = end - now;
+                    // Clamp to u16 ms (PollTimeout's largest finite value is
+                    // ~65s; our timeouts are tens of ms, so saturation is fine).
+                    let ms = remaining.as_millis().min(u16::MAX as u128) as u16;
+                    PollTimeout::from(ms)
+                }
+            };
+
+            let mut fds = [PollFd::new(self.stdout.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut fds, timeout) {
+                Ok(0) => {
+                    // poll timed out without readiness → no data yet.
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                Ok(_) => {
+                    // Readable (or hangup): attempt the read. On a real pipe a
+                    // POLLHUP fd reads as EOF (0), which we surface as Ok(0).
+                    match self.stdout.read(buf) {
+                        // Spurious wakeup (poll said readable but the read
+                        // raced to empty) — loop and re-poll within budget.
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                        other => return other,
+                    }
+                }
+                Err(nix::errno::Errno::EINTR) => continue,
+                Err(e) => return Err(io::Error::from(e)),
+            }
+        }
     }
 }
 
@@ -114,11 +193,13 @@ impl Write for ProcTransport {
 }
 
 impl Transport for ProcTransport {
-    /// No-op: anonymous pipes carry no read-timeout knob. Callers that need
-    /// a real timeout (the serve / forwarding poll loops) must not run over
-    /// a `ProxyCommand` transport — the `ssh` binary rejects `-L`/`-R`/`-N`
-    /// in that case.
-    fn set_read_timeout(&mut self, _t: Option<Duration>) -> io::Result<()> {
+    /// Arm (or clear) a read timeout. The child stdout fd is already
+    /// `O_NONBLOCK`; this just records the deadline [`Read::read`] enforces
+    /// via `poll(2)`. `Some(d)` makes reads return [`io::ErrorKind::WouldBlock`]
+    /// after `d` of no data (the periodic tick the serve / forwarding loops
+    /// rely on); `None` reverts to a blocking read.
+    fn set_read_timeout(&mut self, t: Option<Duration>) -> io::Result<()> {
+        self.read_timeout = t;
         Ok(())
     }
 }
@@ -178,5 +259,47 @@ mod tests {
         let mut buf = [0u8; 10];
         t.read_exact(&mut buf).expect("read echo");
         assert_eq!(&buf, b"hello pipe");
+    }
+
+    #[test]
+    fn read_timeout_ticks_as_wouldblock() {
+        // `sleep` produces no output, so a read with a short timeout must
+        // surface WouldBlock (the serve-loop tick) rather than blocking.
+        let mut t = ProcTransport::spawn("sleep 5").expect("spawn sleep");
+        t.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set timeout");
+        let mut buf = [0u8; 16];
+        let start = Instant::now();
+        let err = t.read(&mut buf).expect_err("should time out");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+        // It should have actually waited ~the timeout, not busy-returned.
+        assert!(
+            start.elapsed() >= Duration::from_millis(40),
+            "poll should have waited out the deadline, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn read_timeout_still_delivers_data() {
+        // With a timeout armed, data that *does* arrive must still be read.
+        let mut t = ProcTransport::spawn("printf abc; sleep 5").expect("spawn");
+        t.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("set timeout");
+        let mut buf = [0u8; 3];
+        t.read_exact(&mut buf).expect("read the printf output");
+        assert_eq!(&buf, b"abc");
+    }
+
+    #[test]
+    fn blocking_read_after_clearing_timeout() {
+        // `set_read_timeout(None)` reverts to a blocking poll: a delayed
+        // write is still delivered (no premature WouldBlock).
+        let mut t = ProcTransport::spawn("sleep 0.1; printf ok").expect("spawn");
+        t.set_read_timeout(None).expect("clear timeout");
+        let mut buf = [0u8; 2];
+        t.read_exact(&mut buf)
+            .expect("blocking read waits for data");
+        assert_eq!(&buf, b"ok");
     }
 }

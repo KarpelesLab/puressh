@@ -66,9 +66,10 @@ zeroize = { version = "1", default-features = false, features = ["alloc", "deriv
 #   fs      — fcntl flags / O_NONBLOCK
 #   ioctl   — TIOCSWINSZ
 #   user    — User::from_name, setuid/setgid/initgroups, geteuid/getegid
+#   poll    — poll(2) for the ProxyCommand non-blocking read-with-deadline
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.30", default-features = false, features = [
-    "process", "signal", "term", "fs", "ioctl", "user",
+    "process", "signal", "term", "fs", "ioctl", "user", "poll",
 ] }
 # `libc` for the few low-level POSIX bits the binaries need (terminal
 # echo control in the password reader; geteuid + Unix-socket stat() for

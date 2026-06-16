@@ -315,3 +315,139 @@ fn proxy_command_dead_helper_aborts() {
         "a ProxyCommand helper that dies immediately must abort the connection"
     );
 }
+
+/// A tiny loopback TCP echo server — the `direct-tcpip` forward target for the
+/// `-L over ProxyCommand` test. Returns its bound port and a join handle.
+#[cfg(unix)]
+fn spawn_echo_server() -> (u16, thread::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind echo");
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        if let Ok((mut sock, _)) = listener.accept() {
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    (port, handle)
+}
+
+/// End-to-end `ssh -L` over a ProxyCommand carrier: connect+auth an SSH server
+/// over an `nc` ProxyCommand pipe, run the serve loop (which now ticks over the
+/// O_NONBLOCK pipe via poll-with-deadline), and open a `direct-tcpip` channel
+/// from inside the loop to a loopback echo server — proving the serve /
+/// forwarding poll loop works over the pipe carrier. Skipped if `nc` is absent.
+#[cfg(unix)]
+#[test]
+fn local_forward_over_proxy_command() {
+    use puressh::client::ClientHandlers;
+    use puressh::proc_transport::{ProcTransport, expand_tokens};
+    use std::io::{Read, Write};
+
+    if !have_nc() {
+        eprintln!("skipping local_forward_over_proxy_command: nc not found");
+        return;
+    }
+
+    // SSH server must permit direct-tcpip so the client can tunnel `-L`.
+    let target = spawn_server(b"unused\n", true);
+    // The forward destination the server will dial on the client's behalf.
+    let (echo_port, echo_handle) = spawn_echo_server();
+
+    let cmd = expand_tokens("nc %h %p", "127.0.0.1", target.addr.port(), "ignored");
+    let proc = ProcTransport::spawn(&cmd).expect("spawn nc ProxyCommand");
+
+    let mut client = Client::connect_via(
+        Box::new(proc),
+        "127.0.0.1",
+        target.addr.port(),
+        client_cfg(HostKeyPolicy::AcceptAny),
+    )
+    .expect("connect_via over ProxyCommand");
+    let hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(target.client_seed));
+    client
+        .authenticate_publickey(&target.user, hk)
+        .expect("auth target over ProxyCommand");
+
+    // Drive the serve loop in a worker thread; we keep a ServeContext to open
+    // the direct-tcpip channel from this thread.
+    let (handlers, ctx) = ClientHandlers::new().with_serve_context();
+    let stop = handlers.stop.clone();
+    let serve = thread::spawn(move || {
+        let _ = client.serve(handlers);
+    });
+
+    // Open the forward target through the serve loop and round-trip a payload.
+    let mut stream = ctx
+        .open_direct_tcpip("127.0.0.1", echo_port, "127.0.0.1", 0)
+        .expect("open direct-tcpip over proxycommand serve loop");
+    stream.write_all(b"ping over -L").expect("write to forward");
+    let mut buf = [0u8; 12];
+    stream.read_exact(&mut buf).expect("read echo from forward");
+    assert_eq!(&buf, b"ping over -L");
+
+    drop(stream);
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = serve.join();
+    let _ = target.handle.join();
+    let _ = echo_handle.join();
+}
+
+/// The serve loop must *tick* over a ProxyCommand pipe — i.e. the poll-with-
+/// deadline read returns periodically so the `stop` flag is honoured even with
+/// no channels open. This is the keepalive/responsiveness property the old
+/// no-op `set_read_timeout` could not provide. Skipped if `nc` is absent.
+#[cfg(unix)]
+#[test]
+fn serve_loop_ticks_over_proxy_command() {
+    use puressh::client::ClientHandlers;
+    use puressh::proc_transport::{ProcTransport, expand_tokens};
+
+    if !have_nc() {
+        eprintln!("skipping serve_loop_ticks_over_proxy_command: nc not found");
+        return;
+    }
+
+    let target = spawn_server(b"unused\n", true);
+    let cmd = expand_tokens("nc %h %p", "127.0.0.1", target.addr.port(), "ignored");
+    let proc = ProcTransport::spawn(&cmd).expect("spawn nc ProxyCommand");
+
+    let mut client = Client::connect_via(
+        Box::new(proc),
+        "127.0.0.1",
+        target.addr.port(),
+        client_cfg(HostKeyPolicy::AcceptAny),
+    )
+    .expect("connect_via over ProxyCommand");
+    let hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(target.client_seed));
+    client
+        .authenticate_publickey(&target.user, hk)
+        .expect("auth target over ProxyCommand");
+
+    let handlers = ClientHandlers::new();
+    let stop = handlers.stop.clone();
+    let serve = thread::spawn(move || client.serve(handlers));
+
+    // No channels are open. Let the loop spin a few poll ticks, then ask it to
+    // stop. If the read blocked forever (the old behaviour), this join would
+    // hang; the test's overall timeout would then catch it.
+    thread::sleep(Duration::from_millis(300));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let joined = serve.join().expect("serve thread panicked");
+    assert!(
+        joined.is_ok(),
+        "serve loop should return Ok after stop over a ProxyCommand carrier"
+    );
+    drop(target.handle);
+}

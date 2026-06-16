@@ -7,12 +7,17 @@ it needs.
 
 ## Client
 
-- **No port/dynamic forwarding over ProxyCommand or ControlMaster mux.** `-L`/`-R`/`-D`
-  (and `-N`) are rejected with a clear error when the transport is a `ProxyCommand`
-  subprocess (`src/proc_transport.rs`) or a mux client connection (`src/mux/`). The
-  serve/forwarding poll loop relies on a real read timeout, which a pipe / mux carrier
-  can't honor. *Closing it:* wrap the pipe fd in an `O_NONBLOCK` adapter (translate
-  `EAGAIN`→`WouldBlock`) and add forwarded-channel support to the mux protocol.
+- ~~**No port/dynamic forwarding over ProxyCommand or ControlMaster mux.**~~ **Done.**
+  `ProcTransport` now sets `O_NONBLOCK` on the child stdout fd and implements
+  `set_read_timeout` as a `poll(2)`-with-deadline read (translating the empty poll into
+  `WouldBlock`), so the serve/forwarding poll loop ticks over the pipe carrier — `-L`/`-R`/
+  `-D`/`-N` are all supported over `ProxyCommand` (`src/proc_transport.rs`). Over a mux
+  client, the protocol gained an `OPEN_DIRECT_TCPIP` frame: each accepted `-L`/`-D`
+  connection opens its own control connection to the master, which dials the destination
+  over its SSH connection and byte-splices the channel back (`src/mux/`). `-R` over mux
+  stays rejected (it needs master-side listener/`tcpip-forward` management the client
+  cannot drive); `-A`/`-X`/`-Y` over mux stay rejected (they need a master-side session
+  channel for the forwarding-request + callbacks). Those run fine without ControlMaster.
 
 - **ControlPersist `yes`/`<N>` is a detached thread, not a daemon.** The master stays
   alive in a background thread of the first `ssh` process rather than double-forking into

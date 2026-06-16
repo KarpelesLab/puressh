@@ -242,6 +242,13 @@ fn accept_loop(listener: UnixListener, shared: SharedClient, state: Arc<MasterSt
 fn reaper_loop(persist: Persist, state: Arc<MasterState>, path: &Path) {
     loop {
         if state.shutdown.load(Ordering::SeqCst) {
+            // Shutdown may have been flipped externally — by `run_master`'s
+            // Persist::No teardown, by `run_master_daemon`'s main loop, or by
+            // an `-O exit` (`Frame::ExitRequest`) handler. Make the socket
+            // teardown idempotent so an ExitRequest under in-process
+            // Persist::Yes still unlinks and wakes the accept loop.
+            wake_accept(path);
+            let _ = fs::remove_file(path);
             return;
         }
         thread::sleep(Duration::from_millis(200));

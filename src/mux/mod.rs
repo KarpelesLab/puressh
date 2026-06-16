@@ -53,8 +53,8 @@ pub use server::{MasterConfig, Persist, run_master, run_master_daemon};
 mod client;
 #[cfg(feature = "multichannel")]
 pub use client::{
-    ProbeOutcome, SessionRequest, TryCloneStream, open_forward, probe_master, run_client,
-    splice_forward,
+    ControlCommand, ProbeOutcome, SessionRequest, TryCloneStream, open_forward, probe_master,
+    run_client, send_control_command, splice_forward,
 };
 
 /// Read exactly one framed message from `r`, blocking until a full frame is

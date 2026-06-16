@@ -40,6 +40,7 @@ const USAGE: &str = "usage: ssh [-v[v[v]]] [-F configfile] [-p port] [-i identit
                      [-o IdentitiesOnly={yes,no}] \
                      [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] [-D [bind:]port] \
                      [-J [user@]host[:port][,...]] \
+                     [-O check|exit|stop] \
                      [-C] [-t] [-T] [-N] [-A] [-X] [-Y] \
                      [-o ssh_config_keyword=value] \
                      [user@]host [command...]";
@@ -143,6 +144,11 @@ struct Cli {
     /// `-J [user@]host[:port][,…]`: ProxyJump chain. `None` when the flag
     /// wasn't supplied; the ssh_config `ProxyJump` then wins.
     proxy_jump: Option<String>,
+    /// `-O <cmd>`: a ControlMaster control command (`check` / `exit` / `stop`).
+    /// `None` for a normal session. Honored only on Unix (the mux carrier is
+    /// unix-gated); requires a resolved `ControlPath`.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    control_cmd: Option<String>,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -281,6 +287,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut agent_forward = false;
     let mut x11_forward: Option<X11Forward> = None;
     let mut proxy_jump: Option<String> = None;
+    let mut control_cmd: Option<String> = None;
     let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
@@ -347,6 +354,22 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 i += 1;
                 let v = args.get(i).ok_or("-J requires a value")?.clone();
                 proxy_jump = Some(v);
+            }
+            // `-O <cmd>`: control a running ControlMaster. We accept the
+            // multiplexing control commands puressh's mux master honors:
+            // `check` (is the master alive?), `exit`/`stop` (tear it down).
+            "-O" => {
+                i += 1;
+                let v = args.get(i).ok_or("-O requires a command")?.clone();
+                match v.as_str() {
+                    "check" | "exit" | "stop" => control_cmd = Some(v),
+                    other => {
+                        return Err(format!(
+                            "-O: unsupported control command {other:?} \
+                             (supported: check, exit, stop)"
+                        ));
+                    }
+                }
             }
             "-A" => {
                 agent_forward = true;
@@ -468,6 +491,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         agent_forward,
         x11_forward,
         proxy_jump,
+        control_cmd,
         verbose,
         host,
         user_in_host,
@@ -1097,6 +1121,18 @@ fn run() -> Result<i32, String> {
     // resolved values just sit unused on other platforms.
     #[cfg(unix)]
     let mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user);
+
+    // `-O check|exit|stop`: a control command, not a session. Resolve the
+    // ControlPath, talk to the master, and return — never connect/auth.
+    #[cfg(unix)]
+    if let Some(cmd) = cli.control_cmd.clone() {
+        let dec = mux_decision.as_ref().ok_or_else(|| {
+            "-O requires a ControlPath (set ControlPath in ssh_config or -o ControlPath=…)"
+                .to_string()
+        })?;
+        return run_control_command(&cmd, &dec.path);
+    }
+
     #[cfg(unix)]
     if let Some(ref dec) = mux_decision {
         use puressh::config::ControlMaster;
@@ -1431,6 +1467,42 @@ fn resolve_mux(
         become_master,
         persist,
     })
+}
+
+/// Handle `ssh -O check|exit|stop`: talk to the master at `path` and report.
+///
+/// * `check` — print whether a live master is present; exit 0 if alive, 255 if
+///   not (matching OpenSSH's "Master running"/"... not running" semantics).
+/// * `exit` / `stop` — ask the master to tear down and unlink its socket.
+#[cfg(unix)]
+fn run_control_command(cmd: &str, path: &std::path::Path) -> Result<i32, String> {
+    use puressh::mux::ControlCommand;
+    match cmd {
+        "check" => {
+            let alive = puressh::mux::send_control_command(path, ControlCommand::Check)
+                .map_err(|e| format!("-O check: {e}"))?;
+            if alive {
+                println!("Master running (control socket {})", path.display());
+                Ok(0)
+            } else {
+                println!("No master running on {}", path.display());
+                Ok(255)
+            }
+        }
+        "exit" | "stop" => {
+            // First confirm something is there; an absent socket is a no-op
+            // success (nothing to stop) under OpenSSH, but we report it.
+            if puressh::mux::probe_master(path) != puressh::mux::ProbeOutcome::Live {
+                println!("No master running on {}", path.display());
+                return Ok(0);
+            }
+            puressh::mux::send_control_command(path, ControlCommand::Exit)
+                .map_err(|e| format!("-O {cmd}: {e}"))?;
+            println!("Exit request sent to master on {}", path.display());
+            Ok(0)
+        }
+        other => Err(format!("-O: unsupported control command {other:?}")),
+    }
 }
 
 /// Serve `-L` / `-D` listeners over a live ControlMaster: bind every local

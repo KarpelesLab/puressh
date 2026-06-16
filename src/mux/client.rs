@@ -221,6 +221,75 @@ pub fn probe_master(path: &Path) -> ProbeOutcome {
     }
 }
 
+/// A `ssh -O` control command directed at a running master.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ControlCommand {
+    /// `-O check`: probe whether the master is alive (HELLO + ALIVE_CHECK).
+    Check,
+    /// `-O exit` / `-O stop`: ask the master to tear down and unlink its
+    /// socket (HELLO + EXIT_REQUEST).
+    Exit,
+}
+
+/// Send a `ssh -O` control command to the master at `path` after a HELLO
+/// handshake.
+///
+/// * [`ControlCommand::Check`] returns `Ok(true)` if the master answered
+///   `ALIVE_OK`, `Ok(false)` if the path has no live master (absent / stale /
+///   wrong version).
+/// * [`ControlCommand::Exit`] sends `EXIT_REQUEST`; the master tears down and
+///   unlinks its socket. Returns `Ok(true)` once the request was delivered.
+///
+/// Connection / protocol failures against an *existing* path surface as `Err`;
+/// a missing socket is reported as `Ok(false)` for `Check`.
+pub fn send_control_command(path: &Path, cmd: ControlCommand) -> Result<bool, MuxError> {
+    let mut sock = match UnixStream::connect(path) {
+        Ok(s) => s,
+        // No live master to talk to.
+        Err(_) if cmd == ControlCommand::Check => return Ok(false),
+        Err(e) => return Err(MuxError::Io(e)),
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(2000)));
+    let _ = sock.set_write_timeout(Some(Duration::from_millis(2000)));
+
+    // HELLO handshake.
+    write_frame(
+        &mut sock,
+        &Frame::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
+    match read_frame(&mut sock) {
+        Ok(Some(Frame::Hello { version })) if version == PROTOCOL_VERSION => {}
+        _ if cmd == ControlCommand::Check => return Ok(false),
+        Ok(Some(Frame::Hello { version })) => {
+            return Err(MuxError::VersionMismatch {
+                ours: PROTOCOL_VERSION,
+                theirs: version,
+            });
+        }
+        Ok(_) => return Err(MuxError::Unexpected("expected HELLO from master")),
+        Err(e) => return Err(e),
+    }
+
+    match cmd {
+        ControlCommand::Check => {
+            write_frame(&mut sock, &Frame::AliveCheck)?;
+            match read_frame(&mut sock) {
+                Ok(Some(Frame::AliveOk)) => Ok(true),
+                _ => Ok(false),
+            }
+        }
+        ControlCommand::Exit => {
+            write_frame(&mut sock, &Frame::ExitRequest)?;
+            // The master closes the socket as it tears down; we don't need a
+            // reply. Best-effort: a clean EOF here confirms it acted on it.
+            let _ = read_frame(&mut sock);
+            Ok(true)
+        }
+    }
+}
+
 /// Attach to the master at `path` and run `req` to completion, splicing local
 /// stdin/stdout/stderr against the multiplexed session. Returns the remote
 /// exit status (0–255), or 255 if the session ended without a status.

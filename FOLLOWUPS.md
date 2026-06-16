@@ -28,10 +28,13 @@ it needs.
   parent `mem::forget`s its `SharedClient` so it never runs Drop on the SSH socket the
   daemon now owns. `ControlPersist no` is unchanged (master tied to the foreground).
 
-- **`ssh -O check|exit|stop` has no CLI flag.** The mux protocol carries `ExitRequest`/
-  `AliveCheck` frames and the master honors them, but no `-O` command-line option is
-  parsed yet (`src/bin/ssh.rs`). *Closing it:* add `-O` arg parsing that opens the control
-  socket and sends the frame.
+- ~~**`ssh -O check|exit|stop` has no CLI flag.**~~ **Done.** `src/bin/ssh.rs` now parses
+  `-O check|exit|stop`: it resolves the `ControlPath` (required), then talks to the master
+  over the control socket without connecting/authenticating. `check` sends `AliveCheck`
+  and reports master alive (exit 0) / not running (exit 255); `exit`/`stop` send
+  `ExitRequest`, after which the master tears down and unlinks its socket. The mux master's
+  reaper unlinks idempotently on shutdown so an `ExitRequest` cleans up correctly.
+  `send_control_command` lives in `src/mux/client.rs`.
 
 - **`HostKeyAlgorithms +ssh-rsa` is rejected.** Bare `ssh-rsa` (SHA-1) is default-off
   behind a process-wide flag and is intentionally excluded from the strict known-name set

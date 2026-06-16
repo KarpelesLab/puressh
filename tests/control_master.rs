@@ -350,6 +350,84 @@ fn run_master_daemon_serves_then_exits_after_idle() {
     let _ = srv.handle.join();
 }
 
+/// `ssh -O check` / `-O exit`: `send_control_command` against a running master.
+/// `check` on a live master returns true and on an absent path returns false;
+/// `exit` tears the master down and unlinks the socket.
+#[test]
+fn control_command_check_and_exit() {
+    use puressh::mux::ControlCommand;
+
+    let srv = spawn_server(b"octl\n");
+    let shared = connect_and_auth(&srv);
+
+    let sock = unique_socket_path("octl");
+
+    // -O check against a path with no master → false.
+    assert!(
+        !puressh::mux::send_control_command(&sock, ControlCommand::Check).expect("check absent"),
+        "check on an absent control path must report no master"
+    );
+
+    let cfg = MasterConfig {
+        control_path: sock.clone(),
+        // Yes so the master keeps running while we probe + exit it.
+        persist: Persist::Yes,
+    };
+    let release = Arc::new(AtomicBool::new(false));
+    let fg_release = release.clone();
+    let master = thread::spawn(move || {
+        puressh::mux::run_master(cfg, shared, move |_s| {
+            while !fg_release.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            0
+        })
+    });
+
+    // Wait for the master to come up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if puressh::mux::probe_master(&sock) == ProbeOutcome::Live {
+            break;
+        }
+        assert!(Instant::now() < deadline, "master never came up");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // -O check against the live master → true.
+    assert!(
+        puressh::mux::send_control_command(&sock, ControlCommand::Check).expect("check live"),
+        "check on a live master must report it alive"
+    );
+
+    // -O exit → master tears down + unlinks the socket.
+    assert!(
+        puressh::mux::send_control_command(&sock, ControlCommand::Exit).expect("exit"),
+        "exit request must be delivered"
+    );
+
+    let gone_by = Instant::now() + Duration::from_secs(5);
+    while sock.exists() {
+        assert!(
+            Instant::now() < gone_by,
+            "-O exit did not tear the master down / unlink the socket"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // A check after exit reports no master.
+    assert!(
+        !puressh::mux::send_control_command(&sock, ControlCommand::Check).expect("check post-exit"),
+        "check after exit must report no master"
+    );
+
+    // Let the foreground finish (the master already shut down).
+    release.store(true, Ordering::SeqCst);
+    let _ = master.join();
+    drop(srv.accepts);
+    let _ = srv.handle.join();
+}
+
 /// Like [`spawn_server`] but permits `direct-tcpip` so a mux client can carry
 /// `ssh -L` / `-D` forwards over the master's connection.
 fn spawn_server_direct_tcpip(banner: &[u8]) -> TestServer {

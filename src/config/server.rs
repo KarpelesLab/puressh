@@ -61,11 +61,12 @@ impl PermitRootLogin {
 /// `pick(cli, cfg, default)` helper, and so [`SshServerConfig::resolve`] can
 /// merge blocks with first-match-wins scalars and concatenated lists.
 ///
-/// Auth/access keywords are constrained by puressh implementing only
-/// public-key authentication: `PasswordAuthentication yes`,
-/// `KbdInteractiveAuthentication yes`, multi-factor `AuthenticationMethods`,
-/// and `PermitEmptyPasswords yes` are rejected at parse time rather than
-/// silently accepted.
+/// Auth/access keywords: `PasswordAuthentication`,
+/// `KbdInteractiveAuthentication`, multi-factor `AuthenticationMethods` chains,
+/// and `PermitEmptyPasswords` are honored. Whether they take effect at runtime
+/// additionally depends on a PAM backend being compiled into the `sshd` binary
+/// (Linux + the `pam` feature); without it the methods are never advertised
+/// (the binary warns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerOptions {
     /// `Port` — default 22 (OpenSSH default; puressh's CLI default differs).
@@ -123,17 +124,25 @@ pub struct ServerOptions {
     /// the advertised method set, which (since it is the only honorable
     /// method) locks the connection out. `None`/`yes` ⇒ enabled.
     pub pubkey_authentication: Option<bool>,
-    /// `PasswordAuthentication` (yes/no). Only `no` is honorable (puressh has
-    /// no password auth); `yes` is rejected at parse time as
-    /// [`ConfigError::Unsupported`]. Stored so a future password
-    /// implementation can read it.
+    /// `PasswordAuthentication` (yes/no). `yes` advertises the `password`
+    /// method (subject to a PAM backend being compiled in — see the crate
+    /// docs); `no`/`None` ⇒ disabled.
     pub password_authentication: Option<bool>,
     /// `KbdInteractiveAuthentication` (alias `ChallengeResponseAuthentication`)
-    /// (yes/no). Same honorability rule as `password_authentication`.
+    /// (yes/no). `yes` advertises `keyboard-interactive` (subject to a PAM
+    /// backend); `no`/`None` ⇒ disabled.
     pub kbd_interactive_authentication: Option<bool>,
-    /// `AuthenticationMethods` — only `publickey` / `any` are honorable;
-    /// anything else (a non-publickey method, or a multi-factor chain) is
-    /// rejected at parse time. Stored as the raw token list for diagnostics.
+    /// `PermitEmptyPasswords` (yes/no). When `yes`, the server will attempt to
+    /// authenticate an account with an empty password (passed through to PAM);
+    /// when `no`/`None` an empty password is rejected without consulting the
+    /// backend.
+    pub permit_empty_passwords: Option<bool>,
+    /// `AuthenticationMethods` — space-separated alternatives, each a
+    /// comma-separated chain of required factors (e.g.
+    /// `publickey,password`). Each factor must be one of `publickey`,
+    /// `password`, `keyboard-interactive`, `any`, or `none`; genuinely-unknown
+    /// tokens are rejected at parse time as [`ConfigError::BadValue`]. Stored as
+    /// the raw token list; the binary maps it into a multi-factor chain set.
     pub authentication_methods: Option<Vec<String>>,
     /// `MaxAuthTries` — disconnect after this many failed auth attempts.
     pub max_auth_tries: Option<u32>,
@@ -403,6 +412,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(pubkey_authentication);
     take_scalar!(password_authentication);
     take_scalar!(kbd_interactive_authentication);
+    take_scalar!(permit_empty_passwords);
     take_scalar!(authentication_methods);
     take_scalar!(max_auth_tries);
     take_scalar!(banner);
@@ -600,29 +610,10 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             opts.pubkey_authentication = Some(parse_yes_no(line)?);
         }
         "passwordauthentication" => {
-            // Only `no` can be honored — puressh has no password auth, so
-            // `yes` would advertise a method we cannot satisfy.
-            let v = parse_yes_no(line)?;
-            if v {
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "PasswordAuthentication yes: password authentication is not implemented"
-                        .into(),
-                });
-            }
-            opts.password_authentication = Some(false);
+            opts.password_authentication = Some(parse_yes_no(line)?);
         }
         "kbdinteractiveauthentication" | "challengeresponseauthentication" => {
-            let v = parse_yes_no(line)?;
-            if v {
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "KbdInteractiveAuthentication yes: keyboard-interactive authentication \
-                          is not implemented"
-                        .into(),
-                });
-            }
-            opts.kbd_interactive_authentication = Some(false);
+            opts.kbd_interactive_authentication = Some(parse_yes_no(line)?);
         }
         "authenticationmethods" => {
             if line.args.is_empty() {
@@ -633,22 +624,32 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 });
             }
             // Each space-separated argument is one alternative; each
-            // alternative is a comma-separated chain of required methods.
-            // The only honorable forms are a single `publickey` (or `any`) —
-            // a chain or any non-publickey factor cannot be satisfied.
+            // alternative is a comma-separated chain of required factors. Every
+            // factor must be a method puressh understands; a genuinely-unknown
+            // token is a configuration error (BadValue), not a silent accept.
             for alt in &line.args {
                 if alt == "any" {
                     continue;
                 }
                 let factors: Vec<&str> = alt.split(',').filter(|s| !s.is_empty()).collect();
-                if factors.len() != 1 || factors[0] != "publickey" {
-                    return Err(ConfigError::Unsupported {
+                if factors.is_empty() {
+                    return Err(ConfigError::BadValue {
                         line: line.line_no,
-                        msg: format!(
-                            "AuthenticationMethods {alt:?}: only `publickey` (or `any`) is \
-                             supported — multi-factor chains and non-publickey methods are not"
-                        ),
+                        keyword: kw.to_string(),
+                        msg: format!("empty method list in {alt:?}"),
                     });
+                }
+                for factor in factors {
+                    if !matches!(
+                        factor,
+                        "publickey" | "password" | "keyboard-interactive" | "any" | "none"
+                    ) {
+                        return Err(ConfigError::BadValue {
+                            line: line.line_no,
+                            keyword: kw.to_string(),
+                            msg: format!("unknown authentication method {factor:?}"),
+                        });
+                    }
                 }
             }
             opts.authentication_methods = Some(line.args.clone());
@@ -699,16 +700,7 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             }
         }
         "permitemptypasswords" => {
-            // `no` is the safe default (nothing to honor since there is no
-            // password auth); `yes` would assert a behaviour we can't provide.
-            let v = parse_yes_no(line)?;
-            if v {
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "PermitEmptyPasswords yes: password authentication is not implemented"
-                        .into(),
-                });
-            }
+            opts.permit_empty_passwords = Some(parse_yes_no(line)?);
         }
         "banner" => {
             let s = one_arg(line)?;
@@ -1294,13 +1286,16 @@ Match LocalPort 2222
     }
 
     #[test]
-    fn match_password_auth_yes_unsupported() {
+    fn match_password_auth_yes_accepted() {
         let src = "Match User alice\n  PasswordAuthentication yes\n";
-        let err = SshServerConfig::parse(src).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Unsupported { line: 2, .. }),
-            "{err:?}"
-        );
+        let cfg = SshServerConfig::parse(src).expect("PasswordAuthentication yes parses");
+        // Resolve the Match block for `alice` and confirm it took effect.
+        let ctx = MatchContext {
+            user: Some("alice"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&ctx, ExecPolicy::Deny);
+        assert_eq!(eff.password_authentication, Some(true));
     }
 
     #[test]
@@ -1359,26 +1354,53 @@ Banner /etc/ssh/banner
     }
 
     #[test]
-    fn authentication_methods_multifactor_unsupported() {
-        let err = SshServerConfig::parse("AuthenticationMethods publickey,password\n").unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Unsupported { line: 1, .. }),
-            "{err:?}"
+    fn authentication_methods_multifactor_accepted() {
+        // A multi-factor chain and a single non-publickey factor now parse.
+        let cfg =
+            SshServerConfig::parse("AuthenticationMethods publickey,password\n").unwrap().global;
+        assert_eq!(
+            cfg.authentication_methods.as_deref(),
+            Some(&["publickey,password".to_string()][..])
         );
-        let err2 = SshServerConfig::parse("AuthenticationMethods password\n").unwrap_err();
-        assert!(
-            matches!(err2, ConfigError::Unsupported { line: 1, .. }),
-            "{err2:?}"
+        let cfg2 = SshServerConfig::parse("AuthenticationMethods password\n").unwrap().global;
+        assert_eq!(
+            cfg2.authentication_methods.as_deref(),
+            Some(&["password".to_string()][..])
         );
-        // `any` and bare `publickey` are accepted.
+        // `any` is accepted too.
         assert!(SshServerConfig::parse("AuthenticationMethods any\n").is_ok());
     }
 
     #[test]
-    fn permit_empty_passwords_yes_unsupported() {
-        let err = SshServerConfig::parse("PermitEmptyPasswords yes\n").unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 1, .. }));
-        assert!(SshServerConfig::parse("PermitEmptyPasswords no\n").is_ok());
+    fn authentication_methods_multiple_alternatives_parse() {
+        // Space-separated alternatives, each its own comma chain.
+        let cfg = SshServerConfig::parse(
+            "AuthenticationMethods publickey,password keyboard-interactive\n",
+        )
+        .unwrap()
+        .global;
+        assert_eq!(
+            cfg.authentication_methods.as_deref(),
+            Some(&["publickey,password".to_string(), "keyboard-interactive".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn authentication_methods_unknown_factor_rejected() {
+        let err =
+            SshServerConfig::parse("AuthenticationMethods publickey,bogus\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn permit_empty_passwords_yes_accepted() {
+        let cfg = SshServerConfig::parse("PermitEmptyPasswords yes\n").unwrap().global;
+        assert_eq!(cfg.permit_empty_passwords, Some(true));
+        let cfg2 = SshServerConfig::parse("PermitEmptyPasswords no\n").unwrap().global;
+        assert_eq!(cfg2.permit_empty_passwords, Some(false));
     }
 
     #[test]

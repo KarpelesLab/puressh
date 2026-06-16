@@ -1220,6 +1220,17 @@ impl Config {
 pub trait AuthenticatorFactory: Send + Sync {
     /// Build a fresh authenticator for one connection.
     fn build(&self) -> Box<dyn Authenticator>;
+
+    /// Build a fresh authenticator for one connection, told the peer's
+    /// resolved address. The default ignores `peer` and delegates to
+    /// [`Self::build`]; factories that match `AllowUsers`/`DenyUsers`
+    /// `user@host` patterns override this to capture the peer for the
+    /// host half of the match. `peer` is `None` when the address is the
+    /// unspecified placeholder (e.g. an in-process test transport).
+    fn build_with_peer(&self, peer: Option<&str>) -> Box<dyn Authenticator> {
+        let _ = peer;
+        self.build()
+    }
 }
 
 impl<F> AuthenticatorFactory for F
@@ -1380,6 +1391,9 @@ fn handle_connection_inner(
         &cfg,
         session_id,
         &preauth,
+        peer_ip.as_deref(),
+        local_ip.as_deref(),
+        local_port,
     ))?;
 
     // Past userauth-success: lift the grace timeout. The connection
@@ -1639,6 +1653,7 @@ fn resolve_effective_policy(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_server_auth<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
     codec: &mut PacketCodec,
@@ -1647,14 +1662,18 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     cfg: &Config,
     session_id: Vec<u8>,
     preauth: &PreAuthPolicy,
+    peer_ip: Option<&str>,
+    local_ip: Option<&str>,
+    local_port: Option<u16>,
 ) -> Result<String> {
     let methods = preauth.methods.clone();
-    let auth_impl = cfg.authenticator.build();
+    let auth_impl = cfg.authenticator.build_with_peer(peer_ip);
     let mut server_auth = ServerAuth::new(session_id, methods, auth_impl);
     server_auth.set_max_auth_tries(preauth.max_auth_tries);
 
     // Address-matched banner (USERAUTH_BANNER), sent before the first
-    // USERAUTH_REQUEST per RFC 4252 §5.4. User-matched banners are deferred.
+    // USERAUTH_REQUEST per RFC 4252 §5.4. A `Match User` banner is deferred
+    // until the username is known (the first USERAUTH_REQUEST), below.
     if let Some(text) = preauth.banner.as_deref() {
         let banner = crate::auth::message::UserauthBanner {
             message: text.to_string(),
@@ -1663,8 +1682,66 @@ fn do_server_auth<R: RngCore + CryptoRng>(
         write_payload(stream, codec, rng, &banner.encode())?;
     }
 
+    // Phase 1.5 (mid-userauth): the first USERAUTH_REQUEST exposes the
+    // username. We re-resolve the policy *once* with the user/groups context
+    // so a `Match User`/`Match Group` block can change the advertised method
+    // set (`PubkeyAuthentication` / `AuthenticationMethods`) and deliver a
+    // user-matched banner. `resolved_user` records that we've done it so the
+    // re-resolve never runs twice.
+    let mut resolved_user: Option<String> = None;
+
     for _ in 0..MAX_AUTH_STEPS {
         let payload = read_one_packet(stream, codec, inbox)?;
+
+        // Re-resolve on the first request that carries a username, before the
+        // attempt is evaluated. Subsequent requests reuse the resolved set.
+        if let Some((user, method)) = ServerAuth::peek_request(&payload) {
+            if resolved_user.is_none() {
+                let reres = reresolve_user_policy(
+                    cfg,
+                    &preauth.methods,
+                    &user,
+                    peer_ip,
+                    local_ip,
+                    local_port,
+                );
+                server_auth.set_accepted_methods(reres.methods);
+                if let Some(text) = reres.banner.as_deref() {
+                    let banner = crate::auth::message::UserauthBanner {
+                        message: text.to_string(),
+                        language: String::new(),
+                    };
+                    write_payload(stream, codec, rng, &banner.encode())?;
+                }
+                resolved_user = Some(user);
+            }
+
+            // If the re-resolved policy forbids the method the client is
+            // attempting (e.g. `PubkeyAuthentication no` for this user), the
+            // attempt is rejected without consulting the authenticator. The
+            // `none` probe is always allowed through so the client still
+            // learns the (possibly empty) advertised set.
+            if method != "none" && !server_auth.accepted_methods().contains(&method) {
+                match server_auth.reject_unadvertised()? {
+                    ServerStep::Send(p) => {
+                        write_payload(stream, codec, rng, &p)?;
+                        continue;
+                    }
+                    ServerStep::Disconnect(reason) => {
+                        let _ = send_disconnect(
+                            stream,
+                            codec,
+                            rng,
+                            SSH_DISCONNECT_HOST_NOT_ALLOWED,
+                            reason,
+                        );
+                        return Err(Error::AuthFailed);
+                    }
+                    ServerStep::Authenticated { .. } => unreachable!(),
+                }
+            }
+        }
+
         match server_auth.on_packet(&payload)? {
             ServerStep::Send(p) => write_payload(stream, codec, rng, &p)?,
             ServerStep::Authenticated { payload, user } => {
@@ -1679,6 +1756,53 @@ fn do_server_auth<R: RngCore + CryptoRng>(
         }
     }
     Err(Error::Protocol("auth: too many steps"))
+}
+
+/// Phase 1.5 re-resolution result: the auth method set to advertise once the
+/// username is known, plus a user-matched banner (if any).
+struct ReResolvedUserPolicy {
+    methods: Vec<&'static str>,
+    banner: Option<String>,
+}
+
+/// Re-resolve the policy with the full user/groups context (the first
+/// USERAUTH_REQUEST exposed the username). Yields the user-conditioned method
+/// set and banner. Without a policy this reproduces the pre-auth method set and
+/// no banner. The group context reuses the same [`GroupResolver`] the
+/// post-auth access checks use, so `Match Group` is honoured uniformly.
+fn reresolve_user_policy(
+    cfg: &Config,
+    base_methods: &[&'static str],
+    user: &str,
+    address: Option<&str>,
+    local_address: Option<&str>,
+    local_port: Option<u16>,
+) -> ReResolvedUserPolicy {
+    let Some(policy) = cfg.policy.as_ref() else {
+        return ReResolvedUserPolicy {
+            methods: base_methods.to_vec(),
+            banner: None,
+        };
+    };
+    let groups = resolve_user_groups(cfg, user);
+    let ctx = crate::config::MatchContext {
+        host: "",
+        user: Some(user),
+        groups: groups.as_deref(),
+        address,
+        local_address,
+        local_port,
+        ..crate::config::MatchContext::default()
+    };
+    let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
+    let methods = resolve_auth_methods(&cfg.allowed_auth_methods, &opts);
+    // Unreadable banner file → skip (never fail auth on a bad banner). This
+    // mirrors the address-matched banner path's `.ok()` policy.
+    let banner = opts
+        .banner
+        .as_deref()
+        .and_then(|p| std::fs::read_to_string(p).ok());
+    ReResolvedUserPolicy { methods, banner }
 }
 
 /// Per-connection state for server-initiated `forwarded-tcpip` channel
@@ -4113,6 +4237,85 @@ mod tests {
     }
 
     #[test]
+    fn loopback_match_user_forbids_publickey() {
+        // F5: a `Match User` block sets `PubkeyAuthentication no` for the
+        // target user. The pre-auth (address-only) set still advertises
+        // publickey, but once the username is known the re-resolve drops it,
+        // so the publickey attempt is rejected and authentication fails —
+        // even though the same key would succeed for any other user.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "blocked-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let policy = crate::config::SshServerConfig::parse(
+            "Match User blocked-user\n  PubkeyAuthentication no\n",
+        )
+        .expect("parse policy");
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"never\n".to_vec(),
+            }),
+        )
+        .with_policy(Arc::new(policy));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        let res = client.authenticate_publickey(&user, client_hk);
+        assert!(
+            res.is_err(),
+            "publickey must be rejected for a Match User PubkeyAuthentication no block"
+        );
+
+        drop(client);
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    #[test]
     fn loopback_forces_rekeys_with_tiny_policy() {
         // A 1-KiB byte threshold makes nearly every CHANNEL_DATA packet (and
         // certainly the cumulative response below) tip the codec over the
@@ -5515,6 +5718,127 @@ mod tests {
         let cfg = policy_cfg("MaxAuthTries 3\n");
         let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
         assert_eq!(pre.max_auth_tries, Some(3));
+    }
+
+    // ---- F5: mid-userauth Match User / Match Group method re-resolve --------
+
+    #[test]
+    fn reresolve_match_user_drops_publickey() {
+        // Global allows publickey; a Match User block turns it off for alice.
+        // The pre-auth (address-only) set still advertises publickey, but the
+        // re-resolve once the username is known must drop it for alice and
+        // leave it for bob.
+        let cfg = policy_cfg("Match User alice\n  PubkeyAuthentication no\n");
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.methods, vec!["publickey"]);
+
+        let alice = reresolve_user_policy(&cfg, &pre.methods, "alice", None, None, None);
+        assert!(
+            alice.methods.is_empty(),
+            "alice should lose publickey, got {:?}",
+            alice.methods
+        );
+        let bob = reresolve_user_policy(&cfg, &pre.methods, "bob", None, None, None);
+        assert_eq!(bob.methods, vec!["publickey"]);
+    }
+
+    #[test]
+    fn reresolve_match_group_uses_group_resolver() {
+        // Match Group dev drops publickey; the group context must come from the
+        // configured GroupResolver (the same path the access checks use).
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(fresh_seed()));
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(|| -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: "x".into(),
+                allowed_blob: Vec::new(),
+            })
+        });
+        let policy =
+            crate::config::SshServerConfig::parse("Match Group dev\n  PubkeyAuthentication no\n")
+                .expect("parse");
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        )
+        .with_policy(Arc::new(policy))
+        .with_group_resolver(Arc::new(|user: &str| {
+            if user == "alice" {
+                vec!["dev".to_string()]
+            } else {
+                vec!["users".to_string()]
+            }
+        }));
+
+        let base = vec!["publickey"];
+        // alice is in `dev` ⇒ publickey dropped.
+        let alice = reresolve_user_policy(&cfg, &base, "alice", None, None, None);
+        assert!(alice.methods.is_empty());
+        // bob is not ⇒ publickey kept.
+        let bob = reresolve_user_policy(&cfg, &base, "bob", None, None, None);
+        assert_eq!(bob.methods, vec!["publickey"]);
+    }
+
+    // ---- F6: user-matched Banner --------------------------------------------
+
+    #[test]
+    fn reresolve_match_user_banner() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("puressh-banner-{}.txt", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).expect("create banner");
+            f.write_all(b"hello alice\n").expect("write banner");
+        }
+        let src = format!(
+            "Match User alice\n  Banner {}\n",
+            path.to_str().expect("utf8 path")
+        );
+        let cfg = policy_cfg(&src);
+
+        let base = vec!["publickey"];
+        let alice = reresolve_user_policy(&cfg, &base, "alice", None, None, None);
+        assert_eq!(alice.banner.as_deref(), Some("hello alice\n"));
+        // bob does not match the block ⇒ no banner.
+        let bob = reresolve_user_policy(&cfg, &base, "bob", None, None, None);
+        assert!(bob.banner.is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn reresolve_unreadable_banner_is_skipped() {
+        // A Match User Banner pointing at a missing file must not fail auth —
+        // the banner is simply skipped (None).
+        let cfg = policy_cfg("Match User alice\n  Banner /nonexistent/puressh/banner\n");
+        let base = vec!["publickey"];
+        let alice = reresolve_user_policy(&cfg, &base, "alice", None, None, None);
+        assert!(alice.banner.is_none());
+        assert_eq!(alice.methods, vec!["publickey"]);
+    }
+
+    #[test]
+    fn reresolve_no_policy_passes_through() {
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(fresh_seed()));
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(|| -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: "x".into(),
+                allowed_blob: Vec::new(),
+            })
+        });
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        );
+        let base = vec!["publickey"];
+        let r = reresolve_user_policy(&cfg, &base, "anyone", None, None, None);
+        assert_eq!(r.methods, vec!["publickey"]);
+        assert!(r.banner.is_none());
     }
 
     #[test]

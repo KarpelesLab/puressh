@@ -200,6 +200,47 @@ impl ServerAuth {
         self
     }
 
+    /// Replace the advertised method set (the `USERAUTH_FAILURE`
+    /// continuations). The server re-resolves its `sshd_config` policy once the
+    /// username is first known — a `Match User`/`Match Group` block may then
+    /// change `PubkeyAuthentication` / `AuthenticationMethods`, which adjusts
+    /// what is offered for the remaining attempts.
+    pub fn set_accepted_methods(&mut self, methods: Vec<&'static str>) -> &mut Self {
+        self.accepted_methods = methods;
+        self
+    }
+
+    /// The currently-advertised method set (the `USERAUTH_FAILURE`
+    /// continuations).
+    pub fn accepted_methods(&self) -> &[&'static str] {
+        &self.accepted_methods
+    }
+
+    /// The method name carried by an inbound `USERAUTH_REQUEST` payload, or
+    /// `None` if `payload` is not a well-formed request. Lets the caller learn
+    /// the username/method *before* the attempt is evaluated, so a re-resolved
+    /// policy can be applied (see [`Self::set_accepted_methods`]).
+    pub fn peek_request(payload: &[u8]) -> Option<(String, &'static str)> {
+        let req = UserauthRequest::decode(payload).ok()?;
+        let method = match req.method {
+            AuthMethodPayload::None => "none",
+            AuthMethodPayload::Password { .. } => "password",
+            AuthMethodPayload::PublicKey { .. } => "publickey",
+            AuthMethodPayload::KeyboardInteractive { .. } => "keyboard-interactive",
+            AuthMethodPayload::Other { .. } => return Some((req.user, "")),
+        };
+        Some((req.user, method))
+    }
+
+    /// Reject an attempt whose method is no longer advertised (e.g. a
+    /// `Match User` block dropped `publickey`). Counts as a failed attempt for
+    /// `MaxAuthTries` and emits `USERAUTH_FAILURE` (or `Disconnect` once the
+    /// limit is exceeded) carrying the *current* method set — without ever
+    /// consulting the [`Authenticator`].
+    pub fn reject_unadvertised(&mut self) -> Result<ServerStep> {
+        self.emit_failure()
+    }
+
     /// Opt in to letting the [`Authenticator`] see `AuthAttempt::None`.
     ///
     /// By default this is `false` and the server short-circuits every
@@ -492,6 +533,28 @@ mod tests {
             sa.on_packet(&password_req()).unwrap(),
             ServerStep::Disconnect(_)
         ));
+    }
+
+    #[test]
+    fn peek_request_extracts_user_and_method() {
+        let (user, method) = ServerAuth::peek_request(&password_req()).expect("decoded");
+        assert_eq!(user, "alice");
+        assert_eq!(method, "password");
+        // A non-request payload yields None.
+        assert!(ServerAuth::peek_request(&service_req()).is_none());
+    }
+
+    #[test]
+    fn reject_unadvertised_counts_and_uses_current_methods() {
+        let mut sa = ServerAuth::new(vec![1, 2, 3], vec!["publickey"], Box::new(RejectAll));
+        // A Match block re-resolve drops publickey for this user.
+        sa.set_accepted_methods(vec![]);
+        assert!(sa.accepted_methods().is_empty());
+        assert!(matches!(
+            sa.reject_unadvertised().unwrap(),
+            ServerStep::Send(_)
+        ));
+        assert_eq!(sa.failed_attempts(), 1);
     }
 
     #[test]

@@ -51,35 +51,35 @@ it needs.
 
 ## Server
 
-- **`Match User`/`Match Group` cannot change the advertised auth-method set mid-userauth.**
-  Method-set Match is resolved once, pre-auth, with address-only context
-  (`src/server.rs` two-phase resolve). User/group-conditional `AuthenticationMethods` /
-  `PubkeyAuthentication` are therefore not honored; only address-based method Match and
-  user-based *Banner* are. *Closing it:* re-resolve and re-advertise methods after the
-  first `USERAUTH_REQUEST` exposes the username.
+- ~~**`Match User`/`Match Group` cannot change the advertised auth-method set mid-userauth.**~~
+  **Done.** The effective policy is re-resolved with user/groups context on the first
+  `USERAUTH_REQUEST`; the advertised method set is updated and an attempt at a now-forbidden
+  method is rejected without consulting the authenticator (`src/server.rs`,
+  `src/auth/server.rs`).
 
-- **Banner: user-matched deferred; PrintMotd via PAM only.** Global and `Match Address`
-  banners send `SSH_MSG_USERAUTH_BANNER`; user-matched banners are not yet wired. `PrintMotd`
-  is resolved but the actual `/etc/motd` print is left to `pam_motd` (the sshd binary
-  already runs PAM). *Closing it:* send the banner after the username is known; print motd
-  in the forked shell handler when PAM isn't doing it.
+- ~~**Banner: user-matched deferred; PrintMotd via PAM only.**~~ **Done.** `Match User`
+  banners are sent right after the user-context re-resolve; `PrintMotd=yes` prints
+  CRLF-rewritten `/etc/motd` at interactive-shell start (default off to avoid double-print
+  with `pam_motd`).
 
-- **`ChrootDirectory` honored for SFTP only.** Mapped to the existing SFTP root; for
-  shell/exec sessions it returns `Unsupported` (a real `chroot()` before privilege drop
-  plus a populated root is out of scope). `ForceCommand internal-sftp` + `ChrootDirectory`
-  works. *Closing it:* `chroot()` in the privilege-drop hook (`src/bin/sshd.rs`).
+- ~~**`ChrootDirectory` honored for SFTP only.**~~ **Done.** Real `chroot()` for shell/exec
+  now runs in the forked child while still root (before `setuid`), with `%h`/`%u` token
+  expansion and a root-owned / not-group-or-world-writable ownership check on the dir and
+  every ancestor. `SftpRoot`/`--sftp-root` remain the no-privilege virtual jail.
 
-- **`AllowUsers`/`DenyUsers` `user@host` form rejected.** Bare-user globs are honored;
-  the `@host` form returns `Unsupported` (`src/bin/sshd.rs` `LocalAuthenticator`).
-  *Closing it:* match the host part against the connection's resolved peer address.
+- ~~**`AllowUsers`/`DenyUsers` `user@host` form rejected.**~~ **Done.** `user@host` patterns
+  match the user glob plus the host glob against the connection's resolved peer address.
 
-- **`AuthenticationMethods` multi-factor chains rejected.** Only `publickey`/`any` are
-  honorable (puressh implements publickey only); any non-`publickey` token or `a,b` chain
-  returns `Unsupported`. Closing it depends on implementing additional auth methods.
+## In progress (scope expansion — being implemented)
 
-## Cross-cutting
+- **Certificate authentication** (host + user OpenSSH certs, `CASignatureAlgorithms`,
+  `TrustedUserCAKeys`/`AuthorizedPrincipalsFile`, known_hosts `@cert-authority`). Tracked
+  as workstream FC.
+- **Password / keyboard-interactive authentication** (client + server), unblocking
+  `PasswordAuthentication`, `PermitEmptyPasswords`, `KbdInteractiveAuthentication`, and
+  multi-factor `AuthenticationMethods` chains. Tracked as workstream FD.
 
-- Directives whose underlying feature puressh cannot perform hard-error by design:
-  `PasswordAuthentication yes`, `KbdInteractiveAuthentication yes`,
-  `PermitEmptyPasswords yes`, `PermitTunnel`, `CASignatureAlgorithms`, and external-command
-  `Subsystem` entries. These are not bugs — they are strict-mode rejections.
+## Permanent non-goals (strict-mode rejections, by design — not bugs)
+
+- `PermitTunnel` (tun/tap device forwarding) and external-command `Subsystem` entries are
+  intentionally unsupported and hard-error.

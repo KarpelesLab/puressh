@@ -36,10 +36,18 @@ it needs.
   reaper unlinks idempotently on shutdown so an `ExitRequest` cleans up correctly.
   `send_control_command` lives in `src/mux/client.rs`.
 
-- **`HostKeyAlgorithms +ssh-rsa` is rejected.** Bare `ssh-rsa` (SHA-1) is default-off
-  behind a process-wide flag and is intentionally excluded from the strict known-name set
-  (`src/config/algos.rs`), so it can't be re-enabled via config. *Closing it:* thread the
-  `allow_rsa_sha1` opt-in through the resolver if interop demand appears.
+- ~~**`HostKeyAlgorithms +ssh-rsa` is rejected.**~~ **Done.** `known_names(HostKey)` in
+  `src/config/algos.rs` now lists bare `ssh-rsa` as a *namable* algorithm, while
+  `default_list(HostKey)` still excludes it — so it only enters a resolved list when a
+  config explicitly requests it (`HostKeyAlgorithms +ssh-rsa` or a bare replace). When the
+  client's resolved `HostKeyAlgorithms` names `ssh-rsa`, the binary flips
+  `hostkey::set_allow_rsa_sha1(true)` (in `config_for_host`), enabling SHA-1 host-key
+  verification; the resolved list is advertised in KEXINIT so the connection actually
+  negotiates and verifies `ssh-rsa`. `PubkeyAcceptedAlgorithms` stays strict (no SHA-1
+  pubkey auth). **SECURITY:** `ssh-rsa` uses SHA-1, which is broken; this is an interop
+  opt-in for ancient peers in controlled environments only, OFF by default. The flag is a
+  single process-wide atomic, so once any host's config opts in it affects subsequent
+  host-key verification in the process.
 
 ## Server
 

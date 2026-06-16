@@ -796,6 +796,28 @@ fn config_for_host(
         .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
     let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
     let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
+
+    // HostKeyAlgorithms +ssh-rsa opt-in: if the resolved host-key list names
+    // legacy bare `ssh-rsa`, enable SHA-1 host-key verification. This is the
+    // ONLY way the SHA-1 form is ever permitted — it stays off by default.
+    //
+    // SECURITY: ssh-rsa uses SHA-1, which is broken; the only legitimate use
+    // is interop with ancient peers in known-controlled environments. The flag
+    // is process-wide (a single atomic), so once any host's config opts in it
+    // affects subsequent host-key verification in this process.
+    if cfg_block
+        .host_key_algorithms
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|n| n == "ssh-rsa"))
+    {
+        vlog(
+            1,
+            "HostKeyAlgorithms names ssh-rsa: enabling legacy SHA-1 host-key verification \
+             (insecure; interop opt-in)",
+        );
+        puressh::hostkey::set_allow_rsa_sha1(true);
+    }
+
     Ok(Config {
         host_key_policy: policy,
         timeout: None,

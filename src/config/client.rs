@@ -1249,6 +1249,47 @@ Host gw
     }
 
     #[test]
+    fn host_key_algorithms_plus_ssh_rsa_accepted() {
+        // `HostKeyAlgorithms +ssh-rsa` used to be rejected; it now resolves to
+        // the defaults plus the legacy SHA-1 name appended (opt-in).
+        let src = "Host legacy\n  HostKeyAlgorithms +ssh-rsa\n";
+        let cfg = SshClientConfig::parse(src).expect("+ssh-rsa must parse");
+        let eff = cfg.lookup("legacy");
+        let list = eff
+            .host_key_algorithms
+            .as_deref()
+            .expect("host_key_algorithms set");
+        assert!(
+            list.iter().any(|n| n == "ssh-rsa"),
+            "+ssh-rsa must appear in the resolved list: {list:?}"
+        );
+        assert!(
+            list.iter().any(|n| n == "ssh-ed25519"),
+            "defaults must be preserved ahead of the appended legacy name"
+        );
+    }
+
+    #[test]
+    fn host_key_algorithms_bare_ssh_rsa_accepted() {
+        // A bare replace naming only ssh-rsa is also accepted (explicit opt-in).
+        let src = "Host legacy\n  HostKeyAlgorithms ssh-rsa\n";
+        let cfg = SshClientConfig::parse(src).expect("bare ssh-rsa must parse");
+        let eff = cfg.lookup("legacy");
+        assert_eq!(
+            eff.host_key_algorithms.as_deref(),
+            Some(&["ssh-rsa".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn pubkey_accepted_ssh_rsa_still_rejected() {
+        // The SHA-1 opt-in is HostKey-only; pubkey auth must still reject it.
+        let src = "Host legacy\n  PubkeyAcceptedAlgorithms +ssh-rsa\n";
+        let err = SshClientConfig::parse(src).unwrap_err();
+        assert!(matches!(err, ConfigError::BadValue { .. }));
+    }
+
+    #[test]
     fn unknown_cipher_rejected_with_line() {
         let src = "Host gw\n  Ciphers totally-bogus\n";
         let err = SshClientConfig::parse(src).unwrap_err();

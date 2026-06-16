@@ -304,8 +304,27 @@ struct SubsystemRuntime {
     close_sent: bool,
 }
 
+/// Per-connection context handed to the [`Config::on_session_open`] hook.
+///
+/// Carries the values resolved from the per-connection [`EffectivePolicy`]
+/// that the hook must act on while the server may still hold root.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionOpenContext<'a> {
+    /// The authenticated username.
+    pub user: &'a str,
+    /// Resolved `ChrootDirectory`, if any. An implementation that drops
+    /// privileges (`setuid`) must `chroot()` to this *first*, while still root.
+    pub chroot_directory: Option<&'a str>,
+    /// Resolved `PrintMotd`. When `true`, an interactive (PTY) shell should
+    /// print `/etc/motd` at startup. Defaults to `false`.
+    pub print_motd: bool,
+}
+
 /// Callback type for [`Config::on_session_open`].
-pub type SessionOpenCallback = Arc<dyn Fn(&str) -> Result<()> + Send + Sync>;
+///
+/// Called once per connection, post-auth, while the server may still hold
+/// root. See [`SessionOpenContext`] for the supplied per-connection policy.
+pub type SessionOpenCallback = Arc<dyn Fn(&SessionOpenContext<'_>) -> Result<()> + Send + Sync>;
 
 /// Server-side hook called when a client sends a `"subsystem"` channel
 /// request (e.g. `"sftp"`).
@@ -888,8 +907,10 @@ pub struct EffectivePolicy {
     /// `ForceCommand` — overrides the client's exec/shell command. The
     /// original command is exposed as `SSH_ORIGINAL_COMMAND`.
     pub force_command: Option<String>,
-    /// `ChrootDirectory` — SFTP root override (only honoured for the SFTP
-    /// path). `None` ⇒ none.
+    /// `ChrootDirectory` — the directory the session is confined to. Passed to
+    /// the [`Config::on_session_open`] hook so it can `chroot()` (while still
+    /// root, before any `setuid`) — confining shell, exec, and the in-process
+    /// SFTP subsystem alike. `None` ⇒ no chroot.
     pub chroot_directory: Option<String>,
     /// `ClientAliveInterval` in seconds. `None`/`0` ⇒ keepalive disabled.
     pub client_alive_interval: Option<u32>,
@@ -1201,10 +1222,13 @@ impl Config {
 
     /// Register a callback fired once per connection between
     /// `userauth_success` and the channel loop. Use this to drop privileges
-    /// to the authenticated user. Returning `Err` aborts the connection.
+    /// to the authenticated user. The [`SessionOpenContext`] carries the
+    /// resolved `ChrootDirectory` (an implementation that `setuid`s should
+    /// `chroot()` to it first, while still root) and `PrintMotd`. Returning
+    /// `Err` aborts the connection.
     pub fn on_session_open<F>(mut self, f: F) -> Self
     where
-        F: Fn(&str) -> Result<()> + Send + Sync + 'static,
+        F: Fn(&SessionOpenContext<'_>) -> Result<()> + Send + Sync + 'static,
     {
         self.on_session_open = Some(Arc::new(f));
         self
@@ -1404,19 +1428,11 @@ fn handle_connection_inner(
         stream.set_read_timeout(None)?;
     }
 
-    // Connection-level hook: drop privileges to the authenticated user
-    // before any shell / exec / subsystem runs. After this call all I/O on
-    // this connection happens as `user`, including the in-process SFTP
-    // subsystem and any forked exec children.
-    if let Some(hook) = cfg.on_session_open.clone() {
-        hook(&user)?;
-    }
-
-    // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
-    codec.activate_compress();
-
     // Phase 2 (post-auth): resolve the policy with the full user/groups
-    // context to build the per-connection capability ceiling.
+    // context to build the per-connection capability ceiling. Resolved
+    // *before* the privilege-drop hook so the hook can act on policy that
+    // must take effect while we are still root — notably `ChrootDirectory`,
+    // which must `chroot()` before `setuid` (chroot needs root).
     let groups = resolve_user_groups(&cfg, &user);
     let effective = resolve_effective_policy(
         &cfg,
@@ -1426,6 +1442,24 @@ fn handle_connection_inner(
         local_ip.as_deref(),
         local_port,
     );
+
+    // Connection-level hook: drop privileges to the authenticated user
+    // before any shell / exec / subsystem runs. After this call all I/O on
+    // this connection happens as `user`, including the in-process SFTP
+    // subsystem and any forked exec children. The hook is also told the
+    // resolved `ChrootDirectory` (if any) so it can `chroot()` while still
+    // root, before its own `setuid`.
+    if let Some(hook) = cfg.on_session_open.clone() {
+        let ctx = SessionOpenContext {
+            user: &user,
+            chroot_directory: effective.chroot_directory.as_deref(),
+            print_motd: effective.print_motd.unwrap_or(false),
+        };
+        hook(&ctx)?;
+    }
+
+    // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
+    codec.activate_compress();
 
     let rekey_policy = cfg.rekey_policy;
     let r = do_connection_phase(

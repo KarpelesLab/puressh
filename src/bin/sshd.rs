@@ -68,8 +68,8 @@ mod imp {
     };
     use puressh::server::{
         AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult, ExecStreamHandler,
-        HARD_BLOCKED_ENV_NAMES, PtySpec, SessionEnv, ShellExitStatus, ShellHandler, ShellSession,
-        SubsystemHandler, handle_session_with_peer,
+        HARD_BLOCKED_ENV_NAMES, PtySpec, SessionEnv, SessionOpenContext, ShellExitStatus,
+        ShellHandler, ShellSession, SubsystemHandler, handle_session_with_peer,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -1483,6 +1483,11 @@ mod imp {
     struct NixShellHandler {
         pam: Arc<pam_gate::PamGate>,
         debug: bool,
+        /// Per-connection `PrintMotd`, written by `on_session_open` and read at
+        /// shell spawn. Shared via `Arc` so the (COW-isolated, per-fork) child
+        /// sees the value the hook resolved for this connection. Only the PTY
+        /// path consults it — `/etc/motd` is for interactive logins.
+        print_motd: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl ShellHandler for NixShellHandler {
@@ -1502,10 +1507,46 @@ mod imp {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
             match pty {
-                Some(spec) => spawn_pty_shell(&self.pam, user, &env_pairs, &spec, self.debug),
+                Some(spec) => {
+                    let print_motd = self.print_motd.load(std::sync::atomic::Ordering::Relaxed);
+                    spawn_pty_shell(&self.pam, user, &env_pairs, &spec, self.debug, print_motd)
+                }
                 None => spawn_pipe_shell(&self.pam, user, &env_pairs, self.debug),
             }
         }
+    }
+
+    /// Read `/etc/motd` and return its bytes with bare `\n` line endings
+    /// rewritten to `\r\n` so the message displays correctly on the raw PTY
+    /// (a terminal in raw mode does not translate `\n`). Returns `None` (and,
+    /// in debug, warns) if the file is missing or unreadable — a missing motd
+    /// is normal and must never block the shell.
+    fn read_motd_for_pty(debug: bool) -> Option<Vec<u8>> {
+        match std::fs::read("/etc/motd") {
+            Ok(bytes) => Some(crlf_for_pty(&bytes)),
+            Err(e) => {
+                if debug {
+                    eprintln!("sshd: PrintMotd: cannot read /etc/motd: {e}");
+                }
+                None
+            }
+        }
+    }
+
+    /// Rewrite bare `\n` to `\r\n` for display on a raw-mode PTY. An existing
+    /// `\r\n` is left intact (the `\r` is copied, then the `\n` does not get a
+    /// second `\r` prepended because the byte before it was already `\r`).
+    fn crlf_for_pty(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len() + 16);
+        let mut prev = 0u8;
+        for &b in bytes {
+            if b == b'\n' && prev != b'\r' {
+                out.push(b'\r');
+            }
+            out.push(b);
+            prev = b;
+        }
+        out
     }
 
     // -------------------------------------------------------------------------
@@ -1834,6 +1875,88 @@ mod imp {
         })
     }
 
+    /// Expand the OpenSSH `%h` (home) / `%u` (user) / `%%` tokens in a
+    /// `ChrootDirectory` template against the target user's passwd entry.
+    /// Unknown `%X` sequences are rejected so a typo can't silently produce a
+    /// surprising path.
+    fn expand_chroot_tokens(template: &str, info: &UserInfo) -> Result<String, String> {
+        let mut out = String::with_capacity(template.len());
+        let mut chars = template.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('h') => out.push_str(&info.home_str),
+                Some('u') => out.push_str(&info.name),
+                Some('%') => out.push('%'),
+                Some(other) => {
+                    return Err(format!("unknown ChrootDirectory token %{other}"));
+                }
+                None => return Err("trailing % in ChrootDirectory".to_string()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// StrictModes-style validation of a resolved `ChrootDirectory`: the
+    /// directory and every parent component up to `/` must be owned by root
+    /// (uid 0) and not group- or world-writable, exactly as OpenSSH requires
+    /// (`safely_chroot`). Returns the resolved path on success.
+    fn validate_chroot_dir(path: &str) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let md =
+            std::fs::metadata(path).map_err(|e| format!("stat ChrootDirectory {path}: {e}"))?;
+        if !md.is_dir() {
+            return Err(format!("ChrootDirectory {path}: not a directory"));
+        }
+        // Walk this component and every ancestor; each must be root-owned and
+        // not group/world-writable. OpenSSH refuses a chroot whose path is
+        // writable by anyone but root, since a writable parent lets a
+        // non-root user swap the target out from under the daemon.
+        let mut cur: Option<&std::path::Path> = Some(std::path::Path::new(path));
+        while let Some(p) = cur {
+            let md = std::fs::metadata(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
+            if md.uid() != 0 {
+                return Err(format!(
+                    "ChrootDirectory component {} must be owned by root (uid 0), is uid {}",
+                    p.display(),
+                    md.uid()
+                ));
+            }
+            if md.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "ChrootDirectory component {} is group/world-writable (mode 0o{:o})",
+                    p.display(),
+                    md.mode() & 0o777
+                ));
+            }
+            cur = p.parent();
+        }
+        Ok(())
+    }
+
+    /// Resolve, validate, and `chroot()` into `template` for `user`, then
+    /// `chdir("/")` inside the new root. Must run **while still root**, before
+    /// any `setuid` — `chroot(2)` requires `CAP_SYS_CHROOT`. Called from
+    /// `Config::on_session_open` ahead of [`drop_to_user`].
+    fn apply_chroot(user: &str, template: &str, debug: bool) -> puressh::Result<()> {
+        let info = lookup_user(user)?;
+        let resolved = expand_chroot_tokens(template, &info).map_err(|e| {
+            puressh::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })?;
+        validate_chroot_dir(&resolved).map_err(|e| {
+            puressh::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, e))
+        })?;
+        nix::unistd::chroot(resolved.as_str()).map_err(nix_io)?;
+        nix::unistd::chdir("/").map_err(nix_io)?;
+        if debug {
+            eprintln!("sshd: chrooted {user} into {resolved}");
+        }
+        Ok(())
+    }
+
     /// Drop the calling process to `user`'s primary uid/gid (with supplementary
     /// groups via `initgroups`). Idempotent — if we already match `info`'s
     /// ids, the function is a no-op. Called from `Config::on_session_open`
@@ -1921,7 +2044,21 @@ mod imp {
         session_env: &[(String, String)],
         spec: &PtySpec,
         debug: bool,
+        print_motd: bool,
     ) -> puressh::Result<Box<dyn ShellSession>> {
+        // PrintMotd: read /etc/motd in the parent (we may already be inside the
+        // ChrootDirectory and dropped to the user — the file is read from the
+        // session's view of the filesystem). The bytes are written to the
+        // slave pty in the child just before exec so they land on the terminal
+        // ahead of the shell prompt. Default is off, so this is skipped unless
+        // PrintMotd=yes — which avoids double-printing when PAM's pam_motd is
+        // already configured.
+        let motd: Option<Vec<u8>> = if print_motd {
+            read_motd_for_pty(debug)
+        } else {
+            None
+        };
+
         let ws = nix::pty::Winsize {
             ws_row: clamp_u16(spec.rows),
             ws_col: clamp_u16(spec.cols),
@@ -2076,6 +2213,20 @@ mod imp {
                 for (k, v) in &channel_envs {
                     unsafe {
                         libc::setenv(k.as_ptr(), v.as_ptr(), 1);
+                    }
+                }
+
+                // PrintMotd: write /etc/motd to the terminal (fd 1 is the
+                // slave pty after the dup2 above) before handing control to the
+                // shell. `write(2)` is async-signal-safe; the byte buffer was
+                // read in the parent. Best-effort — a short write or error must
+                // not block the login.
+                if let Some(bytes) = &motd {
+                    // SAFETY: fd 1 is the slave pty; `bytes` is an owned, live
+                    // buffer. write() is async-signal-safe in the post-fork
+                    // child. Ignore the result (best-effort motd).
+                    unsafe {
+                        let _ = libc::write(1, bytes.as_ptr() as *const libc::c_void, bytes.len());
                     }
                 }
 
@@ -2479,15 +2630,17 @@ mod imp {
             true,
         );
         let sftp_read_only = pick(cli.sftp_read_only, sshd_cfg.global.sftp_read_only, false);
-        // SFTP root precedence: CLI `--sftp-root` > puressh `SftpRoot` >
-        // standard `ChrootDirectory` (the latter is the OpenSSH spelling and
-        // is honoured only for the in-process SFTP path — a real chroot for
-        // shell/exec is out of scope, which the config parser keeps honest).
+        // SFTP virtual-root precedence: CLI `--sftp-root` > puressh `SftpRoot`.
+        // This is an in-process path jail that needs no privilege. The standard
+        // `ChrootDirectory` is no longer mapped here: it now drives a *real*
+        // `chroot()` in `on_session_open` (see `apply_chroot`), which confines
+        // shell / exec / SFTP uniformly — the in-process SFTP subsystem runs
+        // after that hook, so it already operates inside the new root. (A real
+        // chroot requires root, exactly as OpenSSH's `ChrootDirectory` does.)
         let sftp_root: Option<std::path::PathBuf> = cli
             .sftp_root
             .as_deref()
             .or(sshd_cfg.global.sftp_root.as_deref())
-            .or(sshd_cfg.global.chroot_directory.as_deref())
             .map(std::path::PathBuf::from);
         let scp_enabled = pick(cli.scp, sshd_cfg.global.scp_enabled, true);
         let agent_forward = pick(
@@ -2612,6 +2765,11 @@ mod imp {
         // own copy — no cross-connection state bleed.
         let pam_gate = pam_gate::PamGate::new(cli.debug);
 
+        // Per-connection `PrintMotd`, resolved by `on_session_open` and read by
+        // the PTY shell handler. Shared by `Arc` so the (COW-isolated) forked
+        // child sees the value the hook wrote for *this* connection.
+        let print_motd_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let mut config = Config::new(
             host_keys,
             factory,
@@ -2625,6 +2783,7 @@ mod imp {
         .with_shell(Arc::new(NixShellHandler {
             pam: pam_gate.clone(),
             debug: cli.debug,
+            print_motd: print_motd_flag.clone(),
         }));
 
         if sftp_enabled {
@@ -2673,7 +2832,9 @@ mod imp {
         // once-guarded) and simply return the cached PAM env list.
         let debug = cli.debug;
         let session_pam = pam_gate.clone();
-        config = config.on_session_open(move |user: &str| {
+        let session_print_motd = print_motd_flag.clone();
+        config = config.on_session_open(move |ctx: &SessionOpenContext<'_>| {
+            let user = ctx.user;
             // PermitRootLogin backstop, evaluated at login time before we
             // open a PAM session or drop privilege. The authenticator already
             // denies root during userauth; this re-checks against the live
@@ -2691,9 +2852,23 @@ mod imp {
                     "root login not permitted",
                 )));
             }
+            // Stash the resolved PrintMotd for this connection so the PTY shell
+            // handler (which runs later, in a COW-isolated forked child) can
+            // read it. Default-off; only printed when PrintMotd=yes — which
+            // avoids double-printing alongside PAM's pam_motd.
+            session_print_motd.store(ctx.print_motd, std::sync::atomic::Ordering::Relaxed);
             // PAM_TTY = "ssh" matches OpenSSH's value for the session-level
             // gate; PTY shells later re-call ensure() (a no-op) for env.
             session_pam.ensure(user, "ssh")?;
+            // ChrootDirectory: chroot() while we still hold root, *before*
+            // drop_to_user's setuid (chroot(2) needs CAP_SYS_CHROOT). This
+            // confines shell / exec / SFTP alike — the SFTP subsystem runs
+            // in-process after this hook, so it inherits the new root too.
+            // The path is validated StrictModes-style (root-owned, not
+            // group/world-writable) before the chroot.
+            if let Some(dir) = ctx.chroot_directory {
+                apply_chroot(user, dir, debug)?;
+            }
             drop_to_user(user, debug)
         });
 
@@ -2942,7 +3117,14 @@ mod imp {
             deny_groups: &[&str],
             groups: std::collections::HashMap<String, Vec<String>>,
         ) -> LocalAuthenticator {
-            auth_with_peer(allow_users, deny_users, allow_groups, deny_groups, groups, None)
+            auth_with_peer(
+                allow_users,
+                deny_users,
+                allow_groups,
+                deny_groups,
+                groups,
+                None,
+            )
         }
 
         /// Like [`auth_with`] but pins the connection's resolved peer address,
@@ -3021,7 +3203,7 @@ mod imp {
 
         #[test]
         fn allow_users_at_host_matches_peer() {
-            // alice only from 10.* hosts.
+            // alice@10.0.0.0/8-ish glob: only from 10.* hosts.
             let mut a = auth_with_peer(
                 &["alice@10.*"],
                 &[],
@@ -3031,7 +3213,8 @@ mod imp {
                 Some("10.1.2.3"),
             );
             assert!(a.access_allowed("alice"));
-            assert!(!a.access_allowed("bob")); // wrong user
+            // Wrong user.
+            assert!(!a.access_allowed("bob"));
 
             // Same rule, peer outside the host glob ⇒ denied.
             let mut b = auth_with_peer(
@@ -3066,7 +3249,8 @@ mod imp {
 
         #[test]
         fn deny_users_at_host_blocks_by_peer() {
-            // eve is allowed by the wildcard, but denied from the evil range.
+            // eve is allowed by the wildcard, but denied specifically from the
+            // evil host range.
             let mut a = auth_with_peer(
                 &["*"],
                 &["eve@10.6.6.*"],
@@ -3103,6 +3287,138 @@ mod imp {
             let bare = UserHostPattern::parse("dev-*");
             assert!(bare.host.is_none());
             assert!(bare.positive_match("dev-1", None));
+        }
+
+        // ---- F7: ChrootDirectory path resolution + ownership check ----------
+
+        #[test]
+        fn chroot_token_expansion() {
+            let info = lookup_user_for_test();
+            let out = expand_chroot_tokens("/chroots/%u", &info).expect("expand");
+            assert_eq!(out, format!("/chroots/{}", info.name));
+            let out2 = expand_chroot_tokens("%h/jail", &info).expect("expand");
+            assert_eq!(out2, format!("{}/jail", info.home_str));
+            assert_eq!(
+                expand_chroot_tokens("100%%", &info).expect("expand"),
+                "100%"
+            );
+            // Unknown token rejected.
+            assert!(expand_chroot_tokens("%z", &info).is_err());
+            assert!(expand_chroot_tokens("trailing%", &info).is_err());
+        }
+
+        /// Resolve a real user for token-expansion tests: prefer $USER, fall
+        /// back to root (always present).
+        fn lookup_user_for_test() -> UserInfo {
+            std::env::var("USER")
+                .ok()
+                .filter(|n| !n.is_empty())
+                .and_then(|n| lookup_user(&n).ok())
+                .or_else(|| lookup_user("root").ok())
+                .expect("a resolvable test user")
+        }
+
+        #[test]
+        fn chroot_validation_rejects_non_root_owned() {
+            // A temp dir created by the (non-root) test process is owned by the
+            // test user, not root ⇒ the StrictModes-style check must refuse it.
+            // Skip when the suite happens to run as root (the dir would then be
+            // root-owned and pass the ownership half).
+            if nix::unistd::geteuid().is_root() {
+                return;
+            }
+            let dir = std::env::temp_dir().join(format!("puressh-chroot-{}", std::process::id()));
+            let _ = std::fs::create_dir(&dir);
+            let res = validate_chroot_dir(dir.to_str().unwrap());
+            assert!(
+                res.is_err(),
+                "a non-root-owned chroot dir must be rejected: {res:?}"
+            );
+            let _ = std::fs::remove_dir(&dir);
+        }
+
+        #[test]
+        fn chroot_validation_root_passes_ownership_but_checks_writability() {
+            // `/` is root-owned and not group/world-writable on a sane system,
+            // so the validator accepts it. (This documents the happy path
+            // without needing root to create a fixture.)
+            // Only assert when `/` actually has secure modes (it does on
+            // standard installs); otherwise skip to avoid CI flakiness.
+            use std::os::unix::fs::MetadataExt;
+            if let Ok(md) = std::fs::metadata("/")
+                && md.uid() == 0
+                && md.mode() & 0o022 == 0
+            {
+                assert!(validate_chroot_dir("/").is_ok());
+            }
+        }
+
+        /// End-to-end chroot confinement. Requires root (chroot(2) needs
+        /// CAP_SYS_CHROOT) and is therefore `#[ignore]`d by default; run with
+        /// `sudo cargo test --bin sshd -- --ignored chroot_confines`.
+        ///
+        /// Builds a root-owned jail containing a single marker file, forks,
+        /// `apply_chroot`s in the child, and asserts that (a) the marker is now
+        /// reachable at `/marker` and (b) a host-only path outside the jail is
+        /// no longer reachable — i.e. the process is genuinely confined.
+        #[test]
+        #[ignore = "needs root: chroot(2) requires CAP_SYS_CHROOT"]
+        fn chroot_confines_filesystem() {
+            use std::io::Write;
+            use std::os::unix::fs::PermissionsExt;
+
+            assert!(
+                nix::unistd::geteuid().is_root(),
+                "this #[ignore] test must run as root"
+            );
+
+            let jail = std::env::temp_dir().join(format!("puressh-jail-{}", std::process::id()));
+            std::fs::create_dir_all(&jail).expect("mkdir jail");
+            // Root-owned (we are root) and 0755 — passes the StrictModes check.
+            std::fs::set_permissions(&jail, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod jail");
+            {
+                let mut f = std::fs::File::create(jail.join("marker")).expect("marker");
+                f.write_all(b"inside").expect("write marker");
+            }
+
+            // A sentinel that exists on the host but NOT inside the jail.
+            let host_only =
+                std::env::temp_dir().join(format!("puressh-host-only-{}", std::process::id()));
+            std::fs::File::create(&host_only).expect("host-only");
+
+            // Fork so the chroot does not poison the rest of the test process.
+            // SAFETY: single-threaded test child; only does fs reads + _exit.
+            match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => {
+                    let ok = apply_chroot("root", jail.to_str().unwrap(), false).is_ok()
+                        && std::fs::read("/marker")
+                            .map(|b| b == b"inside")
+                            .unwrap_or(false)
+                        && !std::path::Path::new(host_only.to_str().unwrap()).exists();
+                    unsafe { libc::_exit(if ok { 0 } else { 1 }) };
+                }
+                ForkResult::Parent { child } => {
+                    let status = nix::sys::wait::waitpid(child, None).expect("waitpid");
+                    let _ = std::fs::remove_file(&host_only);
+                    let _ = std::fs::remove_dir_all(&jail);
+                    assert!(
+                        matches!(status, nix::sys::wait::WaitStatus::Exited(_, 0)),
+                        "child reported chroot confinement failure: {status:?}"
+                    );
+                }
+            }
+        }
+
+        // ---- F6: PrintMotd CRLF rewriting -----------------------------------
+
+        #[test]
+        fn motd_crlf_rewrite() {
+            // Bare LF gets a CR; existing CRLF is preserved (no doubled CR).
+            assert_eq!(crlf_for_pty(b"hello\nworld\n"), b"hello\r\nworld\r\n");
+            assert_eq!(crlf_for_pty(b"a\r\nb"), b"a\r\nb");
+            assert_eq!(crlf_for_pty(b"no newline"), b"no newline");
+            assert_eq!(crlf_for_pty(b""), b"");
         }
 
         #[test]

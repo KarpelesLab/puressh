@@ -171,9 +171,11 @@ pub struct ServerOptions {
     /// The literal `internal-sftp` routes to the in-process SFTP subsystem.
     /// `None` ⇒ no forced command.
     pub force_command: Option<String>,
-    /// `ChrootDirectory` — chroot for the session. Only honoured for the
-    /// SFTP path (mapped onto the SFTP root); a real chroot for shell/exec is
-    /// out of scope. `None` ⇒ no chroot.
+    /// `ChrootDirectory` — chroot for the session. The `sshd` binary performs
+    /// a real `chroot()` (in its privilege-drop hook, while still root, before
+    /// `setuid`) that confines shell, exec, and the in-process SFTP subsystem
+    /// alike. `%h`/`%u` tokens are expanded; the directory must be root-owned
+    /// and not group/world-writable. `None` ⇒ no chroot.
     pub chroot_directory: Option<String>,
     /// `ClientAliveInterval` in seconds — server keepalive cadence. `0`/`None`
     /// ⇒ disabled.

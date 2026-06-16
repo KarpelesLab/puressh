@@ -47,7 +47,7 @@ pub use path::{
 #[cfg(feature = "multichannel")]
 mod server;
 #[cfg(feature = "multichannel")]
-pub use server::{MasterConfig, Persist, run_master};
+pub use server::{MasterConfig, Persist, run_master, run_master_daemon};
 
 #[cfg(feature = "multichannel")]
 mod client;

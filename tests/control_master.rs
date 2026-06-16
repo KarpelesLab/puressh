@@ -283,6 +283,73 @@ fn control_persist_seconds_master_exits_after_idle() {
     let _ = srv.handle.join();
 }
 
+/// `run_master_daemon` (the entry point the ControlPersist fork() child calls):
+/// it must serve mux clients with no foreground session and, under
+/// `Persist::Seconds`, exit after the linger window once the last client
+/// detaches. We exercise it in a thread rather than a real fork (the test
+/// harness is multi-threaded, where fork() is unsafe); the daemon's blocking +
+/// teardown semantics are what we verify here. The fork()+setsid() wrapper is
+/// covered by the manual check documented in `become_master`/`daemonize_master`.
+#[test]
+fn run_master_daemon_serves_then_exits_after_idle() {
+    let srv = spawn_server(b"daemon-banner\n");
+    let shared = connect_and_auth(&srv);
+    assert_eq!(srv.accepts.load(Ordering::SeqCst), 1, "one auth at master");
+
+    let sock = unique_socket_path("daemon");
+    let cfg = MasterConfig {
+        control_path: sock.clone(),
+        persist: Persist::Seconds(1),
+    };
+
+    // run_master_daemon blocks until shutdown, so drive it from a thread.
+    let daemon = thread::spawn(move || {
+        let _ = puressh::mux::run_master_daemon(cfg, shared);
+    });
+
+    // Master should come up.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if puressh::mux::probe_master(&sock) == ProbeOutcome::Live {
+            break;
+        }
+        assert!(Instant::now() < deadline, "daemon master never came up");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    // A mux client runs a command over the daemon's connection — no 2nd auth.
+    let req = SessionRequest {
+        want_pty: false,
+        term: String::new(),
+        cols: 0,
+        rows: 0,
+        env: vec![],
+        command: Some("echo hi".into()),
+    };
+    let status = puressh::mux::run_client(&sock, &req, None).expect("mux client run");
+    assert_eq!(status, 0, "remote exec exit status over daemon");
+    assert_eq!(
+        srv.accepts.load(Ordering::SeqCst),
+        1,
+        "daemon mux client must not trigger a second auth"
+    );
+
+    // After the client detaches, the 1s linger elapses and the daemon unlinks
+    // the socket and returns (its thread joins).
+    let gone_by = Instant::now() + Duration::from_secs(6);
+    while sock.exists() {
+        assert!(
+            Instant::now() < gone_by,
+            "daemon master did not exit after idle linger"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let _ = daemon.join();
+
+    drop(srv.accepts);
+    let _ = srv.handle.join();
+}
+
 /// Like [`spawn_server`] but permits `direct-tcpip` so a mux client can carry
 /// `ssh -L` / `-D` forwards over the master's connection.
 fn spawn_server_direct_tcpip(banner: &[u8]) -> TestServer {

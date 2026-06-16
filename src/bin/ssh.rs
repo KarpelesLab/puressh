@@ -1315,7 +1315,9 @@ fn run() -> Result<i32, String> {
         if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
             let shared: puressh::shared::SharedClient = client.into();
             let cmd = command.clone();
-            return become_master(dec, shared, move |s| run_exec_shared(s, &cmd));
+            return become_master(dec, &cli, &cfg_block, shared, move |s| {
+                run_exec_shared(s, &cmd)
+            });
         }
         let out = client.exec(&command).map_err(|e| format!("exec: {e}"))?;
         let _ = std::io::stdout().write_all(&out.stdout);
@@ -1343,7 +1345,7 @@ fn run() -> Result<i32, String> {
         // Master role: serve the control socket while running this shell as
         // the foreground session.
         if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
-            return become_master(dec, shared, move |s| {
+            return become_master(dec, &cli, &cfg_block, shared, move |s| {
                 if use_pty {
                     run_interactive_pty_shell_on(s)
                 } else {
@@ -1638,26 +1640,150 @@ fn term_env() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string())
 }
 
-/// Become the ControlMaster: bind the socket and serve clients while running
-/// `foreground` as this invocation's own session.
+/// Become the ControlMaster and run this invocation's own session.
+///
+/// Under `ControlPersist no` the master is tied to the foreground session: we
+/// stay in this process, bind the socket, serve clients, and run `foreground`
+/// (the user's exec / shell) against the master's `SharedClient`. When it
+/// returns, the master tears down and unlinks the socket.
+///
+/// Under `ControlPersist yes`/`<N>` we **daemonize**: `fork()`+`setsid()` move
+/// the authenticated connection into an independent background process that
+/// outlives this `ssh` invocation. The daemon child binds the socket and serves
+/// clients ([`puressh::mux::run_master_daemon`]); the foreground (this process)
+/// then runs its own session as an ordinary mux client over the control socket,
+/// exactly like any later `ssh` to the same master. This is the OpenSSH model:
+/// killing the launching `ssh` leaves the master (and any other attached
+/// sessions) alive.
 #[cfg(unix)]
 fn become_master<F>(
     dec: &MuxDecision,
+    cli: &Cli,
+    cfg_block: &puressh::config::ClientOptions,
     shared: puressh::shared::SharedClient,
     foreground: F,
 ) -> Result<i32, String>
 where
     F: FnOnce(&puressh::shared::SharedClient) -> i32 + Send + 'static,
 {
-    vlog(
-        1,
-        &format!("mux: becoming master at {}", dec.path.display()),
-    );
     let cfg = puressh::mux::MasterConfig {
         control_path: dec.path.clone(),
         persist: dec.persist,
     };
-    puressh::mux::run_master(cfg, shared, foreground)
+
+    // ControlPersist no: master lives and dies with the foreground session in
+    // this process. No daemonization.
+    if matches!(dec.persist, puressh::mux::Persist::No) {
+        vlog(
+            1,
+            &format!("mux: becoming master at {}", dec.path.display()),
+        );
+        return puressh::mux::run_master(cfg, shared, foreground);
+    }
+
+    // ControlPersist yes/<N>: daemonize the master.
+    vlog(
+        1,
+        &format!(
+            "mux: becoming persistent master at {} (daemonizing)",
+            dec.path.display()
+        ),
+    );
+    daemonize_master(dec, cli, cfg_block, shared, cfg)
+}
+
+/// Fork the authenticated connection into a detached daemon that owns the
+/// ControlMaster, then run the foreground session in the parent as a mux
+/// client over the freshly-bound control socket.
+///
+/// fd / Drop discipline: after `fork()` both processes share the SSH socket fd.
+/// The **child** is the sole user of it (the master). The **parent** must never
+/// touch the inherited `SharedClient` — dropping it would send channel/close
+/// traffic on the shared socket and corrupt the daemon's connection — so we
+/// `mem::forget` the parent's handle. The parent reaches the server only via
+/// the control socket from here on.
+#[cfg(unix)]
+fn daemonize_master(
+    dec: &MuxDecision,
+    cli: &Cli,
+    cfg_block: &puressh::config::ClientOptions,
+    shared: puressh::shared::SharedClient,
+    cfg: puressh::mux::MasterConfig,
+) -> Result<i32, String> {
+    use nix::unistd::{ForkResult, fork, setsid};
+
+    // SAFETY: the binary is outside the library's `forbid(unsafe_code)`. At
+    // this point we are still single-threaded (no serve / I/O threads have
+    // been spawned yet — those start inside run_master_daemon in the child),
+    // so fork() does not orphan any locks.
+    match unsafe { fork() }.map_err(|e| format!("ControlPersist: fork failed: {e}"))? {
+        ForkResult::Child => {
+            // --- Daemon master process ---
+            // New session: detach from the controlling terminal so the master
+            // is not killed when the launching shell / terminal goes away.
+            let _ = setsid();
+            // Detach stdio: the daemon must not hold the terminal's fds open
+            // (that would wedge the parent's tty on exit) nor write to it.
+            detach_stdio();
+            // Serve until the persist policy / `-O exit` tears us down. The
+            // daemon never returns to `run()`; exit directly with its status.
+            let code = match puressh::mux::run_master_daemon(cfg, shared) {
+                Ok(()) => 0,
+                Err(e) => {
+                    // stderr is /dev/null now; nothing useful to print.
+                    let _ = e;
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+        ForkResult::Parent { .. } => {
+            // --- Foreground (launcher) process ---
+            // We must NOT run Drop on our copy of the connection: the daemon
+            // owns the SSH socket now. Leak the handle deliberately.
+            core::mem::forget(shared);
+
+            // Wait for the daemon to bind + answer on the control socket.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if puressh::mux::probe_master(&dec.path) == puressh::mux::ProbeOutcome::Live {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(
+                        "ControlPersist: daemon master did not come up on the control socket"
+                            .into(),
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            // Run our own session as a normal mux client over the daemon.
+            run_mux_client(cli, cfg_block, &dec.path)
+        }
+    }
+}
+
+/// Redirect stdin/stdout/stderr to `/dev/null` for the daemon master, so it
+/// neither reads from nor writes to the launcher's terminal.
+#[cfg(unix)]
+fn detach_stdio() {
+    use std::os::fd::AsRawFd;
+    if let Ok(devnull) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")
+    {
+        let fd = devnull.as_raw_fd();
+        // dup2 over 0/1/2. SAFETY: bin is outside the lib's forbid(unsafe);
+        // these are plain POSIX dup2 calls on a valid fd.
+        unsafe {
+            nix::libc::dup2(fd, 0);
+            nix::libc::dup2(fd, 1);
+            nix::libc::dup2(fd, 2);
+        }
+        // `devnull` (and its fd) drops here; the dup'd 0/1/2 stay open.
+    }
 }
 
 /// Run a one-shot `command` over a `SharedClient`, splicing the channel's

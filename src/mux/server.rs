@@ -101,13 +101,11 @@ fn bind_socket(path: &Path) -> Result<UnixListener, String> {
 /// detached thread after `foreground` returns and this call still returns the
 /// foreground status promptly so the invoking terminal is freed.
 ///
-/// # Daemonization limitation
-///
-/// `ControlPersist yes`/`<N>` does **not** double-fork into a separate daemon
-/// process. The master stays alive inside the *first* `ssh` process, in a
-/// detached background thread, after the foreground session returns. The
-/// process therefore lingers (without a controlling session) until the persist
-/// policy fires. True OpenSSH-style daemonization is a follow-up.
+/// This in-process variant is used for `ControlPersist no` (the master is
+/// tied to the foreground session's lifetime) and as the implementation the
+/// daemonized path delegates to. For `yes`/`<N>` the `ssh` binary forks a
+/// daemon that calls [`run_master_daemon`] instead, so the master survives the
+/// launching process exiting.
 pub fn run_master<F>(cfg: MasterConfig, shared: SharedClient, foreground: F) -> Result<i32, String>
 where
     F: FnOnce(&SharedClient) -> i32 + Send + 'static,
@@ -163,6 +161,58 @@ where
             Ok(status)
         }
     }
+}
+
+/// Run a *daemonized* master: bind the control socket and serve attached mux
+/// clients, blocking the calling thread until the ControlPersist policy (or an
+/// `ssh -O exit`) tears the master down.
+///
+/// Unlike [`run_master`], there is **no** foreground session here — the
+/// launching process's own session runs separately as an ordinary mux client
+/// over the control socket. This is the entry point the `ssh` binary's
+/// `fork()`+`setsid()` daemon child calls so the master survives the launcher
+/// exiting (`ControlPersist yes`/`<N>`).
+///
+/// `foreground_done` is treated as already-true (the master never had a local
+/// foreground), so the `Seconds(n)` linger timer keys purely off attached
+/// clients: the master lingers `n` seconds after the last client detaches,
+/// then unlinks the socket and returns. `Yes` blocks until `-O exit`.
+pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), String> {
+    let listener = bind_socket(&cfg.control_path)?;
+
+    let state = Arc::new(MasterState {
+        live_clients: AtomicU64::new(0),
+        // No local foreground session: mark it done so the Seconds linger
+        // begins counting from the first idle moment rather than waiting for a
+        // foreground that never runs.
+        foreground_done: AtomicBool::new(true),
+        shutdown: AtomicBool::new(false),
+        last_idle: Mutex::new(Some(Instant::now())),
+    });
+
+    let accept_shared = shared.clone();
+    let accept_state = state.clone();
+    let accept = thread::spawn(move || {
+        accept_loop(listener, accept_shared, accept_state);
+    });
+
+    let reaper_state = state.clone();
+    let persist = cfg.persist;
+    let reaper_path = cfg.control_path.clone();
+    let reaper = thread::spawn(move || {
+        reaper_loop(persist, reaper_state, &reaper_path);
+    });
+
+    // Block here until something flips `shutdown` — the reaper (Seconds linger)
+    // or an `-O exit` handler. Then make sure the socket is gone and join.
+    while !state.shutdown.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    wake_accept(&cfg.control_path);
+    let _ = fs::remove_file(&cfg.control_path);
+    let _ = accept.join();
+    let _ = reaper.join();
+    Ok(())
 }
 
 /// Wake a blocked `accept()` by making one throwaway connection to the socket.

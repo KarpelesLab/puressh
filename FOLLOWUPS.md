@@ -19,10 +19,14 @@ it needs.
   cannot drive); `-A`/`-X`/`-Y` over mux stay rejected (they need a master-side session
   channel for the forwarding-request + callbacks). Those run fine without ControlMaster.
 
-- **ControlPersist `yes`/`<N>` is a detached thread, not a daemon.** The master stays
-  alive in a background thread of the first `ssh` process rather than double-forking into
-  an independent daemon (`src/mux/server.rs`). If that first process is killed, the master
-  dies with it. *Closing it:* real `fork`+`setsid` daemonization (unix-gated).
+- ~~**ControlPersist `yes`/`<N>` is a detached thread, not a daemon.**~~ **Done.**
+  Becoming a persistent master now `fork()`s + `setsid()`s into an independent daemon
+  (unix-gated, in `src/bin/ssh.rs`'s `daemonize_master`): the child detaches its stdio to
+  `/dev/null` and serves the control socket via `puressh::mux::run_master_daemon`, while
+  the launching process continues its own session as an ordinary mux client over that
+  socket. Killing the launcher leaves the master (and any attached sessions) alive. The
+  parent `mem::forget`s its `SharedClient` so it never runs Drop on the SSH socket the
+  daemon now owns. `ControlPersist no` is unchanged (master tied to the foreground).
 
 - **`ssh -O check|exit|stop` has no CLI flag.** The mux protocol carries `ExitRequest`/
   `AliveCheck` frames and the master honors them, but no `-O` command-line option is

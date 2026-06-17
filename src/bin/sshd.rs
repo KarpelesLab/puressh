@@ -1288,55 +1288,89 @@ mod imp {
         }
 
         /// Record a satisfied factor and decide whether authentication is
-        /// complete given the per-user multi-factor chain set.
+        /// complete given the per-user multi-factor chain set, enforcing
+        /// **positional (listed) order** as OpenSSH does.
         ///
         /// - No chains configured ⇒ single-factor: any one method accepts.
-        /// - Some chain fully covered by the satisfied set ⇒ Accept.
-        /// - Otherwise ⇒ PartialAccept whose `still_required` is the union of
-        ///   the next-needed methods across every chain still viable (a chain
-        ///   is viable iff every method satisfied so far is one of its
-        ///   members).
+        /// - The methods must be completed in the order the chain lists them: a
+        ///   chain stays *alive* only while the ordered `satisfied` sequence is
+        ///   a positional prefix of it. Completing a method that no alive chain
+        ///   expects *next* is out-of-order and is rejected (the method is not
+        ///   committed to `satisfied`).
+        /// - When some alive chain is fully covered (its length equals the
+        ///   satisfied length) ⇒ Accept.
+        /// - Otherwise ⇒ PartialAccept whose `still_required` is the set of the
+        ///   *next* methods (`chain[satisfied.len()]`) across every alive chain
+        ///   — never the whole remaining set.
         ///
-        /// Membership is set-based, not positional: a chain `publickey,password`
-        /// is considered satisfied once *both* methods have succeeded in any
-        /// order. This deviates from OpenSSH, which enforces the listed order;
-        /// the deviation is documented and intentional (it never *weakens* the
-        /// requirement — the same set of factors is still mandatory).
-        /// `none` is never recorded and never counts toward a chain.
+        /// `none` is never recorded and never appears in a parsed chain.
         fn record_and_decide(&mut self, method: &'static str) -> AuthDecision {
-            if method != "none" && !self.satisfied.contains(&method) {
-                self.satisfied.push(method);
-            }
-
             // Single-factor: no chains ⇒ one success is enough.
             if self.chains.is_empty() {
                 return AuthDecision::Accept;
             }
 
-            let satisfied_all = |chain: &[&'static str]| -> bool {
-                chain
-                    .iter()
-                    .all(|m| *m == "none" || self.satisfied.contains(m))
+            if method == "none" {
+                // `none` cannot advance a chain; re-offer the current step.
+                return self.partial_or_reject_for_current();
+            }
+
+            // Tentatively extend the ordered satisfied sequence and require the
+            // result to remain a positional prefix of at least one chain. If
+            // not, the just-completed method was offered out of order (or isn't
+            // part of any chain) ⇒ reject without committing it.
+            let candidate_len = self.satisfied.len() + 1;
+            let mut any_alive = false;
+            for chain in &self.chains {
+                if chain.len() >= candidate_len
+                    && chain[..self.satisfied.len()] == self.satisfied[..]
+                    && chain[self.satisfied.len()] == method
+                {
+                    any_alive = true;
+                    break;
+                }
+            }
+            if !any_alive {
+                if self.debug {
+                    eprintln!(
+                        "sshd: auth: method {method} completed out of order for the configured \
+                         AuthenticationMethods chain(s); rejecting"
+                    );
+                }
+                return AuthDecision::Reject;
+            }
+            self.satisfied.push(method);
+
+            self.partial_or_reject_for_current()
+        }
+
+        /// Given the current ordered `satisfied` prefix, decide Accept (some
+        /// alive chain is fully covered) or PartialAccept with the next-needed
+        /// methods across alive chains. A chain is *alive* iff `satisfied` is a
+        /// positional prefix of it. Never returns Reject here (callers handle
+        /// the out-of-order reject before committing).
+        fn partial_or_reject_for_current(&self) -> AuthDecision {
+            let is_alive = |chain: &[&'static str]| -> bool {
+                chain.len() >= self.satisfied.len()
+                    && chain[..self.satisfied.len()] == self.satisfied[..]
             };
 
-            // Any chain fully satisfied ⇒ done.
-            if self.chains.iter().any(|c| satisfied_all(c)) {
+            // Any alive chain fully covered ⇒ done.
+            if self
+                .chains
+                .iter()
+                .any(|c| is_alive(c) && c.len() == self.satisfied.len())
+            {
                 return AuthDecision::Accept;
             }
 
-            // Otherwise gather the next-needed methods across viable chains. A
-            // chain is viable iff everything we've satisfied so far belongs to
-            // it (we haven't "used up" a factor it doesn't want — though since
-            // extra factors never hurt, we treat any chain that still has
-            // unmet members as viable and offer those members).
+            // Offer only the *next* method of each alive chain (positional).
             let mut next: Vec<String> = Vec::new();
             for chain in &self.chains {
-                for m in chain {
-                    if *m != "none" && !self.satisfied.contains(m) {
-                        let s = (*m).to_string();
-                        if !next.contains(&s) {
-                            next.push(s);
-                        }
+                if is_alive(chain) && chain.len() > self.satisfied.len() {
+                    let s = chain[self.satisfied.len()].to_string();
+                    if !next.contains(&s) {
+                        next.push(s);
                     }
                 }
             }
@@ -4082,17 +4116,79 @@ mod imp {
         }
 
         #[test]
-        fn record_and_decide_order_independent() {
-            // Set-membership: satisfying the chain in reverse order still
-            // accepts (documented deviation from OpenSSH's ordered enforcement).
+        fn record_and_decide_enforces_listed_order() {
+            // OpenSSH positional order: for `publickey,password`, completing
+            // `password` FIRST is out of order and rejected; only `publickey`
+            // first advances the chain.
             let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
             a.chains = vec![vec!["publickey", "password"]];
+            // password-first ⇒ rejected, chain not advanced.
             assert!(matches!(
                 a.record_and_decide("password"),
+                AuthDecision::Reject
+            ));
+            assert!(a.satisfied.is_empty(), "rejected method must not commit");
+            // publickey first ⇒ PartialAccept asking for password next.
+            match a.record_and_decide("publickey") {
+                AuthDecision::PartialAccept { still_required } => {
+                    assert_eq!(still_required, vec!["password".to_string()]);
+                }
+                other => panic!("expected PartialAccept, got {other:?}"),
+            }
+            // now password completes the chain in order.
+            assert!(matches!(
+                a.record_and_decide("password"),
+                AuthDecision::Accept
+            ));
+        }
+
+        #[test]
+        fn record_and_decide_still_required_is_next_not_set() {
+            // With two alternative chains sharing a first factor, `still_required`
+            // after the shared first factor lists only the *next* methods, in the
+            // listed order — never the full remaining set.
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.chains = vec![
+                vec!["publickey", "password"],
+                vec!["publickey", "keyboard-interactive"],
+            ];
+            match a.record_and_decide("publickey") {
+                AuthDecision::PartialAccept { still_required } => {
+                    assert_eq!(
+                        still_required,
+                        vec!["password".to_string(), "keyboard-interactive".to_string()]
+                    );
+                }
+                other => panic!("expected PartialAccept, got {other:?}"),
+            }
+            // Completing the second factor of either alternative accepts.
+            assert!(matches!(
+                a.record_and_decide("keyboard-interactive"),
+                AuthDecision::Accept
+            ));
+        }
+
+        #[test]
+        fn record_and_decide_three_factor_order() {
+            // A three-factor chain must be completed strictly in order.
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.chains = vec![vec!["publickey", "keyboard-interactive", "password"]];
+            assert!(matches!(
+                a.record_and_decide("publickey"),
+                AuthDecision::PartialAccept { .. }
+            ));
+            // Skipping to `password` (the 3rd) before the 2nd is rejected.
+            assert!(matches!(
+                a.record_and_decide("password"),
+                AuthDecision::Reject
+            ));
+            // The expected 2nd factor advances.
+            assert!(matches!(
+                a.record_and_decide("keyboard-interactive"),
                 AuthDecision::PartialAccept { .. }
             ));
             assert!(matches!(
-                a.record_and_decide("publickey"),
+                a.record_and_decide("password"),
                 AuthDecision::Accept
             ));
         }

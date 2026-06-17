@@ -106,12 +106,40 @@ mod imp {
     // with `--all-features`, etc.) falls through to the stub below.
     #[cfg(all(feature = "pam", target_os = "linux"))]
     mod pam_gate {
-        use std::ffi::CString;
+        use std::ffi::{CStr, CString};
         use std::os::unix::ffi::OsStrExt;
         use std::sync::{Arc, Mutex};
 
         use pam_client2::conv_null::Conversation;
-        use pam_client2::{Context, Flag, SessionToken};
+        use pam_client2::{Context, ConversationHandler, ErrorCode, Flag, SessionToken};
+        use zeroize::Zeroizing;
+
+        /// A one-shot PAM conversation that answers every
+        /// `PAM_PROMPT_ECHO_OFF` (the password prompt) with a fixed secret,
+        /// held in a [`Zeroizing`] buffer so its bytes are wiped on drop.
+        /// Echo-on prompts (username) and info/error messages are ignored —
+        /// the username is already bound via `Context::new`, and we never
+        /// surface PAM text to the network here. This is the
+        /// non-interactive "verify this password" conversation; a full
+        /// multi-step PAM challenge (e.g. an OTP module that asks a second
+        /// question) is not handled and will fail closed.
+        struct PasswordConv {
+            password: Zeroizing<Vec<u8>>,
+        }
+
+        impl ConversationHandler for PasswordConv {
+            fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
+                // Username/echo-on prompts: nothing to supply (the context
+                // already carries the target user). Empty answer.
+                CString::new(Vec::new()).map_err(|_| ErrorCode::CONV_ERR)
+            }
+            fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
+                // The password may not contain an interior NUL.
+                CString::new(self.password.to_vec()).map_err(|_| ErrorCode::CONV_ERR)
+            }
+            fn text_info(&mut self, _msg: &CStr) {}
+            fn error_msg(&mut self, _msg: &CStr) {}
+        }
 
         /// Holds the live PAM `Context` and the leaked session handle.
         /// Drop order matters: the leaked `Session` must be re-acquired
@@ -218,6 +246,39 @@ mod imp {
                 }
                 Ok(envs)
             }
+
+            /// Verify `password` for `user` against PAM, *without* opening a
+            /// session (that still happens later in `ensure`/
+            /// `on_session_open`). A fresh, throw-away `Context` is created
+            /// with a [`PasswordConv`] conversation that answers the password
+            /// prompt; `authenticate()` + `acct_mgmt()` must both succeed. The
+            /// context is dropped at the end of this call (running `pam_end`),
+            /// so this never disturbs the cached session state.
+            ///
+            /// Runs in the per-connection forked child while still root, which
+            /// is what PAM auth (e.g. reading `/etc/shadow`) requires; the
+            /// privilege drop happens afterwards in `on_session_open`.
+            pub fn pam_check_password(
+                &self,
+                user: &str,
+                password: Zeroizing<Vec<u8>>,
+                rhost: Option<&str>,
+            ) -> puressh::Result<()> {
+                let conv = PasswordConv { password };
+                let mut ctx = Context::new(self.service, Some(user), conv)
+                    .map_err(|e| pam_err("pam_start", e))?;
+                if let Some(rhost) = rhost {
+                    ctx.set_rhost(Some(rhost))
+                        .map_err(|e| pam_err("set_rhost", e))?;
+                }
+                ctx.authenticate(Flag::NONE)
+                    .map_err(|e| pam_err("authenticate", e))?;
+                ctx.acct_mgmt(Flag::NONE)
+                    .map_err(|e| pam_err("acct_mgmt", e))?;
+                // `ctx` (and the embedded `PasswordConv`, whose buffer is
+                // `Zeroizing`) drops here — pam_end runs, no session opened.
+                Ok(())
+            }
         }
 
         fn pam_err<E: std::fmt::Display>(phase: &'static str, e: E) -> puressh::Error {
@@ -248,6 +309,22 @@ mod imp {
                 _tty: &str,
             ) -> puressh::Result<Vec<(CString, CString)>> {
                 Ok(Vec::new())
+            }
+            /// No PAM backend compiled in: password verification always
+            /// fails. The server additionally never advertises the
+            /// password/keyboard-interactive methods on such a build (the
+            /// method set is computed from `cfg!(all(feature="pam",
+            /// target_os="linux"))`), so this is belt-and-braces. The buffer
+            /// is dropped (and zeroized) here.
+            pub fn pam_check_password(
+                &self,
+                _user: &str,
+                _password: zeroize::Zeroizing<Vec<u8>>,
+                _rhost: Option<&str>,
+            ) -> puressh::Result<()> {
+                Err(puressh::Error::Io(std::io::Error::other(
+                    "password authentication unavailable: no PAM backend compiled",
+                )))
             }
         }
     }
@@ -688,6 +765,32 @@ mod imp {
         deny_groups: Vec<puressh::config::HostPattern>,
         authorized_blobs: Vec<Vec<u8>>,
         permit_root_login: puressh::config::PermitRootLogin,
+        /// Shared PAM gate (per-connection, COW-isolated by `fork`). Used to
+        /// verify passwords via `pam_check_password`. On a non-PAM build the
+        /// stub always fails — but the binary also never advertises
+        /// password/keyboard-interactive there, so this is belt-and-braces.
+        pam: Arc<pam_gate::PamGate>,
+        /// `PasswordAuthentication` enabled for this build/config (advertised).
+        /// When false, a `password` attempt is rejected outright.
+        password_enabled: bool,
+        /// `KbdInteractiveAuthentication` enabled for this build/config.
+        kbd_interactive_enabled: bool,
+        /// `PermitEmptyPasswords` — when false (the default), an empty password
+        /// is rejected without ever consulting PAM.
+        permit_empty_passwords: bool,
+        /// Multi-factor chain set, resolved per-user from
+        /// `AuthenticationMethods` (each inner Vec is one comma-chain of
+        /// required methods). Empty ⇒ single-factor (any one advertised method
+        /// suffices). Installed by `on_user_resolved`.
+        chains: Vec<Vec<&'static str>>,
+        /// Methods satisfied so far on this connection, in order. Used by
+        /// `record_and_decide` to test chain completion. `none` never appears
+        /// here.
+        satisfied: Vec<&'static str>,
+        /// The username bound to this connection once the first request is
+        /// seen. A later attempt with a different username is rejected (OpenSSH
+        /// terminates auth on a mid-userauth username change).
+        bound_user: Option<String>,
         /// Per-connection memoization of `resolves_to_root(user)`. The
         /// passwd lookup happens at auth (login) time, not daemon startup,
         /// so it reflects the current database; the cache only avoids
@@ -756,6 +859,167 @@ mod imp {
             }
             true
         }
+
+        /// Memoized `resolves_to_root(user)` for this connection.
+        fn is_root(&mut self, user: &str) -> bool {
+            match self.root_uid0_cache.get(user) {
+                Some(&r) => r,
+                None => {
+                    let r = resolves_to_root(user);
+                    self.root_uid0_cache.insert(user.to_string(), r);
+                    r
+                }
+            }
+        }
+
+        /// Bind / verify the connection username. Returns `false` if the client
+        /// switched usernames mid-userauth (OpenSSH rejects this). The first
+        /// call binds; subsequent calls must match.
+        fn check_user_binding(&mut self, user: &str) -> bool {
+            match &self.bound_user {
+                None => {
+                    self.bound_user = Some(user.to_string());
+                    true
+                }
+                Some(bound) => bound == user,
+            }
+        }
+
+        /// Decide whether an empty password may even be attempted, *before* any
+        /// PAM call. Extracted as a pure, PAM-independent helper so the policy
+        /// (empty password refused unless `PermitEmptyPasswords`) is unit-
+        /// testable without a live PAM stack.
+        ///
+        /// `true` ⇒ the password is non-empty, or empty passwords are
+        /// permitted, so the caller may proceed to verify it. `false` ⇒ reject
+        /// without consulting the backend.
+        fn empty_password_allowed(permit_empty: bool, password: &[u8]) -> bool {
+            !password.is_empty() || permit_empty
+        }
+
+        /// Full password-verification path shared by the `password` and
+        /// `keyboard-interactive` methods: access control + PermitRootLogin +
+        /// empty-password policy + PAM. Runs uniform work for known and unknown
+        /// users (the PAM call, or the empty-password short-circuit, happens for
+        /// every attempt). Returns the chain-aware decision via
+        /// `record_and_decide` on success, or `Reject`.
+        fn verify_password(
+            &mut self,
+            user: &str,
+            method: &'static str,
+            password: zeroize::Zeroizing<Vec<u8>>,
+        ) -> AuthDecision {
+            // Mid-userauth username change ⇒ reject (don't leak which half
+            // failed).
+            if !self.check_user_binding(user) {
+                if self.debug {
+                    eprintln!("sshd: auth {method}: username changed mid-userauth, rejecting");
+                }
+                return AuthDecision::Reject;
+            }
+            // Access control + root gate run unconditionally for timing
+            // uniformity (mirrors the publickey arm).
+            let user_ok = self.access_allowed(user);
+            let is_root = self.is_root(user);
+            let root_denied = is_root && !self.permit_root_login.permits_password();
+            let empty_ok = Self::empty_password_allowed(self.permit_empty_passwords, &password);
+
+            if !user_ok || root_denied || !empty_ok {
+                // Burn a comparable amount of work so an unknown/denied user is
+                // not obviously faster than a PAM round-trip would be. We still
+                // skip the real PAM call (no point authenticating a denied
+                // user), but the access/group/root lookups above already ran.
+                if self.debug {
+                    if root_denied {
+                        eprintln!(
+                            "sshd: auth {method}: root login denied by PermitRootLogin for {user}"
+                        );
+                    } else if !user_ok {
+                        eprintln!("sshd: auth {method}: user {user} not in allowed set");
+                    } else {
+                        eprintln!("sshd: auth {method}: empty password refused for {user}");
+                    }
+                }
+                return AuthDecision::Reject;
+            }
+
+            let rhost = self.peer.clone();
+            match self
+                .pam
+                .pam_check_password(user, password, rhost.as_deref())
+            {
+                Ok(()) => {
+                    if self.debug {
+                        eprintln!("sshd: auth {method}: PAM accepted user {user}");
+                    }
+                    self.record_and_decide(method)
+                }
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("sshd: auth {method}: PAM rejected user {user} ({e})");
+                    }
+                    AuthDecision::Reject
+                }
+            }
+        }
+
+        /// Record a satisfied factor and decide whether authentication is
+        /// complete given the per-user multi-factor chain set.
+        ///
+        /// - No chains configured ⇒ single-factor: any one method accepts.
+        /// - Some chain fully covered by the satisfied set ⇒ Accept.
+        /// - Otherwise ⇒ PartialAccept whose `still_required` is the union of
+        ///   the next-needed methods across every chain still viable (a chain
+        ///   is viable iff every method satisfied so far is one of its
+        ///   members).
+        ///
+        /// Membership is set-based, not positional: a chain `publickey,password`
+        /// is considered satisfied once *both* methods have succeeded in any
+        /// order. This deviates from OpenSSH, which enforces the listed order;
+        /// the deviation is documented and intentional (it never *weakens* the
+        /// requirement — the same set of factors is still mandatory).
+        /// `none` is never recorded and never counts toward a chain.
+        fn record_and_decide(&mut self, method: &'static str) -> AuthDecision {
+            if method != "none" && !self.satisfied.contains(&method) {
+                self.satisfied.push(method);
+            }
+
+            // Single-factor: no chains ⇒ one success is enough.
+            if self.chains.is_empty() {
+                return AuthDecision::Accept;
+            }
+
+            let satisfied_all = |chain: &[&'static str]| -> bool {
+                chain
+                    .iter()
+                    .all(|m| *m == "none" || self.satisfied.contains(m))
+            };
+
+            // Any chain fully satisfied ⇒ done.
+            if self.chains.iter().any(|c| satisfied_all(c)) {
+                return AuthDecision::Accept;
+            }
+
+            // Otherwise gather the next-needed methods across viable chains. A
+            // chain is viable iff everything we've satisfied so far belongs to
+            // it (we haven't "used up" a factor it doesn't want — though since
+            // extra factors never hurt, we treat any chain that still has
+            // unmet members as viable and offer those members).
+            let mut next: Vec<String> = Vec::new();
+            for chain in &self.chains {
+                for m in chain {
+                    if *m != "none" && !self.satisfied.contains(m) {
+                        let s = (*m).to_string();
+                        if !next.contains(&s) {
+                            next.push(s);
+                        }
+                    }
+                }
+            }
+            AuthDecision::PartialAccept {
+                still_required: next,
+            }
+        }
     }
 
     impl Authenticator for LocalAuthenticator {
@@ -764,12 +1028,6 @@ mod imp {
                 AuthAttempt::None { user } => {
                     if self.debug {
                         eprintln!("sshd: auth none rejected for user {user}");
-                    }
-                    AuthDecision::Reject
-                }
-                AuthAttempt::Password { user, .. } => {
-                    if self.debug {
-                        eprintln!("sshd: auth password rejected (not implemented) for user {user}");
                     }
                     AuthDecision::Reject
                 }
@@ -787,6 +1045,7 @@ mod imp {
                     // AllowGroups, with a memoized group lookup) and the
                     // linear scan over authorized_blobs both run for every
                     // attempt so the paths stay uniform.
+                    let user_bound = self.check_user_binding(&user);
                     let user_ok = self.access_allowed(&user);
                     let blob_ok = self.authorized_blobs.contains(&public_blob);
                     // PermitRootLogin gate: if the requested user resolves to
@@ -797,16 +1056,9 @@ mod imp {
                     // startup is still caught. Resolved for every requested
                     // user (not only allowed ones) so the lookup doesn't add a
                     // user-enumeration timing signal.
-                    let is_root = match self.root_uid0_cache.get(&user) {
-                        Some(&r) => r,
-                        None => {
-                            let r = resolves_to_root(&user);
-                            self.root_uid0_cache.insert(user.clone(), r);
-                            r
-                        }
-                    };
+                    let is_root = self.is_root(&user);
                     let root_denied = is_root && !self.permit_root_login.permits_publickey();
-                    let allow = user_ok && blob_ok && !root_denied;
+                    let allow = user_bound && user_ok && blob_ok && !root_denied;
 
                     // probe_only attempts (no signature) only need
                     // user+blob to be acceptable so the client knows it
@@ -855,29 +1107,121 @@ mod imp {
                         return AuthDecision::Reject;
                     }
                     if self.debug {
-                        eprintln!("sshd: auth publickey: accepted user {user}");
+                        eprintln!("sshd: auth publickey: verified user {user}");
                     }
-                    AuthDecision::Accept
+                    // A verified signature satisfies the `publickey` factor. In
+                    // single-factor mode this Accepts; under a multi-factor
+                    // chain it may PartialAccept and ask for the next factor.
+                    self.record_and_decide("publickey")
+                }
+                AuthAttempt::Password { user, password } => {
+                    if !self.password_enabled {
+                        if self.debug {
+                            eprintln!("sshd: auth password rejected (disabled) for user {user}");
+                        }
+                        return AuthDecision::Reject;
+                    }
+                    // Copy the secret bytes into a zeroize-on-drop buffer; the
+                    // source `SecretString` is itself zeroizing and drops at the
+                    // end of this arm.
+                    let pw = zeroize::Zeroizing::new(password.as_bytes().to_vec());
+                    self.verify_password(&user, "password", pw)
                 }
                 AuthAttempt::KeyboardInteractive { user } => {
-                    // We never advertise "keyboard-interactive" in
-                    // Config::allowed_auth_methods, so the auth core
-                    // should never dispatch a KI attempt here.  Catch
-                    // mis-wired configs in debug builds before they
-                    // become a silent prompt-loop in production.
-                    debug_assert!(
-                        false,
-                        "LocalAuthenticator received KeyboardInteractive but \
-                         keyboard-interactive is not enabled in allowed_auth_methods \
-                         (user={user})",
-                    );
-                    if self.debug {
-                        eprintln!("sshd: auth keyboard-interactive rejected for user {user}");
+                    if !self.kbd_interactive_enabled {
+                        if self.debug {
+                            eprintln!(
+                                "sshd: auth keyboard-interactive rejected (disabled) for user {user}"
+                            );
+                        }
+                        return AuthDecision::Reject;
                     }
-                    AuthDecision::Reject
+                    // Bind the username now (so a later switch is caught) and
+                    // drive a single password prompt. The actual verification
+                    // happens in `evaluate_interactive` once the client answers.
+                    if !self.check_user_binding(&user) {
+                        if self.debug {
+                            eprintln!(
+                                "sshd: auth keyboard-interactive: username changed mid-userauth"
+                            );
+                        }
+                        return AuthDecision::Reject;
+                    }
+                    AuthDecision::InteractiveRequest {
+                        name: String::new(),
+                        instruction: String::new(),
+                        // Single non-echoed password prompt. A full multi-step
+                        // PAM conversation (e.g. an OTP module that asks a
+                        // second question) is a deferred follow-up.
+                        prompts: alloc_prompts(),
+                    }
                 }
             }
         }
+
+        fn evaluate_interactive(&mut self, user: &str, responses: Vec<String>) -> AuthDecision {
+            if !self.kbd_interactive_enabled {
+                return AuthDecision::Reject;
+            }
+            // The response strings come from `UserauthInfoResponse`, whose Drop
+            // zeroizes its buffer; we copy the first answer into a zeroizing
+            // buffer and let `responses` drop normally.
+            let pw = responses
+                .first()
+                .map(|s| zeroize::Zeroizing::new(s.as_bytes().to_vec()))
+                .unwrap_or_default();
+            self.verify_password(user, "keyboard-interactive", pw)
+        }
+
+        fn on_user_resolved(&mut self, user: &str, methods: &[String]) {
+            // Bind the username on first sight (the publickey/password arms also
+            // bind, but this fires first via the server's re-resolve hook).
+            let _ = self.check_user_binding(user);
+            self.chains = parse_auth_method_chains(methods);
+            if self.debug && !self.chains.is_empty() {
+                eprintln!(
+                    "sshd: auth: multi-factor chains for {user}: {:?}",
+                    self.chains
+                );
+            }
+        }
+    }
+
+    /// The single keyboard-interactive prompt set: one non-echoed
+    /// `"Password: "` prompt.
+    fn alloc_prompts() -> Vec<(String, bool)> {
+        vec![("Password: ".to_string(), false)]
+    }
+
+    /// Map a resolved `AuthenticationMethods` value (space-separated
+    /// alternatives, each a comma-chain) into the internal chain set. Each
+    /// factor is interned to a `&'static str` the rest of the machine compares
+    /// by identity; `any` collapses to "no constraint" (an empty chain set, i.e.
+    /// single-factor), and unknown tokens are dropped (the config parser already
+    /// rejected genuinely-unknown ones, so this is defensive).
+    fn parse_auth_method_chains(methods: &[String]) -> Vec<Vec<&'static str>> {
+        let mut chains: Vec<Vec<&'static str>> = Vec::new();
+        for alt in methods {
+            if alt == "any" {
+                // `any` means single-factor — clear any accumulated constraint
+                // and stop (an empty chain set is the single-factor signal).
+                return Vec::new();
+            }
+            let mut chain: Vec<&'static str> = Vec::new();
+            for factor in alt.split(',').filter(|s| !s.is_empty()) {
+                match factor {
+                    "publickey" => chain.push("publickey"),
+                    "password" => chain.push("password"),
+                    "keyboard-interactive" => chain.push("keyboard-interactive"),
+                    "none" => {} // never counts toward a chain
+                    _ => {}      // unknown: defensively ignore
+                }
+            }
+            if !chain.is_empty() {
+                chains.push(chain);
+            }
+        }
+        chains
     }
 
     #[derive(Clone)]
@@ -889,6 +1233,11 @@ mod imp {
         authorized_blobs: Arc<Vec<Vec<u8>>>,
         permit_root_login: puressh::config::PermitRootLogin,
         group_lookup: GroupLookup,
+        /// Shared PAM gate for password verification (see `LocalAuthenticator`).
+        pam: Arc<pam_gate::PamGate>,
+        password_enabled: bool,
+        kbd_interactive_enabled: bool,
+        permit_empty_passwords: bool,
         debug: bool,
     }
 
@@ -901,6 +1250,13 @@ mod imp {
                 deny_groups: (*self.deny_groups).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
                 permit_root_login: self.permit_root_login,
+                pam: self.pam.clone(),
+                password_enabled: self.password_enabled,
+                kbd_interactive_enabled: self.kbd_interactive_enabled,
+                permit_empty_passwords: self.permit_empty_passwords,
+                chains: Vec::new(),
+                satisfied: Vec::new(),
+                bound_user: None,
                 root_uid0_cache: std::collections::HashMap::new(),
                 group_cache: std::collections::HashMap::new(),
                 group_lookup: self.group_lookup.clone(),
@@ -2749,6 +3105,59 @@ mod imp {
             eprintln!("sshd: PermitRootLogin={permit_root_login:?}");
         }
 
+        // One PamGate per accept-loop iteration's child. The parent
+        // holds a clone too, but fork's COW gives each connection its
+        // own copy — no cross-connection state bleed. The authenticator
+        // borrows a clone for password verification.
+        let pam_gate = pam_gate::PamGate::new(cli.debug);
+
+        // Whether a real PAM backend is compiled in. Password and
+        // keyboard-interactive auth are *only* advertised when both the config
+        // enables them AND this is a PAM build — otherwise we'd offer a method
+        // we cannot satisfy. `pam_check_password` on a non-PAM build always
+        // fails, so this is the authoritative gate.
+        let pam_available = cfg!(all(feature = "pam", target_os = "linux"));
+
+        let cfg_password = sshd_cfg.global.password_authentication == Some(true);
+        let cfg_kbdint = sshd_cfg.global.kbd_interactive_authentication == Some(true);
+        let pubkey_enabled = sshd_cfg.global.pubkey_authentication != Some(false);
+        let password_enabled = cfg_password && pam_available;
+        let kbd_interactive_enabled = cfg_kbdint && pam_available;
+        let permit_empty_passwords = sshd_cfg.global.permit_empty_passwords == Some(true);
+
+        if (cfg_password || cfg_kbdint) && !pam_available {
+            eprintln!(
+                "sshd: warning: PasswordAuthentication/KbdInteractiveAuthentication requested but \
+                 no PAM backend is compiled in (need the `pam` feature on Linux); these methods \
+                 will NOT be advertised"
+            );
+        }
+
+        // Compute the advertised method set from config: start with publickey
+        // (unless disabled), add password / keyboard-interactive when enabled
+        // and backed by PAM.
+        let mut advertised: Vec<&'static str> = Vec::new();
+        if pubkey_enabled {
+            advertised.push("publickey");
+        }
+        if password_enabled {
+            advertised.push("password");
+        }
+        if kbd_interactive_enabled {
+            advertised.push("keyboard-interactive");
+        }
+        if cli.debug {
+            eprintln!("sshd: advertised auth methods: {advertised:?}");
+        }
+
+        // Connection-wide AuthenticationMethods default (multi-factor chains),
+        // threaded into the authenticator via on_user_resolved.
+        let default_auth_methods = sshd_cfg
+            .global
+            .authentication_methods
+            .clone()
+            .unwrap_or_default();
+
         let factory = Arc::new(LocalAuthFactory {
             allow_users: Arc::new(allow_users),
             deny_users: Arc::new(deny_users),
@@ -2757,13 +3166,12 @@ mod imp {
             authorized_blobs: Arc::new(authorized_blobs),
             permit_root_login,
             group_lookup: group_lookup.clone(),
+            pam: pam_gate.clone(),
+            password_enabled,
+            kbd_interactive_enabled,
+            permit_empty_passwords,
             debug: cli.debug,
         });
-
-        // One PamGate per accept-loop iteration's child. The parent
-        // holds a clone too, but fork's COW gives each connection its
-        // own copy — no cross-connection state bleed.
-        let pam_gate = pam_gate::PamGate::new(cli.debug);
 
         // Per-connection `PrintMotd`, resolved by `on_session_open` and read by
         // the PTY shell handler. Shared by `Arc` so the (COW-isolated) forked
@@ -2773,13 +3181,14 @@ mod imp {
         let mut config = Config::new(
             host_keys,
             factory,
-            vec!["publickey"],
+            advertised,
             Arc::new(ShellCommandHandler {
                 pam: pam_gate.clone(),
                 debug: cli.debug,
                 debug_commands: cli.debug_commands,
             }),
         )
+        .with_auth_methods(default_auth_methods)
         .with_shell(Arc::new(NixShellHandler {
             pam: pam_gate.clone(),
             debug: cli.debug,
@@ -3153,6 +3562,13 @@ mod imp {
                 deny_groups: to_pats(deny_groups),
                 authorized_blobs: Vec::new(),
                 permit_root_login: puressh::config::PermitRootLogin::ProhibitPassword,
+                pam: pam_gate::PamGate::new(false),
+                password_enabled: false,
+                kbd_interactive_enabled: false,
+                permit_empty_passwords: false,
+                chains: Vec::new(),
+                satisfied: Vec::new(),
+                bound_user: None,
                 root_uid0_cache: std::collections::HashMap::new(),
                 group_cache: std::collections::HashMap::new(),
                 group_lookup: lookup,
@@ -3167,6 +3583,94 @@ mod imp {
             assert!(a.access_allowed("alice"));
             // bob is allowed *and* denied — DenyUsers has higher precedence.
             assert!(!a.access_allowed("bob"));
+        }
+
+        // ---- FD: password / multi-factor helpers ---------------------------
+
+        #[test]
+        fn empty_password_policy() {
+            // Non-empty password is always allowed to proceed.
+            assert!(LocalAuthenticator::empty_password_allowed(false, b"secret"));
+            assert!(LocalAuthenticator::empty_password_allowed(true, b"secret"));
+            // Empty password: refused unless PermitEmptyPasswords.
+            assert!(!LocalAuthenticator::empty_password_allowed(false, b""));
+            assert!(LocalAuthenticator::empty_password_allowed(true, b""));
+        }
+
+        #[test]
+        fn parse_chains_any_is_single_factor() {
+            assert!(parse_auth_method_chains(&["any".to_string()]).is_empty());
+            assert!(parse_auth_method_chains(&[]).is_empty());
+        }
+
+        #[test]
+        fn parse_chains_maps_factors() {
+            let chains = parse_auth_method_chains(&["publickey,password".to_string()]);
+            assert_eq!(chains, vec![vec!["publickey", "password"]]);
+            // `none` never counts toward a chain.
+            let chains2 = parse_auth_method_chains(&["publickey,none".to_string()]);
+            assert_eq!(chains2, vec![vec!["publickey"]]);
+            // Multiple alternatives.
+            let chains3 = parse_auth_method_chains(&[
+                "publickey,password".to_string(),
+                "keyboard-interactive".to_string(),
+            ]);
+            assert_eq!(
+                chains3,
+                vec![vec!["publickey", "password"], vec!["keyboard-interactive"]]
+            );
+        }
+
+        #[test]
+        fn record_and_decide_single_factor_accepts_immediately() {
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            // No chains installed ⇒ single-factor: one success accepts.
+            assert!(matches!(
+                a.record_and_decide("publickey"),
+                AuthDecision::Accept
+            ));
+        }
+
+        #[test]
+        fn record_and_decide_multifactor_partial_then_accept() {
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.chains = vec![vec!["publickey", "password"]];
+            // First factor ⇒ PartialAccept asking for the remaining one.
+            match a.record_and_decide("publickey") {
+                AuthDecision::PartialAccept { still_required } => {
+                    assert_eq!(still_required, vec!["password".to_string()]);
+                }
+                other => panic!("expected PartialAccept, got {other:?}"),
+            }
+            // Second factor completes the chain ⇒ Accept.
+            assert!(matches!(
+                a.record_and_decide("password"),
+                AuthDecision::Accept
+            ));
+        }
+
+        #[test]
+        fn record_and_decide_order_independent() {
+            // Set-membership: satisfying the chain in reverse order still
+            // accepts (documented deviation from OpenSSH's ordered enforcement).
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.chains = vec![vec!["publickey", "password"]];
+            assert!(matches!(
+                a.record_and_decide("password"),
+                AuthDecision::PartialAccept { .. }
+            ));
+            assert!(matches!(
+                a.record_and_decide("publickey"),
+                AuthDecision::Accept
+            ));
+        }
+
+        #[test]
+        fn user_binding_rejects_username_switch() {
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            assert!(a.check_user_binding("alice"));
+            assert!(a.check_user_binding("alice")); // same user OK
+            assert!(!a.check_user_binding("bob")); // switch rejected
         }
 
         #[test]

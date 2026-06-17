@@ -119,6 +119,21 @@ pub trait Authenticator: Send {
         let _ = (user, responses);
         AuthDecision::Reject
     }
+
+    /// Hook fired once, the first time the username for this connection is
+    /// known (before the first attempt is evaluated). `methods` is the resolved
+    /// `AuthenticationMethods` value for this user (space-separated
+    /// alternatives, each a comma-separated chain — e.g.
+    /// `["publickey,password", "publickey,keyboard-interactive"]`), or empty
+    /// when no `AuthenticationMethods` is configured (single-factor: any one
+    /// advertised method suffices). A multi-factor authenticator uses it to
+    /// install the per-user chain set. The default is a no-op. Implementations
+    /// that key off the username must reject a later username change themselves
+    /// (OpenSSH terminates auth if the client switches usernames
+    /// mid-userauth).
+    fn on_user_resolved(&mut self, user: &str, methods: &[String]) {
+        let _ = (user, methods);
+    }
 }
 
 /// What the harness should do next on behalf of the server.
@@ -214,6 +229,15 @@ impl ServerAuth {
     /// continuations).
     pub fn accepted_methods(&self) -> &[&'static str] {
         &self.accepted_methods
+    }
+
+    /// Notify the underlying [`Authenticator`] that the connection's username
+    /// is now known (see [`Authenticator::on_user_resolved`]). The server loop
+    /// calls this once, on the first USERAUTH_REQUEST that carries a username,
+    /// alongside the `Match`-based method-set re-resolve. `methods` is the
+    /// resolved `AuthenticationMethods` chain set for this user.
+    pub fn notify_user_resolved(&mut self, user: &str, methods: &[String]) {
+        self.auth.on_user_resolved(user, methods);
     }
 
     /// The method name carried by an inbound `USERAUTH_REQUEST` payload, or

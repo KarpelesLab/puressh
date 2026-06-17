@@ -52,6 +52,14 @@ impl PermitRootLogin {
             PermitRootLogin::Yes | PermitRootLogin::ProhibitPassword
         )
     }
+
+    /// Whether the root account may authenticate via password (or
+    /// keyboard-interactive, which is also a password-equivalent secret) under
+    /// this policy. `prohibit-password` (alias `without-password`) forbids it;
+    /// only [`PermitRootLogin::Yes`] permits it.
+    pub fn permits_password(self) -> bool {
+        matches!(self, PermitRootLogin::Yes)
+    }
 }
 
 /// One block of `sshd_config(5)` options.
@@ -1356,13 +1364,16 @@ Banner /etc/ssh/banner
     #[test]
     fn authentication_methods_multifactor_accepted() {
         // A multi-factor chain and a single non-publickey factor now parse.
-        let cfg =
-            SshServerConfig::parse("AuthenticationMethods publickey,password\n").unwrap().global;
+        let cfg = SshServerConfig::parse("AuthenticationMethods publickey,password\n")
+            .unwrap()
+            .global;
         assert_eq!(
             cfg.authentication_methods.as_deref(),
             Some(&["publickey,password".to_string()][..])
         );
-        let cfg2 = SshServerConfig::parse("AuthenticationMethods password\n").unwrap().global;
+        let cfg2 = SshServerConfig::parse("AuthenticationMethods password\n")
+            .unwrap()
+            .global;
         assert_eq!(
             cfg2.authentication_methods.as_deref(),
             Some(&["password".to_string()][..])
@@ -1381,14 +1392,18 @@ Banner /etc/ssh/banner
         .global;
         assert_eq!(
             cfg.authentication_methods.as_deref(),
-            Some(&["publickey,password".to_string(), "keyboard-interactive".to_string()][..])
+            Some(
+                &[
+                    "publickey,password".to_string(),
+                    "keyboard-interactive".to_string()
+                ][..]
+            )
         );
     }
 
     #[test]
     fn authentication_methods_unknown_factor_rejected() {
-        let err =
-            SshServerConfig::parse("AuthenticationMethods publickey,bogus\n").unwrap_err();
+        let err = SshServerConfig::parse("AuthenticationMethods publickey,bogus\n").unwrap_err();
         assert!(
             matches!(err, ConfigError::BadValue { line: 1, .. }),
             "{err:?}"
@@ -1397,9 +1412,13 @@ Banner /etc/ssh/banner
 
     #[test]
     fn permit_empty_passwords_yes_accepted() {
-        let cfg = SshServerConfig::parse("PermitEmptyPasswords yes\n").unwrap().global;
+        let cfg = SshServerConfig::parse("PermitEmptyPasswords yes\n")
+            .unwrap()
+            .global;
         assert_eq!(cfg.permit_empty_passwords, Some(true));
-        let cfg2 = SshServerConfig::parse("PermitEmptyPasswords no\n").unwrap().global;
+        let cfg2 = SshServerConfig::parse("PermitEmptyPasswords no\n")
+            .unwrap()
+            .global;
         assert_eq!(cfg2.permit_empty_passwords, Some(false));
     }
 

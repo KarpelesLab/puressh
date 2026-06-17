@@ -688,6 +688,152 @@ fn end_to_end_kbdint_loopback() {
     assert!(matches!(done, ClientStep::Success));
 }
 
+/// An authenticator that requires the `publickey,password` chain: publickey
+/// then password (set-membership, order-independent), accepting only when both
+/// have succeeded.
+struct ChainAuth {
+    user: &'static str,
+    pw: &'static str,
+    satisfied: Vec<&'static str>,
+}
+impl ChainAuth {
+    fn record_and_decide(&mut self, method: &'static str) -> AuthDecision {
+        if !self.satisfied.contains(&method) {
+            self.satisfied.push(method);
+        }
+        let need = ["publickey", "password"];
+        if need.iter().all(|m| self.satisfied.contains(m)) {
+            AuthDecision::Accept
+        } else {
+            let still: Vec<String> = need
+                .iter()
+                .filter(|m| !self.satisfied.contains(*m))
+                .map(|m| (*m).to_string())
+                .collect();
+            AuthDecision::PartialAccept {
+                still_required: still,
+            }
+        }
+    }
+}
+impl Authenticator for ChainAuth {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                probe_only,
+                verified,
+                ..
+            } => {
+                if probe_only {
+                    // Probe just signals the client to sign; doesn't satisfy.
+                    AuthDecision::Accept
+                } else if verified {
+                    self.record_and_decide("publickey")
+                } else {
+                    AuthDecision::Reject
+                }
+            }
+            AuthAttempt::Password { user, password } => {
+                if user == self.user && password == self.pw {
+                    self.record_and_decide("password")
+                } else {
+                    AuthDecision::Reject
+                }
+            }
+            _ => AuthDecision::Reject,
+        }
+    }
+}
+
+#[test]
+fn end_to_end_multifactor_publickey_then_password() {
+    // The client offers a publickey credential then a password; the server
+    // requires both (a `publickey,password` chain). The publickey leg should
+    // PartialAccept (partial_success), the client should advance to password
+    // on the SAME connection (no second SERVICE_REQUEST), and the server then
+    // Accepts.
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.add_credential(ClientCredential::PublicKey(Box::new(
+        Ed25519HostKey::from_seed(TEST_SEED),
+    )));
+    c.add_credential(ClientCredential::Password("hunter2".into()));
+
+    let mut s = ServerAuth::new(
+        TEST_SID.to_vec(),
+        vec!["publickey", "password"],
+        Box::new(ChainAuth {
+            user: "alice",
+            pw: "hunter2",
+            satisfied: Vec::new(),
+        }),
+    );
+
+    // Count SERVICE_REQUESTs the server sees — must be exactly one.
+    let mut service_requests = 0usize;
+
+    let sreq = c.start();
+    if sreq.first() == Some(&super::message::SSH_MSG_SERVICE_REQUEST) {
+        service_requests += 1;
+    }
+    let saccept = match s.on_packet(&sreq).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("expected service accept"),
+    };
+
+    // Client emits the publickey probe.
+    let probe = match c.on_packet(&saccept).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected probe"),
+    };
+    // Server replies PK_OK.
+    let pk_ok = match s.on_packet(&probe).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("expected pk_ok"),
+    };
+    // Client sends the signed request.
+    let signed = match c.on_packet(&pk_ok).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected signed pk"),
+    };
+    // Server PartialAccepts (partial_success) — the publickey factor is in.
+    let partial = match s.on_packet(&signed).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("expected partial failure (Send), not immediate Accept"),
+    };
+    let pf = UserauthFailure::decode(&partial).unwrap();
+    assert!(
+        pf.partial_success,
+        "publickey leg must be a partial success"
+    );
+    assert_eq!(pf.continuations, vec!["password".to_string()]);
+
+    // Client advances to the password credential on the SAME connection.
+    let pw_req = match c.on_packet(&partial).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("expected password request"),
+    };
+    // It must NOT be another SERVICE_REQUEST.
+    assert_ne!(
+        pw_req.first(),
+        Some(&super::message::SSH_MSG_SERVICE_REQUEST),
+        "client must not re-send SERVICE_REQUEST mid-userauth"
+    );
+    let parsed = UserauthRequest::decode(&pw_req).unwrap();
+    assert_eq!(parsed.method.method_name(), "password");
+
+    // Server now Accepts (both factors satisfied).
+    let success = match s.on_packet(&pw_req).unwrap() {
+        ServerStep::Authenticated { payload, user } => {
+            assert_eq!(user, "alice");
+            payload
+        }
+        _ => panic!("expected Authenticated"),
+    };
+    let done = c.on_packet(&success).unwrap();
+    assert!(matches!(done, ClientStep::Success));
+    assert_eq!(service_requests, 1, "exactly one SERVICE_REQUEST expected");
+}
+
 #[test]
 fn client_skips_publickey_not_in_server_sig_algs() {
     // ssh-ed25519 key, server-sig-algs advertises rsa-sha2-{256,512} only.

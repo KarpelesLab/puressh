@@ -870,6 +870,13 @@ pub struct Config {
     /// `yes` / `delayed` / `None` leave the built-in advert (currently
     /// `none`-only, since puressh does not yet implement SSH-layer zlib).
     pub compression: Option<crate::config::Compression>,
+    /// Connection-wide `AuthenticationMethods` default (space-separated
+    /// alternatives, each a comma-chain — e.g. `["publickey,password"]`). Empty
+    /// ⇒ single-factor (any one advertised method suffices). A `Match` block may
+    /// override this per user; the resolved value is handed to the authenticator
+    /// via [`crate::auth::Authenticator::on_user_resolved`]. Set with
+    /// [`Config::with_auth_methods`].
+    pub default_auth_methods: Vec<String>,
 }
 
 /// Resolver from a user name to its supplementary group names. Boxed so the
@@ -1097,7 +1104,19 @@ impl Config {
             policy: None,
             group_resolver: None,
             compression: None,
+            default_auth_methods: Vec::new(),
         }
+    }
+
+    /// Set the connection-wide `AuthenticationMethods` default — the
+    /// multi-factor chain set handed to the authenticator's
+    /// [`crate::auth::Authenticator::on_user_resolved`] hook. Each entry is one
+    /// space-separated alternative, itself a comma-separated chain of required
+    /// factors (e.g. `"publickey,password"`). Empty (the default) ⇒
+    /// single-factor: any one advertised method suffices.
+    pub fn with_auth_methods(mut self, methods: Vec<String>) -> Self {
+        self.default_auth_methods = methods;
+        self
     }
 
     /// Attach a parsed `sshd_config` policy. The policy is resolved
@@ -1622,12 +1641,17 @@ fn resolve_preauth_policy(
 }
 
 /// Compute the advertised auth method set from the static config default and
-/// the resolved policy options. Public-key is the only honorable method, so:
+/// the resolved policy options. The base set is what the binary computed at
+/// startup (e.g. `["publickey", "password"]`); a `Match` block can only ever
+/// *subtract* from it by turning a method off:
 ///
-/// - `PubkeyAuthentication no` ⇒ drop `publickey` ⇒ empty set (lockout).
-/// - `AuthenticationMethods` naming only non-publickey alternatives ⇒ the
-///   parser already rejected those at load; an `any` / `publickey` value
-///   leaves the set unchanged.
+/// - `PubkeyAuthentication no` ⇒ drop `publickey`.
+/// - `PasswordAuthentication no` ⇒ drop `password`.
+/// - `KbdInteractiveAuthentication no` ⇒ drop `keyboard-interactive`.
+///
+/// A method is never *added* here — the base set already reflects whether a
+/// PAM backend is compiled in, so a `Match` block enabling password auth on a
+/// non-PAM build cannot conjure a method the server cannot satisfy.
 fn resolve_auth_methods(
     base: &[&'static str],
     opts: &crate::config::ServerOptions,
@@ -1635,6 +1659,12 @@ fn resolve_auth_methods(
     let mut methods: Vec<&'static str> = base.to_vec();
     if opts.pubkey_authentication == Some(false) {
         methods.retain(|m| *m != "publickey");
+    }
+    if opts.password_authentication == Some(false) {
+        methods.retain(|m| *m != "password");
+    }
+    if opts.kbd_interactive_authentication == Some(false) {
+        methods.retain(|m| *m != "keyboard-interactive");
     }
     methods
 }
@@ -1740,6 +1770,10 @@ fn do_server_auth<R: RngCore + CryptoRng>(
                     local_port,
                 );
                 server_auth.set_accepted_methods(reres.methods);
+                // Let the authenticator install per-user multi-factor chains
+                // (resolved from `AuthenticationMethods` in any matched block)
+                // before the first attempt is evaluated.
+                server_auth.notify_user_resolved(&user, &reres.auth_methods);
                 if let Some(text) = reres.banner.as_deref() {
                     let banner = crate::auth::message::UserauthBanner {
                         message: text.to_string(),
@@ -1797,6 +1831,9 @@ fn do_server_auth<R: RngCore + CryptoRng>(
 struct ReResolvedUserPolicy {
     methods: Vec<&'static str>,
     banner: Option<String>,
+    /// Resolved `AuthenticationMethods` for this user (space-separated
+    /// alternatives, each a comma-chain). Empty ⇒ single-factor.
+    auth_methods: Vec<String>,
 }
 
 /// Re-resolve the policy with the full user/groups context (the first
@@ -1816,6 +1853,7 @@ fn reresolve_user_policy(
         return ReResolvedUserPolicy {
             methods: base_methods.to_vec(),
             banner: None,
+            auth_methods: cfg.default_auth_methods.clone(),
         };
     };
     let groups = resolve_user_groups(cfg, user);
@@ -1836,7 +1874,17 @@ fn reresolve_user_policy(
         .banner
         .as_deref()
         .and_then(|p| std::fs::read_to_string(p).ok());
-    ReResolvedUserPolicy { methods, banner }
+    // A `Match` block may override `AuthenticationMethods`; fall back to the
+    // connection-wide default when it doesn't.
+    let auth_methods = opts
+        .authentication_methods
+        .clone()
+        .unwrap_or_else(|| cfg.default_auth_methods.clone());
+    ReResolvedUserPolicy {
+        methods,
+        banner,
+        auth_methods,
+    }
 }
 
 /// Per-connection state for server-initiated `forwarded-tcpip` channel
@@ -3923,6 +3971,38 @@ mod tests {
                 _ => AuthDecision::Reject,
             }
         }
+    }
+
+    #[test]
+    fn resolve_auth_methods_subtracts_disabled() {
+        let base: &[&'static str] = &["publickey", "password", "keyboard-interactive"];
+        // No overrides ⇒ unchanged.
+        let opts = crate::config::ServerOptions::default();
+        assert_eq!(
+            resolve_auth_methods(base, &opts),
+            vec!["publickey", "password", "keyboard-interactive"]
+        );
+        // PasswordAuthentication no ⇒ password dropped.
+        let mut opts = crate::config::ServerOptions::default();
+        opts.password_authentication = Some(false);
+        assert_eq!(
+            resolve_auth_methods(base, &opts),
+            vec!["publickey", "keyboard-interactive"]
+        );
+        // KbdInteractiveAuthentication no ⇒ keyboard-interactive dropped.
+        let mut opts = crate::config::ServerOptions::default();
+        opts.kbd_interactive_authentication = Some(false);
+        assert_eq!(
+            resolve_auth_methods(base, &opts),
+            vec!["publickey", "password"]
+        );
+        // PubkeyAuthentication no ⇒ publickey dropped.
+        let mut opts = crate::config::ServerOptions::default();
+        opts.pubkey_authentication = Some(false);
+        assert_eq!(
+            resolve_auth_methods(base, &opts),
+            vec!["password", "keyboard-interactive"]
+        );
     }
 
     struct StaticHandler {

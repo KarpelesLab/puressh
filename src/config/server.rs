@@ -128,6 +128,10 @@ pub struct ServerOptions {
     pub kex_algorithms: Option<Vec<String>>,
     /// `HostKeyAlgorithms` — resolved server host-key preference list.
     pub host_key_algorithms: Option<Vec<String>>,
+    /// `CASignatureAlgorithms` — resolved set of signature algorithms accepted
+    /// from a CA when verifying a user certificate. `None` ⇒ built-in default
+    /// ([`super::algos::CA_SIGNATURE_DEFAULTS`]).
+    pub ca_signature_algorithms: Option<Vec<String>>,
     /// `PubkeyAuthentication` (yes/no). `no` ⇒ public-key auth is dropped from
     /// the advertised method set, which (since it is the only honorable
     /// method) locks the connection out. `None`/`yes` ⇒ enabled.
@@ -417,6 +421,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(macs);
     take_scalar!(kex_algorithms);
     take_scalar!(host_key_algorithms);
+    take_scalar!(ca_signature_algorithms);
     take_scalar!(pubkey_authentication);
     take_scalar!(password_authentication);
     take_scalar!(kbd_interactive_authentication);
@@ -607,12 +612,12 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             )?);
         }
         "casignaturealgorithms" => {
-            // Certificate-based host/user keys are not implemented; reject so
-            // a security-relevant directive cannot appear to take effect.
-            return Err(ConfigError::Unsupported {
-                line: line.line_no,
-                msg: "CASignatureAlgorithms: certificate authentication is not supported".into(),
-            });
+            opts.ca_signature_algorithms = Some(resolve_algo_list(
+                AlgoCategory::CaSignature,
+                &line.args,
+                line.line_no,
+                "CASignatureAlgorithms",
+            )?);
         }
         "pubkeyauthentication" => {
             opts.pubkey_authentication = Some(parse_yes_no(line)?);
@@ -1507,10 +1512,20 @@ HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
     }
 
     #[test]
-    fn server_casignaturealgorithms_unsupported() {
-        let src = "Port 22\nCASignatureAlgorithms ssh-ed25519\n";
+    fn server_casignaturealgorithms_accepted() {
+        let src = "Port 22\nCASignatureAlgorithms ssh-ed25519,rsa-sha2-512\n";
+        let cfg = SshServerConfig::parse(src).unwrap().global;
+        assert_eq!(
+            cfg.ca_signature_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string(), "rsa-sha2-512".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn server_casignaturealgorithms_rejects_plain_ssh_rsa() {
+        let src = "Port 22\nCASignatureAlgorithms ssh-rsa\n";
         let err = SshServerConfig::parse(src).unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 2, .. }));
+        assert!(matches!(err, ConfigError::BadValue { line: 2, .. }));
     }
 
     #[test]

@@ -55,7 +55,22 @@ pub enum AlgoCategory {
     HostKey,
     /// `PubkeyAcceptedAlgorithms` — client publickey-auth signature algorithms.
     PubkeyAccepted,
+    /// `CASignatureAlgorithms` — signature algorithms accepted from a
+    /// certificate authority when verifying an OpenSSH certificate.
+    CaSignature,
 }
+
+/// The default `CASignatureAlgorithms` set (OpenSSH default, minus plain
+/// SHA-1 `ssh-rsa`). These are the algorithms a CA's signature over a
+/// certificate may use.
+pub const CA_SIGNATURE_DEFAULTS: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+];
 
 /// Real (non-marker) KEX algorithm names, in default preference order.
 ///
@@ -92,6 +107,7 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
             names
         }
         AlgoCategory::PubkeyAccepted => crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec(),
+        AlgoCategory::CaSignature => CA_SIGNATURE_DEFAULTS.to_vec(),
     }
 }
 
@@ -106,6 +122,7 @@ pub fn default_list(cat: AlgoCategory) -> Vec<&'static str> {
         AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted => {
             crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec()
         }
+        AlgoCategory::CaSignature => CA_SIGNATURE_DEFAULTS.to_vec(),
     }
 }
 

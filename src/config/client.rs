@@ -212,6 +212,10 @@ pub struct ClientOptions {
     pub host_key_algorithms: Option<Vec<String>>,
     /// `PubkeyAcceptedAlgorithms` — resolved publickey-auth signature list.
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
+    /// `CASignatureAlgorithms` — resolved set of signature algorithms accepted
+    /// from a CA when verifying a host certificate. `None` ⇒ built-in default
+    /// ([`super::algos::CA_SIGNATURE_DEFAULTS`]).
+    pub ca_signature_algorithms: Option<Vec<String>>,
     /// `ProxyCommand` — shell command (with `%h`/`%p`/`%r`/`%%` tokens
     /// un-expanded) to spawn and use as the connection transport. The
     /// literal `none` clears it back to `None`.
@@ -803,13 +807,12 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             opts.control_persist = Some(parse_control_persist(line)?);
         }
         "casignaturealgorithms" => {
-            // Certificate-based authentication is not implemented; reject
-            // rather than silently ignore so a security-relevant directive
-            // can never appear to take effect.
-            return Err(ConfigError::Unsupported {
-                line: line.line_no,
-                msg: "CASignatureAlgorithms: certificate authentication is not supported".into(),
-            });
+            opts.ca_signature_algorithms = Some(resolve_algo_list(
+                AlgoCategory::CaSignature,
+                args,
+                line.line_no,
+                &line.keyword,
+            )?);
         }
         _ => {
             return Err(ConfigError::UnknownKeyword {
@@ -852,6 +855,7 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(kex_algorithms);
     take_scalar!(host_key_algorithms);
     take_scalar!(pubkey_accepted_algorithms);
+    take_scalar!(ca_signature_algorithms);
     take_scalar!(proxy_command);
     take_scalar!(proxy_jump);
     take_scalar!(compression);
@@ -1365,10 +1369,22 @@ Host target
     }
 
     #[test]
-    fn casignaturealgorithms_unsupported() {
-        let src = "Host gw\n  CASignatureAlgorithms ssh-ed25519\n";
+    fn casignaturealgorithms_accepted() {
+        let src = "Host gw\n  CASignatureAlgorithms ssh-ed25519,rsa-sha2-512\n";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let eff = cfg.lookup("gw");
+        assert_eq!(
+            eff.ca_signature_algorithms.as_deref(),
+            Some(["ssh-ed25519".to_string(), "rsa-sha2-512".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn casignaturealgorithms_rejects_plain_ssh_rsa() {
+        // Plain SHA-1 ssh-rsa is not a valid CA signature algorithm.
+        let src = "Host gw\n  CASignatureAlgorithms ssh-rsa\n";
         let err = SshClientConfig::parse(src).unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { line: 2, .. }));
+        assert!(matches!(err, ConfigError::BadValue { line: 2, .. }));
     }
 
     #[test]

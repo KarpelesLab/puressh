@@ -86,6 +86,18 @@ pub struct ServerOptions {
     pub listen_addresses: Vec<String>,
     /// `HostKey` entries — cumulative.
     pub host_key_files: Vec<String>,
+    /// `HostCertificate` entries — cumulative. Each is the path to an OpenSSH
+    /// host certificate (`*-cert.pub`), paired at load time with the preceding
+    /// `HostKey` whose embedded key it certifies.
+    pub host_certificate_files: Vec<String>,
+    /// `TrustedUserCAKeys` — path to a file of CA public keys whose user
+    /// certificates the server will accept (one key per line).
+    pub trusted_user_ca_keys: Option<String>,
+    /// `AuthorizedPrincipalsFile` — path (with `%u`/`%h` tokens) to a file
+    /// listing the certificate principals a connecting user is allowed to
+    /// authenticate as. When unset, the login user must itself appear in the
+    /// certificate's principals list.
+    pub authorized_principals_file: Option<String>,
     /// `AuthorizedKeysFile`.
     pub authorized_keys_file: Option<String>,
     /// `AllowUsers` — cumulative; empty ⇒ "current user only" (matches the
@@ -454,6 +466,10 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
         .extend(src.listen_addresses.iter().cloned());
     dst.host_key_files
         .extend(src.host_key_files.iter().cloned());
+    dst.host_certificate_files
+        .extend(src.host_certificate_files.iter().cloned());
+    take_scalar!(trusted_user_ca_keys);
+    take_scalar!(authorized_principals_file);
     dst.allow_users.extend(src.allow_users.iter().cloned());
     dst.accept_env.extend(src.accept_env.iter().cloned());
     dst.deny_users.extend(src.deny_users.iter().cloned());
@@ -469,6 +485,7 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "port",
         "listenaddress",
         "hostkey",
+        "hostcertificate",
         "addressfamily",
         "pidfile",
         "loglevel",
@@ -501,6 +518,15 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "hostkey" => {
             opts.host_key_files.push(one_arg(line)?);
+        }
+        "hostcertificate" => {
+            opts.host_certificate_files.push(one_arg(line)?);
+        }
+        "trustedusercakeys" => {
+            opts.trusted_user_ca_keys = Some(one_arg(line)?);
+        }
+        "authorizedprincipalsfile" => {
+            opts.authorized_principals_file = Some(one_arg(line)?);
         }
         "authorizedkeysfile" => {
             opts.authorized_keys_file = Some(one_arg(line)?);

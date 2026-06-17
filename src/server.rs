@@ -3743,6 +3743,13 @@ fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
     // in the default preference order (used both as the default advert and as
     // the intersection mask for a HostKeyAlgorithms override).
     let mut have: Vec<&'static str> = Vec::new();
+    // Certificate host keys first (matching OpenSSH), so a client that supports
+    // certs negotiates the cert algorithm ahead of the plain key it wraps.
+    for n in crate::cert::CERT_KEY_NAMES {
+        if host_keys.iter().any(|k| k.algorithm() == *n) {
+            have.push(*n);
+        }
+    }
     for n in defaults::HOST_KEY {
         if host_keys.iter().any(|k| k.algorithm() == *n) {
             have.push(*n);

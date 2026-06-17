@@ -384,6 +384,30 @@ impl Certificate {
         })
     }
 
+    /// Parse a certificate from an OpenSSH single-line public form:
+    /// `<cert-key-type> <base64-blob> [comment]` (the contents of a
+    /// `*-cert.pub` file). The leading key-type token must be one of
+    /// [`CERT_KEY_NAMES`]; the returned certificate's blob type is validated
+    /// against it.
+    pub fn parse_openssh_line(line: &str) -> Result<Self> {
+        let line = line.trim();
+        let mut it = line.split_whitespace();
+        let name = it.next().ok_or(Error::Format("cert: empty line"))?;
+        if !CERT_KEY_NAMES.contains(&name) {
+            return Err(Error::Format("cert: line is not an OpenSSH certificate"));
+        }
+        let b64 = it
+            .next()
+            .ok_or(Error::Format("cert: missing base64 blob"))?;
+        let blob = crate::key::base64_decode(b64.as_bytes())?;
+        let cert = Self::parse(&blob)?;
+        // The negotiated/file name must be consistent with the blob's own type.
+        if cert_name_to_plain(name) != blob_type_to_plain(&cert.key_type) {
+            return Err(Error::Format("cert: line key-type disagrees with blob"));
+        }
+        Ok(cert)
+    }
+
     /// The plain key-type name of the embedded key (e.g. `"ssh-ed25519"`,
     /// `"ssh-rsa"`). For RSA this is the SHA-1-era name; the actual signature
     /// hash is taken from the signature blob — see [`embedded_verifier`].

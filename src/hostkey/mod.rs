@@ -14,6 +14,8 @@ use alloc::vec::Vec;
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "alloc")]
+pub mod cert;
 pub mod ecdsa;
 pub mod ed25519;
 pub mod rsa;
@@ -47,6 +49,8 @@ pub fn allow_rsa_sha1() -> bool {
 }
 
 #[cfg(feature = "alloc")]
+pub use cert::CertHostKey;
+#[cfg(feature = "alloc")]
 pub use ecdsa::{EcdsaP256HostKey, EcdsaP384HostKey, EcdsaP521HostKey};
 #[cfg(feature = "alloc")]
 pub use ed25519::Ed25519HostKey;
@@ -68,6 +72,17 @@ pub const HOST_KEY_VERIFY_NAMES: &[&str] = &[
     "rsa-sha2-512",
     "rsa-sha2-256",
 ];
+
+/// OpenSSH certificate host-key / signature algorithm names this build can
+/// verify, in descending preference order. These are the names advertised in
+/// the KEX host-key list (host certs) and the userauth publickey method (user
+/// certs) when certificate authentication is in play.
+///
+/// A name from this list passed to [`host_key_verify_by_name`] yields a
+/// verifier over the certificate's *embedded* key (the cert blob is parsed and
+/// the embedded key reconstructed); the CA-trust decision is made elsewhere.
+#[cfg(feature = "alloc")]
+pub const HOST_KEY_CERT_VERIFY_NAMES: &[&str] = crate::cert::CERT_KEY_NAMES;
 
 /// A signature algorithm exposed to the rest of the crate.
 pub trait HostKeyAlgorithm {
@@ -142,6 +157,30 @@ pub fn host_key_verify_by_name(name: &str, blob: &[u8]) -> crate::Result<Box<dyn
         }
         "rsa-sha2-256" => Ok(Box::new(RsaSha2_256HostKey::from_public_blob(blob)?)),
         "rsa-sha2-512" => Ok(Box::new(RsaSha2_512HostKey::from_public_blob(blob)?)),
+        // Certificate names: `blob` is a certificate, not a plain key. Parse it
+        // and build a verifier over the EMBEDDED key, keyed on the plain
+        // signature algorithm the negotiated cert name pins (the negotiated
+        // name pins the RSA hash, exactly like a plain RSA key). The CA-trust
+        // decision is the caller's responsibility — this only verifies the
+        // exchange-hash / userauth signature against the embedded key.
+        n if crate::cert::is_cert_name(n) => {
+            let plain = crate::cert::cert_name_to_plain(n)
+                .ok_or(crate::Error::Unsupported("certificate algorithm"))?;
+            let cert = crate::cert::Certificate::parse(blob)?;
+            // The negotiated name pins the signature algorithm (and, for RSA,
+            // the hash). It must belong to the same key family as the cert's
+            // embedded key — an ed25519 cert can't be verified with an RSA name.
+            let family_ok = match cert.embedded_algorithm() {
+                "ssh-rsa" => matches!(plain, "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa"),
+                other => plain == other,
+            };
+            if !family_ok {
+                return Err(crate::Error::Format(
+                    "cert: negotiated name/key family mismatch",
+                ));
+            }
+            host_key_verify_by_name(plain, &cert.embedded_pubkey_blob)
+        }
         _ => Err(crate::Error::Unsupported("host-key algorithm")),
     }
 }

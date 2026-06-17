@@ -856,6 +856,7 @@ fn config_for_host(
             kex_algorithms: cfg_block.kex_algorithms.clone(),
             host_key_algorithms: cfg_block.host_key_algorithms.clone(),
             pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
+            ca_signature_algorithms: cfg_block.ca_signature_algorithms.clone(),
             // -o Compression / config Compression. The keyword is rejected
             // up front (in run()) when the `compress` feature is absent, so
             // by the time we get here Some(true) is honourable.

@@ -350,6 +350,7 @@ mod imp {
         /// fold into the same list.
         listen_addresses: Vec<String>,
         host_key_files: Vec<String>,
+        host_certificate_files: Vec<String>,
         authorized_keys_file: Option<String>,
         allowed_users: Vec<String>,
         debug: bool,
@@ -422,6 +423,7 @@ mod imp {
         let mut port: Option<u16> = None;
         let mut listen_addresses: Vec<String> = Vec::new();
         let mut host_key_files: Vec<String> = Vec::new();
+        let mut host_certificate_files: Vec<String> = Vec::new();
         let mut authorized_keys_file: Option<String> = None;
         let mut allowed_users: Vec<String> = Vec::new();
         let mut debug = false;
@@ -462,6 +464,14 @@ mod imp {
                     i += 1;
                     let v = args.get(i).ok_or("-h requires a value")?.clone();
                     host_key_files.push(v);
+                }
+                "--host-certificate" => {
+                    i += 1;
+                    let v = args
+                        .get(i)
+                        .ok_or("--host-certificate requires a value")?
+                        .clone();
+                    host_certificate_files.push(v);
                 }
                 "-A" => {
                     i += 1;
@@ -547,6 +557,7 @@ mod imp {
             port,
             listen_addresses,
             host_key_files,
+            host_certificate_files,
             authorized_keys_file,
             allowed_users,
             debug,
@@ -566,12 +577,30 @@ mod imp {
         })
     }
 
-    fn load_host_keys(
-        paths: &[String],
+    /// Load each `HostKey`, then for each `HostCertificate` path wrap the
+    /// matching plain host key (paired by embedded-key equality) in a
+    /// [`CertHostKey`] so KEX can advertise the certificate algorithm. The
+    /// certificate-wrapped key is inserted *ahead of* the plain key it
+    /// certifies, so `build_server_kexinit` advertises the cert name first.
+    fn load_host_keys_with_certs(
+        key_paths: &[String],
+        cert_paths: &[String],
         strict_modes: bool,
     ) -> Result<Vec<Box<dyn HostKey + Send + Sync>>, String> {
-        let mut out: Vec<Box<dyn HostKey + Send + Sync>> = Vec::new();
-        for path in paths {
+        use puressh::cert::Certificate;
+        use puressh::hostkey::CertHostKey;
+        use std::sync::Arc;
+
+        // Load plain keys as shared (Arc) signers, retaining their public blob
+        // for cert pairing. Sharing lets the same key material back both the
+        // plain host-key entry and a CertHostKey wrapper without re-reading the
+        // private key file.
+        struct Loaded {
+            blob: Vec<u8>,
+            key: Arc<dyn HostKey + Send + Sync>,
+        }
+        let mut loaded: Vec<Loaded> = Vec::new();
+        for path in key_paths {
             if strict_modes {
                 check_mode_strict(path, 0o077, "host key")?;
             }
@@ -585,9 +614,71 @@ mod imp {
             // upgrade to `Send + Sync` by wrapping. Our concrete signers (Ed25519,
             // ECDSA, RSA) hold only `Sync`-safe types internally; we expose this
             // via a small thunk that just defers to the boxed signer.
-            out.push(SyncHostKey::wrap(hk));
+            let key: Arc<dyn HostKey + Send + Sync> = Arc::from(SyncHostKey::wrap(hk));
+            loaded.push(Loaded {
+                blob: key.public_blob(),
+                key,
+            });
+        }
+
+        // Parse all host certificates up front, pairing by embedded-key
+        // equality below.
+        let mut certs: Vec<(Certificate, &'static str)> = Vec::new();
+        for path in cert_paths {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+            let cert = Certificate::parse_openssh_line(&text)
+                .map_err(|e| format!("{path}: parse host certificate: {e}"))?;
+            if !matches!(cert.cert_type, puressh::cert::CertType::Host) {
+                return Err(format!("{path}: not a host certificate"));
+            }
+            let cert_name = puressh::cert::CERT_KEY_NAMES
+                .iter()
+                .copied()
+                .find(|n| puressh::cert::cert_name_to_plain(n) == Some(cert.embedded_algorithm()))
+                .ok_or_else(|| format!("{path}: unsupported certificate family"))?;
+            certs.push((cert, cert_name));
+        }
+
+        // Build the output list. For each loaded key, if a certificate
+        // certifies it, emit the CertHostKey first (so KEX advertises the cert
+        // name ahead of the plain key), then the plain key.
+        let mut out: Vec<Box<dyn HostKey + Send + Sync>> = Vec::new();
+        for item in loaded {
+            if let Some(pos) = certs
+                .iter()
+                .position(|(c, _)| c.embedded_pubkey_blob == item.blob)
+            {
+                let (cert, cert_name) = certs.remove(pos);
+                let cert_key =
+                    CertHostKey::new(Box::new(SharedSigner(item.key.clone())), &cert, cert_name)
+                        .map_err(|e| format!("host certificate does not match its key: {e}"))?;
+                out.push(Box::new(cert_key));
+            }
+            out.push(Box::new(SharedSigner(item.key)));
+        }
+
+        if let Some((_, name)) = certs.first() {
+            return Err(format!(
+                "HostCertificate present but no matching HostKey for {name}"
+            ));
         }
         Ok(out)
+    }
+
+    /// A `HostKey` backed by a shared `Arc` signer, so one loaded private key
+    /// can stand behind both a plain host-key entry and its `CertHostKey`.
+    struct SharedSigner(std::sync::Arc<dyn HostKey + Send + Sync>);
+
+    impl HostKey for SharedSigner {
+        fn algorithm(&self) -> &'static str {
+            self.0.algorithm()
+        }
+        fn public_blob(&self) -> Vec<u8> {
+            self.0.public_blob()
+        }
+        fn sign(&self, msg: &[u8]) -> puressh::Result<Vec<u8>> {
+            self.0.sign(msg)
+        }
     }
 
     /// Refuse to read `path` when its Unix mode shares any forbidden bit
@@ -3082,7 +3173,10 @@ mod imp {
             None => format!("127.0.0.1:{port}"),
         };
 
-        let host_keys = load_host_keys(&host_key_files, strict_modes)?;
+        let mut host_certificate_files = cli.host_certificate_files.clone();
+        host_certificate_files.extend(sshd_cfg.global.host_certificate_files.iter().cloned());
+        let host_keys =
+            load_host_keys_with_certs(&host_key_files, &host_certificate_files, strict_modes)?;
         let authorized_blobs: Vec<Vec<u8>> = match &authorized_keys_file {
             Some(path) => load_authorized_keys(path, strict_modes)?
                 .into_iter()

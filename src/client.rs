@@ -222,6 +222,10 @@ pub struct AlgoOverrides {
     /// `PubkeyAcceptedAlgorithms` — signature algorithms for our own
     /// publickey credentials. Consumed by the userauth driver, not KEXINIT.
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
+    /// `CASignatureAlgorithms` — signature algorithms accepted from a CA when
+    /// verifying a host certificate. `None` ⇒ built-in default
+    /// ([`crate::config::algos::CA_SIGNATURE_DEFAULTS`]).
+    pub ca_signature_algorithms: Option<Vec<String>>,
     /// `Compression` — `Some(true)` advertises `zlib@openssh.com` ahead of
     /// `none` in both directions; `Some(false)` / `None` advertises `none`
     /// only. Honouring `Some(true)` requires the `compress` feature; the
@@ -2194,6 +2198,8 @@ impl Client {
                 &self.runner,
                 &self.target_host,
                 self.target_port,
+                self.algo_overrides.ca_signature_algorithms.as_deref(),
+                unix_now(),
             )?);
             verifier_box.as_deref()
         } else {
@@ -2865,7 +2871,23 @@ fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexIn
 
     let ciphers = owned_or_default(&over.ciphers, defaults::CIPHERS);
     let macs = owned_or_default(&over.macs, defaults::MACS);
-    let host_key = owned_or_default(&over.host_key_algorithms, defaults::HOST_KEY);
+    // Host-key algorithms. With no explicit `HostKeyAlgorithms` override we
+    // advertise the certificate key-types ahead of the matching plain keys
+    // (matching OpenSSH), so a server with a host certificate can offer it.
+    // Accepting an offered cert still requires a trusted CA at verify time
+    // (`build_verifier` → `verify_host_cert`); merely advertising the name does
+    // not weaken host verification. An explicit override is taken verbatim.
+    let host_key = match &over.host_key_algorithms {
+        Some(v) => v.clone(),
+        None => {
+            let mut v: Vec<String> = crate::cert::CERT_KEY_NAMES
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+            v.extend(defaults::HOST_KEY.iter().map(|s| s.to_string()));
+            v
+        }
+    };
     // Compression preference. `Compression yes` advertises
     // `zlib@openssh.com` ahead of `none` so we still negotiate a session
     // with a server that lacks zlib. The delayed-zlib variant only starts
@@ -2896,12 +2918,26 @@ fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexIn
     KexInit::from_algorithms_owned(algs, cookie)
 }
 
+/// Current wall-clock time as Unix seconds, injected into certificate
+/// validity checks at the std edge. Falls back to 0 (which fails every
+/// not-yet-valid check and is harmless for already-valid certs) on the
+/// impossible pre-epoch case.
+fn unix_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn build_verifier(
     reply_payload: &[u8],
     policy: &HostKeyPolicy,
     runner: &KexRunner,
     target_host: &str,
     target_port: u16,
+    ca_signature_algorithms: Option<&[String]>,
+    now: u64,
 ) -> Result<Box<dyn HostKeyVerify>> {
     if reply_payload.len() < 5 {
         return Err(Error::Format("kex-ecdh-reply too short"));
@@ -2931,6 +2967,47 @@ fn build_verifier(
     let neg = runner
         .negotiated()
         .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;
+
+    // Certificate host keys: `k_s` is an OpenSSH certificate, not a plain key.
+    // Parse it, enforce type/validity/critical-options, then make the trust
+    // decision per policy. The signature over `H` is verified against the
+    // certificate's EMBEDDED key (built below); the CA signature ties the
+    // embedded key to a trusted CA.
+    if crate::cert::is_cert_name(&neg.host_key) {
+        let cert = crate::cert::Certificate::parse(k_s)?;
+        let ca_algos: Vec<&str> = match ca_signature_algorithms {
+            Some(list) => list.iter().map(|s| s.as_str()).collect(),
+            None => crate::config::algos::CA_SIGNATURE_DEFAULTS.to_vec(),
+        };
+        match policy {
+            // No host verification requested: still parse and enforce the
+            // cert's own constraints (type/validity/critical-options) but do
+            // not require CA trust. `H` is verified against the embedded key.
+            HostKeyPolicy::AcceptAny => {
+                cert.check_type(crate::cert::CertType::Host)?;
+                cert.check_validity(now)?;
+                cert.require_known_critical_options()?;
+            }
+            // Pin the whole certificate blob by fingerprint.
+            HostKeyPolicy::AcceptFingerprint(fp) => {
+                let digest = Sha256::digest(k_s);
+                if digest.as_ref() != fp {
+                    return Err(Error::HostKeyRejected);
+                }
+                cert.check_type(crate::cert::CertType::Host)?;
+                cert.check_validity(now)?;
+                cert.require_known_critical_options()?;
+            }
+            // Trust via known_hosts `@cert-authority` (and `@revoked`).
+            HostKeyPolicy::KnownHosts(kh) => {
+                let store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                store.verify_host_cert(target_host, target_port, &cert, &ca_algos, now)?;
+            }
+        }
+        // Build the exchange-hash verifier from the cert's embedded key, keyed
+        // on the negotiated cert name (which pins the RSA hash).
+        return host_key_verify_by_name(&neg.host_key, k_s);
+    }
 
     match policy {
         HostKeyPolicy::AcceptAny => {}
@@ -3540,9 +3617,9 @@ mod tests {
         // is consulted, so we don't need a real KEX outcome.
         let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];
         reply.extend_from_slice(&0u32.to_be_bytes());
-        let err = build_verifier(&reply, &policy, &runner, "", 22);
+        let err = build_verifier(&reply, &policy, &runner, "", 22, None, 0);
         assert!(matches!(err, Err(Error::Config(_))));
-        let err = build_verifier(&reply, &policy, &runner, "host", 0);
+        let err = build_verifier(&reply, &policy, &runner, "host", 0, None, 0);
         assert!(matches!(err, Err(Error::Config(_))));
     }
 

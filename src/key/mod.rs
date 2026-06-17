@@ -29,6 +29,13 @@ mod writer;
 
 pub use writer::EcdsaCurve;
 
+/// Decode standard (padded) base64, as used in `authorized_keys` / `.pub` /
+/// `*-cert.pub` files. Exposed crate-wide so the certificate module can parse
+/// OpenSSH single-line public forms without duplicating the decoder.
+pub(crate) fn base64_decode(input: &[u8]) -> Result<Vec<u8>> {
+    base64::decode(input)
+}
+
 /// SSH public key, tagged by algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicKey {

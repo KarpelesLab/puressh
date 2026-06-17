@@ -239,6 +239,77 @@ impl KnownHosts {
         }
     }
 
+    /// Decide whether a host *certificate* is trusted for `host[:port]`.
+    ///
+    /// Trust flows from `@cert-authority` lines: a host cert is accepted iff
+    /// some `@cert-authority` entry whose host field matches `host` names a CA
+    /// key equal to the certificate's `signature_key_blob`, the certificate's
+    /// CA signature verifies under `allowed_ca_algos`, and the cert is a valid,
+    /// in-window host cert authorizing `host` as a principal.
+    ///
+    /// `@revoked` is evaluated first: a revoke line matching either the CA key
+    /// or the cert's embedded key refuses the connection outright. (Full KRL
+    /// binary format is out of scope; `@revoked` covers key/serial-by-key
+    /// revocation at the granularity of a key blob.)
+    ///
+    /// Returns `Ok(())` when trusted; an `Err` (one of the `Cert*` variants or
+    /// `HostKeyRejected`) when not.
+    pub fn verify_host_cert(
+        &self,
+        host: &str,
+        port: u16,
+        cert: &crate::cert::Certificate,
+        allowed_ca_algos: &[&str],
+        now: u64,
+    ) -> crate::Result<()> {
+        use crate::error::Error;
+
+        // Pass 1: @revoked — refuse if a revoke line matches the CA key OR the
+        // certificate's embedded key (revoking either kills the cert).
+        for slot in &self.lines {
+            if let Slot::Entry(e) = slot
+                && e.marker == Some(Marker::Revoked)
+                && host_field_matches(&e.host_spec, host, port)
+                && (e.key_blob == cert.signature_key_blob
+                    || e.key_blob == cert.embedded_pubkey_blob)
+            {
+                return Err(Error::HostKeyRejected);
+            }
+        }
+
+        // Validate the certificate itself before consulting the CA list, so a
+        // structurally-bad cert is rejected with a precise error.
+        cert.check_type(crate::cert::CertType::Host)?;
+        cert.check_validity(now)?;
+        cert.require_known_critical_options()?;
+
+        // Pass 2: find a matching @cert-authority entry.
+        let mut saw_ca = false;
+        for slot in &self.lines {
+            let Slot::Entry(e) = slot else { continue };
+            if e.marker != Some(Marker::CertAuthority) {
+                continue;
+            }
+            if !host_field_matches(&e.host_spec, host, port) {
+                continue;
+            }
+            saw_ca = true;
+            if e.key_blob == cert.signature_key_blob {
+                // This CA is trusted for this host. Verify the CA signature
+                // and the principal binding.
+                cert.verify_ca_signature(allowed_ca_algos)?;
+                cert.check_principal(host)?;
+                return Ok(());
+            }
+        }
+
+        // No trusted CA for this host. If we saw a @cert-authority line for the
+        // host but its key didn't match, that's a CA mismatch; otherwise the
+        // host is simply unknown to the cert system.
+        let _ = saw_ca;
+        Err(Error::HostKeyRejected)
+    }
+
     /// Append a new entry. The host is formatted as `host` for the
     /// default port and `[host]:port` otherwise.
     ///

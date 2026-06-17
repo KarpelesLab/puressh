@@ -41,6 +41,24 @@ pub enum Error {
     /// without a connect target). Distinct from `Protocol` so callers can
     /// tell "I configured this wrong" from "the peer is misbehaving".
     Config(&'static str),
+    /// An OpenSSH certificate's validity window has already ended
+    /// (`now >= valid_before`).
+    CertExpired,
+    /// An OpenSSH certificate is not yet valid (`now < valid_after`).
+    CertNotYetValid,
+    /// The requested principal (host name or login user) is not listed in
+    /// the certificate's `valid principals`.
+    CertPrincipalMismatch,
+    /// The certificate's `type` field does not match the context it is being
+    /// used in (a host cert presented for user auth, or vice versa).
+    CertTypeMismatch,
+    /// The certificate carries a critical option this build does not
+    /// understand; per the spec such a certificate MUST be rejected.
+    CertUnknownCriticalOption,
+    /// The CA signature over the certificate failed to verify, or the CA
+    /// signature algorithm is not in the permitted `CASignatureAlgorithms`
+    /// set.
+    CertBadCaSignature,
 }
 
 impl fmt::Display for Error {
@@ -61,6 +79,14 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "io: {e}"),
             Error::Crypto(s) => write!(f, "crypto: {s}"),
             Error::Config(s) => write!(f, "config error: {s}"),
+            Error::CertExpired => f.write_str("certificate has expired"),
+            Error::CertNotYetValid => f.write_str("certificate is not yet valid"),
+            Error::CertPrincipalMismatch => f.write_str("certificate principal not authorized"),
+            Error::CertTypeMismatch => f.write_str("certificate type mismatch"),
+            Error::CertUnknownCriticalOption => {
+                f.write_str("certificate has an unknown critical option")
+            }
+            Error::CertBadCaSignature => f.write_str("certificate CA signature invalid"),
         }
     }
 }

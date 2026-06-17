@@ -39,6 +39,9 @@ pub mod mac;
 pub mod transport;
 
 #[cfg(feature = "alloc")]
+pub mod cert;
+
+#[cfg(feature = "alloc")]
 pub mod compress;
 
 #[cfg(feature = "alloc")]

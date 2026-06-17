@@ -61,6 +61,13 @@ pub(crate) fn map_error(err: &Error) -> c_int {
         Error::BadChannelState => PCSSH_ERR_PROTOCOL,
         Error::Unsupported(_) => PCSSH_ERR_GENERIC,
         Error::Config(_) => PCSSH_ERR_CONFIG,
+        // Certificate rejections are a host-key / auth trust failure.
+        Error::CertBadCaSignature => PCSSH_ERR_HOSTKEY_REJECTED,
+        Error::CertExpired
+        | Error::CertNotYetValid
+        | Error::CertPrincipalMismatch
+        | Error::CertTypeMismatch
+        | Error::CertUnknownCriticalOption => PCSSH_ERR_HOSTKEY_REJECTED,
     }
 }
 

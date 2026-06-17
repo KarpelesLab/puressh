@@ -1020,6 +1020,238 @@ pub fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
+/// What a [`KeystrokeObfuscator`] tick decided to do this cadence slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TickAction {
+    /// Ship this chunk of real keystroke data over the channel.
+    SendData(Vec<u8>),
+    /// No real data was queued but the chaff window is open — emit a
+    /// `ping@openssh.com` chaff packet to keep the cadence constant.
+    SendChaff,
+    /// The chaff window just expired on this tick (no data was queued and
+    /// the tail elapsed). The caller should stop the cadence and emit the
+    /// "stopping: chaff time expired" debug line. Carries the number of
+    /// chaff packets sent during the window that just closed.
+    WindowExpired { chaff_sent: u64 },
+    /// Cadence is idle (window closed, nothing queued); do nothing.
+    Idle,
+}
+
+/// Pure, timer-independent state machine implementing OpenSSH's
+/// `ObscureKeystrokeTiming` cadence + chaff model for an interactive pty
+/// session.
+///
+/// The caller drives it with a monotonic millisecond clock so the logic is
+/// fully testable without real threads or timers:
+///
+/// - [`enqueue`](Self::enqueue) appends real keystroke bytes and (re)opens a
+///   chaff window that stays open for `tail_ms` after the most recent
+///   keystroke.
+/// - [`tick`](Self::tick) is called on the cadence (every `interval_ms`). If
+///   data is queued it returns a bounded [`TickAction::SendData`] chunk; if
+///   the window is open but nothing is queued it returns
+///   [`TickAction::SendChaff`]; when the window's tail elapses with nothing
+///   queued it returns [`TickAction::WindowExpired`] once, then
+///   [`TickAction::Idle`] until the next keystroke.
+///
+/// Releasing data on the fixed cadence (rather than immediately) and padding
+/// idle gaps with chaff makes the on-wire packet rate constant while typing,
+/// masking both inter-keystroke timing and when typing starts/stops.
+pub struct KeystrokeObfuscator {
+    interval_ms: u32,
+    tail_ms: u32,
+    max_chunk: usize,
+    queue: Vec<u8>,
+    /// Clock value at/after which the chaff window closes, when open.
+    window_until: Option<u64>,
+    /// `true` once a window has opened and not yet been reported as expired.
+    window_active: bool,
+    /// Chaff packets emitted during the currently-open window.
+    chaff_sent: u64,
+    /// `true` once we have logged the "starting" line for the open window.
+    started_logged: bool,
+}
+
+impl KeystrokeObfuscator {
+    /// Default per-keystroke chunk cap. OpenSSH ships keystrokes one cadence
+    /// slot at a time; a small cap keeps a paste from collapsing the timing
+    /// cover, while still draining a burst over a few ticks.
+    pub const DEFAULT_MAX_CHUNK: usize = 256;
+
+    /// Create a new obfuscator with the given cadence `interval_ms` and chaff
+    /// `tail_ms` (how long the window stays open after the last keystroke).
+    pub fn new(interval_ms: u32, tail_ms: u32) -> Self {
+        Self {
+            interval_ms: interval_ms.max(1),
+            tail_ms,
+            max_chunk: Self::DEFAULT_MAX_CHUNK,
+            queue: Vec::new(),
+            window_until: None,
+            window_active: false,
+            chaff_sent: 0,
+            started_logged: false,
+        }
+    }
+
+    /// The configured cadence interval in milliseconds (≥ 1).
+    pub fn interval_ms(&self) -> u32 {
+        self.interval_ms
+    }
+
+    /// `true` when the chaff window is currently open (cadence running).
+    pub fn window_open(&self) -> bool {
+        self.window_active
+    }
+
+    /// `true` if the caller still needs to emit the "starting" debug line for
+    /// the current window. Returns `true` exactly once per window open; calling
+    /// it flips the flag so the line is logged a single time.
+    pub fn take_started_log(&mut self) -> bool {
+        if self.window_active && !self.started_logged {
+            self.started_logged = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Append real keystroke bytes and (re)open the chaff window: the window
+    /// will stay open until `now_ms + tail_ms`.
+    pub fn enqueue(&mut self, data: &[u8], now_ms: u64) {
+        if data.is_empty() {
+            return;
+        }
+        self.queue.extend_from_slice(data);
+        self.open_or_extend_window(now_ms);
+    }
+
+    fn open_or_extend_window(&mut self, now_ms: u64) {
+        let deadline = now_ms.saturating_add(self.tail_ms as u64);
+        self.window_until = Some(deadline);
+        if !self.window_active {
+            self.window_active = true;
+            self.chaff_sent = 0;
+            self.started_logged = false;
+        }
+    }
+
+    /// Advance the cadence by one slot at `now_ms`. See [`TickAction`].
+    pub fn tick(&mut self, now_ms: u64) -> TickAction {
+        // Data always takes priority: drain a bounded chunk and keep the
+        // window open (so a long burst doesn't let the cover lapse mid-type).
+        if !self.queue.is_empty() {
+            let take = self.queue.len().min(self.max_chunk);
+            let chunk: Vec<u8> = self.queue.drain(..take).collect();
+            // Sending real data refreshes the tail, exactly like a keystroke.
+            self.open_or_extend_window(now_ms);
+            return TickAction::SendData(chunk);
+        }
+
+        if !self.window_active {
+            return TickAction::Idle;
+        }
+
+        // Window open, nothing queued: chaff until the tail elapses.
+        match self.window_until {
+            Some(until) if now_ms < until => {
+                self.chaff_sent = self.chaff_sent.saturating_add(1);
+                TickAction::SendChaff
+            }
+            _ => {
+                let chaff_sent = self.chaff_sent;
+                self.window_active = false;
+                self.window_until = None;
+                self.started_logged = false;
+                self.chaff_sent = 0;
+                TickAction::WindowExpired { chaff_sent }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod keystroke_obfuscator_tests {
+    use super::*;
+
+    #[test]
+    fn idle_when_no_activity() {
+        let mut o = KeystrokeObfuscator::new(20, 1000);
+        assert_eq!(o.tick(0), TickAction::Idle);
+        assert_eq!(o.tick(20), TickAction::Idle);
+        assert!(!o.window_open());
+    }
+
+    #[test]
+    fn enqueue_opens_window_and_data_drains_on_ticks() {
+        let mut o = KeystrokeObfuscator::new(20, 1000);
+        o.enqueue(b"abc", 0);
+        assert!(o.window_open());
+        // First tick after the keystroke ships the data.
+        assert_eq!(o.tick(20), TickAction::SendData(b"abc".to_vec()));
+        // No more data, but the window stayed open → chaff.
+        assert_eq!(o.tick(40), TickAction::SendChaff);
+    }
+
+    #[test]
+    fn large_burst_is_chunked_across_ticks() {
+        let mut o = KeystrokeObfuscator::new(20, 1000);
+        let big = vec![b'x'; KeystrokeObfuscator::DEFAULT_MAX_CHUNK * 2 + 5];
+        o.enqueue(&big, 0);
+        let a = o.tick(20);
+        let b = o.tick(40);
+        let c = o.tick(60);
+        match (&a, &b, &c) {
+            (TickAction::SendData(x), TickAction::SendData(y), TickAction::SendData(z)) => {
+                assert_eq!(x.len(), KeystrokeObfuscator::DEFAULT_MAX_CHUNK);
+                assert_eq!(y.len(), KeystrokeObfuscator::DEFAULT_MAX_CHUNK);
+                assert_eq!(z.len(), 5);
+            }
+            other => panic!("expected three SendData chunks, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn window_expires_after_tail_with_chaff_count() {
+        let mut o = KeystrokeObfuscator::new(20, 50);
+        o.enqueue(b"k", 0);
+        // Ship the data at t=20 (refreshes tail to 70).
+        assert_eq!(o.tick(20), TickAction::SendData(b"k".to_vec()));
+        // Chaff while within the window.
+        assert_eq!(o.tick(40), TickAction::SendChaff);
+        assert_eq!(o.tick(60), TickAction::SendChaff);
+        // At t=70 the tail (last refresh 20 + 50) has elapsed → expired,
+        // reporting the two chaff packets sent.
+        assert_eq!(o.tick(70), TickAction::WindowExpired { chaff_sent: 2 });
+        // After expiry the cadence is idle until the next keystroke.
+        assert_eq!(o.tick(90), TickAction::Idle);
+        assert!(!o.window_open());
+    }
+
+    #[test]
+    fn new_keystroke_reopens_window_after_expiry() {
+        let mut o = KeystrokeObfuscator::new(20, 30);
+        o.enqueue(b"a", 0);
+        assert_eq!(o.tick(20), TickAction::SendData(b"a".to_vec()));
+        // Let it expire (last refresh 20 + 30 = 50).
+        assert!(matches!(o.tick(50), TickAction::WindowExpired { .. }));
+        assert_eq!(o.tick(70), TickAction::Idle);
+        // Typing again reopens a fresh window.
+        o.enqueue(b"b", 100);
+        assert!(o.window_open());
+        assert!(o.take_started_log(), "starting line logged once per window");
+        assert!(!o.take_started_log(), "starting line not logged twice");
+        assert_eq!(o.tick(120), TickAction::SendData(b"b".to_vec()));
+    }
+
+    #[test]
+    fn started_log_fires_once_per_window() {
+        let mut o = KeystrokeObfuscator::new(20, 30);
+        o.enqueue(b"a", 0);
+        assert!(o.take_started_log());
+        assert!(!o.take_started_log());
+    }
+}
+
 #[cfg(test)]
 mod target_tests {
     //! Cross-platform tests for the `[user@]host[:port]` and

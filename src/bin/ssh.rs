@@ -27,6 +27,8 @@ use puressh::client::{
 
 #[path = "common.rs"]
 mod common;
+#[cfg(unix)]
+use common::{KeystrokeObfuscator, TickAction};
 use common::{
     StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
     expand_tilde, load_identity, parse_target, read_kbdint_response, read_password_from_stdin,
@@ -1494,12 +1496,17 @@ fn run() -> Result<i32, String> {
             Some(No) => false,
             Some(Auto) | None => stdin_is_tty(),
         };
+        // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms). Only
+        // meaningful for the PTY (interactive) path; the pipe path ignores it.
+        let okt = cfg_block
+            .obscure_keystroke_timing
+            .unwrap_or_else(puressh::config::ObscureKeystrokeTiming::default_on);
         // Master role: serve the control socket while running this shell as
         // the foreground session.
         if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
             return become_master(dec, &cli, &cfg_block, shared, move |s| {
                 if use_pty {
-                    run_interactive_pty_shell_on(s)
+                    run_interactive_pty_shell_on(s, okt)
                 } else {
                     run_interactive_pipe_shell_on(s)
                 }
@@ -1507,7 +1514,7 @@ fn run() -> Result<i32, String> {
             });
         }
         if use_pty {
-            run_interactive_pty_shell(shared)
+            run_interactive_pty_shell(shared, okt)
         } else {
             run_interactive_pipe_shell(shared)
         }
@@ -2038,6 +2045,152 @@ fn stdin_is_tty() -> bool {
     unsafe { nix::libc::isatty(0) == 1 }
 }
 
+/// `ObscureKeystrokeTiming` chaff tail: how long the cadence keeps emitting
+/// chaff after the last keystroke before logging "chaff time expired". OpenSSH
+/// uses a randomized duration; we use a modestly jittered ~1 s tail (the lib
+/// stays deterministic — the jitter lives here in the binary, which may use
+/// std). Spirit-equivalent: the cover outlasts a pause in typing.
+#[cfg(unix)]
+fn chaff_tail_ms() -> u32 {
+    // Base 1000 ms ± up to ~256 ms of jitter, derived cheaply from the
+    // process clock (no crypto-grade randomness needed for timing cover).
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    1000u32.saturating_add(now & 0xff)
+}
+
+/// Spawn the obfuscated stdin path: a blocking stdin reader that enqueues
+/// keystrokes into a shared [`KeystrokeObfuscator`], plus a fixed-interval
+/// cadence thread that releases queued data (or emits chaff `ping@openssh.com`
+/// packets) so the on-wire rate is constant while typing. Returns the join
+/// handles for both threads.
+///
+/// `stop` is the shared "remote shell exited" flag (set by the stdout reader);
+/// once it trips and stdin has hit EOF, the cadence thread winds down.
+#[cfg(unix)]
+fn spawn_obfuscated_stdin(
+    shared: &puressh::shared::SharedClient,
+    channel_id: u32,
+    okt: puressh::config::ObscureKeystrokeTiming,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<thread::JoinHandle<()>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let interval_ms = okt
+        .interval_ms()
+        .unwrap_or(puressh::config::ObscureKeystrokeTiming::DEFAULT_INTERVAL_MS)
+        .max(1);
+    let tail_ms = chaff_tail_ms();
+    vlog(
+        2,
+        &format!("ObscureKeystrokeTiming enabled: interval ~{interval_ms}ms"),
+    );
+
+    let obf = std::sync::Arc::new(std::sync::Mutex::new(KeystrokeObfuscator::new(
+        interval_ms,
+        tail_ms,
+    )));
+    // Set once stdin reaches EOF so the cadence thread can flush remaining
+    // queued bytes, send EOF to the remote, and exit.
+    let stdin_eof = std::sync::Arc::new(AtomicBool::new(false));
+    let start = std::time::Instant::now();
+
+    // Reader thread: blocking stdin → obfuscator queue.
+    let r_obf = obf.clone();
+    let r_eof = stdin_eof.clone();
+    let t_reader = thread::spawn(move || {
+        let mut buf = [0u8; 8 * 1024];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let now = start.elapsed().as_millis() as u64;
+                    if let Ok(mut g) = r_obf.lock() {
+                        g.enqueue(&buf[..n], now);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        r_eof.store(true, Ordering::Relaxed);
+    });
+
+    // Cadence thread: fixed-interval release of data / chaff.
+    let c_shared = shared.clone();
+    let c_obf = obf.clone();
+    let c_stop = stop;
+    let c_eof = stdin_eof;
+    let t_cadence = thread::spawn(move || {
+        let interval = std::time::Duration::from_millis(interval_ms as u64);
+        loop {
+            thread::sleep(interval);
+            let now = start.elapsed().as_millis() as u64;
+            let (action, started) = match c_obf.lock() {
+                Ok(mut g) => {
+                    let started = g.take_started_log();
+                    (g.tick(now), started)
+                }
+                Err(_) => break,
+            };
+            if started {
+                vlog(
+                    2,
+                    &format!("ObscureKeystrokeTiming starting: interval ~{interval_ms}ms"),
+                );
+            }
+            match action {
+                TickAction::SendData(chunk) => {
+                    let mut off = 0;
+                    while off < chunk.len() {
+                        match c_shared.channel_send_data(channel_id, &chunk[off..]) {
+                            Ok(0) | Err(_) => return,
+                            Ok(taken) => off += taken,
+                        }
+                    }
+                }
+                TickAction::SendChaff => {
+                    // Connection-level chaff: a PING the peer answers with a
+                    // PONG (which our pump drops). Failure means the transport
+                    // is gone — stop.
+                    if c_shared.send_ping(b"").is_err() {
+                        return;
+                    }
+                }
+                TickAction::WindowExpired { chaff_sent } => {
+                    vlog(
+                        2,
+                        &format!(
+                            "ObscureKeystrokeTiming stopping: chaff time expired \
+                             ({chaff_sent} chaff packets sent)"
+                        ),
+                    );
+                }
+                TickAction::Idle => {}
+            }
+
+            // Wind-down: once stdin hit EOF and the obfuscator has drained
+            // (window closed, queue empty), half-close the write side and
+            // exit. Also exit if the remote shell has gone away.
+            if c_eof.load(Ordering::Relaxed) {
+                let drained = c_obf.lock().map(|g| !g.window_open()).unwrap_or(true);
+                if drained {
+                    let _ = c_shared.channel_send_eof(channel_id);
+                    return;
+                }
+            }
+            if c_stop.load(Ordering::Relaxed) {
+                return;
+            }
+        }
+    });
+
+    vec![t_reader, t_cadence]
+}
+
 /// Run an interactive shell with a real PTY:
 ///   1. capture local terminal size + termios
 ///   2. switch local TTY into raw mode (restored on Drop)
@@ -2047,15 +2200,21 @@ fn stdin_is_tty() -> bool {
 ///      window-change requests on local resize
 ///   5. wait for the I/O threads to finish, then read exit-status
 #[cfg(unix)]
-fn run_interactive_pty_shell(shared: puressh::shared::SharedClient) -> Result<i32, String> {
-    run_interactive_pty_shell_on(&shared)
+fn run_interactive_pty_shell(
+    shared: puressh::shared::SharedClient,
+    okt: puressh::config::ObscureKeystrokeTiming,
+) -> Result<i32, String> {
+    run_interactive_pty_shell_on(&shared, okt)
 }
 
 /// `&`-taking variant of [`run_interactive_pty_shell`] so the ControlMaster
 /// foreground closure (which only borrows the `SharedClient`) can run the same
 /// interactive session while the accept loop holds its own clone.
 #[cfg(unix)]
-fn run_interactive_pty_shell_on(shared: &puressh::shared::SharedClient) -> Result<i32, String> {
+fn run_interactive_pty_shell_on(
+    shared: &puressh::shared::SharedClient,
+    okt: puressh::config::ObscureKeystrokeTiming,
+) -> Result<i32, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // 1. Geometry.
@@ -2098,33 +2257,43 @@ fn run_interactive_pty_shell_on(shared: &puressh::shared::SharedClient) -> Resul
     //    independently and yields between pump iterations.
     let stdout_done = Arc::new(AtomicBool::new(false));
 
-    // stdin → channel.
-    let writer_shared = shared.clone();
-    let t_in = thread::spawn(move || {
-        let mut buf = [0u8; 8 * 1024];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut off = 0;
-                    while off < n {
-                        match writer_shared.channel_send_data(channel_id, &buf[off..n]) {
-                            Ok(0) => return,
-                            Err(_) => return,
-                            Ok(taken) => off += taken,
+    // stdin → channel. Two modes:
+    //   * ObscureKeystrokeTiming on: a reader thread enqueues stdin bytes
+    //     into a shared KeystrokeObfuscator while a cadence thread releases
+    //     them (or emits chaff PINGs) on a fixed interval — see
+    //     `spawn_obfuscated_stdin`.
+    //   * off: the historical immediate-write thread.
+    let stdin_stop = stdout_done.clone();
+    let t_in: Vec<thread::JoinHandle<()>> = if okt.is_on() {
+        spawn_obfuscated_stdin(shared, channel_id, okt, stdin_stop)
+    } else {
+        let writer_shared = shared.clone();
+        vec![thread::spawn(move || {
+            let mut buf = [0u8; 8 * 1024];
+            let mut stdin = std::io::stdin();
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut off = 0;
+                        while off < n {
+                            match writer_shared.channel_send_data(channel_id, &buf[off..n]) {
+                                Ok(0) => return,
+                                Err(_) => return,
+                                Ok(taken) => off += taken,
+                            }
                         }
                     }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
             }
-        }
-        // Half-close the write side so the remote shell sees EOF on
-        // its stdin. We don't close the channel — the remote stdout
-        // is probably still draining.
-        let _ = writer_shared.channel_send_eof(channel_id);
-    });
+            // Half-close the write side so the remote shell sees EOF on
+            // its stdin. We don't close the channel — the remote stdout
+            // is probably still draining.
+            let _ = writer_shared.channel_send_eof(channel_id);
+        })]
+    };
 
     // channel → stdout. Owns the stream — no outer mutex.
     let stdout_flag = stdout_done.clone();

@@ -158,6 +158,129 @@ fn exec_against_real_sshd() {
     assert_eq!(out.exit_status, Some(0), "stderr was: {stderr}");
 }
 
+/// Interactive (pty) session against a real sshd while exercising the
+/// `ping@openssh.com` chaff path that `ObscureKeystrokeTiming` relies on:
+/// open a real shell channel, interleave transport PINGs (chaff) with
+/// keystroke data, and confirm the shell still echoes our command. A real
+/// OpenSSH server answers each PING with a PONG (dropped by our read loop);
+/// if PING/PONG framing were wrong the session would desynchronise.
+#[test]
+#[ignore]
+fn interactive_shell_with_keystroke_chaff_against_real_sshd() {
+    use puressh::shared::SharedClient;
+
+    let tmp = tempdir();
+    let host_key = tmp.join("host_ed25519");
+    let client_key = tmp.join("client_ed25519");
+    let authorized = tmp.join("authorized_keys");
+    let config = tmp.join("sshd_config");
+
+    ssh_keygen(&host_key, "ed25519");
+    ssh_keygen(&client_key, "ed25519");
+
+    let pubkey = std::fs::read(format!("{}.pub", client_key.display())).expect("client pub");
+    std::fs::write(&authorized, &pubkey).expect("write authorized_keys");
+    chmod_600(&authorized);
+
+    let user = current_user();
+    let port = pick_free_port();
+
+    let cfg_body = format!(
+        "Port {port}\n\
+         ListenAddress 127.0.0.1\n\
+         HostKey {host_key}\n\
+         PidFile {pid}\n\
+         AuthorizedKeysFile {authorized}\n\
+         StrictModes no\n\
+         UsePAM no\n\
+         PasswordAuthentication no\n\
+         KbdInteractiveAuthentication no\n\
+         PubkeyAuthentication yes\n\
+         PermitRootLogin no\n\
+         AllowUsers {user}\n\
+         LogLevel DEBUG1\n",
+        host_key = host_key.display(),
+        authorized = authorized.display(),
+        pid = tmp.join("sshd.pid").display(),
+        port = port,
+        user = user,
+    );
+    std::fs::write(&config, cfg_body).expect("write sshd_config");
+
+    let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
+    let child = Command::new(&sshd)
+        .args(["-D", "-e", "-f"])
+        .arg(&config)
+        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stdin(Stdio::null())
+        .spawn()
+        .expect("spawn sshd");
+    let _guard = SshdGuard { child };
+
+    wait_for_tcp(port, Duration::from_secs(5));
+
+    let mut client = Client::connect(
+        ("127.0.0.1", port),
+        Config {
+            host_key_policy: HostKeyPolicy::AcceptAny,
+            timeout: Some(Duration::from_secs(10)),
+            algorithms: Default::default(),
+        },
+    )
+    .expect("connect");
+
+    let pem = std::fs::read_to_string(&client_key).expect("client key pem");
+    let pk = PrivateKey::parse_openssh_pem(&pem, None).expect("parse client key");
+    let hk = pk.into_host_key().expect("into_host_key");
+    client
+        .authenticate(&user, vec![ClientCredential::PublicKey(hk)])
+        .expect("auth");
+
+    let shared: SharedClient = client.into();
+    shared
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .expect("set timeout");
+
+    // Open a pty shell.
+    let mut stream = shared
+        .shell_stream("xterm", 80, 24, 0, 0, Vec::new())
+        .expect("shell_stream");
+    let ch = stream.channel_id();
+
+    // Simulate the obfuscator cadence: a few chaff PINGs, then real
+    // keystrokes (a command + newline), then more chaff.
+    for _ in 0..3 {
+        shared.send_ping(b"").expect("chaff ping");
+    }
+    shared
+        .channel_send_data(ch, b"echo chaff-ok\n")
+        .expect("send keystrokes");
+    for _ in 0..3 {
+        shared.send_ping(b"timing").expect("chaff ping");
+    }
+
+    // Read the shell output until we see our marker (with a deadline).
+    use std::io::Read as _;
+    let mut acc = Vec::new();
+    let mut buf = [0u8; 4096];
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                acc.extend_from_slice(&buf[..n]);
+                if String::from_utf8_lossy(&acc).contains("chaff-ok") {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    let out = String::from_utf8_lossy(&acc);
+    assert!(out.contains("chaff-ok"), "shell output was: {out:?}");
+}
+
 fn tempdir() -> PathBuf {
     let base = std::env::temp_dir().join(format!(
         "puressh_e2e_{}_{}",

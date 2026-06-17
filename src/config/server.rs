@@ -93,6 +93,12 @@ pub struct ServerOptions {
     /// `TrustedUserCAKeys` — path to a file of CA public keys whose user
     /// certificates the server will accept (one key per line).
     pub trusted_user_ca_keys: Option<String>,
+    /// `RevokedKeys` — path to a key-revocation list. OpenSSH accepts either a
+    /// list of plain public keys (`authorized_keys` format) or a binary KRL
+    /// blob (`ssh-keygen -k`); puressh loads the binary KRL form. A
+    /// publickey / certificate the KRL covers is refused regardless of any
+    /// other trust.
+    pub revoked_keys: Option<String>,
     /// `AuthorizedPrincipalsFile` — path (with `%u`/`%h` tokens) to a file
     /// listing the certificate principals a connecting user is allowed to
     /// authenticate as. When unset, the login user must itself appear in the
@@ -469,6 +475,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     dst.host_certificate_files
         .extend(src.host_certificate_files.iter().cloned());
     take_scalar!(trusted_user_ca_keys);
+    take_scalar!(revoked_keys);
     take_scalar!(authorized_principals_file);
     dst.allow_users.extend(src.allow_users.iter().cloned());
     dst.accept_env.extend(src.accept_env.iter().cloned());
@@ -524,6 +531,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "trustedusercakeys" => {
             opts.trusted_user_ca_keys = Some(one_arg(line)?);
+        }
+        "revokedkeys" => {
+            opts.revoked_keys = Some(one_arg(line)?);
         }
         "authorizedprincipalsfile" => {
             opts.authorized_principals_file = Some(one_arg(line)?);
@@ -1535,6 +1545,13 @@ HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
             }
             other => panic!("expected BadValue, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn server_revoked_keys_accepted() {
+        let src = "Port 22\nRevokedKeys /etc/ssh/revoked\n";
+        let cfg = SshServerConfig::parse(src).unwrap().global;
+        assert_eq!(cfg.revoked_keys.as_deref(), Some("/etc/ssh/revoked"));
     }
 
     #[test]

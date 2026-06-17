@@ -1008,6 +1008,10 @@ mod imp {
         /// `authorized_keys`. A user cert whose `ca_key_blob` is in this set is
         /// CA-trusted (principal authorization is checked separately).
         trusted_user_ca_blobs: Vec<Vec<u8>>,
+        /// Parsed `RevokedKeys` KRL, shared read-only across connections.
+        /// `None` ⇒ no revocation list configured. A publickey / certificate
+        /// the KRL covers is refused regardless of any other trust.
+        revoked_keys: Arc<Option<puressh::krl::Krl>>,
         /// `AuthorizedPrincipalsFile` path *template* (may contain `%u`/`%h`/
         /// `%%` tokens), or `None` when no file is configured. Resolved and
         /// loaded lazily per connection once the login user is known (the home
@@ -1137,6 +1141,27 @@ mod imp {
         /// understanding were already enforced by the auth layer before this is
         /// reached; this is purely the trust + authorization gate.
         fn cert_trusted(&mut self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
+            // 0. KRL revocation wins outright: a cert whose (CA, serial) or
+            //    (CA, key-id) the KRL covers — or whose CA key itself is
+            //    revoked as a plain key — is refused before any trust check.
+            if let Some(krl) = self.revoked_keys.as_ref() {
+                if krl.is_revoked_cert(&ci.ca_key_blob, ci.serial, &ci.key_id) {
+                    if self.debug {
+                        eprintln!(
+                            "sshd: cert auth: certificate revoked by KRL (serial {}, key-id {:?})",
+                            ci.serial, ci.key_id
+                        );
+                    }
+                    return false;
+                }
+                if krl.is_revoked_key(&ci.ca_key_blob) {
+                    if self.debug {
+                        eprintln!("sshd: cert auth: signing CA key revoked by KRL");
+                    }
+                    return false;
+                }
+            }
+
             // 1. Is the signing CA trusted?
             if !self.trusted_user_ca_blobs.contains(&ci.ca_key_blob) {
                 if self.debug {
@@ -1478,10 +1503,25 @@ mod imp {
                     // auth layer already verified the CA signature, the cert
                     // type/validity, and that all critical options are
                     // understood, before producing a `verified` cert attempt.)
-                    let blob_ok = match &cert {
-                        Some(ci) => self.cert_trusted(ci, &user),
-                        None => self.authorized_blobs.contains(&public_blob),
-                    };
+                    // KRL revocation applies uniformly to plain keys and to a
+                    // certificate's full wire blob (OpenSSH's explicit-key /
+                    // fingerprint sections can name a cert blob directly). A
+                    // revoked blob forces `blob_ok` false regardless of the
+                    // authorized-keys / cert-trust verdict.
+                    let blob_revoked = self
+                        .revoked_keys
+                        .as_ref()
+                        .as_ref()
+                        .map(|krl| krl.is_revoked_key(&public_blob))
+                        .unwrap_or(false);
+                    if blob_revoked && self.debug {
+                        eprintln!("sshd: auth publickey: key/cert blob revoked by KRL for {user}");
+                    }
+                    let blob_ok = !blob_revoked
+                        && match &cert {
+                            Some(ci) => self.cert_trusted(ci, &user),
+                            None => self.authorized_blobs.contains(&public_blob),
+                        };
                     // PermitRootLogin gate: if the requested user resolves to
                     // the root account (uid 0) and policy forbids it, deny
                     // regardless of key match. The username is resolved at
@@ -1676,6 +1716,8 @@ mod imp {
         /// Trusted user-CA blobs (TrustedUserCAKeys ++ authorized_keys
         /// cert-authority lines), shared across connections.
         trusted_user_ca_blobs: Arc<Vec<Vec<u8>>>,
+        /// Parsed `RevokedKeys` KRL, shared read-only across connections.
+        revoked_keys: Arc<Option<puressh::krl::Krl>>,
         /// `AuthorizedPrincipalsFile` path *template* (may contain `%u`/`%h`/
         /// `%%`), shared across connections. `None` ⇒ no file configured. Each
         /// connection expands + loads it lazily for its own login user.
@@ -1701,6 +1743,7 @@ mod imp {
                 deny_groups: (*self.deny_groups).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
                 trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
+                revoked_keys: self.revoked_keys.clone(),
                 authorized_principals_file: self.authorized_principals_file.clone(),
                 strict_modes: self.strict_modes,
                 authorized_principals: None,
@@ -3551,6 +3594,28 @@ mod imp {
             }
         }
 
+        // RevokedKeys: load and parse the binary KRL once at startup. A
+        // configured-but-unreadable / unparsable KRL is a hard startup error —
+        // failing closed beats silently running with no revocation. Parsed once
+        // and shared read-only across all connections.
+        let revoked_keys: Arc<Option<puressh::krl::Krl>> = match &sshd_cfg.global.revoked_keys {
+            Some(path) => {
+                let bytes = std::fs::read(path)
+                    .map_err(|e| format!("RevokedKeys {path}: {e}"))?;
+                let krl = puressh::krl::Krl::parse(&bytes)
+                    .map_err(|e| format!("RevokedKeys {path}: parse failed: {e}"))?;
+                if cli.debug {
+                    eprintln!(
+                        "sshd: loaded RevokedKeys from {path} ({} bytes, empty={})",
+                        bytes.len(),
+                        krl.is_empty()
+                    );
+                }
+                Arc::new(Some(krl))
+            }
+            None => Arc::new(None),
+        };
+
         // AuthorizedPrincipalsFile: keep the raw path *template* (it may carry
         // `%u`/`%h` tokens). Each connection expands it against its own login
         // user's passwd entry and loads it lazily in the authenticator — `%h`
@@ -3647,6 +3712,7 @@ mod imp {
             deny_groups: Arc::new(deny_groups),
             authorized_blobs: Arc::new(authorized_blobs),
             trusted_user_ca_blobs: Arc::new(trusted_user_ca_blobs),
+            revoked_keys,
             authorized_principals_file,
             strict_modes,
             permit_root_login,
@@ -4097,6 +4163,7 @@ mod imp {
                 deny_groups: to_pats(deny_groups),
                 authorized_blobs: Vec::new(),
                 trusted_user_ca_blobs: Vec::new(),
+                revoked_keys: std::sync::Arc::new(None),
                 authorized_principals_file: None,
                 strict_modes: false,
                 authorized_principals: None,
@@ -4588,6 +4655,63 @@ mod imp {
             }
             // An impossible user name resolves to no groups.
             assert!(lookup_user_groups("\u{0}no-such-user-xyzzy").is_empty());
+        }
+
+        // ---- KRL revocation wiring -----------------------------------------
+
+        /// Decode a hex string to bytes (test-only helper).
+        fn unhex(s: &str) -> Vec<u8> {
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
+        }
+
+        /// Real `ssh-keygen -k` explicit-key KRL revoking the user key below.
+        const KRL_EXPLICIT_HEX: &str = "5353484b524c0a00000000010000000000000000000000006a31ff28000000000000000000000000000000000200000037000000330000000b7373682d6564323535313900000020dac8c367fff423cc766d20abff4f2620880f421ea7e2c58a47100892e490547f";
+        /// Raw wire blob of that user's ed25519 public key.
+        const USERKEY_BLOB_HEX: &str = "0000000b7373682d6564323535313900000020dac8c367fff423cc766d20abff4f2620880f421ea7e2c58a47100892e490547f";
+
+        #[test]
+        fn krl_revokes_authorized_plain_key() {
+            let blob = unhex(USERKEY_BLOB_HEX);
+            let krl =
+                puressh::krl::Krl::parse(&unhex(KRL_EXPLICIT_HEX)).expect("parse fixture KRL");
+
+            // Build an authenticator that *authorizes* the key, then revokes it.
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_blobs = vec![blob.clone()];
+            a.revoked_keys = std::sync::Arc::new(Some(krl));
+
+            // A verified publickey attempt for an authorized-but-revoked key is
+            // rejected.
+            let decision = a.evaluate(AuthAttempt::PublicKey {
+                user: "alice".into(),
+                algorithm: "ssh-ed25519".into(),
+                public_blob: blob.clone(),
+                probe_only: false,
+                verified: true,
+                cert: None,
+            });
+            assert!(matches!(decision, AuthDecision::Reject));
+        }
+
+        #[test]
+        fn krl_absent_allows_authorized_plain_key() {
+            // Sanity: the same authorized key WITHOUT a KRL is accepted, so the
+            // rejection above is attributable to revocation, not the harness.
+            let blob = unhex(USERKEY_BLOB_HEX);
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_blobs = vec![blob.clone()];
+            let decision = a.evaluate(AuthAttempt::PublicKey {
+                user: "alice".into(),
+                algorithm: "ssh-ed25519".into(),
+                public_blob: blob,
+                probe_only: false,
+                verified: true,
+                cert: None,
+            });
+            assert!(matches!(decision, AuthDecision::Accept));
         }
     }
 }

@@ -107,10 +107,16 @@ fn cert_key_id() {
 fn serial_bitmap() {
     let krl = Krl::parse(KRL_BITMAP).expect("parse");
     for s in [1u64, 2, 3, 5, 8] {
-        assert!(krl.is_revoked_cert(CA_BLOB, s, ""), "serial {s} should revoke");
+        assert!(
+            krl.is_revoked_cert(CA_BLOB, s, ""),
+            "serial {s} should revoke"
+        );
     }
     for s in [4u64, 6, 7, 9, 100] {
-        assert!(!krl.is_revoked_cert(CA_BLOB, s, ""), "serial {s} should NOT revoke");
+        assert!(
+            !krl.is_revoked_cert(CA_BLOB, s, ""),
+            "serial {s} should NOT revoke"
+        );
     }
 }
 

@@ -605,7 +605,10 @@ mod imp {
 
         /// Stub mirror of the real [`KbdStep`]. On a non-PAM build a
         /// keyboard-interactive conversation can never start, so this is only
-        /// ever observed as `Done(false)`.
+        /// ever observed as `Done(false)`. The `Prompt` variant exists purely
+        /// for type parity with the real module's `kbd_pump` match arms, so it
+        /// is never constructed here.
+        #[allow(dead_code)]
         pub enum KbdStep {
             /// Never produced on this build (kept for type parity).
             Prompt {
@@ -2084,10 +2087,7 @@ mod imp {
             // input-dependent (not user-dependent), so it leaks no user-
             // existence oracle. `pending_first_prompt` tracks whether this is
             // the opening answer.
-            if self.pending_first_prompt
-                && answer.is_empty()
-                && !self.permit_empty_passwords
-            {
+            if self.pending_first_prompt && answer.is_empty() && !self.permit_empty_passwords {
                 if self.debug {
                     eprintln!("sshd: auth keyboard-interactive: empty password refused for {user}");
                 }
@@ -4050,8 +4050,7 @@ mod imp {
         // and shared read-only across all connections.
         let revoked_keys: Arc<Option<puressh::krl::Krl>> = match &sshd_cfg.global.revoked_keys {
             Some(path) => {
-                let bytes = std::fs::read(path)
-                    .map_err(|e| format!("RevokedKeys {path}: {e}"))?;
+                let bytes = std::fs::read(path).map_err(|e| format!("RevokedKeys {path}: {e}"))?;
                 let krl = puressh::krl::Krl::parse(&bytes)
                     .map_err(|e| format!("RevokedKeys {path}: parse failed: {e}"))?;
                 if cli.debug {

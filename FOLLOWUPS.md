@@ -98,13 +98,25 @@ it needs.
 - `PermitTunnel` (tun/tap device forwarding) and external-command `Subsystem` entries are
   intentionally unsupported and hard-error.
 
-## Deferred (documented, out of scope)
+## Deferred (documented, out of scope) — **both now done; this file can be retired.**
 
-- **Full multi-step keyboard-interactive PAM conversation** (e.g. an OTP module that asks
-  a second prompt after the password). The PAM conversation handler answers a single
-  `PAM_PROMPT_ECHO_OFF` and otherwise fails closed; a genuine multi-prompt PAM challenge is
-  not driven over the wire. Closing it needs a stateful conversation bridging PAM prompts to
-  successive `USERAUTH_INFO_REQUEST`/`_RESPONSE` rounds.
-- **KRL (key revocation list) binary format.** `RevokedKeys` / certificate-serial
-  revocation in OpenSSH's binary KRL format is not parsed. Closing it needs a KRL reader and
-  a revocation check wired into the cert and pubkey trust gates.
+- ~~**Full multi-step keyboard-interactive PAM conversation**~~ **Done.** A genuine
+  multi-round PAM conversation is now driven over the wire (Linux+PAM build). Each
+  kbd-interactive attempt runs PAM `authenticate()` on a dedicated worker thread; PAM's
+  pull-based conversation callback (`BridgeConv`) blocks on a channel, handing each prompt
+  to the authenticator as a `USERAUTH_INFO_REQUEST` and waiting for the
+  `USERAUTH_INFO_RESPONSE` answer, until the terminal PAM verdict (`Accept`/`Reject` via
+  `record_and_decide("keyboard-interactive")`). `KbdConversation` (in
+  `LocalAuthenticator.kbd_conv`) owns the channel ends + JoinHandle; the PAM `Context`
+  lives on the worker thread and is torn down on disconnect (bounded by LoginGraceTime).
+  Answers are held in `Zeroizing` and never logged. Non-PAM builds keep the rejecting stub.
+  Tested with a scripted fake-worker state-machine (two-prompt accept, reject, empty-
+  password refusal, username-change); manual e2e recipe documented on
+  `start_kbd_interactive` (`src/bin/sshd.rs`).
+- ~~**KRL (key revocation list) binary format.**~~ **Done.** `src/krl/mod.rs` parses the
+  OpenSSH binary KRL (certificates section: serial-list / serial-range / serial-bitmap /
+  key-id; explicit-key; fingerprint-sha1 / -sha256; signature parse-and-ignore). The
+  `RevokedKeys <file>` sshd_config directive loads it at startup (fail-closed on
+  read/parse error); `LocalAuthenticator` refuses a cert whose (CA, serial/key-id) or
+  signing-CA key is revoked, and a plain/cert blob revoked by explicit-key/fingerprint.
+  Client host-key revocation stays with known_hosts `@revoked`.

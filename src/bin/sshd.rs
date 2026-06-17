@@ -1008,11 +1008,19 @@ mod imp {
         /// `authorized_keys`. A user cert whose `ca_key_blob` is in this set is
         /// CA-trusted (principal authorization is checked separately).
         trusted_user_ca_blobs: Vec<Vec<u8>>,
-        /// Explicit principals a connecting user may authenticate as, from an
-        /// `AuthorizedPrincipalsFile` (already `%u`-expanded for the bound
-        /// user). `None` ⇒ no file configured: the login user must itself be in
-        /// the certificate's principals list (OpenSSH default).
-        authorized_principals: Option<Vec<String>>,
+        /// `AuthorizedPrincipalsFile` path *template* (may contain `%u`/`%h`/
+        /// `%%` tokens), or `None` when no file is configured. Resolved and
+        /// loaded lazily per connection once the login user is known (the home
+        /// directory needed for `%h` is only knowable then). See
+        /// [`Self::resolved_principals`].
+        authorized_principals_file: Option<String>,
+        /// StrictModes ownership/permission check for the principals file.
+        strict_modes: bool,
+        /// Lazily-resolved `AuthorizedPrincipalsFile` contents for the bound
+        /// user: `None` until first resolved; the inner `Option` is `None` when
+        /// no file is configured (login user must itself be a cert principal,
+        /// the OpenSSH default) or `Some(list)` of the file's principal names.
+        authorized_principals: Option<Option<Vec<String>>>,
         permit_root_login: puressh::config::PermitRootLogin,
         /// Shared PAM gate (per-connection, COW-isolated by `fork`). Used to
         /// verify passwords via `pam_check_password`. On a non-PAM build the
@@ -1128,7 +1136,7 @@ mod imp {
         /// The CA signature, cert type, validity and critical-option
         /// understanding were already enforced by the auth layer before this is
         /// reached; this is purely the trust + authorization gate.
-        fn cert_trusted(&self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
+        fn cert_trusted(&mut self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
             // 1. Is the signing CA trusted?
             if !self.trusted_user_ca_blobs.contains(&ci.ca_key_blob) {
                 if self.debug {
@@ -1145,7 +1153,10 @@ mod imp {
             //      a principal that the cert also lists.
             //    - Without one, the login user must itself be in the cert's
             //      principals (an empty cert principal list authorizes any).
-            let principal_ok = match &self.authorized_principals {
+            // The file path is `%u`/`%h`-expanded and loaded lazily for this
+            // user the first time it is needed.
+            let resolved = self.resolved_principals(user);
+            let principal_ok = match resolved {
                 Some(allowed) => {
                     // The user is authorized iff some name they're allowed to
                     // use (from the file) is also present in the cert.
@@ -1189,6 +1200,61 @@ mod imp {
                 }
             }
             true
+        }
+
+        /// Resolve (and cache) the `AuthorizedPrincipalsFile` contents for the
+        /// login `user`, expanding `%u`/`%h`/`%%` tokens in the configured path
+        /// template against the user's passwd entry. Loaded at most once per
+        /// connection.
+        ///
+        /// Returns a reference to the cached value: `None` ⇒ no file configured
+        /// (the login user must itself be a cert principal — OpenSSH default);
+        /// `Some(list)` ⇒ the principal names the file grants. A file that is
+        /// configured but unreadable / fails StrictModes / has an unexpandable
+        /// path resolves to `Some(vec![])` (no principals), which fails the
+        /// authorization closed rather than silently widening it.
+        fn resolved_principals(&mut self, user: &str) -> &Option<Vec<String>> {
+            if self.authorized_principals.is_none() {
+                let template = self.authorized_principals_file.clone();
+                let resolved = template.map(|t| self.load_principals_for(&t, user));
+                self.authorized_principals = Some(resolved);
+            }
+            // Safe: just populated above.
+            self.authorized_principals.as_ref().unwrap()
+        }
+
+        /// Expand a principals-file path template for `user` and load it,
+        /// returning the principal names (empty on any failure — fail closed).
+        fn load_principals_for(&self, template: &str, user: &str) -> Vec<String> {
+            let info = match lookup_user(user) {
+                Ok(i) => i,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!(
+                            "sshd: AuthorizedPrincipalsFile: user lookup failed for {user}: {e}"
+                        );
+                    }
+                    return Vec::new();
+                }
+            };
+            let path = match expand_pct_tokens(template, &info) {
+                Ok(p) => p,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("sshd: AuthorizedPrincipalsFile: bad path template: {e}");
+                    }
+                    return Vec::new();
+                }
+            };
+            match load_principals_file(&path, self.strict_modes) {
+                Ok(list) => list,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("sshd: AuthorizedPrincipalsFile {path}: {e}");
+                    }
+                    Vec::new()
+                }
+            }
         }
 
         /// Bind / verify the connection username. Returns `false` if the client
@@ -1610,9 +1676,12 @@ mod imp {
         /// Trusted user-CA blobs (TrustedUserCAKeys ++ authorized_keys
         /// cert-authority lines), shared across connections.
         trusted_user_ca_blobs: Arc<Vec<Vec<u8>>>,
-        /// Pre-loaded AuthorizedPrincipalsFile entries (no `%u` expansion in
-        /// this build), shared across connections. `None` ⇒ no file configured.
-        authorized_principals: Option<Arc<Vec<String>>>,
+        /// `AuthorizedPrincipalsFile` path *template* (may contain `%u`/`%h`/
+        /// `%%`), shared across connections. `None` ⇒ no file configured. Each
+        /// connection expands + loads it lazily for its own login user.
+        authorized_principals_file: Option<String>,
+        /// StrictModes for the principals file (and other strict checks).
+        strict_modes: bool,
         permit_root_login: puressh::config::PermitRootLogin,
         group_lookup: GroupLookup,
         /// Shared PAM gate for password verification (see `LocalAuthenticator`).
@@ -1632,7 +1701,9 @@ mod imp {
                 deny_groups: (*self.deny_groups).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
                 trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
-                authorized_principals: self.authorized_principals.as_ref().map(|a| (**a).clone()),
+                authorized_principals_file: self.authorized_principals_file.clone(),
+                strict_modes: self.strict_modes,
+                authorized_principals: None,
                 permit_root_login: self.permit_root_login,
                 pam: self.pam.clone(),
                 password_enabled: self.password_enabled,
@@ -2622,11 +2693,11 @@ mod imp {
         })
     }
 
-    /// Expand the OpenSSH `%h` (home) / `%u` (user) / `%%` tokens in a
-    /// `ChrootDirectory` template against the target user's passwd entry.
-    /// Unknown `%X` sequences are rejected so a typo can't silently produce a
-    /// surprising path.
-    fn expand_chroot_tokens(template: &str, info: &UserInfo) -> Result<String, String> {
+    /// Expand the OpenSSH `%h` (home) / `%u` (user) / `%%` tokens in a path
+    /// template (`ChrootDirectory`, `AuthorizedPrincipalsFile`) against the
+    /// target user's passwd entry. Unknown `%X` sequences are rejected so a typo
+    /// can't silently produce a surprising path.
+    fn expand_pct_tokens(template: &str, info: &UserInfo) -> Result<String, String> {
         let mut out = String::with_capacity(template.len());
         let mut chars = template.chars();
         while let Some(c) = chars.next() {
@@ -2639,9 +2710,9 @@ mod imp {
                 Some('u') => out.push_str(&info.name),
                 Some('%') => out.push('%'),
                 Some(other) => {
-                    return Err(format!("unknown ChrootDirectory token %{other}"));
+                    return Err(format!("unknown token %{other}"));
                 }
-                None => return Err("trailing % in ChrootDirectory".to_string()),
+                None => return Err("trailing % in path template".to_string()),
             }
         }
         Ok(out)
@@ -2690,7 +2761,7 @@ mod imp {
     /// `Config::on_session_open` ahead of [`drop_to_user`].
     fn apply_chroot(user: &str, template: &str, debug: bool) -> puressh::Result<()> {
         let info = lookup_user(user)?;
-        let resolved = expand_chroot_tokens(template, &info).map_err(|e| {
+        let resolved = expand_pct_tokens(template, &info).map_err(|e| {
             puressh::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
         validate_chroot_dir(&resolved).map_err(|e| {
@@ -3480,13 +3551,12 @@ mod imp {
             }
         }
 
-        // AuthorizedPrincipalsFile (no `%u` token expansion in this build): a
-        // flat list of principal names a connecting user may authenticate as.
-        let authorized_principals: Option<Vec<String>> =
-            match &sshd_cfg.global.authorized_principals_file {
-                Some(path) => Some(load_principals_file(path, strict_modes)?),
-                None => None,
-            };
+        // AuthorizedPrincipalsFile: keep the raw path *template* (it may carry
+        // `%u`/`%h` tokens). Each connection expands it against its own login
+        // user's passwd entry and loads it lazily in the authenticator — `%h`
+        // is only knowable once the user is bound.
+        let authorized_principals_file: Option<String> =
+            sshd_cfg.global.authorized_principals_file.clone();
 
         // AllowUsers is matched as OpenSSH `Host`-style globs (a literal name
         // is just a glob with no metacharacters). Empty ⇒ the historical
@@ -3577,7 +3647,8 @@ mod imp {
             deny_groups: Arc::new(deny_groups),
             authorized_blobs: Arc::new(authorized_blobs),
             trusted_user_ca_blobs: Arc::new(trusted_user_ca_blobs),
-            authorized_principals: authorized_principals.map(Arc::new),
+            authorized_principals_file,
+            strict_modes,
             permit_root_login,
             group_lookup: group_lookup.clone(),
             pam: pam_gate.clone(),
@@ -4026,6 +4097,8 @@ mod imp {
                 deny_groups: to_pats(deny_groups),
                 authorized_blobs: Vec::new(),
                 trusted_user_ca_blobs: Vec::new(),
+                authorized_principals_file: None,
+                strict_modes: false,
                 authorized_principals: None,
                 permit_root_login: puressh::config::PermitRootLogin::ProhibitPassword,
                 pam: pam_gate::PamGate::new(false),
@@ -4326,17 +4399,63 @@ mod imp {
         #[test]
         fn chroot_token_expansion() {
             let info = lookup_user_for_test();
-            let out = expand_chroot_tokens("/chroots/%u", &info).expect("expand");
+            let out = expand_pct_tokens("/chroots/%u", &info).expect("expand");
             assert_eq!(out, format!("/chroots/{}", info.name));
-            let out2 = expand_chroot_tokens("%h/jail", &info).expect("expand");
+            let out2 = expand_pct_tokens("%h/jail", &info).expect("expand");
             assert_eq!(out2, format!("{}/jail", info.home_str));
-            assert_eq!(
-                expand_chroot_tokens("100%%", &info).expect("expand"),
-                "100%"
-            );
+            assert_eq!(expand_pct_tokens("100%%", &info).expect("expand"), "100%");
             // Unknown token rejected.
-            assert!(expand_chroot_tokens("%z", &info).is_err());
-            assert!(expand_chroot_tokens("trailing%", &info).is_err());
+            assert!(expand_pct_tokens("%z", &info).is_err());
+            assert!(expand_pct_tokens("trailing%", &info).is_err());
+        }
+
+        #[test]
+        fn authorized_principals_file_expands_u_token() {
+            // Build an AuthorizedPrincipalsFile path containing `%u`, write a
+            // principals list at the expanded path, and confirm the lazy loader
+            // resolves + reads it for the bound user.
+            let info = lookup_user_for_test();
+            let user = info.name.clone();
+            let dir = std::env::temp_dir().join(format!("puressh-princ-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            // Path template uses %u; the resolved file is named after the user.
+            let template = format!("{}/%u.principals", dir.display());
+            let expanded = format!("{}/{}.principals", dir.display(), user);
+            std::fs::write(&expanded, "alice\nbob\n# comment\n\n").expect("write principals");
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_principals_file = Some(template);
+            a.strict_modes = false; // temp file isn't root-owned
+
+            let resolved = a.resolved_principals(&user).clone();
+            std::fs::remove_file(&expanded).ok();
+            std::fs::remove_dir(&dir).ok();
+
+            assert_eq!(
+                resolved,
+                Some(vec!["alice".to_string(), "bob".to_string()]),
+                "%u-expanded AuthorizedPrincipalsFile must load the user's file"
+            );
+        }
+
+        #[test]
+        fn authorized_principals_file_none_is_no_constraint() {
+            // No file configured ⇒ resolves to `None` (login user must itself be
+            // a cert principal — OpenSSH default).
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_principals_file = None;
+            assert!(a.resolved_principals("anyone").is_none());
+        }
+
+        #[test]
+        fn authorized_principals_file_missing_fails_closed() {
+            // A configured-but-missing file resolves to `Some(vec![])` — no
+            // principals — which fails authorization closed (never widens it).
+            let info = lookup_user_for_test();
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_principals_file = Some("/nonexistent/puressh/%u.principals".to_string());
+            a.strict_modes = false;
+            assert_eq!(a.resolved_principals(&info.name).clone(), Some(Vec::new()));
         }
 
         /// Resolve a real user for token-expansion tests: prefer $USER, fall

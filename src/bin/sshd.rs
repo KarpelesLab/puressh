@@ -601,7 +601,7 @@ mod imp {
 
     /// Load each `HostKey`, then for each `HostCertificate` path wrap the
     /// matching plain host key (paired by embedded-key equality) in a
-    /// [`CertHostKey`] so KEX can advertise the certificate algorithm. The
+    /// `CertHostKey` so KEX can advertise the certificate algorithm. The
     /// certificate-wrapped key is inserted *ahead of* the plain key it
     /// certifies, so `build_server_kexinit` advertises the cert name first.
     fn load_host_keys_with_certs(

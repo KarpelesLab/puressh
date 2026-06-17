@@ -108,11 +108,176 @@ mod imp {
     mod pam_gate {
         use std::ffi::{CStr, CString};
         use std::os::unix::ffi::OsStrExt;
+        use std::sync::mpsc::{Receiver, Sender, channel};
         use std::sync::{Arc, Mutex};
+        use std::thread::JoinHandle;
 
         use pam_client2::conv_null::Conversation;
         use pam_client2::{Context, ConversationHandler, ErrorCode, Flag, SessionToken};
         use zeroize::Zeroizing;
+
+        /// One step of a live keyboard-interactive PAM conversation, returned
+        /// by [`KbdConversation::next`].
+        pub enum KbdStep {
+            /// PAM asked a prompt. `instruction` carries any `text_info` /
+            /// `error_msg` the module emitted just before it (often the OTP
+            /// challenge text). `echo` is true for a visible prompt.
+            Prompt {
+                /// Instruction / info text to show above the prompt.
+                instruction: String,
+                /// The prompt label (e.g. `"Password: "`, `"OTP: "`).
+                prompt: String,
+                /// Whether the client should echo the typed answer.
+                echo: bool,
+            },
+            /// The PAM `authenticate()` + `acct_mgmt()` finished. `true` ⇒ both
+            /// succeeded (accept); `false` ⇒ rejected.
+            Done(bool),
+        }
+
+        /// A message sent FROM the worker thread (running PAM) TO the
+        /// authenticator (driving the SSH wire).
+        enum FromWorker {
+            /// PAM wants an answer to this prompt.
+            Prompt {
+                instruction: String,
+                prompt: String,
+                echo: bool,
+            },
+            /// PAM finished with this overall verdict.
+            Done(bool),
+        }
+
+        /// The reply the authenticator hands back for a prompt: the user's
+        /// answer, wiped on drop. A `None` answer (channel closed / no
+        /// response) is treated by the worker as a conversation error.
+        type ToWorker = Zeroizing<Vec<u8>>;
+
+        /// A keyboard-interactive PAM conversation in flight.
+        ///
+        /// The PAM `Context` lives on a dedicated worker thread (`handle`); its
+        /// conversation callback blocks on `to_worker`, handing each prompt out
+        /// over `from_worker` and waiting for the answer. The authenticator
+        /// holds the channel ends + the join handle here. Dropping this struct
+        /// (on disconnect, or when `LoginGraceTime` fires) closes `to_worker`,
+        /// which unblocks the worker's conversation with a `RecvError` → PAM
+        /// aborts → the thread exits and is joined.
+        pub struct KbdConversation {
+            from_worker: Receiver<FromWorker>,
+            to_worker: Sender<ToWorker>,
+            handle: Option<JoinHandle<()>>,
+            /// Set once a terminal `Done` has been observed, so a stray extra
+            /// `answer`/`next` cannot wedge on a dead worker.
+            finished: bool,
+        }
+
+        /// The conversation handler that runs ON the worker thread. Each
+        /// per-message PAM callback sends one prompt to the authenticator and
+        /// blocks for its answer.
+        struct BridgeConv {
+            to_main: Sender<FromWorker>,
+            from_main: Receiver<ToWorker>,
+            /// `text_info` / `error_msg` text accumulated since the last
+            /// prompt, attached to the next prompt's instruction.
+            pending_info: String,
+        }
+
+        impl BridgeConv {
+            /// Block until the authenticator supplies the answer to `prompt`.
+            /// A closed channel (authenticator dropped the conversation) maps
+            /// to a PAM conversation error so `authenticate()` aborts cleanly.
+            fn ask(&mut self, prompt: &CStr, echo: bool) -> Result<CString, ErrorCode> {
+                let instruction = core::mem::take(&mut self.pending_info);
+                let prompt = String::from_utf8_lossy(prompt.to_bytes()).into_owned();
+                self.to_main
+                    .send(FromWorker::Prompt {
+                        instruction,
+                        prompt,
+                        echo,
+                    })
+                    .map_err(|_| ErrorCode::CONV_ERR)?;
+                let answer = self.from_main.recv().map_err(|_| ErrorCode::CONV_ERR)?;
+                // The answer may not contain an interior NUL.
+                CString::new(answer.to_vec()).map_err(|_| ErrorCode::CONV_ERR)
+            }
+        }
+
+        impl ConversationHandler for BridgeConv {
+            fn prompt_echo_on(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
+                self.ask(prompt, true)
+            }
+            fn prompt_echo_off(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
+                self.ask(prompt, false)
+            }
+            fn text_info(&mut self, msg: &CStr) {
+                let s = String::from_utf8_lossy(msg.to_bytes());
+                if !self.pending_info.is_empty() {
+                    self.pending_info.push('\n');
+                }
+                self.pending_info.push_str(&s);
+            }
+            fn error_msg(&mut self, msg: &CStr) {
+                // Surface errors as instruction text too (e.g. "Account
+                // locked"); they precede the next prompt or are dropped if the
+                // conversation ends.
+                self.text_info(msg);
+            }
+        }
+
+        impl KbdConversation {
+            /// Pull the next step from the worker: either a prompt to send to
+            /// the client, or the terminal verdict. After a `Done`, further
+            /// calls return `Done` with the same verdict without blocking.
+            pub fn next(&mut self) -> KbdStep {
+                if self.finished {
+                    return KbdStep::Done(false);
+                }
+                match self.from_worker.recv() {
+                    Ok(FromWorker::Prompt {
+                        instruction,
+                        prompt,
+                        echo,
+                    }) => KbdStep::Prompt {
+                        instruction,
+                        prompt,
+                        echo,
+                    },
+                    Ok(FromWorker::Done(ok)) => {
+                        self.finished = true;
+                        KbdStep::Done(ok)
+                    }
+                    // Worker died without a verdict ⇒ reject.
+                    Err(_) => {
+                        self.finished = true;
+                        KbdStep::Done(false)
+                    }
+                }
+            }
+
+            /// Hand the user's answer for the outstanding prompt to the worker.
+            /// Returns `false` if the worker is already gone.
+            pub fn answer(&mut self, response: Zeroizing<Vec<u8>>) -> bool {
+                if self.finished {
+                    return false;
+                }
+                self.to_worker.send(response).is_ok()
+            }
+        }
+
+        impl Drop for KbdConversation {
+            fn drop(&mut self) {
+                // Dropping `to_worker` closes the response channel; a worker
+                // blocked in `recv()` wakes with `RecvError`, returns
+                // CONV_ERR, and PAM `authenticate()` unwinds. Then join.
+                // (Replace the sender with a fresh, immediately-dropped one to
+                // force-close without needing `to_worker` to be an Option.)
+                let (dead, _) = channel::<ToWorker>();
+                drop(core::mem::replace(&mut self.to_worker, dead));
+                if let Some(h) = self.handle.take() {
+                    let _ = h.join();
+                }
+            }
+        }
 
         /// A one-shot PAM conversation that answers every
         /// `PAM_PROMPT_ECHO_OFF` (the password prompt) with a fixed secret,
@@ -120,9 +285,11 @@ mod imp {
         /// Echo-on prompts (username) and info/error messages are ignored —
         /// the username is already bound via `Context::new`, and we never
         /// surface PAM text to the network here. This is the
-        /// non-interactive "verify this password" conversation; a full
+        /// non-interactive "verify this password" conversation used by the
+        /// SSH `password` method, which is single-prompt by nature. A genuine
         /// multi-step PAM challenge (e.g. an OTP module that asks a second
-        /// question) is not handled and will fail closed.
+        /// question) is driven instead by [`BridgeConv`] /
+        /// [`KbdConversation`] over the `keyboard-interactive` method.
         struct PasswordConv {
             password: Zeroizing<Vec<u8>>,
         }
@@ -289,10 +456,138 @@ mod imp {
                 // `Zeroizing`) drops here — pam_end runs, no session opened.
                 Ok(())
             }
+
+            /// Begin a genuine multi-step keyboard-interactive PAM
+            /// conversation for `user`. PAM `authenticate()` runs on a
+            /// dedicated worker thread whose conversation callback bridges each
+            /// prompt to the SSH `USERAUTH_INFO_REQUEST`/`_RESPONSE` rounds via
+            /// channels (see [`KbdConversation`]). The returned handle is
+            /// driven by [`KbdConversation::next`] / [`KbdConversation::answer`]
+            /// and torn down on drop.
+            ///
+            /// Like [`Self::pam_check_password`], this opens **no** session —
+            /// it only authenticates (`authenticate()` + `acct_mgmt()`); the
+            /// session is opened later in `ensure`. A throw-away `Context`
+            /// lives entirely on the worker thread, so its (`!Sync`) PAM handle
+            /// never crosses back to the authenticator.
+            ///
+            /// MANUAL e2e against a real 2-prompt PAM service (not hermetic —
+            /// installing a PAM service file needs root + writes to
+            /// `/etc/pam.d`):
+            ///   1. Install a second-factor PAM module that prompts after the
+            ///      password — e.g. `pam_google_authenticator.so` — into
+            ///      `/etc/pam.d/sshd`:
+            ///        ```text
+            ///        auth required pam_unix.so
+            ///        auth required pam_google_authenticator.so
+            ///        account required pam_unix.so
+            ///        ```
+            ///   2. Run sshd with `KbdInteractiveAuthentication yes`, connect
+            ///      with `ssh -o PreferredAuthentications=keyboard-interactive`,
+            ///      and confirm the client is asked the password FIRST, then the
+            ///      `Verification code:` prompt, and that a correct code logs in
+            ///      while a wrong one (or an empty password under
+            ///      `PermitEmptyPasswords no`) is refused.
+            ///   3. A simpler 2-prompt stand-in is `pam_listfile`/`pam_exec`
+            ///      with a script that echoes a `PAM_PROMPT_ECHO_OFF` message;
+            ///      the bridge issues each as its own `USERAUTH_INFO_REQUEST`.
+            pub fn start_kbd_interactive(
+                &self,
+                user: &str,
+                rhost: Option<&str>,
+            ) -> KbdConversation {
+                let (to_main, from_worker) = channel::<FromWorker>();
+                let (to_worker, from_main) = channel::<ToWorker>();
+                let service = self.service;
+                let user = user.to_string();
+                let rhost = rhost.map(str::to_string);
+
+                let handle = std::thread::spawn(move || {
+                    let conv = BridgeConv {
+                        to_main: to_main.clone(),
+                        from_main,
+                        pending_info: String::new(),
+                    };
+                    // Build the context on THIS thread; the PAM handle never
+                    // leaves it.
+                    let mut ctx = match Context::new(service, Some(&user), conv) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            let _ = to_main.send(FromWorker::Done(false));
+                            return;
+                        }
+                    };
+                    if let Some(rhost) = rhost.as_deref()
+                        && ctx.set_rhost(Some(rhost)).is_err()
+                    {
+                        let _ = to_main.send(FromWorker::Done(false));
+                        return;
+                    }
+                    // authenticate() drives the conversation: each prompt
+                    // blocks in BridgeConv::ask until the authenticator answers.
+                    let ok =
+                        ctx.authenticate(Flag::NONE).is_ok() && ctx.acct_mgmt(Flag::NONE).is_ok();
+                    let _ = to_main.send(FromWorker::Done(ok));
+                    // `ctx` drops here on the worker thread → pam_end.
+                });
+
+                KbdConversation {
+                    from_worker,
+                    to_worker,
+                    handle: Some(handle),
+                    finished: false,
+                }
+            }
         }
 
         fn pam_err<E: std::fmt::Display>(phase: &'static str, e: E) -> puressh::Error {
             puressh::Error::Io(std::io::Error::other(format!("PAM {phase}: {e}")))
+        }
+
+        #[cfg(test)]
+        impl KbdConversation {
+            /// Build a conversation backed by a scripted *fake* worker instead
+            /// of a real PAM `Context`, for hermetic state-machine tests. The
+            /// worker emits each `(instruction, prompt, echo)` in `script`,
+            /// blocking for the answer after each (recording it into
+            /// `received`), then emits `Done(verdict)`. This exercises the exact
+            /// channel protocol `BridgeConv` + the real worker use, without
+            /// requiring a multi-prompt PAM module to be installed.
+            pub fn fake_for_test(
+                script: Vec<(String, String, bool)>,
+                verdict: bool,
+                received: std::sync::Arc<Mutex<Vec<Vec<u8>>>>,
+            ) -> Self {
+                let (to_main, from_worker) = channel::<FromWorker>();
+                let (to_worker, from_main) = channel::<ToWorker>();
+                let handle = std::thread::spawn(move || {
+                    for (instruction, prompt, echo) in script {
+                        if to_main
+                            .send(FromWorker::Prompt {
+                                instruction,
+                                prompt,
+                                echo,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        match from_main.recv() {
+                            Ok(answer) => received.lock().unwrap().push(answer.to_vec()),
+                            // Authenticator dropped us (disconnect / grace
+                            // timeout) — exit like the real worker would.
+                            Err(_) => return,
+                        }
+                    }
+                    let _ = to_main.send(FromWorker::Done(verdict));
+                });
+                KbdConversation {
+                    from_worker,
+                    to_worker,
+                    handle: Some(handle),
+                    finished: false,
+                }
+            }
         }
     }
 
@@ -307,6 +602,40 @@ mod imp {
         /// operations are no-ops so the rest of the binary can ignore
         /// the feature state.
         pub struct PamGate;
+
+        /// Stub mirror of the real [`KbdStep`]. On a non-PAM build a
+        /// keyboard-interactive conversation can never start, so this is only
+        /// ever observed as `Done(false)`.
+        pub enum KbdStep {
+            /// Never produced on this build (kept for type parity).
+            Prompt {
+                /// Instruction text.
+                instruction: String,
+                /// Prompt label.
+                prompt: String,
+                /// Echo flag.
+                echo: bool,
+            },
+            /// Terminal verdict; always `false` here.
+            Done(bool),
+        }
+
+        /// Stub mirror of the real `KbdConversation` for non-PAM builds. It
+        /// always reports a rejecting `Done(false)` and accepts no answers.
+        pub struct KbdConversation {
+            done: bool,
+        }
+
+        impl KbdConversation {
+            pub fn next(&mut self) -> KbdStep {
+                self.done = true;
+                KbdStep::Done(false)
+            }
+            pub fn answer(&mut self, _response: zeroize::Zeroizing<Vec<u8>>) -> bool {
+                let _ = self.done;
+                false
+            }
+        }
 
         impl PamGate {
             pub fn new(_debug: bool) -> Arc<Self> {
@@ -335,6 +664,16 @@ mod imp {
                 Err(puressh::Error::Io(std::io::Error::other(
                     "password authentication unavailable: no PAM backend compiled",
                 )))
+            }
+            /// No PAM backend: a keyboard-interactive conversation cannot run.
+            /// Returns a stub that immediately rejects. The server also never
+            /// advertises `keyboard-interactive` on such a build.
+            pub fn start_kbd_interactive(
+                &self,
+                _user: &str,
+                _rhost: Option<&str>,
+            ) -> KbdConversation {
+                KbdConversation { done: false }
             }
         }
     }
@@ -1036,6 +1375,18 @@ mod imp {
         password_enabled: bool,
         /// `KbdInteractiveAuthentication` enabled for this build/config.
         kbd_interactive_enabled: bool,
+        /// Live multi-step keyboard-interactive PAM conversation, if one is in
+        /// flight. The PAM `Context` runs on a worker thread; this holds the
+        /// channel ends + join handle (see `pam_gate::KbdConversation`). `Some`
+        /// between the first `keyboard-interactive` request and the terminal
+        /// PAM verdict; reset to `None` on accept/reject so a fresh attempt
+        /// starts a new conversation. Dropping it tears the worker down.
+        kbd_conv: Option<pam_gate::KbdConversation>,
+        /// True while the next keyboard-interactive answer would be the FIRST
+        /// of a conversation, so the empty-password policy applies to it; reset
+        /// once the opening answer is consumed, and re-armed when a new
+        /// conversation starts.
+        pending_first_prompt: bool,
         /// `PermitEmptyPasswords` — when false (the default), an empty password
         /// is rejected without ever consulting PAM.
         permit_empty_passwords: bool,
@@ -1378,6 +1729,70 @@ mod imp {
             AuthDecision::Reject
         }
 
+        /// Pull the next step from the live keyboard-interactive PAM
+        /// conversation and translate it into an [`AuthDecision`].
+        ///
+        /// - A `Prompt` becomes an `InteractiveRequest` carrying that single
+        ///   prompt (and any instruction/info text PAM emitted before it). The
+        ///   conversation stays open; the client's answer arrives in the next
+        ///   `evaluate_interactive`.
+        /// - A terminal `Done(ok)` ends the conversation: the worker is torn
+        ///   down (by clearing `kbd_conv`). On `ok` the same access-control +
+        ///   PermitRootLogin gates as the password path are ANDed in, and a
+        ///   pass yields the chain-aware verdict via `record_and_decide`. Any
+        ///   failure yields `Reject`.
+        fn kbd_pump(&mut self, user: &str) -> AuthDecision {
+            let step = match self.kbd_conv.as_mut() {
+                Some(c) => c.next(),
+                None => return AuthDecision::Reject,
+            };
+            match step {
+                pam_gate::KbdStep::Prompt {
+                    instruction,
+                    prompt,
+                    echo,
+                } => AuthDecision::InteractiveRequest {
+                    name: String::new(),
+                    instruction,
+                    prompts: vec![(prompt, echo)],
+                },
+                pam_gate::KbdStep::Done(ok) => {
+                    // Conversation finished; drop the worker.
+                    self.kbd_conv = None;
+                    if !ok {
+                        if self.debug {
+                            eprintln!("sshd: auth keyboard-interactive: PAM rejected user {user}");
+                        }
+                        return AuthDecision::Reject;
+                    }
+                    // PAM accepted. AND in the access + root gates (the same
+                    // ones the password path applies). Resolve both uniformly.
+                    let user_ok = self.access_allowed(user);
+                    let is_root = self.is_root(user);
+                    let root_denied = is_root && !self.permit_root_login.permits_password();
+                    if user_ok && !root_denied {
+                        if self.debug {
+                            eprintln!("sshd: auth keyboard-interactive: accepted user {user}");
+                        }
+                        self.record_and_decide("keyboard-interactive")
+                    } else {
+                        if self.debug {
+                            if root_denied {
+                                eprintln!(
+                                    "sshd: auth keyboard-interactive: root login denied by PermitRootLogin for {user}"
+                                );
+                            } else {
+                                eprintln!(
+                                    "sshd: auth keyboard-interactive: user {user} not in allowed set"
+                                );
+                            }
+                        }
+                        AuthDecision::Reject
+                    }
+                }
+            }
+        }
+
         /// Record a satisfied factor and decide whether authentication is
         /// complete given the per-user multi-factor chain set, enforcing
         /// **positional (listed) order** as OpenSSH does.
@@ -1618,9 +2033,7 @@ mod imp {
                         }
                         return AuthDecision::Reject;
                     }
-                    // Bind the username now (so a later switch is caught) and
-                    // drive a single password prompt. The actual verification
-                    // happens in `evaluate_interactive` once the client answers.
+                    // Bind the username now (so a later switch is caught).
                     if !self.check_user_binding(&user) {
                         if self.debug {
                             eprintln!(
@@ -1629,14 +2042,17 @@ mod imp {
                         }
                         return AuthDecision::Reject;
                     }
-                    AuthDecision::InteractiveRequest {
-                        name: String::new(),
-                        instruction: String::new(),
-                        // Single non-echoed password prompt. A full multi-step
-                        // PAM conversation (e.g. an OTP module that asks a
-                        // second question) is a deferred follow-up.
-                        prompts: alloc_prompts(),
-                    }
+                    // Start a fresh PAM conversation on a worker thread. Any
+                    // previous (abandoned) conversation is dropped here, tearing
+                    // down its worker. The first `next()` blocks until PAM
+                    // either asks a prompt (→ InteractiveRequest) or finishes
+                    // immediately (e.g. pam_permit with no prompts → decide).
+                    let rhost = self.peer.clone();
+                    let conv = self.pam.start_kbd_interactive(&user, rhost.as_deref());
+                    self.kbd_conv = Some(conv);
+                    self.pending_first_prompt = true;
+                    let user = user.clone();
+                    self.kbd_pump(&user)
                 }
             }
         }
@@ -1645,14 +2061,52 @@ mod imp {
             if !self.kbd_interactive_enabled {
                 return AuthDecision::Reject;
             }
-            // The response strings come from `UserauthInfoResponse`, whose Drop
-            // zeroizes its buffer; we copy the first answer into a zeroizing
-            // buffer and let `responses` drop normally.
-            let pw = responses
+            // Username must not change mid-conversation.
+            if !self.check_user_binding(user) {
+                if self.debug {
+                    eprintln!("sshd: auth keyboard-interactive: username changed mid-userauth");
+                }
+                self.kbd_conv = None;
+                return AuthDecision::Reject;
+            }
+            // Feed the answer (we issue one prompt per round, so exactly one
+            // response is expected) into the running conversation, then pump
+            // for the next step. The response strings come from
+            // `UserauthInfoResponse`, whose Drop zeroizes its buffer; we copy
+            // the answer into a zeroizing buffer first.
+            let answer = responses
                 .first()
                 .map(|s| zeroize::Zeroizing::new(s.as_bytes().to_vec()))
                 .unwrap_or_default();
-            self.verify_password(user, "keyboard-interactive", pw)
+
+            // Empty-password policy: refuse an empty answer to the first prompt
+            // unless PermitEmptyPasswords, mirroring the password path. This is
+            // input-dependent (not user-dependent), so it leaks no user-
+            // existence oracle. `pending_first_prompt` tracks whether this is
+            // the opening answer.
+            if self.pending_first_prompt
+                && answer.is_empty()
+                && !self.permit_empty_passwords
+            {
+                if self.debug {
+                    eprintln!("sshd: auth keyboard-interactive: empty password refused for {user}");
+                }
+                self.kbd_conv = None;
+                return AuthDecision::Reject;
+            }
+            self.pending_first_prompt = false;
+
+            let conv = match self.kbd_conv.as_mut() {
+                Some(c) => c,
+                None => return AuthDecision::Reject,
+            };
+            if !conv.answer(answer) {
+                // Worker already gone (e.g. PAM aborted) ⇒ reject.
+                self.kbd_conv = None;
+                return AuthDecision::Reject;
+            }
+            let user = user.to_string();
+            self.kbd_pump(&user)
         }
 
         fn on_user_resolved(&mut self, user: &str, methods: &[String]) {
@@ -1667,12 +2121,6 @@ mod imp {
                 );
             }
         }
-    }
-
-    /// The single keyboard-interactive prompt set: one non-echoed
-    /// `"Password: "` prompt.
-    fn alloc_prompts() -> Vec<(String, bool)> {
-        vec![("Password: ".to_string(), false)]
     }
 
     /// Map a resolved `AuthenticationMethods` value (space-separated
@@ -1751,6 +2199,8 @@ mod imp {
                 pam: self.pam.clone(),
                 password_enabled: self.password_enabled,
                 kbd_interactive_enabled: self.kbd_interactive_enabled,
+                kbd_conv: None,
+                pending_first_prompt: true,
                 permit_empty_passwords: self.permit_empty_passwords,
                 chains: Vec::new(),
                 satisfied: Vec::new(),
@@ -4171,6 +4621,8 @@ mod imp {
                 pam: pam_gate::PamGate::new(false),
                 password_enabled: false,
                 kbd_interactive_enabled: false,
+                kbd_conv: None,
+                pending_first_prompt: true,
                 permit_empty_passwords: false,
                 chains: Vec::new(),
                 satisfied: Vec::new(),
@@ -4694,6 +5146,146 @@ mod imp {
                 cert: None,
             });
             assert!(matches!(decision, AuthDecision::Reject));
+        }
+
+        // ---- Multi-step keyboard-interactive bridge ------------------------
+        //
+        // These drive the LocalAuthenticator's kbd-interactive state machine
+        // through the real `pam_gate::KbdConversation` channel protocol via a
+        // scripted *fake* worker (no real PAM module needed). Gated to the
+        // Linux+PAM build, where the conversation type and its test helper
+        // live.
+
+        #[cfg(all(feature = "pam", target_os = "linux"))]
+        #[test]
+        fn kbd_interactive_two_prompt_accept() {
+            use std::sync::{Arc, Mutex};
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let script = vec![
+                (String::new(), "Password: ".to_string(), false),
+                ("One-time code".to_string(), "OTP: ".to_string(), false),
+            ];
+            let conv = pam_gate::KbdConversation::fake_for_test(script, true, received.clone());
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.kbd_interactive_enabled = true;
+            a.permit_empty_passwords = false;
+            let _ = a.check_user_binding("alice");
+            a.kbd_conv = Some(conv);
+            a.pending_first_prompt = true;
+
+            // First pump: PAM asked the password prompt.
+            match a.kbd_pump("alice") {
+                AuthDecision::InteractiveRequest { prompts, .. } => {
+                    assert_eq!(prompts, vec![("Password: ".to_string(), false)]);
+                }
+                other => panic!("expected first prompt, got {other:?}"),
+            }
+            // Answer it → second prompt (OTP), with instruction text attached.
+            match a.evaluate_interactive("alice", vec!["hunter2".to_string()]) {
+                AuthDecision::InteractiveRequest {
+                    prompts,
+                    instruction,
+                    ..
+                } => {
+                    assert_eq!(prompts, vec![("OTP: ".to_string(), false)]);
+                    assert_eq!(instruction, "One-time code");
+                }
+                other => panic!("expected second prompt, got {other:?}"),
+            }
+            // Answer the OTP → PAM Done(true) → Accept (single-factor: no
+            // chains; alice is allowed by "*", non-root).
+            assert!(matches!(
+                a.evaluate_interactive("alice", vec!["123456".to_string()]),
+                AuthDecision::Accept
+            ));
+            // Both answers were threaded to the worker in order.
+            assert_eq!(
+                *received.lock().unwrap(),
+                vec![b"hunter2".to_vec(), b"123456".to_vec()]
+            );
+            // Conversation cleared after the terminal verdict.
+            assert!(a.kbd_conv.is_none());
+        }
+
+        #[cfg(all(feature = "pam", target_os = "linux"))]
+        #[test]
+        fn kbd_interactive_pam_reject() {
+            use std::sync::{Arc, Mutex};
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let script = vec![(String::new(), "Password: ".to_string(), false)];
+            let conv = pam_gate::KbdConversation::fake_for_test(script, false, received);
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.kbd_interactive_enabled = true;
+            let _ = a.check_user_binding("alice");
+            a.kbd_conv = Some(conv);
+            a.pending_first_prompt = true;
+
+            assert!(matches!(
+                a.kbd_pump("alice"),
+                AuthDecision::InteractiveRequest { .. }
+            ));
+            // Wrong answer → PAM Done(false) → Reject.
+            assert!(matches!(
+                a.evaluate_interactive("alice", vec!["wrong".to_string()]),
+                AuthDecision::Reject
+            ));
+            assert!(a.kbd_conv.is_none());
+        }
+
+        #[cfg(all(feature = "pam", target_os = "linux"))]
+        #[test]
+        fn kbd_interactive_empty_password_refused() {
+            use std::sync::{Arc, Mutex};
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let script = vec![(String::new(), "Password: ".to_string(), false)];
+            // Verdict would be accept, but the empty-password policy must short-
+            // circuit BEFORE the worker ever sees the answer.
+            let conv = pam_gate::KbdConversation::fake_for_test(script, true, received.clone());
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.kbd_interactive_enabled = true;
+            a.permit_empty_passwords = false;
+            let _ = a.check_user_binding("alice");
+            a.kbd_conv = Some(conv);
+            a.pending_first_prompt = true;
+
+            assert!(matches!(
+                a.kbd_pump("alice"),
+                AuthDecision::InteractiveRequest { .. }
+            ));
+            // Empty first answer ⇒ refused without consulting the worker.
+            assert!(matches!(
+                a.evaluate_interactive("alice", vec![String::new()]),
+                AuthDecision::Reject
+            ));
+            assert!(received.lock().unwrap().is_empty());
+            assert!(a.kbd_conv.is_none());
+        }
+
+        #[cfg(all(feature = "pam", target_os = "linux"))]
+        #[test]
+        fn kbd_interactive_username_change_rejected() {
+            use std::sync::{Arc, Mutex};
+            let received = Arc::new(Mutex::new(Vec::new()));
+            let script = vec![(String::new(), "Password: ".to_string(), false)];
+            let conv = pam_gate::KbdConversation::fake_for_test(script, true, received);
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.kbd_interactive_enabled = true;
+            let _ = a.check_user_binding("alice");
+            a.kbd_conv = Some(conv);
+            a.pending_first_prompt = true;
+            assert!(matches!(
+                a.kbd_pump("alice"),
+                AuthDecision::InteractiveRequest { .. }
+            ));
+            // A response that claims a different user mid-conversation ⇒ reject.
+            assert!(matches!(
+                a.evaluate_interactive("mallory", vec!["x".to_string()]),
+                AuthDecision::Reject
+            ));
         }
 
         #[test]

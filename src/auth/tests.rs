@@ -299,7 +299,7 @@ fn server_password_accept() {
     .encode();
     let step = s.on_packet(&req).unwrap();
     match step {
-        ServerStep::Authenticated { user, payload } => {
+        ServerStep::Authenticated { user, payload, .. } => {
             assert_eq!(user, "alice");
             assert_eq!(payload[0], super::message::SSH_MSG_USERAUTH_SUCCESS);
         }
@@ -496,7 +496,7 @@ fn end_to_end_password_loopback() {
         _ => panic!(),
     };
     let success_payload = match s.on_packet(&pwreq).unwrap() {
-        ServerStep::Authenticated { payload, user } => {
+        ServerStep::Authenticated { payload, user, .. } => {
             assert_eq!(user, "alice");
             payload
         }
@@ -938,7 +938,7 @@ fn end_to_end_multifactor_publickey_then_password() {
 
     // Server now Accepts (both factors satisfied).
     let success = match s.on_packet(&pw_req).unwrap() {
-        ServerStep::Authenticated { payload, user } => {
+        ServerStep::Authenticated { payload, user, .. } => {
             assert_eq!(user, "alice");
             payload
         }

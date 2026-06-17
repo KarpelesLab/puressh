@@ -393,3 +393,399 @@ fn puressh_fresh_seed() -> [u8; 32] {
     OsRng.fill_bytes(&mut s);
     s
 }
+
+// ---------------------------------------------------------------------------
+// R1/R2: user-certificate extension default-deny + force-command end-to-end.
+//
+// These build a signed ed25519 user certificate *in process* (no ssh-keygen
+// dependency) so we can vary the extension set / force-command per test, then
+// drive a full loopback auth + shell and observe, through a recording
+// `ShellHandler`, whether the server honoured the `pty-req` and which command
+// the connection ran. The default-deny behaviour lives in the server's
+// `EffectivePolicy`, fed from the authenticating cert's `AuthCertCaps`.
+// ---------------------------------------------------------------------------
+
+use puressh::format::Writer;
+use puressh::server::{PtySpec, ShellExitStatus, ShellHandler, ShellSession};
+
+/// Build a signed ed25519 user certificate blob in process.
+///
+/// `extensions` is the ordered (sorted) list of extension names to include
+/// (empty data each, like OpenSSH's permit-* flags). `critical` is the ordered
+/// list of `(name, ssh-string-payload)` critical options. The cert wraps
+/// `user_pub` (a plain ssh-ed25519 32-byte key) and is signed by `ca` acting as
+/// the CA. Returns `(cert_blob, ca_pubkey_blob)`.
+fn build_user_cert(
+    ca: &Ed25519HostKey,
+    user_pub: &[u8; 32],
+    principals: &[&str],
+    extensions: &[&str],
+    critical: &[(&str, Vec<u8>)],
+) -> (Vec<u8>, Vec<u8>) {
+    // The wire layout up to (and including) the signature key, per
+    // PROTOCOL.certkeys; we then sign that region and append the signature.
+    let mut w = Writer::new();
+    w.write_string(b"ssh-ed25519-cert-v01@openssh.com");
+    w.write_string(&puressh_fresh_seed()); // nonce
+    w.write_string(user_pub); // ed25519 public key field
+    w.write_u64(7); // serial
+    w.write_u32(1); // type = user
+    w.write_string(b"e2e"); // key id
+    // principals: a list-of-strings, itself length-prefixed.
+    let mut princ = Writer::new();
+    for p in principals {
+        princ.write_string(p.as_bytes());
+    }
+    w.write_string(&princ.into_vec());
+    w.write_u64(0); // valid after
+    w.write_u64(u64::MAX); // valid before (always valid)
+    // critical options (must be name-sorted; caller supplies sorted).
+    let mut crit = Writer::new();
+    for (name, data) in critical {
+        crit.write_string(name.as_bytes());
+        crit.write_string(data);
+    }
+    w.write_string(&crit.into_vec());
+    // extensions (must be name-sorted; caller supplies sorted).
+    let mut ext = Writer::new();
+    for name in extensions {
+        ext.write_string(name.as_bytes());
+        ext.write_string(b""); // empty data
+    }
+    w.write_string(&ext.into_vec());
+    w.write_string(b""); // reserved
+    let ca_blob = ca.public_blob();
+    w.write_string(&ca_blob); // signature key
+    let signed = w.into_vec();
+    let signature = ca.sign(&signed).expect("CA sign");
+    let mut full = signed;
+    // Append the signature string.
+    let mut sw = Writer::new();
+    sw.write_string(&signature);
+    full.extend_from_slice(&sw.into_vec());
+    (full, ca_blob)
+}
+
+/// Encode `s` as an SSH `string` (4-byte length prefix + bytes), the inner
+/// payload form a `force-command` critical option carries.
+fn ssh_string(s: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_string(s.as_bytes());
+    w.into_vec()
+}
+
+/// Recording shell handler: latches the `pty-req` spec (if any) and the user
+/// seen at spawn, and replays a fixed stdout + clean exit.
+#[derive(Clone)]
+struct RecordingShell {
+    inner: Arc<Mutex<RecordingShellState>>,
+}
+#[derive(Default)]
+struct RecordingShellState {
+    pty: Option<PtySpec>,
+    spawned: bool,
+    stdout: Vec<u8>,
+}
+impl RecordingShell {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RecordingShellState {
+                pty: None,
+                spawned: false,
+                stdout: b"shell-ran\n".to_vec(),
+            })),
+        }
+    }
+}
+impl ShellHandler for RecordingShell {
+    fn spawn(
+        &self,
+        _user: &str,
+        _env: &SessionEnv,
+        pty: Option<PtySpec>,
+    ) -> puressh::Result<Box<dyn ShellSession>> {
+        let mut st = self.inner.lock().unwrap();
+        st.pty = pty;
+        st.spawned = true;
+        Ok(Box::new(RecordingSession {
+            inner: self.inner.clone(),
+        }))
+    }
+}
+struct RecordingSession {
+    inner: Arc<Mutex<RecordingShellState>>,
+}
+impl ShellSession for RecordingSession {
+    fn read(&mut self, buf: &mut [u8]) -> puressh::Result<usize> {
+        let mut st = self.inner.lock().unwrap();
+        if st.stdout.is_empty() {
+            return Ok(0);
+        }
+        let n = std::cmp::min(buf.len(), st.stdout.len());
+        buf[..n].copy_from_slice(&st.stdout[..n]);
+        st.stdout.drain(..n);
+        Ok(n)
+    }
+    fn write(&mut self, data: &[u8]) -> puressh::Result<usize> {
+        Ok(data.len())
+    }
+    fn close_stdin(&mut self) -> puressh::Result<()> {
+        Ok(())
+    }
+    fn resize(&mut self, _c: u32, _r: u32, _w: u32, _h: u32) -> puressh::Result<()> {
+        Ok(())
+    }
+    fn try_exit(&mut self) -> Option<ShellExitStatus> {
+        // Exit once stdout has drained so the client's shell call returns.
+        if self.inner.lock().unwrap().stdout.is_empty() {
+            Some(ShellExitStatus::Exited(0))
+        } else {
+            None
+        }
+    }
+}
+
+/// Records the command string the buffered command handler was asked to run,
+/// so a force-command test can confirm what the connection executed and what
+/// `SSH_ORIGINAL_COMMAND` carried.
+#[derive(Clone)]
+struct CmdRecorder {
+    last: Arc<Mutex<Option<(String, String)>>>,
+}
+impl CommandHandler for CmdRecorder {
+    fn handle(&self, _user: &str, env: &SessionEnv, command: &str) -> ExecResult {
+        let orig = env.get("SSH_ORIGINAL_COMMAND").unwrap_or("").to_string();
+        *self.last.lock().unwrap() = Some((command.to_string(), orig.clone()));
+        ExecResult {
+            stdout: format!("CMD={command}\nORIG={orig}\n").into_bytes(),
+            stderr: Vec::new(),
+            exit_status: 0,
+        }
+    }
+}
+
+/// Authenticator accepting any CA-trusted, in-principals user cert.
+struct AnyCaUserAuth {
+    trusted_ca: Vec<u8>,
+}
+impl Authenticator for AnyCaUserAuth {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                user,
+                probe_only,
+                verified,
+                cert: Some(ci),
+                ..
+            } => {
+                let ca_ok = ci.ca_key_blob == self.trusted_ca;
+                let principal_ok =
+                    ci.valid_principals.is_empty() || ci.valid_principals.contains(&user);
+                if (probe_only || verified) && ca_ok && principal_ok {
+                    AuthDecision::Accept
+                } else {
+                    AuthDecision::Reject
+                }
+            }
+            _ => AuthDecision::Reject,
+        }
+    }
+}
+
+/// Spin up a loopback server with a `RecordingShell` + `CmdRecorder`, trusting
+/// `ca`, and authenticate a client offering `(cert_blob, identity-seed)`.
+/// Drives a `pty-req`+`shell`, returning the recorded shell + command state.
+/// Result of driving an authenticated cert connection through `pty-req`+`shell`.
+struct CertShellOutcome {
+    /// The pty spec the shell handler saw (`None` if the server refused it).
+    pty: Option<PtySpec>,
+    /// Whether the shell handler's `spawn` ran at all.
+    spawned: bool,
+    /// `Ok` iff the client's `shell_with_stdin` completed (a refused `pty-req`
+    /// makes it `Err`, since that call requests a pty with want_reply=true).
+    shell_ok: bool,
+    /// The (command, SSH_ORIGINAL_COMMAND) the buffered handler ran, if any.
+    cmd: Option<(String, String)>,
+}
+
+#[allow(clippy::type_complexity)]
+fn run_cert_shell(
+    login_user: &str,
+    cert_blob: Vec<u8>,
+    identity_seed: [u8; 32],
+    ca_blob: Vec<u8>,
+) -> CertShellOutcome {
+    let host_seed = puressh_fresh_seed();
+    let trusted = ca_blob.clone();
+    let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+        Box::new(AnyCaUserAuth {
+            trusted_ca: trusted.clone(),
+        })
+    });
+    let shell = RecordingShell::new();
+    let cmd_last = Arc::new(Mutex::new(None));
+    let host_key: Box<dyn HostKey + Send + Sync> = Box::new(Ed25519HostKey::from_seed(host_seed));
+    let cfg = ServerConfig::new(
+        vec![host_key],
+        factory,
+        vec!["publickey"],
+        Arc::new(CmdRecorder {
+            last: cmd_last.clone(),
+        }),
+    )
+    .with_shell(Arc::new(shell.clone()));
+    let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let handle = thread::spawn(move || {
+        let _ = server.accept_one();
+    });
+
+    // Client: offer the user cert as a CertHostKey credential.
+    let cert = Certificate::parse(&cert_blob).expect("parse built cert");
+    let signer =
+        Box::new(Ed25519HostKey::from_seed(identity_seed)) as Box<dyn HostKey + Send + Sync>;
+    let cert_cred = CertHostKey::new(signer, &cert, "ssh-ed25519-cert-v01@openssh.com")
+        .expect("wrap user cert");
+
+    let mut client =
+        Client::connect(addr, client_cfg(HostKeyPolicy::AcceptAny)).expect("client connect");
+    client
+        .authenticate(
+            login_user,
+            vec![puressh::auth::ClientCredential::PublicKey(Box::new(
+                cert_cred,
+            ))],
+        )
+        .expect("cert auth");
+    // `shell_with_stdin` itself sends a `pty-req` (want_reply=true) then
+    // `shell`; a server that refuses the pty makes this call return `Err`.
+    let shell_ok = client.shell_with_stdin("xterm", 80, 24, b"").is_ok();
+    drop(client);
+    let _ = handle.join();
+
+    let st = shell.inner.lock().unwrap();
+    let cmd = cmd_last.lock().unwrap().clone();
+    CertShellOutcome {
+        pty: st.pty.clone(),
+        spawned: st.spawned,
+        shell_ok,
+        cmd,
+    }
+}
+
+#[test]
+fn r1_cert_without_permit_pty_is_refused_a_pty() {
+    let ca = Ed25519HostKey::from_seed(puressh_fresh_seed());
+    let id_seed = puressh_fresh_seed();
+    let user_pub = raw_ed25519_from_blob(&Ed25519HostKey::from_seed(id_seed).public_blob());
+
+    // Cert WITHOUT permit-pty (only other permits present).
+    let (cert, ca_blob) =
+        build_user_cert(&ca, &user_pub, &["alice"], &["permit-port-forwarding"], &[]);
+    let out = run_cert_shell("alice", cert, id_seed, ca_blob);
+    // The `pty-req` is refused (want_reply=true), so the interactive-shell
+    // request never reaches the handler and the client call errors. Auth itself
+    // succeeded (we got far enough to issue the session request).
+    assert!(
+        !out.shell_ok,
+        "a user cert without permit-pty must have its pty-req refused"
+    );
+    assert!(out.pty.is_none(), "no pty must have reached the handler");
+}
+
+#[test]
+fn r1_cert_with_permit_pty_gets_a_pty() {
+    let ca = Ed25519HostKey::from_seed(puressh_fresh_seed());
+    let id_seed = puressh_fresh_seed();
+    let user_pub = raw_ed25519_from_blob(&Ed25519HostKey::from_seed(id_seed).public_blob());
+    let (cert, ca_blob) = build_user_cert(
+        &ca,
+        &user_pub,
+        &["alice"],
+        &["permit-port-forwarding", "permit-pty"],
+        &[],
+    );
+    let out = run_cert_shell("alice", cert, id_seed, ca_blob);
+    assert!(out.shell_ok, "shell with pty should succeed");
+    assert!(out.spawned);
+    assert!(
+        out.pty.is_some(),
+        "a user cert with permit-pty must be granted a pty"
+    );
+}
+
+#[test]
+fn r1_plain_key_auth_still_gets_a_pty() {
+    // Plain-key (non-cert) auth is unaffected by cert gating: a pty is allowed.
+    let host_seed = puressh_fresh_seed();
+    let client_seed = puressh_fresh_seed();
+    let allowed = Ed25519HostKey::from_seed(client_seed).public_blob();
+    let user = "plain".to_string();
+    let user_s = user.clone();
+    let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+        Box::new(OneKeyAuth {
+            user: user_s.clone(),
+            blob: allowed.clone(),
+        })
+    });
+    let shell = RecordingShell::new();
+    let host_key: Box<dyn HostKey + Send + Sync> = Box::new(Ed25519HostKey::from_seed(host_seed));
+    let cfg = ServerConfig::new(
+        vec![host_key],
+        factory,
+        vec!["publickey"],
+        Arc::new(StaticHandler(b"x\n".to_vec())),
+    )
+    .with_shell(Arc::new(shell.clone()));
+    let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let handle = thread::spawn(move || {
+        let _ = server.accept_one();
+    });
+    let mut client = Client::connect(addr, client_cfg(HostKeyPolicy::AcceptAny)).expect("connect");
+    let hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+    client.authenticate_publickey(&user, hk).expect("auth");
+    client.set_request_pty(Some(("xterm".into(), 80, 24, 0, 0, Vec::new())));
+    let _ = client.shell_with_stdin("xterm", 80, 24, b"");
+    drop(client);
+    let _ = handle.join();
+    let st = shell.inner.lock().unwrap();
+    assert!(st.spawned);
+    assert!(st.pty.is_some(), "plain-key auth must still get a pty");
+}
+
+#[test]
+fn r2_cert_force_command_overrides_interactive_shell() {
+    let ca = Ed25519HostKey::from_seed(puressh_fresh_seed());
+    let id_seed = puressh_fresh_seed();
+    let user_pub = raw_ed25519_from_blob(&Ed25519HostKey::from_seed(id_seed).public_blob());
+    // Cert carries permit-pty AND a force-command critical option.
+    let (cert, ca_blob) = build_user_cert(
+        &ca,
+        &user_pub,
+        &["alice"],
+        &["permit-pty"],
+        &[("force-command", ssh_string("/forced/by/cert"))],
+    );
+    let out = run_cert_shell("alice", cert, id_seed, ca_blob);
+    // The shell handler is NOT used; the forced command runs via the buffered
+    // command handler instead of a login shell.
+    assert!(
+        !out.spawned,
+        "force-command must run instead of a login shell"
+    );
+    let (cmd, orig) = out.cmd.expect("forced command ran");
+    assert_eq!(cmd, "/forced/by/cert");
+    // An interactive shell has no client command ⇒ empty SSH_ORIGINAL_COMMAND.
+    assert_eq!(orig, "");
+}
+
+/// Extract the raw 32-byte ed25519 public key from a wire `ssh-ed25519` blob
+/// (`string "ssh-ed25519"`, `string <32 bytes>`).
+fn raw_ed25519_from_blob(blob: &[u8]) -> [u8; 32] {
+    use puressh::format::Reader;
+    let mut r = Reader::new(blob);
+    let _algo = r.read_string().expect("algo");
+    let pk = r.read_string().expect("pk");
+    pk.try_into().expect("32-byte ed25519 key")
+}

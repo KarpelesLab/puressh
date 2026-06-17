@@ -932,6 +932,14 @@ pub struct EffectivePolicy {
     /// `PrintMotd` — print `/etc/motd` for interactive shells. `None` ⇒
     /// default (no).
     pub print_motd: Option<bool>,
+    /// Capability gates from an authenticating **user certificate**. `Some`
+    /// only when the connection authenticated with an OpenSSH user certificate;
+    /// its extensions are *default-deny* — an absent `permit-*` extension
+    /// refuses the corresponding capability (`pty-req`, port forwarding, agent
+    /// forwarding, X11) for the whole connection, on top of (logically ANDed
+    /// with) the `sshd_config` gates above. `None` ⇒ plain-key / password /
+    /// keyboard-interactive auth: certificates impose no extra restriction.
+    pub cert_caps: Option<crate::auth::AuthCertCaps>,
 }
 
 impl EffectivePolicy {
@@ -950,31 +958,58 @@ impl EffectivePolicy {
             client_alive_interval: None,
             client_alive_count_max: None,
             print_motd: None,
+            cert_caps: None,
         }
     }
 
-    /// True iff agent forwarding is permitted (default-allow unless the policy
-    /// resolved to `AllowAgentForwarding no`).
-    fn agent_forwarding_allowed(&self) -> bool {
-        self.allow_agent_forwarding != Some(false)
+    /// True iff a `pty-req` may be honoured. Plain-key/password auth always
+    /// permits a PTY (subject to a shell handler being attached); a user
+    /// certificate must carry the `permit-pty` extension (default-deny).
+    fn pty_allowed(&self) -> bool {
+        self.cert_caps.as_ref().is_none_or(|c| c.permit_pty)
     }
 
-    /// True iff X11 forwarding is permitted (default-allow unless the policy
-    /// resolved to `X11Forwarding no`).
+    /// True iff agent forwarding is permitted: not refused by
+    /// `AllowAgentForwarding no`, AND (for a user cert) the `permit-agent-
+    /// forwarding` extension is present.
+    fn agent_forwarding_allowed(&self) -> bool {
+        self.allow_agent_forwarding != Some(false)
+            && self
+                .cert_caps
+                .as_ref()
+                .is_none_or(|c| c.permit_agent_forwarding)
+    }
+
+    /// True iff X11 forwarding is permitted: not refused by `X11Forwarding no`,
+    /// AND (for a user cert) the `permit-X11-forwarding` extension is present.
     fn x11_forwarding_allowed(&self) -> bool {
         self.x11_forwarding != Some(false)
+            && self
+                .cert_caps
+                .as_ref()
+                .is_none_or(|c| c.permit_x11_forwarding)
     }
 
     /// True iff `direct-tcpip` (`ssh -L`) opens are permitted by
-    /// `AllowTcpForwarding`. Default-allow when unset.
+    /// `AllowTcpForwarding`, AND (for a user cert) the `permit-port-forwarding`
+    /// extension is present. Default-allow when unset.
     fn local_forwarding_allowed(&self) -> bool {
         self.allow_tcp_forwarding.is_none_or(|p| p.local_allowed())
+            && self
+                .cert_caps
+                .as_ref()
+                .is_none_or(|c| c.permit_port_forwarding)
     }
 
     /// True iff `tcpip-forward` (`ssh -R`) requests are permitted by
-    /// `AllowTcpForwarding`. Default-allow when unset.
+    /// `AllowTcpForwarding`, AND (for a user cert) the `permit-port-forwarding`
+    /// extension is present. Default-allow when unset.
     fn remote_forwarding_allowed(&self) -> bool {
         self.allow_tcp_forwarding.is_none_or(|p| p.remote_allowed())
+            && self
+                .cert_caps
+                .as_ref()
+                .is_none_or(|c| c.permit_port_forwarding)
     }
 
     /// True iff a `direct-tcpip` open to `(host, port)` is permitted by
@@ -1432,7 +1467,7 @@ fn handle_connection_inner(
     let local_port = local.map(|a| a.port());
     let preauth = resolve_preauth_policy(&cfg, peer_ip.as_deref(), local_ip.as_deref(), local_port);
 
-    let user = map_preauth_timeout(do_server_auth(
+    let (user, cert_caps) = map_preauth_timeout(do_server_auth(
         &mut stream,
         &mut codec,
         &mut rng,
@@ -1459,7 +1494,7 @@ fn handle_connection_inner(
     // must take effect while we are still root — notably `ChrootDirectory`,
     // which must `chroot()` before `setuid` (chroot needs root).
     let groups = resolve_user_groups(&cfg, &user);
-    let effective = resolve_effective_policy(
+    let mut effective = resolve_effective_policy(
         &cfg,
         &user,
         groups.as_deref(),
@@ -1467,6 +1502,21 @@ fn handle_connection_inner(
         local_ip.as_deref(),
         local_port,
     );
+
+    // Fold the authenticating user certificate's capability gates into the
+    // per-connection ceiling. The certificate's extensions are default-deny
+    // (an absent `permit-*` refuses pty/forwarding/agent/X11) and AND with the
+    // `sshd_config` gates already resolved above; its `force-command` critical
+    // option converges with the config `ForceCommand` machinery — when both are
+    // present the certificate's wins (it is the command actually enforced),
+    // matching OpenSSH. Plain-key / password auth leaves `cert_caps` `None`, so
+    // nothing here changes their behaviour.
+    if let Some(caps) = cert_caps {
+        if let Some(forced) = caps.force_command.clone() {
+            effective.force_command = Some(forced);
+        }
+        effective.cert_caps = Some(caps);
+    }
 
     // Connection-level hook: drop privileges to the authenticated user
     // before any shell / exec / subsystem runs. After this call all I/O on
@@ -1720,6 +1770,9 @@ fn resolve_effective_policy(
         client_alive_interval: opts.client_alive_interval,
         client_alive_count_max: opts.client_alive_count_max,
         print_motd: opts.print_motd,
+        // Certificate caps are not a `sshd_config` concept; they are folded in
+        // post-auth by the caller from the authenticating user certificate.
+        cert_caps: None,
     }
 }
 
@@ -1735,7 +1788,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     peer_ip: Option<&str>,
     local_ip: Option<&str>,
     local_port: Option<u16>,
-) -> Result<String> {
+) -> Result<(String, Option<crate::auth::AuthCertCaps>)> {
     let methods = preauth.methods.clone();
     let auth_impl = cfg.authenticator.build_with_peer(peer_ip);
     let mut server_auth = ServerAuth::new(session_id, methods, auth_impl);
@@ -1822,9 +1875,13 @@ fn do_server_auth<R: RngCore + CryptoRng>(
 
         match server_auth.on_packet(&payload)? {
             ServerStep::Send(p) => write_payload(stream, codec, rng, &p)?,
-            ServerStep::Authenticated { payload, user } => {
+            ServerStep::Authenticated {
+                payload,
+                user,
+                cert_caps,
+            } => {
                 write_payload(stream, codec, rng, &payload)?;
-                return Ok(user);
+                return Ok((user, cert_caps));
             }
             ServerStep::Disconnect(reason) => {
                 let _ =
@@ -3310,7 +3367,11 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             // RFC 4254 §6.2: pty-req may precede shell/exec. We just stash
             // the spec on the channel's ShellRuntime; the actual PTY is
             // allocated when "shell" arrives.
-            if cfg.shell_handler.is_some() {
+            //
+            // Certificate default-deny: a user cert without the `permit-pty`
+            // extension is refused a PTY (the gate folds into `pty_allowed`).
+            // Plain-key / password auth is unaffected.
+            if cfg.shell_handler.is_some() && effective.pty_allowed() {
                 let rt = shells.entry(channel).or_insert_with(ShellRuntime::new);
                 rt.pending_pty = Some(PtySpec {
                     term,
@@ -6108,6 +6169,135 @@ mod tests {
         assert!(eff2.force_command.is_none());
     }
 
+    // ---- R1: user-certificate extension default-deny gating --------------
+
+    /// `AuthCertCaps` with every capability permitted (the shape a default
+    /// `ssh-keygen` user cert produces).
+    fn caps_all() -> crate::auth::AuthCertCaps {
+        crate::auth::AuthCertCaps {
+            permit_pty: true,
+            permit_port_forwarding: true,
+            permit_agent_forwarding: true,
+            permit_x11_forwarding: true,
+            force_command: None,
+        }
+    }
+
+    /// `AuthCertCaps` with no capabilities permitted (a hardened cert produced
+    /// with `ssh-keygen -O clear`).
+    fn caps_none() -> crate::auth::AuthCertCaps {
+        crate::auth::AuthCertCaps {
+            permit_pty: false,
+            permit_port_forwarding: false,
+            permit_agent_forwarding: false,
+            permit_x11_forwarding: false,
+            force_command: None,
+        }
+    }
+
+    #[test]
+    fn r1_plain_key_auth_allows_all_capabilities() {
+        // No cert caps ⇒ plain-key / password auth: every capability allowed,
+        // exactly as before certificates existed.
+        let eff = EffectivePolicy::unrestricted();
+        assert!(eff.pty_allowed());
+        assert!(eff.agent_forwarding_allowed());
+        assert!(eff.x11_forwarding_allowed());
+        assert!(eff.local_forwarding_allowed());
+        assert!(eff.remote_forwarding_allowed());
+    }
+
+    #[test]
+    fn r1_cert_with_all_extensions_allows_all_capabilities() {
+        let mut eff = EffectivePolicy::unrestricted();
+        eff.cert_caps = Some(caps_all());
+        assert!(eff.pty_allowed());
+        assert!(eff.agent_forwarding_allowed());
+        assert!(eff.x11_forwarding_allowed());
+        assert!(eff.local_forwarding_allowed());
+        assert!(eff.remote_forwarding_allowed());
+    }
+
+    #[test]
+    fn r1_cert_without_extensions_denies_each_capability() {
+        let mut eff = EffectivePolicy::unrestricted();
+        eff.cert_caps = Some(caps_none());
+        // Default-deny: absent permit-* ⇒ capability refused.
+        assert!(!eff.pty_allowed());
+        assert!(!eff.agent_forwarding_allowed());
+        assert!(!eff.x11_forwarding_allowed());
+        assert!(!eff.local_forwarding_allowed());
+        assert!(!eff.remote_forwarding_allowed());
+    }
+
+    #[test]
+    fn r1_cert_extensions_gate_independently() {
+        // permit-pty present but everything else absent ⇒ only pty allowed.
+        let mut eff = EffectivePolicy::unrestricted();
+        eff.cert_caps = Some(crate::auth::AuthCertCaps {
+            permit_pty: true,
+            permit_port_forwarding: false,
+            permit_agent_forwarding: false,
+            permit_x11_forwarding: false,
+            force_command: None,
+        });
+        assert!(eff.pty_allowed());
+        assert!(!eff.agent_forwarding_allowed());
+        assert!(!eff.x11_forwarding_allowed());
+        assert!(!eff.local_forwarding_allowed());
+        assert!(!eff.remote_forwarding_allowed());
+    }
+
+    #[test]
+    fn r1_cert_and_config_gates_compose_with_and() {
+        // A cert that permits port forwarding still cannot forward when the
+        // sshd_config gate forbids it (the two gates AND together).
+        let cfg = policy_cfg("AllowTcpForwarding no\n");
+        let mut eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        eff.cert_caps = Some(caps_all());
+        assert!(!eff.local_forwarding_allowed());
+        assert!(!eff.remote_forwarding_allowed());
+
+        // Conversely, config allows but the cert denies ⇒ still denied.
+        let cfg2 = policy_cfg("Port 22\n");
+        let mut eff2 = resolve_effective_policy(&cfg2, "alice", None, None, None, None);
+        eff2.cert_caps = Some(caps_none());
+        assert!(!eff2.local_forwarding_allowed());
+        assert!(!eff2.pty_allowed());
+    }
+
+    #[test]
+    fn r1_auth_cert_caps_reads_extensions_from_cert() {
+        // A real ssh-keygen user cert carries the full permit-* set.
+        let blob = {
+            let path = format!(
+                "{}/tests/fixtures/cert/u_ed25519-cert.pub",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let text = std::fs::read_to_string(&path).expect("read fixture");
+            let b64 = text.split_whitespace().nth(1).expect("base64");
+            crate::key::base64::decode(b64.as_bytes()).expect("decode")
+        };
+        let cert = crate::cert::Certificate::parse(&blob).expect("parse cert");
+        let ci = crate::auth::CertInfo::from_certificate(&cert).expect("certinfo");
+        let caps = crate::auth::AuthCertCaps::from_cert_info(&ci);
+        assert!(caps.permit_pty);
+        assert!(caps.permit_port_forwarding);
+        assert!(caps.permit_agent_forwarding);
+        assert!(caps.permit_x11_forwarding);
+        assert!(caps.force_command.is_none());
+
+        // Synthesise a cert view with the extensions stripped (as `-O clear`
+        // would) and confirm default-deny is read out.
+        let mut stripped = ci.clone();
+        stripped.extensions.clear();
+        let caps2 = crate::auth::AuthCertCaps::from_cert_info(&stripped);
+        assert!(!caps2.permit_pty);
+        assert!(!caps2.permit_port_forwarding);
+        assert!(!caps2.permit_agent_forwarding);
+        assert!(!caps2.permit_x11_forwarding);
+    }
+
     #[test]
     fn w7_gateway_ports_rewrite() {
         use crate::config::ServerGatewayPorts as GP;
@@ -6251,6 +6441,102 @@ mod tests {
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(stdout.contains("CMD=/only/forced"), "stdout was {stdout:?}");
         w7_finish(client, st, sd);
+    }
+
+    /// An exec-stream handler that claims `scp`-prefixed commands and records
+    /// the command + `SSH_ORIGINAL_COMMAND` it was handed. Used to prove a
+    /// `ForceCommand` / cert force-command routes through the exec-stream (SCP)
+    /// overlay, not just the buffered command handler.
+    struct RecordingScpStream {
+        seen: Arc<Mutex<Option<(String, String)>>>,
+    }
+    impl ExecStreamHandler for RecordingScpStream {
+        fn claims(&self, command: &str) -> bool {
+            let t = command.trim_start();
+            t.starts_with("scp ") || t == "scp"
+        }
+        fn run(
+            &self,
+            _user: &str,
+            env: &SessionEnv,
+            command: &str,
+            mut stream: ChannelStream,
+        ) -> Result<()> {
+            let orig = env.get("SSH_ORIGINAL_COMMAND").unwrap_or("").to_string();
+            *self.seen.lock().unwrap() = Some((command.to_string(), orig));
+            // Write a byte so the client sees data, then drop to close.
+            let _ = stream.write_all(b"\0");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn r2_force_command_routes_to_exec_stream_scp() {
+        // The SCP path is the exec-stream overlay. A `ForceCommand` set to an
+        // `scp` invocation must be claimed by the overlay (the same machinery a
+        // cert force-command uses — both feed `EffectivePolicy.force_command`,
+        // and the dispatcher rewrites the command before consulting the
+        // overlay).
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let allowed_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+        let user = "scp-user".to_string();
+        let user_f = user.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: user_f.clone(),
+                allowed_blob: allowed_blob.clone(),
+            })
+        });
+        let policy =
+            crate::config::SshServerConfig::parse("ForceCommand scp -t /tmp/dst\n").expect("parse");
+        let seen = Arc::new(Mutex::new(None));
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(EchoCommandHandler),
+        )
+        .with_policy(Arc::new(policy))
+        .with_exec_stream_handler(Arc::new(RecordingScpStream { seen: seen.clone() }));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let st = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+            },
+        )
+        .expect("connect");
+        client
+            .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+            .expect("auth");
+        // Client asks for an interactive-ish command; ForceCommand rewrites it
+        // to the scp invocation which the overlay claims.
+        let _ = client.exec("the-client-command");
+        w7_finish(client, st, server_done);
+
+        let got = seen.lock().unwrap().clone().expect("exec-stream claimed");
+        assert_eq!(
+            got.0, "scp -t /tmp/dst",
+            "forced scp command reached overlay"
+        );
+        assert_eq!(
+            got.1, "the-client-command",
+            "original command exposed as SSH_ORIGINAL_COMMAND"
+        );
     }
 
     #[test]

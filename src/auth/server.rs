@@ -213,6 +213,66 @@ pub trait Authenticator: Send {
     }
 }
 
+/// Per-connection capability facts carried out of a *successful* user-certificate
+/// authentication, for the connection phase to enforce.
+///
+/// OpenSSH user certificates carry **extensions** that are default-deny: when an
+/// extension is absent the corresponding capability is refused for the whole
+/// connection. The auth layer captures the winning certificate's extension set
+/// (and its `force-command` critical option) here so the connection phase can
+/// gate `pty-req` / forwarding / agent / X11 — and apply the forced command —
+/// without re-parsing the certificate.
+///
+/// `None` (i.e. plain public-key, password, or keyboard-interactive auth)
+/// leaves every capability allowed, exactly as before certificates existed.
+#[derive(Debug, Clone)]
+#[cfg(feature = "alloc")]
+pub struct AuthCertCaps {
+    /// `permit-pty` extension present ⇒ a `pty-req` may be honoured.
+    pub permit_pty: bool,
+    /// `permit-port-forwarding` present ⇒ `direct-tcpip` / `tcpip-forward` allowed.
+    pub permit_port_forwarding: bool,
+    /// `permit-agent-forwarding` present ⇒ `auth-agent-req@openssh.com` allowed.
+    pub permit_agent_forwarding: bool,
+    /// `permit-X11-forwarding` present ⇒ `x11-req` allowed.
+    pub permit_x11_forwarding: bool,
+    /// The decoded `force-command` critical option (an SSH `string`), if present.
+    /// The connection phase runs this in place of the client's command/shell.
+    pub force_command: Option<String>,
+}
+
+#[cfg(feature = "alloc")]
+impl AuthCertCaps {
+    /// Build the capability view from a verified user certificate's `CertInfo`.
+    /// The `force-command` payload is itself a length-prefixed SSH `string`; it
+    /// is decoded here so callers don't repeat the unwrap.
+    pub fn from_cert_info(ci: &CertInfo) -> Self {
+        let force_command = ci
+            .critical_option("force-command")
+            .and_then(decode_ssh_string);
+        AuthCertCaps {
+            permit_pty: ci.has_extension("permit-pty"),
+            permit_port_forwarding: ci.has_extension("permit-port-forwarding"),
+            permit_agent_forwarding: ci.has_extension("permit-agent-forwarding"),
+            permit_x11_forwarding: ci.has_extension("permit-X11-forwarding"),
+            force_command,
+        }
+    }
+}
+
+/// Decode an SSH `string` (4-byte BE length + bytes) into UTF-8. Used for the
+/// `force-command` critical-option payload, which is itself a length-prefixed
+/// string.
+#[cfg(feature = "alloc")]
+fn decode_ssh_string(data: &[u8]) -> Option<String> {
+    let mut r = crate::format::Reader::new(data);
+    let s = r.read_string().ok()?;
+    if !r.is_empty() {
+        return None;
+    }
+    core::str::from_utf8(s).ok().map(|s| s.to_string())
+}
+
 /// What the harness should do next on behalf of the server.
 pub enum ServerStep {
     /// Send this payload to the peer.
@@ -224,6 +284,11 @@ pub enum ServerStep {
         payload: Vec<u8>,
         /// The validated user name.
         user: String,
+        /// `Some` iff the credential that completed authentication was a user
+        /// certificate; carries that cert's connection-phase capability gates
+        /// (default-deny extensions + `force-command`). `None` for plain-key /
+        /// password / keyboard-interactive auth (all capabilities allowed).
+        cert_caps: Option<AuthCertCaps>,
     },
     /// Disconnect the peer with the given (static) reason.
     Disconnect(&'static str),
@@ -266,6 +331,11 @@ pub struct ServerAuth {
     /// Resolved `CASignatureAlgorithms` — the signature algorithms a CA may use
     /// when signing a user certificate. Empty ⇒ the built-in default set.
     ca_signature_algorithms: Vec<String>,
+    /// Capability facts captured from the most recent *verified* user-cert
+    /// publickey attempt (extensions + `force-command`). Held across a possible
+    /// multi-factor PartialAccept so the eventual `Authenticated` step can carry
+    /// it. `None` until a verified cert attempt is seen.
+    pending_cert_caps: Option<AuthCertCaps>,
 }
 
 impl ServerAuth {
@@ -291,6 +361,7 @@ impl ServerAuth {
             failed_attempts: 0,
             now: 0,
             ca_signature_algorithms: Vec::new(),
+            pending_cert_caps: None,
         }
     }
 
@@ -585,6 +656,17 @@ impl ServerAuth {
             return self.emit_failure();
         }
 
+        // Capture the cert's connection-phase capability gates (default-deny
+        // extensions + `force-command`) BEFORE evaluating, so an eventual
+        // Accept — possibly several factors later under a multi-factor chain —
+        // can carry them. The authenticator still owns the *trust* verdict; we
+        // only record what a successful cert would authorize. Overwrites any
+        // previously-captured caps so the last verified cert wins (matching the
+        // last-cert-verified semantics of a repeated publickey factor).
+        if let Some(ci) = &cert_info {
+            self.pending_cert_caps = Some(AuthCertCaps::from_cert_info(ci));
+        }
+
         let decision = self.auth.evaluate(AuthAttempt::PublicKey {
             user: user.clone(),
             algorithm,
@@ -603,6 +685,7 @@ impl ServerAuth {
                 Ok(ServerStep::Authenticated {
                     payload: encode_success(),
                     user: user.into(),
+                    cert_caps: self.pending_cert_caps.take(),
                 })
             }
             AuthDecision::PartialAccept { still_required } => {

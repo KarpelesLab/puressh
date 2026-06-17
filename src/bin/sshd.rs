@@ -75,28 +75,6 @@ mod imp {
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    // Per-connection forced command from a user certificate's `force-command`
-    // critical option. Each connection runs in its own `fork()`ed child, so a
-    // process-global here is effectively per-connection: the authenticator sets
-    // it on a successful cert auth and the exec/shell handlers (same child)
-    // read it to override whatever command the client requested. OpenSSH's
-    // `ForceCommand` / cert force-command semantics: the original command is
-    // exposed to the forced command via `$SSH_ORIGINAL_COMMAND`, which the env
-    // layering passes through; we override the executed command only.
-    static FORCED_COMMAND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-    /// Record a certificate `force-command` for this connection (forked child).
-    fn set_forced_command(cmd: Option<String>) {
-        if let Ok(mut g) = FORCED_COMMAND.lock() {
-            *g = cmd;
-        }
-    }
-
-    /// The forced command for this connection, if any.
-    fn forced_command() -> Option<String> {
-        FORCED_COMMAND.lock().ok().and_then(|g| g.clone())
-    }
-
     const USAGE: &str = "usage: sshd [-d] [-f configfile] [-p port] [-b address]... \
                          [-h host_key_file]... [-A authorized_keys_file] \
                          [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
@@ -1465,15 +1443,14 @@ mod imp {
                     if self.debug {
                         eprintln!("sshd: auth publickey: verified user {user}");
                     }
-                    // Certificate `force-command`: record it for this connection
-                    // so the exec/shell handlers override the client's command.
-                    // The inner payload is an SSH string (force-command="cmd").
-                    if let Some(ci) = &cert {
-                        let forced = ci
-                            .critical_option("force-command")
-                            .and_then(decode_ssh_string);
-                        set_forced_command(forced);
-                    }
+                    // A verified user certificate's `force-command` critical
+                    // option (and its default-deny extensions) are captured by
+                    // the auth layer into `AuthCertCaps`, folded into the
+                    // per-connection `EffectivePolicy`, and enforced by the
+                    // server connection-phase dispatcher uniformly with the
+                    // config `ForceCommand` / forwarding gates. Nothing to
+                    // record here.
+                    //
                     // A verified signature satisfies the `publickey` factor. In
                     // single-factor mode this Accepts; under a multi-factor
                     // chain it may PartialAccept and ask for the next factor.
@@ -1662,22 +1639,13 @@ mod imp {
 
     impl CommandHandler for ShellCommandHandler {
         fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
-            // Certificate `force-command` overrides the client's command. The
-            // original command is exposed to it via `$SSH_ORIGINAL_COMMAND`
-            // (layered into the session env below), matching OpenSSH.
-            let forced = forced_command();
-            let mut effective_env;
-            let (env, command): (&SessionEnv, &str) = match &forced {
-                Some(forced) => {
-                    effective_env = env.clone();
-                    effective_env.insert("SSH_ORIGINAL_COMMAND", command);
-                    if self.debug {
-                        eprintln!("sshd: force-command active for {user}");
-                    }
-                    (&effective_env, forced.as_str())
-                }
-                None => (env, command),
-            };
+            // Both the config `ForceCommand` directive and a user certificate's
+            // `force-command` critical option are applied uniformly by the
+            // server connection-phase dispatcher (it rewrites `command` to the
+            // forced one and injects `$SSH_ORIGINAL_COMMAND` into the session
+            // env before this handler runs). The handler therefore sees the
+            // already-forced command and the populated env — no separate
+            // force-command path lives here.
             if self.debug {
                 if self.debug_commands {
                     eprintln!("sshd: exec by {user}: {command}");

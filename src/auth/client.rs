@@ -9,9 +9,9 @@ use crate::error::{Error, Result};
 
 use super::message::{
     AuthMethodPayload, SSH_MSG_SERVICE_ACCEPT, SSH_MSG_USERAUTH_BANNER, SSH_MSG_USERAUTH_FAILURE,
-    SSH_MSG_USERAUTH_PK_OK, SSH_MSG_USERAUTH_SUCCESS, SecretString, ServiceAccept, ServiceRequest,
-    UserauthBanner, UserauthFailure, UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk,
-    UserauthRequest,
+    SSH_MSG_USERAUTH_PASSWD_CHANGEREQ, SSH_MSG_USERAUTH_PK_OK, SSH_MSG_USERAUTH_SUCCESS,
+    SecretString, ServiceAccept, ServiceRequest, UserauthBanner, UserauthFailure,
+    UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest,
 };
 
 /// Callback hook for keyboard-interactive (RFC 4256).
@@ -28,6 +28,13 @@ pub enum ClientCredential {
     /// Plaintext password, held in zeroize-on-drop storage so its bytes
     /// are wiped when the credential is dropped.
     Password(SecretString),
+    /// Lazily-produced, re-promptable password. The closure is invoked each
+    /// time the `password` method is attempted; the `bool` argument is `true`
+    /// on a retry (a prior password attempt failed and the server still offers
+    /// `password`). Returning `None` stops further password attempts (e.g. the
+    /// user pressed Ctrl-D, `BatchMode` is on, or `NumberOfPasswordPrompts` is
+    /// exhausted — the closure owns that cap). Method name `"password"`.
+    PasswordPrompt(Box<dyn FnMut(bool) -> Option<SecretString> + Send>),
     /// Publickey — signs the request with the private side.
     PublicKey(Box<dyn crate::hostkey::HostKey>),
     /// Keyboard-interactive — defers prompt answering to a responder.
@@ -39,6 +46,7 @@ impl ClientCredential {
         match self {
             ClientCredential::None => "none",
             ClientCredential::Password(_) => "password",
+            ClientCredential::PasswordPrompt(_) => "password",
             ClientCredential::PublicKey(_) => "publickey",
             ClientCredential::KeyboardInteractive(_) => "keyboard-interactive",
         }
@@ -90,6 +98,10 @@ pub struct ClientAuth {
     current: Option<ClientCredential>,
     server_continuations: Vec<String>,
     last_partial_success: bool,
+    /// Set when the just-failed credential was a re-promptable
+    /// [`ClientCredential::PasswordPrompt`] re-queued for another try, so the
+    /// next prompt call passes `retry = true`.
+    password_retry: bool,
     state: State,
     /// `server-sig-algs` from `SSH_MSG_EXT_INFO` (RFC 8308 §3.1). When
     /// present, publickey credentials whose `HostKey::algorithm()` is
@@ -116,6 +128,7 @@ impl ClientAuth {
             current: None,
             server_continuations: Vec::new(),
             last_partial_success: false,
+            password_retry: false,
             state: State::Initial,
             server_sig_algs: None,
             pubkey_accepted: None,
@@ -188,7 +201,19 @@ impl ClientAuth {
             }
             State::AwaitingPkOk => self.on_pk_probe_reply(payload),
             State::AwaitingPkResult => self.on_auth_result(payload),
-            State::AwaitingPasswordResult => self.on_auth_result(payload),
+            State::AwaitingPasswordResult => {
+                // RFC 4252 §8: the server may answer a password request with
+                // SSH_MSG_USERAUTH_PASSWD_CHANGEREQ (msg 60) to demand a new
+                // password. We do not implement the change-password exchange;
+                // surface a clear, actionable error rather than a generic
+                // "unexpected packet".
+                if msg_type == SSH_MSG_USERAUTH_PASSWD_CHANGEREQ {
+                    return Err(Error::Protocol(
+                        "server requires password change; not supported",
+                    ));
+                }
+                self.on_auth_result(payload)
+            }
             State::AwaitingNoneResult => self.on_auth_result(payload),
             State::AwaitingKbdintResult => self.on_kbdint_reply(payload),
             State::Done => Ok(ClientStep::Idle),
@@ -268,12 +293,48 @@ impl ClientAuth {
     }
 
     fn emit_current_request(&mut self) -> Result<ClientStep> {
+        // `PasswordPrompt` needs a mutable borrow to call its closure (and may
+        // decline, returning `None`, which means "skip me, try the next
+        // credential"). Handle it before the shared-borrow match below.
+        if matches!(self.current, Some(ClientCredential::PasswordPrompt(_))) {
+            let retry = self.password_retry;
+            let pw = match &mut self.current {
+                Some(ClientCredential::PasswordPrompt(f)) => f(retry),
+                _ => unreachable!(),
+            };
+            match pw {
+                Some(secret) => {
+                    let req = UserauthRequest {
+                        user: self.user.clone(),
+                        service: self.service.into(),
+                        method: AuthMethodPayload::Password {
+                            new_password: None,
+                            password: secret,
+                        },
+                    };
+                    self.state = State::AwaitingPasswordResult;
+                    return Ok(ClientStep::Send(req.encode()));
+                }
+                None => {
+                    // The closure declined (Ctrl-D / BatchMode / prompt cap):
+                    // drop this credential and advance to the next.
+                    self.current = None;
+                    self.password_retry = false;
+                    return self.advance_to_next_credential();
+                }
+            }
+        }
+
         let cred = self
             .current
             .as_ref()
             .ok_or(Error::Protocol("auth: no current credential"))?;
         let (method, next_state) = match cred {
             ClientCredential::None => (AuthMethodPayload::None, State::AwaitingNoneResult),
+            ClientCredential::PasswordPrompt(_) => {
+                // Handled above; unreachable here.
+                return Err(Error::Protocol("auth: password prompt mis-dispatched"));
+            }
             ClientCredential::Password(pw) => (
                 AuthMethodPayload::Password {
                     new_password: None,
@@ -379,7 +440,26 @@ impl ClientAuth {
             let failure = UserauthFailure::decode(payload)?;
             self.server_continuations = failure.continuations;
             self.last_partial_success = failure.partial_success;
-            self.current = None;
+            // Re-promptable password: if the just-failed attempt used a
+            // `PasswordPrompt` and the server still offers `password`, re-queue
+            // it at the front for another try. The closure (which owns the
+            // `NumberOfPasswordPrompts` cap and `BatchMode`) decides whether to
+            // actually prompt again; returning `None` then skips it. A
+            // partial_success failure is *not* a wrong-password retry — the
+            // factor was accepted and the server wants a different method — so
+            // we do not re-prompt in that case.
+            let was_prompt = matches!(self.current, Some(ClientCredential::PasswordPrompt(_)));
+            if was_prompt
+                && !failure.partial_success
+                && self.server_continuations.iter().any(|m| m == "password")
+                && let Some(cred) = self.current.take()
+            {
+                self.credentials.push_front(cred);
+                self.password_retry = true;
+            } else {
+                self.current = None;
+                self.password_retry = false;
+            }
             self.advance_to_next_credential()
         } else {
             Err(Error::Protocol("auth: unexpected packet for auth result"))
@@ -428,7 +508,113 @@ impl ClientAuth {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::message::{ServiceAccept, UserauthFailure, UserauthRequest};
     use crate::hostkey::HostKey;
+
+    fn service_accept_payload() -> Vec<u8> {
+        ServiceAccept {
+            service: "ssh-userauth".into(),
+        }
+        .encode()
+    }
+
+    #[test]
+    fn password_prompt_invoked_and_sends_password() {
+        let mut c = ClientAuth::new("u", Vec::new());
+        c.add_credential(ClientCredential::PasswordPrompt(Box::new(|retry| {
+            assert!(!retry, "first call is not a retry");
+            Some(SecretString::from("hunter2"))
+        })));
+        let _ = c.start();
+        let step = c.on_packet(&service_accept_payload()).unwrap();
+        let p = match step {
+            ClientStep::Send(p) => p,
+            _ => panic!("expected Send"),
+        };
+        let req = UserauthRequest::decode(&p).unwrap();
+        assert_eq!(req.method.method_name(), "password");
+    }
+
+    #[test]
+    fn password_prompt_none_yields_failed_no_packet() {
+        // BatchMode-style closure: declines immediately. The driver must report
+        // Failed without ever emitting a password packet.
+        let mut c = ClientAuth::new("u", Vec::new());
+        c.add_credential(ClientCredential::PasswordPrompt(Box::new(|_retry| None)));
+        let _ = c.start();
+        let step = c.on_packet(&service_accept_payload()).unwrap();
+        assert!(
+            matches!(step, ClientStep::Failed { .. }),
+            "declined prompt must yield Failed, not a Send"
+        );
+    }
+
+    #[test]
+    fn password_prompt_reprompts_on_failure() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Arc;
+        // The closure is called twice: first attempt, then a retry after the
+        // server's USERAUTH_FAILURE that still offers `password`.
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls2 = calls.clone();
+        let mut c = ClientAuth::new("u", Vec::new());
+        c.add_credential(ClientCredential::PasswordPrompt(Box::new(move |retry| {
+            let n = calls2.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                assert!(!retry);
+                Some(SecretString::from("wrong"))
+            } else if n == 2 {
+                assert!(retry, "second call must be flagged as a retry");
+                Some(SecretString::from("right"))
+            } else {
+                None
+            }
+        })));
+        let _ = c.start();
+        // First password request.
+        let p1 = match c.on_packet(&service_accept_payload()).unwrap() {
+            ClientStep::Send(p) => p,
+            _ => panic!("expected first password Send"),
+        };
+        assert_eq!(
+            UserauthRequest::decode(&p1).unwrap().method.method_name(),
+            "password"
+        );
+        // Server rejects but still offers password ⇒ re-prompt.
+        let failure = UserauthFailure {
+            continuations: vec!["password".into()],
+            partial_success: false,
+        }
+        .encode();
+        let p2 = match c.on_packet(&failure).unwrap() {
+            ClientStep::Send(p) => p,
+            _ => panic!("expected re-prompt Send, not Failed"),
+        };
+        assert_eq!(
+            UserauthRequest::decode(&p2).unwrap().method.method_name(),
+            "password"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn passwd_changereq_is_clear_error() {
+        // Msg type 60 in the AwaitingPasswordResult state is
+        // SSH_MSG_USERAUTH_PASSWD_CHANGEREQ; we surface a specific error.
+        let mut c = ClientAuth::new("u", Vec::new());
+        c.add_credential(ClientCredential::Password("pw".into()));
+        let _ = c.start();
+        let _ = c.on_packet(&service_accept_payload()).unwrap(); // sends password
+        let changereq = vec![SSH_MSG_USERAUTH_PASSWD_CHANGEREQ];
+        match c.on_packet(&changereq) {
+            Err(Error::Protocol(m)) => assert!(
+                m.contains("password change"),
+                "expected password-change error, got {m:?}"
+            ),
+            Err(other) => panic!("expected Protocol error, got {other:?}"),
+            Ok(_) => panic!("expected an error for PASSWD_CHANGEREQ"),
+        }
+    }
 
     /// A test double for [`HostKey`]: reports a fixed algorithm name and,
     /// optionally, upgrades to another name when `upgraded_for` is asked and

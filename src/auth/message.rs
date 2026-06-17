@@ -21,6 +21,10 @@ pub const SSH_MSG_USERAUTH_FAILURE: u8 = 51;
 pub const SSH_MSG_USERAUTH_SUCCESS: u8 = 52;
 pub const SSH_MSG_USERAUTH_BANNER: u8 = 53;
 pub const SSH_MSG_USERAUTH_PK_OK: u8 = 60;
+/// Sent by the server in the `AwaitingPasswordResult` phase to demand a new
+/// password (RFC 4252 §8). Shares msg-type 60 with PK_OK / INFO_REQUEST; the
+/// client's current state disambiguates.
+pub const SSH_MSG_USERAUTH_PASSWD_CHANGEREQ: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_REQUEST: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_RESPONSE: u8 = 61;
 

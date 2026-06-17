@@ -701,6 +701,13 @@ impl Client {
     }
 
     /// Try every credential in order until one succeeds or all are refused.
+    ///
+    /// Builds a single [`ClientAuth`] driver carrying every credential and
+    /// runs it to completion on this one connection — the SERVICE_REQUEST is
+    /// sent exactly once. Multiple credentials (e.g. several keys, a password,
+    /// a keyboard-interactive responder) are tried in order *within the same
+    /// userauth exchange*, which is what a multi-factor server expects (the
+    /// driver advances on each USERAUTH_FAILURE / partial-success).
     pub fn authenticate(&mut self, user: &str, credentials: Vec<ClientCredential>) -> Result<()> {
         let mut auth = ClientAuth::new(user, self.session_id.clone());
         // Local PubkeyAcceptedAlgorithms policy from ssh_config, applied
@@ -719,6 +726,17 @@ impl Client {
         for c in credentials {
             auth.add_credential(c);
         }
+        self.run_auth(auth)
+    }
+
+    /// Drive a fully-configured [`ClientAuth`] to a verdict on this connection.
+    /// Sends the initial SERVICE_REQUEST and pumps packets until the driver
+    /// reports success or exhausts its credentials. Callers that need to inject
+    /// policy (server-sig-algs, pubkey-accepted, a re-promptable password
+    /// closure, a keyboard-interactive responder) build the driver themselves
+    /// and hand it here — there is exactly one driver, and thus exactly one
+    /// SERVICE_REQUEST, per connection.
+    pub fn run_auth(&mut self, mut auth: ClientAuth) -> Result<()> {
         let first = auth.start();
         self.write_payload(&first)?;
 
@@ -742,6 +760,25 @@ impl Client {
             }
         }
         Err(Error::Protocol("auth: too many steps without termination"))
+    }
+
+    /// Build a [`ClientAuth`] for `user` with this connection's resolved
+    /// ssh_config policy (PubkeyAcceptedAlgorithms + server-sig-algs)
+    /// pre-installed, ready for the caller to push credentials onto and then
+    /// hand to [`Self::run_auth`]. This is the one-driver-per-connection entry
+    /// point for callers (e.g. the `ssh` binary) that need a re-promptable
+    /// password or a keyboard-interactive responder.
+    pub fn new_auth_driver(&self, user: &str) -> ClientAuth {
+        let mut auth = ClientAuth::new(user, self.session_id.clone());
+        if let Some(accepted) = self.algo_overrides.pubkey_accepted_algorithms.clone() {
+            auth.set_pubkey_accepted(accepted);
+        }
+        if let Some(ext) = self.runner.peer_ext_info()
+            && let Some(algs) = ext.server_sig_algs.as_deref()
+        {
+            auth.set_server_sig_algs(algs);
+        }
+        auth
     }
 
     /// Convenience: try password authentication only.

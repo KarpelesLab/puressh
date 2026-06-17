@@ -18,7 +18,8 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use puressh::auth::ClientCredential;
+use puressh::auth::message::SecretString;
+use puressh::auth::{ClientCredential, KeyboardInteractiveResponder};
 use puressh::client::{
     AlgoOverrides, ChannelStream, Client, ClientHandlers, Config, ForwardedTcpipCallback,
     ForwardedTcpipOrigin, ServeContext,
@@ -28,8 +29,8 @@ use puressh::client::{
 mod common;
 use common::{
     StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
-    expand_tilde, load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
-    try_load_default_identity, vlog,
+    expand_tilde, load_identity, parse_target, read_kbdint_response, read_password_from_stdin,
+    resolve_user, set_verbose, try_load_default_identity, vlog,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -689,44 +690,49 @@ fn collect_credentials(
     credentials
 }
 
-/// Authenticate `client` as `user` with `credentials`: try publickey, then
-/// fall back to an interactive password prompt. Used for the final target
-/// and for every ProxyJump hop.
+/// A keyboard-interactive responder (RFC 4256) backed by the terminal: prints
+/// the server's title/instruction once, then reads one answer per prompt,
+/// honoring each prompt's echo flag via [`read_kbdint_response`].
+struct StdinKbdResponder;
+impl KeyboardInteractiveResponder for StdinKbdResponder {
+    fn respond(
+        &mut self,
+        name: &str,
+        instruction: &str,
+        prompts: &[(String, bool)],
+    ) -> Vec<String> {
+        if !name.is_empty() {
+            eprintln!("{name}");
+        }
+        if !instruction.is_empty() {
+            eprintln!("{instruction}");
+        }
+        prompts
+            .iter()
+            .map(|(prompt, echo)| {
+                read_kbdint_response(prompt, *echo)
+                    .map(|z| z.to_string())
+                    // On read error, send an empty answer (the server will
+                    // reject); never abort the whole exchange here.
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+}
+
+/// Authenticate `client` as `user`. Builds a SINGLE [`ClientAuth`] driver for
+/// this connection — publickey credentials first, then a re-promptable
+/// password closure, then a keyboard-interactive responder — and runs it once.
+/// Crucially this sends exactly one SERVICE_REQUEST: every method is attempted
+/// inside the same userauth exchange, which is both RFC-conformant and required
+/// for a multi-factor server. Used for the final target and every ProxyJump
+/// hop.
 fn authenticate_client(
     client: &mut Client,
     user: &str,
     credentials: Vec<ClientCredential>,
     cfg_block: &puressh::config::ClientOptions,
 ) -> Result<(), String> {
-    let authed = if !credentials.is_empty() {
-        vlog(
-            1,
-            &format!(
-                "attempting publickey auth with {} credentials",
-                credentials.len()
-            ),
-        );
-        match client.authenticate(user, credentials) {
-            Ok(()) => {
-                vlog(1, &format!("authenticated as {user} via publickey"));
-                true
-            }
-            Err(e) => {
-                eprintln!("publickey auth: {e}");
-                false
-            }
-        }
-    } else {
-        vlog(
-            1,
-            "no publickey credentials available; falling back to password",
-        );
-        false
-    };
-    if authed {
-        return Ok(());
-    }
-
     // Whether password auth is permitted: BatchMode disables it outright;
     // PreferredAuthentications must include "password"; NumberOfPasswordPrompts
     // 0 also disables it.
@@ -736,46 +742,69 @@ fn authenticate_client(
         .as_ref()
         .map(|p| p.iter().any(|m| m == "password"))
         .unwrap_or(true);
+    let kbdint_allowed_by_prefs = cfg_block
+        .preferred_authentications
+        .as_ref()
+        .map(|p| p.iter().any(|m| m == "keyboard-interactive"))
+        .unwrap_or(true);
     // OpenSSH default is 3 attempts.
     let max_prompts = cfg_block.number_of_password_prompts.unwrap_or(3);
+    let password_enabled = !batch && password_allowed_by_prefs && max_prompts > 0;
+    let kbdint_enabled = !batch && kbdint_allowed_by_prefs;
 
-    if batch {
-        return Err(
-            "Auth failed: BatchMode is on and publickey auth did not succeed (no password prompt)"
-                .into(),
+    let mut auth = client.new_auth_driver(user);
+    if !credentials.is_empty() {
+        vlog(
+            1,
+            &format!("offering {} publickey credential(s)", credentials.len()),
         );
-    }
-    if !password_allowed_by_prefs {
-        return Err(
-            "Auth failed: publickey auth did not succeed and PreferredAuthentications excludes password"
-                .into(),
-        );
-    }
-    if max_prompts == 0 {
-        return Err(
-            "Auth failed: publickey auth did not succeed and NumberOfPasswordPrompts is 0".into(),
-        );
-    }
-
-    // Up to `max_prompts` interactive password attempts. The reader honors
-    // $SSH_ASKPASS and suppresses terminal echo on Unix (see common.rs).
-    let mut last_err = String::from("no attempt made");
-    for attempt in 1..=max_prompts {
-        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
-        match client.authenticate_password(user, &password) {
-            Ok(()) => {
-                vlog(1, &format!("authenticated as {user} via password"));
-                return Ok(());
-            }
-            Err(e) => {
-                last_err = format!("{e}");
-                if attempt < max_prompts {
-                    eprintln!("Permission denied, please try again.");
-                }
-            }
+        for c in credentials {
+            auth.add_credential(c);
         }
     }
-    Err(format!("Auth failed: {last_err}"))
+
+    // Re-promptable password: the closure owns the NumberOfPasswordPrompts cap
+    // and BatchMode. It is invoked by the driver each time `password` is
+    // attempted; `retry` is true after a wrong password where the server still
+    // offers `password`. Returning None stops further attempts.
+    if password_enabled {
+        let mut attempts: u32 = 0;
+        let closure = move |retry: bool| -> Option<SecretString> {
+            if retry {
+                eprintln!("Permission denied, please try again.");
+            }
+            if attempts >= max_prompts {
+                return None;
+            }
+            attempts += 1;
+            match read_password_from_stdin() {
+                Ok(z) => Some(SecretString::from(z.to_string())),
+                Err(e) => {
+                    eprintln!("read password: {e}");
+                    None
+                }
+            }
+        };
+        auth.add_credential(ClientCredential::PasswordPrompt(Box::new(closure)));
+    } else if batch {
+        vlog(1, "BatchMode: no interactive password prompt");
+    }
+
+    // Keyboard-interactive: offered after password (OpenSSH's default order
+    // for these two), gated on PreferredAuthentications and BatchMode.
+    if kbdint_enabled {
+        auth.add_credential(ClientCredential::KeyboardInteractive(Box::new(
+            StdinKbdResponder,
+        )));
+    }
+
+    match client.run_auth(auth) {
+        Ok(()) => {
+            vlog(1, &format!("authenticated as {user}"));
+            Ok(())
+        }
+        Err(e) => Err(format!("Auth failed: {e}")),
+    }
 }
 
 /// Build the [`Config`] for a host from its resolved ssh_config block:

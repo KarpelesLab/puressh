@@ -688,6 +688,121 @@ fn end_to_end_kbdint_loopback() {
     assert!(matches!(done, ClientStep::Success));
 }
 
+#[test]
+fn end_to_end_kbdint_two_prompts_wrong_then_right() {
+    // A 2-prompt keyboard-interactive round; the first attempt is wrong, the
+    // server fails it (still offering keyboard-interactive), and a second round
+    // with the right answers succeeds — all on one connection.
+    struct TwoPromptAuth;
+    impl Authenticator for TwoPromptAuth {
+        fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+            match attempt {
+                AuthAttempt::KeyboardInteractive { .. } => AuthDecision::InteractiveRequest {
+                    name: "MFA".into(),
+                    instruction: "enter token and PIN".into(),
+                    prompts: vec![("Token: ".into(), true), ("PIN: ".into(), false)],
+                },
+                _ => AuthDecision::Reject,
+            }
+        }
+        fn evaluate_interactive(&mut self, _user: &str, responses: Vec<String>) -> AuthDecision {
+            let ok = responses.first().map(|s| s.as_str()) == Some("token-123")
+                && responses.get(1).map(|s| s.as_str()) == Some("4242");
+            if ok {
+                AuthDecision::Accept
+            } else {
+                AuthDecision::Reject
+            }
+        }
+    }
+
+    // A responder that gives wrong answers (round 1).
+    struct WrongResponder;
+    impl KeyboardInteractiveResponder for WrongResponder {
+        fn respond(
+            &mut self,
+            _name: &str,
+            _instruction: &str,
+            prompts: &[(String, bool)],
+        ) -> Vec<String> {
+            assert_eq!(prompts.len(), 2);
+            vec!["nope".into(), "0000".into()]
+        }
+    }
+    // A responder with the right answers (round 2). The driver advances to the
+    // next credential after the first kbdint failure (server still offers it).
+    struct RightResponder;
+    impl KeyboardInteractiveResponder for RightResponder {
+        fn respond(
+            &mut self,
+            _name: &str,
+            _instruction: &str,
+            _prompts: &[(String, bool)],
+        ) -> Vec<String> {
+            vec!["token-123".into(), "4242".into()]
+        }
+    }
+    let mut c = ClientAuth::new("alice", TEST_SID.to_vec());
+    c.add_credential(ClientCredential::KeyboardInteractive(Box::new(
+        WrongResponder,
+    )));
+    c.add_credential(ClientCredential::KeyboardInteractive(Box::new(
+        RightResponder,
+    )));
+
+    let mut s = ServerAuth::new(
+        TEST_SID.to_vec(),
+        vec!["keyboard-interactive"],
+        Box::new(TwoPromptAuth),
+    );
+
+    let sreq = c.start();
+    let saccept = match s.on_packet(&sreq).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!(),
+    };
+    // Round 1: client requests kbdint, server sends INFO_REQUEST.
+    let kreq = match c.on_packet(&saccept).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("kbdint request"),
+    };
+    let info = match s.on_packet(&kreq).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("info request"),
+    };
+    let resp = match c.on_packet(&info).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("info response"),
+    };
+    // Wrong answers ⇒ server fails (still offering kbdint).
+    let failure = match s.on_packet(&resp).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("expected failure for wrong answers"),
+    };
+    UserauthFailure::decode(&failure).unwrap();
+    // Round 2: client advances to the next kbdint credential.
+    let kreq2 = match c.on_packet(&failure).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("second kbdint request"),
+    };
+    let info2 = match s.on_packet(&kreq2).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("second info request"),
+    };
+    let resp2 = match c.on_packet(&info2).unwrap() {
+        ClientStep::Send(p) => p,
+        _ => panic!("second info response"),
+    };
+    let success = match s.on_packet(&resp2).unwrap() {
+        ServerStep::Authenticated { payload, .. } => payload,
+        _ => panic!("expected Authenticated on right answers"),
+    };
+    assert!(matches!(
+        c.on_packet(&success).unwrap(),
+        ClientStep::Success
+    ));
+}
+
 /// An authenticator that requires the `publickey,password` chain: publickey
 /// then password (set-membership, order-independent), accepting only when both
 /// have succeeded.

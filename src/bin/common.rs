@@ -175,6 +175,34 @@ pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(buf))
 }
 
+/// Read one keyboard-interactive (RFC 4256) answer for `prompt`. When `echo`
+/// is `true` the input is shown (e.g. an OTP token, a username); when `false`
+/// the terminal echo bit is suppressed exactly like the password reader. Used
+/// by the `ssh` binary's keyboard-interactive responder.
+///
+/// The returned buffer is [`Zeroizing`] so even echo-on answers (which may
+/// still be secret-adjacent) are wiped on drop.
+pub fn read_kbdint_response(prompt: &str, echo: bool) -> std::io::Result<Zeroizing<String>> {
+    eprint!("{prompt}");
+    std::io::stderr().flush()?;
+
+    if !echo {
+        #[cfg(unix)]
+        {
+            if let Some(out) = read_password_no_echo_unix()? {
+                return Ok(out);
+            }
+        }
+        // Non-Unix / non-tty: warn, then read with echo.
+        eprintln!();
+        eprintln!("(warning: terminal echo could not be disabled; input will be visible)");
+    }
+
+    let mut buf = String::new();
+    read_one_line(&mut buf, 4096)?;
+    Ok(Zeroizing::new(buf))
+}
+
 /// Pull one line off stdin into `buf`, stopping at `\n` (which is
 /// consumed but not appended). `\r` is dropped. Capped at `max_len`
 /// bytes to bound memory if the source is unbounded.

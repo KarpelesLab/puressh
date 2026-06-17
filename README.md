@@ -165,6 +165,7 @@ upgrade your toolchain.
 | Host keys (ed25519/ecdsa/rsa) | ✅ incl. `server-sig-algs` upgrade |
 | OpenSSH key file parsing    | ✅ incl. encrypted keys (`bcrypt_pbkdf`) |
 | Userauth (RFC 4252)         | ✅ password / publickey / kbd-int / hostbased |
+| OpenSSH certificates        | ✅ host + user certs, `@cert-authority`, `TrustedUserCAKeys`, KRL (`RevokedKeys`) |
 | Channels / sessions         | ✅ |
 | Client API                  | ✅ |
 | Server API                  | ✅ |
@@ -174,6 +175,10 @@ upgrade your toolchain.
 | `known_hosts`               | ✅ |
 | `ssh_config` (Match/Include) | ✅ |
 | C ABI (`ffi`)               | ✅ optional |
+
+**Non-goals.** A few OpenSSH directives are intentionally unsupported and are
+rejected (strict mode) rather than silently ignored: `PermitTunnel` (tun/tap
+device forwarding) and external-command `Subsystem` entries.
 
 ## Security
 

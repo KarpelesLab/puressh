@@ -70,16 +70,41 @@ it needs.
 - ~~**`AllowUsers`/`DenyUsers` `user@host` form rejected.**~~ **Done.** `user@host` patterns
   match the user glob plus the host glob against the connection's resolved peer address.
 
-## In progress (scope expansion — being implemented)
+## Authentication (host + user certs, password / keyboard-interactive) — **Done.**
 
 - **Certificate authentication** (host + user OpenSSH certs, `CASignatureAlgorithms`,
-  `TrustedUserCAKeys`/`AuthorizedPrincipalsFile`, known_hosts `@cert-authority`). Tracked
-  as workstream FC.
+  `TrustedUserCAKeys`/`AuthorizedPrincipalsFile`, known_hosts `@cert-authority`).
 - **Password / keyboard-interactive authentication** (client + server), unblocking
   `PasswordAuthentication`, `PermitEmptyPasswords`, `KbdInteractiveAuthentication`, and
-  multi-factor `AuthenticationMethods` chains. Tracked as workstream FD.
+  multi-factor `AuthenticationMethods` chains.
+
+  Residual gaps the cert-auth work deferred are now closed (workstream FF):
+  - ~~User-cert extensions treated as advisory.~~ **Done.** User-certificate extensions
+    are default-deny: an absent `permit-pty`/`permit-port-forwarding`/
+    `permit-agent-forwarding`/`permit-X11-forwarding` refuses the corresponding capability
+    for the whole connection (folded into the per-connection `EffectivePolicy`, ANDed with
+    the `sshd_config` gates). Plain-key / password auth is unaffected.
+  - ~~Cert `force-command` overrode only the exec path.~~ **Done.** It now overrides the
+    interactive shell and the SCP exec-stream path too, converging on the same dispatcher
+    machinery as the config `ForceCommand`; the original request is exposed as
+    `$SSH_ORIGINAL_COMMAND`, and a cert force-command wins when both are present.
+  - ~~Multi-factor `AuthenticationMethods` used set-membership.~~ **Done.** The chain is
+    enforced in the LISTED order; `still_required` offers only the next method.
+  - ~~`AuthorizedPrincipalsFile` loaded without token expansion.~~ **Done.** `%u`/`%h`
+    are expanded per connection against the bound user's passwd entry.
 
 ## Permanent non-goals (strict-mode rejections, by design — not bugs)
 
 - `PermitTunnel` (tun/tap device forwarding) and external-command `Subsystem` entries are
   intentionally unsupported and hard-error.
+
+## Deferred (documented, out of scope)
+
+- **Full multi-step keyboard-interactive PAM conversation** (e.g. an OTP module that asks
+  a second prompt after the password). The PAM conversation handler answers a single
+  `PAM_PROMPT_ECHO_OFF` and otherwise fails closed; a genuine multi-prompt PAM challenge is
+  not driven over the wire. Closing it needs a stateful conversation bridging PAM prompts to
+  successive `USERAUTH_INFO_REQUEST`/`_RESPONSE` rounds.
+- **KRL (key revocation list) binary format.** `RevokedKeys` / certificate-serial
+  revocation in OpenSSH's binary KRL format is not parsed. Closing it needs a KRL reader and
+  a revocation check wired into the cert and pubkey trust gates.

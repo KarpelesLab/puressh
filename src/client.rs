@@ -3655,7 +3655,15 @@ mod tests {
             let v_s = LOCAL_VERSION.as_bytes().to_vec();
 
             let mut codec = PacketCodec::new();
-            let advert = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
+            // This minimal test server holds a single plain Ed25519 host key, so
+            // it must advertise only that algorithm — not the certificate
+            // key-types the client builder lists by default (which would let
+            // negotiation pick a cert name this server cannot satisfy).
+            let server_over = AlgoOverrides {
+                host_key_algorithms: Some(vec!["ssh-ed25519".to_string()]),
+                ..Default::default()
+            };
+            let advert = build_default_kexinit(&mut OsRng, &server_over);
             let mut runner = KexRunner::new(Role::Server, advert);
 
             let mut inbox: Vec<u8> = Vec::new();

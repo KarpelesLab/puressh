@@ -237,6 +237,156 @@ fn expired_host_cert_fails_validity() {
     assert!(matches!(cert.cert_type, CertType::User));
 }
 
+// ---------------------------------------------------------------------------
+// User certificates: client offers a CertHostKey credential; the server trusts
+// the CA via a `CertInfo`-driven authenticator (mirroring sshd's
+// LocalAuthenticator trust gate) and checks the principal binding.
+// ---------------------------------------------------------------------------
+
+/// An authenticator that accepts a user certificate iff its CA matches a
+/// trusted blob and the login user is among the cert's principals.
+struct CaUserAuth {
+    trusted_ca: Vec<u8>,
+}
+impl Authenticator for CaUserAuth {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                user,
+                probe_only,
+                verified,
+                cert: Some(ci),
+                ..
+            } => {
+                let ca_ok = ci.ca_key_blob == self.trusted_ca;
+                let principal_ok =
+                    ci.valid_principals.is_empty() || ci.valid_principals.contains(&user);
+                if probe_only {
+                    // Let the client proceed to the signed step; final trust is
+                    // re-checked on the verified attempt below.
+                    return if ca_ok && principal_ok {
+                        AuthDecision::Accept
+                    } else {
+                        AuthDecision::Reject
+                    };
+                }
+                if verified && ca_ok && principal_ok {
+                    AuthDecision::Accept
+                } else {
+                    AuthDecision::Reject
+                }
+            }
+            // Reject plain keys and everything else.
+            _ => AuthDecision::Reject,
+        }
+    }
+}
+
+/// CA-trust helper that builds a server which accepts certs from `trusted_ca`,
+/// plus a client that offers the given (cert, identity-key) pair.
+fn run_user_cert_auth(
+    login_user: &str,
+    cert_fixture: &str,
+    identity_fixture: &str,
+    trusted_ca_fixture: &str,
+) -> Result<(), puressh::Error> {
+    // Server.
+    let host_seed = puressh_fresh_seed();
+    let trusted_ca = {
+        let (algo, b64) = pub_field(trusted_ca_fixture);
+        let line = format!("{algo} {b64}");
+        // Reuse the cert line parser? No — decode the plain pubkey blob.
+        puressh::key::PublicKey::parse_authorized_keys_line(&line)
+            .unwrap()
+            .wire_blob()
+    };
+    let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+        Box::new(CaUserAuth {
+            trusted_ca: trusted_ca.clone(),
+        })
+    });
+    let host_key: Box<dyn HostKey + Send + Sync> = Box::new(Ed25519HostKey::from_seed(host_seed));
+    let cfg = ServerConfig::new(
+        vec![host_key],
+        factory,
+        vec!["publickey"],
+        Arc::new(StaticHandler(b"user-cert-ok\n".to_vec())),
+    );
+    let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+    let addr = server.local_addr().expect("addr");
+    let handle = thread::spawn(move || {
+        let _ = server.accept_one();
+    });
+
+    // Client.
+    let cert = load_cert(cert_fixture);
+    let signer = load_priv(identity_fixture).into_host_key_sync().unwrap();
+    let cert_name = puressh::cert::CERT_KEY_NAMES
+        .iter()
+        .copied()
+        .find(|n| puressh::cert::cert_name_to_plain(n) == Some(cert.embedded_algorithm()))
+        .unwrap();
+    let cert_cred = CertHostKey::new(signer, &cert, cert_name).expect("wrap user cert");
+
+    let mut client = Client::connect(addr, client_cfg(HostKeyPolicy::AcceptAny))?;
+    let res = client.authenticate(
+        login_user,
+        vec![puressh::auth::ClientCredential::PublicKey(Box::new(
+            cert_cred,
+        ))],
+    );
+    drop(client);
+    let _ = handle.join();
+    res
+}
+
+#[test]
+fn user_cert_accepted() {
+    // alice's ed25519 user cert, signed by the ed25519 CA, login as alice.
+    run_user_cert_auth("alice", "u_ed25519-cert.pub", "u_ed25519", "ca_ed25519.pub")
+        .expect("user cert auth should succeed");
+}
+
+#[test]
+fn user_cert_wrong_ca_rejected() {
+    // Server trusts the ecdsa CA, but the cert was signed by the ed25519 CA.
+    let r = run_user_cert_auth("alice", "u_ed25519-cert.pub", "u_ed25519", "ca_ecdsa.pub");
+    assert!(r.is_err(), "cert from an untrusted CA must be rejected");
+}
+
+#[test]
+fn user_cert_principal_not_allowed_rejected() {
+    // The ed25519 cert authorizes alice,bob — logging in as carol must fail.
+    let r = run_user_cert_auth("carol", "u_ed25519-cert.pub", "u_ed25519", "ca_ed25519.pub");
+    assert!(
+        r.is_err(),
+        "login user not in cert principals must be rejected"
+    );
+}
+
+#[test]
+fn user_cert_expired_rejected() {
+    // The expired user cert must be rejected at the auth layer (validity gate)
+    // before the authenticator even sees a verified attempt.
+    let r = run_user_cert_auth(
+        "alice",
+        "u_ed25519_expired-cert.pub",
+        "u_ed25519",
+        "ca_ed25519.pub",
+    );
+    assert!(r.is_err(), "expired cert must be rejected");
+}
+
+#[test]
+fn user_cert_unknown_critical_option_rejected() {
+    // Build a cert blob with an injected unknown critical option and confirm
+    // the parse-level gate the auth layer relies on rejects it.
+    let mut cert = load_cert("u_ed25519-cert.pub");
+    cert.critical_options
+        .push(("bogus-must-understand".to_string(), Vec::new()));
+    assert!(cert.require_known_critical_options().is_err());
+}
+
 fn puressh_fresh_seed() -> [u8; 32] {
     use purecrypto::rng::{OsRng, RngCore};
     let mut s = [0u8; 32];

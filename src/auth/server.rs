@@ -38,15 +38,26 @@ pub enum AuthAttempt {
     PublicKey {
         /// Requested user name.
         user: String,
-        /// SSH algorithm name (e.g. `"ssh-ed25519"`).
+        /// SSH algorithm name (e.g. `"ssh-ed25519"`). For a certificate this is
+        /// the cert key-type name (e.g. `"ssh-ed25519-cert-v01@openssh.com"`).
         algorithm: String,
-        /// Wire-format public-key blob.
+        /// Wire-format public-key blob. For a certificate this is the full
+        /// certificate blob; the authenticator should consult `cert` instead of
+        /// treating the blob as a plain key.
         public_blob: Vec<u8>,
         /// True if the client only probed (no signature); false if a signature
         /// was attached and verified successfully.
         probe_only: bool,
         /// True iff the signature was both present and verified by this layer.
+        /// For a certificate, this additionally means the CA signature verified
+        /// and the certificate's type/validity were accepted (the *trust* in
+        /// the CA itself is still the authenticator's call).
         verified: bool,
+        /// `Some` iff `algorithm` is an OpenSSH certificate key-type. Carries
+        /// the parsed certificate facts the trust decision needs (CA key,
+        /// principals, critical options, …). `None` for a plain public key, so
+        /// existing plain-key authenticators are unaffected.
+        cert: Option<CertInfo>,
     },
     /// `keyboard-interactive` request.
     KeyboardInteractive {
@@ -70,6 +81,7 @@ impl core::fmt::Debug for AuthAttempt {
                 public_blob,
                 probe_only,
                 verified,
+                cert,
             } => f
                 .debug_struct("PublicKey")
                 .field("user", user)
@@ -77,12 +89,77 @@ impl core::fmt::Debug for AuthAttempt {
                 .field("public_blob", public_blob)
                 .field("probe_only", probe_only)
                 .field("verified", verified)
+                .field("cert", cert)
                 .finish(),
             AuthAttempt::KeyboardInteractive { user } => f
                 .debug_struct("KeyboardInteractive")
                 .field("user", user)
                 .finish(),
         }
+    }
+}
+
+/// The parsed certificate facts handed to an authenticator alongside a
+/// certificate-based [`AuthAttempt::PublicKey`].
+///
+/// The auth layer has already verified the CA signature (under the configured
+/// `CASignatureAlgorithms`) and the cert's type/validity by the time this is
+/// produced for a *verified* attempt; the authenticator's remaining job is the
+/// **trust** decision (is `ca_key_blob` a CA we accept?) and the **principal**
+/// decision (is the login user authorized by `valid_principals` / an
+/// `AuthorizedPrincipalsFile`?), plus honoring critical options.
+#[derive(Debug, Clone)]
+#[cfg(feature = "alloc")]
+pub struct CertInfo {
+    /// The CA's public-key blob (`signature_key_blob`) — the key the
+    /// authenticator must check against its trusted-CA set.
+    pub ca_key_blob: Vec<u8>,
+    /// The CA's signature algorithm (e.g. `"ssh-ed25519"`, `"rsa-sha2-512"`).
+    pub ca_algorithm: String,
+    /// The certificate's key-id (free-form CA-stamped identity, for logging).
+    pub key_id: String,
+    /// Monotonic serial number assigned by the CA.
+    pub serial: u64,
+    /// The principals the certificate authorizes (empty ⇒ any).
+    pub valid_principals: Vec<String>,
+    /// Critical options as ordered `(name, data)` pairs — MUST be understood.
+    pub critical_options: Vec<(String, Vec<u8>)>,
+    /// Extensions as ordered `(name, data)` pairs — advisory.
+    pub extensions: Vec<(String, Vec<u8>)>,
+    /// Start of the validity window (Unix seconds).
+    pub valid_after: u64,
+    /// End of the validity window (Unix seconds, exclusive).
+    pub valid_before: u64,
+}
+
+#[cfg(feature = "alloc")]
+impl CertInfo {
+    /// Build a `CertInfo` view from a parsed [`crate::cert::Certificate`].
+    pub fn from_certificate(cert: &crate::cert::Certificate) -> Result<Self> {
+        Ok(CertInfo {
+            ca_key_blob: cert.signature_key_blob.clone(),
+            ca_algorithm: cert.ca_algorithm()?.into(),
+            key_id: cert.key_id.clone(),
+            serial: cert.serial,
+            valid_principals: cert.valid_principals.clone(),
+            critical_options: cert.critical_options.clone(),
+            extensions: cert.extensions.clone(),
+            valid_after: cert.valid_after,
+            valid_before: cert.valid_before,
+        })
+    }
+
+    /// True if the named extension is present.
+    pub fn has_extension(&self, name: &str) -> bool {
+        self.extensions.iter().any(|(n, _)| n == name)
+    }
+
+    /// The data of a critical option by name, if present.
+    pub fn critical_option(&self, name: &str) -> Option<&[u8]> {
+        self.critical_options
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, d)| d.as_slice())
     }
 }
 
@@ -181,6 +258,14 @@ pub struct ServerAuth {
     /// Count of failed attempts so far (each USERAUTH_FAILURE without partial
     /// success). Compared against `max_auth_tries`.
     failed_attempts: u32,
+    /// Current wall-clock time (Unix seconds), injected by the server at the
+    /// std edge for certificate validity checks. `0` (the default) makes every
+    /// not-yet-valid certificate fail closed, which is the safe default if a
+    /// caller forgets to thread real time in.
+    now: u64,
+    /// Resolved `CASignatureAlgorithms` — the signature algorithms a CA may use
+    /// when signing a user certificate. Empty ⇒ the built-in default set.
+    ca_signature_algorithms: Vec<String>,
 }
 
 impl ServerAuth {
@@ -204,7 +289,26 @@ impl ServerAuth {
             allow_none: false,
             max_auth_tries: None,
             failed_attempts: 0,
+            now: 0,
+            ca_signature_algorithms: Vec::new(),
         }
+    }
+
+    /// Inject the current wall-clock time (Unix seconds) used for certificate
+    /// validity checks. Servers should set this from `SystemTime` at accept
+    /// time; left unset it defaults to `0`, which fails every certificate's
+    /// not-yet-valid check (fail-closed).
+    pub fn set_now(&mut self, now: u64) -> &mut Self {
+        self.now = now;
+        self
+    }
+
+    /// Set the resolved `CASignatureAlgorithms` allow-list used when verifying
+    /// a user certificate's CA signature. Empty (the default) ⇒ the built-in
+    /// default set ([`crate::config::algos::CA_SIGNATURE_DEFAULTS`]).
+    pub fn set_ca_signature_algorithms(&mut self, algos: Vec<String>) -> &mut Self {
+        self.ca_signature_algorithms = algos;
+        self
     }
 
     /// Set the `MaxAuthTries` limit. After this many failed attempts the
@@ -390,13 +494,28 @@ impl ServerAuth {
         public_blob: Vec<u8>,
         signature: Option<Vec<u8>>,
     ) -> Result<ServerStep> {
+        let is_cert = crate::cert::is_cert_name(&algorithm);
+
         if !signature_present {
+            // Probe (no signature). For a certificate, parse it so the
+            // authenticator can decide whether to invite a signature, but do
+            // not yet require CA validity — the binding signature comes next.
+            let cert_info = if is_cert {
+                match crate::cert::Certificate::parse(&public_blob) {
+                    Ok(c) => Some(CertInfo::from_certificate(&c)?),
+                    // A malformed cert blob is not a probe we can honour.
+                    Err(_) => return self.emit_failure(),
+                }
+            } else {
+                None
+            };
             let decision = self.auth.evaluate(AuthAttempt::PublicKey {
                 user: user.clone(),
                 algorithm: algorithm.clone(),
                 public_blob: public_blob.clone(),
                 probe_only: true,
                 verified: false,
+                cert: cert_info,
             });
             return match decision {
                 AuthDecision::Accept | AuthDecision::PartialAccept { .. } => {
@@ -418,7 +537,43 @@ impl ServerAuth {
             None => return Err(Error::Format("auth: missing signature")),
         };
 
-        let verifier: Box<dyn HostKeyVerify> = host_key_verify_by_name(&algorithm, &public_blob)?;
+        // For a certificate, verify the CA signature, type, validity and
+        // critical-options BEFORE the userauth signature check, then build the
+        // userauth-signature verifier from the cert's EMBEDDED key. The signed
+        // data hashes the cert key-type name + the full cert blob, which is
+        // already what `algorithm` / `public_blob` carry — so the standard
+        // `publickey_signed_data` is correct as-is.
+        let (verifier, cert_info): (Box<dyn HostKeyVerify>, Option<CertInfo>) = if is_cert {
+            let cert = match crate::cert::Certificate::parse(&public_blob) {
+                Ok(c) => c,
+                Err(_) => return self.emit_failure(),
+            };
+            if cert.check_type(crate::cert::CertType::User).is_err()
+                || cert.check_validity(self.now).is_err()
+                || cert.require_known_critical_options().is_err()
+            {
+                return self.emit_failure();
+            }
+            let ca_algos: Vec<&str> = if self.ca_signature_algorithms.is_empty() {
+                crate::config::algos::CA_SIGNATURE_DEFAULTS.to_vec()
+            } else {
+                self.ca_signature_algorithms
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect()
+            };
+            if cert.verify_ca_signature(&ca_algos).is_err() {
+                return self.emit_failure();
+            }
+            let v = match cert.embedded_verifier(&sig) {
+                Ok(v) => v,
+                Err(_) => return self.emit_failure(),
+            };
+            (v, Some(CertInfo::from_certificate(&cert)?))
+        } else {
+            (host_key_verify_by_name(&algorithm, &public_blob)?, None)
+        };
+
         let signed = super::message::publickey_signed_data(
             &self.session_id,
             &user,
@@ -436,6 +591,7 @@ impl ServerAuth {
             public_blob,
             probe_only: false,
             verified: true,
+            cert: cert_info,
         });
         self.apply_decision(decision, &user)
     }

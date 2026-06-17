@@ -36,6 +36,89 @@ pub(crate) fn base64_decode(input: &[u8]) -> Result<Vec<u8>> {
     base64::decode(input)
 }
 
+/// The certificate-relevant options recognised on an `authorized_keys` line by
+/// [`PublicKey::parse_authorized_keys_line_with_options`].
+///
+/// Only the options needed for certificate authentication are understood;
+/// anything else is a hard error (the strict "refuse unknown option" stance).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct AuthorizedKeyOptions {
+    /// The `cert-authority` flag: this key is a CA whose certificates are
+    /// trusted (rather than a directly-authorized user key).
+    pub cert_authority: bool,
+    /// `principals="a,b,c"` — the principals this line authorizes. Empty when
+    /// the option was absent.
+    pub principals: Vec<String>,
+}
+
+impl AuthorizedKeyOptions {
+    /// Parse a comma-separated option list (the leading field of an
+    /// `authorized_keys` line). Recognises `cert-authority` and
+    /// `principals="..."`; every other option is rejected with
+    /// [`Error::Format`] rather than silently dropped.
+    ///
+    /// The grammar is intentionally minimal: options are split on commas that
+    /// are not inside a double-quoted value. This covers the
+    /// `cert-authority,principals="alice,bob"` forms used for cert auth.
+    pub fn parse(list: &str) -> Result<Self> {
+        let mut out = AuthorizedKeyOptions::default();
+        for opt in split_options(list)? {
+            let opt = opt.trim();
+            if opt.is_empty() {
+                continue;
+            }
+            if opt.eq_ignore_ascii_case("cert-authority") {
+                out.cert_authority = true;
+            } else if let Some(rest) = opt.strip_prefix("principals=") {
+                let val = rest.trim();
+                let val = val
+                    .strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .ok_or(Error::Format(
+                        "authorized_keys: principals= value must be quoted",
+                    ))?;
+                out.principals = val
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            } else {
+                return Err(Error::Format(
+                    "authorized_keys: unknown option — refusing rather than silently dropping",
+                ));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Split an `authorized_keys` option list on commas that are not inside a
+/// double-quoted value. Rejects an unterminated quote.
+fn split_options(list: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_quotes = false;
+    for ch in list.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                cur.push(ch);
+            }
+            ',' if !in_quotes => {
+                out.push(core::mem::take(&mut cur));
+            }
+            _ => cur.push(ch),
+        }
+    }
+    if in_quotes {
+        return Err(Error::Format(
+            "authorized_keys: unterminated quote in options",
+        ));
+    }
+    out.push(cur);
+    Ok(out)
+}
+
 /// SSH public key, tagged by algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PublicKey {
@@ -269,6 +352,64 @@ impl PublicKey {
         Ok(pk)
     }
 
+    /// Parse a single `authorized_keys` line that may carry a leading option
+    /// list, returning the decoded key blob alongside the recognised options.
+    ///
+    /// Unlike [`Self::parse_authorized_keys_line`] (which refuses any options
+    /// prefix outright), this understands the certificate-relevant options
+    /// `cert-authority` (a flag marking the key as a CA) and `principals="..."`
+    /// (a comma-separated allow-list). It KEEPS the strict stance for anything
+    /// else: an unrecognised option is an error, never silently dropped.
+    ///
+    /// Returns `(blob, options)` where `blob` is the raw key/cert wire blob (the
+    /// base64-decoded second field) and `options` records the parsed flags.
+    pub fn parse_authorized_keys_line_with_options(
+        s: &str,
+    ) -> Result<(Vec<u8>, AuthorizedKeyOptions)> {
+        let line = s.trim_end_matches(['\n', '\r']).trim();
+        if line.is_empty() || line.starts_with('#') {
+            return Err(Error::Format("authorized_keys: empty or comment line"));
+        }
+
+        // The line is `[options] <algo> <base64> [comment]`. The first token is
+        // an algorithm name iff it is a known key/cert type; otherwise it is an
+        // option list (which may itself contain spaces inside quotes — but
+        // OpenSSH option lists never contain unquoted spaces, and the value
+        // quoting we support has no spaces, so a whitespace split is adequate
+        // for the options we accept).
+        let first_ws = line.find(char::is_whitespace);
+        let (first_tok, rest) = match first_ws {
+            Some(i) => (&line[..i], line[i..].trim_start()),
+            None => return Err(Error::Format("authorized_keys: missing key blob")),
+        };
+
+        let mut options = AuthorizedKeyOptions::default();
+        let (algo_tok, after_algo) =
+            if is_known_algorithm_name(first_tok) || crate::cert::is_cert_name(first_tok) {
+                // No options prefix.
+                (first_tok, rest)
+            } else {
+                // `first_tok` is an option list. Parse it strictly.
+                options = AuthorizedKeyOptions::parse(first_tok)?;
+                let i = rest.find(char::is_whitespace).ok_or(Error::Format(
+                    "authorized_keys: missing key blob after options",
+                ))?;
+                (&rest[..i], rest[i..].trim_start())
+            };
+
+        if !(is_known_algorithm_name(algo_tok) || crate::cert::is_cert_name(algo_tok)) {
+            return Err(Error::Format(
+                "authorized_keys: unknown key/cert algorithm tag",
+            ));
+        }
+        let b64 = after_algo
+            .split_whitespace()
+            .next()
+            .ok_or(Error::Format("authorized_keys: missing key blob"))?;
+        let blob = base64::decode(b64.as_bytes())?;
+        Ok((blob, options))
+    }
+
     /// Serialise as a single-line `authorized_keys` entry (no trailing
     /// newline). Comment is omitted if empty.
     pub fn to_authorized_keys_line(&self) -> String {
@@ -396,6 +537,39 @@ impl PrivateKey {
     ///
     /// For RSA keys, defaults to `rsa-sha2-512` (modern OpenSSH preference).
     pub fn into_host_key(self) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send>> {
+        use purecrypto::bignum::BoxedUint;
+        match self {
+            PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::Ed25519HostKey::from_seed(seed),
+            )),
+            PrivateKey::EcdsaP256 { d, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::EcdsaP256HostKey::from_scalar(&d)?,
+            )),
+            PrivateKey::EcdsaP384 { d, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::EcdsaP384HostKey::from_scalar(&d)?,
+            )),
+            PrivateKey::EcdsaP521 { d, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::EcdsaP521HostKey::from_scalar(&d)?,
+            )),
+            PrivateKey::Rsa { n, e, d, .. } => {
+                let n_u = BoxedUint::from_be_bytes(trim_leading_zeros(&n));
+                let e_u = BoxedUint::from_be_bytes(trim_leading_zeros(&e));
+                let d_u = BoxedUint::from_be_bytes(trim_leading_zeros(&d));
+                Ok(alloc::boxed::Box::new(
+                    crate::hostkey::RsaSha2_512HostKey::from_components(n_u, e_u, d_u)?,
+                ))
+            }
+        }
+    }
+
+    /// Like [`Self::into_host_key`], but returns a `Send + Sync` signer. The
+    /// concrete signer types ([`crate::hostkey::Ed25519HostKey`], the ECDSA and
+    /// RSA host keys) hold only `Sync`-safe state, so this is always available;
+    /// it exists for callers (the server's `Config.host_keys`, a `CertHostKey`
+    /// inner) that require `Sync`.
+    pub fn into_host_key_sync(
+        self,
+    ) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send + Sync>> {
         use purecrypto::bignum::BoxedUint;
         match self {
             PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(

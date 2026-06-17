@@ -179,6 +179,10 @@ pub struct ClientOptions {
     pub user: Option<String>,
     /// `IdentityFile` (cumulative across matching blocks).
     pub identity_files: Vec<String>,
+    /// `CertificateFile` (cumulative across matching blocks) — paths to user
+    /// certificates (`*-cert.pub`) to offer, each paired at load time with the
+    /// `IdentityFile` private key whose embedded key it certifies.
+    pub certificate_files: Vec<String>,
     /// `IdentitiesOnly` (yes/no).
     pub identities_only: Option<bool>,
     /// `StrictHostKeyChecking`.
@@ -507,6 +511,9 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "identityfile" => {
             opts.identity_files.push(one_arg(line)?);
+        }
+        "certificatefile" => {
+            opts.certificate_files.push(one_arg(line)?);
         }
         "identitiesonly" => {
             opts.identities_only = Some(parse_yes_no(line)?);
@@ -879,6 +886,8 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(control_persist);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
+    dst.certificate_files
+        .extend(src.certificate_files.iter().cloned());
     dst.local_forwards
         .extend(src.local_forwards.iter().cloned());
     dst.remote_forwards

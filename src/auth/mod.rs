@@ -27,7 +27,7 @@ mod server;
 pub use client::{ClientAuth, ClientCredential, ClientStep, KeyboardInteractiveResponder};
 
 #[cfg(feature = "alloc")]
-pub use server::{AuthAttempt, AuthDecision, Authenticator, ServerAuth, ServerStep};
+pub use server::{AuthAttempt, AuthDecision, Authenticator, CertInfo, ServerAuth, ServerStep};
 
 #[cfg(all(test, feature = "alloc"))]
 mod tests;

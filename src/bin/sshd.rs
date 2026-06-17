@@ -739,25 +739,163 @@ mod imp {
         }
     }
 
-    fn load_authorized_keys(path: &str, strict_modes: bool) -> Result<Vec<PublicKey>, String> {
+    /// `(authorized_blobs, ca_blobs)` returned by [`load_authorized_keys_and_cas`].
+    type AuthorizedAndCaBlobs = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+
+    /// Parse an `authorized_keys` file, returning `(authorized_blobs, ca_blobs)`:
+    /// the wire blobs of directly-authorized keys, and the CA key blobs from any
+    /// `cert-authority` lines (trusted to sign user certificates). Lines that
+    /// fail the strict option-aware parser are logged and skipped.
+    fn load_authorized_keys_and_cas(
+        path: &str,
+        strict_modes: bool,
+    ) -> Result<AuthorizedAndCaBlobs, String> {
         if strict_modes {
             check_mode_strict(path, 0o022, "authorized_keys file")?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        let mut keys: Vec<PublicKey> = Vec::new();
+        let mut authorized: Vec<Vec<u8>> = Vec::new();
+        let mut cas: Vec<Vec<u8>> = Vec::new();
+        for (idx, line) in body.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            match PublicKey::parse_authorized_keys_line_with_options(trimmed) {
+                Ok((blob, opts)) => {
+                    if opts.cert_authority {
+                        cas.push(blob);
+                    } else {
+                        authorized.push(blob);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sshd: skipping authorized_keys line {}: {e}", idx + 1);
+                }
+            }
+        }
+        Ok((authorized, cas))
+    }
+
+    /// Load a file of CA public keys (one `authorized_keys`-style key per line),
+    /// returning their wire blobs. Used for `TrustedUserCAKeys`.
+    fn load_ca_keys_file(path: &str, strict_modes: bool) -> Result<Vec<Vec<u8>>, String> {
+        if strict_modes {
+            check_mode_strict(path, 0o022, "TrustedUserCAKeys file")?;
+        }
+        let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+        let mut out = Vec::new();
         for (idx, line) in body.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
             match PublicKey::parse_authorized_keys_line(trimmed) {
-                Ok(k) => keys.push(k),
-                Err(e) => {
-                    eprintln!("sshd: skipping authorized_keys line {}: {e}", idx + 1);
-                }
+                Ok(k) => out.push(k.wire_blob()),
+                Err(e) => eprintln!("sshd: skipping TrustedUserCAKeys line {}: {e}", idx + 1),
             }
         }
-        Ok(keys)
+        Ok(out)
+    }
+
+    /// Load an `AuthorizedPrincipalsFile`: one principal name per line
+    /// (comments / blanks skipped). No `%u`/`%h` token expansion in this build.
+    fn load_principals_file(path: &str, strict_modes: bool) -> Result<Vec<String>, String> {
+        if strict_modes {
+            check_mode_strict(path, 0o022, "AuthorizedPrincipalsFile")?;
+        }
+        let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+        Ok(body
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            // Each line may carry trailing option tokens in OpenSSH; we take the
+            // first whitespace-delimited token as the principal name.
+            .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
+            .collect())
+    }
+
+    /// Decode an SSH `string` (4-byte BE length + bytes) into UTF-8. Used for
+    /// the inner payload of certificate critical options (`force-command`,
+    /// `source-address`), which are themselves length-prefixed strings.
+    fn decode_ssh_string(data: &[u8]) -> Option<String> {
+        if data.len() < 4 {
+            return None;
+        }
+        let len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if data.len() != 4 + len {
+            return None;
+        }
+        std::str::from_utf8(&data[4..]).ok().map(|s| s.to_string())
+    }
+
+    /// Parse a peer descriptor (`"ip:port"`, `"[v6]:port"`, or a bare IP) into
+    /// an `IpAddr`. Returns `None` if no IP can be recovered.
+    fn parse_peer_ip(peer: &str) -> Option<std::net::IpAddr> {
+        // Try the full socket-addr form first, then a bracketed v6, then bare.
+        if let Ok(sa) = peer.parse::<std::net::SocketAddr>() {
+            return Some(sa.ip());
+        }
+        if let Some(inner) = peer.strip_prefix('[').and_then(|s| s.split(']').next())
+            && let Ok(ip) = inner.parse()
+        {
+            return Some(ip);
+        }
+        if let Some((host, _port)) = peer.rsplit_once(':')
+            && let Ok(ip) = host.parse()
+        {
+            return Some(ip);
+        }
+        peer.parse().ok()
+    }
+
+    /// Does `ip` fall within `cidr` (e.g. `"10.0.0.0/8"`, `"192.168.1.5"`,
+    /// `"2001:db8::/32"`)? A bare address with no `/` is treated as a `/32`
+    /// (v4) or `/128` (v6) exact match. Address-family mismatches never match.
+    fn cidr_matches(cidr: &str, ip: std::net::IpAddr) -> bool {
+        use std::net::IpAddr;
+        let (net_str, prefix_str) = match cidr.split_once('/') {
+            Some((n, p)) => (n, Some(p)),
+            None => (cidr, None),
+        };
+        let Ok(net) = net_str.parse::<IpAddr>() else {
+            return false;
+        };
+        match (net, ip) {
+            (IpAddr::V4(net), IpAddr::V4(ip)) => {
+                let bits: u32 = match prefix_str {
+                    Some(p) => match p.parse() {
+                        Ok(b) if b <= 32 => b,
+                        _ => return false,
+                    },
+                    None => 32,
+                };
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - bits)
+                };
+                (u32::from(net) & mask) == (u32::from(ip) & mask)
+            }
+            (IpAddr::V6(net), IpAddr::V6(ip)) => {
+                let bits: u32 = match prefix_str {
+                    Some(p) => match p.parse() {
+                        Ok(b) if b <= 128 => b,
+                        _ => return false,
+                    },
+                    None => 128,
+                };
+                let net = u128::from(net);
+                let ip = u128::from(ip);
+                let mask = if bits == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - bits)
+                };
+                (net & mask) == (ip & mask)
+            }
+            _ => false,
+        }
     }
 
     /// A user→group-names resolver. Boxed so tests can inject a mock; the
@@ -865,6 +1003,16 @@ mod imp {
         /// `DenyGroups` patterns (glob).
         deny_groups: Vec<puressh::config::HostPattern>,
         authorized_blobs: Vec<Vec<u8>>,
+        /// CA public-key blobs trusted to sign user certificates, from
+        /// `TrustedUserCAKeys` and any `cert-authority` lines in
+        /// `authorized_keys`. A user cert whose `ca_key_blob` is in this set is
+        /// CA-trusted (principal authorization is checked separately).
+        trusted_user_ca_blobs: Vec<Vec<u8>>,
+        /// Explicit principals a connecting user may authenticate as, from an
+        /// `AuthorizedPrincipalsFile` (already `%u`-expanded for the bound
+        /// user). `None` ⇒ no file configured: the login user must itself be in
+        /// the certificate's principals list (OpenSSH default).
+        authorized_principals: Option<Vec<String>>,
         permit_root_login: puressh::config::PermitRootLogin,
         /// Shared PAM gate (per-connection, COW-isolated by `fork`). Used to
         /// verify passwords via `pam_check_password`. On a non-PAM build the
@@ -971,6 +1119,76 @@ mod imp {
                     r
                 }
             }
+        }
+
+        /// Trust decision for a verified user certificate: the CA must be in
+        /// our trusted set, the login `user` must be an authorized principal,
+        /// and any `source-address` critical option must admit the peer.
+        ///
+        /// The CA signature, cert type, validity and critical-option
+        /// understanding were already enforced by the auth layer before this is
+        /// reached; this is purely the trust + authorization gate.
+        fn cert_trusted(&self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
+            // 1. Is the signing CA trusted?
+            if !self.trusted_user_ca_blobs.contains(&ci.ca_key_blob) {
+                if self.debug {
+                    eprintln!(
+                        "sshd: cert auth: signing CA is not trusted (key-id {:?})",
+                        ci.key_id
+                    );
+                }
+                return false;
+            }
+
+            // 2. Is the login user an authorized principal?
+            //    - With an AuthorizedPrincipalsFile, the login user must map to
+            //      a principal that the cert also lists.
+            //    - Without one, the login user must itself be in the cert's
+            //      principals (an empty cert principal list authorizes any).
+            let principal_ok = match &self.authorized_principals {
+                Some(allowed) => {
+                    // The user is authorized iff some name they're allowed to
+                    // use (from the file) is also present in the cert.
+                    !ci.valid_principals.is_empty()
+                        && allowed
+                            .iter()
+                            .any(|p| ci.valid_principals.iter().any(|vp| vp == p))
+                        // and the login user must be one of the file's mapped
+                        // principals too (the file maps login → allowed principals).
+                        && allowed.iter().any(|p| p == user)
+                }
+                None => {
+                    ci.valid_principals.is_empty() || ci.valid_principals.iter().any(|p| p == user)
+                }
+            };
+            if !principal_ok {
+                if self.debug {
+                    eprintln!("sshd: cert auth: user {user} not an authorized principal");
+                }
+                return false;
+            }
+
+            // 3. source-address critical option (if present) must admit the peer.
+            if let Some(data) = ci.critical_option("source-address") {
+                let allowed_cidrs = decode_ssh_string(data);
+                let peer_ip = self.peer.as_deref().and_then(parse_peer_ip);
+                let ok = match (allowed_cidrs, peer_ip) {
+                    (Some(list), Some(ip)) => list
+                        .split(',')
+                        .filter(|s| !s.is_empty())
+                        .any(|cidr| cidr_matches(cidr.trim(), ip)),
+                    // Option present but we can't determine the peer, or the
+                    // option payload is malformed → fail closed.
+                    _ => false,
+                };
+                if !ok {
+                    if self.debug {
+                        eprintln!("sshd: cert auth: peer not in source-address for {user}");
+                    }
+                    return false;
+                }
+            }
+            true
         }
 
         /// Bind / verify the connection username. Returns `false` if the client
@@ -1142,6 +1360,7 @@ mod imp {
                     public_blob,
                     probe_only,
                     verified,
+                    cert,
                     ..
                 } => {
                     // Always run *both* checks unconditionally so an
@@ -1153,7 +1372,16 @@ mod imp {
                     // attempt so the paths stay uniform.
                     let user_bound = self.check_user_binding(&user);
                     let user_ok = self.access_allowed(&user);
-                    let blob_ok = self.authorized_blobs.contains(&public_blob);
+                    // For a certificate, "blob_ok" becomes: the CA is trusted,
+                    // the login user is an authorized principal, and any
+                    // source-address critical option admits this peer. (The
+                    // auth layer already verified the CA signature, the cert
+                    // type/validity, and that all critical options are
+                    // understood, before producing a `verified` cert attempt.)
+                    let blob_ok = match &cert {
+                        Some(ci) => self.cert_trusted(ci, &user),
+                        None => self.authorized_blobs.contains(&public_blob),
+                    };
                     // PermitRootLogin gate: if the requested user resolves to
                     // the root account (uid 0) and policy forbids it, deny
                     // regardless of key match. The username is resolved at
@@ -1337,6 +1565,12 @@ mod imp {
         allow_groups: Arc<Vec<puressh::config::HostPattern>>,
         deny_groups: Arc<Vec<puressh::config::HostPattern>>,
         authorized_blobs: Arc<Vec<Vec<u8>>>,
+        /// Trusted user-CA blobs (TrustedUserCAKeys ++ authorized_keys
+        /// cert-authority lines), shared across connections.
+        trusted_user_ca_blobs: Arc<Vec<Vec<u8>>>,
+        /// Pre-loaded AuthorizedPrincipalsFile entries (no `%u` expansion in
+        /// this build), shared across connections. `None` ⇒ no file configured.
+        authorized_principals: Option<Arc<Vec<String>>>,
         permit_root_login: puressh::config::PermitRootLogin,
         group_lookup: GroupLookup,
         /// Shared PAM gate for password verification (see `LocalAuthenticator`).
@@ -1355,6 +1589,8 @@ mod imp {
                 allow_groups: (*self.allow_groups).clone(),
                 deny_groups: (*self.deny_groups).clone(),
                 authorized_blobs: (*self.authorized_blobs).clone(),
+                trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
+                authorized_principals: self.authorized_principals.as_ref().map(|a| (**a).clone()),
                 permit_root_login: self.permit_root_login,
                 pam: self.pam.clone(),
                 password_enabled: self.password_enabled,
@@ -3177,13 +3413,31 @@ mod imp {
         host_certificate_files.extend(sshd_cfg.global.host_certificate_files.iter().cloned());
         let host_keys =
             load_host_keys_with_certs(&host_key_files, &host_certificate_files, strict_modes)?;
-        let authorized_blobs: Vec<Vec<u8>> = match &authorized_keys_file {
-            Some(path) => load_authorized_keys(path, strict_modes)?
-                .into_iter()
-                .map(|k| k.wire_blob())
-                .collect(),
-            None => Vec::new(),
-        };
+        // authorized_keys: plain authorized key blobs, plus any CA blobs from
+        // `cert-authority` lines (their keys are trusted to sign user certs).
+        let (authorized_blobs, ak_ca_blobs): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
+            match &authorized_keys_file {
+                Some(path) => load_authorized_keys_and_cas(path, strict_modes)?,
+                None => (Vec::new(), Vec::new()),
+            };
+
+        // Trusted user-CA set = TrustedUserCAKeys file ++ authorized_keys
+        // cert-authority lines.
+        let mut trusted_user_ca_blobs = ak_ca_blobs;
+        if let Some(path) = &sshd_cfg.global.trusted_user_ca_keys {
+            match load_ca_keys_file(path, strict_modes) {
+                Ok(mut cas) => trusted_user_ca_blobs.append(&mut cas),
+                Err(e) => return Err(format!("TrustedUserCAKeys: {e}")),
+            }
+        }
+
+        // AuthorizedPrincipalsFile (no `%u` token expansion in this build): a
+        // flat list of principal names a connecting user may authenticate as.
+        let authorized_principals: Option<Vec<String>> =
+            match &sshd_cfg.global.authorized_principals_file {
+                Some(path) => Some(load_principals_file(path, strict_modes)?),
+                None => None,
+            };
 
         // AllowUsers is matched as OpenSSH `Host`-style globs (a literal name
         // is just a glob with no metacharacters). Empty ⇒ the historical
@@ -3273,6 +3527,8 @@ mod imp {
             allow_groups: Arc::new(allow_groups),
             deny_groups: Arc::new(deny_groups),
             authorized_blobs: Arc::new(authorized_blobs),
+            trusted_user_ca_blobs: Arc::new(trusted_user_ca_blobs),
+            authorized_principals: authorized_principals.map(Arc::new),
             permit_root_login,
             group_lookup: group_lookup.clone(),
             pam: pam_gate.clone(),
@@ -3303,6 +3559,11 @@ mod imp {
             debug: cli.debug,
             print_motd: print_motd_flag.clone(),
         }));
+
+        // Resolved CASignatureAlgorithms for user-certificate verification.
+        if let Some(ca) = sshd_cfg.global.ca_signature_algorithms.clone() {
+            config.ca_signature_algorithms = ca;
+        }
 
         if sftp_enabled {
             let sftp = SftpSubsystemHandler {
@@ -3670,6 +3931,8 @@ mod imp {
                 allow_groups: to_pats(allow_groups),
                 deny_groups: to_pats(deny_groups),
                 authorized_blobs: Vec::new(),
+                trusted_user_ca_blobs: Vec::new(),
+                authorized_principals: None,
                 permit_root_login: puressh::config::PermitRootLogin::ProhibitPassword,
                 pam: pam_gate::PamGate::new(false),
                 password_enabled: false,

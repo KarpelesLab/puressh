@@ -877,6 +877,11 @@ pub struct Config {
     /// via [`crate::auth::Authenticator::on_user_resolved`]. Set with
     /// [`Config::with_auth_methods`].
     pub default_auth_methods: Vec<String>,
+    /// `CASignatureAlgorithms` — the signature algorithms a CA may use when
+    /// signing a user certificate. Empty ⇒ the built-in default set
+    /// ([`crate::config::algos::CA_SIGNATURE_DEFAULTS`]). Threaded into the
+    /// per-connection [`ServerAuth`] for certificate verification.
+    pub ca_signature_algorithms: Vec<String>,
 }
 
 /// Resolver from a user name to its supplementary group names. Boxed so the
@@ -1105,6 +1110,7 @@ impl Config {
             group_resolver: None,
             compression: None,
             default_auth_methods: Vec::new(),
+            ca_signature_algorithms: Vec::new(),
         }
     }
 
@@ -1734,6 +1740,10 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     let auth_impl = cfg.authenticator.build_with_peer(peer_ip);
     let mut server_auth = ServerAuth::new(session_id, methods, auth_impl);
     server_auth.set_max_auth_tries(preauth.max_auth_tries);
+    // Certificate verification context: current time + the resolved
+    // CASignatureAlgorithms. `now` is read from the wall clock at the std edge.
+    server_auth.set_now(unix_now());
+    server_auth.set_ca_signature_algorithms(cfg.ca_signature_algorithms.clone());
 
     // Address-matched banner (USERAUTH_BANNER), sent before the first
     // USERAUTH_REQUEST per RFC 4252 §5.4. A `Match User` banner is deferred
@@ -3723,10 +3733,29 @@ fn server_ext_info() -> ExtInfo {
     // Order is the same priority as our host-key KEX list — strongest first.
     // Legacy `ssh-rsa` (SHA-1) is intentionally omitted; it stays opt-in via
     // hostkey::set_allow_rsa_sha1.
+    // The certificate key-type names are advertised too, so a client holding a
+    // user certificate offers it (its `HostKey::algorithm()` is the cert name,
+    // which the client filters against this list). Accepting the resulting
+    // signature still requires CA trust + principal authorization at the
+    // authenticator — advertising the name does not weaken anything.
     ExtInfo::new().with_server_sig_algs(
-        "ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
+        "ssh-ed25519-cert-v01@openssh.com,\
+         ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,\
+         ecdsa-sha2-nistp521-cert-v01@openssh.com,\
+         rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,\
+         ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
          rsa-sha2-512,rsa-sha2-256",
     )
+}
+
+/// Current wall-clock time as Unix seconds, for certificate validity checks.
+/// Injected at the std edge; falls back to 0 (fail-closed for not-yet-valid).
+fn unix_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Helper: owned list from an override, or the given default slice.

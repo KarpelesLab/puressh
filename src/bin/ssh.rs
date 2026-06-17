@@ -635,6 +635,69 @@ fn collect_credentials(
             Err(e) => eprintln!("warning: agent: {e}"),
         }
     }
+    // User certificates (`CertificateFile`). Each cert is paired with the
+    // IdentityFile / -i private key whose embedded key it certifies, then
+    // offered as a `CertHostKey` credential *ahead of* the plain keys so the
+    // server sees the certificate first. The signed userauth blob hashes the
+    // cert key-type name + cert blob, which `CertHostKey` produces correctly.
+    {
+        use puressh::cert::Certificate;
+        use puressh::hostkey::CertHostKey;
+
+        // Candidate private keys: -i then config IdentityFile.
+        let mut key_paths: Vec<String> = cli_identities.to_vec();
+        key_paths.extend(cfg_block.identity_files.iter().map(|p| expand_tilde(p)));
+
+        for cert_raw in &cfg_block.certificate_files {
+            let cert_path = expand_tilde(cert_raw);
+            let text = match std::fs::read_to_string(&cert_path) {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("warning: CertificateFile {cert_path}: {e}");
+                    continue;
+                }
+            };
+            let cert = match Certificate::parse_openssh_line(&text) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("warning: CertificateFile {cert_path}: {e}");
+                    continue;
+                }
+            };
+            // Find the matching private key by embedded-key equality.
+            let mut paired = false;
+            for kp in &key_paths {
+                let Ok(pk) = load_identity(kp) else { continue };
+                let Ok(signer) = pk.into_host_key_sync() else {
+                    continue;
+                };
+                if signer.public_blob() != cert.embedded_pubkey_blob {
+                    continue;
+                }
+                let cert_name = puressh::cert::CERT_KEY_NAMES
+                    .iter()
+                    .copied()
+                    .find(|n| {
+                        puressh::cert::cert_name_to_plain(n) == Some(cert.embedded_algorithm())
+                    })
+                    .unwrap_or("ssh-ed25519-cert-v01@openssh.com");
+                match CertHostKey::new(signer, &cert, cert_name) {
+                    Ok(ch) => {
+                        vlog(1, &format!("certificate {cert_path}: offered"));
+                        credentials.push(ClientCredential::PublicKey(Box::new(ch)));
+                        paired = true;
+                        break;
+                    }
+                    Err(e) => eprintln!("warning: CertificateFile {cert_path}: {e}"),
+                }
+            }
+            if !paired {
+                eprintln!(
+                    "warning: CertificateFile {cert_path}: no matching IdentityFile private key"
+                );
+            }
+        }
+    }
     for id_path in cli_identities {
         let pk = match load_identity(id_path) {
             Ok(p) => p,

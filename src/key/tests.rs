@@ -678,3 +678,41 @@ fn parse_wire_blob_rejects_off_curve_ecdsa_p256() {
         Ok(_) => panic!("expected off-curve point to be rejected"),
     }
 }
+
+#[test]
+fn options_parser_plain_key_no_options() {
+    let (blob, opts) =
+        PublicKey::parse_authorized_keys_line_with_options(ED25519_PUB_LINE).unwrap();
+    assert!(!opts.cert_authority);
+    assert!(opts.principals.is_empty());
+    // Same blob as the plain parser yields.
+    let plain = PublicKey::parse_authorized_keys_line(ED25519_PUB_LINE).unwrap();
+    assert_eq!(blob, plain.wire_blob());
+}
+
+#[test]
+fn options_parser_cert_authority_flag() {
+    let line = format!("cert-authority {ED25519_PUB_LINE}");
+    let (_blob, opts) = PublicKey::parse_authorized_keys_line_with_options(&line).unwrap();
+    assert!(opts.cert_authority);
+}
+
+#[test]
+fn options_parser_principals_quoted() {
+    let line = format!("cert-authority,principals=\"alice,bob\" {ED25519_PUB_LINE}");
+    let (_blob, opts) = PublicKey::parse_authorized_keys_line_with_options(&line).unwrap();
+    assert!(opts.cert_authority);
+    assert_eq!(opts.principals, vec!["alice", "bob"]);
+}
+
+#[test]
+fn options_parser_rejects_unknown_option() {
+    let line = format!("from=\"10.0.0.0/8\" {ED25519_PUB_LINE}");
+    assert!(PublicKey::parse_authorized_keys_line_with_options(&line).is_err());
+}
+
+#[test]
+fn options_parser_rejects_unquoted_principals() {
+    let line = format!("principals=alice {ED25519_PUB_LINE}");
+    assert!(PublicKey::parse_authorized_keys_line_with_options(&line).is_err());
+}

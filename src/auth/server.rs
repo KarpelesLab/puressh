@@ -270,7 +270,7 @@ fn decode_ssh_string(data: &[u8]) -> Option<String> {
     if !r.is_empty() {
         return None;
     }
-    core::str::from_utf8(s).ok().map(|s| s.to_string())
+    core::str::from_utf8(s).ok().map(String::from)
 }
 
 /// What the harness should do next on behalf of the server.

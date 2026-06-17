@@ -75,6 +75,28 @@ mod imp {
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+    // Per-connection forced command from a user certificate's `force-command`
+    // critical option. Each connection runs in its own `fork()`ed child, so a
+    // process-global here is effectively per-connection: the authenticator sets
+    // it on a successful cert auth and the exec/shell handlers (same child)
+    // read it to override whatever command the client requested. OpenSSH's
+    // `ForceCommand` / cert force-command semantics: the original command is
+    // exposed to the forced command via `$SSH_ORIGINAL_COMMAND`, which the env
+    // layering passes through; we override the executed command only.
+    static FORCED_COMMAND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    /// Record a certificate `force-command` for this connection (forked child).
+    fn set_forced_command(cmd: Option<String>) {
+        if let Ok(mut g) = FORCED_COMMAND.lock() {
+            *g = cmd;
+        }
+    }
+
+    /// The forced command for this connection, if any.
+    fn forced_command() -> Option<String> {
+        FORCED_COMMAND.lock().ok().and_then(|g| g.clone())
+    }
+
     const USAGE: &str = "usage: sshd [-d] [-f configfile] [-p port] [-b address]... \
                          [-h host_key_file]... [-A authorized_keys_file] \
                          [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
@@ -1443,6 +1465,15 @@ mod imp {
                     if self.debug {
                         eprintln!("sshd: auth publickey: verified user {user}");
                     }
+                    // Certificate `force-command`: record it for this connection
+                    // so the exec/shell handlers override the client's command.
+                    // The inner payload is an SSH string (force-command="cmd").
+                    if let Some(ci) = &cert {
+                        let forced = ci
+                            .critical_option("force-command")
+                            .and_then(decode_ssh_string);
+                        set_forced_command(forced);
+                    }
                     // A verified signature satisfies the `publickey` factor. In
                     // single-factor mode this Accepts; under a multi-factor
                     // chain it may PartialAccept and ask for the next factor.
@@ -1631,6 +1662,22 @@ mod imp {
 
     impl CommandHandler for ShellCommandHandler {
         fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
+            // Certificate `force-command` overrides the client's command. The
+            // original command is exposed to it via `$SSH_ORIGINAL_COMMAND`
+            // (layered into the session env below), matching OpenSSH.
+            let forced = forced_command();
+            let mut effective_env;
+            let (env, command): (&SessionEnv, &str) = match &forced {
+                Some(forced) => {
+                    effective_env = env.clone();
+                    effective_env.insert("SSH_ORIGINAL_COMMAND", command);
+                    if self.debug {
+                        eprintln!("sshd: force-command active for {user}");
+                    }
+                    (&effective_env, forced.as_str())
+                }
+                None => (env, command),
+            };
             if self.debug {
                 if self.debug_commands {
                     eprintln!("sshd: exec by {user}: {command}");
@@ -3886,6 +3933,51 @@ mod imp {
     mod tests {
         use super::*;
         use puressh::config::HostPattern;
+
+        #[test]
+        fn cidr_matches_ipv4() {
+            let ip = "10.1.2.3".parse().unwrap();
+            assert!(cidr_matches("10.0.0.0/8", ip));
+            assert!(cidr_matches("10.1.2.3", ip)); // bare = /32 exact
+            assert!(!cidr_matches("10.1.2.4", ip));
+            assert!(!cidr_matches("192.168.0.0/16", ip));
+            // Family mismatch never matches.
+            assert!(!cidr_matches("2001:db8::/32", ip));
+            // Malformed prefix rejects.
+            assert!(!cidr_matches("10.0.0.0/99", ip));
+        }
+
+        #[test]
+        fn cidr_matches_ipv6() {
+            let ip = "2001:db8::1".parse().unwrap();
+            assert!(cidr_matches("2001:db8::/32", ip));
+            assert!(!cidr_matches("2001:dead::/32", ip));
+        }
+
+        #[test]
+        fn parse_peer_ip_forms() {
+            assert_eq!(
+                parse_peer_ip("10.0.0.5:2222"),
+                Some("10.0.0.5".parse().unwrap())
+            );
+            assert_eq!(parse_peer_ip("10.0.0.5"), Some("10.0.0.5".parse().unwrap()));
+            assert_eq!(
+                parse_peer_ip("[2001:db8::1]:22"),
+                Some("2001:db8::1".parse().unwrap())
+            );
+        }
+
+        #[test]
+        fn decode_ssh_string_roundtrip() {
+            // "force-command"="echo hi" inner payload is an SSH string.
+            let mut blob = Vec::new();
+            let s = b"echo hi";
+            blob.extend_from_slice(&(s.len() as u32).to_be_bytes());
+            blob.extend_from_slice(s);
+            assert_eq!(decode_ssh_string(&blob).as_deref(), Some("echo hi"));
+            // Truncated / mismatched length rejects.
+            assert_eq!(decode_ssh_string(&blob[..blob.len() - 1]), None);
+        }
 
         /// Build a `LocalAuthenticator` with a mock group resolver for access
         /// precedence tests. `groups` maps user→group-names.

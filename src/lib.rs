@@ -42,6 +42,9 @@ pub mod transport;
 pub mod cert;
 
 #[cfg(feature = "alloc")]
+pub mod krl;
+
+#[cfg(feature = "alloc")]
 pub mod compress;
 
 #[cfg(feature = "alloc")]

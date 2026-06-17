@@ -720,7 +720,7 @@ impl KeyboardInteractiveResponder for StdinKbdResponder {
     }
 }
 
-/// Authenticate `client` as `user`. Builds a SINGLE [`ClientAuth`] driver for
+/// Authenticate `client` as `user`. Builds a SINGLE `ClientAuth` driver for
 /// this connection — publickey credentials first, then a re-promptable
 /// password closure, then a keyboard-interactive responder — and runs it once.
 /// Crucially this sends exactly one SERVICE_REQUEST: every method is attempted

@@ -3983,22 +3983,28 @@ mod tests {
             vec!["publickey", "password", "keyboard-interactive"]
         );
         // PasswordAuthentication no ⇒ password dropped.
-        let mut opts = crate::config::ServerOptions::default();
-        opts.password_authentication = Some(false);
+        let opts = crate::config::ServerOptions {
+            password_authentication: Some(false),
+            ..Default::default()
+        };
         assert_eq!(
             resolve_auth_methods(base, &opts),
             vec!["publickey", "keyboard-interactive"]
         );
         // KbdInteractiveAuthentication no ⇒ keyboard-interactive dropped.
-        let mut opts = crate::config::ServerOptions::default();
-        opts.kbd_interactive_authentication = Some(false);
+        let opts = crate::config::ServerOptions {
+            kbd_interactive_authentication: Some(false),
+            ..Default::default()
+        };
         assert_eq!(
             resolve_auth_methods(base, &opts),
             vec!["publickey", "password"]
         );
         // PubkeyAuthentication no ⇒ publickey dropped.
-        let mut opts = crate::config::ServerOptions::default();
-        opts.pubkey_authentication = Some(false);
+        let opts = crate::config::ServerOptions {
+            pubkey_authentication: Some(false),
+            ..Default::default()
+        };
         assert_eq!(
             resolve_auth_methods(base, &opts),
             vec!["password", "keyboard-interactive"]

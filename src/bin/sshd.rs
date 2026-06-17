@@ -258,6 +258,16 @@ mod imp {
             /// Runs in the per-connection forked child while still root, which
             /// is what PAM auth (e.g. reading `/etc/shadow`) requires; the
             /// privilege drop happens afterwards in `on_session_open`.
+            ///
+            /// MANUAL e2e (not a hermetic unit test — installing a PAM service
+            /// file needs root + writes to `/etc/pam.d`, which CI can't do):
+            ///   1. Create `/etc/pam.d/sshd` containing only
+            ///      `auth required pam_permit.so` / `account required
+            ///      pam_permit.so` and confirm any password authenticates;
+            ///      swap `pam_permit.so` for `pam_deny.so` and confirm none do.
+            ///   2. With the real system `sshd` service, confirm a correct
+            ///      account password authenticates and a wrong one is rejected,
+            ///      and that `PermitEmptyPasswords no` refuses an empty one.
             pub fn pam_check_password(
                 &self,
                 user: &str,
@@ -899,10 +909,19 @@ mod imp {
 
         /// Full password-verification path shared by the `password` and
         /// `keyboard-interactive` methods: access control + PermitRootLogin +
-        /// empty-password policy + PAM. Runs uniform work for known and unknown
-        /// users (the PAM call, or the empty-password short-circuit, happens for
-        /// every attempt). Returns the chain-aware decision via
-        /// `record_and_decide` on success, or `Reject`.
+        /// empty-password policy + PAM.
+        ///
+        /// Timing uniformity: the PAM call (the dominant, shadow-hashing cost)
+        /// runs for *every* attempt regardless of whether access control or the
+        /// root gate would refuse the user — PAM returns USER_UNKNOWN/AUTH_ERR
+        /// after a comparable delay for unknown users, so an attacker cannot
+        /// distinguish "no such user / not allowed" from "wrong password" by
+        /// wall-clock. The access/root verdicts only AND into the final result;
+        /// the only short-circuit is the empty-password refusal, which is gated
+        /// on the *client-supplied input* (an empty password), not on any
+        /// per-user secret, so it leaks nothing about which users exist.
+        /// Returns the chain-aware decision via `record_and_decide` on success,
+        /// or `Reject`.
         fn verify_password(
             &mut self,
             user: &str,
@@ -917,50 +936,46 @@ mod imp {
                 }
                 return AuthDecision::Reject;
             }
-            // Access control + root gate run unconditionally for timing
-            // uniformity (mirrors the publickey arm).
-            let user_ok = self.access_allowed(user);
-            let is_root = self.is_root(user);
-            let root_denied = is_root && !self.permit_root_login.permits_password();
-            let empty_ok = Self::empty_password_allowed(self.permit_empty_passwords, &password);
 
-            if !user_ok || root_denied || !empty_ok {
-                // Burn a comparable amount of work so an unknown/denied user is
-                // not obviously faster than a PAM round-trip would be. We still
-                // skip the real PAM call (no point authenticating a denied
-                // user), but the access/group/root lookups above already ran.
+            // Empty-password refusal is input-dependent (not user-dependent), so
+            // short-circuiting here introduces no user-enumeration oracle.
+            if !Self::empty_password_allowed(self.permit_empty_passwords, &password) {
                 if self.debug {
-                    if root_denied {
-                        eprintln!(
-                            "sshd: auth {method}: root login denied by PermitRootLogin for {user}"
-                        );
-                    } else if !user_ok {
-                        eprintln!("sshd: auth {method}: user {user} not in allowed set");
-                    } else {
-                        eprintln!("sshd: auth {method}: empty password refused for {user}");
-                    }
+                    eprintln!("sshd: auth {method}: empty password refused for {user}");
                 }
                 return AuthDecision::Reject;
             }
 
+            // Access control + root gate. Computed up front but applied *after*
+            // the PAM call so the call always runs (uniform timing).
+            let user_ok = self.access_allowed(user);
+            let is_root = self.is_root(user);
+            let root_denied = is_root && !self.permit_root_login.permits_password();
+
             let rhost = self.peer.clone();
-            match self
+            let pam_ok = self
                 .pam
                 .pam_check_password(user, password, rhost.as_deref())
-            {
-                Ok(()) => {
-                    if self.debug {
-                        eprintln!("sshd: auth {method}: PAM accepted user {user}");
-                    }
-                    self.record_and_decide(method)
+                .is_ok();
+
+            if pam_ok && user_ok && !root_denied {
+                if self.debug {
+                    eprintln!("sshd: auth {method}: accepted user {user}");
                 }
-                Err(e) => {
-                    if self.debug {
-                        eprintln!("sshd: auth {method}: PAM rejected user {user} ({e})");
-                    }
-                    AuthDecision::Reject
+                return self.record_and_decide(method);
+            }
+            if self.debug {
+                if !pam_ok {
+                    eprintln!("sshd: auth {method}: PAM rejected user {user}");
+                } else if root_denied {
+                    eprintln!(
+                        "sshd: auth {method}: root login denied by PermitRootLogin for {user}"
+                    );
+                } else {
+                    eprintln!("sshd: auth {method}: user {user} not in allowed set");
                 }
             }
+            AuthDecision::Reject
         }
 
         /// Record a satisfied factor and decide whether authentication is

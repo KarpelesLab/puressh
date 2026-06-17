@@ -556,6 +556,7 @@ fn apply_extra_o(
         address_family,
         bind_address,
         identity_agent,
+        obscure_keystroke_timing,
     );
     // Cumulative lists: append whatever the -o block contributed.
     cfg_block.identity_files.extend(o.identity_files);

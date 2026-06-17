@@ -128,6 +128,53 @@ pub enum ControlPersist {
     Seconds(u64),
 }
 
+/// `ObscureKeystrokeTiming` value (OpenSSH 9.5+). Controls keystroke-timing
+/// obfuscation on interactive (pty) sessions: when on, the client releases
+/// keystrokes on a fixed cadence and pads idle gaps with `ping@openssh.com`
+/// chaff so the on-wire packet rate is constant while typing.
+///
+/// OpenSSH syntax: `yes` (on, default interval 20 ms), `no`, or
+/// `interval:<spec>` where `<spec>` is a millisecond count (`interval:80`) or
+/// an OpenSSH time value with unit suffixes (`interval:1s`). The OpenSSH
+/// default when the option is unset is `yes` at 20 ms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ObscureKeystrokeTiming {
+    /// `no`: disabled — keystrokes are sent immediately as today.
+    Off,
+    /// `yes` / `interval:<spec>`: enabled with the given cadence in
+    /// milliseconds. `yes` ⇒ `On { interval_ms: 20 }`.
+    On {
+        /// Cadence between cadence ticks, in milliseconds.
+        interval_ms: u32,
+    },
+}
+
+impl ObscureKeystrokeTiming {
+    /// OpenSSH's default cadence interval (20 ms) used by bare `yes`.
+    pub const DEFAULT_INTERVAL_MS: u32 = 20;
+
+    /// The effective default when the option is unset: on at 20 ms, matching
+    /// OpenSSH's compiled-in default.
+    pub fn default_on() -> Self {
+        ObscureKeystrokeTiming::On {
+            interval_ms: Self::DEFAULT_INTERVAL_MS,
+        }
+    }
+
+    /// `true` if obfuscation is enabled.
+    pub fn is_on(&self) -> bool {
+        matches!(self, ObscureKeystrokeTiming::On { .. })
+    }
+
+    /// The cadence interval in milliseconds when on; `None` when off.
+    pub fn interval_ms(&self) -> Option<u32> {
+        match self {
+            ObscureKeystrokeTiming::On { interval_ms } => Some(*interval_ms),
+            ObscureKeystrokeTiming::Off => None,
+        }
+    }
+}
+
 /// One `DynamicForward` entry — a local SOCKS proxy listener. Wire form
 /// `[bind:]port`, e.g. `1080` or `127.0.0.1:1080`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -290,6 +337,10 @@ pub struct ClientOptions {
     /// `ControlPersist` — how long the master lingers after its foreground
     /// session ends (no/yes/`<N>[smh]`).
     pub control_persist: Option<ControlPersist>,
+    /// `ObscureKeystrokeTiming` — keystroke-timing obfuscation for
+    /// interactive sessions (`yes`/`no`/`interval:<spec>`). Unset ⇒ honoring
+    /// site applies the OpenSSH default (`yes` at 20 ms).
+    pub obscure_keystroke_timing: Option<ObscureKeystrokeTiming>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -813,6 +864,9 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "controlpersist" => {
             opts.control_persist = Some(parse_control_persist(line)?);
         }
+        "obscurekeystroketiming" => {
+            opts.obscure_keystroke_timing = Some(parse_obscure_keystroke_timing(line)?);
+        }
         "casignaturealgorithms" => {
             opts.ca_signature_algorithms = Some(resolve_algo_list(
                 AlgoCategory::CaSignature,
@@ -884,6 +938,7 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(control_master);
     take_scalar!(control_path);
     take_scalar!(control_persist);
+    take_scalar!(obscure_keystroke_timing);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.certificate_files
@@ -1036,6 +1091,65 @@ fn parse_control_persist(line: &ParsedLine) -> Result<ControlPersist, ConfigErro
     } else {
         Ok(ControlPersist::Seconds(secs))
     }
+}
+
+/// Parse an `ObscureKeystrokeTiming` value: `yes` / `no` / `interval:<spec>`.
+///
+/// `yes` ⇒ on at the OpenSSH default (20 ms). `no` ⇒ off. `interval:<spec>`
+/// ⇒ on with `<spec>` resolved to milliseconds: either a bare integer
+/// (milliseconds, `interval:80`) or an OpenSSH time value with a unit suffix
+/// (`interval:1s`, `interval:500ms`). A zero interval is rejected. STRICT:
+/// anything malformed is a [`ConfigError::BadValue`].
+fn parse_obscure_keystroke_timing(
+    line: &ParsedLine,
+) -> Result<ObscureKeystrokeTiming, ConfigError> {
+    let raw = one_arg(line)?;
+    let s = raw.to_ascii_lowercase();
+    let bad = |msg: String| ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg,
+    };
+    match s.as_str() {
+        "no" | "false" | "off" => return Ok(ObscureKeystrokeTiming::Off),
+        "yes" | "true" | "on" => return Ok(ObscureKeystrokeTiming::default_on()),
+        _ => {}
+    }
+    let Some(spec) = s.strip_prefix("interval:") else {
+        return Err(bad(format!("expected yes/no/interval:<spec>, got {raw:?}")));
+    };
+    if spec.is_empty() {
+        return Err(bad("interval: requires a value".into()));
+    }
+    // Resolve <spec> to milliseconds. Bare integer ⇒ ms. `ms` suffix ⇒ ms.
+    // `s`/`m`/`h` suffixes ⇒ seconds/minutes/hours scaled to ms.
+    let (digits, scale_ms): (&str, u64) = if let Some(d) = spec.strip_suffix("ms") {
+        (d, 1)
+    } else if let Some(d) = spec.strip_suffix('s') {
+        (d, 1000)
+    } else if let Some(d) = spec.strip_suffix('m') {
+        (d, 60_000)
+    } else if let Some(d) = spec.strip_suffix('h') {
+        (d, 3_600_000)
+    } else {
+        (spec, 1)
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(bad(format!(
+            "interval: expected <ms> or <N>[ms|s|m|h], got {spec:?}"
+        )));
+    }
+    let n: u64 = digits
+        .parse()
+        .map_err(|_| bad(format!("interval: invalid number {spec:?}")))?;
+    let ms = n
+        .checked_mul(scale_ms)
+        .ok_or_else(|| bad("interval: duration overflows".into()))?;
+    if ms == 0 {
+        return Err(bad("interval: must be greater than zero".into()));
+    }
+    let interval_ms = u32::try_from(ms).map_err(|_| bad("interval: too large".into()))?;
+    Ok(ObscureKeystrokeTiming::On { interval_ms })
 }
 
 fn parse_yes_no(line: &ParsedLine) -> Result<bool, ConfigError> {
@@ -2016,6 +2130,84 @@ Match host gw
             ConfigError::BadValue { line, .. } => assert_eq!(line, 1),
             _ => panic!("wrong err: {err:?}"),
         }
+    }
+
+    // ----- ObscureKeystrokeTiming tests --------------------------------
+
+    #[test]
+    fn obscure_keystroke_timing_yes_defaults_to_20ms() {
+        let cfg = SshClientConfig::parse("ObscureKeystrokeTiming yes\n").unwrap();
+        assert_eq!(
+            cfg.lookup("h").obscure_keystroke_timing,
+            Some(ObscureKeystrokeTiming::On { interval_ms: 20 })
+        );
+    }
+
+    #[test]
+    fn obscure_keystroke_timing_no_is_off() {
+        let cfg = SshClientConfig::parse("ObscureKeystrokeTiming no\n").unwrap();
+        assert_eq!(
+            cfg.lookup("h").obscure_keystroke_timing,
+            Some(ObscureKeystrokeTiming::Off)
+        );
+    }
+
+    #[test]
+    fn obscure_keystroke_timing_interval_ms_integer() {
+        let cfg = SshClientConfig::parse("ObscureKeystrokeTiming interval:80\n").unwrap();
+        assert_eq!(
+            cfg.lookup("h").obscure_keystroke_timing,
+            Some(ObscureKeystrokeTiming::On { interval_ms: 80 })
+        );
+    }
+
+    #[test]
+    fn obscure_keystroke_timing_interval_time_units() {
+        let cases = [
+            ("interval:1s", 1000),
+            ("interval:500ms", 500),
+            ("interval:2m", 120_000),
+        ];
+        for (spec, want) in cases {
+            let cfg = SshClientConfig::parse(&format!("ObscureKeystrokeTiming {spec}\n")).unwrap();
+            assert_eq!(
+                cfg.lookup("h").obscure_keystroke_timing,
+                Some(ObscureKeystrokeTiming::On { interval_ms: want }),
+                "spec {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn obscure_keystroke_timing_unset_is_none() {
+        let cfg = SshClientConfig::parse("Host h\n  Port 22\n").unwrap();
+        assert_eq!(cfg.lookup("h").obscure_keystroke_timing, None);
+    }
+
+    #[test]
+    fn obscure_keystroke_timing_malformed_is_bad_value() {
+        for bad in [
+            "ObscureKeystrokeTiming maybe\n",
+            "ObscureKeystrokeTiming interval:\n",
+            "ObscureKeystrokeTiming interval:abc\n",
+            "ObscureKeystrokeTiming interval:0\n",
+            "ObscureKeystrokeTiming interval:-5\n",
+            "ObscureKeystrokeTiming 80\n",
+        ] {
+            let err = SshClientConfig::parse(bad).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::BadValue { .. }),
+                "input {bad:?} gave {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn obscure_keystroke_timing_default_helpers() {
+        assert!(ObscureKeystrokeTiming::default_on().is_on());
+        assert_eq!(ObscureKeystrokeTiming::default_on().interval_ms(), Some(20));
+        assert!(!ObscureKeystrokeTiming::Off.is_on());
+        assert_eq!(ObscureKeystrokeTiming::Off.interval_ms(), None);
     }
 
     // ----- Include-directive tests -------------------------------------

@@ -13,6 +13,8 @@ pub mod kex;
 pub mod kexinit;
 pub mod packet;
 #[cfg(feature = "alloc")]
+pub mod ping;
+#[cfg(feature = "alloc")]
 pub mod rekey;
 pub mod runner;
 pub mod version;
@@ -24,6 +26,8 @@ pub use ext_info::{
 pub use kex::{KexAlgorithms, Negotiated};
 pub use kexinit::{KexAlgorithmsOwned, KexInit, NegotiatedOwned, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS};
 pub use packet::{BLOCK_SIZE_DEFAULT, MAX_PACKET_LEN, Packet, PacketCodec};
+#[cfg(feature = "alloc")]
+pub use ping::{SSH_MSG_PING, SSH_MSG_PONG, encode_ping, encode_pong, pong_for_ping};
 #[cfg(feature = "alloc")]
 pub use rekey::{RekeyPolicy, is_kex_msg};
 pub use runner::{DirKeys, InstalledKeys, KexAdvance, KexRunner, Role};

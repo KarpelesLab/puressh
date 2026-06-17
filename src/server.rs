@@ -42,6 +42,7 @@ use crate::error::{Error, Result};
 use crate::format::Writer;
 use crate::hostkey::HostKey;
 use crate::transport::kex::{defaults, is_strict_kex_marker};
+use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, pong_for_ping};
 use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
 use crate::transport::{
     ExtInfo, KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
@@ -2449,6 +2450,20 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             continue;
         }
 
+        // ping@openssh.com (RFC 4251 §7 private range): answer an inbound
+        // PING with a PONG echoing its data; drop a PONG. A PING must not
+        // be answered mid-rekey (RFC 4253 §7.3) — drop it in that window.
+        if msg == SSH_MSG_PING {
+            if !runner.is_kexing() {
+                let pong = pong_for_ping(&payload)?;
+                write_payload(stream, codec, rng, &pong)?;
+            }
+            continue;
+        }
+        if msg == SSH_MSG_PONG {
+            continue;
+        }
+
         // RFC 4253 §7.3: KEX messages (20, 21, 30..=49) are routed through
         // the KEX runner, not the application layer. A peer-initiated re-KEX
         // is signalled by an inbound SSH_MSG_KEXINIT while we are still in
@@ -3973,6 +3988,10 @@ fn read_one_packet(
         match payload.first().copied() {
             Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
             Some(2) | Some(3) | Some(4) => continue,
+            // PING/PONG arriving on the blocking-read paths (auth / kex
+            // phases). Drop them so callers only ever see a real protocol
+            // packet; the connection loop answers PINGs in steady state.
+            Some(SSH_MSG_PING) | Some(SSH_MSG_PONG) => continue,
             _ => return Ok(payload),
         }
     }
@@ -4443,6 +4462,90 @@ mod tests {
         drop(client);
 
         // Bound the server-thread wait so a regression can't hang the suite.
+        let start = std::time::Instant::now();
+        while !*server_done.lock().unwrap() {
+            if start.elapsed() > Duration::from_secs(10) {
+                panic!("server thread did not finish in time");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    /// End-to-end check that the server answers a `ping@openssh.com`
+    /// `SSH2_MSG_PING` with a `SSH2_MSG_PONG` and that the client silently
+    /// drops the PONG: the client sends a PING mid-stream and a following
+    /// `exec` still completes cleanly (no mis-dispatch on either side).
+    #[test]
+    fn loopback_ping_pong_roundtrip() {
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let client_hk_for_auth = Ed25519HostKey::from_seed(client_seed);
+        let allowed_blob = client_hk_for_auth.public_blob();
+
+        let user = "ssh-test-user".to_string();
+        let allowed_user_for_factory = user.clone();
+        let allowed_blob_clone = allowed_blob.clone();
+
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: allowed_user_for_factory.clone(),
+                allowed_blob: allowed_blob_clone.clone(),
+            })
+        });
+
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"after-ping\n".to_vec(),
+            }),
+        );
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+            },
+        )
+        .expect("client connect");
+
+        let client_hk: Box<dyn HostKey + Send> = Box::new(Ed25519HostKey::from_seed(client_seed));
+        client
+            .authenticate_publickey(&user, client_hk)
+            .expect("authenticate");
+
+        // Fire a transport PING. The server must answer with a PONG echoing
+        // the data; the client's read loop must drop that PONG. We can't
+        // observe the PONG directly here, but a subsequent exec proves the
+        // PING/PONG exchange did not desynchronise either dispatcher.
+        client
+            .send_transport_ping(b"obscure-keystroke-chaff")
+            .expect("send PING");
+
+        let out = client.exec("ignored").expect("exec after ping");
+        assert_eq!(out.stdout, b"after-ping\n");
+        assert_eq!(out.exit_status, Some(0));
+
+        drop(client);
+
         let start = std::time::Instant::now();
         while !*server_done.lock().unwrap() {
             if start.elapsed() > Duration::from_secs(10) {

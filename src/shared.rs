@@ -589,6 +589,17 @@ impl SharedClient {
         g.client.set_read_timeout(t).map_err(Error::Io)
     }
 
+    /// Send a `ping@openssh.com` `SSH2_MSG_PING` over the transport carrying
+    /// `data`. The peer replies with a `SSH2_MSG_PONG` echoing `data`, which
+    /// the pump silently drops. This is the connection-level "chaff"
+    /// mechanism used by the `ObscureKeystrokeTiming` keystroke obfuscator;
+    /// it is independent of any channel. Thread-safe: takes the inner mutex,
+    /// so it serialises with the concurrent channel pump and other senders.
+    pub fn send_ping(&self, data: &[u8]) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        g.client.send_transport_ping(data)
+    }
+
     /// Open a `direct-tcpip` channel (RFC 4254 §7.2) — the server
     /// connects to `dest_host:dest_port` and proxies bytes across the
     /// returned stream. `orig_host` / `orig_port` are informational.

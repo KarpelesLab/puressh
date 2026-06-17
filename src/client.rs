@@ -35,6 +35,7 @@ use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
 pub use crate::stream::{ChannelEgress, ChannelStream};
 use crate::transport::kex::{defaults, is_strict_kex_marker};
+use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, encode_ping, pong_for_ping};
 use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
 use crate::transport::{
     KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
@@ -2232,6 +2233,10 @@ impl Client {
             match payload.first().copied() {
                 Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
                 Some(2) | Some(3) | Some(4) => continue,
+                // PING/PONG may not interleave with a KEX exchange we are
+                // driving; drop them here (the steady-state read loop answers
+                // PINGs) so the next packet is a KEX or app payload.
+                Some(SSH_MSG_PING) | Some(SSH_MSG_PONG) => continue,
                 _ => return Ok(payload),
             }
         }
@@ -2284,6 +2289,14 @@ impl Client {
                 Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
                 // SSH_MSG_IGNORE, SSH_MSG_UNIMPLEMENTED, SSH_MSG_DEBUG — drop.
                 Some(2) | Some(3) | Some(4) => continue,
+                // ping@openssh.com (RFC 4251 §7 private range): answer an
+                // inbound PING with a PONG echoing its data; drop a PONG.
+                Some(SSH_MSG_PING) => {
+                    let pong = pong_for_ping(&payload)?;
+                    self.write_payload(&pong)?;
+                    continue;
+                }
+                Some(SSH_MSG_PONG) => continue,
                 // SSH_MSG_EXT_INFO (RFC 8308) — route into the runner only at
                 // the legal one-shot slot. Outside it, fail loudly per §2.3.
                 Some(7) => {
@@ -2357,6 +2370,16 @@ impl Client {
         let frame = self.codec.encode(payload, &mut self.rng)?;
         self.stream.write_all(&frame)?;
         Ok(())
+    }
+
+    /// Send a `ping@openssh.com` `SSH2_MSG_PING` carrying `data` over the
+    /// transport. The peer answers with a `SSH2_MSG_PONG` echoing `data`,
+    /// which the read loop drops. Used as constant-rate "chaff" by the
+    /// `ObscureKeystrokeTiming` sender in the `ssh` binary. Must not be
+    /// called while a KEX is in flight.
+    pub(crate) fn send_transport_ping(&mut self, data: &[u8]) -> Result<()> {
+        let ping = encode_ping(data);
+        self.write_payload(&ping)
     }
 }
 
@@ -3743,6 +3766,117 @@ mod tests {
         let server_sid = server.join().unwrap().expect("server handshake");
         assert_eq!(client.session_id, server_sid);
         assert!(!client.session_id.is_empty());
+    }
+
+    /// Drive the *client* read loop to answer a `ping@openssh.com` PING with
+    /// a PONG echoing the data. A minimal loopback server completes KEX, sends
+    /// an encrypted `SSH2_MSG_PING`, and asserts the client replies with the
+    /// matching `SSH2_MSG_PONG`. Also confirms the client's read loop drops a
+    /// stray inbound PONG (we send one before the PING and the client never
+    /// surfaces it).
+    #[test]
+    fn client_answers_ping_with_pong() {
+        use crate::transport::ping::{SSH_MSG_PONG, encode_ping, encode_pong};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+
+        let server = thread::spawn(move || -> std::result::Result<Vec<u8>, String> {
+            let (mut s, _) = listener.accept().map_err(|e| e.to_string())?;
+            let server_hk = Ed25519HostKey::from_seed(seed);
+
+            s.write_all(&VersionExchange::outgoing_bytes())
+                .map_err(|e| e.to_string())?;
+            let mut line = Vec::new();
+            let v_c: Vec<u8> = {
+                read_line(&mut s, &mut line, 1024).map_err(|e| format!("{e:?}"))?;
+                let parsed = VersionExchange::parse_remote(&line).map_err(|e| format!("{e:?}"))?;
+                parsed.into_bytes()
+            };
+            let v_s = LOCAL_VERSION.as_bytes().to_vec();
+
+            let mut codec = PacketCodec::new();
+            let server_over = AlgoOverrides {
+                host_key_algorithms: Some(vec!["ssh-ed25519".to_string()]),
+                ..Default::default()
+            };
+            let advert = build_default_kexinit(&mut OsRng, &server_over);
+            let mut runner = KexRunner::new(Role::Server, advert);
+            let mut inbox: Vec<u8> = Vec::new();
+            let mut rng = OsRng;
+
+            let initial = runner.start(&mut rng).map_err(|e| format!("{e:?}"))?;
+            for p in initial.outbound {
+                let frame = codec.encode(&p, &mut rng).map_err(|e| format!("{e:?}"))?;
+                s.write_all(&frame).map_err(|e| e.to_string())?;
+            }
+            let mut steps = 0;
+            loop {
+                steps += 1;
+                if steps > MAX_KEX_STEPS {
+                    return Err("server kex did not converge".into());
+                }
+                let payload = read_one_packet_local(&mut s, &mut codec, &mut inbox)
+                    .map_err(|e| format!("{e:?}"))?;
+                let adv = runner
+                    .on_packet(
+                        &mut rng,
+                        &mut codec,
+                        &payload,
+                        Some(&server_hk),
+                        None,
+                        &v_c,
+                        &v_s,
+                    )
+                    .map_err(|e| format!("{e:?}"))?;
+                for p in adv.outbound {
+                    let frame = codec.encode(&p, &mut rng).map_err(|e| format!("{e:?}"))?;
+                    s.write_all(&frame).map_err(|e| e.to_string())?;
+                }
+                if adv.completed {
+                    break;
+                }
+            }
+
+            // Post-KEX: send a stray PONG (client must drop it), then a PING.
+            let stray = encode_pong(b"unsolicited");
+            let frame = codec
+                .encode(&stray, &mut rng)
+                .map_err(|e| format!("{e:?}"))?;
+            s.write_all(&frame).map_err(|e| e.to_string())?;
+            let ping = encode_ping(b"chaff-1234");
+            let frame = codec
+                .encode(&ping, &mut rng)
+                .map_err(|e| format!("{e:?}"))?;
+            s.write_all(&frame).map_err(|e| e.to_string())?;
+
+            // Expect the client's PONG echoing our PING data.
+            let reply = read_one_packet_local(&mut s, &mut codec, &mut inbox)
+                .map_err(|e| format!("{e:?}"))?;
+            if reply.first().copied() != Some(SSH_MSG_PONG) {
+                return Err(format!("expected PONG, got msg {:?}", reply.first()));
+            }
+            let mut r = crate::format::Reader::new(&reply);
+            r.read_u8().map_err(|e| format!("{e:?}"))?;
+            let data = r.read_string().map_err(|e| format!("{e:?}"))?;
+            if data != b"chaff-1234" {
+                return Err(format!("PONG echoed wrong data: {data:?}"));
+            }
+            Ok(b"ok".to_vec())
+        });
+
+        let mut client = Client::connect(addr, Config::insecure()).expect("client connect");
+        // Pump the client read loop: it must drop the stray PONG and answer
+        // the PING by writing a PONG back (which our server thread asserts).
+        // The server closes after reading our PONG, so this eventually errors
+        // with a closed connection — that's the success path here.
+        let _ = client.read_one_packet();
+
+        let res = server.join().unwrap();
+        assert_eq!(res.expect("server PONG assertions"), b"ok");
     }
 
     #[test]

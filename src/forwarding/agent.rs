@@ -162,8 +162,9 @@ impl DefaultAgentForwardHandler {
 /// lands. On any such mismatch we refuse rather than silently trusting it.
 #[cfg(feature = "server")]
 fn ensure_private_tmp_dir() -> Result<PathBuf> {
-    // SAFETY: `geteuid` always succeeds and has no preconditions.
-    let euid = unsafe { libc::geteuid() };
+    // `nix::unistd::geteuid` wraps the syscall safely, avoiding an `unsafe`
+    // block that `forbid(unsafe_code)` (outside the `ffi` feature) would reject.
+    let euid = nix::unistd::geteuid().as_raw();
     let dir = PathBuf::from(format!("/tmp/puressh-agent-{euid}"));
     ensure_private_dir(&dir, euid)?;
     Ok(dir)

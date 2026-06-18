@@ -61,6 +61,30 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// The base TCP port for X displays. Display `N` lives on port `6000 + N`.
 const X_BASE_PORT: u16 = 6000;
 
+/// The only X11 authorisation protocol this handler validates. OpenSSH's
+/// `ssh -X`/`-Y` always negotiates this; anything else is rejected by the
+/// cookie-enforcing path.
+#[cfg(feature = "server")]
+const MIT_MAGIC_COOKIE_1: &str = "MIT-MAGIC-COOKIE-1";
+
+/// Hard cap on the X11 connection-setup prelude we will buffer while
+/// validating the cookie. A well-formed setup packet is a 12-byte fixed
+/// header plus the (padded) protocol name and cookie — a few dozen bytes in
+/// practice. Cap it so a malicious local connection can't make us buffer
+/// unbounded data before the cookie check completes.
+#[cfg(feature = "server")]
+const MAX_X11_SETUP_PRELUDE: usize = 1 << 16;
+
+/// Per-setup decision about how to treat accepted local connections.
+#[cfg(feature = "server")]
+enum CookiePolicy {
+    /// Splice everything (legacy, opt-in via `permit_unauthenticated()`).
+    PermitUnauthenticated,
+    /// Require a matching `MIT-MAGIC-COOKIE-1` on the first setup packet.
+    /// Holds the raw (hex-decoded) cookie bytes.
+    RequireCookie(Arc<Vec<u8>>),
+}
+
 /// Default first display number to try. OpenSSH starts at 10 to leave
 /// `:0`–`:9` for real local X servers.
 #[cfg(feature = "server")]
@@ -104,6 +128,13 @@ impl Drop for X11Binding {
 pub struct DefaultX11ForwardHandler {
     min_display: u16,
     max_display: u16,
+    /// When `true`, accepted local connections are spliced straight through
+    /// without validating the X11 authorisation cookie. This is the legacy
+    /// "trust loopback" behaviour and is OPT-IN: a local user on the server
+    /// box could otherwise connect to `localhost:6000+N` and hijack the
+    /// client's display. The default (`false`) enforces a
+    /// `MIT-MAGIC-COOKIE-1` check against the cookie from `x11-req`.
+    permit_unauthenticated: bool,
 }
 
 #[cfg(feature = "server")]
@@ -116,21 +147,39 @@ impl Default for DefaultX11ForwardHandler {
 #[cfg(feature = "server")]
 impl DefaultX11ForwardHandler {
     /// Build a fresh handler that scans displays `10..=999` for a free
-    /// `127.0.0.1:6000+N`.
+    /// `127.0.0.1:6000+N` and enforces `MIT-MAGIC-COOKIE-1` validation on
+    /// every accepted local connection (default-deny).
     pub fn new() -> Self {
         Self {
             min_display: DEFAULT_MIN_DISPLAY,
             max_display: DEFAULT_MAX_DISPLAY,
+            permit_unauthenticated: false,
         }
     }
 
     /// Build a handler that scans `min_display..=max_display`. Useful for
-    /// tests that want to constrain the scan to a small range.
+    /// tests that want to constrain the scan to a small range. Cookie
+    /// validation is enforced (default-deny), as with [`Self::new`].
     pub fn with_display_range(min_display: u16, max_display: u16) -> Self {
         Self {
             min_display,
             max_display,
+            permit_unauthenticated: false,
         }
+    }
+
+    /// Opt into the legacy "splice everything on loopback" behaviour: any
+    /// local connection to `127.0.0.1:6000+N` is forwarded WITHOUT checking
+    /// the X11 authorisation cookie. This mirrors stock OpenSSH's behaviour
+    /// when the X server itself enforces no per-connection auth, but it lets
+    /// any local user on the server box hijack the forwarded display. Prefer
+    /// [`Self::new`] (cookie-enforcing) unless you have a specific reason.
+    ///
+    /// This is the analogue of the `permit_all` opt-in on the TCP-forward
+    /// handlers in `direct.rs` / `reverse.rs`.
+    pub fn permit_unauthenticated(mut self) -> Self {
+        self.permit_unauthenticated = true;
+        self
     }
 
     fn bind_first_free(&self) -> Result<(TcpListener, u16)> {
@@ -154,33 +203,57 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
         &self,
         _user: &str,
         single_connection: bool,
-        _auth_protocol: &str,
-        _auth_cookie: &str,
+        auth_protocol: &str,
+        auth_cookie: &str,
         screen: u32,
         ctx: X11ForwardContext,
     ) -> Result<X11ForwardHandle> {
-        // SECURITY NOTE — X11 authorisation cookie validation.
+        // SECURITY — X11 authorisation cookie validation.
         //
         // RFC 4254 §6.3.1 carries `auth_protocol` + `auth_cookie` from the
-        // client so the server can program the X server (or its proxy) to
-        // accept only connections that present the matching cookie on the
-        // first wire bytes. We deliberately do NOT do that here — the
-        // default handler binds a plain TCP socket on `127.0.0.1:6000+N`
-        // and forwards anything that connects, trusting that:
+        // client so the server can accept only connections that present the
+        // matching cookie on the first wire bytes. The default handler now
+        // enforces that: each accepted connection to `127.0.0.1:6000+N` must
+        // open with an X11 connection-setup packet whose
+        // authorization-protocol-name is `MIT-MAGIC-COOKIE-1` and whose
+        // authorization-protocol-data matches the cookie from `x11-req`
+        // (constant-time compare). Connections that fail are dropped before
+        // any bytes are spliced to the client's display, so a local user on
+        // the server box can no longer hijack `localhost:6000+N`.
         //
-        //   1) the listener is loopback-only (no remote attacker can reach
-        //      it without already holding a shell on this host), AND
-        //   2) the operator wraps the binary or runs the X server with its
-        //      own access controls (`Xauthority` on a downstream display).
+        // The legacy "splice everything on loopback" behaviour is still
+        // reachable, but only OPT-IN via `permit_unauthenticated()`.
         //
-        // This matches OpenSSH's default `X11UseLocalhost yes` behaviour,
-        // but it does NOT enforce the cookie itself. A local user on the
-        // server box CAN open `localhost:6000+N` and reach the client's X
-        // server without presenting the cookie — exactly as with stock
-        // OpenSSH. If you need per-connection cookie checks, wrap this
-        // handler with one that intercepts the first XAuth packet on each
-        // accepted connection and validates `auth_protocol`/`auth_cookie`
-        // before splicing.
+        // Decode the validation policy once, up front, so the per-connection
+        // accept loop just consults a cheap enum.
+        let policy = if self.permit_unauthenticated {
+            CookiePolicy::PermitUnauthenticated
+        } else {
+            // The cookie arrives hex-encoded over `x11-req`. If we can't
+            // decode it (or it's empty), fail the whole setup rather than
+            // silently downgrading to "accept anything" — a malformed cookie
+            // request must not become an open display.
+            if !auth_protocol.eq_ignore_ascii_case(MIT_MAGIC_COOKIE_1) {
+                return Err(Error::Io(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "x11-forward: unsupported authorization protocol (only MIT-MAGIC-COOKIE-1)",
+                )));
+            }
+            let Some(cookie) = hex_decode(auth_cookie) else {
+                return Err(Error::Io(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "x11-forward: x11-req cookie is not valid hex",
+                )));
+            };
+            if cookie.is_empty() {
+                return Err(Error::Io(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "x11-forward: x11-req carried an empty cookie",
+                )));
+            }
+            CookiePolicy::RequireCookie(Arc::new(cookie))
+        };
+
         let (listener, display_number) = self.bind_first_free()?;
         listener.set_nonblocking(true)?;
 
@@ -189,7 +262,31 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
         let handle = thread::spawn(move || {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((conn, peer)) => {
+                    Ok((mut conn, peer)) => {
+                        // Validate the X11 authorisation cookie on the first
+                        // setup packet before doing anything else. On any
+                        // failure, drop the connection without opening a
+                        // channel back to the client.
+                        let prelude = match &policy {
+                            CookiePolicy::PermitUnauthenticated => Vec::new(),
+                            CookiePolicy::RequireCookie(cookie) => {
+                                match read_and_check_cookie(&mut conn, cookie) {
+                                    Ok(bytes) => bytes,
+                                    Err(_) => {
+                                        // A rejected (bad-cookie) connection must
+                                        // NOT consume the `single_connection`
+                                        // allowance: otherwise a local attacker
+                                        // who races in first with a bogus cookie
+                                        // could tear down the listener before the
+                                        // legitimate client connects. Keep
+                                        // looping; only a *validated* connection
+                                        // (below) honours `single_connection`.
+                                        let _ = conn.shutdown(Shutdown::Both);
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         let orig_host = match peer.ip() {
                             std::net::IpAddr::V4(v4) => v4.to_string(),
                             std::net::IpAddr::V6(v6) => v6.to_string(),
@@ -197,7 +294,9 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
                         let orig_port = peer.port() as u32;
                         match ctx.open_x11(orig_host, orig_port) {
                             Ok(channel_stream) => {
-                                spawn_tcp_splice(conn, channel_stream);
+                                // Replay the setup packet bytes we consumed
+                                // during validation, then splice the rest.
+                                spawn_tcp_splice_with_prelude(conn, channel_stream, prelude);
                             }
                             Err(_) => {
                                 let _ = conn.shutdown(Shutdown::Both);
@@ -286,6 +385,209 @@ fn spawn_tcp_splice(tcp: TcpStream, stream: ChannelStream) {
         let _ = b.join();
         let _ = chan_tx.send(ChannelEgress::Close);
     });
+}
+
+/// Like [`spawn_tcp_splice`] but pushes `prelude` (the X11 setup-packet
+/// bytes we read off the wire during cookie validation) to the channel
+/// first, so the client's X server sees the full, unmodified setup request.
+#[cfg(feature = "server")]
+fn spawn_tcp_splice_with_prelude(tcp: TcpStream, stream: ChannelStream, prelude: Vec<u8>) {
+    let (chan_rx, chan_tx) = stream.into_raw();
+
+    // Replay the setup bytes consumed during cookie validation before any
+    // live data. If the channel is already gone, drop the connection.
+    if !prelude.is_empty() && chan_tx.send(ChannelEgress::Data(prelude)).is_err() {
+        let _ = tcp.shutdown(Shutdown::Both);
+        return;
+    }
+
+    let Ok(tcp_in) = tcp.try_clone() else {
+        let _ = chan_tx.send(ChannelEgress::Eof);
+        let _ = chan_tx.send(ChannelEgress::Close);
+        return;
+    };
+    let tcp_out = tcp;
+
+    // Direction A: TCP → channel.
+    let chan_tx_a = chan_tx.clone();
+    let mut tcp_in_a = tcp_in;
+    let a = thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match tcp_in_a.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if chan_tx_a
+                        .send(ChannelEgress::Data(buf[..n].to_vec()))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = chan_tx_a.send(ChannelEgress::Eof);
+    });
+
+    // Direction B: channel → TCP.
+    let mut tcp_out_b = tcp_out;
+    let b = thread::spawn(move || {
+        while let Ok(Some(chunk)) = chan_rx.recv() {
+            if tcp_out_b.write_all(&chunk).is_err() {
+                break;
+            }
+        }
+        let _ = tcp_out_b.shutdown(Shutdown::Read);
+    });
+
+    // Reaper: when both directions finish, send Close to drop the channel.
+    thread::spawn(move || {
+        let _ = a.join();
+        let _ = b.join();
+        let _ = chan_tx.send(ChannelEgress::Close);
+    });
+}
+
+/// Read the X11 connection-setup packet from `conn`, validate that it uses
+/// `MIT-MAGIC-COOKIE-1` and that its authorization-protocol-data matches
+/// `expected` (constant-time), and return the raw bytes consumed so the
+/// caller can replay them to the client's X server. Returns `Err` on any
+/// malformed packet, protocol mismatch, or cookie mismatch.
+///
+/// X11 connection-setup packet layout (RFC-equivalent, X protocol §8):
+///   byte 0      : byte-order ('B' = 0x42 MSB first, 'l' = 0x6c LSB first)
+///   byte 1      : unused
+///   bytes 2..3  : protocol-major-version (byte-order dependent)
+///   bytes 4..5  : protocol-minor-version
+///   bytes 6..7  : n = length of authorization-protocol-name
+///   bytes 8..9  : d = length of authorization-protocol-data
+///   bytes 10..11: unused
+///   bytes 12..  : authorization-protocol-name, padded to a multiple of 4
+///   then        : authorization-protocol-data, padded to a multiple of 4
+#[cfg(feature = "server")]
+fn read_and_check_cookie(conn: &mut TcpStream, expected: &[u8]) -> std::io::Result<Vec<u8>> {
+    use std::io::{Error as IoError, Read};
+
+    // A short read timeout keeps a silent/hostile local connection from
+    // pinning the accept-loop's splice thread indefinitely.
+    let prev_timeout = conn.read_timeout().ok().flatten();
+    conn.set_read_timeout(Some(Duration::from_secs(10)))?;
+
+    let result = (|| {
+        let mut buf = Vec::with_capacity(64);
+
+        // Helper: read until `buf.len() >= need`, capping total size.
+        let mut read_until = |buf: &mut Vec<u8>, need: usize| -> std::io::Result<()> {
+            if need > MAX_X11_SETUP_PRELUDE {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "x11-forward: setup packet exceeds maximum size",
+                ));
+            }
+            let mut chunk = [0u8; 4096];
+            while buf.len() < need {
+                let want = (need - buf.len()).min(chunk.len());
+                let n = conn.read(&mut chunk[..want])?;
+                if n == 0 {
+                    return Err(IoError::new(
+                        ErrorKind::UnexpectedEof,
+                        "x11-forward: connection closed during setup packet",
+                    ));
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            Ok(())
+        };
+
+        // Fixed 12-byte header.
+        read_until(&mut buf, 12)?;
+        let big_endian = match buf[0] {
+            0x42 => true,  // 'B'
+            0x6c => false, // 'l'
+            _ => {
+                return Err(IoError::new(
+                    ErrorKind::InvalidData,
+                    "x11-forward: bad byte-order byte in setup packet",
+                ));
+            }
+        };
+        let rd16 = |hi: u8, lo: u8| -> usize {
+            if big_endian {
+                ((hi as usize) << 8) | lo as usize
+            } else {
+                ((lo as usize) << 8) | hi as usize
+            }
+        };
+        let name_len = rd16(buf[6], buf[7]);
+        let data_len = rd16(buf[8], buf[9]);
+        let pad = |x: usize| -> usize { (x + 3) & !3 };
+        let name_off = 12;
+        let data_off = name_off + pad(name_len);
+        let total = data_off + pad(data_len);
+
+        read_until(&mut buf, total)?;
+
+        let name = &buf[name_off..name_off + name_len];
+        let data = &buf[data_off..data_off + data_len];
+
+        if name != MIT_MAGIC_COOKIE_1.as_bytes() {
+            return Err(IoError::new(
+                ErrorKind::PermissionDenied,
+                "x11-forward: unsupported authorization protocol on connection",
+            ));
+        }
+        if !constant_time_eq(data, expected) {
+            return Err(IoError::new(
+                ErrorKind::PermissionDenied,
+                "x11-forward: authorization cookie mismatch",
+            ));
+        }
+        Ok(buf)
+    })();
+
+    // Restore the prior timeout (best-effort) before handing the socket on.
+    let _ = conn.set_read_timeout(prev_timeout);
+    result
+}
+
+/// Constant-time byte-slice equality. Avoids leaking how many leading bytes
+/// of the cookie matched via early-return timing.
+#[cfg(feature = "server")]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Decode an ASCII hex string into bytes. Returns `None` on odd length or a
+/// non-hex digit. Used to turn the hex-encoded `x11-req` cookie into the raw
+/// bytes that appear on the X11 wire.
+#[cfg(feature = "server")]
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let nib = |c: u8| -> Option<u8> {
+        match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        out.push((nib(pair[0])? << 4) | nib(pair[1])?);
+    }
+    Some(out)
 }
 
 /// Build a closure shaped like
@@ -450,9 +752,10 @@ mod tests {
         );
     }
 
-    /// Connecting to the display while no `open_x11` receiver is wired
-    /// causes the worker to drop the connection. We assert the peer
-    /// observes that (read returns 0 / errors out within a sane timeout).
+    /// Connecting to the display (with a VALID cookie so we pass the gate)
+    /// while no `open_x11` receiver is wired causes the worker to drop the
+    /// connection. We assert the peer observes that (read returns 0 / errors
+    /// out within a sane timeout).
     #[test]
     fn accepted_connection_is_closed_when_open_fails() {
         let h = DefaultX11ForwardHandler::with_display_range(800, 820);
@@ -462,6 +765,10 @@ mod tests {
             .expect("setup");
         let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
         let mut peer = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        // Present the matching cookie so the gate passes and the worker
+        // reaches `open_x11` (which fails under for_test_no_opens).
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
+        peer.write_all(&pkt).expect("write setup packet");
         peer.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("read timeout");
         let mut buf = [0u8; 1];
@@ -474,6 +781,170 @@ mod tests {
     #[test]
     fn tcp_display_callback_constructs() {
         let _cb = splice_to_tcp_display_callback("127.0.0.1".to_string(), 65000);
+    }
+
+    #[test]
+    fn hex_decode_roundtrips_and_rejects_garbage() {
+        assert_eq!(hex_decode("deadbeef"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(hex_decode(""), Some(vec![]));
+        assert_eq!(hex_decode("DEADbeef"), Some(vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(hex_decode("abc"), None, "odd length must fail");
+        assert_eq!(hex_decode("zz"), None, "non-hex must fail");
+    }
+
+    #[test]
+    fn constant_time_eq_basic() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    /// Build a minimal X11 connection-setup packet (big-endian) carrying the
+    /// given authorization protocol name + cookie bytes.
+    fn x11_setup_packet(name: &[u8], cookie: &[u8]) -> Vec<u8> {
+        let pad = |x: usize| (x + 3) & !3;
+        let mut p = Vec::new();
+        p.push(0x42); // 'B' big-endian
+        p.push(0); // unused
+        p.extend_from_slice(&11u16.to_be_bytes()); // proto major
+        p.extend_from_slice(&0u16.to_be_bytes()); // proto minor
+        p.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        p.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+        p.extend_from_slice(&0u16.to_be_bytes()); // unused
+        p.extend_from_slice(name);
+        p.resize(12 + pad(name.len()), 0);
+        p.extend_from_slice(cookie);
+        let want = 12 + pad(name.len()) + pad(cookie.len());
+        p.resize(want, 0);
+        p
+    }
+
+    /// Drive `read_and_check_cookie` over a real loopback TCP pair: the
+    /// "client" side writes a setup packet, the server side validates it.
+    fn check_over_loopback(packet: &[u8], expected: &[u8]) -> std::io::Result<Vec<u8>> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let pkt = packet.to_vec();
+        let writer = thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(&pkt);
+            // Keep the socket open briefly so the server can read it all.
+            thread::sleep(Duration::from_millis(50));
+        });
+        let (mut server_side, _peer) = listener.accept().unwrap();
+        let res = read_and_check_cookie(&mut server_side, expected);
+        let _ = writer.join();
+        res
+    }
+
+    #[test]
+    fn cookie_check_accepts_matching_packet() {
+        let cookie = vec![0xde, 0xad, 0xbe, 0xef, 0x01, 0x02];
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &cookie);
+        let consumed = check_over_loopback(&pkt, &cookie).expect("should accept");
+        // The bytes returned must be exactly what we sent so they can be
+        // replayed to the client's X server verbatim.
+        assert_eq!(consumed, pkt);
+    }
+
+    #[test]
+    fn cookie_check_rejects_wrong_cookie() {
+        let cookie = vec![0xde, 0xad, 0xbe, 0xef];
+        let wrong = vec![0x00, 0x00, 0x00, 0x00];
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &cookie);
+        let err = check_over_loopback(&pkt, &wrong).expect_err("should reject");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn cookie_check_rejects_wrong_protocol() {
+        let cookie = vec![0xaa, 0xbb];
+        let pkt = x11_setup_packet(b"XDM-AUTHORIZATION-1", &cookie);
+        let err = check_over_loopback(&pkt, &cookie).expect_err("should reject");
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// A connection that presents the wrong cookie is dropped before any
+    /// `open_x11` happens — i.e. the cookie gate runs ahead of the splice.
+    /// With `for_test_no_opens` the open would fail anyway, so instead we
+    /// assert the listener stays bound (the worker keeps looping) after a
+    /// rejected connection, and accepts a fresh connection afterwards.
+    #[test]
+    fn bad_cookie_connection_is_dropped_then_loop_continues() {
+        let h = DefaultX11ForwardHandler::with_display_range(640, 660);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", false, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
+
+        // First connection presents a bad cookie and gets dropped.
+        let mut bad = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0x00, 0x11, 0x22]);
+        bad.write_all(&pkt).expect("write bad packet");
+        bad.set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        let _ = bad.read(&mut buf); // expect EOF / shutdown, not a hang
+        drop(bad);
+
+        // The listener must still be bound (worker kept looping after the
+        // rejection) — binding the same port should still fail.
+        let still_bound = TcpListener::bind(addr).is_err();
+        assert!(
+            still_bound,
+            "non-single_connection: port should remain bound after a rejected connection"
+        );
+        drop(handle);
+    }
+
+    /// `permit_unauthenticated()` opts back into the legacy splice-everything
+    /// behaviour: a connection with no cookie at all is forwarded (reaches
+    /// `open_x11`, which fails under `for_test_no_opens` and drops it).
+    #[test]
+    fn permit_unauthenticated_skips_cookie_check() {
+        let h = DefaultX11ForwardHandler::with_display_range(620, 639).permit_unauthenticated();
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", false, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
+        let mut peer = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        // No cookie sent at all. The worker still routes it to open_x11
+        // (which fails for_test_no_opens) and closes it — we just assert no
+        // hang.
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
+        let mut buf = [0u8; 1];
+        let _ = peer.read(&mut buf);
+        drop(handle);
+    }
+
+    /// Cookie-enforcing setup rejects an unsupported auth protocol up front.
+    #[test]
+    fn setup_rejects_unsupported_protocol() {
+        let h = DefaultX11ForwardHandler::with_display_range(600, 619);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        // `X11ForwardHandle` isn't `Debug`, so avoid `expect_err`; match the
+        // result directly.
+        match h.setup("u", false, "XDM-AUTHORIZATION-1", "deadbeef", 0, ctx) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("unsupported protocol must fail setup"),
+        }
+    }
+
+    /// Cookie-enforcing setup rejects a non-hex cookie up front.
+    #[test]
+    fn setup_rejects_non_hex_cookie() {
+        let h = DefaultX11ForwardHandler::with_display_range(580, 599);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        match h.setup("u", false, "MIT-MAGIC-COOKIE-1", "nothex!!", 0, ctx) {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::InvalidInput),
+            Err(other) => panic!("unexpected error: {other:?}"),
+            Ok(_) => panic!("non-hex cookie must fail setup"),
+        }
     }
 
     /// With `single_connection: true`, the accept-loop must drop the
@@ -489,11 +960,13 @@ mod tests {
             .expect("setup");
         let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
 
-        // First connect succeeds; the accept-loop pushes it through
-        // (the `for_test_no_opens` context drops the conn) and then
-        // exits because single_connection is set.
-        let first =
+        // First connect succeeds; the accept-loop validates the cookie,
+        // pushes it through (the `for_test_no_opens` context drops the conn)
+        // and then exits because single_connection is set.
+        let mut first =
             TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("first connect");
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
+        first.write_all(&pkt).expect("write setup packet");
         drop(first);
 
         // Give the worker time to exit and release the port.

@@ -397,6 +397,21 @@ fn handle_direct_tcpip(
     orig_host: &str,
     orig_port: u32,
 ) {
+    // Ports arrive as `u32` over the mux control protocol but SSH (and the
+    // `as u16` cast below) only carries 16-bit port numbers. Reject anything
+    // out of range explicitly: a silent `as u16` truncation would dial an
+    // unintended port (e.g. 65558 → 22) instead of failing.
+    if dest_port > 0xFFFF || orig_port > 0xFFFF {
+        let _ = write_frame(
+            &mut ctrl,
+            &Frame::OpenFail {
+                reason: format!(
+                    "direct-tcpip {dest_host}:{dest_port}: invalid port (out of range)"
+                ),
+            },
+        );
+        return;
+    }
     let chan =
         match shared.open_direct_tcpip(dest_host, dest_port as u16, orig_host, orig_port as u16) {
             Ok(c) => c,

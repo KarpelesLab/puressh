@@ -51,6 +51,10 @@ impl Writer {
 
     /// Write a `string`: 4-byte big-endian length, then bytes.
     pub fn write_string(&mut self, s: &[u8]) {
+        debug_assert!(
+            s.len() <= u32::MAX as usize,
+            "SSH string length overflows u32 length prefix"
+        );
         self.write_u32(s.len() as u32);
         self.buf.extend_from_slice(s);
     }

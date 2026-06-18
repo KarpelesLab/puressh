@@ -57,22 +57,25 @@ pub struct ServerReplyOut {
     pub kex: KexOutput,
 }
 
-fn field_len(curve: CurveId) -> usize {
+fn field_len(curve: CurveId) -> Option<usize> {
     match curve {
-        CurveId::P256 => 32,
-        CurveId::P384 => 48,
-        CurveId::P521 => 66,
-        CurveId::Secp256k1 => 32,
+        CurveId::P256 => Some(32),
+        CurveId::P384 => Some(48),
+        CurveId::P521 => Some(66),
+        CurveId::Secp256k1 => Some(32),
         // `CurveId` is `#[non_exhaustive]` upstream. Only the curves above are
-        // ever passed here (see `ecdh_impl!` invocations at the bottom of the
-        // file); anything else would mean a new SSH KEX algorithm was added
-        // without wiring up its field length.
-        _ => unreachable!("unsupported CurveId in SSH ECDH KEX"),
+        // ever passed here (see the `Kex` impls above), so this arm is
+        // unreachable today. We fail closed rather than `unreachable!()`: if a
+        // future refactor ever let a peer-influenced curve reach this code, a
+        // panic would be a DoS, whereas `None` turns into a clean protocol
+        // error at the call site. Returning a guessed length would be worse —
+        // it would silently mis-frame crypto.
+        _ => None,
     }
 }
 
-fn sec1_point_len(curve: CurveId) -> usize {
-    1 + 2 * field_len(curve)
+fn sec1_point_len(curve: CurveId) -> Option<usize> {
+    Some(1 + 2 * field_len(curve)?)
 }
 
 fn client_init<R: RngCore + CryptoRng>(curve: CurveId, rng: &mut R) -> (ClientState, KexInitOut) {
@@ -103,7 +106,8 @@ where
         return Err(Error::Protocol("expected SSH_MSG_KEX_ECDH_INIT"));
     }
     let q_c_bytes = r.read_string()?;
-    if q_c_bytes.len() != sec1_point_len(curve) {
+    let expected_len = sec1_point_len(curve).ok_or(Error::Unsupported("unsupported ECDH curve"))?;
+    if q_c_bytes.len() != expected_len {
         return Err(Error::Format("ECDH Q_C wrong length"));
     }
     let peer = BoxedEcdsaPublicKey::from_sec1(curve, q_c_bytes)
@@ -164,7 +168,9 @@ fn client_finish_inner<D: Digest>(
     }
     let k_s = r.read_string()?;
     let q_s_bytes = r.read_string()?;
-    if q_s_bytes.len() != sec1_point_len(state.curve) {
+    let expected_len =
+        sec1_point_len(state.curve).ok_or(Error::Unsupported("unsupported ECDH curve"))?;
+    if q_s_bytes.len() != expected_len {
         return Err(Error::Format("ECDH Q_S wrong length"));
     }
     let sig = r.read_string()?;
@@ -260,8 +266,8 @@ mod tests {
 
     #[test]
     fn sec1_lengths_match_curves() {
-        assert_eq!(sec1_point_len(CurveId::P256), 65);
-        assert_eq!(sec1_point_len(CurveId::P384), 97);
-        assert_eq!(sec1_point_len(CurveId::P521), 133);
+        assert_eq!(sec1_point_len(CurveId::P256), Some(65));
+        assert_eq!(sec1_point_len(CurveId::P384), Some(97));
+        assert_eq!(sec1_point_len(CurveId::P521), Some(133));
     }
 }

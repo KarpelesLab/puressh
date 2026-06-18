@@ -59,7 +59,7 @@ pub fn tokenize_file_with_includes(
     path: &Path,
     depth: usize,
 ) -> Result<Vec<ParsedLine>, ConfigError> {
-    if depth > MAX_INCLUDE_DEPTH {
+    if depth >= MAX_INCLUDE_DEPTH {
         return Err(ConfigError::Syntax {
             line: 0,
             msg: "Include: max depth exceeded".into(),
@@ -80,7 +80,7 @@ pub fn tokenize_file_with_includes(
 /// I/O failure as a silent skip (returning `Ok(empty)`). Used for the
 /// recursive Include path, where ssh_config(5) says to warn and continue.
 fn tokenize_included_file(path: &Path, depth: usize) -> Result<Vec<ParsedLine>, ConfigError> {
-    if depth > MAX_INCLUDE_DEPTH {
+    if depth >= MAX_INCLUDE_DEPTH {
         return Err(ConfigError::Syntax {
             line: 0,
             msg: "Include: max depth exceeded".into(),
@@ -130,7 +130,7 @@ pub fn expand_includes(
                 Err(_) => continue, // unreadable parent dir → warn-and-skip
             };
             for matched in matches {
-                if depth + 1 > MAX_INCLUDE_DEPTH {
+                if depth + 1 >= MAX_INCLUDE_DEPTH {
                     return Err(ConfigError::Syntax {
                         line: line.line_no,
                         msg: "Include: max depth exceeded".into(),

@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -842,6 +843,15 @@ pub struct Config {
     /// window has the connection dropped with `Error::Io`/`TimedOut`.
     /// Defaults to 120 seconds. Set to [`Duration::ZERO`] to disable.
     pub login_grace_time: Duration,
+    /// Maximum number of connections handled concurrently by [`Server::serve`]
+    /// (OpenSSH's `MaxStartups`-style ceiling, applied to fully-accepted
+    /// connections rather than just unauthenticated ones). When the live
+    /// handler count is at or above this cap, a freshly-accepted connection is
+    /// closed immediately instead of spawning another handler thread — a
+    /// pre-auth backpressure valve against thread-exhaustion floods. `None`
+    /// means unlimited. Defaults to `Some(256)`. Has no effect on
+    /// [`Server::accept_one`], which never spawns.
+    pub max_connections: Option<usize>,
     /// `Ciphers` override (sshd_config) — advertised cipher preference list
     /// for both directions. `None` ⇒ built-in default.
     pub ciphers: Option<Vec<String>>,
@@ -1138,6 +1148,7 @@ impl Config {
             rekey_policy: RekeyPolicy::default(),
             accept_env: Vec::new(),
             login_grace_time: Duration::from_secs(120),
+            max_connections: Some(256),
             ciphers: None,
             macs: None,
             kex_algorithms: None,
@@ -1221,6 +1232,16 @@ impl Config {
     /// [`Duration::ZERO`] to disable.
     pub fn with_login_grace_time(mut self, dur: Duration) -> Self {
         self.login_grace_time = dur;
+        self
+    }
+
+    /// Set the maximum number of connections [`Server::serve`] will handle
+    /// concurrently. When the live handler count reaches this cap, newly
+    /// accepted connections are closed immediately (the accept loop keeps
+    /// running) rather than spawning an unbounded number of handler threads.
+    /// `None` disables the cap (unlimited). Defaults to `Some(256)`.
+    pub fn with_max_connections(mut self, max: Option<usize>) -> Self {
+        self.max_connections = max;
         self
     }
 
@@ -1360,14 +1381,74 @@ impl Server {
     }
 
     /// Accept connections forever, spawning a fresh thread per connection.
+    ///
+    /// Two pre-auth DoS guards apply here (neither affects [`accept_one`],
+    /// which never spawns):
+    ///
+    /// * **Bounded concurrency** — at most [`Config::max_connections`] handler
+    ///   threads run at once. When the live count is at the cap, a newly
+    ///   accepted connection is dropped (closed) immediately and the accept
+    ///   loop continues, instead of spawning unboundedly.
+    /// * **Non-panicking spawn** — the OS refusing a new thread
+    ///   (`thread::Builder::spawn` returning `Err`, e.g. `EAGAIN` under a
+    ///   thread/PID-exhaustion flood) drops that one connection and continues
+    ///   accepting, rather than panicking and killing the whole accept loop.
+    ///
+    /// [`accept_one`]: Server::accept_one
     pub fn serve(&mut self) -> Result<()> {
+        let live = Arc::new(AtomicUsize::new(0));
         loop {
             let (stream, peer) = self.listener.accept()?;
+
+            // Backpressure: refuse (close) once we're at the concurrency cap.
+            // We reserve the slot up front so the check and the increment are a
+            // single atomic step; the reservation is rolled back if the cap is
+            // exceeded or the spawn fails.
+            if let Some(max) = self.cfg.max_connections {
+                let prev = live.fetch_add(1, Ordering::AcqRel);
+                if prev >= max {
+                    live.fetch_sub(1, Ordering::AcqRel);
+                    // Drop `stream`: closes the socket, refusing the peer.
+                    drop(stream);
+                    continue;
+                }
+            } else {
+                live.fetch_add(1, Ordering::AcqRel);
+            }
+
             let cfg = self.cfg.clone();
-            thread::spawn(move || {
-                let _ = handle_session_with_peer(stream, peer, cfg);
-            });
+            // `ConnGuard::Drop` decrements `live` whether the handler returns
+            // normally, errors, or panics — keeping the counter accurate.
+            let guard = ConnGuard { live: live.clone() };
+            let spawn = thread::Builder::new()
+                .name("puressh-conn".into())
+                .spawn(move || {
+                    let _guard = guard;
+                    let _ = handle_session_with_peer(stream, peer, cfg);
+                });
+
+            if spawn.is_err() {
+                // The OS refused the thread (e.g. EAGAIN). The handler never
+                // ran, so its `ConnGuard` was consumed by the closure and
+                // dropped here on the spawn failure path, releasing the slot.
+                // `stream` was moved into the closure and is dropped with it,
+                // closing the socket. Keep accepting rather than panicking.
+                continue;
+            }
         }
+    }
+}
+
+/// RAII slot guard for [`Server::serve`]'s bounded-concurrency counter.
+/// Decrements the live-connection count on drop, so the slot is released
+/// exactly once whether the handler thread returns, errors, or unwinds.
+struct ConnGuard {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -1427,14 +1508,20 @@ fn handle_connection_inner(
     stream.set_nodelay(true)?;
 
     // RFC 4252 / OpenSSH "LoginGraceTime": cap the time the peer can
-    // sit idle between TCP accept and userauth-success. We arm the
-    // socket-level read timeout once here; every subsequent blocking
-    // `read` in banner exchange, KEX, and auth inherits it without
-    // having to thread a deadline through the handshake.
+    // sit between TCP accept and userauth-success. This is an ABSOLUTE
+    // deadline for the whole pre-auth phase, not a per-read inactivity
+    // window — a slow-loris peer that dribbles one byte per (grace-ε)
+    // interval must not be able to extend the budget forever. Each
+    // blocking pre-auth read (banner exchange, KEX, auth) re-arms the
+    // socket read timeout to the time *remaining* until `deadline`; once
+    // the deadline elapses the read fails with the pre-auth timeout error.
+    // `grace.is_zero()` ⇒ no budget (`deadline` stays `None`).
     let grace = cfg.login_grace_time;
-    if !grace.is_zero() {
-        stream.set_read_timeout(Some(grace))?;
-    }
+    let deadline = if grace.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + grace)
+    };
 
     let mut codec = PacketCodec::new();
     let mut inbox: Vec<u8> = Vec::new();
@@ -1446,7 +1533,7 @@ fn handle_connection_inner(
             .write_all(&VersionExchange::outgoing_bytes())
             .map_err(Error::Io),
     )?;
-    let v_c = map_preauth_timeout(read_peer_version(&mut stream))?;
+    let v_c = map_preauth_timeout(read_peer_version(&mut stream, deadline))?;
 
     let (mut runner, session_id) = map_preauth_timeout(do_server_kex(
         &mut stream,
@@ -1456,6 +1543,7 @@ fn handle_connection_inner(
         &cfg,
         &v_c,
         &v_s,
+        deadline,
     ))?;
     let mut last_kex = Instant::now();
 
@@ -1479,6 +1567,7 @@ fn handle_connection_inner(
         peer_ip.as_deref(),
         local_ip.as_deref(),
         local_port,
+        deadline,
     ))?;
 
     // Past userauth-success: lift the grace timeout. The connection
@@ -1563,6 +1652,7 @@ fn handle_connection_inner(
     r
 }
 
+#[allow(clippy::too_many_arguments)]
 fn do_server_kex<R: RngCore + CryptoRng>(
     stream: &mut TcpStream,
     codec: &mut PacketCodec,
@@ -1571,6 +1661,7 @@ fn do_server_kex<R: RngCore + CryptoRng>(
     cfg: &Config,
     v_c: &[u8],
     v_s: &[u8],
+    deadline: Option<Instant>,
 ) -> Result<(KexRunner, Vec<u8>)> {
     // First KEX only: advertise ext-info-s so the client may send us
     // SSH_MSG_EXT_INFO (RFC 8308 §2.1). Re-KEX paths use the un-marked
@@ -1585,7 +1676,17 @@ fn do_server_kex<R: RngCore + CryptoRng>(
         write_payload(stream, codec, rng, &p)?;
     }
 
-    drive_server_kex(stream, codec, rng, inbox, &mut runner, cfg, v_c, v_s)?;
+    drive_server_kex(
+        stream,
+        codec,
+        rng,
+        inbox,
+        &mut runner,
+        cfg,
+        v_c,
+        v_s,
+        deadline,
+    )?;
 
     let sid = runner
         .session_id()
@@ -1606,6 +1707,7 @@ fn drive_server_kex<R: RngCore + CryptoRng>(
     cfg: &Config,
     v_c: &[u8],
     v_s: &[u8],
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let mut steps = 0usize;
     let mut selected_host_key: Option<&(dyn HostKey + Send + Sync)> = None;
@@ -1615,7 +1717,7 @@ fn drive_server_kex<R: RngCore + CryptoRng>(
         if steps > MAX_KEX_STEPS {
             return Err(Error::Protocol("kex: too many steps"));
         }
-        let payload = read_one_packet(stream, codec, inbox)?;
+        let payload = read_one_packet(stream, codec, inbox, deadline)?;
 
         if selected_host_key.is_none()
             && let Some(neg) = runner.negotiated()
@@ -1789,6 +1891,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     peer_ip: Option<&str>,
     local_ip: Option<&str>,
     local_port: Option<u16>,
+    deadline: Option<Instant>,
 ) -> Result<(String, Option<crate::auth::AuthCertCaps>)> {
     let methods = preauth.methods.clone();
     let auth_impl = cfg.authenticator.build_with_peer(peer_ip);
@@ -1819,7 +1922,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     let mut resolved_user: Option<String> = None;
 
     for _ in 0..MAX_AUTH_STEPS {
-        let payload = read_one_packet(stream, codec, inbox)?;
+        let payload = read_one_packet(stream, codec, inbox, deadline)?;
 
         // Re-resolve on the first request that carries a username, before the
         // attempt is evaluated. Subsequent requests reuse the resolved set.
@@ -2428,7 +2531,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                 None => continue, // 50 ms tick; re-enter drain/rekey checks
             }
         } else {
-            read_one_packet(stream, codec, inbox)?
+            read_one_packet(stream, codec, inbox, None)?
         };
 
         let msg = payload.first().copied().unwrap_or(0);
@@ -2780,7 +2883,7 @@ fn read_one_packet_maybe_timeout(
     codec: &mut PacketCodec,
     inbox: &mut Vec<u8>,
 ) -> Result<Option<Vec<u8>>> {
-    match read_one_packet(stream, codec, inbox) {
+    match read_one_packet(stream, codec, inbox, None) {
         Ok(p) => Ok(Some(p)),
         Err(Error::Io(e))
             if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
@@ -3765,7 +3868,7 @@ fn drain_send<R: RngCore + CryptoRng>(
             data = &data[taken..];
             continue;
         }
-        let pkt = read_one_packet(stream, codec, inbox)?;
+        let pkt = read_one_packet(stream, codec, inbox, None)?;
         let ev = conn.on_packet(&pkt)?;
         match ev {
             ChannelEvent::WindowAdjust { channel: c, .. } if c == channel => continue,
@@ -3948,11 +4051,11 @@ fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
     KexInit::from_algorithms_owned(algs, cookie)
 }
 
-fn read_peer_version(stream: &mut TcpStream) -> Result<Vec<u8>> {
+fn read_peer_version(stream: &mut TcpStream, deadline: Option<Instant>) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     for _ in 0..MAX_BANNER_LINES {
         buf.clear();
-        read_line(stream, &mut buf, MAX_BANNER_LINE)?;
+        read_line(stream, &mut buf, MAX_BANNER_LINE, deadline)?;
         if buf.starts_with(b"SSH-") {
             let parsed = VersionExchange::parse_remote(&buf)?;
             return Ok(parsed.into_bytes());
@@ -3961,9 +4064,37 @@ fn read_peer_version(stream: &mut TcpStream) -> Result<Vec<u8>> {
     Err(Error::Protocol("peer banner too long"))
 }
 
-fn read_line<S: Read>(stream: &mut S, buf: &mut Vec<u8>, max_len: usize) -> Result<()> {
+/// Arm the per-read socket timeout against an absolute pre-auth `deadline`
+/// (OpenSSH's `LoginGraceTime` as a whole-phase budget rather than a
+/// per-read inactivity window). When `deadline` is `None` the budget is
+/// disabled and the socket timeout is left untouched. If the deadline has
+/// already elapsed, return the canonical pre-auth timeout error so the
+/// caller fails closed instead of issuing a read that would block forever.
+fn arm_preauth_deadline(stream: &TcpStream, deadline: Option<Instant>) -> Result<()> {
+    if let Some(deadline) = deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(Error::Io(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "pre-auth inactivity timeout (LoginGraceTime)",
+            )));
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(Error::Io)?;
+    }
+    Ok(())
+}
+
+fn read_line(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    max_len: usize,
+    deadline: Option<Instant>,
+) -> Result<()> {
     let mut byte = [0u8; 1];
     loop {
+        arm_preauth_deadline(stream, deadline)?;
         let n = stream.read(&mut byte)?;
         if n == 0 {
             return Err(Error::Protocol("connection closed before newline"));
@@ -3982,9 +4113,10 @@ fn read_one_packet(
     stream: &mut TcpStream,
     codec: &mut PacketCodec,
     inbox: &mut Vec<u8>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<u8>> {
     loop {
-        let payload = read_one_raw_packet(stream, codec, inbox)?;
+        let payload = read_one_raw_packet(stream, codec, inbox, deadline)?;
         match payload.first().copied() {
             Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
             Some(2) | Some(3) | Some(4) => continue,
@@ -4001,12 +4133,18 @@ fn read_one_raw_packet(
     stream: &mut TcpStream,
     codec: &mut PacketCodec,
     inbox: &mut Vec<u8>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<u8>> {
     loop {
         if let Some((payload, consumed)) = codec.decode(inbox)? {
             inbox.drain(..consumed);
             return Ok(payload);
         }
+        // Re-arm the absolute pre-auth deadline before every blocking read so
+        // a slow-loris peer that dribbles bytes can't extend the grace window
+        // indefinitely (the socket read timeout otherwise resets per read).
+        // `None` ⇒ post-auth / no budget; leaves the socket timeout untouched.
+        arm_preauth_deadline(stream, deadline)?;
         let mut tmp = [0u8; 16 * 1024];
         let n = stream.read(&mut tmp)?;
         if n == 0 {

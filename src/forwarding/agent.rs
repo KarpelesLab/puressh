@@ -128,23 +128,98 @@ impl DefaultAgentForwardHandler {
         }
     }
 
-    fn resolve_parent(&self) -> PathBuf {
+    fn resolve_parent(&self) -> Result<PathBuf> {
         if let Some(d) = &self.parent_dir {
-            return d.clone();
+            return Ok(d.clone());
         }
+        // `$XDG_RUNTIME_DIR` is already a user-private (0700, owned by the
+        // user) per-login root, so we use it verbatim when present.
         if let Ok(d) = std::env::var("XDG_RUNTIME_DIR")
             && !d.is_empty()
         {
-            return PathBuf::from(d);
+            return Ok(PathBuf::from(d));
         }
-        PathBuf::from("/tmp")
+        // Fallback: `/tmp` is world-writable with the sticky bit, so dropping
+        // the socket there leaves its *directory entry* (and thus the
+        // session's existence) visible to every other local user. Instead,
+        // mint a per-user private subdirectory `/tmp/puressh-agent-<uid>/`
+        // (mode 0700, owned by the current euid) and place the socket inside
+        // it, so the socket — and the fact that a session exists at all — is
+        // not exposed to other users.
+        ensure_private_tmp_dir()
+    }
+}
+
+/// Ensure `/tmp/puressh-agent-<euid>/` exists as a private (mode 0700,
+/// euid-owned, real directory) staging area for the per-session agent
+/// socket, and return its path.
+///
+/// If the directory does not exist we create it 0700. If it already exists
+/// we re-verify it before reuse: it must be a real directory (not a
+/// symlink), owned by the current euid, and exactly mode 0700 — otherwise
+/// a different local user could have pre-planted a directory (or a symlink
+/// pointing elsewhere) at the well-known path to influence where our socket
+/// lands. On any such mismatch we refuse rather than silently trusting it.
+#[cfg(feature = "server")]
+fn ensure_private_tmp_dir() -> Result<PathBuf> {
+    // SAFETY: `geteuid` always succeeds and has no preconditions.
+    let euid = unsafe { libc::geteuid() };
+    let dir = PathBuf::from(format!("/tmp/puressh-agent-{euid}"));
+    ensure_private_dir(&dir, euid)?;
+    Ok(dir)
+}
+
+/// Ensure `dir` exists as a private (mode 0700, owned by `euid`, real
+/// directory) staging area. Creates it 0700 if absent; if present, verifies
+/// it is a real directory (not a symlink), owned by `euid`, and exactly mode
+/// 0700, refusing otherwise so a different local user can't pre-plant a
+/// directory (or a symlink pointing elsewhere) at the well-known path.
+#[cfg(feature = "server")]
+fn ensure_private_dir(dir: &Path, euid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    match std::fs::symlink_metadata(dir) {
+        Ok(meta) => {
+            // Reject a planted symlink outright: trusting it would let an
+            // attacker redirect our socket into a directory they control.
+            if meta.file_type().is_symlink() || !meta.file_type().is_dir() {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "agent-forward: private dir path exists but is not a real directory",
+                )));
+            }
+            // Must be owned by us and locked to 0700; anything looser means
+            // another user could read/traverse/plant inside it.
+            if meta.uid() != euid {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "agent-forward: private dir is not owned by the current user",
+                )));
+            }
+            if meta.mode() & 0o777 != 0o700 {
+                return Err(crate::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "agent-forward: private dir has unsafe permissions (want 0700)",
+                )));
+            }
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            // Create it 0700. `create_dir` honours the umask, so tighten the
+            // mode explicitly afterwards to guarantee 0700 regardless of the
+            // inherited umask.
+            std::fs::create_dir(dir)?;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+            Ok(())
+        }
+        Err(e) => Err(crate::error::Error::Io(e)),
     }
 }
 
 #[cfg(feature = "server")]
 impl AgentForwardHandler for DefaultAgentForwardHandler {
     fn setup(&self, _user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle> {
-        let parent = self.resolve_parent();
+        let parent = self.resolve_parent()?;
         let socket_path = mint_socket_path(&parent)?;
         // Don't unlink-then-bind: a `remove_file` followed by `bind` opens a
         // narrow window where an attacker (or a buggy peer) can swap a
@@ -420,5 +495,79 @@ mod tests {
             .expect("read timeout");
         let mut buf = [0u8; 1];
         let _ = peer.read(&mut buf);
+    }
+
+    /// `ensure_private_dir` creates a missing dir as a real 0700 directory.
+    #[test]
+    fn ensure_private_dir_creates_0700() {
+        use std::os::unix::fs::MetadataExt;
+        let scratch = TestTempDir::new("epd-create");
+        let euid = unsafe { libc::geteuid() };
+        let target = scratch.path().join("priv");
+        ensure_private_dir(&target, euid).expect("should create");
+        let meta = std::fs::symlink_metadata(&target).expect("stat");
+        assert!(meta.file_type().is_dir());
+        assert_eq!(meta.mode() & 0o777, 0o700, "must be 0700");
+        assert_eq!(meta.uid(), euid, "must be euid-owned");
+        // Idempotent: a second call accepts the freshly-created 0700 dir.
+        ensure_private_dir(&target, euid).expect("reuse should accept");
+    }
+
+    /// `ensure_private_dir` rejects a loose-mode (e.g. 0755) existing dir
+    /// rather than trusting it.
+    #[test]
+    fn ensure_private_dir_rejects_loose_mode() {
+        let scratch = TestTempDir::new("epd-loose");
+        let euid = unsafe { libc::geteuid() };
+        let target = scratch.path().join("loose");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let err = ensure_private_dir(&target, euid).expect_err("0755 must be rejected");
+        match err {
+            crate::error::Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied)
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `ensure_private_dir` rejects a symlink planted at the path (even one
+    /// pointing at a valid 0700 dir) — it must be a real directory.
+    #[test]
+    fn ensure_private_dir_rejects_symlink() {
+        let scratch = TestTempDir::new("epd-symlink");
+        let euid = unsafe { libc::geteuid() };
+        let real = scratch.path().join("real");
+        std::fs::create_dir(&real).expect("mkdir real");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+        let err = ensure_private_dir(&link, euid).expect_err("symlink must be rejected");
+        match err {
+            crate::error::Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists)
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    /// `ensure_private_dir` rejects a dir owned by someone else (simulated by
+    /// passing a bogus expected euid that won't match the real owner).
+    #[test]
+    fn ensure_private_dir_rejects_wrong_owner() {
+        let scratch = TestTempDir::new("epd-owner");
+        let target = scratch.path().join("owned");
+        std::fs::create_dir(&target).expect("mkdir");
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+        // Pretend we expect a different owner than the one that created it.
+        let real_euid = unsafe { libc::geteuid() };
+        let bogus = real_euid.wrapping_add(1);
+        let err = ensure_private_dir(&target, bogus).expect_err("wrong owner must be rejected");
+        match err {
+            crate::error::Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied)
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 }

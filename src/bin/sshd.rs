@@ -944,7 +944,7 @@ mod imp {
         let mut loaded: Vec<Loaded> = Vec::new();
         for path in key_paths {
             if strict_modes {
-                check_mode_strict(path, 0o077, "host key")?;
+                check_mode_strict(path, 0o077, "host key", None)?;
             }
             let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
             let priv_key = PrivateKey::parse_openssh_pem(&pem, None)
@@ -1028,9 +1028,22 @@ mod imp {
     /// by group or world"). Matches OpenSSH's `StrictModes`. The
     /// `--no-strict-modes` CLI flag short-circuits this check.
     ///
+    /// Beyond the mode bits, this also enforces OpenSSH's ownership and
+    /// ancestor-writability rules (`secure_filename`): the file must be
+    /// owned by root (uid 0) or, when `allowed_uid` is set, the target
+    /// user; and no path component from the file up to `/` may be group-
+    /// or world-writable. A correctly-permissioned root- or owner-owned
+    /// file in non-writable directories continues to pass unchanged.
+    /// The ancestor walk + ownership check mirror `validate_chroot_dir`.
+    ///
     /// `kind` is just a human label for the error message ("host key",
     /// "authorized_keys file").
-    fn check_mode_strict(path: &str, forbidden_mask: u32, kind: &str) -> Result<(), String> {
+    fn check_mode_strict(
+        path: &str,
+        forbidden_mask: u32,
+        kind: &str,
+        allowed_uid: Option<nix::unistd::Uid>,
+    ) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
         let md = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
         if !md.is_file() {
@@ -1043,6 +1056,50 @@ mod imp {
                  fix with `chmod 0{:o} {path}` or override with --no-strict-modes",
                 mode & !forbidden_mask & 0o777
             ));
+        }
+        // Ownership: the file must be owned by root, or by the target user
+        // when one is known. A file owned by an untrusted third party is
+        // rejected even if its mode bits look benign.
+        let allowed = allowed_uid.map(|u| u.as_raw());
+        if md.uid() != 0 && Some(md.uid()) != allowed {
+            return Err(format!(
+                "{kind} {path}: must be owned by root (uid 0){}, is uid {}; \
+                 override with --no-strict-modes",
+                allowed.map(|u| format!(" or uid {u}")).unwrap_or_default(),
+                md.uid()
+            ));
+        }
+        // Ancestor walk: no directory from the file up to / may be group-
+        // or world-writable, otherwise a non-trusted user could swap the
+        // file (or a parent dir) out from under us. Same logic as
+        // validate_chroot_dir, but each component may be owned by root or
+        // the target user (OpenSSH's secure_filename allows the owner).
+        let mut cur = std::path::Path::new(path).parent();
+        while let Some(p) = cur {
+            // An empty parent ("" from a relative leaf) means we've run out
+            // of components to check.
+            if p.as_os_str().is_empty() {
+                break;
+            }
+            let dmd = std::fs::metadata(p).map_err(|e| format!("stat {}: {e}", p.display()))?;
+            if dmd.uid() != 0 && Some(dmd.uid()) != allowed {
+                return Err(format!(
+                    "{kind} {path}: ancestor {} is owned by uid {} (must be root{}); \
+                     override with --no-strict-modes",
+                    p.display(),
+                    dmd.uid(),
+                    allowed.map(|u| format!(" or uid {u}")).unwrap_or_default(),
+                ));
+            }
+            if dmd.mode() & 0o022 != 0 {
+                return Err(format!(
+                    "{kind} {path}: ancestor {} is group/world-writable (mode 0o{:o}); \
+                     override with --no-strict-modes",
+                    p.display(),
+                    dmd.mode() & 0o777
+                ));
+            }
+            cur = p.parent();
         }
         Ok(())
     }
@@ -1093,7 +1150,7 @@ mod imp {
         strict_modes: bool,
     ) -> Result<AuthorizedAndCaBlobs, String> {
         if strict_modes {
-            check_mode_strict(path, 0o022, "authorized_keys file")?;
+            check_mode_strict(path, 0o022, "authorized_keys file", None)?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         let mut authorized: Vec<Vec<u8>> = Vec::new();
@@ -1123,7 +1180,7 @@ mod imp {
     /// returning their wire blobs. Used for `TrustedUserCAKeys`.
     fn load_ca_keys_file(path: &str, strict_modes: bool) -> Result<Vec<Vec<u8>>, String> {
         if strict_modes {
-            check_mode_strict(path, 0o022, "TrustedUserCAKeys file")?;
+            check_mode_strict(path, 0o022, "TrustedUserCAKeys file", None)?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         let mut out = Vec::new();
@@ -1142,9 +1199,13 @@ mod imp {
 
     /// Load an `AuthorizedPrincipalsFile`: one principal name per line
     /// (comments / blanks skipped). No `%u`/`%h` token expansion in this build.
-    fn load_principals_file(path: &str, strict_modes: bool) -> Result<Vec<String>, String> {
+    fn load_principals_file(
+        path: &str,
+        strict_modes: bool,
+        owner_uid: Option<nix::unistd::Uid>,
+    ) -> Result<Vec<String>, String> {
         if strict_modes {
-            check_mode_strict(path, 0o022, "AuthorizedPrincipalsFile")?;
+            check_mode_strict(path, 0o022, "AuthorizedPrincipalsFile", owner_uid)?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         Ok(body
@@ -1625,7 +1686,7 @@ mod imp {
                     return Vec::new();
                 }
             };
-            match load_principals_file(&path, self.strict_modes) {
+            match load_principals_file(&path, self.strict_modes, Some(info.uid)) {
                 Ok(list) => list,
                 Err(e) => {
                     if self.debug {
@@ -3387,6 +3448,33 @@ mod imp {
         // pam_systemd, pam_lastlog, …) can stat it; `forkpty` doesn't
         // expose that path pre-fork, hence the manual split.
         let pty = nix::pty::openpty(Some(&ws), None).map_err(nix_io)?;
+
+        // pty_setowner parity with OpenSSH: while still root and before the
+        // fork hands the slave to the unprivileged shell, set the slave's
+        // ownership to the authenticated user and mode to 0620 (user rw,
+        // tty-group w). Without this the slave stays root-owned and, on a
+        // permissively-configured devpts, another local user could snoop or
+        // inject into the victim's tty. The tty group is resolved by name,
+        // falling back to the user's primary gid when no "tty" group exists.
+        //
+        // Only meaningful when we are privileged and dropping to a different
+        // user; when the daemon already runs as the target (e.g. unprivileged
+        // single-user testing) the kernel already allocated the slave to that
+        // uid and a self-chown would need privileges we don't have, so skip it.
+        if drop_privs {
+            let tty_gid = match nix::unistd::Group::from_name("tty").map_err(nix_io)? {
+                Some(g) => g.gid,
+                None => info.gid,
+            };
+            nix::unistd::fchown(pty.slave.as_fd(), Some(info.uid), Some(tty_gid))
+                .map_err(nix_io)?;
+            nix::sys::stat::fchmod(
+                pty.slave.as_fd(),
+                nix::sys::stat::Mode::from_bits_truncate(0o620),
+            )
+            .map_err(nix_io)?;
+        }
+
         let slave_path = nix::unistd::ttyname(&pty.slave)
             .map_err(nix_io)?
             .to_string_lossy()

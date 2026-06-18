@@ -310,6 +310,17 @@ pub struct ServerAuth {
     auth: Box<dyn Authenticator>,
     state: State,
     pending_user: Option<String>,
+    /// Number of prompts issued in the in-flight keyboard-interactive
+    /// `InteractiveRequest`, retained so the matching INFO_RESPONSE can be
+    /// rejected when its response count does not equal the prompt count
+    /// (RFC 4256 §3.4). `Some` only while [`State::AwaitingInfoResponse`];
+    /// `.take()`n alongside `pending_user`.
+    pending_prompt_count: Option<usize>,
+    /// The username carried by the *first* USERAUTH_REQUEST seen. Once set,
+    /// every later request must carry the same name — OpenSSH terminates
+    /// authentication if the client switches usernames mid-userauth. `None`
+    /// until the first request that carries a username.
+    first_user: Option<String>,
     /// Default-off opt-in: when false (the default), any `AuthAttempt::None`
     /// is short-circuited to `AuthDecision::Reject` **before** the
     /// [`Authenticator`] sees it. This protects against an
@@ -356,6 +367,8 @@ impl ServerAuth {
             auth,
             state: State::AwaitingServiceRequest,
             pending_user: None,
+            pending_prompt_count: None,
+            first_user: None,
             allow_none: false,
             max_auth_tries: None,
             failed_attempts: 0,
@@ -498,14 +511,22 @@ impl ServerAuth {
                     .pending_user
                     .take()
                     .ok_or(Error::Protocol("auth: info response without pending user"))?;
+                let prompt_count = self.pending_prompt_count.take();
                 // `core::mem::take` the responses out instead of moving the
                 // field (which `UserauthInfoResponse`'s zeroizing `Drop` impl
                 // forbids). The drained source leaves an empty Vec behind;
                 // ownership of the response strings passes to the
                 // authenticator via the `Vec<String>` trait API.
                 let responses = core::mem::take(&mut resp.responses);
-                let decision = self.auth.evaluate_interactive(&user, responses);
                 self.state = State::AwaitingRequest;
+                // RFC 4256 §3.4: num-responses MUST equal the num-prompts the
+                // server issued. A mismatch is a malformed/forged response —
+                // treat it as a failed attempt rather than forwarding the
+                // wrong-shaped responses to the authenticator.
+                if prompt_count != Some(responses.len()) {
+                    return self.emit_failure();
+                }
+                let decision = self.auth.evaluate_interactive(&user, responses);
                 self.apply_decision(decision, &user)
             }
             State::Done => Ok(ServerStep::Disconnect("auth: already finished")),
@@ -514,6 +535,20 @@ impl ServerAuth {
 
     fn handle_request(&mut self, req: UserauthRequest) -> Result<ServerStep> {
         let user = req.user.clone();
+        // Pin the username to the first request's value. OpenSSH disconnects
+        // if the client changes the login name mid-userauth; every probe and
+        // every real attempt for a connection must carry the same name. (The
+        // `none`- and pubkey-probe flows all reuse the same username, so this
+        // only fires on an actual switch.)
+        match &self.first_user {
+            Some(prev) if *prev != user => {
+                return Ok(ServerStep::Disconnect(
+                    "auth: username changed mid-authentication",
+                ));
+            }
+            None => self.first_user = Some(user.clone()),
+            _ => {}
+        }
         match req.method {
             AuthMethodPayload::None => {
                 // Hard gate: refuse `"none"` unless the caller explicitly
@@ -701,6 +736,7 @@ impl ServerAuth {
                 instruction,
                 prompts,
             } => {
+                let prompt_count = prompts.len();
                 let req = UserauthInfoRequest {
                     name,
                     instruction,
@@ -709,6 +745,7 @@ impl ServerAuth {
                 };
                 self.state = State::AwaitingInfoResponse;
                 self.pending_user = Some(user.into());
+                self.pending_prompt_count = Some(prompt_count);
                 Ok(ServerStep::Send(req.encode()))
             }
         }

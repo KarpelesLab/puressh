@@ -1173,3 +1173,116 @@ fn client_unset_server_sig_algs_does_not_filter() {
     let parsed = UserauthRequest::decode(&payload).unwrap();
     assert!(matches!(parsed.method, AuthMethodPayload::PublicKey { .. }));
 }
+
+// --- Finding B1: keyboard-interactive response count must equal prompt count.
+#[test]
+fn server_kbdint_wrong_response_count_rejected() {
+    // The server issues a single-prompt InteractiveRequest; a forged
+    // INFO_RESPONSE carrying two responses (count != prompt count, RFC 4256
+    // §3.4) must be treated as a failed attempt — emit_failure — and the
+    // authenticator's evaluate_interactive must never be consulted.
+    struct OnePromptAuth {
+        interactive_called: bool,
+    }
+    impl Authenticator for OnePromptAuth {
+        fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+            match attempt {
+                AuthAttempt::KeyboardInteractive { .. } => AuthDecision::InteractiveRequest {
+                    name: "Login".into(),
+                    instruction: String::new(),
+                    prompts: vec![("Password: ".into(), false)],
+                },
+                _ => AuthDecision::Reject,
+            }
+        }
+        fn evaluate_interactive(&mut self, _user: &str, _responses: Vec<String>) -> AuthDecision {
+            self.interactive_called = true;
+            AuthDecision::Accept
+        }
+    }
+
+    let mut s = ServerAuth::new(
+        TEST_SID.to_vec(),
+        vec!["keyboard-interactive"],
+        Box::new(OnePromptAuth {
+            interactive_called: false,
+        }),
+    );
+    let _ = s.on_packet(
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    );
+    let kreq = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::KeyboardInteractive {
+            language_tag: String::new(),
+            submethods: String::new(),
+        },
+    }
+    .encode();
+    // Server emits a one-prompt InfoRequest.
+    let info_req = match s.on_packet(&kreq).unwrap() {
+        ServerStep::Send(p) => p,
+        _ => panic!("expected InfoRequest Send"),
+    };
+    let ir = UserauthInfoRequest::decode(&info_req).unwrap();
+    assert_eq!(ir.prompts.len(), 1);
+    // Forge a two-response INFO_RESPONSE (wrong count).
+    let bad_resp = super::message::UserauthInfoResponse {
+        responses: vec!["a".into(), "b".into()],
+    }
+    .encode();
+    let step = s.on_packet(&bad_resp).unwrap();
+    match step {
+        ServerStep::Send(p) => {
+            // It is a USERAUTH_FAILURE, not a success.
+            UserauthFailure::decode(&p).unwrap();
+        }
+        _ => panic!("expected Send(failure)"),
+    }
+}
+
+// --- Finding B2: a username change mid-userauth disconnects.
+#[test]
+fn server_username_change_disconnects() {
+    let mut s = ServerAuth::new(TEST_SID.to_vec(), vec!["password"], Box::new(AlwaysReject));
+    let _ = s.on_packet(
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    );
+    // First request pins the username to "alice" (rejected, but pins).
+    let req_alice = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::Password {
+            new_password: None,
+            password: "x".into(),
+        },
+    }
+    .encode();
+    assert!(matches!(
+        s.on_packet(&req_alice).unwrap(),
+        ServerStep::Send(_)
+    ));
+    // A second request that switches to "bob" must disconnect.
+    let req_bob = UserauthRequest {
+        user: "bob".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::Password {
+            new_password: None,
+            password: "x".into(),
+        },
+    }
+    .encode();
+    match s.on_packet(&req_bob).unwrap() {
+        ServerStep::Disconnect(reason) => {
+            assert_eq!(reason, "auth: username changed mid-authentication");
+        }
+        _ => panic!("expected Disconnect"),
+    }
+}

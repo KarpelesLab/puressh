@@ -635,15 +635,18 @@ impl SharedClient {
     #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
     pub(crate) fn with_client<R>(&self, f: impl FnOnce(&mut Client) -> R) -> R {
         // This helper exists for the FFI surface, which expects an infallible
-        // return. If the mutex is poisoned the only meaningful recovery is to
-        // free the handle and reconnect — but the FFI can't observe that from
-        // a function returning `R`. Keep the panic here; the multi-channel
-        // entry points (`sftp`, `exec_stream`, `shell`, …) use `lock_or_poison`
-        // and propagate `Error::Protocol` instead.
-        let mut g = self
-            .inner
-            .lock()
-            .expect("SharedClient mutex poisoned (with_client)");
+        // return, so it cannot propagate poisoning as a `Result` the way the
+        // `lock_or_poison` family does. Finding E (Medium): the previous
+        // `.expect()` panicked on a poisoned mutex, and that panic unwinds
+        // across the C ABI — UB / a process abort — turning one connection's
+        // fault into a whole-process crash, the exact thing the surrounding
+        // code (line-99 note, Finding #9) tries to contain. Recover the guard
+        // instead (same `unwrap_or_else(|e| e.into_inner())` recovery the
+        // poison helpers rely on) so the lock never causes an unwind. Callers
+        // that *can* observe poisoning should prefer `try_with_client`; the
+        // multi-channel entry points (`sftp`, `exec_stream`, `shell`, …) use
+        // `lock_or_poison` and propagate `Error::Protocol` instead.
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         f(&mut g.client)
     }
 

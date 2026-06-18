@@ -503,11 +503,24 @@ impl Certificate {
 
     /// Check that `name` is among the valid principals. An empty principals
     /// list authorizes any principal (OpenSSH semantics).
+    ///
+    /// For **host** certificates the principals are DNS host names, which are
+    /// case-insensitive; we compare with `eq_ignore_ascii_case`, matching
+    /// OpenSSH (and the case-insensitive `@cert-authority` host-pattern gate
+    /// that precedes this call). For **user** certificates the principals are
+    /// login names and the comparison stays case-sensitive.
     pub fn check_principal(&self, name: &str) -> Result<()> {
         if self.valid_principals.is_empty() {
             return Ok(());
         }
-        if self.valid_principals.iter().any(|p| p == name) {
+        let matched = match self.cert_type {
+            CertType::Host => self
+                .valid_principals
+                .iter()
+                .any(|p| p.eq_ignore_ascii_case(name)),
+            CertType::User => self.valid_principals.iter().any(|p| p == name),
+        };
+        if matched {
             Ok(())
         } else {
             Err(Error::CertPrincipalMismatch)

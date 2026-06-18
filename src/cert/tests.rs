@@ -196,6 +196,52 @@ fn principal_mismatch_rejected() {
 }
 
 #[test]
+fn host_principal_match_is_case_insensitive() {
+    // Host-cert principals are DNS host names: case-insensitive per OpenSSH.
+    let mut cert = Certificate::parse(&load_cert_blob("h_ed25519-cert.pub")).unwrap();
+    assert_eq!(cert.cert_type, CertType::Host);
+    assert_eq!(
+        cert.valid_principals,
+        vec!["host.example.com", "host2.example.com"]
+    );
+    // Mixed-case query must match a lowercase principal for a host cert.
+    cert.check_principal("Host.Example.Com").unwrap();
+    cert.check_principal("HOST2.EXAMPLE.COM").unwrap();
+    // A genuinely different host still fails.
+    assert!(matches!(
+        cert.check_principal("evil.example.com"),
+        Err(Error::CertPrincipalMismatch)
+    ));
+
+    // Sanity: forcing the *same* cert to user type makes the comparison
+    // case-sensitive, so the mixed-case query no longer matches.
+    cert.cert_type = CertType::User;
+    assert!(matches!(
+        cert.check_principal("Host.Example.Com"),
+        Err(Error::CertPrincipalMismatch)
+    ));
+    cert.check_principal("host.example.com").unwrap();
+}
+
+#[test]
+fn user_principal_match_is_case_sensitive() {
+    // User-cert principals are login names: case-sensitive per OpenSSH.
+    let cert = Certificate::parse(&load_cert_blob("u_ed25519-cert.pub")).unwrap();
+    assert_eq!(cert.cert_type, CertType::User);
+    assert_eq!(cert.valid_principals, vec!["alice", "bob"]);
+    cert.check_principal("alice").unwrap();
+    // A case variant must NOT match a user-cert login name.
+    assert!(matches!(
+        cert.check_principal("Alice"),
+        Err(Error::CertPrincipalMismatch)
+    ));
+    assert!(matches!(
+        cert.check_principal("BOB"),
+        Err(Error::CertPrincipalMismatch)
+    ));
+}
+
+#[test]
 fn type_mismatch_rejected() {
     let user = Certificate::parse(&load_cert_blob("u_ed25519-cert.pub")).unwrap();
     assert!(matches!(

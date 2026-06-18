@@ -318,6 +318,28 @@ impl SftpServerSession {
         }
     }
 
+    /// When a jail is configured, reject a path whose final component is a
+    /// symlink before performing a mutating fs operation on it. This mirrors
+    /// the guard already used by `op_setstat`/`op_opendir`/`op_ext_hardlink`:
+    /// `resolve()` only does a *lexical* jail check, so a symlink planted at
+    /// the final component (or a symlinked intermediate directory) could
+    /// otherwise redirect remove/rmdir/rename outside the jail. Reuses the
+    /// identical `FxpStatus::NoSuchFile`/"symlink rejected" mapping so a probe
+    /// can't distinguish "absent" from "symlinked", and so behaviour is
+    /// consistent across all guarded ops. No-op when unjailed (`root` None).
+    fn reject_symlink_when_jailed(&self, path: &std::path::Path) -> Result<(), SftpError> {
+        if self.opts.root.is_some() {
+            let md = fs::symlink_metadata(path)?;
+            if md.file_type().is_symlink() {
+                return Err(SftpError::status_msg(
+                    FxpStatus::NoSuchFile,
+                    "symlink rejected",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn op_open(
         &mut self,
         id: u32,
@@ -589,6 +611,9 @@ impl SftpServerSession {
     fn op_remove(&mut self, id: u32, path: Vec<u8>) -> Result<Packet, SftpError> {
         self.require_writable()?;
         let p = self.resolve(&path)?;
+        // Jail consistency: reject a symlinked final component before unlinking
+        // (matches op_setstat/op_opendir). `resolve()` is only a lexical check.
+        self.reject_symlink_when_jailed(&p)?;
         fs::remove_file(&p)?;
         Ok(status_ok(id))
     }
@@ -610,6 +635,9 @@ impl SftpServerSession {
     fn op_rmdir(&mut self, id: u32, path: Vec<u8>) -> Result<Packet, SftpError> {
         self.require_writable()?;
         let p = self.resolve(&path)?;
+        // Jail consistency: reject a symlinked final component before removing
+        // (matches op_setstat/op_opendir). `resolve()` is only a lexical check.
+        self.reject_symlink_when_jailed(&p)?;
         fs::remove_dir(&p)?;
         Ok(status_ok(id))
     }
@@ -665,6 +693,12 @@ impl SftpServerSession {
         self.require_writable()?;
         let from = self.resolve(&oldpath)?;
         let to = self.resolve(&newpath)?;
+        // Jail consistency: reject a symlinked final component on either
+        // operand before renaming (matches op_setstat/op_opendir). `resolve()`
+        // is only a lexical check, so a symlink at `from`/`to` could otherwise
+        // redirect the rename outside the jail.
+        self.reject_symlink_when_jailed(&from)?;
+        self.reject_symlink_when_jailed(&to)?;
         // SFTP v3 RENAME refuses to overwrite the destination.
         if to.exists() {
             return Ok(status_pkt(id, FxpStatus::Failure, "destination exists"));
@@ -792,6 +826,12 @@ impl SftpServerSession {
         let newpath = r.read_string()?.to_vec();
         let from = self.resolve(&oldpath)?;
         let to = self.resolve(&newpath)?;
+        // Jail consistency: reject a symlinked final component on either
+        // operand before renaming (matches op_setstat/op_opendir). `resolve()`
+        // is only a lexical check, so a symlink at `from`/`to` could otherwise
+        // redirect the rename outside the jail.
+        self.reject_symlink_when_jailed(&from)?;
+        self.reject_symlink_when_jailed(&to)?;
         // OpenSSH posix-rename intentionally overwrites the destination —
         // that's the whole reason it exists alongside SFTP v3 RENAME.
         fs::rename(&from, &to)?;
@@ -1101,8 +1141,25 @@ fn format_long_name(name: &[u8], a: &Attrs) -> Vec<u8> {
     );
     let size = a.size.unwrap_or(0);
     let (uid, gid) = a.uid_gid.unwrap_or((0, 0));
-    let name_str = String::from_utf8_lossy(name);
+    // The `longname` is human-readable text rendered directly by clients
+    // (e.g. `ls`). A filename containing terminal control sequences (ANSI/OSC
+    // escapes, carriage returns, etc.) could hijack the client's terminal.
+    // Replace control bytes (C0 < 0x20 and DEL 0x7f) with '?' in this display
+    // string only. The actual `filename` field is left untouched so it
+    // round-trips for subsequent operations.
+    let name_str = sanitize_display(name);
     format!("{p} 1 {uid:>8} {gid:>8} {size:>10} Jan  1 00:00 {name_str}").into_bytes()
+}
+
+/// Replace ASCII control bytes (C0 range `< 0x20` and DEL `0x7f`) with '?' in
+/// a lossy-decoded string, for inclusion in human-readable display output that
+/// a client may render to a terminal. Non-control bytes (including valid
+/// multibyte UTF-8) are preserved.
+fn sanitize_display(name: &[u8]) -> String {
+    String::from_utf8_lossy(name)
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 fn status_ok(id: u32) -> Packet {
@@ -1142,5 +1199,42 @@ fn status_from_err(id: u32, e: SftpError) -> Packet {
         }
         SftpError::Format(s) => status_pkt(id, FxpStatus::BadMessage, s),
         SftpError::Protocol(s) => status_pkt(id, FxpStatus::BadMessage, s),
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    #[test]
+    fn format_long_name_strips_terminal_control_bytes() {
+        // A hostile filename embedding an ANSI escape (ESC = 0x1b) and OSC
+        // sequence plus a carriage return / DEL must not survive into the
+        // human-readable `longname` a client renders on `ls`.
+        let hostile = b"evil\x1b[31m\x1b]0;pwn\x07\rbad\x7f.txt";
+        let attrs = Attrs {
+            permissions: Some(0o100644),
+            size: Some(0),
+            uid_gid: Some((0, 0)),
+            ..Attrs::default()
+        };
+        let out = format_long_name(hostile, &attrs);
+        // No control byte (< 0x20 or 0x7f) may appear anywhere in the output.
+        assert!(
+            !out.iter().any(|&b| b < 0x20 || b == 0x7f),
+            "longname must contain no control bytes: {out:?}"
+        );
+        // The visible (non-control) characters of the name are preserved.
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("evil"));
+        assert!(s.contains("bad"));
+        assert!(s.contains(".txt"));
+    }
+
+    #[test]
+    fn sanitize_display_preserves_utf8_and_replaces_controls() {
+        // Valid multibyte UTF-8 is kept; only control characters become '?'.
+        assert_eq!(sanitize_display("café\t\nx".as_bytes()), "café??x");
+        assert_eq!(sanitize_display(b"plain.txt"), "plain.txt");
     }
 }

@@ -304,6 +304,97 @@ fn jailed_setstat_through_symlink_rejected() {
     h.join().unwrap();
 }
 
+/// Build an outside-the-jail victim file with a unique name, returning the
+/// path plus a guard that unlinks it on drop.
+fn outside_victim(tag: &str, contents: &[u8]) -> (PathBuf, OutsideGuard) {
+    let outside = std::env::temp_dir().join(format!(
+        "puressh-sftp-victim-{}-{}-{}",
+        tag,
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    fs::write(&outside, contents).unwrap();
+    let guard = OutsideGuard(outside.clone());
+    (outside, guard)
+}
+
+#[test]
+fn jailed_remove_through_symlink_rejected() {
+    let tmp = TempDir::new("symjail-remove");
+    let jail = tmp.path().to_path_buf();
+    let (outside, _g) = outside_victim("remove", b"victim");
+    // Plant a symlink inside the jail pointing at the outside victim.
+    std::os::unix::fs::symlink(&outside, jail.join("link")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let err = client.remove(b"link").unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    }
+    // The victim is untouched.
+    assert!(outside.exists());
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_rmdir_through_symlink_rejected() {
+    let tmp = TempDir::new("symjail-rmdir");
+    let jail = tmp.path().to_path_buf();
+    // Outside the jail, a victim directory.
+    let (outside, _g) = outside_victim("rmdir", b"");
+    fs::remove_file(&outside).unwrap();
+    fs::create_dir(&outside).unwrap();
+    let _gd = OutsideDirGuard(outside.clone());
+    // Plant a symlink inside the jail pointing at the outside directory.
+    std::os::unix::fs::symlink(&outside, jail.join("dlink")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let err = client.rmdir(b"dlink").unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    }
+    // The victim directory is untouched.
+    assert!(outside.is_dir());
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_rename_through_symlink_rejected() {
+    let tmp = TempDir::new("symjail-rename");
+    let jail = tmp.path().to_path_buf();
+    let (outside, _g) = outside_victim("rename", b"victim");
+    // Plant a symlink at the rename source pointing outside the jail.
+    std::os::unix::fs::symlink(&outside, jail.join("from")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let err = client.rename(b"from", b"to").unwrap_err();
+    match err {
+        SftpError::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    }
+    // The outside victim still exists at its original location.
+    assert!(outside.exists());
+    assert!(!jail.join("to").exists());
+    drop(client);
+    h.join().unwrap();
+}
+
 #[test]
 fn jailed_open_relative_symlink_to_outside_rejected() {
     let tmp = TempDir::new("symjail-rel");
@@ -490,6 +581,13 @@ impl Drop for OutsideGuard {
     }
 }
 
+struct OutsideDirGuard(PathBuf);
+impl Drop for OutsideDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn large_file_round_trip() {
     let tmp = TempDir::new("large");
@@ -638,6 +736,34 @@ fn posix_rename_outside_jail_rejected() {
         Packet::Status { code, .. } => assert_eq!(code, FxpStatus::PermissionDenied),
         other => panic!("expected STATUS, got {other:?}"),
     }
+
+    drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn posix_rename_through_symlink_rejected() {
+    let tmp = TempDir::new("posix-rename-symjail");
+    let jail = tmp.path().to_path_buf();
+    let (outside, _g) = outside_victim("posix-rename", b"victim");
+    // Plant a symlink at the rename source pointing outside the jail. The
+    // lexical jail check passes (the link itself is inside), so the
+    // final-component symlink guard is what must reject it.
+    std::os::unix::fs::symlink(&outside, jail.join("from")).unwrap();
+    let (a, mut b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let _ = handshake(&mut b);
+
+    let payload = ext_strings(&[b"from", b"to"]);
+    let reply = ext_request(&mut b, b"posix-rename@openssh.com", &payload);
+    match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected STATUS, got {other:?}"),
+    }
+    // The outside victim is untouched and no `to` entry was created.
+    assert!(outside.exists());
+    assert!(!jail.join("to").exists());
 
     drop(b);
     h.join().unwrap();

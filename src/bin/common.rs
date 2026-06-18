@@ -43,6 +43,31 @@ use zeroize::Zeroizing;
 // sites keep compiling unchanged.
 pub use puressh::config::StrictMode;
 
+/// Scrub bytes that are unsafe to emit to an interactive terminal, returning
+/// a display-safe `String`.
+///
+/// Keyboard-interactive (RFC 4256) `name`, `instruction`, and `prompt`
+/// strings arrive from the server DURING authentication — before any trust
+/// decision — and are written verbatim to the operator's TTY. A malicious or
+/// MITM server can embed ANSI/OSC control sequences (e.g. `ESC[...m`,
+/// `ESC]0;...BEL`) to clear the screen, retitle the window, or spoof a prompt
+/// to phish a password. Mirroring `sftp`'s `sanitize_terminal_bytes`, every
+/// control byte — anything below `0x20` (including ESC `0x1b`, TAB `0x09`,
+/// CR/LF) and DEL `0x7f` — is replaced with a `?` placeholder. Printable
+/// non-ASCII characters (e.g. UTF-8 multibyte) pass through unchanged; only
+/// the C0 control range and DEL are scrubbed.
+pub fn sanitize_terminal_str(src: &str) -> String {
+    src.chars()
+        .map(|c| {
+            if (c as u32) < 0x20 || c == '\u{7f}' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
+}
+
 /// Pick the effective username for an SSH session, in OpenSSH's order of
 /// precedence: explicit `-l user` wins; otherwise `user@host` syntax;
 /// otherwise the calling user's `$USER`.
@@ -183,6 +208,9 @@ pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
 /// The returned buffer is [`Zeroizing`] so even echo-on answers (which may
 /// still be secret-adjacent) are wiped on drop.
 pub fn read_kbdint_response(prompt: &str, echo: bool) -> std::io::Result<Zeroizing<String>> {
+    // The prompt is server-supplied and arrives pre-trust; scrub control
+    // bytes so it cannot rewrite the terminal or spoof another prompt.
+    let prompt = sanitize_terminal_str(prompt);
     eprint!("{prompt}");
     std::io::stderr().flush()?;
 
@@ -1259,6 +1287,27 @@ mod target_tests {
     //! not gated to `cfg(unix)` (unlike the signal-handler tests below,
     //! which do).
     use super::*;
+
+    #[test]
+    fn sanitize_strips_control_and_del() {
+        // ESC, OSC-style title set, BEL, CR/LF, TAB, and DEL all become '?'.
+        let evil = "ok\x1b]0;pwned\x07\x1b[2Jline2\r\n\ttab\x7fend";
+        let out = sanitize_terminal_str(evil);
+        assert!(!out.contains('\x1b'), "ESC survived: {out:?}");
+        assert!(!out.contains('\x07'), "BEL survived: {out:?}");
+        assert!(!out.contains('\r') && !out.contains('\n'), "CR/LF survived");
+        assert!(!out.contains('\t'), "TAB survived");
+        assert!(!out.contains('\x7f'), "DEL survived");
+        // Printable text is preserved; each scrubbed byte maps to one '?'.
+        assert!(out.starts_with("ok?]0;pwned?"));
+        assert!(out.ends_with("end"));
+    }
+
+    #[test]
+    fn sanitize_preserves_printable_and_unicode() {
+        let s = "Password for café (日本語): ";
+        assert_eq!(sanitize_terminal_str(s), s);
+    }
 
     #[test]
     fn parse_target_plain_host_no_port() {

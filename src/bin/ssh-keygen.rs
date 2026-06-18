@@ -370,6 +370,12 @@ fn run_generate(args: &Args) -> Result<i32, String> {
         }
         "rsa" => {
             let bits = args.bits.unwrap_or(3072);
+            // OpenSSH refuses RSA keys below 1024 bits and recommends at
+            // least 2048; enforce a 2048-bit floor so a too-small `-b` can't
+            // produce a weak key.
+            if bits < 2048 {
+                return Err("RSA key size must be at least 2048 bits".to_string());
+            }
             PrivateKey::generate_rsa(&mut rng, bits, comment)
                 .map_err(|e| format!("rsa generation: {e}"))?
         }
@@ -630,5 +636,40 @@ fn main() -> ExitCode {
             let clamped = code.clamp(0, 255) as u8;
             ExitCode::from(clamped)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rsa_1024_is_rejected_before_writing() {
+        let args = Args {
+            type_: Some("rsa".into()),
+            bits: Some(1024),
+            file: Some("/tmp/puressh-ssh-keygen-test-should-not-be-written".into()),
+            ..Args::default()
+        };
+        let err = run_generate(&args).unwrap_err();
+        assert!(
+            err.contains("at least 2048 bits"),
+            "expected RSA floor error, got: {err}"
+        );
+        // The guard must fire before any key material is written.
+        assert!(!std::path::Path::new(args.file.as_ref().unwrap()).exists());
+    }
+
+    #[test]
+    fn rsa_just_below_floor_is_rejected() {
+        // 2048 is the minimum accepted value; 2047 must still be refused.
+        let args = Args {
+            type_: Some("rsa".into()),
+            bits: Some(2047),
+            file: Some("/tmp/puressh-ssh-keygen-test-should-not-be-written".into()),
+            ..Args::default()
+        };
+        let err = run_generate(&args).unwrap_err();
+        assert!(err.contains("at least 2048 bits"), "got: {err}");
     }
 }

@@ -32,7 +32,7 @@ use common::{KeystrokeObfuscator, TickAction};
 use common::{
     StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
     expand_tilde, load_identity, parse_target, read_kbdint_response, read_password_from_stdin,
-    resolve_user, set_verbose, try_load_default_identity, vlog,
+    resolve_user, sanitize_terminal_str, set_verbose, try_load_default_identity, vlog,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -767,11 +767,15 @@ impl KeyboardInteractiveResponder for StdinKbdResponder {
         instruction: &str,
         prompts: &[(String, bool)],
     ) -> Vec<String> {
+        // `name`, `instruction`, and each prompt are server-supplied and
+        // reach the TTY before any trust decision; scrub control bytes so a
+        // hostile server can't inject terminal escapes (the per-prompt scrub
+        // happens inside `read_kbdint_response`).
         if !name.is_empty() {
-            eprintln!("{name}");
+            eprintln!("{}", sanitize_terminal_str(name));
         }
         if !instruction.is_empty() {
-            eprintln!("{instruction}");
+            eprintln!("{}", sanitize_terminal_str(instruction));
         }
         prompts
             .iter()

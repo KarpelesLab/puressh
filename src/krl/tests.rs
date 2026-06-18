@@ -160,6 +160,63 @@ fn fingerprint_sha1_and_sha256() {
     assert!(!krl.is_revoked_key(CA_BLOB));
 }
 
+/// Wrap a certificates-section body in a complete KRL blob (header + one
+/// type-1 section) for the hand-built serial-0 tests below.
+fn krl_with_cert_section(sec: &[u8]) -> Vec<u8> {
+    let mut blob = vec![];
+    blob.extend_from_slice(&KRL_MAGIC.to_be_bytes());
+    blob.extend_from_slice(&KRL_FORMAT_VERSION.to_be_bytes());
+    blob.extend_from_slice(&0u64.to_be_bytes()); // krl_version
+    blob.extend_from_slice(&0u64.to_be_bytes()); // generated_date
+    blob.extend_from_slice(&0u64.to_be_bytes()); // flags
+    blob.extend_from_slice(&0u32.to_be_bytes()); // reserved (empty)
+    blob.extend_from_slice(&0u32.to_be_bytes()); // comment (empty)
+    blob.push(SECTION_CERTIFICATES);
+    blob.extend_from_slice(&(sec.len() as u32).to_be_bytes());
+    blob.extend_from_slice(sec);
+    blob
+}
+
+#[test]
+fn serial_zero_revocable_by_list() {
+    // serial 0 is a legitimate default cert serial; a serial-list naming it
+    // must revoke it (consistent with the bitmap path).
+    let mut sec = vec![];
+    sec.extend_from_slice(&0u32.to_be_bytes()); // ca_key (wildcard)
+    sec.extend_from_slice(&0u32.to_be_bytes()); // reserved (empty)
+    sec.push(super::CERT_SERIAL_LIST);
+    sec.extend_from_slice(&8u32.to_be_bytes()); // body len: one u64
+    sec.extend_from_slice(&0u64.to_be_bytes()); // serial 0
+
+    let krl = Krl::parse(&krl_with_cert_section(&sec)).expect("parse");
+    assert!(
+        krl.is_revoked_cert(CA_BLOB, 0, ""),
+        "serial 0 must be revocable by serial-list"
+    );
+    // A non-zero serial not in the list is untouched.
+    assert!(!krl.is_revoked_cert(CA_BLOB, 1, ""));
+}
+
+#[test]
+fn serial_zero_revocable_by_range() {
+    // A range covering 0 (0..=5) must revoke serial 0.
+    let mut sec = vec![];
+    sec.extend_from_slice(&0u32.to_be_bytes()); // ca_key (wildcard)
+    sec.extend_from_slice(&0u32.to_be_bytes()); // reserved (empty)
+    sec.push(super::CERT_SERIAL_RANGE);
+    sec.extend_from_slice(&16u32.to_be_bytes()); // body len: two u64
+    sec.extend_from_slice(&0u64.to_be_bytes()); // min = 0
+    sec.extend_from_slice(&5u64.to_be_bytes()); // max = 5
+
+    let krl = Krl::parse(&krl_with_cert_section(&sec)).expect("parse");
+    assert!(
+        krl.is_revoked_cert(CA_BLOB, 0, ""),
+        "serial 0 must be revocable by serial-range"
+    );
+    assert!(krl.is_revoked_cert(CA_BLOB, 5, ""));
+    assert!(!krl.is_revoked_cert(CA_BLOB, 6, ""));
+}
+
 #[test]
 fn wildcard_ca_applies_to_all() {
     // Build a certificates section with an EMPTY ca_key (wildcard) + a

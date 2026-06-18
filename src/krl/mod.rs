@@ -104,12 +104,18 @@ struct CaRevocation {
 
 impl CaRevocation {
     /// True if a cert with `serial` / `key_id` issued by this CA is revoked.
+    ///
+    /// Serial `0` is treated as an ordinary serial number here, consistently
+    /// across the serial-list, serial-range, and serial-bitmap paths: a KRL
+    /// that lists serial 0 (or a range/bitmap covering it) revokes a cert
+    /// whose serial is 0. Distinguishing "serial 0" from "serial unset" is the
+    /// caller's job (see [`Krl::is_revoked_cert`]); we do not conflate them.
     fn covers(&self, serial: u64, key_id: &str) -> bool {
-        if serial != 0 && self.serials.contains(&serial) {
+        if self.serials.contains(&serial) {
             return true;
         }
         for &(lo, hi) in &self.serial_ranges {
-            if serial != 0 && serial >= lo && serial <= hi {
+            if serial >= lo && serial <= hi {
                 return true;
             }
         }
@@ -268,9 +274,13 @@ impl Krl {
     }
 
     /// True if a certificate signed by `ca_key_blob` with the given `serial`
-    /// and `key_id` is revoked. A serial of `0` (unset) is matched only by
-    /// key-id. A certificates block whose `ca_key_blob` is empty applies to
-    /// every CA.
+    /// and `key_id` is revoked. `serial` is matched literally against the
+    /// serial-list, serial-range, and serial-bitmap entries — including serial
+    /// `0`, which a KRL may legitimately revoke (it is the default cert serial
+    /// `ssh-keygen` assigns when `-z` is not given). A caller that wants to
+    /// treat `0` as "no serial, key-id match only" must pass an empty `key_id`
+    /// alongside it deliberately, not rely on this function to special-case 0.
+    /// A certificates block whose `ca_key_blob` is empty applies to every CA.
     pub fn is_revoked_cert(&self, ca_key_blob: &[u8], serial: u64, key_id: &str) -> bool {
         self.cert_revocations.iter().any(|rev| {
             (rev.ca_key_blob.is_empty() || rev.ca_key_blob == ca_key_blob)

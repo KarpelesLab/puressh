@@ -87,6 +87,33 @@ fn mpint_to_uint(bytes: &[u8]) -> Result<BoxedUint> {
     Ok(BoxedUint::from_be_bytes(&bytes[start..]))
 }
 
+/// Minimum accepted RSA modulus size, in bits.
+///
+/// purecrypto's `BoxedRsaPublicKey` accepts anything down to ~1024 bits, but
+/// 1024-bit RSA is considered broken for SSH authentication (NIST SP 800-131A
+/// withdrew it and OpenSSH 7.6+ rejects shorter-than-2048 by default). We
+/// refuse at parse time rather than at verify time so callers cannot hold a
+/// key/cert that will never be safely usable.
+#[cfg(feature = "alloc")]
+pub(crate) const MIN_RSA_MODULUS_BITS: usize = 2048;
+
+/// Validate a raw RSA modulus `mpint` (as it appears in a public-key or
+/// certificate blob): reject negative / zero encodings and enforce the
+/// [`MIN_RSA_MODULUS_BITS`] floor. This is the single source of truth shared
+/// by the plain-key parser and the certificate parser so the floor cannot be
+/// bypassed by wrapping a weak key in a certificate.
+#[cfg(feature = "alloc")]
+pub(crate) fn check_rsa_modulus_mpint(n_raw: &[u8]) -> Result<()> {
+    let n = mpint_to_uint(n_raw)?;
+    if n.is_zero() {
+        return Err(Error::Format("rsa: zero modulus"));
+    }
+    if n.bit_len() < MIN_RSA_MODULUS_BITS {
+        return Err(Error::Format("rsa: modulus shorter than 2048 bits"));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "alloc")]
 fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, usize)> {
     let mut r = Reader::new(blob);
@@ -104,13 +131,7 @@ fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, usize)> {
     if n.is_zero() {
         return Err(Error::Format("rsa: zero modulus"));
     }
-    // Enforce a 2048-bit minimum modulus. purecrypto's BoxedRsaPublicKey
-    // accepts anything down to ~1024 bits, but 1024-bit RSA is considered
-    // broken for SSH host-key authentication (NIST SP 800-131A withdrew it
-    // and OpenSSH 7.6+ rejects shorter-than-2048 by default). We refuse
-    // here at parse time rather than at verify time so callers cannot hold
-    // a `dyn HostKeyVerify` for a key that will never be safely usable.
-    if n.bit_len() < 2048 {
+    if n.bit_len() < MIN_RSA_MODULUS_BITS {
         return Err(Error::Format("rsa: modulus shorter than 2048 bits"));
     }
     let k = n.bit_len().div_ceil(8);

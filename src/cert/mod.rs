@@ -281,6 +281,11 @@ fn read_embedded_pubkey(key_type: &str, r: &mut Reader<'_>) -> Result<Vec<u8>> {
             // (e then n), matching the plain ssh-rsa blob.
             let e = r.read_string()?;
             let n = r.read_string()?;
+            // Enforce the same 2048-bit modulus floor as the plain ssh-rsa
+            // parser, at parse time. Otherwise a cert wrapping a weak
+            // (<2048-bit) RSA key would parse successfully and the floor would
+            // only bite later if/when an embedded verifier was built.
+            crate::hostkey::rsa::check_rsa_modulus_mpint(n)?;
             w.write_string(b"ssh-rsa");
             w.write_string(e);
             w.write_string(n);

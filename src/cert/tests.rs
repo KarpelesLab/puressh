@@ -330,6 +330,67 @@ fn embedded_verifier_matches_underlying_key() {
     }
 }
 
+/// Build a syntactically-complete `ssh-rsa-cert-v01@openssh.com` blob whose
+/// embedded modulus is `n_bits` bits. The CA signature is garbage — parse()
+/// does not verify it, and the modulus floor is enforced *before* any
+/// signature work, so a too-short modulus must be rejected at parse.
+fn build_rsa_cert_blob(n_bits: usize) -> Vec<u8> {
+    assert_eq!(n_bits % 8, 0);
+    let n_len = n_bits / 8;
+    // Modulus: top bit of the leading magnitude byte set, so the value is
+    // exactly `n_bits` bits wide. Encode as a proper non-negative mpint by
+    // prepending a 0x00 sign byte.
+    let mut n_mag = alloc::vec![0xa5u8; n_len];
+    n_mag[0] = 0x80;
+    let mut n_mpint = alloc::vec![0x00u8];
+    n_mpint.extend_from_slice(&n_mag);
+    let e_mpint = [0x01u8, 0x00, 0x01]; // 65537
+
+    let mut w = Writer::new();
+    w.write_string(b"ssh-rsa-cert-v01@openssh.com");
+    w.write_string(&[0u8; 16]); // nonce
+    w.write_string(&e_mpint); // mpint e
+    w.write_string(&n_mpint); // mpint n
+    w.write_u64(1); // serial
+    w.write_u32(1); // type = user
+    w.write_string(b"weak-rsa"); // key id
+    w.write_string(b""); // valid principals (empty list)
+    w.write_u64(0); // valid after
+    w.write_u64(u64::MAX); // valid before
+    w.write_string(b""); // critical options (empty)
+    w.write_string(b""); // extensions (empty)
+    w.write_string(b""); // reserved
+    w.write_string(b"\x00\x00\x00\x07ssh-rsa"); // signature key (arbitrary)
+    w.write_string(b"\x00\x00\x00\x07ssh-rsasig"); // signature (arbitrary)
+    w.into_vec()
+}
+
+#[test]
+fn rsa_cert_with_weak_modulus_rejected_at_parse() {
+    // A cert wrapping a 1024-bit RSA key must be refused at parse time, with
+    // the same 2048-bit-floor error the plain ssh-rsa parser raises.
+    let blob = build_rsa_cert_blob(1024);
+    match Certificate::parse(&blob) {
+        Err(Error::Format(msg)) => {
+            assert!(
+                msg.contains("2048"),
+                "expected 2048-bit floor error, got {msg:?}"
+            )
+        }
+        Err(other) => panic!("expected Format(2048), got {other:?}"),
+        Ok(_) => panic!("expected 1024-bit embedded RSA key to be rejected at parse"),
+    }
+}
+
+#[test]
+fn rsa_cert_with_2048_modulus_parses() {
+    // The same construction at 2048 bits must clear the floor (it then fails
+    // only later at CA-signature verification, which we don't run here).
+    let blob = build_rsa_cert_blob(2048);
+    let cert = Certificate::parse(&blob).expect("2048-bit embedded RSA must parse");
+    assert_eq!(cert.embedded_algorithm(), "ssh-rsa");
+}
+
 /// Helper mirroring SSH string encoding for the force-command assertion.
 fn encode_str(s: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();

@@ -765,12 +765,17 @@ mod tests {
             .expect("setup");
         let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
         let mut peer = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        // Arm the read timeout while the socket is still freshly connected and
+        // healthy. The worker closes its side as soon as `open_x11` fails, and
+        // on macOS calling `setsockopt(SO_RCVTIMEO)` on a peer-closed socket
+        // returns EINVAL (Linux tolerates it), so setting it after the write
+        // would race the worker's close and flake. Set it up front instead.
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout");
         // Present the matching cookie so the gate passes and the worker
         // reaches `open_x11` (which fails under for_test_no_opens).
         let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
         peer.write_all(&pkt).expect("write setup packet");
-        peer.set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("read timeout");
         let mut buf = [0u8; 1];
         let _ = peer.read(&mut buf);
     }

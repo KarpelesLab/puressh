@@ -50,6 +50,40 @@ jobs:
       - name: Test (all features)
         run: cargo test --all-features
 
+  msrv:
+    name: MSRV (Rust 1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pin the exact MSRV declared in Cargo.toml (`rust-version = "1.88"`).
+      # Keep this version in sync with that field. This job exists so that an
+      # accidental use of a newer-than-1.88 language/std feature — or a
+      # dependency bump that raises the floor (as purecrypto <=0.6.13 silently
+      # did to 1.95) — fails here instead of quietly bumping the real MSRV.
+      # Cargo.lock is gitignored, so dependencies resolve fresh and cargo's
+      # MSRV-aware resolver picks versions compatible with 1.88.
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@1.88
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      # `--all-features` pulls in `pam` (Linux), which links libpam.
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Check (all features, all targets) on MSRV
+        run: cargo check --all-targets --all-features
+
+      - name: Build no_std + alloc on MSRV
+        run: cargo build --no-default-features --features alloc
+
+      - name: Build all module features, no std, on MSRV
+        run: cargo build --no-default-features --features "alloc,client,server"
+
   no_std:
     name: no_std builds
     runs-on: ubuntu-latest

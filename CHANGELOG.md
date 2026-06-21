@@ -7,6 +7,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.6](https://github.com/KarpelesLab/puressh/compare/v0.0.5...v0.0.6) - 2026-06-19
+
+### Fixed
+
+- *(windows)* silence dead-code for unix-only request_tty field
+- *(windows)* collapse cfg(windows) nested if into let-chain
+
+### Other
+
+- bump purecrypto 0.6.1 -> 0.6.14 to honor the 1.88 MSRV
+- fix macOS-only flake in close-on-open-fail test
+- use safe nix::geteuid in lib code (no_std build fix)
+- fail-closed ECDH curve, writer length assert, include depth bound
+- enforce MIT-MAGIC-COOKIE-1 validation by default
+- place /tmp fallback socket in a private per-user subdir
+- reject out-of-range direct-tcpip ports instead of truncating
+- sanitize pre-auth kbd-interactive strings; enforce RSA keygen floor
+- chown/chmod PTY slave to user; StrictModes ownership + ancestor checks
+- recover poisoned mutex in with_client instead of panicking (Finding E)
+- pre-auth DoS hardening — absolute LoginGraceTime + bounded non-panicking accept loop
+- enforce 2048-bit RSA floor on cert-embedded keys at parse time
+- make serial 0 revocable via serial-list and serial-range
+- compare host-cert principals case-insensitively
+- validate kbd-interactive response count and pin username (B1, B2)
+- SFTP jail: reject symlinked final component in remove/rmdir/rename/posix-rename; sanitize control bytes in longname
+- ObscureKeystrokeTiming keystroke-timing obfuscation sender
+- add ObscureKeystrokeTiming client option
+- add ping@openssh.com PING/PONG handling on both sides
+- retire FOLLOWUPS.md — all items closed
+- mark kbd-interactive PAM + KRL done; fmt + macOS dead_code
+- multi-step keyboard-interactive PAM conversation bridge
+- wire RevokedKeys into server cert + pubkey trust gates
+- OpenSSH binary key-revocation-list parser
+- record closed cert-auth residuals (R1-R4) + deferred PAM/KRL items in FOLLOWUPS
+- no_std fix — use String::from in cert force-command decoder (R1)
+- expand %u/%h tokens in AuthorizedPrincipalsFile per connection (R4)
+- enforce positional order for multi-factor AuthenticationMethods chains (R3)
+- enforce user-cert extensions (default-deny) + force-command on shell/SCP (R1+R2)
+- e2e interop tests against real OpenSSH sshd (#[ignore], unix)
+- fix rustdoc intra-doc link in sshd loader comment
+- Phase 5 — critical options (force-command, source-address)
+- Phase 4 — user certificates (client offers, server authorizes)
+- Phase 3 — host certificates (server presents, client verifies)
+- Phase 2 — CASignatureAlgorithms config keyword
+- Phase 1 — OpenSSH certificate parse/verify core
+- run PAM unconditionally for password timing uniformity + doc manual e2e
+- one persistent auth driver, re-promptable password, kbd-interactive
+- PAM password / keyboard-interactive auth + multi-factor chains
+- *(server)* accept password/kbd-interactive/PermitEmptyPasswords + MFA chains
+- mark server follow-ups done; note cert/password auth in progress
+- real ChrootDirectory for shell/exec + PrintMotd for shells (F7, F6)
+- support AllowUsers/DenyUsers user@host form (F8)
+- re-resolve auth method set + banner once username is known (F5, F6)
+- HostKeyAlgorithms +ssh-rsa opt-in (F4)
+- ssh -O check|exit|stop control commands (F3)
+- real ControlPersist daemonization via fork()+setsid() (F2)
+- port/dynamic forwarding over ProxyCommand and ControlMaster mux (F1)
+- track deferred config follow-ups (FOLLOWUPS.md)
+- *(mux)* in-process ControlMaster e2e over loopback Server
+- master/client roles, ControlPersist lifetime, ssh.rs wiring
+- add framed control-socket codec + ControlPath expansion
+- *(client)* add ControlMaster/ControlPath/ControlPersist keywords
+- satisfy clippy on AddressFamily/PidFile wiring
+- W7 unit + in-process integration tests
+- wire W7 startup keywords (RekeyLimit, AddressFamily, PidFile, LogLevel, Compression, Subsystem)
+- gate W7 session/forwarding policy at dispatch points
+- parse W7 session/forwarding/policy + startup keywords
+- per-connection sshd_config policy gate (Match + auth keywords)
+- *(server)* refactor SshServerConfig into global + Match blocks
+- fix rustdoc private/unresolved intra-doc links (W2+W4)
+- document -D/-C/-t/-T and -o passthrough in usage
+- reject Compression yes at parse time without `compress`
+- wire modern client keywords + DynamicForward (-D) end to end
+- honor compression, env, keepalive, pty, add-identity
+- SOCKS4/4a/5 CONNECT handshake for DynamicForward
+- parse modern client ssh_config keywords (strict)
+- wire ProxyJump (-J) and ProxyCommand into the client binary
+- ProxyCommand/ProxyJump keywords + ProcTransport
+- add Transport abstraction over the byte stream (refactor)
+- no_std format import + clippy manual-contains cleanup
+- cargo fmt
+- cover algorithm overrides, negotiation, and auth filtering
+- server + auth + binaries: thread algorithm overrides end-to-end
+- kexinit owned advert + client/server config algorithm keywords
+- strict algorithm-list resolver + catalogues
+- migrate to Rust edition 2024 (rust-version 1.88)
+- portable post-fork env scrub + rustfmt the tree
+- resolve PermitRootLogin root check at login time, not startup
+- add PermitRootLogin policy (config + CLI)
+- cache readdir chunks so no directory entries are dropped
+- saturate exec exit status so it cannot alias the -1 sentinel
+- reject unsolicited forwarded-tcpip opens in serve
+- refuse server-renamed/extra files in single-file fetches
+- sanitize server-supplied names before TTY output
+- clear environment in PTY login shell child (FIX 5)
+- gate every session type via PAM at root, before drop (FIX 1, FIX 2)
+- bound deferred rekey packet queue (FIX 4)
+- cap shell stdout backlog to stop authenticated memory DoS (FIX 3)
+- zeroize cleartext password material on drop
+- make pattern_match private to remove the negation footgun
+- parse line-by-line so one bad UTF-8 byte can't empty the store
+- encode hybrid K as SSH string (not mpint) for H and KDF
+- remove Clone from stateful AEAD/CTR cipher states (nonce-reuse hardening)
+- zeroize derived session keys and redact DirKeys
+- zeroize HMAC session integrity keys on drop
+- reset rekey byte counters & use epoch-relative seq baseline (rekey storm)
+- reject pad_len > packet_length in cleartext decode (CRITICAL pre-auth DoS)
+- bump no_std example to 0.0.5
+- rewrite stale scaffolding doc to match the implemented crate
+
 ## [0.0.5](https://github.com/KarpelesLab/puressh/compare/v0.0.4...v0.0.5) - 2026-06-09
 
 ### Other

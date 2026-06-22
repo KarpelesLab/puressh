@@ -3051,7 +3051,7 @@ fn owned_or_default(over: &Option<Vec<String>>, default: &[&str]) -> Vec<String>
 /// are re-appended here, *after* the (possibly user-supplied) kex list, so a
 /// `KexAlgorithms` override can never strip the Terrapin (CVE-2023-48795)
 /// mitigation. The non-marker default order is taken from `defaults::KEX`.
-fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexInit {
+pub(crate) fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexInit {
     // Real (non-marker) kex default order.
     let default_kex: Vec<&str> = defaults::KEX
         .iter()

@@ -56,6 +56,12 @@ pub mod stream;
 #[cfg(feature = "client")]
 pub mod client;
 
+// Sans-IO connection drivers (transport + handshake + auth + channel
+// orchestration as a pure state machine). The blocking `client`/`server`
+// frontends drive these; an async frontend can too.
+#[cfg(feature = "client")]
+pub mod driver;
+
 // `ProxyCommand` transport (Unix-only): spawns a helper process and runs the
 // SSH session over its stdio. Gated on `client` (which pulls in `std` and the
 // `Transport` trait) so a no_std+alloc build still compiles without it.

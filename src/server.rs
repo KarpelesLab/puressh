@@ -423,6 +423,43 @@ pub trait DirectTcpipHandler: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Decoded `direct-streamlocal@openssh.com` channel-open request (OpenSSH
+/// extension; the Unix-socket analog of [`DirectTcpipRequest`]).
+///
+/// The wire fields are `string socket_path, string reserved, uint32
+/// reserved`; only the socket path is meaningful, and it is surfaced
+/// borrowed so handlers don't need to take ownership.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectStreamlocalRequest<'a> {
+    /// Filesystem path of the Unix-domain socket the client wants the server
+    /// to connect to.
+    pub socket_path: &'a str,
+}
+
+/// Server-side hook called when a client opens a `direct-streamlocal@openssh.com`
+/// channel (used by `ssh -L local:/path/to/remote.sock`).
+///
+/// The handler runs on a dedicated thread per channel. Return `Ok(())` to
+/// close the channel gracefully — the dispatcher emits EOF + Close when the
+/// stream drops, unless the handler has explicitly torn it down via
+/// [`ChannelStream::into_raw`].
+///
+/// Without a handler attached to [`Config::direct_streamlocal_handler`] every
+/// `direct-streamlocal@openssh.com` open is rejected with
+/// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`.
+pub trait DirectStreamlocalHandler: Send + Sync {
+    /// Bridge `request` to whatever transport the implementation wants. The
+    /// default in
+    /// [`crate::forwarding::direct_streamlocal::DefaultDirectStreamlocalHandler`]
+    /// connects to the Unix socket and splices.
+    fn handle(
+        &self,
+        user: &str,
+        request: DirectStreamlocalRequest<'_>,
+        stream: ChannelStream,
+    ) -> Result<()>;
+}
+
 /// Per-binding handle a [`TcpipForwardHandler`] uses to ask the per-connection
 /// server loop to open a `forwarded-tcpip` channel back to the client
 /// (RFC 4254 §7.2; the wire side of `ssh -R`).
@@ -542,6 +579,104 @@ pub trait TcpipForwardHandler: Send + Sync {
     /// Tear down a previously-bound listener. `Err` causes the server to
     /// reply `REQUEST_FAILURE`.
     fn unbind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<()>;
+}
+
+/// Per-binding handle a [`StreamlocalForwardHandler`] uses to ask the
+/// per-connection server loop to open a `forwarded-streamlocal@openssh.com`
+/// channel back to the client (OpenSSH extension; the Unix-socket analog of
+/// [`ForwardContext`] / the wire side of `ssh -R /path/to/remote.sock:...`).
+///
+/// One instance is supplied to each successful call to
+/// [`StreamlocalForwardHandler::bind`]; it stays valid for the lifetime of
+/// that binding. The handler's accept-loop calls
+/// [`StreamlocalForwardContext::open_forwarded_streamlocal`] for every
+/// accepted Unix socket connection on the bound path. The call blocks until
+/// the client confirms (returns a [`ChannelStream`]) or rejects (returns
+/// `Err`).
+#[derive(Clone)]
+pub struct StreamlocalForwardContext {
+    /// Sender into the per-connection streamlocal-open mpsc queue. The loop on
+    /// the receiver end translates each request into a wire-level
+    /// `SSH_MSG_CHANNEL_OPEN forwarded-streamlocal@openssh.com` and parks a
+    /// reply slot until the matching `OPEN_CONFIRMATION` / `OPEN_FAILURE`
+    /// lands.
+    req_tx: Sender<StreamlocalOpenRequest>,
+}
+
+/// One pending server-initiated `forwarded-streamlocal@openssh.com` open.
+/// Carries the bound socket path (echoed back per the extension) and a reply
+/// slot for the resulting [`ChannelStream`].
+pub(crate) struct StreamlocalOpenRequest {
+    /// Path that was being listened on (echoed back to the client).
+    socket_path: String,
+    /// One-shot reply slot. `Ok(stream)` after `OPEN_CONFIRMATION`,
+    /// `Err(_)` after `OPEN_FAILURE` or connection teardown.
+    reply: std::sync::mpsc::SyncSender<Result<ChannelStream>>,
+}
+
+impl StreamlocalForwardContext {
+    /// Used by the connection loop; not for user code.
+    pub(crate) fn new(req_tx: Sender<StreamlocalOpenRequest>) -> Self {
+        Self { req_tx }
+    }
+
+    /// Build a [`StreamlocalForwardContext`] whose
+    /// [`Self::open_forwarded_streamlocal`] calls always fail (the request
+    /// mpsc has no receiver). Useful for unit tests that only exercise
+    /// `bind` / `unbind` and never dial the listener.
+    #[doc(hidden)]
+    pub fn for_test_no_opens() -> Self {
+        let (tx, _rx) = mpsc::channel();
+        drop(_rx);
+        Self { req_tx: tx }
+    }
+
+    /// Ask the connection loop to open a `forwarded-streamlocal@openssh.com`
+    /// channel toward the client. Blocks until the client confirms or rejects
+    /// the open.
+    ///
+    /// On success returns a [`ChannelStream`] connected to the new channel.
+    /// Drop the stream (or send EOF/Close via [`ChannelStream::into_raw`])
+    /// when the Unix socket side hangs up.
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the underlying SSH connection has
+    /// gone away or the client rejected the open.
+    pub fn open_forwarded_streamlocal(&self, socket_path: &str) -> Result<ChannelStream> {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        self.req_tx
+            .send(StreamlocalOpenRequest {
+                socket_path: socket_path.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| Error::Protocol("forwarded-streamlocal: connection closed"))?;
+        rx.recv()
+            .map_err(|_| Error::Protocol("forwarded-streamlocal: reply dropped"))?
+    }
+}
+
+/// Server-side hook for `streamlocal-forward@openssh.com` and
+/// `cancel-streamlocal-forward@openssh.com` global requests (OpenSSH
+/// extension; the inbound bookend of `ssh -R /path/to/remote.sock:...`, the
+/// Unix-socket analog of [`TcpipForwardHandler`]).
+///
+/// The default implementation in
+/// [`crate::forwarding::streamlocal::DefaultStreamlocalForwardHandler`] binds
+/// a real Unix-domain socket, tracks it per-connection so cancel actually
+/// unbinds, and — via the [`StreamlocalForwardContext`] passed to `bind` —
+/// opens a server-initiated `forwarded-streamlocal@openssh.com` channel back
+/// to the client for every accepted connection.
+pub trait StreamlocalForwardHandler: Send + Sync {
+    /// Bind a listener on `socket_path`. An `Err` causes the server to reply
+    /// `REQUEST_FAILURE`.
+    ///
+    /// `ctx` is a per-binding handle the implementation typically clones into
+    /// its accept-loop thread so it can request
+    /// `forwarded-streamlocal@openssh.com` channel-opens back toward the
+    /// client.
+    fn bind(&self, user: &str, socket_path: &str, ctx: StreamlocalForwardContext) -> Result<()>;
+    /// Tear down a previously-bound listener. `Err` causes the server to
+    /// reply `REQUEST_FAILURE`.
+    fn unbind(&self, user: &str, socket_path: &str) -> Result<()>;
 }
 
 /// Per-session-channel handle used by an [`AgentForwardHandler`] to ask the
@@ -804,6 +939,23 @@ pub struct Config {
     /// server-initiated `forwarded-tcpip` channel-open lands in a
     /// follow-up phase, accepted connections are dropped.
     pub tcpip_forward_handler: Option<Arc<dyn TcpipForwardHandler>>,
+    /// Optional `direct-streamlocal@openssh.com` hook (the Unix-socket analog
+    /// of [`Self::direct_tcpip_handler`]; `ssh -L local:/remote.sock`). When
+    /// `None` (the default), every `direct-streamlocal@openssh.com` channel
+    /// open is rejected with `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`. Set this
+    /// to [`crate::forwarding::direct_streamlocal::DefaultDirectStreamlocalHandler`]
+    /// (or your own filter) to enable it.
+    pub direct_streamlocal_handler: Option<Arc<dyn DirectStreamlocalHandler>>,
+    /// Optional `streamlocal-forward@openssh.com` /
+    /// `cancel-streamlocal-forward@openssh.com` global-request hook (the
+    /// Unix-socket analog of [`Self::tcpip_forward_handler`]; the server side
+    /// of `ssh -R /remote.sock:...`). When `None` (the default), both
+    /// requests reply `REQUEST_FAILURE`. Set this to
+    /// [`crate::forwarding::streamlocal::DefaultStreamlocalForwardHandler`] to
+    /// have the server bind a real Unix-socket listener and open
+    /// server-initiated `forwarded-streamlocal@openssh.com` channels back to
+    /// the client.
+    pub streamlocal_forward_handler: Option<Arc<dyn StreamlocalForwardHandler>>,
     /// Optional `auth-agent-req@openssh.com` channel-request hook (i.e. the
     /// server side of `ssh -A`). When `None` (the default), every
     /// `auth-agent-req@openssh.com` request is answered with `CHANNEL_FAILURE`
@@ -1142,6 +1294,8 @@ impl Config {
             subsystem_handler: None,
             direct_tcpip_handler: None,
             tcpip_forward_handler: None,
+            direct_streamlocal_handler: None,
+            streamlocal_forward_handler: None,
             agent_forward_handler: None,
             x11_forward_handler: None,
             on_session_open: None,
@@ -1283,6 +1437,27 @@ impl Config {
     /// `ssh -R`) is answered with `REQUEST_FAILURE`.
     pub fn with_tcpip_forward(mut self, handler: Arc<dyn TcpipForwardHandler>) -> Self {
         self.tcpip_forward_handler = Some(handler);
+        self
+    }
+
+    /// Attach a `DirectStreamlocalHandler`. Without one, every
+    /// `direct-streamlocal@openssh.com` channel open (i.e.
+    /// `ssh -L local:/remote.sock`) is rejected with
+    /// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`.
+    pub fn with_direct_streamlocal(mut self, handler: Arc<dyn DirectStreamlocalHandler>) -> Self {
+        self.direct_streamlocal_handler = Some(handler);
+        self
+    }
+
+    /// Attach a `StreamlocalForwardHandler`. Without one, every
+    /// `streamlocal-forward@openssh.com` / `cancel-streamlocal-forward@openssh.com`
+    /// global request (i.e. `ssh -R /remote.sock:...`) is answered with
+    /// `REQUEST_FAILURE`.
+    pub fn with_streamlocal_forward(
+        mut self,
+        handler: Arc<dyn StreamlocalForwardHandler>,
+    ) -> Self {
+        self.streamlocal_forward_handler = Some(handler);
         self
     }
 
@@ -2115,6 +2290,60 @@ impl ForwardConn {
     }
 }
 
+/// Per-connection state for server-initiated `forwarded-streamlocal@openssh.com`
+/// channel opens (the Unix-socket analog of [`ForwardConn`]; the inbound
+/// half of `ssh -R /remote.sock:...`). [`StreamlocalForwardHandler`]
+/// implementations push [`StreamlocalOpenRequest`]s here; the connection loop
+/// drains them, emits `SSH_MSG_CHANNEL_OPEN`, and parks the reply slot in
+/// `pending_opens` until the client confirms or rejects.
+struct StreamlocalForwardConn {
+    req_tx: Sender<StreamlocalOpenRequest>,
+    req_rx: Receiver<StreamlocalOpenRequest>,
+    /// Local channel id -> reply slot for that open.
+    pending_opens: BTreeMap<u32, std::sync::mpsc::SyncSender<Result<ChannelStream>>>,
+    /// Socket paths we've handed to the handler, so we can unbind them on
+    /// connection teardown.
+    owned_bindings: Vec<String>,
+}
+
+impl StreamlocalForwardConn {
+    fn new() -> Self {
+        let (req_tx, req_rx) = std::sync::mpsc::channel();
+        Self {
+            req_tx,
+            req_rx,
+            pending_opens: BTreeMap::new(),
+            owned_bindings: Vec::new(),
+        }
+    }
+
+    /// Emit one `SSH_MSG_CHANNEL_OPEN forwarded-streamlocal@openssh.com` per
+    /// queued request. Pending-reply entries land in `self.pending_opens`
+    /// keyed by the freshly-allocated local id.
+    fn drain_pending<R: RngCore + CryptoRng>(
+        &mut self,
+        stream: &mut TcpStream,
+        codec: &mut PacketCodec,
+        rng: &mut R,
+        conn: &mut ConnectionState,
+    ) -> Result<()> {
+        loop {
+            match self.req_rx.try_recv() {
+                Ok(req) => {
+                    let kind = ChannelOpen::ForwardedStreamlocal {
+                        socket_path: req.socket_path.clone(),
+                    };
+                    let (local_id, payload) = conn.open(kind)?;
+                    write_payload(stream, codec, rng, &payload)?;
+                    self.pending_opens.insert(local_id, req.reply);
+                }
+                Err(TryRecvError::Empty) => return Ok(()),
+                Err(TryRecvError::Disconnected) => return Ok(()),
+            }
+        }
+    }
+}
+
 /// Per-connection state for server-initiated `auth-agent@openssh.com`
 /// channel opens (`ssh -A` traffic). Mirrors [`ForwardConn`] but for the
 /// payload-free OpenSSH agent extension: the accept loop inside an
@@ -2269,6 +2498,9 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     // Per-connection X11-forward queue + active handles. Empty until at
     // least one session channel requests `x11-req`.
     let mut x11_forward = X11ForwardConn::new();
+    // Per-connection streamlocal-forward queue + bindings. Empty until the
+    // client sends a `streamlocal-forward@openssh.com` global request.
+    let mut streamlocal_forward = StreamlocalForwardConn::new();
     let mut polling_active = false;
     let mut extras = ConnExtras::new();
     let result = do_connection_loop(
@@ -2294,6 +2526,7 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
         &mut forward,
         &mut agent_forward,
         &mut x11_forward,
+        &mut streamlocal_forward,
         &mut polling_active,
         &mut extras,
     );
@@ -2321,6 +2554,18 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     x11_forward.active.clear();
     for (_id, reply) in x11_forward.pending_opens.drain_filter_compat() {
         let _ = reply.send(Err(Error::Protocol("x11: connection torn down")));
+    }
+    // Release every streamlocal binding so the Unix-socket listener threads
+    // inside the handler exit cleanly and unlink their sockets.
+    if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
+        for path in streamlocal_forward.owned_bindings.drain(..) {
+            let _ = handler.unbind(user, &path);
+        }
+    }
+    for (_id, reply) in streamlocal_forward.pending_opens.drain_filter_compat() {
+        let _ = reply.send(Err(Error::Protocol(
+            "forwarded-streamlocal: connection torn down",
+        )));
     }
     result
 }
@@ -2398,6 +2643,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
     forward: &mut ForwardConn,
     agent_forward: &mut AgentForwardConn,
     x11_forward: &mut X11ForwardConn,
+    streamlocal_forward: &mut StreamlocalForwardConn,
     polling_active: &mut bool,
     extras: &mut ConnExtras,
 ) -> Result<()> {
@@ -2431,6 +2677,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                 forward,
                 agent_forward,
                 x11_forward,
+                streamlocal_forward,
             )?;
             continue;
         }
@@ -2450,6 +2697,10 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // `x11` channel-opens asynchronously and needs the 50 ms polling
         // tick to flush them.
         let any_x11_fwd_alive = !x11_forward.active.is_empty();
+        // Same for streamlocal reverse forwarding: each active Unix-socket
+        // listener spins up `forwarded-streamlocal@openssh.com` opens
+        // asynchronously and needs the 50 ms polling tick to flush them.
+        let any_streamlocal_fwd_alive = !streamlocal_forward.owned_bindings.is_empty();
         // ClientAliveInterval: the keepalive timer needs the loop to spin on
         // the 50 ms tick even when nothing else is draining, so it can notice
         // a silent peer and emit `keepalive@openssh.com`.
@@ -2459,6 +2710,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             || any_forward_alive
             || any_agent_fwd_alive
             || any_x11_fwd_alive
+            || any_streamlocal_fwd_alive
             || keepalive_enabled;
         if want_polling && !*polling_active {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
@@ -2478,6 +2730,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             forward.drain_pending(stream, codec, rng, conn)?;
             agent_forward.drain_pending(stream, codec, rng, conn)?;
             x11_forward.drain_pending(stream, codec, rng, conn)?;
+            streamlocal_forward.drain_pending(stream, codec, rng, conn)?;
         }
 
         // ClientAliveInterval / ClientAliveCountMax (OpenSSH server keepalive).
@@ -2510,6 +2763,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             && !any_forward_alive
             && !any_agent_fwd_alive
             && !any_x11_fwd_alive
+            && !any_streamlocal_fwd_alive
         {
             return Ok(());
         }
@@ -2634,6 +2888,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             forward,
             agent_forward,
             x11_forward,
+            streamlocal_forward,
         )?;
     }
 }
@@ -2913,6 +3168,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
     forward: &mut ForwardConn,
     agent_forward: &mut AgentForwardConn,
     x11_forward: &mut X11ForwardConn,
+    streamlocal_forward: &mut StreamlocalForwardConn,
 ) -> Result<()> {
     let ev = conn.on_packet(payload)?;
     match ev {
@@ -2987,6 +3243,26 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                     },
                 );
                 let _ = reply.send(Ok(cs));
+            } else if let Some(reply) = streamlocal_forward.pending_opens.remove(&channel) {
+                // Symmetric with the `forwarded-tcpip` arm, for
+                // `forwarded-streamlocal@openssh.com`.
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                let cs = ChannelStream::new(ingress_rx, egress_tx);
+                subsystems.insert(
+                    channel,
+                    SubsystemRuntime {
+                        ingress_tx,
+                        egress_rx,
+                        pending_data: Vec::new(),
+                        pending_eof: false,
+                        pending_close: false,
+                        eof_sent: false,
+                        close_sent: false,
+                    },
+                );
+                let _ = reply.send(Ok(cs));
             }
         }
         ChannelEvent::OpenFailed {
@@ -3002,6 +3278,10 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 let _ = reply.send(Err(Error::Protocol("auth-agent: open rejected by peer")));
             } else if let Some(reply) = x11_forward.pending_opens.remove(&channel) {
                 let _ = reply.send(Err(Error::Protocol("x11: open rejected by peer")));
+            } else if let Some(reply) = streamlocal_forward.pending_opens.remove(&channel) {
+                let _ = reply.send(Err(Error::Protocol(
+                    "forwarded-streamlocal: open rejected by peer",
+                )));
             }
         }
         ChannelEvent::OpenRejected {
@@ -3109,6 +3389,58 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                         channel,
                         SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
                         "direct-tcpip not enabled",
+                        "",
+                    )?;
+                    write_payload(stream, codec, rng, &p)?;
+                }
+            }
+            ChannelOpen::DirectStreamlocal { socket_path } => {
+                // AllowStreamLocalForwarding capability ceiling. We reuse the
+                // local-forwarding gate (the same `AllowTcpForwarding`-derived
+                // flag `direct-tcpip` uses); PermitOpen is host:port-based and
+                // does not apply to Unix-socket paths, so destination
+                // filtering is left to the handler's own policy.
+                let forwarding_ok = effective.local_forwarding_allowed();
+                if !forwarding_ok {
+                    let p = conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "local forwarding administratively prohibited",
+                        "",
+                    )?;
+                    write_payload(stream, codec, rng, &p)?;
+                } else if let Some(handler) = cfg.direct_streamlocal_handler.clone() {
+                    let p = conn.accept_open(channel)?;
+                    write_payload(stream, codec, rng, &p)?;
+
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    let user_owned = user.to_string();
+                    thread::spawn(move || {
+                        let req = DirectStreamlocalRequest {
+                            socket_path: &socket_path,
+                        };
+                        let _ = handler.handle(&user_owned, req, cs);
+                    });
+                    subsystems.insert(
+                        channel,
+                        SubsystemRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                } else {
+                    let p = conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "direct-streamlocal not enabled",
                         "",
                     )?;
                     write_payload(stream, codec, rng, &p)?;
@@ -3227,7 +3559,17 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             want_reply,
         } => {
             handle_global_request(
-                stream, codec, rng, conn, cfg, effective, user, request, want_reply, forward,
+                stream,
+                codec,
+                rng,
+                conn,
+                cfg,
+                effective,
+                user,
+                request,
+                want_reply,
+                forward,
+                streamlocal_forward,
             )?;
         }
         _ => {}
@@ -3247,6 +3589,7 @@ fn handle_global_request<R: RngCore + CryptoRng>(
     request: crate::channel::GlobalRequest,
     want_reply: bool,
     forward: &mut ForwardConn,
+    streamlocal_forward: &mut StreamlocalForwardConn,
 ) -> Result<()> {
     use crate::channel::GlobalRequest;
     use crate::format::Writer;
@@ -3325,6 +3668,54 @@ fn handle_global_request<R: RngCore + CryptoRng>(
                     forward
                         .owned_bindings
                         .retain(|(a, p)| !(a == &effective_bind && *p == bind_port as u16));
+                }
+                r
+            } else {
+                false
+            };
+            if !want_reply {
+                return Ok(());
+            }
+            let p = if ok {
+                conn.send_global_success(&[])
+            } else {
+                conn.send_global_failure()
+            };
+            write_payload(stream, codec, rng, &p)?;
+        }
+        GlobalRequest::StreamlocalForward { socket_path } => {
+            // AllowStreamLocalForwarding capability ceiling: reuse the
+            // remote-forwarding gate. PermitListen is host:port-based and does
+            // not apply to Unix-socket paths, so path filtering is left to the
+            // handler's own policy.
+            let bound = if !effective.remote_forwarding_allowed() {
+                false
+            } else if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
+                let ctx = StreamlocalForwardContext::new(streamlocal_forward.req_tx.clone());
+                handler.bind(user, &socket_path, ctx).is_ok()
+            } else {
+                false
+            };
+            if bound {
+                streamlocal_forward.owned_bindings.push(socket_path.clone());
+            }
+            if !want_reply {
+                return Ok(());
+            }
+            let p = if bound {
+                conn.send_global_success(&[])
+            } else {
+                conn.send_global_failure()
+            };
+            write_payload(stream, codec, rng, &p)?;
+        }
+        GlobalRequest::CancelStreamlocalForward { socket_path } => {
+            let ok = if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
+                let r = handler.unbind(user, &socket_path).is_ok();
+                if r {
+                    streamlocal_forward
+                        .owned_bindings
+                        .retain(|p| p != &socket_path);
                 }
                 r
             } else {

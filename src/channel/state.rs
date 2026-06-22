@@ -101,6 +101,28 @@ pub enum ChannelOpen {
         /// Originator's TCP port.
         orig_port: u32,
     },
+    /// `"direct-streamlocal@openssh.com"` — client asks the server to open a
+    /// connection to a Unix-domain socket (OpenSSH extension, the Unix-socket
+    /// analog of `direct-tcpip`; what `ssh -L local:/remote.sock` opens).
+    ///
+    /// The wire tail is `string socket_path, string reserved, uint32
+    /// reserved`; the two reserved fields are currently unused by OpenSSH —
+    /// we emit them empty/zero and ignore them on decode.
+    DirectStreamlocal {
+        /// Filesystem path of the socket the server should connect to.
+        socket_path: String,
+    },
+    /// `"forwarded-streamlocal@openssh.com"` — server delivers an incoming
+    /// connection accepted on a previously bound Unix-domain socket (OpenSSH
+    /// extension, the Unix-socket analog of `forwarded-tcpip`).
+    ///
+    /// The wire tail is `string socket_path, string reserved`; the reserved
+    /// field is currently unused by OpenSSH — we emit it empty and ignore it
+    /// on decode.
+    ForwardedStreamlocal {
+        /// Path that was being listened on (echoed back per the extension).
+        socket_path: String,
+    },
     /// `"auth-agent@openssh.com"` — server-initiated channel that proxies a
     /// connection on the per-session forwarded agent socket back to the
     /// client's local `$SSH_AUTH_SOCK`. RFC pseudo-extension as deployed by
@@ -131,6 +153,8 @@ impl ChannelOpen {
             ChannelOpen::Session => "session",
             ChannelOpen::DirectTcpip { .. } => "direct-tcpip",
             ChannelOpen::ForwardedTcpip { .. } => "forwarded-tcpip",
+            ChannelOpen::DirectStreamlocal { .. } => "direct-streamlocal@openssh.com",
+            ChannelOpen::ForwardedStreamlocal { .. } => "forwarded-streamlocal@openssh.com",
             ChannelOpen::AuthAgent => "auth-agent@openssh.com",
             ChannelOpen::X11 { .. } => "x11",
             ChannelOpen::Other { kind, .. } => kind.as_str(),
@@ -156,6 +180,17 @@ impl ChannelOpen {
                 w.write_u32(*dest_port);
                 w.write_string(orig_host.as_bytes());
                 w.write_u32(*orig_port);
+            }
+            ChannelOpen::DirectStreamlocal { socket_path } => {
+                // `string socket_path, string reserved, uint32 reserved`.
+                w.write_string(socket_path.as_bytes());
+                w.write_string(&[]);
+                w.write_u32(0);
+            }
+            ChannelOpen::ForwardedStreamlocal { socket_path } => {
+                // `string socket_path, string reserved`.
+                w.write_string(socket_path.as_bytes());
+                w.write_string(&[]);
             }
             ChannelOpen::AuthAgent => {}
             ChannelOpen::X11 {
@@ -198,6 +233,19 @@ impl ChannelOpen {
                     orig_host,
                     orig_port,
                 })
+            }
+            "direct-streamlocal@openssh.com" => {
+                let socket_path = read_utf8(&mut r)?;
+                // `string reserved, uint32 reserved` — currently unused.
+                let _reserved = r.read_string()?;
+                let _reserved2 = r.read_u32()?;
+                Ok(ChannelOpen::DirectStreamlocal { socket_path })
+            }
+            "forwarded-streamlocal@openssh.com" => {
+                let socket_path = read_utf8(&mut r)?;
+                // `string reserved` — currently unused.
+                let _reserved = r.read_string()?;
+                Ok(ChannelOpen::ForwardedStreamlocal { socket_path })
             }
             "auth-agent@openssh.com" => Ok(ChannelOpen::AuthAgent),
             "x11" => {

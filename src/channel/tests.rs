@@ -315,6 +315,34 @@ fn forwarded_tcpip_open_round_trip() {
 }
 
 #[test]
+fn direct_streamlocal_open_round_trip() {
+    let (mut client, mut server) = pair();
+    let open = ChannelOpen::DirectStreamlocal {
+        socket_path: "/run/user/1000/docker.sock".to_string(),
+    };
+    let (_client_local, payload) = client.open(open.clone()).unwrap();
+    let ev = server.on_packet(&payload).unwrap();
+    match ev {
+        ChannelEvent::OpenRequest { kind, .. } => assert_eq!(kind, open),
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn forwarded_streamlocal_open_round_trip() {
+    let (mut client, mut server) = pair();
+    let open = ChannelOpen::ForwardedStreamlocal {
+        socket_path: "/tmp/remote.sock".to_string(),
+    };
+    let (_, payload) = client.open(open.clone()).unwrap();
+    let ev = server.on_packet(&payload).unwrap();
+    match ev {
+        ChannelEvent::OpenRequest { kind, .. } => assert_eq!(kind, open),
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn auth_agent_open_round_trip() {
     let (mut client, mut server) = pair();
     let open = ChannelOpen::AuthAgent;
@@ -529,6 +557,41 @@ fn global_request_cancel_forward_round_trip() {
     req.encode(&mut w);
     let decoded = GlobalRequest::decode("cancel-tcpip-forward", w.as_slice()).unwrap();
     assert_eq!(decoded, req);
+}
+
+#[test]
+fn global_request_streamlocal_forward_round_trip() {
+    let conn = ConnectionState::new();
+    let req = GlobalRequest::StreamlocalForward {
+        socket_path: "/tmp/remote.sock".to_string(),
+    };
+    let payload = conn.send_global_request(req.clone(), true);
+
+    let mut peer = ConnectionState::new();
+    let ev = peer.on_packet(&payload).unwrap();
+    match ev {
+        ChannelEvent::GlobalRequest {
+            request,
+            want_reply,
+        } => {
+            assert!(want_reply);
+            assert_eq!(request, req);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
+fn global_request_cancel_streamlocal_forward_round_trip() {
+    let req = GlobalRequest::CancelStreamlocalForward {
+        socket_path: "/tmp/remote.sock".to_string(),
+    };
+    let mut w = crate::format::Writer::new();
+    req.encode(&mut w);
+    let decoded =
+        GlobalRequest::decode("cancel-streamlocal-forward@openssh.com", w.as_slice()).unwrap();
+    assert_eq!(decoded, req);
+    assert_eq!(req.name(), "cancel-streamlocal-forward@openssh.com");
 }
 
 #[test]

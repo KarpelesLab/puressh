@@ -24,6 +24,20 @@ pub enum GlobalRequest {
         /// The originally bound port.
         bind_port: u32,
     },
+    /// `"streamlocal-forward@openssh.com"` — ask the server to listen on a
+    /// Unix-domain socket and forward incoming connections (OpenSSH
+    /// extension, the Unix-socket analog of `tcpip-forward`; the inbound
+    /// bookend of `ssh -R /remote.sock:...`).
+    StreamlocalForward {
+        /// Filesystem path of the socket the server should bind.
+        socket_path: String,
+    },
+    /// `"cancel-streamlocal-forward@openssh.com"` — undo a previous
+    /// `streamlocal-forward`.
+    CancelStreamlocalForward {
+        /// The originally bound socket path.
+        socket_path: String,
+    },
     /// OpenSSH's `"keepalive@openssh.com"` heartbeat.
     Keepalive,
     /// Any request type we don't recognise.
@@ -41,6 +55,10 @@ impl GlobalRequest {
         match self {
             GlobalRequest::TcpipForward { .. } => "tcpip-forward",
             GlobalRequest::CancelTcpipForward { .. } => "cancel-tcpip-forward",
+            GlobalRequest::StreamlocalForward { .. } => "streamlocal-forward@openssh.com",
+            GlobalRequest::CancelStreamlocalForward { .. } => {
+                "cancel-streamlocal-forward@openssh.com"
+            }
             GlobalRequest::Keepalive => "keepalive@openssh.com",
             GlobalRequest::Other { name, .. } => name.as_str(),
         }
@@ -59,6 +77,10 @@ impl GlobalRequest {
             } => {
                 w.write_string(bind_address.as_bytes());
                 w.write_u32(*bind_port);
+            }
+            GlobalRequest::StreamlocalForward { socket_path }
+            | GlobalRequest::CancelStreamlocalForward { socket_path } => {
+                w.write_string(socket_path.as_bytes());
             }
             GlobalRequest::Keepalive => {}
             GlobalRequest::Other { raw, .. } => {
@@ -86,6 +108,14 @@ impl GlobalRequest {
                     bind_address,
                     bind_port,
                 })
+            }
+            "streamlocal-forward@openssh.com" => {
+                let socket_path = read_utf8(&mut r)?;
+                Ok(GlobalRequest::StreamlocalForward { socket_path })
+            }
+            "cancel-streamlocal-forward@openssh.com" => {
+                let socket_path = read_utf8(&mut r)?;
+                Ok(GlobalRequest::CancelStreamlocalForward { socket_path })
             }
             "keepalive@openssh.com" => Ok(GlobalRequest::Keepalive),
             other => Ok(GlobalRequest::Other {

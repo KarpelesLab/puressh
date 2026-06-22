@@ -306,6 +306,28 @@ pub struct ForwardedTcpipOrigin {
 pub type ForwardedTcpipCallback =
     dyn Fn(ForwardedTcpipOrigin, ChannelStream) + Send + Sync + 'static;
 
+/// Origin info accompanying a server-initiated `forwarded-streamlocal@openssh.com`
+/// channel (OpenSSH extension; the Unix-socket analog of
+/// [`ForwardedTcpipOrigin`]). Passed to
+/// [`ClientHandlers::on_forwarded_streamlocal`] so the callback knows which
+/// bound socket the connection arrived on.
+#[derive(Debug, Clone)]
+pub struct ForwardedStreamlocalOrigin {
+    /// Path the server is listening on (typically what the client passed to
+    /// [`Client::request_streamlocal_forward`]).
+    pub socket_path: String,
+}
+
+/// Type alias for the [`ClientHandlers::on_forwarded_streamlocal`] callback.
+///
+/// The handler takes ownership of a fresh [`ChannelStream`] wired to the
+/// incoming channel. When it returns (or the stream drops), the channel is
+/// torn down by the serve loop. Implementations typically splice the stream
+/// against a local Unix socket — see
+/// [`crate::forwarding::streamlocal::splice_to_unix_socket_callback`].
+pub type ForwardedStreamlocalCallback =
+    dyn Fn(ForwardedStreamlocalOrigin, ChannelStream) + Send + Sync + 'static;
+
 /// Type alias for the [`ClientHandlers::on_auth_agent`] callback.
 ///
 /// Fires on every server-initiated `auth-agent@openssh.com` channel — one
@@ -334,6 +356,10 @@ pub struct ClientHandlers {
     /// Callback for `"forwarded-tcpip"` channel opens (RFC 4254 §7.2, the
     /// inbound bookend of `ssh -R`). `None` ⇒ reject.
     pub on_forwarded_tcpip: Option<Arc<ForwardedTcpipCallback>>,
+    /// Callback for `"forwarded-streamlocal@openssh.com"` channel opens
+    /// (OpenSSH extension, the inbound bookend of `ssh -R /remote.sock:...`).
+    /// `None` ⇒ reject.
+    pub on_forwarded_streamlocal: Option<Arc<ForwardedStreamlocalCallback>>,
     /// Callback for `"auth-agent@openssh.com"` channel opens (server-side
     /// half of agent forwarding, `ssh -A`). `None` ⇒ reject.
     pub on_auth_agent: Option<Arc<AuthAgentCallback>>,
@@ -361,6 +387,7 @@ impl ClientHandlers {
     pub fn new() -> Self {
         Self {
             on_forwarded_tcpip: None,
+            on_forwarded_streamlocal: None,
             on_auth_agent: None,
             on_x11: None,
             stop: Arc::new(AtomicBool::new(false)),
@@ -371,6 +398,15 @@ impl ClientHandlers {
     /// Install a `forwarded-tcpip` handler (`ssh -R` server-initiated opens).
     pub fn with_forwarded_tcpip(mut self, cb: Arc<ForwardedTcpipCallback>) -> Self {
         self.on_forwarded_tcpip = Some(cb);
+        self
+    }
+
+    /// Install a `forwarded-streamlocal@openssh.com` handler
+    /// (`ssh -R /remote.sock:...` server-initiated opens). For the default
+    /// behaviour (splice each incoming channel against a local Unix socket),
+    /// see [`crate::forwarding::streamlocal::splice_to_unix_socket_callback`].
+    pub fn with_forwarded_streamlocal(mut self, cb: Arc<ForwardedStreamlocalCallback>) -> Self {
+        self.on_forwarded_streamlocal = Some(cb);
         self
     }
 
@@ -428,6 +464,15 @@ pub enum ServeCommand {
         /// `OpenConfirmed`, `Err` on `OpenFailed` or loop teardown.
         reply: mpsc::SyncSender<Result<ChannelStream>>,
     },
+    /// Open a `direct-streamlocal@openssh.com` channel; on confirmation, send
+    /// the resulting [`ChannelStream`] back through `reply`. On peer
+    /// rejection, send `Err`.
+    OpenDirectStreamlocal {
+        /// Unix-socket path the *server* should connect to.
+        socket_path: String,
+        /// Where to deliver the open's outcome.
+        reply: mpsc::SyncSender<Result<ChannelStream>>,
+    },
 }
 
 /// Handle external threads use to drive the running [`Client::serve`] loop.
@@ -463,6 +508,26 @@ impl ServeContext {
                 dest_port,
                 orig_host: orig_host.to_string(),
                 orig_port,
+                reply: reply_tx,
+            })
+            .map_err(|_| Error::Protocol("serve loop terminated"))?;
+        reply_rx
+            .recv()
+            .map_err(|_| Error::Protocol("serve loop terminated"))?
+    }
+
+    /// Request a `direct-streamlocal@openssh.com` channel from inside a
+    /// running serve loop and block until the peer confirms or rejects.
+    /// Mirrors [`Self::open_direct_tcpip`] but for a Unix-socket destination
+    /// (the wire side of `ssh -L local:/remote.sock`).
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the serve loop has already
+    /// returned (the receiver hung up).
+    pub fn open_direct_streamlocal(&self, socket_path: &str) -> Result<ChannelStream> {
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<ChannelStream>>(1);
+        self.cmd_tx
+            .send(ServeCommand::OpenDirectStreamlocal {
+                socket_path: socket_path.to_string(),
                 reply: reply_tx,
             })
             .map_err(|_| Error::Protocol("serve loop terminated"))?;
@@ -594,6 +659,13 @@ pub struct Client {
     /// `ssh` binary does) should keep doing it in their
     /// `on_forwarded_tcpip` callback.
     tcpip_forward_grants: Vec<(String, u16)>,
+    /// Outstanding reverse streamlocal-forward grants: socket paths for which
+    /// [`Self::request_streamlocal_forward`] succeeded and which have not been
+    /// cancelled via [`Self::cancel_streamlocal_forward`]. Used as the same
+    /// conservative defence-in-depth filter as [`Self::tcpip_forward_grants`]:
+    /// a `forwarded-streamlocal@openssh.com` open is rejected only when there
+    /// are **zero** outstanding grants.
+    streamlocal_forward_grants: Vec<String>,
 }
 
 /// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
@@ -699,6 +771,7 @@ impl Client {
             keepalive: None,
             request_pty: None,
             tcpip_forward_grants: Vec::new(),
+            streamlocal_forward_grants: Vec::new(),
         };
         me.host_key_policy = cfg.host_key_policy;
         me.do_version_and_kex()?;
@@ -1723,6 +1796,59 @@ impl Client {
         })
     }
 
+    /// Open a `direct-streamlocal@openssh.com` channel (OpenSSH extension; the
+    /// Unix-socket analog of [`Self::open_direct_tcpip`], the wire side of
+    /// `ssh -L local:/remote.sock`). Asks the server to connect to
+    /// `socket_path` and proxies bytes over the returned channel.
+    ///
+    /// Single-channel helper: while the returned stream is alive the client
+    /// cannot be used for anything else. For multi-channel use, drive
+    /// [`Self::serve`] and call
+    /// [`ServeContext::open_direct_streamlocal`] from another thread.
+    #[cfg_attr(
+        feature = "multichannel",
+        deprecated(
+            since = "0.0.7",
+            note = "Use ServeContext::open_direct_streamlocal for multi-channel support."
+        )
+    )]
+    pub fn open_direct_streamlocal(
+        &mut self,
+        socket_path: &str,
+    ) -> Result<ClientChannelStream<'_>> {
+        let (local_id, open_payload) = self.conn.open(ChannelOpen::DirectStreamlocal {
+            socket_path: socket_path.to_string(),
+        })?;
+        self.write_payload(&open_payload)?;
+
+        let mut iter_guard = 0usize;
+        loop {
+            iter_guard += 1;
+            if iter_guard > MAX_EXEC_ITER {
+                return Err(Error::Protocol(
+                    "direct-streamlocal: open loop did not converge",
+                ));
+            }
+            let payload = self.read_one_packet()?;
+            match self.conn.on_packet(&payload)? {
+                ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
+                ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
+                    return Err(Error::Protocol("direct-streamlocal: open failed"));
+                }
+                _ => {}
+            }
+        }
+
+        Ok(ClientChannelStream {
+            client: self,
+            channel: local_id,
+            read_buf: Vec::new(),
+            stderr_buf: Vec::new(),
+            remote_eof: false,
+            local_close_sent: false,
+        })
+    }
+
     /// Upload one or more local sources to a remote destination via SCP.
     ///
     /// Issues `scp -t [-r] [-p] -- <quoted dest>` on the peer (a remote
@@ -1917,6 +2043,56 @@ impl Client {
             })
         {
             self.tcpip_forward_grants.swap_remove(idx);
+        }
+        Ok(())
+    }
+
+    /// Send a `streamlocal-forward@openssh.com` global request (OpenSSH
+    /// extension; the Unix-socket analog of [`Self::request_tcpip_forward`],
+    /// the outbound bookend of `ssh -R /remote.sock:...`) and block until the
+    /// server replies.
+    ///
+    /// On success the server binds a Unix-domain listener at `socket_path` and
+    /// will open `forwarded-streamlocal@openssh.com` channels back for each
+    /// accepted connection — handle them via
+    /// [`ClientHandlers::on_forwarded_streamlocal`] in [`Self::serve`].
+    ///
+    /// Returns `Err(Error::Protocol(_))` if the server replies
+    /// `REQUEST_FAILURE`.
+    pub fn request_streamlocal_forward(&mut self, socket_path: &str) -> Result<()> {
+        use crate::channel::GlobalRequest;
+        let payload = self.conn.send_global_request(
+            GlobalRequest::StreamlocalForward {
+                socket_path: socket_path.to_string(),
+            },
+            true,
+        );
+        self.write_payload(&payload)?;
+        let _ = self.await_global_reply("streamlocal-forward@openssh.com")?;
+        self.streamlocal_forward_grants
+            .push(socket_path.to_string());
+        Ok(())
+    }
+
+    /// Send a `cancel-streamlocal-forward@openssh.com` global request (OpenSSH
+    /// extension) and block until the server replies. `socket_path` must match
+    /// a previous successful [`Self::request_streamlocal_forward`].
+    pub fn cancel_streamlocal_forward(&mut self, socket_path: &str) -> Result<()> {
+        use crate::channel::GlobalRequest;
+        let payload = self.conn.send_global_request(
+            GlobalRequest::CancelStreamlocalForward {
+                socket_path: socket_path.to_string(),
+            },
+            true,
+        );
+        self.write_payload(&payload)?;
+        let _ = self.await_global_reply("cancel-streamlocal-forward@openssh.com")?;
+        if let Some(idx) = self
+            .streamlocal_forward_grants
+            .iter()
+            .position(|p| p == socket_path)
+        {
+            self.streamlocal_forward_grants.swap_remove(idx);
         }
         Ok(())
     }
@@ -3176,6 +3352,24 @@ fn serve_drain_commands(
                     },
                 );
             }
+            Ok(ServeCommand::OpenDirectStreamlocal { socket_path, reply }) => {
+                let (local_id, open_payload) =
+                    client.conn.open(ChannelOpen::DirectStreamlocal { socket_path })?;
+                client.write_payload(&open_payload)?;
+                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (egress_tx, egress_rx) =
+                    mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
+                let stream = ChannelStream::new(ingress_rx, egress_tx);
+                pending_opens.insert(
+                    local_id,
+                    PendingOutboundOpen {
+                        stream: Some(stream),
+                        ingress_tx,
+                        egress_rx: Some(egress_rx),
+                        reply,
+                    },
+                );
+            }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
         }
@@ -3390,6 +3584,55 @@ fn serve_dispatch_packet(
                         channel,
                         SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
                         "forwarded-tcpip not enabled",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                }
+            }
+            ChannelOpen::ForwardedStreamlocal { socket_path } => {
+                // Same conservative defence-in-depth as `forwarded-tcpip`: a
+                // `forwarded-streamlocal@openssh.com` open must correlate to a
+                // streamlocal-forward the client actually requested. Reject if
+                // there are zero outstanding grants.
+                if client.streamlocal_forward_grants.is_empty() {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "no streamlocal-forward requested",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                    return Ok(());
+                }
+                if let Some(cb) = handlers.on_forwarded_streamlocal.clone() {
+                    let p = client.conn.accept_open(channel)?;
+                    client.write_payload(&p)?;
+
+                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (egress_tx, egress_rx) =
+                        mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
+                    let cs = ChannelStream::new(ingress_rx, egress_tx);
+                    let origin = ForwardedStreamlocalOrigin { socket_path };
+                    thread::spawn(move || {
+                        cb(origin, cs);
+                    });
+                    runtimes.insert(
+                        channel,
+                        ServeRuntime {
+                            ingress_tx,
+                            egress_rx,
+                            pending_data: Vec::new(),
+                            pending_eof: false,
+                            pending_close: false,
+                            eof_sent: false,
+                            close_sent: false,
+                        },
+                    );
+                } else {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "forwarded-streamlocal not enabled",
                         "",
                     )?;
                     client.write_payload(&p)?;

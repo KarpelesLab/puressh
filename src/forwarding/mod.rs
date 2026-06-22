@@ -25,6 +25,22 @@
 //!   the client proxies to its own local agent. Server-side glue lives
 //!   in [`agent::DefaultAgentForwardHandler`] plus the
 //!   [`crate::server::AgentForwardHandler`] trait.
+//! - **`direct-streamlocal@openssh.com`** (OpenSSH extension): the
+//!   Unix-socket analog of `direct-tcpip`. The client asks the server to
+//!   connect to a Unix-domain socket and proxy bytes over the SSH channel
+//!   (what `ssh -L local:/remote.sock` opens). Server-side glue lives in
+//!   [`direct_streamlocal::DefaultDirectStreamlocalHandler`] plus the
+//!   [`crate::server::DirectStreamlocalHandler`] trait.
+//! - **`streamlocal-forward@openssh.com`** +
+//!   **`forwarded-streamlocal@openssh.com`** (OpenSSH extension): the
+//!   Unix-socket analog of `tcpip-forward` / `forwarded-tcpip`, the wire side
+//!   of `ssh -R /remote.sock:...`. A client global-request asks the server to
+//!   bind a Unix-domain listener; each accepted connection triggers a
+//!   `forwarded-streamlocal@openssh.com` channel-open back toward the client.
+//!   Server-side glue lives in
+//!   [`streamlocal::DefaultStreamlocalForwardHandler`] plus the
+//!   [`crate::server::StreamlocalForwardHandler`] trait; the client-side
+//!   splice helper is [`streamlocal::splice_to_unix_socket_callback`].
 //! - **`x11-req`** + **`x11`** (RFC 4254 §6.3, `ssh -X` / `ssh -Y`):
 //!   the client asks the server to set up an X display proxy. The
 //!   server binds `127.0.0.1:6000+N` for some free display number `N`
@@ -51,8 +67,16 @@
 pub mod agent;
 #[cfg(feature = "server")]
 pub mod direct;
+// direct-streamlocal is a server-side handler over Unix-domain sockets.
+#[cfg(all(feature = "server", unix))]
+pub mod direct_streamlocal;
 #[cfg(feature = "server")]
 pub mod reverse;
+// streamlocal reverse-forward straddles the line like `agent`/`x11`: the
+// `Default*Handler` is server-only, but `splice_to_unix_socket_callback` is a
+// client helper, so it uses per-item `#[cfg(feature = "...")]` internally.
+#[cfg(unix)]
+pub mod streamlocal;
 // SOCKS dynamic-forward (`ssh -D`) is purely client-side and TCP-only, so it
 // is gated on the `client` feature and stays portable across platforms.
 #[cfg(feature = "client")]

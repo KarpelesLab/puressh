@@ -49,7 +49,7 @@ async = ["std", "client", "dep:futures-util"]
 pam = ["dep:pam-client2"]
 
 [dependencies]
-purecrypto = { version = "0.6.16", default-features = false, features = [
+purecrypto = { version = "0.6.17", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem",
 ] }
 compcol = { version = "0.4.2", default-features = false, features = ["alloc", "zlib"], optional = true }

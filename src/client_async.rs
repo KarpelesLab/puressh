@@ -456,7 +456,6 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpStream;
     use std::sync::{Arc, Mutex};
-    use std::task::Wake;
     use std::thread;
     use std::time::Duration;
 
@@ -503,12 +502,7 @@ mod tests {
     /// Minimal executor: our I/O adapter never returns `Pending`, so the
     /// future always advances to `Ready` and this never busy-spins.
     fn block_on<F: Future>(f: F) -> F::Output {
-        struct Noop;
-        impl Wake for Noop {
-            fn wake(self: Arc<Self>) {}
-        }
-        let waker = Arc::new(Noop).into();
-        let mut cx = Context::from_waker(&waker);
+        let mut cx = Context::from_waker(std::task::Waker::noop());
         let mut fut = Box::pin(f);
         loop {
             if let Poll::Ready(v) = fut.as_mut().poll(&mut cx) {

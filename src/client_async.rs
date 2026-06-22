@@ -1,8 +1,8 @@
 //! Runtime-agnostic async SSH client frontend.
 //!
-//! [`AsyncClient`] drives the same sans-IO [`ClientDriver`](crate::driver::ClientDriver)
+//! [`AsyncClient`] drives the same sans-IO [`ClientDriver`]
 //! as the blocking [`Client`](crate::client::Client), but over any
-//! [`futures_io::AsyncRead`] + [`futures_io::AsyncWrite`] transport — so it
+//! `futures_io::AsyncRead` + `AsyncWrite` transport — so it
 //! works on tokio (via `tokio_util::compat`), smol, async-std, or any other
 //! executor without the library depending on a specific runtime.
 //!

@@ -2,8 +2,8 @@
 //!
 //! [`AsyncServerConnection`] is the server-side counterpart of
 //! [`AsyncClient`](crate::client_async::AsyncClient): it drives the sans-IO
-//! [`ServerDriver`](crate::driver::ServerDriver) over any
-//! [`futures_io::AsyncRead`] + [`futures_io::AsyncWrite`] transport, so an SSH
+//! [`ServerDriver`] over any
+//! `futures_io::AsyncRead` + `AsyncWrite` transport, so an SSH
 //! server can run on tokio (via compat), smol, async-std, or any executor with
 //! no runtime dependency baked into the library.
 //!

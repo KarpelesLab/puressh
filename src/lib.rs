@@ -62,6 +62,11 @@ pub mod client;
 #[cfg(feature = "client")]
 pub mod driver;
 
+// Runtime-agnostic async client frontend over `futures_io::AsyncRead/AsyncWrite`,
+// driving the same `ClientDriver` as the blocking client. Opt-in.
+#[cfg(feature = "async")]
+pub mod client_async;
+
 // `ProxyCommand` transport (Unix-only): spawns a helper process and runs the
 // SSH session over its stdio. Gated on `client` (which pulls in `std` and the
 // `Transport` trait) so a no_std+alloc build still compiles without it.

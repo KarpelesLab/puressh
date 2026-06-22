@@ -37,6 +37,11 @@ multichannel = ["client"]
 # layer (the FFI's PcSshSftp / PcSshAgent depend on `SharedClient`). Produces
 # additional `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
 ffi = ["std", "client", "multichannel"]
+# Runtime-agnostic async client frontend (`AsyncClient`), driving the same
+# sans-IO `ClientDriver` as the blocking `Client` over any
+# `futures_io::AsyncRead + AsyncWrite` transport (tokio via compat, smol,
+# async-std, …). Default-off; pulls in `futures-util` only when enabled.
+async = ["std", "client", "dep:futures-util"]
 # PAM session integration for the `sshd` binary. Default-on but opt-out:
 # building with `--no-default-features` (or `--features ...` without `pam`)
 # drops the libpam runtime dep entirely. The dep itself is also gated to
@@ -53,6 +58,9 @@ compcol = { version = "0.4.2", default-features = false, features = ["alloc", "z
 # secret-wiping for derived KDF output, password buffers carried across FFI,
 # and similar transient secrets. The crate itself is `no_std`-friendly.
 zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
+# Runtime-agnostic async I/O traits (`AsyncRead`/`AsyncWrite`) plus their
+# `read`/`write_all` combinators, used only by the optional `async` frontend.
+futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }
 
 # Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
 # set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it

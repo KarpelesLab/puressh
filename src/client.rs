@@ -2891,7 +2891,7 @@ pub(crate) fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverride
 /// validity checks at the std edge. Falls back to 0 (which fails every
 /// not-yet-valid check and is harmless for already-valid certs) on the
 /// impossible pre-epoch case.
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2899,7 +2899,7 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn build_verifier(
+pub(crate) fn build_verifier(
     reply_payload: &[u8],
     policy: &HostKeyPolicy,
     runner: &KexRunner,

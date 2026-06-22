@@ -32,9 +32,10 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use purecrypto::rng::{CryptoRng, OsRng, RngCore};
+use purecrypto::rng::RngCore;
 
 use crate::auth::{Authenticator, ServerAuth, ServerStep};
+use crate::driver::{Event, ServerDriver};
 use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
     SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, SSH_OPEN_RESOURCE_SHORTAGE,
@@ -43,30 +44,15 @@ use crate::error::{Error, Result};
 use crate::format::Writer;
 use crate::hostkey::HostKey;
 use crate::transport::kex::{defaults, is_strict_kex_marker};
-use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, pong_for_ping};
-use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
-use crate::transport::{
-    ExtInfo, KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
-};
+use crate::transport::rekey::RekeyPolicy;
+use crate::transport::{ExtInfo, KexAlgorithmsOwned, KexInit};
 
-const MAX_BANNER_LINE: usize = 1024;
-const MAX_BANNER_LINES: usize = 256;
-const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_KEX_STEPS: usize = 32;
+// Banner-scanning, inbound-buffer, KEX-step and re-key-deferral bounds now
+// live inside the sans-IO `ServerDriver`; the frontend keeps only the
+// auth-step and connection/drain loop caps.
 const MAX_AUTH_STEPS: usize = 64;
 const MAX_CONNECTION_STEPS: usize = 10_000_000;
 const MAX_DRAIN_STEPS: usize = 1_000_000;
-
-/// Cap on the number of application packets buffered in `deferred` while a
-/// re-KEX is in flight (RFC 4253 §7.3). A client can trigger a rekey and
-/// then flood `CHANNEL_DATA` without ever completing the exchange; without a
-/// bound the queue would grow until `MAX_CONNECTION_STEPS`, buffering
-/// millions of payloads. Whichever of count / aggregate bytes trips first
-/// aborts the connection with a protocol error.
-const MAX_DEFERRED_PACKETS: usize = 4096;
-/// Aggregate byte budget for the `deferred` rekey queue (see
-/// `MAX_DEFERRED_PACKETS`).
-const MAX_DEFERRED_BYTES: usize = 4 * 1024 * 1024;
 
 /// Bound on the per-subsystem egress queue. Handlers self-throttle when
 /// the dispatcher can't ship `CHANNEL_DATA` fast enough (remote window
@@ -1698,29 +1684,14 @@ fn handle_connection_inner(
         Some(Instant::now() + grace)
     };
 
-    let mut codec = PacketCodec::new();
-    let mut inbox: Vec<u8> = Vec::new();
-    let mut rng = OsRng;
-
-    let v_s = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
-    map_preauth_timeout(
-        stream
-            .write_all(&VersionExchange::outgoing_bytes())
-            .map_err(Error::Io),
-    )?;
-    let v_c = map_preauth_timeout(read_peer_version(&mut stream, deadline))?;
-
-    let (mut runner, session_id) = map_preauth_timeout(do_server_kex(
-        &mut stream,
-        &mut codec,
-        &mut rng,
-        &mut inbox,
-        &cfg,
-        &v_c,
-        &v_s,
-        deadline,
-    ))?;
-    let mut last_kex = Instant::now();
+    // Sans-IO transport engine: owns the codec, KEX runner, re-key, and all
+    // transport-message routing (version exchange, EXT_INFO, PING/PONG, KEX).
+    // The frontend pumps it via `srv_send` / `srv_read` and supplies the clock
+    // and the pre-auth deadline.
+    let mut driver = ServerDriver::new(cfg.clone());
+    driver.start(Instant::now())?;
+    map_preauth_timeout(srv_drive_handshake(&mut stream, &mut driver, deadline))?;
+    let session_id = driver.session_id().to_vec();
 
     // Phase 1 (pre-auth): resolve the policy with an address-only context.
     // This yields the auth method set advertised to the client and an
@@ -1733,9 +1704,7 @@ fn handle_connection_inner(
 
     let (user, cert_caps) = map_preauth_timeout(do_server_auth(
         &mut stream,
-        &mut codec,
-        &mut rng,
-        &mut inbox,
+        &mut driver,
         &cfg,
         session_id,
         &preauth,
@@ -1799,28 +1768,14 @@ fn handle_connection_inner(
     }
 
     // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
-    codec.activate_compress();
+    driver.notify_auth_success();
 
-    let rekey_policy = cfg.rekey_policy;
-    let r = do_connection_phase(
-        &mut stream,
-        &mut codec,
-        &mut rng,
-        &mut inbox,
-        &cfg,
-        &user,
-        &mut runner,
-        &v_c,
-        &v_s,
-        &mut last_kex,
-        &rekey_policy,
-        &effective,
-    );
+    driver.set_rekey_policy(cfg.rekey_policy);
+    let r = do_connection_phase(&mut stream, &mut driver, &cfg, &user, &effective);
 
-    let _ = send_disconnect(
+    let _ = srv_send_disconnect(
         &mut stream,
-        &mut codec,
-        &mut rng,
+        &mut driver,
         SSH_DISCONNECT_BY_APPLICATION,
         "closing session",
     );
@@ -1828,92 +1783,6 @@ fn handle_connection_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn do_server_kex<R: RngCore + CryptoRng>(
-    stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
-    cfg: &Config,
-    v_c: &[u8],
-    v_s: &[u8],
-    deadline: Option<Instant>,
-) -> Result<(KexRunner, Vec<u8>)> {
-    // First KEX only: advertise ext-info-s so the client may send us
-    // SSH_MSG_EXT_INFO (RFC 8308 §2.1). Re-KEX paths use the un-marked
-    // builder via KexRunner::restart, which scrubs the marker.
-    let advert = build_server_kexinit(rng, cfg).with_ext_info_marker(Role::Server);
-    let mut runner = KexRunner::new(Role::Server, advert);
-    // Queue our outbound EXT_INFO; the runner emits it after NEWKEYS on the
-    // first KEX iff the client also advertised the marker.
-    runner.set_outbound_ext_info(server_ext_info());
-    let initial = runner.start(rng)?;
-    for p in initial.outbound {
-        write_payload(stream, codec, rng, &p)?;
-    }
-
-    drive_server_kex(
-        stream,
-        codec,
-        rng,
-        inbox,
-        &mut runner,
-        cfg,
-        v_c,
-        v_s,
-        deadline,
-    )?;
-
-    let sid = runner
-        .session_id()
-        .ok_or(Error::Protocol("kex: missing session id"))?
-        .to_vec();
-    Ok((runner, sid))
-}
-
-/// Drive a KEX (initial or re-key) to completion. The caller must have
-/// already pushed our own KEXINIT onto the wire via `start()` or `restart()`.
-#[allow(clippy::too_many_arguments)]
-fn drive_server_kex<R: RngCore + CryptoRng>(
-    stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
-    runner: &mut KexRunner,
-    cfg: &Config,
-    v_c: &[u8],
-    v_s: &[u8],
-    deadline: Option<Instant>,
-) -> Result<()> {
-    let mut steps = 0usize;
-    let mut selected_host_key: Option<&(dyn HostKey + Send + Sync)> = None;
-
-    loop {
-        steps += 1;
-        if steps > MAX_KEX_STEPS {
-            return Err(Error::Protocol("kex: too many steps"));
-        }
-        let payload = read_one_packet(stream, codec, inbox, deadline)?;
-
-        if selected_host_key.is_none()
-            && let Some(neg) = runner.negotiated()
-        {
-            selected_host_key = pick_host_key(&cfg.host_keys, &neg.host_key);
-            if selected_host_key.is_none() {
-                return Err(Error::Protocol("kex: no host key for negotiated algorithm"));
-            }
-        }
-
-        let hk_ref: Option<&dyn HostKey> = selected_host_key.map(|k| k as &dyn HostKey);
-        let adv = runner.on_packet(rng, codec, &payload, hk_ref, None, v_c, v_s)?;
-        for p in adv.outbound {
-            write_payload(stream, codec, rng, &p)?;
-        }
-        if adv.completed {
-            return Ok(());
-        }
-    }
-}
-
 /// The textual form of a socket address's IP (no port). Returns `None` for
 /// the unspecified placeholder so a `Match address` never matches a missing
 /// address.
@@ -2055,11 +1924,9 @@ fn resolve_effective_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn do_server_auth<R: RngCore + CryptoRng>(
+fn do_server_auth(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
+    driver: &mut ServerDriver,
     cfg: &Config,
     session_id: Vec<u8>,
     preauth: &PreAuthPolicy,
@@ -2085,7 +1952,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
             message: text.to_string(),
             language: String::new(),
         };
-        write_payload(stream, codec, rng, &banner.encode())?;
+        srv_send(stream, driver, &banner.encode())?;
     }
 
     // Phase 1.5 (mid-userauth): the first USERAUTH_REQUEST exposes the
@@ -2097,7 +1964,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
     let mut resolved_user: Option<String> = None;
 
     for _ in 0..MAX_AUTH_STEPS {
-        let payload = read_one_packet(stream, codec, inbox, deadline)?;
+        let payload = srv_read(stream, driver, deadline)?;
 
         // Re-resolve on the first request that carries a username, before the
         // attempt is evaluated. Subsequent requests reuse the resolved set.
@@ -2121,7 +1988,7 @@ fn do_server_auth<R: RngCore + CryptoRng>(
                         message: text.to_string(),
                         language: String::new(),
                     };
-                    write_payload(stream, codec, rng, &banner.encode())?;
+                    srv_send(stream, driver, &banner.encode())?;
                 }
                 resolved_user = Some(user);
             }
@@ -2134,14 +2001,13 @@ fn do_server_auth<R: RngCore + CryptoRng>(
             if method != "none" && !server_auth.accepted_methods().contains(&method) {
                 match server_auth.reject_unadvertised()? {
                     ServerStep::Send(p) => {
-                        write_payload(stream, codec, rng, &p)?;
+                        srv_send(stream, driver, &p)?;
                         continue;
                     }
                     ServerStep::Disconnect(reason) => {
-                        let _ = send_disconnect(
+                        let _ = srv_send_disconnect(
                             stream,
-                            codec,
-                            rng,
+                            driver,
                             SSH_DISCONNECT_HOST_NOT_ALLOWED,
                             reason,
                         );
@@ -2153,18 +2019,18 @@ fn do_server_auth<R: RngCore + CryptoRng>(
         }
 
         match server_auth.on_packet(&payload)? {
-            ServerStep::Send(p) => write_payload(stream, codec, rng, &p)?,
+            ServerStep::Send(p) => srv_send(stream, driver, &p)?,
             ServerStep::Authenticated {
                 payload,
                 user,
                 cert_caps,
             } => {
-                write_payload(stream, codec, rng, &payload)?;
+                srv_send(stream, driver, &payload)?;
                 return Ok((user, cert_caps));
             }
             ServerStep::Disconnect(reason) => {
                 let _ =
-                    send_disconnect(stream, codec, rng, SSH_DISCONNECT_HOST_NOT_ALLOWED, reason);
+                    srv_send_disconnect(stream, driver, SSH_DISCONNECT_HOST_NOT_ALLOWED, reason);
                 return Err(Error::AuthFailed);
             }
         }
@@ -2263,11 +2129,10 @@ impl ForwardConn {
     /// Emit one `SSH_MSG_CHANNEL_OPEN forwarded-tcpip` per queued request,
     /// returning early on a hard write error. Pending-reply entries land
     /// in `self.pending_opens` keyed by the freshly-allocated local id.
-    fn drain_pending<R: RngCore + CryptoRng>(
+    fn drain_pending(
         &mut self,
         stream: &mut TcpStream,
-        codec: &mut PacketCodec,
-        rng: &mut R,
+        driver: &mut ServerDriver,
         conn: &mut ConnectionState,
     ) -> Result<()> {
         loop {
@@ -2280,7 +2145,7 @@ impl ForwardConn {
                         orig_port: req.orig_port,
                     };
                     let (local_id, payload) = conn.open(kind)?;
-                    write_payload(stream, codec, rng, &payload)?;
+                    srv_send(stream, driver, &payload)?;
                     self.pending_opens.insert(local_id, req.reply);
                 }
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -2320,11 +2185,10 @@ impl StreamlocalForwardConn {
     /// Emit one `SSH_MSG_CHANNEL_OPEN forwarded-streamlocal@openssh.com` per
     /// queued request. Pending-reply entries land in `self.pending_opens`
     /// keyed by the freshly-allocated local id.
-    fn drain_pending<R: RngCore + CryptoRng>(
+    fn drain_pending(
         &mut self,
         stream: &mut TcpStream,
-        codec: &mut PacketCodec,
-        rng: &mut R,
+        driver: &mut ServerDriver,
         conn: &mut ConnectionState,
     ) -> Result<()> {
         loop {
@@ -2334,7 +2198,7 @@ impl StreamlocalForwardConn {
                         socket_path: req.socket_path.clone(),
                     };
                     let (local_id, payload) = conn.open(kind)?;
-                    write_payload(stream, codec, rng, &payload)?;
+                    srv_send(stream, driver, &payload)?;
                     self.pending_opens.insert(local_id, req.reply);
                 }
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -2378,18 +2242,17 @@ impl AgentForwardConn {
     /// Emit one `SSH_MSG_CHANNEL_OPEN auth-agent@openssh.com` per queued
     /// request. Pending-reply entries land in `self.pending_opens` keyed by
     /// the freshly-allocated local id.
-    fn drain_pending<R: RngCore + CryptoRng>(
+    fn drain_pending(
         &mut self,
         stream: &mut TcpStream,
-        codec: &mut PacketCodec,
-        rng: &mut R,
+        driver: &mut ServerDriver,
         conn: &mut ConnectionState,
     ) -> Result<()> {
         loop {
             match self.req_rx.try_recv() {
                 Ok(req) => {
                     let (local_id, payload) = conn.open(ChannelOpen::AuthAgent)?;
-                    write_payload(stream, codec, rng, &payload)?;
+                    srv_send(stream, driver, &payload)?;
                     self.pending_opens.insert(local_id, req.reply);
                 }
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -2432,11 +2295,10 @@ impl X11ForwardConn {
     /// Emit one `SSH_MSG_CHANNEL_OPEN x11` per queued request. Pending-reply
     /// entries land in `self.pending_opens` keyed by the freshly-allocated
     /// local id.
-    fn drain_pending<R: RngCore + CryptoRng>(
+    fn drain_pending(
         &mut self,
         stream: &mut TcpStream,
-        codec: &mut PacketCodec,
-        rng: &mut R,
+        driver: &mut ServerDriver,
         conn: &mut ConnectionState,
     ) -> Result<()> {
         loop {
@@ -2447,7 +2309,7 @@ impl X11ForwardConn {
                         orig_port: req.orig_port,
                     };
                     let (local_id, payload) = conn.open(kind)?;
-                    write_payload(stream, codec, rng, &payload)?;
+                    srv_send(stream, driver, &payload)?;
                     self.pending_opens.insert(local_id, req.reply);
                 }
                 Err(TryRecvError::Empty) => return Ok(()),
@@ -2458,26 +2320,16 @@ impl X11ForwardConn {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn do_connection_phase<R: RngCore + CryptoRng>(
+fn do_connection_phase(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
+    driver: &mut ServerDriver,
     cfg: &Config,
     user: &str,
-    runner: &mut KexRunner,
-    v_c: &[u8],
-    v_s: &[u8],
-    last_kex: &mut Instant,
-    rekey_policy: &RekeyPolicy,
     effective: &EffectivePolicy,
 ) -> Result<()> {
     let mut conn = ConnectionState::new();
     let mut any_channel_opened = false;
     let mut steps = 0usize;
-    // App packets received while a re-KEX is in flight (RFC 4253 §7.3).
-    // Drained back into the app-layer dispatch as soon as the rekey lands.
-    let mut deferred: Vec<Vec<u8>> = Vec::new();
     // Per-channel interactive-shell state. Empty when no `shell` request
     // has been served — in that case the loop stays in pure blocking-read
     // mode and behaves exactly like the historical exec-only path.
@@ -2505,21 +2357,13 @@ fn do_connection_phase<R: RngCore + CryptoRng>(
     let mut extras = ConnExtras::new();
     let result = do_connection_loop(
         stream,
-        codec,
-        rng,
-        inbox,
+        driver,
         cfg,
         user,
-        runner,
-        v_c,
-        v_s,
-        last_kex,
-        rekey_policy,
         effective,
         &mut conn,
         &mut any_channel_opened,
         &mut steps,
-        &mut deferred,
         &mut shells,
         &mut subsystems,
         &mut envs,
@@ -2620,23 +2464,15 @@ impl<K: Ord + Clone, V> DrainFilterCompat<K, V> for BTreeMap<K, V> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn do_connection_loop<R: RngCore + CryptoRng>(
+fn do_connection_loop(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
+    driver: &mut ServerDriver,
     cfg: &Config,
     user: &str,
-    runner: &mut KexRunner,
-    v_c: &[u8],
-    v_s: &[u8],
-    last_kex: &mut Instant,
-    rekey_policy: &RekeyPolicy,
     effective: &EffectivePolicy,
     conn: &mut ConnectionState,
     any_channel_opened: &mut bool,
     steps: &mut usize,
-    deferred: &mut Vec<Vec<u8>>,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
     envs: &mut BTreeMap<u32, SessionEnv>,
@@ -2651,35 +2487,6 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         *steps += 1;
         if *steps > MAX_CONNECTION_STEPS {
             return Err(Error::Protocol("connection: step cap exceeded"));
-        }
-
-        // Drain any application packets we couldn't process while re-KEXing.
-        if !runner.is_kexing() && !deferred.is_empty() {
-            let payload = deferred.remove(0);
-            // The deferred queue only ever holds non-KEX, non-EXT_INFO app
-            // traffic. Re-asserting closes the window if it was ever opened.
-            runner.note_inbound_other();
-            dispatch_app_packet(
-                stream,
-                codec,
-                rng,
-                inbox,
-                conn,
-                cfg,
-                effective,
-                user,
-                &payload,
-                any_channel_opened,
-                extras,
-                shells,
-                subsystems,
-                envs,
-                forward,
-                agent_forward,
-                x11_forward,
-                streamlocal_forward,
-            )?;
-            continue;
         }
 
         // Shells, subsystems, and live `tcpip-forward` bindings all need
@@ -2723,14 +2530,14 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // Per-tick I/O: shell drains, subsystem egress, and any server-
         // initiated `forwarded-tcpip` opens queued by `TcpipForwardHandler`
         // accept-loops. Only when no KEX is in flight.
-        if *polling_active && !runner.is_kexing() {
-            drain_shells(stream, codec, rng, conn, shells)?;
-            finalize_exited_shells(stream, codec, rng, conn, shells)?;
-            drain_subsystems(stream, codec, rng, conn, subsystems)?;
-            forward.drain_pending(stream, codec, rng, conn)?;
-            agent_forward.drain_pending(stream, codec, rng, conn)?;
-            x11_forward.drain_pending(stream, codec, rng, conn)?;
-            streamlocal_forward.drain_pending(stream, codec, rng, conn)?;
+        if *polling_active && !driver.is_kexing() {
+            drain_shells(stream, driver, conn, shells)?;
+            finalize_exited_shells(stream, driver, conn, shells)?;
+            drain_subsystems(stream, driver, conn, subsystems)?;
+            forward.drain_pending(stream, driver, conn)?;
+            agent_forward.drain_pending(stream, driver, conn)?;
+            x11_forward.drain_pending(stream, driver, conn)?;
+            streamlocal_forward.drain_pending(stream, driver, conn)?;
         }
 
         // ClientAliveInterval / ClientAliveCountMax (OpenSSH server keepalive).
@@ -2738,7 +2545,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         // `keepalive@openssh.com` global request (want_reply) and bump the
         // missed counter; the peer's REQUEST_SUCCESS/FAILURE resets it. After
         // CountMax unanswered probes, drop the connection.
-        if keepalive_enabled && !runner.is_kexing() {
+        if keepalive_enabled && !driver.is_kexing() {
             let interval = Duration::from_secs(effective.client_alive_interval.unwrap_or(0) as u64);
             let count_max = effective.client_alive_count_max.unwrap_or(3);
             let now = Instant::now();
@@ -2751,7 +2558,7 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
                     ));
                 }
                 let p = conn.send_global_request(crate::channel::GlobalRequest::Keepalive, true);
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
                 extras.last_keepalive = now;
                 extras.missed_keepalives = extras.missed_keepalives.saturating_add(1);
             }
@@ -2759,7 +2566,6 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
 
         if *any_channel_opened
             && !conn.channels().any(|c| !c.is_fully_closed())
-            && deferred.is_empty()
             && !any_forward_alive
             && !any_agent_fwd_alive
             && !any_x11_fwd_alive
@@ -2768,27 +2574,18 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
             return Ok(());
         }
 
-        // RFC 4253 §9: re-key once we've crossed any threshold. Only initiate
-        // when no KEX is currently in flight (one side starts; the other will
-        // respond when it sees the SSH_MSG_KEXINIT).
-        if !runner.is_kexing() && rekey_policy.should_rekey(codec, *last_kex, Instant::now()) {
-            let advert = build_server_kexinit(rng, cfg);
-            let adv = runner.restart(rng, advert)?;
-            for p in adv.outbound {
-                write_payload(stream, codec, rng, &p)?;
-            }
-        }
-
+        // The driver handles re-key (in `handle_timeout`, ticked by `srv_read`),
+        // EXT_INFO, PING/PONG, and KEX routing internally — and buffers app
+        // packets received mid-re-key. `srv_read` therefore only ever surfaces
+        // an application-layer payload.
         let payload = if *polling_active {
-            match read_one_packet_maybe_timeout(stream, codec, inbox)? {
+            match srv_read_maybe_timeout(stream, driver)? {
                 Some(p) => p,
-                None => continue, // 50 ms tick; re-enter drain/rekey checks
+                None => continue, // 50 ms tick; re-enter drain checks
             }
         } else {
-            read_one_packet(stream, codec, inbox, None)?
+            srv_read(stream, driver, None)?
         };
-
-        let msg = payload.first().copied().unwrap_or(0);
 
         // Any inbound packet proves the peer is alive: reset the keepalive
         // activity clock and clear the unanswered-probe counter (a reply to our
@@ -2796,85 +2593,9 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
         extras.last_activity = Instant::now();
         extras.missed_keepalives = 0;
 
-        // RFC 8308 §2.3: client may send a single SSH_MSG_EXT_INFO at the
-        // post-NEWKEYS slot of the first KEX. Anywhere else it is a protocol
-        // error.
-        if msg == 7 {
-            if !runner.may_accept_ext_info() {
-                return Err(Error::Protocol("unexpected SSH_MSG_EXT_INFO"));
-            }
-            runner.handle_inbound_ext_info(&payload)?;
-            continue;
-        }
-
-        // ping@openssh.com (RFC 4251 §7 private range): answer an inbound
-        // PING with a PONG echoing its data; drop a PONG. A PING must not
-        // be answered mid-rekey (RFC 4253 §7.3) — drop it in that window.
-        if msg == SSH_MSG_PING {
-            if !runner.is_kexing() {
-                let pong = pong_for_ping(&payload)?;
-                write_payload(stream, codec, rng, &pong)?;
-            }
-            continue;
-        }
-        if msg == SSH_MSG_PONG {
-            continue;
-        }
-
-        // RFC 4253 §7.3: KEX messages (20, 21, 30..=49) are routed through
-        // the KEX runner, not the application layer. A peer-initiated re-KEX
-        // is signalled by an inbound SSH_MSG_KEXINIT while we are still in
-        // Phase::Completed — handle that by emitting our own KEXINIT first.
-        if is_kex_msg(msg) {
-            if msg == 20 && !runner.is_kexing() {
-                let advert = build_server_kexinit(rng, cfg);
-                let adv = runner.restart(rng, advert)?;
-                for p in adv.outbound {
-                    write_payload(stream, codec, rng, &p)?;
-                }
-            }
-            let hk_ref: Option<&dyn HostKey> = match runner.negotiated() {
-                Some(neg) => {
-                    pick_host_key(&cfg.host_keys, &neg.host_key).map(|k| k as &dyn HostKey)
-                }
-                None => None,
-            };
-            let adv = runner.on_packet(rng, codec, &payload, hk_ref, None, v_c, v_s)?;
-            for p in adv.outbound {
-                write_payload(stream, codec, rng, &p)?;
-            }
-            if adv.completed {
-                *last_kex = Instant::now();
-            }
-            continue;
-        }
-
-        // Application-layer packet. If we're mid-rekey, RFC §7.3 says we
-        // must NOT respond with channel traffic — buffer for later. Bound the
-        // queue so a peer can't trigger a rekey, withhold its completion, and
-        // flood CHANNEL_DATA to exhaust memory.
-        if runner.is_kexing() {
-            let deferred_bytes: usize = deferred.iter().map(Vec::len).sum();
-            if deferred.len() >= MAX_DEFERRED_PACKETS
-                || deferred_bytes.saturating_add(payload.len()) > MAX_DEFERRED_BYTES
-            {
-                return Err(Error::Protocol(
-                    "connection: deferred rekey packet queue overflow",
-                ));
-            }
-            deferred.push(payload);
-            continue;
-        }
-
-        // RFC 8308 §2.3: the post-NEWKEYS ext-info slot is one-shot. Any
-        // non-EXT_INFO packet closes the acceptance window.
-        runner.note_inbound_other();
-
         dispatch_app_packet(
             stream,
-            codec,
-            rng,
-            inbox,
+            driver,
             conn,
             cfg,
             effective,
@@ -2896,10 +2617,9 @@ fn do_connection_loop<R: RngCore + CryptoRng>(
 /// Per-tick: read non-blocking from each live shell and emit CHANNEL_DATA.
 /// Bytes that can't ship right now (remote window exhausted) stay in the
 /// runtime's `pending_stdout` for the next tick.
-fn drain_shells<R: RngCore + CryptoRng>(
+fn drain_shells(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     shells: &mut BTreeMap<u32, ShellRuntime>,
 ) -> Result<()> {
@@ -2916,7 +2636,7 @@ fn drain_shells<R: RngCore + CryptoRng>(
         // shell (up to ~64 KiB per tick).
         if !rt.pending_stdout.is_empty() {
             let leftover = core::mem::take(&mut rt.pending_stdout);
-            emit_channel_data(stream, codec, rng, conn, ch, &leftover, rt)?;
+            emit_channel_data(stream, driver, conn, ch, &leftover, rt)?;
         }
         // Back-pressure: if the held-over stdout is still at/over the high-
         // water mark after the flush attempt (remote window exhausted because
@@ -2934,7 +2654,7 @@ fn drain_shells<R: RngCore + CryptoRng>(
                 }
                 pulled += n;
                 let bytes = buf[..n].to_vec();
-                emit_channel_data(stream, codec, rng, conn, ch, &bytes, rt)?;
+                emit_channel_data(stream, driver, conn, ch, &bytes, rt)?;
             } else {
                 break;
             }
@@ -2952,10 +2672,9 @@ fn drain_shells<R: RngCore + CryptoRng>(
 
 /// Send as much of `bytes` over `CHANNEL_DATA` as the remote window allows;
 /// stash the remainder on `rt.pending_stdout`.
-fn emit_channel_data<R: RngCore + CryptoRng>(
+fn emit_channel_data(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     channel: u32,
     bytes: &[u8],
@@ -2969,7 +2688,7 @@ fn emit_channel_data<R: RngCore + CryptoRng>(
             rt.pending_stdout.extend_from_slice(&bytes[off..]);
             return Ok(());
         }
-        write_payload(stream, codec, rng, &payload)?;
+        srv_send(stream, driver, &payload)?;
         off += taken;
     }
     Ok(())
@@ -2978,10 +2697,9 @@ fn emit_channel_data<R: RngCore + CryptoRng>(
 /// Per-tick: any shell whose `try_exit` returned `Some` and whose stdout
 /// has been flushed gets its `exit-status` / `exit-signal` request, then
 /// EOF and CHANNEL_CLOSE.
-fn finalize_exited_shells<R: RngCore + CryptoRng>(
+fn finalize_exited_shells(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     shells: &mut BTreeMap<u32, ShellRuntime>,
 ) -> Result<()> {
@@ -3014,11 +2732,11 @@ fn finalize_exited_shells<R: RngCore + CryptoRng>(
             },
         };
         let p = conn.send_request(ch, req, false)?;
-        write_payload(stream, codec, rng, &p)?;
+        srv_send(stream, driver, &p)?;
         let p = conn.send_eof(ch)?;
-        write_payload(stream, codec, rng, &p)?;
+        srv_send(stream, driver, &p)?;
         let p = conn.send_close(ch)?;
-        write_payload(stream, codec, rng, &p)?;
+        srv_send(stream, driver, &p)?;
         rt.exit_sent = true;
         // Drop the session here so the backend can close fds and reap the
         // child process immediately, even before the peer's CLOSE arrives.
@@ -3031,10 +2749,9 @@ fn finalize_exited_shells<R: RngCore + CryptoRng>(
 /// Pulls `Data` / `Eof` / `Close` from the handler's `egress_rx`, respecting
 /// the remote SSH window — bytes that don't fit go into `pending_data` and
 /// are re-attempted on the next tick.
-fn drain_subsystems<R: RngCore + CryptoRng>(
+fn drain_subsystems(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
 ) -> Result<()> {
@@ -3050,7 +2767,7 @@ fn drain_subsystems<R: RngCore + CryptoRng>(
         // 1) Re-attempt any leftover bytes from last tick.
         if !rt.pending_data.is_empty() {
             let leftover = core::mem::take(&mut rt.pending_data);
-            emit_subsystem_data(stream, codec, rng, conn, ch, &leftover, rt)?;
+            emit_subsystem_data(stream, driver, conn, ch, &leftover, rt)?;
             if !rt.pending_data.is_empty() {
                 // Still window-blocked; skip this tick's drain entirely.
                 continue;
@@ -3065,7 +2782,7 @@ fn drain_subsystems<R: RngCore + CryptoRng>(
             }
             match rt.egress_rx.try_recv() {
                 Ok(ChannelEgress::Data(bytes)) => {
-                    emit_subsystem_data(stream, codec, rng, conn, ch, &bytes, rt)?;
+                    emit_subsystem_data(stream, driver, conn, ch, &bytes, rt)?;
                 }
                 Ok(ChannelEgress::Eof) => {
                     rt.pending_eof = true;
@@ -3089,17 +2806,17 @@ fn drain_subsystems<R: RngCore + CryptoRng>(
         if rt.pending_data.is_empty() {
             if rt.pending_eof && !rt.eof_sent {
                 let p = conn.send_eof(ch)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
                 rt.eof_sent = true;
             }
             if rt.pending_close && !rt.close_sent {
                 if !rt.eof_sent {
                     let p = conn.send_eof(ch)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                     rt.eof_sent = true;
                 }
                 let p = conn.send_close(ch)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
                 rt.close_sent = true;
             }
         }
@@ -3109,10 +2826,9 @@ fn drain_subsystems<R: RngCore + CryptoRng>(
 
 /// Send `bytes` over `CHANNEL_DATA`, stashing anything the remote window
 /// can't accept onto `rt.pending_data` for next tick.
-fn emit_subsystem_data<R: RngCore + CryptoRng>(
+fn emit_subsystem_data(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     channel: u32,
     bytes: &[u8],
@@ -3125,36 +2841,16 @@ fn emit_subsystem_data<R: RngCore + CryptoRng>(
             rt.pending_data.extend_from_slice(&bytes[off..]);
             return Ok(());
         }
-        write_payload(stream, codec, rng, &payload)?;
+        srv_send(stream, driver, &payload)?;
         off += taken;
     }
     Ok(())
 }
 
-/// Like [`read_one_packet`], but returns `Ok(None)` on a 50 ms read
-/// timeout instead of erroring. Other I/O errors propagate.
-fn read_one_packet_maybe_timeout(
-    stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    inbox: &mut Vec<u8>,
-) -> Result<Option<Vec<u8>>> {
-    match read_one_packet(stream, codec, inbox, None) {
-        Ok(p) => Ok(Some(p)),
-        Err(Error::Io(e))
-            if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-        {
-            Ok(None)
-        }
-        Err(e) => Err(e),
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
-fn dispatch_app_packet<R: RngCore + CryptoRng>(
+fn dispatch_app_packet(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     cfg: &Config,
     effective: &EffectivePolicy,
@@ -3293,7 +2989,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
             // SSH_MSG_CHANNEL_OPEN_FAILURE bytes and did NOT allocate a
             // local channel id; we just ship the payload so the peer can
             // back off without us tearing down the transport.
-            write_payload(stream, codec, rng, &failure_payload)?;
+            srv_send(stream, driver, &failure_payload)?;
         }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
             ChannelOpen::Session => {
@@ -3310,10 +3006,10 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                         "MaxSessions limit reached",
                         "",
                     )?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 } else {
                     let p = conn.accept_open(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                     extras.session_channels.insert(channel);
                     // Allocate an empty per-channel env bag. Client `"env"`
                     // requests append to it; handlers read it on `exec` /
@@ -3350,13 +3046,13 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                         reason,
                         "",
                     )?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 } else if let Some(handler) = cfg.direct_tcpip_handler.clone() {
                     // Accept first, then hand off to the handler thread. The
                     // dispatcher routes subsequent Data/Eof/Close into the
                     // SubsystemRuntime mpsc just like for subsystems.
                     let p = conn.accept_open(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
 
                     let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
                     let (egress_tx, egress_rx) =
@@ -3391,7 +3087,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                         "direct-tcpip not enabled",
                         "",
                     )?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
             }
             ChannelOpen::DirectStreamlocal { socket_path } => {
@@ -3408,10 +3104,10 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                         "local forwarding administratively prohibited",
                         "",
                     )?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 } else if let Some(handler) = cfg.direct_streamlocal_handler.clone() {
                     let p = conn.accept_open(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
 
                     let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
                     let (egress_tx, egress_rx) =
@@ -3443,7 +3139,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                         "direct-streamlocal not enabled",
                         "",
                     )?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
             }
             _ => {
@@ -3453,7 +3149,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                     "channel type not supported",
                     "",
                 )?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         },
         ChannelEvent::Request {
@@ -3463,9 +3159,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
         } => {
             handle_channel_request(
                 stream,
-                codec,
-                rng,
-                inbox,
+                driver,
                 conn,
                 cfg,
                 effective,
@@ -3510,12 +3204,12 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 let _ = rt.ingress_tx.send(Some(data.clone()));
             }
             if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
-                write_payload(stream, codec, rng, &adj)?;
+                srv_send(stream, driver, &adj)?;
             }
         }
         ChannelEvent::ExtendedData { channel, data, .. } => {
             if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
-                write_payload(stream, codec, rng, &adj)?;
+                srv_send(stream, driver, &adj)?;
             }
         }
         ChannelEvent::Eof { channel } => {
@@ -3535,7 +3229,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
                 && !ch.local_closed
             {
                 let p = conn.send_close(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
             // Drop the runtime so the backend can reap its child / close fds.
             shells.remove(&channel);
@@ -3560,8 +3254,7 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
         } => {
             handle_global_request(
                 stream,
-                codec,
-                rng,
+                driver,
                 conn,
                 cfg,
                 effective,
@@ -3578,10 +3271,9 @@ fn dispatch_app_packet<R: RngCore + CryptoRng>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_global_request<R: RngCore + CryptoRng>(
+fn handle_global_request(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     cfg: &Config,
     effective: &EffectivePolicy,
@@ -3640,11 +3332,11 @@ fn handle_global_request<R: RngCore + CryptoRng>(
                         Vec::new()
                     };
                     let p = conn.send_global_success(&tail);
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
                 None => {
                     let p = conn.send_global_failure();
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
             }
         }
@@ -3681,7 +3373,7 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             } else {
                 conn.send_global_failure()
             };
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
         }
         GlobalRequest::StreamlocalForward { socket_path } => {
             // AllowStreamLocalForwarding capability ceiling: reuse the
@@ -3707,7 +3399,7 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             } else {
                 conn.send_global_failure()
             };
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
         }
         GlobalRequest::CancelStreamlocalForward { socket_path } => {
             let ok = if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
@@ -3729,12 +3421,12 @@ fn handle_global_request<R: RngCore + CryptoRng>(
             } else {
                 conn.send_global_failure()
             };
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
         }
         GlobalRequest::Keepalive | GlobalRequest::Other { .. } => {
             if want_reply {
                 let p = conn.send_global_failure();
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
     }
@@ -3742,11 +3434,9 @@ fn handle_global_request<R: RngCore + CryptoRng>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn handle_channel_request<R: RngCore + CryptoRng>(
+fn handle_channel_request(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     cfg: &Config,
     effective: &EffectivePolicy,
@@ -3776,7 +3466,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                     .insert("SSH_ORIGINAL_COMMAND".to_string(), command.clone());
                 if forced.eq_ignore_ascii_case("internal-sftp") {
                     return route_internal_sftp(
-                        stream, codec, rng, conn, cfg, user, channel, want_reply, subsystems, envs,
+                        stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
                     );
                 }
                 forced.to_string()
@@ -3821,7 +3511,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 );
                 if want_reply {
                     let p = conn.send_request_success(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
                 return Ok(());
             }
@@ -3830,13 +3520,11 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             let result = cfg.command_handler.handle(user, env_ref, &command);
             if want_reply {
                 let p = conn.send_request_success(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
             drain_send(
                 stream,
-                codec,
-                rng,
-                inbox,
+                driver,
                 conn,
                 channel,
                 &result.stdout,
@@ -3844,9 +3532,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
             )?;
             drain_send(
                 stream,
-                codec,
-                rng,
-                inbox,
+                driver,
                 conn,
                 channel,
                 &result.stderr,
@@ -3859,11 +3545,11 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 },
                 false,
             )?;
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
             let p = conn.send_eof(channel)?;
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
             let p = conn.send_close(channel)?;
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
         }
         ChannelRequest::PtyReq {
             term,
@@ -3892,11 +3578,11 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 });
                 if want_reply {
                     let p = conn.send_request_success(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
         ChannelRequest::Shell => {
@@ -3910,20 +3596,18 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                     .insert("SSH_ORIGINAL_COMMAND".to_string(), String::new());
                 if forced.eq_ignore_ascii_case("internal-sftp") {
                     return route_internal_sftp(
-                        stream, codec, rng, conn, cfg, user, channel, want_reply, subsystems, envs,
+                        stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
                     );
                 }
                 let env_ref = envs.get(&channel).unwrap_or(&empty_env);
                 let result = cfg.command_handler.handle(user, env_ref, forced);
                 if want_reply {
                     let p = conn.send_request_success(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
                 drain_send(
                     stream,
-                    codec,
-                    rng,
-                    inbox,
+                    driver,
                     conn,
                     channel,
                     &result.stdout,
@@ -3931,9 +3615,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 )?;
                 drain_send(
                     stream,
-                    codec,
-                    rng,
-                    inbox,
+                    driver,
                     conn,
                     channel,
                     &result.stderr,
@@ -3946,11 +3628,11 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                     },
                     false,
                 )?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
                 let p = conn.send_eof(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
                 let p = conn.send_close(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
                 return Ok(());
             }
             if let Some(handler) = cfg.shell_handler.clone() {
@@ -3962,7 +3644,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                         rt.session = Some(sess);
                         if want_reply {
                             let p = conn.send_request_success(channel)?;
-                            write_payload(stream, codec, rng, &p)?;
+                            srv_send(stream, driver, &p)?;
                         }
                     }
                     Err(_) => {
@@ -3971,13 +3653,13 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                         shells.remove(&channel);
                         if want_reply {
                             let p = conn.send_request_failure(channel)?;
-                            write_payload(stream, codec, rng, &p)?;
+                            srv_send(stream, driver, &p)?;
                         }
                     }
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
         ChannelRequest::WindowChange {
@@ -4034,18 +3716,18 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 if new_count > MAX_ENV_PER_CHANNEL || new_bytes > MAX_ENV_BYTES_PER_CHANNEL {
                     if want_reply {
                         let p = conn.send_request_failure(channel)?;
-                        write_payload(stream, codec, rng, &p)?;
+                        srv_send(stream, driver, &p)?;
                     }
                 } else {
                     bag.insert(name, value);
                     if want_reply {
                         let p = conn.send_request_success(channel)?;
-                        write_payload(stream, codec, rng, &p)?;
+                        srv_send(stream, driver, &p)?;
                     }
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
         ChannelRequest::Subsystem { name } => {
@@ -4080,11 +3762,11 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                 );
                 if want_reply {
                     let p = conn.send_request_success(channel)?;
-                    write_payload(stream, codec, rng, &p)?;
+                    srv_send(stream, driver, &p)?;
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
         ChannelRequest::AuthAgentReq => {
@@ -4107,19 +3789,19 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                         agent_forward.active.insert(channel, handle);
                         if want_reply {
                             let p = conn.send_request_success(channel)?;
-                            write_payload(stream, codec, rng, &p)?;
+                            srv_send(stream, driver, &p)?;
                         }
                     }
                     Err(_) => {
                         if want_reply {
                             let p = conn.send_request_failure(channel)?;
-                            write_payload(stream, codec, rng, &p)?;
+                            srv_send(stream, driver, &p)?;
                         }
                     }
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
         ChannelRequest::X11Req {
@@ -4154,19 +3836,19 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
                         x11_forward.active.insert(channel, handle);
                         if want_reply {
                             let p = conn.send_request_success(channel)?;
-                            write_payload(stream, codec, rng, &p)?;
+                            srv_send(stream, driver, &p)?;
                         }
                     }
                     Err(_) => {
                         if want_reply {
                             let p = conn.send_request_failure(channel)?;
-                            write_payload(stream, codec, rng, &p)?;
+                            srv_send(stream, driver, &p)?;
                         }
                     }
                 }
             } else if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
         // ChannelRequest::Signal { name } — forwarded as kill(child_pid,
@@ -4174,7 +3856,7 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
         _ => {
             if want_reply {
                 let p = conn.send_request_failure(channel)?;
-                write_payload(stream, codec, rng, &p)?;
+                srv_send(stream, driver, &p)?;
             }
         }
     }
@@ -4187,10 +3869,9 @@ fn handle_channel_request<R: RngCore + CryptoRng>(
 /// own thread bound to a freshly-registered [`SubsystemRuntime`]. If no
 /// subsystem handler is attached the request fails.
 #[allow(clippy::too_many_arguments)]
-fn route_internal_sftp<R: RngCore + CryptoRng>(
+fn route_internal_sftp(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     cfg: &Config,
     user: &str,
@@ -4222,21 +3903,19 @@ fn route_internal_sftp<R: RngCore + CryptoRng>(
         );
         if want_reply {
             let p = conn.send_request_success(channel)?;
-            write_payload(stream, codec, rng, &p)?;
+            srv_send(stream, driver, &p)?;
         }
     } else if want_reply {
         let p = conn.send_request_failure(channel)?;
-        write_payload(stream, codec, rng, &p)?;
+        srv_send(stream, driver, &p)?;
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn drain_send<R: RngCore + CryptoRng>(
+fn drain_send(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    inbox: &mut Vec<u8>,
+    driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     channel: u32,
     mut data: &[u8],
@@ -4255,11 +3934,11 @@ fn drain_send<R: RngCore + CryptoRng>(
         };
 
         if taken > 0 {
-            write_payload(stream, codec, rng, &payload)?;
+            srv_send(stream, driver, &payload)?;
             data = &data[taken..];
             continue;
         }
-        let pkt = read_one_packet(stream, codec, inbox, None)?;
+        let pkt = srv_read(stream, driver, None)?;
         let ev = conn.on_packet(&pkt)?;
         match ev {
             ChannelEvent::WindowAdjust { channel: c, .. } if c == channel => continue,
@@ -4442,18 +4121,6 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
     KexInit::from_algorithms_owned(algs, cookie)
 }
 
-fn read_peer_version(stream: &mut TcpStream, deadline: Option<Instant>) -> Result<Vec<u8>> {
-    let mut buf = Vec::new();
-    for _ in 0..MAX_BANNER_LINES {
-        buf.clear();
-        read_line(stream, &mut buf, MAX_BANNER_LINE, deadline)?;
-        if buf.starts_with(b"SSH-") {
-            let parsed = VersionExchange::parse_remote(&buf)?;
-            return Ok(parsed.into_bytes());
-        }
-    }
-    Err(Error::Protocol("peer banner too long"))
-}
 
 /// Arm the per-read socket timeout against an absolute pre-auth `deadline`
 /// (OpenSSH's `LoginGraceTime` as a whole-phase budget rather than a
@@ -4477,92 +4144,88 @@ fn arm_preauth_deadline(stream: &TcpStream, deadline: Option<Instant>) -> Result
     Ok(())
 }
 
-fn read_line(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-    max_len: usize,
-    deadline: Option<Instant>,
-) -> Result<()> {
-    let mut byte = [0u8; 1];
-    loop {
-        arm_preauth_deadline(stream, deadline)?;
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Err(Error::Protocol("connection closed before newline"));
-        }
-        buf.push(byte[0]);
-        if byte[0] == b'\n' {
-            return Ok(());
-        }
-        if buf.len() >= max_len {
-            return Err(Error::Protocol("banner line too long"));
-        }
-    }
-}
+// --- Frontend pump over the sans-IO ServerDriver ---
+//
+// The connection is driven by a `ServerDriver` that owns the codec, KEX
+// runner, re-key, and all transport-message routing (version exchange,
+// EXT_INFO, PING/PONG, KEX). The functions below are the only place this
+// frontend touches the socket: they flush the driver's outbound queue, feed it
+// inbound bytes, and surface the next application payload.
 
-fn read_one_packet(
-    stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    inbox: &mut Vec<u8>,
-    deadline: Option<Instant>,
-) -> Result<Vec<u8>> {
-    loop {
-        let payload = read_one_raw_packet(stream, codec, inbox, deadline)?;
-        match payload.first().copied() {
-            Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
-            Some(2) | Some(3) | Some(4) => continue,
-            // PING/PONG arriving on the blocking-read paths (auth / kex
-            // phases). Drop them so callers only ever see a real protocol
-            // packet; the connection loop answers PINGs in steady state.
-            Some(SSH_MSG_PING) | Some(SSH_MSG_PONG) => continue,
-            _ => return Ok(payload),
-        }
+/// Flush every frame the driver has queued to the wire.
+fn srv_pump_out(stream: &mut TcpStream, driver: &mut ServerDriver) -> Result<()> {
+    while let Some(frame) = driver.poll_transmit() {
+        stream.write_all(&frame)?;
     }
-}
-
-fn read_one_raw_packet(
-    stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    inbox: &mut Vec<u8>,
-    deadline: Option<Instant>,
-) -> Result<Vec<u8>> {
-    loop {
-        if let Some((payload, consumed)) = codec.decode(inbox)? {
-            inbox.drain(..consumed);
-            return Ok(payload);
-        }
-        // Re-arm the absolute pre-auth deadline before every blocking read so
-        // a slow-loris peer that dribbles bytes can't extend the grace window
-        // indefinitely (the socket read timeout otherwise resets per read).
-        // `None` ⇒ post-auth / no budget; leaves the socket timeout untouched.
-        arm_preauth_deadline(stream, deadline)?;
-        let mut tmp = [0u8; 16 * 1024];
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            return Err(Error::Protocol("connection closed"));
-        }
-        inbox.extend_from_slice(&tmp[..n]);
-        if inbox.len() > MAX_INBOX_BYTES {
-            return Err(Error::Protocol("inbound buffer too large"));
-        }
-    }
-}
-
-fn write_payload<R: RngCore + CryptoRng>(
-    stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
-    payload: &[u8],
-) -> Result<()> {
-    let frame = codec.encode(payload, rng)?;
-    stream.write_all(&frame)?;
     Ok(())
 }
 
-fn send_disconnect<R: RngCore + CryptoRng>(
+/// Encode `payload` and send it (the driver-backed replacement for the old
+/// `srv_send(stream, driver, payload)`).
+fn srv_send(stream: &mut TcpStream, driver: &mut ServerDriver, payload: &[u8]) -> Result<()> {
+    driver.enqueue_payload(payload)?;
+    srv_pump_out(stream, driver)
+}
+
+/// Read one chunk off the transport (re-arming the pre-auth `deadline` first)
+/// and feed it to the driver.
+fn srv_read_into(
     stream: &mut TcpStream,
-    codec: &mut PacketCodec,
-    rng: &mut R,
+    driver: &mut ServerDriver,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    arm_preauth_deadline(stream, deadline)?;
+    let mut tmp = [0u8; 16 * 1024];
+    let n = stream.read(&mut tmp)?;
+    if n == 0 {
+        return Err(Error::Protocol("connection closed"));
+    }
+    driver.handle_input(&tmp[..n], Instant::now())?;
+    Ok(())
+}
+
+/// Pump the driver until it yields the next application payload. Re-key /
+/// keepalive timers tick on each iteration; transport messages are handled
+/// inside the driver and never surface. The driver-backed replacement for the
+/// old `srv_read(stream, driver, deadline)`.
+fn srv_read(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    deadline: Option<Instant>,
+) -> Result<Vec<u8>> {
+    loop {
+        driver.handle_timeout(Instant::now())?;
+        srv_pump_out(stream, driver)?;
+        while let Some(ev) = driver.poll_event() {
+            if let Event::AppData(payload) = ev {
+                srv_pump_out(stream, driver)?;
+                return Ok(payload);
+            }
+        }
+        srv_read_into(stream, driver, deadline)?;
+    }
+}
+
+/// Like [`srv_read`] but returns `Ok(None)` on a socket read timeout (the
+/// 50 ms polling tick), so the connection loop can interleave wire reads with
+/// per-channel draining. Replacement for `read_one_packet_maybe_timeout`.
+fn srv_read_maybe_timeout(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+) -> Result<Option<Vec<u8>>> {
+    match srv_read(stream, driver, None) {
+        Ok(p) => Ok(Some(p)),
+        Err(Error::Io(e)) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Send an `SSH_MSG_DISCONNECT` via the driver.
+fn srv_send_disconnect(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
     reason: u32,
     description: &str,
 ) -> Result<()> {
@@ -4571,8 +4234,30 @@ fn send_disconnect<R: RngCore + CryptoRng>(
     w.write_u32(reason);
     w.write_string(description.as_bytes());
     w.write_string(b"");
-    write_payload(stream, codec, rng, &w.into_vec())
+    srv_send(stream, driver, &w.into_vec())
 }
+
+/// Pump the driver until the handshake (version exchange + first KEX) completes.
+fn srv_drive_handshake(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    loop {
+        srv_pump_out(stream, driver)?;
+        while let Some(ev) = driver.poll_event() {
+            if matches!(ev, Event::HandshakeComplete) {
+                srv_pump_out(stream, driver)?;
+                return Ok(());
+            }
+        }
+        srv_read_into(stream, driver, deadline)?;
+    }
+}
+
+
+
+
 
 #[cfg(test)]
 mod tests {
@@ -4581,6 +4266,8 @@ mod tests {
     use crate::client::{Client, Config as ClientConfig, HostKeyPolicy};
     use crate::hostkey::Ed25519HostKey;
     use crate::transport::kex::KexAlgorithms;
+    use crate::transport::{KexRunner, PacketCodec, Role};
+    use purecrypto::rng::OsRng;
     use std::sync::Mutex;
     use std::time::Duration;
 

@@ -163,11 +163,10 @@ impl ServerDriver {
     }
 
     /// Notify the driver that userauth has just succeeded: activate
-    /// compression (RFC 4253 §6.2) and re-open the post-auth EXT_INFO window.
-    /// The frontend calls this when its `ServerAuth` reports `Authenticated`.
+    /// `zlib@openssh.com` compression (RFC 4253 §6.2). The frontend calls this
+    /// once its `ServerAuth` reports `Authenticated`, before the next packet.
     pub fn notify_auth_success(&mut self) {
         self.codec.activate_compress();
-        self.runner.arm_ext_info_post_auth();
     }
 
     // --- pump surface ---

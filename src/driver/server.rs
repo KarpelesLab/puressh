@@ -128,7 +128,8 @@ impl ServerDriver {
     pub fn start(&mut self, now: Instant) -> Result<()> {
         self.last_activity = now;
         self.outbox.push_back(VersionExchange::outgoing_bytes());
-        let advert = build_server_kexinit(&mut self.rng, &self.cfg).with_ext_info_marker(Role::Server);
+        let advert =
+            build_server_kexinit(&mut self.rng, &self.cfg).with_ext_info_marker(Role::Server);
         self.runner = KexRunner::new(Role::Server, advert);
         // Queue our outbound EXT_INFO; the runner emits it after NEWKEYS iff
         // the client also advertised the marker.
@@ -493,7 +494,8 @@ mod tests {
 
         // We are the server frontend.
         let (mut sock, _peer) = listener.accept().expect("accept");
-        sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         let mut driver = ServerDriver::new(cfg.clone());
         driver.start(Instant::now()).expect("start");
 
@@ -555,13 +557,11 @@ mod tests {
                             } if Some(channel) == session_ch => {
                                 if matches!(request, ChannelRequest::Exec { .. }) {
                                     if want_reply {
-                                        let p =
-                                            conn.send_request_success(channel).expect("succ");
+                                        let p = conn.send_request_success(channel).expect("succ");
                                         driver.enqueue_payload(&p).expect("enq");
                                     }
                                     // stdout
-                                    let (p, _n) =
-                                        conn.send_data(channel, &reply).expect("data");
+                                    let (p, _n) = conn.send_data(channel, &reply).expect("data");
                                     driver.enqueue_payload(&p).expect("enq");
                                     // exit-status 0
                                     let p = conn
@@ -595,7 +595,9 @@ mod tests {
             let mut buf = [0u8; 16 * 1024];
             match sock.read(&mut buf) {
                 Ok(0) => break 'pump,
-                Ok(n) => driver.handle_input(&buf[..n], Instant::now()).expect("input"),
+                Ok(n) => driver
+                    .handle_input(&buf[..n], Instant::now())
+                    .expect("input"),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -607,7 +609,10 @@ mod tests {
         }
 
         let out = client_thread.join().expect("client thread");
-        assert_eq!(out.stdout, reply, "exec stdout round-trips through the server driver");
+        assert_eq!(
+            out.stdout, reply,
+            "exec stdout round-trips through the server driver"
+        );
         assert_eq!(out.exit, Some(0));
         let _ = sock;
     }

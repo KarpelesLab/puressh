@@ -533,7 +533,8 @@ mod tests {
         });
 
         let mut sock = TcpStream::connect(addr).expect("connect");
-        sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
         let mut driver = ClientDriver::new(Default::default(), accept_any_factory());
         // The frontend owns the connection multiplexer.
         let mut conn = ConnectionState::new();
@@ -649,7 +650,9 @@ mod tests {
             let mut buf = [0u8; 16 * 1024];
             match sock.read(&mut buf) {
                 Ok(0) => break 'pump,
-                Ok(n) => driver.handle_input(&buf[..n], Instant::now()).expect("input"),
+                Ok(n) => driver
+                    .handle_input(&buf[..n], Instant::now())
+                    .expect("input"),
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
@@ -660,7 +663,10 @@ mod tests {
             }
         }
 
-        assert_eq!(stdout, expected, "exec stdout round-trips through the driver");
+        assert_eq!(
+            stdout, expected,
+            "exec stdout round-trips through the driver"
+        );
         assert_eq!(exit, Some(0), "exit status captured");
 
         drop(sock);

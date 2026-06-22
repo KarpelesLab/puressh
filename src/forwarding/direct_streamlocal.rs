@@ -228,8 +228,8 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let pid = std::process::id();
-            let path =
-                std::path::PathBuf::from("/tmp").join(format!("p-dsl-{prefix}-{pid:x}-{:x}", nanos as u32));
+            let path = std::path::PathBuf::from("/tmp")
+                .join(format!("p-dsl-{prefix}-{pid:x}-{:x}", nanos as u32));
             std::fs::create_dir_all(&path).expect("create tempdir");
             Self { path }
         }
@@ -278,7 +278,9 @@ mod tests {
             h.handle("test-user", req, stream).expect("handle");
         });
 
-        ingress_tx.send(Some(b"ping".to_vec())).expect("ingress send");
+        ingress_tx
+            .send(Some(b"ping".to_vec()))
+            .expect("ingress send");
 
         let mut got = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -316,8 +318,8 @@ mod tests {
         let (_ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
         let (egress_tx, _egress_rx) = mpsc::sync_channel::<ChannelEgress>(8);
         let stream = ChannelStream::new(ingress_rx, egress_tx);
-        let h = DefaultDirectStreamlocalHandler::new()
-            .with_allow_list(|path| path == "/allowed.sock");
+        let h =
+            DefaultDirectStreamlocalHandler::new().with_allow_list(|path| path == "/allowed.sock");
         let req = DirectStreamlocalRequest {
             socket_path: "/denied.sock",
         };

@@ -33,8 +33,8 @@ use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
 };
 use crate::client::{AlgoOverrides, Config, ExecOutput, build_verifier, unix_now};
-use crate::driver::{ClientDriver, Event};
 use crate::driver::client::VerifierFactory;
+use crate::driver::{ClientDriver, Event};
 use crate::error::{Error, Result};
 use crate::hostkey::HostKey;
 
@@ -390,7 +390,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncChannel<'_, S> {
             match self.client.conn.on_packet(&payload)? {
                 ChannelEvent::Data { channel, data } if channel == self.channel => {
                     self.read_buf.extend_from_slice(&data);
-                    self.client.replenish(self.channel, data.len() as u32).await?;
+                    self.client
+                        .replenish(self.channel, data.len() as u32)
+                        .await?;
                 }
                 ChannelEvent::Eof { channel } if channel == self.channel => {
                     self.remote_eof = true;
@@ -493,10 +495,7 @@ mod tests {
         ) -> Poll<std::io::Result<()>> {
             Poll::Ready(self.0.flush())
         }
-        fn poll_close(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
         }
     }
@@ -614,10 +613,7 @@ mod tests {
             .await
             .expect("connect");
             client
-                .authenticate_publickey(
-                    &user,
-                    Box::new(Ed25519HostKey::from_seed(client_seed)),
-                )
+                .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
                 .await
                 .expect("auth");
             client.exec("hi").await.expect("exec")

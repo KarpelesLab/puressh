@@ -35,11 +35,11 @@ use std::time::{Duration, Instant};
 use purecrypto::rng::RngCore;
 
 use crate::auth::{Authenticator, ServerAuth, ServerStep};
-use crate::driver::{Event, ServerDriver};
 use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
     SSH_OPEN_ADMINISTRATIVELY_PROHIBITED, SSH_OPEN_RESOURCE_SHORTAGE,
 };
+use crate::driver::{Event, ServerDriver};
 use crate::error::{Error, Result};
 use crate::format::Writer;
 use crate::hostkey::HostKey;
@@ -1439,10 +1439,7 @@ impl Config {
     /// `streamlocal-forward@openssh.com` / `cancel-streamlocal-forward@openssh.com`
     /// global request (i.e. `ssh -R /remote.sock:...`) is answered with
     /// `REQUEST_FAILURE`.
-    pub fn with_streamlocal_forward(
-        mut self,
-        handler: Arc<dyn StreamlocalForwardHandler>,
-    ) -> Self {
+    pub fn with_streamlocal_forward(mut self, handler: Arc<dyn StreamlocalForwardHandler>) -> Self {
         self.streamlocal_forward_handler = Some(handler);
         self
     }
@@ -3522,14 +3519,7 @@ fn handle_channel_request(
                 let p = conn.send_request_success(channel)?;
                 srv_send(stream, driver, &p)?;
             }
-            drain_send(
-                stream,
-                driver,
-                conn,
-                channel,
-                &result.stdout,
-                None,
-            )?;
+            drain_send(stream, driver, conn, channel, &result.stdout, None)?;
             drain_send(
                 stream,
                 driver,
@@ -3605,14 +3595,7 @@ fn handle_channel_request(
                     let p = conn.send_request_success(channel)?;
                     srv_send(stream, driver, &p)?;
                 }
-                drain_send(
-                    stream,
-                    driver,
-                    conn,
-                    channel,
-                    &result.stdout,
-                    None,
-                )?;
+                drain_send(stream, driver, conn, channel, &result.stdout, None)?;
                 drain_send(
                     stream,
                     driver,
@@ -4121,7 +4104,6 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
     KexInit::from_algorithms_owned(algs, cookie)
 }
 
-
 /// Arm the per-read socket timeout against an absolute pre-auth `deadline`
 /// (OpenSSH's `LoginGraceTime` as a whole-phase budget rather than a
 /// per-read inactivity window). When `deadline` is `None` the budget is
@@ -4215,7 +4197,9 @@ fn srv_read_maybe_timeout(
 ) -> Result<Option<Vec<u8>>> {
     match srv_read(stream, driver, None) {
         Ok(p) => Ok(Some(p)),
-        Err(Error::Io(e)) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {
+        Err(Error::Io(e))
+            if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+        {
             Ok(None)
         }
         Err(e) => Err(e),
@@ -4254,10 +4238,6 @@ fn srv_drive_handshake(
         srv_read_into(stream, driver, deadline)?;
     }
 }
-
-
-
-
 
 #[cfg(test)]
 mod tests {

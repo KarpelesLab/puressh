@@ -170,7 +170,9 @@ impl DefaultStreamlocalForwardHandler {
 impl StreamlocalForwardHandler for DefaultStreamlocalForwardHandler {
     fn bind(&self, user: &str, socket_path: &str, ctx: StreamlocalForwardContext) -> Result<()> {
         if !self.allowed(user, socket_path) {
-            return Err(Error::Protocol("streamlocal-forward: bind refused by policy"));
+            return Err(Error::Protocol(
+                "streamlocal-forward: bind refused by policy",
+            ));
         }
         let path = PathBuf::from(socket_path);
 
@@ -357,7 +359,8 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0);
             let pid = std::process::id();
-            let path = PathBuf::from("/tmp").join(format!("p-slf-{prefix}-{pid:x}-{:x}", nanos as u32));
+            let path =
+                PathBuf::from("/tmp").join(format!("p-slf-{prefix}-{pid:x}-{:x}", nanos as u32));
             std::fs::create_dir_all(&path).expect("create tempdir");
             Self { path }
         }
@@ -375,8 +378,12 @@ mod tests {
         let sock = dir.path.join("fwd.sock");
         let sock_str = sock.to_string_lossy().to_string();
         let h = DefaultStreamlocalForwardHandler::permit_all();
-        h.bind("u", &sock_str, StreamlocalForwardContext::for_test_no_opens())
-            .expect("bind");
+        h.bind(
+            "u",
+            &sock_str,
+            StreamlocalForwardContext::for_test_no_opens(),
+        )
+        .expect("bind");
         assert!(sock.exists(), "socket should exist on disk after bind");
         assert_eq!(h.binding_count(), 1);
         h.unbind("u", &sock_str).expect("unbind");

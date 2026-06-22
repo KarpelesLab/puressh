@@ -202,7 +202,10 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             Poll::Ready(self.0.write(buf))
         }
-        fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
             Poll::Ready(self.0.flush())
         }
         fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -355,12 +358,18 @@ mod tests {
                                 let pl = srv.conn_mut().send_request_success(channel).expect("s");
                                 srv.send(&pl).await.expect("send");
                             }
-                            let (pl, _n) =
-                                srv.conn_mut().send_data(channel, &reply_for_srv).expect("d");
+                            let (pl, _n) = srv
+                                .conn_mut()
+                                .send_data(channel, &reply_for_srv)
+                                .expect("d");
                             srv.send(&pl).await.expect("send");
                             let pl = srv
                                 .conn_mut()
-                                .send_request(channel, ChannelRequest::ExitStatus { code: 0 }, false)
+                                .send_request(
+                                    channel,
+                                    ChannelRequest::ExitStatus { code: 0 },
+                                    false,
+                                )
                                 .expect("e");
                             srv.send(&pl).await.expect("send");
                             let pl = srv.conn_mut().send_eof(channel).expect("eof");
@@ -376,7 +385,10 @@ mod tests {
         });
 
         let (stdout, exit) = client_thread.join().expect("client thread");
-        assert_eq!(stdout, reply, "exec stdout round-trips through the async server");
+        assert_eq!(
+            stdout, reply,
+            "exec stdout round-trips through the async server"
+        );
         assert_eq!(exit, Some(0));
     }
 }

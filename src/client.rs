@@ -3123,8 +3123,9 @@ fn serve_drain_commands(
                 );
             }
             Ok(ServeCommand::OpenDirectStreamlocal { socket_path, reply }) => {
-                let (local_id, open_payload) =
-                    client.conn.open(ChannelOpen::DirectStreamlocal { socket_path })?;
+                let (local_id, open_payload) = client
+                    .conn
+                    .open(ChannelOpen::DirectStreamlocal { socket_path })?;
                 client.write_payload(&open_payload)?;
                 let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
                 let (egress_tx, egress_rx) =

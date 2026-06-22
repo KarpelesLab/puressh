@@ -4272,7 +4272,7 @@ fn drain_send<R: RngCore + CryptoRng>(
     Ok(())
 }
 
-fn pick_host_key<'a>(
+pub(crate) fn pick_host_key<'a>(
     keys: &'a [Box<dyn HostKey + Send + Sync>],
     name: &str,
 ) -> Option<&'a (dyn HostKey + Send + Sync)> {
@@ -4298,7 +4298,7 @@ fn pick_host_key<'a>(
 /// Build the `SSH_MSG_EXT_INFO` we send to the client on the first KEX.
 /// Carries `server-sig-algs` (RFC 8308 §3.1) so the client can pick
 /// rsa-sha2-{256,512} instead of legacy `ssh-rsa` for publickey signatures.
-fn server_ext_info() -> ExtInfo {
+pub(crate) fn server_ext_info() -> ExtInfo {
     // Algorithms we are willing to verify a client publickey signature with.
     // Order is the same priority as our host-key KEX list — strongest first.
     // Legacy `ssh-rsa` (SHA-1) is intentionally omitted; it stays opt-in via
@@ -4336,7 +4336,7 @@ fn owned_or_default(over: &Option<Vec<String>>, default: &[&str]) -> Vec<String>
     }
 }
 
-fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
+pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> KexInit {
     let host_keys = &cfg.host_keys;
     // The set of host-key algorithms we can actually produce signatures for,
     // in the default preference order (used both as the default advert and as

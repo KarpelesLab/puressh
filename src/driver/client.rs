@@ -26,26 +26,17 @@ use std::time::{Duration, Instant};
 
 use purecrypto::rng::{CryptoRng, OsRng, RngCore};
 
-use crate::channel::{GlobalRequest, MSG_GLOBAL_REQUEST};
 use crate::client::AlgoOverrides;
 use crate::error::{Error, Result};
-use crate::format::Writer;
 use crate::hostkey::HostKeyVerify;
 use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, pong_for_ping};
 use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
 use crate::transport::{ExtInfo, KexRunner, PacketCodec, Role, VersionExchange};
 
-use super::Event;
-
-/// `SSH_MSG_KEX_ECDH_REPLY` — the KEX message carrying the host key.
-const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
-const SSH_MSG_KEXINIT: u8 = 20;
-const SSH_MSG_EXT_INFO: u8 = 7;
-
-const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
-const MAX_BANNER_LINE: usize = 1024;
-const MAX_BANNER_LINES: usize = 32;
-const MAX_BANNER_TOTAL_BYTES: usize = 64 * 1024;
+use super::{
+    Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_INBOX_BYTES,
+    SSH_MSG_EXT_INFO, SSH_MSG_KEX_ECDH_REPLY, SSH_MSG_KEXINIT, keepalive_request,
+};
 
 /// Builds the exchange-hash host-key verifier from the `SSH_MSG_KEX_ECDH_REPLY`
 /// payload, applying the frontend's host-key policy. Receives the live
@@ -410,18 +401,6 @@ impl ClientDriver {
         self.last_activity = now;
         self.missed_keepalives = 0;
     }
-}
-
-/// Build a `keepalive@openssh.com` global-request payload (want_reply = true),
-/// without needing a `ConnectionState` (the encoding is stateless).
-fn keepalive_request() -> Vec<u8> {
-    let req = GlobalRequest::Keepalive;
-    let mut w = Writer::new();
-    w.write_u8(MSG_GLOBAL_REQUEST);
-    w.write_string(req.name().as_bytes());
-    w.write_bool(true);
-    req.encode(&mut w);
-    w.into_vec()
 }
 
 // `OsRng` is `CryptoRng + RngCore`; assert the bounds we rely on.

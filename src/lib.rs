@@ -19,8 +19,31 @@
 //! - [`auth`]     — userauth (RFC 4252).
 //! - [`channel`]  — channels (RFC 4254).
 //! - [`key`]      — OpenSSH key file parsing and serialisation.
-//! - [`client`]   — high-level client API (feature `client`).
-//! - [`server`]   — high-level server API (feature `server`).
+//! - [`client`]   — high-level blocking client API (feature `client`).
+//! - [`server`]   — high-level blocking server API (feature `server`).
+//! - `driver`     — sans-IO connection drivers (features `client` / `server`).
+//! - `client_async` — runtime-agnostic async client (feature `async`).
+//!
+//! # Sans-IO core and frontends
+//!
+//! The protocol layers above ([`mod@format`], [`transport`], [`channel`],
+//! [`auth`]) are *sans-IO*: they transform byte buffers and never touch a
+//! socket. The `driver` module lifts the connection *orchestration* — the
+//! state machine that sequences version exchange → key exchange →
+//! authentication → application channels and drives re-key/keepalive timers —
+//! into the same sans-IO style: a `ClientDriver` / `ServerDriver` takes inbound
+//! bytes (`handle_input`), produces outbound frames (`poll_transmit`) and
+//! events (`poll_event`), and ticks timers (`handle_timeout`), with the caller
+//! supplying the I/O and the clock.
+//!
+//! Two frontends drive that one core, sharing all protocol logic:
+//!
+//! - the blocking [`Client`](client::Client) / [`Server`](server::Server)
+//!   (default), which pump the driver over `std::net` sockets and threads;
+//! - the async `AsyncClient` (feature `async`), which pumps the same
+//!   `ClientDriver` over any `futures_io::AsyncRead` + `AsyncWrite` transport
+//!   (tokio via compat, smol, async-std, …) with no runtime dependency of its
+//!   own.
 //!
 //! [`purecrypto`]: https://crates.io/crates/purecrypto
 
@@ -59,7 +82,7 @@ pub mod client;
 // Sans-IO connection drivers (transport + handshake + auth + channel
 // orchestration as a pure state machine). The blocking `client`/`server`
 // frontends drive these; an async frontend can too.
-#[cfg(feature = "client")]
+#[cfg(any(feature = "client", feature = "server"))]
 pub mod driver;
 
 // Runtime-agnostic async client frontend over `futures_io::AsyncRead/AsyncWrite`,

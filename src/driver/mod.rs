@@ -18,15 +18,44 @@
 //!
 //! This makes the same core reusable from a blocking frontend (the existing
 //! [`crate::client::Client`]) and an async one, with no duplicated protocol
-//! logic. See [`client::ClientDriver`].
+//! logic. See [`client::ClientDriver`] and [`server::ServerDriver`].
 
-#![cfg(feature = "client")]
-
+#[cfg(feature = "client")]
 pub mod client;
+#[cfg(feature = "server")]
+pub mod server;
 
+#[cfg(feature = "client")]
 pub use client::{ClientDriver, VerifierFactory};
+#[cfg(feature = "server")]
+pub use server::ServerDriver;
 
 use alloc::vec::Vec;
+
+use crate::channel::{GlobalRequest, MSG_GLOBAL_REQUEST};
+use crate::format::Writer;
+
+// Transport-routing message bytes and buffer caps shared by both drivers.
+/// `SSH_MSG_KEX_ECDH_REPLY` — the KEX message carrying the host key.
+pub(crate) const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+pub(crate) const SSH_MSG_KEXINIT: u8 = 20;
+pub(crate) const SSH_MSG_EXT_INFO: u8 = 7;
+pub(crate) const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_BANNER_LINE: usize = 1024;
+pub(crate) const MAX_BANNER_LINES: usize = 32;
+pub(crate) const MAX_BANNER_TOTAL_BYTES: usize = 64 * 1024;
+
+/// Build a `keepalive@openssh.com` global-request payload (want_reply = true),
+/// without a `ConnectionState` (the encoding is stateless).
+pub(crate) fn keepalive_request() -> Vec<u8> {
+    let req = GlobalRequest::Keepalive;
+    let mut w = Writer::new();
+    w.write_u8(MSG_GLOBAL_REQUEST);
+    w.write_string(req.name().as_bytes());
+    w.write_bool(true);
+    req.encode(&mut w);
+    w.into_vec()
+}
 
 /// A high-level event surfaced by a driver's `poll_event`.
 ///

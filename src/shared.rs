@@ -20,6 +20,12 @@
 //! as needed, dispatches inbound packets to the right queue, and only
 //! returns to the caller once *its* channel has bytes.
 //!
+//! Framing/handshake/re-key are not re-derived here: the pumper drives the
+//! same sans-IO [`ClientDriver`](crate::driver::ClientDriver) as the blocking
+//! client, transitively through [`Client`]'s `read_one_packet` /
+//! `write_payload` primitives (which queue into / drain out of the driver).
+//! `SharedClient` only adds the per-channel fan-out and locking on top.
+//!
 //! ## Surface
 //!
 //! - [`SharedClient::sftp`] — open an SFTP session (returns

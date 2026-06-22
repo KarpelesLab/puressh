@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.7](https://github.com/KarpelesLab/puressh/compare/v0.0.6...v0.0.7) - 2026-06-22
+
+### Added
+
+- *(async)* runtime-agnostic async server connection (phase 5)
+- *(driver)* sans-IO ServerDriver + crate docs (phases 5–6)
+- *(async)* runtime-agnostic async client frontend (phase 3)
+- *(driver)* add sans-IO ClientDriver (refactor phase 1)
+- add StreamLocal (Unix-socket) tunnel support
+
+### Other
+
+- use Waker::noop() in async block_on (fix CI clippy on Rust 1.96)
+- fix broken intra-doc links in async frontends (fix CI docs job)
+- cargo fmt across the sans-IO refactor (fix CI)
+- *(server)* run blocking Server on ServerDriver (phase 5 complete)
+- *(client)* reimplement blocking Client over the sans-IO driver (phase 2)
+- add MSRV (Rust 1.88) guard job
+
 ## [0.0.6](https://github.com/KarpelesLab/puressh/compare/v0.0.5...v0.0.6) - 2026-06-19
 
 ### Fixed

@@ -90,6 +90,11 @@ pub mod driver;
 #[cfg(feature = "async")]
 pub mod client_async;
 
+// Runtime-agnostic async server connection driving `ServerDriver`. Opt-in
+// (needs both the async frontend and the server transport engine).
+#[cfg(all(feature = "async", feature = "server"))]
+pub mod server_async;
+
 // `ProxyCommand` transport (Unix-only): spawns a helper process and runs the
 // SSH session over its stdio. Gated on `client` (which pulls in `std` and the
 // `Transport` trait) so a no_std+alloc build still compiles without it.

@@ -22,24 +22,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use purecrypto::hash::{Digest, Sha256};
-use purecrypto::rng::{OsRng, RngCore};
+use purecrypto::rng::RngCore;
 
 use crate::auth::{ClientAuth, ClientCredential, ClientStep};
 use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
     SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
 };
+use crate::driver::{ClientDriver, Event};
 use crate::error::{Error, Result};
 use crate::hostkey::{HostKey, HostKeyVerify, host_key_verify_by_name};
 use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
 pub use crate::stream::{ChannelEgress, ChannelStream};
 use crate::transport::kex::{defaults, is_strict_kex_marker};
-use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, encode_ping, pong_for_ping};
-use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
-use crate::transport::{
-    KexAlgorithmsOwned, KexInit, KexRunner, PacketCodec, Role, VersionExchange,
-};
+use crate::transport::ping::encode_ping;
+use crate::transport::{KexAlgorithmsOwned, KexInit, KexRunner};
 
 /// Abstraction over the byte transport a [`Client`] runs on. The default is
 /// a plain [`TcpStream`], but a client can also run over a proxied channel
@@ -64,19 +62,10 @@ impl Transport for TcpStream {
     }
 }
 
-/// Maximum line length when reading the peer's identification banner.
-const MAX_BANNER_LINE: usize = 1024;
-/// Maximum number of banner lines we'll skim through before giving up.
-/// Tightened (was 256) to match OpenSSH's much smaller pre-auth banner
-/// tolerance: an attacker should not be able to make us buffer hundreds of
-/// kilobytes of unauthenticated text before we even see the SSH version.
+/// Number of banner lines the handshake will skim through before giving up
+/// (used to bound the handshake pump's iteration count). The driver does the
+/// actual banner-scanning and enforces its own byte caps.
 const MAX_BANNER_LINES: usize = 32;
-/// Hard cap on the **total** bytes we will read across all pre-version
-/// banner lines (RFC 4253 §4.2 permits arbitrary text before the
-/// `SSH-2.0-…` line; OpenSSH caps this at ~64 KiB total).
-const MAX_BANNER_TOTAL_BYTES: usize = 64 * 1024;
-/// Soft cap on the inbound packet-reassembly buffer.
-const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
 /// Hard cap on accumulated exec stdout+stderr.
 const MAX_EXEC_OUTPUT: usize = 64 * 1024 * 1024;
 /// Maximum iterations for the KEX driver loop.
@@ -96,8 +85,6 @@ const MAX_SERVE_STEPS: usize = 100_000_000;
 /// Read timeout the serve loop installs on the socket while it has at least
 /// one live channel runtime to drain. Reverts to blocking when idle.
 const SERVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 
 /// Policy for accepting (or rejecting) a server's host key.
 pub enum HostKeyPolicy {
@@ -578,39 +565,18 @@ struct ServeRuntime {
 /// A blocking SSH client.
 pub struct Client {
     stream: Box<dyn Transport>,
-    codec: PacketCodec,
+    /// Connection multiplexer (channel bookkeeping). The frontend owns this:
+    /// the sans-IO [`ClientDriver`] surfaces decoded application payloads
+    /// (post-auth), which we feed into `conn`, and we hand `conn`'s
+    /// channel-protocol output back to the driver to encode and queue.
     pub(crate) conn: ConnectionState,
-    session_id: Vec<u8>,
-    inbox: Vec<u8>,
-    rng: OsRng,
-    /// Persistent KEX state machine, kept alive across the connection so
-    /// re-keys (RFC 4253 §9) can drive a fresh handshake without dropping
-    /// the codec.
-    runner: KexRunner,
-    /// Local and remote version strings, recorded at the start so re-keys
-    /// can re-hash them without re-reading the banner.
-    v_c: Vec<u8>,
-    v_s: Vec<u8>,
-    /// Host-key policy retained so re-key replies can be re-verified.
-    host_key_policy: HostKeyPolicy,
-    /// Algorithm-preference overrides from config. Retained so re-keys
-    /// re-advertise the same (overridden) lists as the initial KEX.
+    /// Transport + authentication engine: version exchange, key exchange,
+    /// re-key, EXT_INFO/PING handling, and the userauth state machine, all
+    /// sans-IO. The frontend pumps it via `write_payload` / `read_one_packet`.
+    driver: ClientDriver,
+    /// Algorithm-preference overrides from config. Retained for the auth
+    /// driver's PubkeyAcceptedAlgorithms / server-sig-algs policy.
     algo_overrides: AlgoOverrides,
-    /// Wall-clock instant the most recent KEX completed.
-    last_kex: Instant,
-    /// Thresholds that trigger a re-KEX.
-    rekey_policy: RekeyPolicy,
-    /// App-layer payloads received while a re-KEX was in flight (RFC 4253
-    /// §7.3). Drained out by `read_one_packet` ahead of new wire reads.
-    deferred: Vec<Vec<u8>>,
-    /// Hostname the user passed to `connect_to_host`, used for
-    /// `HostKeyPolicy::KnownHosts` lookups. Empty when the client was
-    /// constructed via `connect` (in which case `KnownHosts` policy
-    /// degrades to AcceptAny — see [`HostKeyPolicy::KnownHosts`] docs).
-    target_host: String,
-    /// Port the user passed to `connect_to_host`. 0 means "not threaded
-    /// in"; lookups need a non-zero port to match.
-    target_port: u16,
     /// When `true`, every session-channel helper ([`Self::exec`],
     /// [`Self::exec_stream`], [`Self::shell_with_stdin`], [`Self::sftp`])
     /// issues `auth-agent-req@openssh.com` immediately after the open and
@@ -743,28 +709,31 @@ impl Client {
         port: u16,
         cfg: Config,
     ) -> Result<Self> {
-        // The runner is bootstrapped inside `do_version_and_kex`; we install
-        // a placeholder advert here just so the struct field is initialised
-        // (it's replaced immediately).
-        let mut rng = OsRng;
-        let placeholder_advert = build_default_kexinit(&mut rng, &cfg.algorithms);
+        // Host-key verification is injected into the sans-IO driver as a
+        // closure, capturing the policy + target so the driver stays free of
+        // known-hosts I/O / prompting. Called on each `SSH_MSG_KEX_ECDH_REPLY`
+        // (initial and re-key).
+        let host_key_policy = cfg.host_key_policy;
+        let target_host = host.to_string();
+        let ca_sig_algos = cfg.algorithms.ca_signature_algorithms.clone();
+        let verifier_factory: crate::driver::client::VerifierFactory =
+            Box::new(move |reply: &[u8], runner: &KexRunner| {
+                build_verifier(
+                    reply,
+                    &host_key_policy,
+                    runner,
+                    &target_host,
+                    port,
+                    ca_sig_algos.as_deref(),
+                    unix_now(),
+                )
+            });
+        let driver = ClientDriver::new(cfg.algorithms.clone(), verifier_factory);
         let mut me = Self {
             stream,
-            codec: PacketCodec::new(),
             conn: ConnectionState::new(),
-            session_id: Vec::new(),
-            inbox: Vec::new(),
-            rng,
-            runner: KexRunner::new(Role::Client, placeholder_advert),
-            v_c: Vec::new(),
-            v_s: Vec::new(),
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            algo_overrides: cfg.algorithms.clone(),
-            last_kex: Instant::now(),
-            rekey_policy: RekeyPolicy::default(),
-            deferred: Vec::new(),
-            target_host: host.to_string(),
-            target_port: port,
+            driver,
+            algo_overrides: cfg.algorithms,
             request_auth_agent: false,
             request_x11: None,
             session_env: Vec::new(),
@@ -773,8 +742,8 @@ impl Client {
             tcpip_forward_grants: Vec::new(),
             streamlocal_forward_grants: Vec::new(),
         };
-        me.host_key_policy = cfg.host_key_policy;
-        me.do_version_and_kex()?;
+        me.driver.start(Instant::now())?;
+        me.drive_handshake()?;
         Ok(me)
     }
 
@@ -787,7 +756,7 @@ impl Client {
     /// userauth exchange*, which is what a multi-factor server expects (the
     /// driver advances on each USERAUTH_FAILURE / partial-success).
     pub fn authenticate(&mut self, user: &str, credentials: Vec<ClientCredential>) -> Result<()> {
-        let mut auth = ClientAuth::new(user, self.session_id.clone());
+        let mut auth = ClientAuth::new(user, self.driver.session_id().to_vec());
         // Local PubkeyAcceptedAlgorithms policy from ssh_config, applied
         // before any server-sig-algs filtering.
         if let Some(accepted) = self.algo_overrides.pubkey_accepted_algorithms.clone() {
@@ -796,7 +765,7 @@ impl Client {
         // RFC 8308 §3.1: if the server told us which signature algorithms
         // it will accept on a publickey auth, propagate that to the auth
         // driver so we skip credentials it would reject anyway.
-        if let Some(ext) = self.runner.peer_ext_info()
+        if let Some(ext) = self.driver.peer_ext_info()
             && let Some(algs) = ext.server_sig_algs.as_deref()
         {
             auth.set_server_sig_algs(algs);
@@ -808,28 +777,26 @@ impl Client {
     }
 
     /// Drive a fully-configured [`ClientAuth`] to a verdict on this connection.
-    /// Sends the initial SERVICE_REQUEST and pumps packets until the driver
-    /// reports success or exhausts its credentials. Callers that need to inject
-    /// policy (server-sig-algs, pubkey-accepted, a re-promptable password
-    /// closure, a keyboard-interactive responder) build the driver themselves
-    /// and hand it here — there is exactly one driver, and thus exactly one
-    /// SERVICE_REQUEST, per connection.
+    /// Hands the driver the auth state machine (which emits the single
+    /// SERVICE_REQUEST) and pumps until it reports success or exhausts its
+    /// credentials. Callers that need to inject policy (server-sig-algs,
+    /// pubkey-accepted, a re-promptable password closure, a keyboard-interactive
+    /// responder) build the driver themselves and hand it here — there is
+    /// exactly one driver, and thus exactly one SERVICE_REQUEST, per connection.
     pub fn run_auth(&mut self, mut auth: ClientAuth) -> Result<()> {
         let first = auth.start();
         self.write_payload(&first)?;
 
         for _ in 0..MAX_AUTH_STEPS {
+            // `read_one_packet` surfaces post-NEWKEYS payloads (userauth here)
+            // from the driver; transport concerns stay inside it.
             let payload = self.read_one_packet()?;
             match auth.on_packet(&payload)? {
                 ClientStep::Send(p) => self.write_payload(&p)?,
                 ClientStep::Success => {
-                    // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
-                    self.codec.activate_compress();
-                    // RFC 8308 §2.3: server may send a second EXT_INFO as
-                    // the first packet after USERAUTH_SUCCESS. Re-open the
-                    // one-shot acceptance window (no-op if ext-info was not
-                    // negotiated).
-                    self.runner.arm_ext_info_post_auth();
+                    // Hand the post-auth transitions (compression + EXT_INFO
+                    // re-arm) to the driver, which owns the codec/runner.
+                    self.driver.notify_auth_success();
                     return Ok(());
                 }
                 ClientStep::Failed { .. } => return Err(Error::AuthFailed),
@@ -847,11 +814,11 @@ impl Client {
     /// point for callers (e.g. the `ssh` binary) that need a re-promptable
     /// password or a keyboard-interactive responder.
     pub fn new_auth_driver(&self, user: &str) -> ClientAuth {
-        let mut auth = ClientAuth::new(user, self.session_id.clone());
+        let mut auth = ClientAuth::new(user, self.driver.session_id().to_vec());
         if let Some(accepted) = self.algo_overrides.pubkey_accepted_algorithms.clone() {
             auth.set_pubkey_accepted(accepted);
         }
-        if let Some(ext) = self.runner.peer_ext_info()
+        if let Some(ext) = self.driver.peer_ext_info()
             && let Some(algs) = ext.server_sig_algs.as_deref()
         {
             auth.set_server_sig_algs(algs);
@@ -867,7 +834,7 @@ impl Client {
     /// Session identifier for this connection — the exchange hash `H` of the
     /// *first* key exchange (RFC 4253 §7.2). Stable across re-keys.
     pub fn session_id(&self) -> &[u8] {
-        &self.session_id
+        self.driver.session_id()
     }
 
     /// Most recent `SSH_MSG_EXT_INFO` (RFC 8308) received from the server,
@@ -876,7 +843,7 @@ impl Client {
     /// advertised the `ext-info-{c,s}` markers or the server simply
     /// declined to send one.
     pub fn peer_ext_info(&self) -> Option<&crate::transport::ExtInfo> {
-        self.runner.peer_ext_info()
+        self.driver.peer_ext_info()
     }
 
     /// Convenience: try publickey authentication only.
@@ -2141,7 +2108,7 @@ impl Client {
             // Keepalive: after `interval` of silence, probe the peer. After
             // `count_max` unanswered probes, treat the connection as dead.
             if let Some((interval, count_max)) = self.keepalive
-                && !self.runner.is_kexing()
+                && !self.driver.is_kexing()
                 && last_activity.elapsed() >= interval
             {
                 if probes_pending >= count_max {
@@ -2161,25 +2128,11 @@ impl Client {
                 last_activity = Instant::now();
             }
 
-            // Drain deferred app payloads first (collected while a re-KEX
-            // was in flight).
-            if !self.runner.is_kexing() && !self.deferred.is_empty() {
-                let payload = self.deferred.remove(0);
-                if let Err(e) = serve_dispatch_packet(
-                    self,
-                    &handlers,
-                    &mut runtimes,
-                    &mut pending_opens,
-                    &payload,
-                ) {
-                    break Err(e);
-                }
-                continue;
-            }
-
             // Per-tick: process any outbound open requests from external
-            // threads (ssh -L listener accepts, etc.).
-            if !self.runner.is_kexing()
+            // threads (ssh -L listener accepts, etc.). The driver buffers and
+            // replays app payloads received during a re-KEX itself, so the
+            // frontend no longer tracks a deferred queue.
+            if !self.driver.is_kexing()
                 && let Some(rx) = handlers.cmd_rx.as_ref()
                 && let Err(e) = serve_drain_commands(self, rx, &mut pending_opens)
             {
@@ -2188,7 +2141,7 @@ impl Client {
 
             // Per-tick: ship pending egress from each runtime onto the wire,
             // then reap any runtime whose close has been fully emitted.
-            if !self.runner.is_kexing() {
+            if !self.driver.is_kexing() {
                 if let Err(e) = serve_drain_runtimes(self, &mut runtimes) {
                     break Err(e);
                 }
@@ -2205,17 +2158,9 @@ impl Client {
                 break Ok(());
             }
 
-            // RFC 4253 §9: opportunistic re-KEX. Same logic as the
-            // single-channel path; only initiate when not already KEXing.
-            if !self.runner.is_kexing()
-                && self
-                    .rekey_policy
-                    .should_rekey(&self.codec, self.last_kex, Instant::now())
-                && let Err(e) = self.initiate_rekey()
-            {
-                break Err(e);
-            }
-
+            // RFC 4253 §9 re-key is driven inside the driver's `handle_timeout`
+            // (invoked by `read_one_packet_maybe_timeout` below), so the
+            // frontend no longer initiates it explicitly.
             let payload = match self.read_one_packet_maybe_timeout() {
                 Ok(Some(p)) => p,
                 Ok(None) => continue, // tick; re-enter drain/stop checks
@@ -2307,245 +2252,70 @@ impl Client {
         ))
     }
 
-    fn do_version_and_kex(&mut self) -> Result<()> {
-        let v_c = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
-        self.stream.write_all(&VersionExchange::outgoing_bytes())?;
-
-        let v_s = self.read_peer_version()?;
-        self.v_c = v_c;
-        self.v_s = v_s;
-
-        // First KEX only: advertise ext-info-c so the server is allowed to
-        // send us SSH_MSG_EXT_INFO with server-sig-algs (RFC 8308 §2.1).
-        let advert = build_default_kexinit(&mut self.rng, &self.algo_overrides)
-            .with_ext_info_marker(Role::Client);
-        self.runner = KexRunner::new(Role::Client, advert);
-        let initial = self.runner.start(&mut self.rng)?;
-        for p in initial.outbound {
-            self.write_payload(&p)?;
+    /// Flush every frame the driver has queued for transmission to the wire.
+    pub(crate) fn pump_out(&mut self) -> Result<()> {
+        while let Some(frame) = self.driver.poll_transmit() {
+            self.stream.write_all(&frame)?;
         }
-
-        self.drive_kex_to_completion()?;
-        self.session_id = self
-            .runner
-            .session_id()
-            .ok_or(Error::Protocol("kex: missing session id"))?
-            .to_vec();
-        self.last_kex = Instant::now();
         Ok(())
     }
 
-    /// Drive the KEX state machine to `Phase::Completed`. The caller is
-    /// responsible for having already pushed our own KEXINIT — and, if the
-    /// peer already sent theirs, for routing that first inbound message
-    /// before calling this.
-    ///
-    /// Non-KEX packets the peer sent while it hadn't yet seen our KEXINIT
-    /// are buffered into `self.deferred` and replayed by the next
-    /// `read_one_packet` call.
-    fn drive_kex_to_completion(&mut self) -> Result<()> {
-        let mut steps = 0usize;
-        loop {
-            steps += 1;
-            if steps > MAX_KEX_STEPS {
-                return Err(Error::Protocol("kex: too many steps"));
-            }
-            let payload = self.read_one_raw_kex_packet()?;
-            let b = *payload.first().ok_or(Error::Format("empty payload"))?;
-            if is_kex_msg(b) {
-                self.dispatch_kex_packet(&payload)?;
-                if self.runner.is_completed() {
+    /// Read one chunk off the transport and feed it to the driver. Propagates
+    /// the socket's `WouldBlock`/`TimedOut` error so timeout-aware callers can
+    /// convert it to `Ok(None)`.
+    fn read_into_driver(&mut self) -> Result<()> {
+        let mut tmp = [0u8; 16 * 1024];
+        let n = self.stream.read(&mut tmp)?;
+        if n == 0 {
+            return Err(Error::Protocol("connection closed"));
+        }
+        self.driver.handle_input(&tmp[..n], Instant::now())?;
+        Ok(())
+    }
+
+    /// Pump the transport until the handshake (version exchange + first KEX)
+    /// completes.
+    fn drive_handshake(&mut self) -> Result<()> {
+        for _ in 0..MAX_KEX_STEPS.saturating_mul(MAX_BANNER_LINES + 4) {
+            self.pump_out()?;
+            while let Some(ev) = self.driver.poll_event() {
+                if matches!(ev, Event::HandshakeComplete) {
+                    self.pump_out()?;
                     return Ok(());
                 }
-            } else {
-                self.deferred.push(payload);
             }
+            self.read_into_driver()?;
         }
+        Err(Error::Protocol("kex: too many steps"))
     }
 
-    /// Feed one inbound transport packet that we know belongs to the KEX
-    /// stream into the runner, writing any outbound packets it produces.
-    fn dispatch_kex_packet(&mut self, payload: &[u8]) -> Result<()> {
-        let msg = *payload.first().ok_or(Error::Format("empty kex payload"))?;
-        let verifier_box;
-        let verifier: Option<&dyn HostKeyVerify> = if msg == SSH_MSG_KEX_ECDH_REPLY {
-            verifier_box = Some(build_verifier(
-                payload,
-                &self.host_key_policy,
-                &self.runner,
-                &self.target_host,
-                self.target_port,
-                self.algo_overrides.ca_signature_algorithms.as_deref(),
-                unix_now(),
-            )?);
-            verifier_box.as_deref()
-        } else {
-            None
-        };
-
-        let v_c = self.v_c.clone();
-        let v_s = self.v_s.clone();
-        let adv = self.runner.on_packet(
-            &mut self.rng,
-            &mut self.codec,
-            payload,
-            None,
-            verifier,
-            &v_c,
-            &v_s,
-        )?;
-        for p in adv.outbound {
-            self.write_payload(&p)?;
-        }
-        Ok(())
-    }
-
-    /// Like `read_one_raw_packet` but additionally drops transport-meta
-    /// (IGNORE/UNIMPLEMENTED/DEBUG) messages so callers always see a KEX or
-    /// app payload next.
-    fn read_one_raw_kex_packet(&mut self) -> Result<Vec<u8>> {
-        loop {
-            let payload = self.read_one_raw_packet()?;
-            match payload.first().copied() {
-                Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
-                Some(2) | Some(3) | Some(4) => continue,
-                // PING/PONG may not interleave with a KEX exchange we are
-                // driving; drop them here (the steady-state read loop answers
-                // PINGs) so the next packet is a KEX or app payload.
-                Some(SSH_MSG_PING) | Some(SSH_MSG_PONG) => continue,
-                _ => return Ok(payload),
-            }
-        }
-    }
-
-    fn read_peer_version(&mut self) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
-        let mut total: usize = 0;
-        for _ in 0..MAX_BANNER_LINES {
-            buf.clear();
-            read_line(&mut self.stream, &mut buf, MAX_BANNER_LINE)?;
-            total = total.saturating_add(buf.len());
-            if total > MAX_BANNER_TOTAL_BYTES {
-                return Err(Error::Protocol("banner too large"));
-            }
-            if buf.starts_with(b"SSH-") {
-                let parsed = VersionExchange::parse_remote(&buf)?;
-                return Ok(parsed.into_bytes());
-            }
-        }
-        Err(Error::Protocol("peer banner too long"))
-    }
-
+    /// Block until the driver yields the next application payload (post-auth
+    /// connection-protocol packet). Transport concerns (KEX, re-key, EXT_INFO,
+    /// PING/PONG) are handled inside the driver and never surface here. The
+    /// returned bytes are fed to `self.conn` by the caller, exactly as before.
     pub(crate) fn read_one_packet(&mut self) -> Result<Vec<u8>> {
         loop {
-            // Drain any app packets we buffered during a re-KEX before
-            // pulling more bytes off the wire.
-            if !self.runner.is_kexing() && !self.deferred.is_empty() {
-                // Deferred packets are non-KEX, non-EXT_INFO app traffic;
-                // surfacing them closes the ext-info one-shot window if
-                // it was somehow still open (rekey itself does not open it).
-                self.runner.note_inbound_other();
-                return Ok(self.deferred.remove(0));
-            }
-
-            // RFC 4253 §9: re-key once we've crossed any threshold. We only
-            // initiate when no KEX is in flight; the peer's KEXINIT (handled
-            // below) will trigger our half if they fire first.
-            if !self.runner.is_kexing()
-                && self
-                    .rekey_policy
-                    .should_rekey(&self.codec, self.last_kex, Instant::now())
-            {
-                self.initiate_rekey()?;
-            }
-
-            let payload = self.read_one_raw_packet()?;
-            match payload.first().copied() {
-                // SSH_MSG_DISCONNECT — peer initiated.
-                Some(1) => return Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
-                // SSH_MSG_IGNORE, SSH_MSG_UNIMPLEMENTED, SSH_MSG_DEBUG — drop.
-                Some(2) | Some(3) | Some(4) => continue,
-                // ping@openssh.com (RFC 4251 §7 private range): answer an
-                // inbound PING with a PONG echoing its data; drop a PONG.
-                Some(SSH_MSG_PING) => {
-                    let pong = pong_for_ping(&payload)?;
-                    self.write_payload(&pong)?;
-                    continue;
-                }
-                Some(SSH_MSG_PONG) => continue,
-                // SSH_MSG_EXT_INFO (RFC 8308) — route into the runner only at
-                // the legal one-shot slot. Outside it, fail loudly per §2.3.
-                Some(7) => {
-                    if !self.runner.may_accept_ext_info() {
-                        return Err(Error::Protocol("unexpected SSH_MSG_EXT_INFO"));
-                    }
-                    self.runner.handle_inbound_ext_info(&payload)?;
-                    continue;
-                }
-                // KEX messages route through the runner. A SSH_MSG_KEXINIT
-                // (20) while we're not already KEXing is a peer-initiated
-                // re-KEX — we must answer with our own KEXINIT first.
-                Some(b) if is_kex_msg(b) => {
-                    if b == 20 && !self.runner.is_kexing() {
-                        self.initiate_rekey()?;
-                    }
-                    self.dispatch_kex_packet(&payload)?;
-                    if !self.runner.is_completed() {
-                        self.drive_kex_to_completion()?;
-                    }
-                    self.last_kex = Instant::now();
-                    continue;
-                }
-                _ => {
-                    // RFC 4253 §7.3: app traffic during a re-KEX must be
-                    // buffered until NEWKEYS lands. Keep reading until we
-                    // have a non-KEX, non-rekeying packet to return.
-                    if self.runner.is_kexing() {
-                        self.deferred.push(payload);
-                        continue;
-                    }
-                    // Any non-EXT_INFO packet at the post-NEWKEYS slot
-                    // closes the one-shot acceptance window — RFC 8308 §2.3.
-                    self.runner.note_inbound_other();
+            // Tick re-key / keepalive timers before each (possibly blocking or
+            // timing-out) read so they advance even when the wire is idle.
+            self.driver.handle_timeout(Instant::now())?;
+            self.pump_out()?;
+            while let Some(ev) = self.driver.poll_event() {
+                if let Event::AppData(payload) = ev {
+                    self.pump_out()?;
                     return Ok(payload);
                 }
+                // HandshakeComplete doesn't occur on this (post-handshake) path.
             }
+            self.read_into_driver()?;
         }
     }
 
-    /// Send our own SSH_MSG_KEXINIT to start a re-KEX. Caller must ensure
-    /// the runner is currently in `Phase::Completed`.
-    fn initiate_rekey(&mut self) -> Result<()> {
-        let advert = build_default_kexinit(&mut self.rng, &self.algo_overrides);
-        let adv = self.runner.restart(&mut self.rng, advert)?;
-        for p in adv.outbound {
-            self.write_payload(&p)?;
-        }
-        Ok(())
-    }
-
-    fn read_one_raw_packet(&mut self) -> Result<Vec<u8>> {
-        loop {
-            if let Some((payload, consumed)) = self.codec.decode(&self.inbox)? {
-                self.inbox.drain(..consumed);
-                return Ok(payload);
-            }
-            let mut tmp = [0u8; 16 * 1024];
-            let n = self.stream.read(&mut tmp)?;
-            if n == 0 {
-                return Err(Error::Protocol("connection closed"));
-            }
-            self.inbox.extend_from_slice(&tmp[..n]);
-            if self.inbox.len() > MAX_INBOX_BYTES {
-                return Err(Error::Protocol("inbound buffer too large"));
-            }
-        }
-    }
-
+    /// Encode `payload` and send it. The sans-IO driver owns the codec, so this
+    /// queues the frame and flushes the outbound queue immediately (preserving
+    /// the old eager-send semantics).
     pub(crate) fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
-        let frame = self.codec.encode(payload, &mut self.rng)?;
-        self.stream.write_all(&frame)?;
-        Ok(())
+        self.driver.enqueue_payload(payload)?;
+        self.pump_out()
     }
 
     /// Send a `ping@openssh.com` `SSH2_MSG_PING` carrying `data` over the
@@ -3783,46 +3553,39 @@ fn clamp_u16(v: u32) -> u16 {
     }
 }
 
-fn read_line<S: Read>(stream: &mut S, buf: &mut Vec<u8>, max_len: usize) -> Result<()> {
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte)?;
-        if n == 0 {
-            return Err(Error::Protocol("connection closed before newline"));
-        }
-        buf.push(byte[0]);
-        if byte[0] == b'\n' {
-            return Ok(());
-        }
-        if buf.len() >= max_len {
-            return Err(Error::Protocol("banner line too long"));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::hostkey::Ed25519HostKey;
     use crate::transport::version::LOCAL_VERSION;
-    use std::io::{Cursor, Read, Write};
+    use crate::transport::{PacketCodec, Role, VersionExchange};
+    use purecrypto::rng::OsRng;
+    use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
-    #[test]
-    fn read_line_caps_length() {
-        let mut buf = Vec::new();
-        let mut src = Cursor::new(vec![b'A'; 4096]);
-        let err = read_line(&mut src, &mut buf, 1024);
-        assert!(matches!(err, Err(Error::Protocol(_))));
-    }
+    // Transport-engine details the in-process fake-server harness below needs.
+    // (The driver owns these in production; the tests hand-roll a server.)
+    const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
+    const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
 
-    #[test]
-    fn read_line_returns_at_newline() {
-        let mut buf = Vec::new();
-        let mut src = Cursor::new(b"hello\r\n".to_vec());
-        read_line(&mut src, &mut buf, 1024).unwrap();
-        assert_eq!(buf, b"hello\r\n");
+    /// Read one `\n`-terminated line from `stream` into `buf` (test helper for
+    /// the fake server's version-exchange step).
+    fn read_line<S: Read>(stream: &mut S, buf: &mut Vec<u8>, max_len: usize) -> Result<()> {
+        let mut byte = [0u8; 1];
+        loop {
+            let n = stream.read(&mut byte)?;
+            if n == 0 {
+                return Err(Error::Protocol("connection closed before newline"));
+            }
+            buf.push(byte[0]);
+            if byte[0] == b'\n' {
+                return Ok(());
+            }
+            if buf.len() >= max_len {
+                return Err(Error::Protocol("banner line too long"));
+            }
+        }
     }
 
     #[test]
@@ -4007,8 +3770,8 @@ mod tests {
 
         let client = Client::connect(addr, Config::insecure()).expect("client connect");
         let server_sid = server.join().unwrap().expect("server handshake");
-        assert_eq!(client.session_id, server_sid);
-        assert!(!client.session_id.is_empty());
+        assert_eq!(client.session_id(), server_sid.as_slice());
+        assert!(!client.session_id().is_empty());
     }
 
     /// Drive the *client* read loop to answer a `ping@openssh.com` PING with

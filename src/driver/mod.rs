@@ -22,37 +22,28 @@
 
 #![cfg(feature = "client")]
 
-mod client;
+pub mod client;
 
-pub use client::ClientDriver;
+pub use client::{ClientDriver, VerifierFactory};
 
-use alloc::string::String;
-
-use crate::channel::ChannelEvent;
+use alloc::vec::Vec;
 
 /// A high-level event surfaced by a driver's `poll_event`.
 ///
-/// Channel- and connection-protocol events are re-surfaced verbatim as
-/// [`Event::Channel`] so frontends can reuse the same match arms they used
-/// against [`ChannelEvent`]; handshake and authentication milestones get their
-/// own variants.
+/// The driver runs the transport engine (version exchange, KEX, re-key,
+/// EXT_INFO/PING handling); once the handshake completes it surfaces every
+/// decoded transport payload as [`Event::AppData`] for the frontend. The
+/// frontend runs userauth (feeding the auth payloads to its own
+/// [`ClientAuth`](crate::auth::ClientAuth)) and then the connection protocol
+/// (feeding the rest to its own [`ConnectionState`](crate::channel::ConnectionState)).
+/// Transport concerns never surface.
 #[derive(Debug, Clone)]
 pub enum Event {
     /// The transport handshake (version exchange + first key exchange) has
     /// completed; the connection is keyed and ready for authentication.
     HandshakeComplete,
-    /// The server sent a `SSH_MSG_USERAUTH_BANNER` during authentication.
-    AuthBanner {
-        /// Banner text.
-        message: String,
-        /// RFC 3066 language tag.
-        language: String,
-    },
-    /// Authentication succeeded; the connection layer is open for channels.
-    AuthSuccess,
-    /// Authentication exhausted every offered credential.
-    AuthFailure,
-    /// A connection-protocol event (channel open/data/eof/close, global
-    /// request/reply, …) decoded from an application packet.
-    Channel(ChannelEvent),
+    /// A decoded post-handshake payload (userauth, then the connection
+    /// protocol). The frontend routes it to its auth driver or
+    /// [`ConnectionState`](crate::channel::ConnectionState) as appropriate.
+    AppData(Vec<u8>),
 }

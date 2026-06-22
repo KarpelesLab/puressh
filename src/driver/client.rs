@@ -1,16 +1,23 @@
-//! Sans-IO client connection driver.
+//! Sans-IO client transport + authentication driver.
 //!
-//! [`ClientDriver`] owns the transport codec, the KEX runner, the connection
-//! multiplexer, and the authentication state machine, and sequences them
-//! through the SSH handshake → auth → application phases. It performs no I/O:
-//! the frontend feeds inbound bytes ([`ClientDriver::handle_input`]), drains
-//! encoded outbound frames ([`ClientDriver::poll_transmit`]), pulls
-//! [`Event`]s ([`ClientDriver::poll_event`]), and ticks timers
+//! [`ClientDriver`] owns the transport codec, the KEX runner, and the
+//! authentication state machine, and sequences them through the SSH handshake
+//! → auth phases. It performs no I/O: the frontend feeds inbound bytes
+//! ([`ClientDriver::handle_input`]), drains encoded outbound frames
+//! ([`ClientDriver::poll_transmit`]), pulls [`Event`]s
+//! ([`ClientDriver::poll_event`]), and ticks timers
 //! ([`ClientDriver::handle_timeout`]).
 //!
+//! The driver deliberately does **not** own the connection multiplexer
+//! ([`ConnectionState`](crate::channel::ConnectionState)): once authenticated
+//! it surfaces each decoded application payload as [`Event::AppData`], and the
+//! frontend runs its own `ConnectionState` over those payloads and hands
+//! channel-protocol payloads back via [`ClientDriver::enqueue_payload`]. This
+//! keeps the channel/session helpers in the frontend (sync or async)
+//! unchanged while the transport engine is shared.
+//!
 //! Host-key verification is injected as a [`VerifierFactory`] closure so the
-//! driver stays free of policy, prompting, and known-hosts I/O — those remain
-//! a frontend concern.
+//! driver stays free of policy, prompting, and known-hosts I/O.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -19,10 +26,10 @@ use std::time::{Duration, Instant};
 
 use purecrypto::rng::{CryptoRng, OsRng, RngCore};
 
-use crate::auth::{ClientAuth, ClientStep};
-use crate::channel::{ChannelOpen, ChannelRequest, ConnectionState, GlobalRequest};
+use crate::channel::{GlobalRequest, MSG_GLOBAL_REQUEST};
 use crate::client::AlgoOverrides;
 use crate::error::{Error, Result};
+use crate::format::Writer;
 use crate::hostkey::HostKeyVerify;
 use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, pong_for_ping};
 use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
@@ -30,10 +37,8 @@ use crate::transport::{ExtInfo, KexRunner, PacketCodec, Role, VersionExchange};
 
 use super::Event;
 
-/// `SSH_MSG_KEX_ECDH_REPLY` — the KEX message that carries the host key, so
-/// the one we must verify against policy.
+/// `SSH_MSG_KEX_ECDH_REPLY` — the KEX message carrying the host key.
 const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
-/// `SSH_MSG_KEXINIT`.
 const SSH_MSG_KEXINIT: u8 = 20;
 const SSH_MSG_EXT_INFO: u8 = 7;
 
@@ -56,15 +61,12 @@ enum Phase {
     AwaitingVersion,
     /// First key exchange in flight.
     Kex,
-    /// Handshake done; the frontend may begin authentication.
-    AuthReady,
-    /// `ClientAuth` driver running.
-    Authenticating,
-    /// Authenticated; application channels may flow.
-    Established,
+    /// Handshake done; post-NEWKEYS payloads surface as [`Event::AppData`]
+    /// (userauth first, then the connection protocol).
+    PostKex,
 }
 
-/// Sans-IO driver for the client half of an SSH connection.
+/// Sans-IO driver for the transport + auth half of an SSH client connection.
 ///
 /// See the [module docs](crate::driver) for the bytes-in / bytes-out / events
 /// contract. Construct with [`ClientDriver::new`], kick off with
@@ -73,7 +75,6 @@ pub struct ClientDriver {
     phase: Phase,
     codec: PacketCodec,
     runner: KexRunner,
-    conn: ConnectionState,
     rng: OsRng,
 
     inbox: Vec<u8>,
@@ -95,9 +96,6 @@ pub struct ClientDriver {
     last_activity: Instant,
     missed_keepalives: u32,
 
-    auth: Option<ClientAuth>,
-
-    // Banner-scan bookkeeping for the version-exchange phase.
     banner_lines: usize,
     banner_total: usize,
 }
@@ -111,13 +109,11 @@ impl ClientDriver {
     /// initial KEXINIT.
     pub fn new(algo_overrides: AlgoOverrides, verifier_factory: VerifierFactory) -> Self {
         let mut rng = OsRng;
-        // Placeholder advert; replaced in `start`.
         let placeholder = crate::client::build_default_kexinit(&mut rng, &algo_overrides);
         Self {
             phase: Phase::AwaitingVersion,
             codec: PacketCodec::new(),
             runner: KexRunner::new(Role::Client, placeholder),
-            conn: ConnectionState::new(),
             rng,
             inbox: Vec::new(),
             outbox: VecDeque::new(),
@@ -132,7 +128,6 @@ impl ClientDriver {
             keepalive: None,
             last_activity: Instant::now(),
             missed_keepalives: 0,
-            auth: None,
             banner_lines: 0,
             banner_total: 0,
         }
@@ -152,12 +147,10 @@ impl ClientDriver {
     }
 
     /// Emit the local version line and the initial KEXINIT. `now` seeds the
-    /// keepalive activity clock. Must be called exactly once, before pumping.
+    /// keepalive activity clock. Call exactly once, before pumping.
     pub fn start(&mut self, now: Instant) -> Result<()> {
         self.last_activity = now;
         self.outbox.push_back(VersionExchange::outgoing_bytes());
-        // First KEX advertises ext-info-c so the server may send EXT_INFO with
-        // server-sig-algs (RFC 8308 §2.1).
         let advert = crate::client::build_default_kexinit(&mut self.rng, &self.algo_overrides)
             .with_ext_info_marker(Role::Client);
         self.runner = KexRunner::new(Role::Client, advert);
@@ -168,7 +161,7 @@ impl ClientDriver {
         Ok(())
     }
 
-    // --- accessors the frontend needs to build auth / inspect state ---
+    // --- accessors ---
 
     /// The session identifier (KEX exchange hash `H`), stable across re-keys.
     /// Empty until the handshake completes.
@@ -181,9 +174,9 @@ impl ClientDriver {
         self.runner.peer_ext_info()
     }
 
-    /// True once authentication has succeeded.
-    pub fn is_established(&self) -> bool {
-        self.phase == Phase::Established
+    /// True once the handshake has completed (post-NEWKEYS).
+    pub fn handshake_done(&self) -> bool {
+        self.phase == Phase::PostKex
     }
 
     /// True while a key exchange is in flight.
@@ -191,22 +184,19 @@ impl ClientDriver {
         self.runner.is_kexing()
     }
 
-    /// Shared access to the connection multiplexer (channel bookkeeping).
-    pub fn conn(&self) -> &ConnectionState {
-        &self.conn
-    }
-
-    /// Mutable access to the connection multiplexer. Frontends use this to
-    /// build channel-protocol payloads, then ship them with
-    /// [`enqueue_payload`](Self::enqueue_payload).
-    pub fn conn_mut(&mut self) -> &mut ConnectionState {
-        &mut self.conn
+    /// Notify the driver that userauth has just succeeded. Activates
+    /// `zlib@openssh.com` compression (RFC 4253 §6.2) and re-opens the one-shot
+    /// post-auth EXT_INFO window (RFC 8308 §2.3). The frontend calls this when
+    /// its auth driver reports success, before the next packet is read.
+    pub fn notify_auth_success(&mut self) {
+        self.codec.activate_compress();
+        self.runner.arm_ext_info_post_auth();
     }
 
     // --- pump surface ---
 
     /// Encode `payload` with the current keys and queue it for transmission.
-    /// This is the sans-IO analog of the old `Client::write_payload`.
+    /// The sans-IO analog of the old `Client::write_payload`.
     pub fn enqueue_payload(&mut self, payload: &[u8]) -> Result<()> {
         let frame = self.codec.encode(payload, &mut self.rng)?;
         self.outbox.push_back(frame);
@@ -223,16 +213,6 @@ impl ClientDriver {
         self.events.pop_front()
     }
 
-    /// Begin authentication with a fully-configured [`ClientAuth`] driver.
-    /// Emits the initial SERVICE_REQUEST; the verdict arrives later as an
-    /// [`Event::AuthSuccess`] / [`Event::AuthFailure`].
-    pub fn begin_auth(&mut self, mut auth: ClientAuth) -> Result<()> {
-        let first = auth.start();
-        self.auth = Some(auth);
-        self.phase = Phase::Authenticating;
-        self.enqueue_payload(&first)
-    }
-
     /// Feed inbound transport bytes. Decodes and routes as many packets as are
     /// available, enqueuing outbound frames and events. `now` advances the
     /// keepalive activity clock.
@@ -242,13 +222,10 @@ impl ClientDriver {
             return Err(Error::Protocol("inbound buffer too large"));
         }
 
-        // Version-exchange phase: consume the peer's identification line
-        // (skipping any preamble lines) before any binary packets.
         if self.phase == Phase::AwaitingVersion && !self.scan_peer_version()? {
             return Ok(()); // need more bytes for a complete line
         }
 
-        // Framed-packet phase: decode everything currently buffered.
         loop {
             match self.codec.decode(&self.inbox)? {
                 Some((payload, consumed)) => {
@@ -260,28 +237,25 @@ impl ClientDriver {
         }
     }
 
-    /// Drive re-key and keepalive timers. The frontend calls this on its tick
-    /// (and after `next_timeout`). Returns `Err` if keepalive has gone
-    /// unanswered past `count_max`.
+    /// Drive re-key and keepalive timers. The frontend calls this on its tick.
+    /// Returns `Err` if keepalive has gone unanswered past `count_max`.
     pub fn handle_timeout(&mut self, now: Instant) -> Result<()> {
         if self.runner.is_kexing() {
             return Ok(());
         }
-        // RFC 4253 §9: re-key once a threshold is crossed.
         if let Some(last) = self.last_kex
             && self.rekey_policy.should_rekey(&self.codec, last, now)
         {
             self.initiate_rekey()?;
             return Ok(());
         }
-        // ServerAliveInterval / ServerAliveCountMax.
         if let Some((interval, count_max)) = self.keepalive
             && now.duration_since(self.last_activity) >= interval
         {
             if self.missed_keepalives >= count_max {
                 return Err(Error::Protocol("keepalive: no response from peer"));
             }
-            let probe = self.conn.send_global_request(GlobalRequest::Keepalive, true);
+            let probe = keepalive_request();
             self.enqueue_payload(&probe)?;
             self.missed_keepalives += 1;
             self.last_activity = now;
@@ -290,80 +264,21 @@ impl ClientDriver {
     }
 
     /// When the frontend should next call [`handle_timeout`](Self::handle_timeout).
-    /// Currently driven by the keepalive interval; re-key timing is checked
+    /// Driven by the keepalive interval; re-key timing is checked
     /// opportunistically on each tick.
     pub fn next_timeout(&self) -> Option<Instant> {
         self.keepalive
             .map(|(interval, _)| self.last_activity + interval)
     }
 
-    // --- channel intents (thin wrappers that enqueue the produced payload) ---
-
-    /// Open a channel; the `OpenConfirmed` / `OpenFailed` outcome arrives as an
-    /// [`Event::Channel`]. Returns the local channel id.
-    pub fn open_channel(&mut self, kind: ChannelOpen) -> Result<u32> {
-        let (id, payload) = self.conn.open(kind)?;
-        self.enqueue_payload(&payload)?;
-        Ok(id)
-    }
-
-    /// Queue channel data, honouring the peer's window. Returns the number of
-    /// bytes accepted (may be 0 when the window is full).
-    pub fn send_channel_data(&mut self, channel: u32, data: &[u8]) -> Result<usize> {
-        let (payload, taken) = self.conn.send_data(channel, data)?;
-        if !payload.is_empty() {
-            self.enqueue_payload(&payload)?;
-        }
-        Ok(taken)
-    }
-
-    /// Send a channel request (`exec`, `pty-req`, `subsystem`, …).
-    pub fn send_channel_request(
-        &mut self,
-        channel: u32,
-        req: ChannelRequest,
-        want_reply: bool,
-    ) -> Result<()> {
-        let payload = self.conn.send_request(channel, req, want_reply)?;
-        self.enqueue_payload(&payload)
-    }
-
-    /// Send CHANNEL_EOF for `channel`.
-    pub fn send_channel_eof(&mut self, channel: u32) -> Result<()> {
-        let payload = self.conn.send_eof(channel)?;
-        self.enqueue_payload(&payload)
-    }
-
-    /// Send CHANNEL_CLOSE for `channel`.
-    pub fn send_channel_close(&mut self, channel: u32) -> Result<()> {
-        let payload = self.conn.send_close(channel)?;
-        self.enqueue_payload(&payload)
-    }
-
-    /// Credit the receive window for `channel` after consuming `n` bytes.
-    /// Emits a WINDOW_ADJUST if one is due.
-    pub fn replenish_window(&mut self, channel: u32, n: u32) -> Result<()> {
-        if let Some(payload) = self.conn.replenish_window(channel, n)? {
-            self.enqueue_payload(&payload)?;
-        }
-        Ok(())
-    }
-
-    /// Send a global request (e.g. `tcpip-forward`, `keepalive`).
-    pub fn send_global_request(&mut self, req: GlobalRequest, want_reply: bool) -> Result<()> {
-        let payload = self.conn.send_global_request(req, want_reply);
-        self.enqueue_payload(&payload)
-    }
-
     // --- internal routing ---
 
     /// Consume version-exchange preamble + the `SSH-2.0-…` line from `inbox`.
-    /// Returns `Ok(true)` once the peer version has been parsed (phase moves to
-    /// `Kex`), `Ok(false)` if more bytes are needed.
+    /// Returns `Ok(true)` once the peer version is parsed (phase → `Kex`),
+    /// `Ok(false)` if more bytes are needed.
     fn scan_peer_version(&mut self) -> Result<bool> {
         loop {
             let Some(pos) = self.inbox.iter().position(|&b| b == b'\n') else {
-                // No complete line yet; guard against an unbounded line.
                 if self.inbox.len() > MAX_BANNER_LINE {
                     return Err(Error::Protocol("banner line too long"));
                 }
@@ -384,7 +299,6 @@ impl ClientDriver {
             if self.banner_lines > MAX_BANNER_LINES {
                 return Err(Error::Protocol("peer banner too long"));
             }
-            // Otherwise it's a preamble line; keep scanning.
         }
     }
 
@@ -394,7 +308,6 @@ impl ClientDriver {
         self.note_activity(now);
         match payload.first().copied() {
             Some(1) => Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
-            // SSH_MSG_IGNORE / UNIMPLEMENTED / DEBUG — drop.
             Some(2) | Some(3) | Some(4) => Ok(()),
             Some(SSH_MSG_PING) => {
                 let pong = pong_for_ping(payload)?;
@@ -408,8 +321,6 @@ impl ClientDriver {
                 self.runner.handle_inbound_ext_info(payload)
             }
             Some(b) if is_kex_msg(b) => {
-                // A peer KEXINIT while we're idle is a peer-initiated re-key;
-                // answer with our own KEXINIT first.
                 if b == SSH_MSG_KEXINIT && !self.runner.is_kexing() {
                     self.initiate_rekey()?;
                 }
@@ -421,7 +332,7 @@ impl ClientDriver {
                             .session_id()
                             .ok_or(Error::Protocol("kex: missing session id"))?
                             .to_vec();
-                        self.phase = Phase::AuthReady;
+                        self.phase = Phase::PostKex;
                         self.events.push_back(Event::HandshakeComplete);
                     }
                     self.last_kex = Some(now);
@@ -430,8 +341,6 @@ impl ClientDriver {
                 Ok(())
             }
             _ => {
-                // Application traffic. During a re-key it must be buffered
-                // until NEWKEYS lands (RFC 4253 §7.3).
                 if self.runner.is_kexing() {
                     self.deferred.push_back(payload.to_vec());
                     return Ok(());
@@ -480,41 +389,10 @@ impl ClientDriver {
         Ok(())
     }
 
-    /// Route a (post-NEWKEYS) application packet: to the auth driver while
-    /// authenticating, otherwise to the connection multiplexer.
+    /// Surface a (post-NEWKEYS) application packet to the frontend.
     fn route_app(&mut self, payload: &[u8]) -> Result<()> {
-        if self.phase == Phase::Authenticating {
-            let auth = self
-                .auth
-                .as_mut()
-                .ok_or(Error::Protocol("auth packet with no auth driver"))?;
-            match auth.on_packet(payload)? {
-                ClientStep::Send(p) => self.enqueue_payload(&p)?,
-                ClientStep::Success => {
-                    // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
-                    self.codec.activate_compress();
-                    // RFC 8308 §2.3: re-open the one-shot EXT_INFO window for a
-                    // possible post-auth EXT_INFO.
-                    self.runner.arm_ext_info_post_auth();
-                    self.phase = Phase::Established;
-                    self.auth = None;
-                    self.events.push_back(Event::AuthSuccess);
-                }
-                ClientStep::Failed { .. } => {
-                    self.auth = None;
-                    self.events.push_back(Event::AuthFailure);
-                }
-                ClientStep::Banner { message, language } => {
-                    self.events.push_back(Event::AuthBanner { message, language });
-                }
-                ClientStep::Idle => {}
-            }
-            Ok(())
-        } else {
-            let ev = self.conn.on_packet(payload)?;
-            self.events.push_back(Event::Channel(ev));
-            Ok(())
-        }
+        self.events.push_back(Event::AppData(payload.to_vec()));
+        Ok(())
     }
 
     /// Emit our KEXINIT to start a re-key (runner must be in `Completed`).
@@ -534,17 +412,28 @@ impl ClientDriver {
     }
 }
 
-// `OsRng` is `CryptoRng + RngCore`; assert the trait bounds we rely on so the
-// generic runner/codec calls type-check without spelling them at each site.
+/// Build a `keepalive@openssh.com` global-request payload (want_reply = true),
+/// without needing a `ConnectionState` (the encoding is stateless).
+fn keepalive_request() -> Vec<u8> {
+    let req = GlobalRequest::Keepalive;
+    let mut w = Writer::new();
+    w.write_u8(MSG_GLOBAL_REQUEST);
+    w.write_string(req.name().as_bytes());
+    w.write_bool(true);
+    req.encode(&mut w);
+    w.into_vec()
+}
+
+// `OsRng` is `CryptoRng + RngCore`; assert the bounds we rely on.
 const _: fn() = || {
     fn _assert<T: CryptoRng + RngCore>() {}
     _assert::<OsRng>();
 };
 
-// End-to-end driver test: drive a `ClientDriver` by hand over a raw TCP socket
+// End-to-end driver test: drive a `ClientDriver` (transport + auth engine)
+// plus a frontend-owned `ConnectionState` by hand over a raw TCP socket
 // against the real blocking `Server`, exercising version exchange → KEX → auth
-// → an exec round-trip entirely through the sans-IO surface. This also
-// prototypes the Phase-2 sync pump.
+// → an exec round-trip through the sans-IO surface.
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
@@ -554,10 +443,8 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
-    use crate::auth::{
-        AuthAttempt, AuthDecision, Authenticator, ClientAuth, ClientCredential,
-    };
-    use crate::channel::{ChannelEvent, ChannelOpen, ChannelRequest};
+    use crate::auth::{AuthAttempt, AuthDecision, Authenticator, ClientAuth, ClientCredential};
+    use crate::channel::{ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState};
     use crate::hostkey::{Ed25519HostKey, HostKey, host_key_verify_by_name};
     use crate::server::{
         AuthenticatorFactory, CommandHandler, Config as ServerConfig, ExecResult, Server,
@@ -614,15 +501,12 @@ mod tests {
         s
     }
 
-    /// `AcceptAny` host-key verifier (plain-key path): build the exchange-hash
-    /// verifier straight from the presented key, no policy check.
     fn accept_any_factory() -> VerifierFactory {
         Box::new(|reply: &[u8], runner: &KexRunner| {
             if reply.len() < 5 {
                 return Err(Error::Format("kex-ecdh-reply too short"));
             }
-            let k_s_len =
-                u32::from_be_bytes([reply[1], reply[2], reply[3], reply[4]]) as usize;
+            let k_s_len = u32::from_be_bytes([reply[1], reply[2], reply[3], reply[4]]) as usize;
             if reply.len() < 5 + k_s_len {
                 return Err(Error::Format("kex-ecdh-reply truncated"));
             }
@@ -642,7 +526,6 @@ mod tests {
         let user = "driver-user".to_string();
         let expected = b"hello from sans-io driver\n".to_vec();
 
-        // --- server on a thread ---
         let host_key: Box<dyn HostKey + Send + Sync> =
             Box::new(Ed25519HostKey::from_seed(host_seed));
         let u = user.clone();
@@ -670,90 +553,117 @@ mod tests {
             *d2.lock().unwrap() = true;
         });
 
-        // --- client driver over a raw socket ---
         let mut sock = TcpStream::connect(addr).expect("connect");
         sock.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
         let mut driver = ClientDriver::new(Default::default(), accept_any_factory());
+        // The frontend owns the connection multiplexer.
+        let mut conn = ConnectionState::new();
         driver.start(Instant::now()).expect("start");
 
+        // The frontend owns the userauth driver too; the transport driver just
+        // surfaces post-handshake payloads as `AppData`.
+        let mut auth: Option<ClientAuth> = None;
         let mut channel: Option<u32> = None;
         let mut stdout = Vec::new();
         let mut exit: Option<u32> = None;
         let (mut eof_sent, mut close_sent, mut remote_close) = (false, false, false);
 
-        let flush = |sock: &mut TcpStream, d: &mut ClientDriver| {
-            while let Some(frame) = d.poll_transmit() {
-                sock.write_all(&frame).expect("write");
-            }
-        };
+        macro_rules! flush {
+            () => {
+                while let Some(frame) = driver.poll_transmit() {
+                    sock.write_all(&frame).expect("write");
+                }
+            };
+        }
 
         'pump: for _ in 0..100_000 {
-            flush(&mut sock, &mut driver);
+            flush!();
             while let Some(ev) = driver.poll_event() {
                 match ev {
                     Event::HandshakeComplete => {
-                        let mut auth =
-                            ClientAuth::new(user.clone(), driver.session_id().to_vec());
-                        auth.add_credential(ClientCredential::PublicKey(Box::new(
+                        let mut a = ClientAuth::new(user.clone(), driver.session_id().to_vec());
+                        a.add_credential(ClientCredential::PublicKey(Box::new(
                             Ed25519HostKey::from_seed(client_seed),
                         )));
-                        driver.begin_auth(auth).expect("begin_auth");
+                        let first = a.start();
+                        driver.enqueue_payload(&first).expect("enq");
+                        auth = Some(a);
                     }
-                    Event::AuthSuccess => {
-                        channel = Some(
-                            driver.open_channel(ChannelOpen::Session).expect("open"),
-                        );
-                    }
-                    Event::AuthFailure => panic!("auth failed"),
-                    Event::AuthBanner { .. } => {}
-                    Event::Channel(ce) => match ce {
-                        ChannelEvent::OpenConfirmed { channel: c } if Some(c) == channel => {
-                            driver
-                                .send_channel_request(
-                                    c,
-                                    ChannelRequest::Exec {
-                                        command: "hi".into(),
-                                    },
-                                    true,
-                                )
-                                .expect("exec req");
-                        }
-                        ChannelEvent::Data { channel: c, data } if Some(c) == channel => {
-                            stdout.extend_from_slice(&data);
-                            driver.replenish_window(c, data.len() as u32).expect("win");
-                        }
-                        ChannelEvent::Request {
-                            channel: c,
-                            request,
-                            want_reply,
-                        } if Some(c) == channel => {
-                            if let ChannelRequest::ExitStatus { code } = request {
-                                exit = Some(code);
+                    // Userauth phase: feed payloads to the auth driver until it
+                    // succeeds, then switch to the connection protocol.
+                    Event::AppData(payload) if auth.is_some() => {
+                        let a = auth.as_mut().unwrap();
+                        match a.on_packet(&payload).expect("auth on_packet") {
+                            crate::auth::ClientStep::Send(p) => {
+                                driver.enqueue_payload(&p).expect("enq")
                             }
-                            if want_reply {
-                                let p = driver
-                                    .conn_mut()
-                                    .send_request_failure(c)
-                                    .expect("req fail");
+                            crate::auth::ClientStep::Success => {
+                                driver.notify_auth_success();
+                                auth = None;
+                                let (id, p) = conn.open(ChannelOpen::Session).expect("open");
+                                driver.enqueue_payload(&p).expect("enq");
+                                channel = Some(id);
+                            }
+                            crate::auth::ClientStep::Failed { .. } => panic!("auth failed"),
+                            crate::auth::ClientStep::Banner { .. }
+                            | crate::auth::ClientStep::Idle => {}
+                        }
+                    }
+                    Event::AppData(payload) => {
+                        let ce = conn.on_packet(&payload).expect("on_packet");
+                        match ce {
+                            ChannelEvent::OpenConfirmed { channel: c } if Some(c) == channel => {
+                                let p = conn
+                                    .send_request(
+                                        c,
+                                        ChannelRequest::Exec {
+                                            command: "hi".into(),
+                                        },
+                                        true,
+                                    )
+                                    .expect("exec req");
                                 driver.enqueue_payload(&p).expect("enq");
                             }
-                        }
-                        ChannelEvent::Eof { channel: c } if Some(c) == channel && !eof_sent => {
-                            driver.send_channel_eof(c).expect("eof");
-                            eof_sent = true;
-                        }
-                        ChannelEvent::Close { channel: c } if Some(c) == channel => {
-                            remote_close = true;
-                            if !close_sent {
-                                driver.send_channel_close(c).expect("close");
-                                close_sent = true;
+                            ChannelEvent::Data { channel: c, data } if Some(c) == channel => {
+                                stdout.extend_from_slice(&data);
+                                if let Some(adj) =
+                                    conn.replenish_window(c, data.len() as u32).expect("win")
+                                {
+                                    driver.enqueue_payload(&adj).expect("enq");
+                                }
                             }
+                            ChannelEvent::Request {
+                                channel: c,
+                                request,
+                                want_reply,
+                            } if Some(c) == channel => {
+                                if let ChannelRequest::ExitStatus { code } = request {
+                                    exit = Some(code);
+                                }
+                                if want_reply {
+                                    let p = conn.send_request_failure(c).expect("rf");
+                                    driver.enqueue_payload(&p).expect("enq");
+                                }
+                            }
+                            ChannelEvent::Eof { channel: c } if Some(c) == channel && !eof_sent => {
+                                let p = conn.send_eof(c).expect("eof");
+                                driver.enqueue_payload(&p).expect("enq");
+                                eof_sent = true;
+                            }
+                            ChannelEvent::Close { channel: c } if Some(c) == channel => {
+                                remote_close = true;
+                                if !close_sent {
+                                    let p = conn.send_close(c).expect("close");
+                                    driver.enqueue_payload(&p).expect("enq");
+                                    close_sent = true;
+                                }
+                            }
+                            _ => {}
                         }
-                        _ => {}
-                    },
+                    }
                 }
             }
-            flush(&mut sock, &mut driver);
+            flush!();
             if remote_close && close_sent {
                 break 'pump;
             }

@@ -14,10 +14,9 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 
 > **Status: functional, pre-1.0.** Client, server, SFTP, SCP, port/agent/X11
 > and Unix-socket (StreamLocal) forwarding, `known_hosts`, and `ssh_config`
-> parsing are all implemented and tested against OpenSSH. Blocking and
-> runtime-agnostic async frontends share one sans-I/O core. The crate is
-> `0.0.x`; the public API may still change before 1.0. See
-> [Implementation status](#implementation-status).
+> parsing are all implemented and tested against OpenSSH. Blocking, async,
+> tokio, and mio frontends share one sans-I/O core. The crate is `0.0.x`; the
+> public API may still change before 1.0.
 
 ## What's in the box
 
@@ -196,34 +195,12 @@ src/
 `puressh`'s MSRV is **Rust 1.88**, declared as `rust-version` in `Cargo.toml`
 and enforced by a dedicated CI job. Older toolchains are not supported.
 
-## Implementation status
+## Non-goals
 
-| Layer                       | Status |
-|-----------------------------|--------|
-| Wire format (`format/`)     | ✅ reader, writer, mpint, name-list |
-| Binary packet codec         | ✅ encrypt/decrypt, ETM, rekey |
-| Version exchange            | ✅ |
-| KEX (all algorithms above)  | ✅ incl. PQ hybrid + GEX |
-| Ciphers / MACs              | ✅ |
-| Host keys (ed25519/ecdsa/rsa) | ✅ incl. `server-sig-algs` upgrade |
-| Private key file parsing    | ✅ OpenSSH (incl. encrypted `bcrypt_pbkdf`), PKCS#1, SEC1, PKCS#8 PEM |
-| Userauth (RFC 4252)         | ✅ password / publickey / kbd-int (`hostbased` and `gssapi-with-mic` not yet implemented) |
-| OpenSSH certificates        | ✅ host + user certs, `@cert-authority`, `TrustedUserCAKeys`, KRL (`RevokedKeys`) |
-| Channels / sessions         | ✅ |
-| Sans-I/O drivers            | ✅ `ClientDriver` / `ServerDriver` |
-| Client API                  | ✅ blocking + async (`AsyncClient`) + tokio + mio (`MioClient`) |
-| Server API                  | ✅ blocking + async (`AsyncServerConnection`) + tokio |
-| SFTP client + server        | ✅ incl. OpenSSH extensions |
-| SCP                         | ✅ |
-| Port / agent / X11 forwarding | ✅ |
-| StreamLocal (Unix-socket) forwarding | ✅ `direct-`/`forwarded-streamlocal@openssh.com` |
-| `known_hosts`               | ✅ |
-| `ssh_config` (Match/Include) | ✅ |
-| C ABI (`ffi`)               | ✅ optional |
-
-**Non-goals.** A few OpenSSH directives are intentionally unsupported and are
-rejected (strict mode) rather than silently ignored: `PermitTunnel` (tun/tap
-device forwarding) and external-command `Subsystem` entries.
+A few OpenSSH directives are intentionally unsupported and are rejected (strict
+mode) rather than silently ignored: `PermitTunnel` (tun/tap device forwarding)
+and external-command `Subsystem` entries. Two userauth methods are also not yet
+implemented: `hostbased` and `gssapi-with-mic`.
 
 ## Security
 

@@ -181,9 +181,12 @@ impl<S: Read + Write> MioClient<S> {
             out_pos: 0,
         };
         me.driver.start(Instant::now())?;
-        // Buffer the version banner + initial KEXINIT; an opportunistic flush
-        // tolerates a not-yet-writable socket via `WouldBlock`.
-        me.flush()?;
+        // Buffer the version banner + initial KEXINIT but do NOT write yet: a
+        // non-blocking connect (e.g. `mio::net::TcpStream::connect`) may still
+        // be completing its TCP handshake, and an early write then fails
+        // (`ENOTCONN` on macOS, `EAGAIN` on Linux). The bytes go out on the
+        // first writable readiness — see `pump_writable` / `wants_write`.
+        me.drain_transmit();
         Ok(me)
     }
 
@@ -309,15 +312,27 @@ impl<S: Read + Write> MioClient<S> {
 
     // --- internals ---
 
-    fn flush(&mut self) -> Result<()> {
+    /// Move any fully-encoded outbound frames from the driver into `outbuf`,
+    /// without touching the socket. Safe to call before the connect completes.
+    fn drain_transmit(&mut self) {
         while let Some(frame) = self.driver.poll_transmit() {
             self.outbuf.extend_from_slice(&frame);
         }
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.drain_transmit();
         while self.out_pos < self.outbuf.len() {
             match self.stream.write(&self.outbuf[self.out_pos..]) {
                 Ok(0) => return Err(Error::Protocol("write returned 0 (peer closed)")),
                 Ok(n) => self.out_pos += n,
-                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                // `WouldBlock`: the socket send buffer is full. `NotConnected`:
+                // a non-blocking connect has not finished its TCP handshake yet
+                // (macOS surfaces `ENOTCONN` here where Linux gives `EAGAIN`).
+                // Both mean "nothing more accepted now; retry once writable".
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::NotConnected) => {
+                    break;
+                }
                 Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(e) => return Err(Error::Io(e)),
             }

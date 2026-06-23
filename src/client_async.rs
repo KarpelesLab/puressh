@@ -94,7 +94,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
     pub fn session_id(&self) -> &[u8] {
         self.driver.session_id()
     }
+}
 
+/// Tokio-native entry point (feature `tokio`).
+///
+/// Accepts tokio's own `AsyncRead`/`AsyncWrite` streams — most commonly a
+/// [`tokio::net::TcpStream`] — and bridges them to the runtime-agnostic
+/// `futures` core with [`tokio_util::compat`], so the entire handshake / auth /
+/// channel machinery is shared with [`AsyncClient::connect`]. The caller owns
+/// the tokio runtime; the library pulls in no runtime of its own.
+#[cfg(feature = "tokio")]
+impl<T> AsyncClient<tokio_util::compat::Compat<T>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    /// Connect over an already-established tokio stream and run the SSH
+    /// handshake. `host`/`port` name the target for host-key verification.
+    pub async fn connect_tokio(stream: T, host: &str, port: u16, cfg: Config) -> Result<Self> {
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+        Self::connect(stream.compat(), host, port, cfg).await
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
     /// Try every credential in order within a single userauth exchange.
     pub async fn authenticate(
         &mut self,
@@ -623,6 +645,64 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(20));
         }
+        let _ = server_thread.join();
+    }
+
+    // Same round-trip, but over a real tokio runtime through the native
+    // `connect_tokio` entry point — proving the tokio compat bridge drives the
+    // same sans-IO core. Only built with `--features tokio`.
+    #[test]
+    #[cfg(feature = "tokio")]
+    fn tokio_connect_auth_exec_round_trip() {
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let client_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+        let user = "tokio-user".to_string();
+        let expected = b"hello from tokio client\n".to_vec();
+
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let u = user.clone();
+        let b = client_blob.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || {
+            Box::new(OneKeyAuth {
+                user: u.clone(),
+                blob: b.clone(),
+            }) as Box<dyn Authenticator>
+        });
+        let cfg = ServerConfig::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: expected.clone(),
+            }),
+        );
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let server_thread = thread::spawn(move || {
+            let _ = server.accept_one();
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio runtime");
+        let out = rt.block_on(async {
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            let mut client =
+                AsyncClient::connect_tokio(tcp, "localhost", addr.port(), Config::insecure())
+                    .await
+                    .expect("ssh connect");
+            client
+                .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+                .await
+                .expect("auth");
+            client.exec("hi").await.expect("exec")
+        });
+
+        assert_eq!(out.stdout, expected, "tokio exec stdout round-trips");
+        assert_eq!(out.exit_status, Some(0));
         let _ = server_thread.join();
     }
 }

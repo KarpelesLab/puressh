@@ -53,6 +53,21 @@ pub struct AsyncServerConnection<S> {
     conn: ConnectionState,
 }
 
+/// Tokio-native server entry point (feature `tokio`). Accepts tokio's own
+/// `AsyncRead`/`AsyncWrite` streams (e.g. [`tokio::net::TcpStream`]) directly,
+/// bridging to the `futures` core with [`tokio_util::compat`].
+#[cfg(feature = "tokio")]
+impl<T> AsyncServerConnection<tokio_util::compat::Compat<T>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    /// Run the server handshake over an accepted tokio `stream`.
+    pub async fn accept_tokio(stream: T, cfg: Arc<Config>) -> Result<Self> {
+        use tokio_util::compat::TokioAsyncReadCompatExt;
+        Self::accept(stream.compat(), cfg).await
+    }
+}
+
 impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
     /// Run the server handshake over an accepted `stream`. `cfg` supplies the
     /// host keys and algorithm policy.

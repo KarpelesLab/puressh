@@ -42,6 +42,17 @@ ffi = ["std", "client", "multichannel"]
 # `futures_io::AsyncRead + AsyncWrite` transport (tokio via compat, smol,
 # async-std, …). Default-off; pulls in `futures-util` only when enabled.
 async = ["std", "client", "dep:futures-util"]
+# Native tokio frontend. Builds on the runtime-agnostic `async` core and adds
+# `connect_tokio` / `accept_tokio` constructors that accept tokio's own
+# `AsyncRead`/`AsyncWrite` streams (e.g. `tokio::net::TcpStream`) directly,
+# bridged to the `futures` traits with tokio-util's compat shim. No tokio
+# runtime is pulled into the library; the caller owns the runtime.
+tokio = ["async", "dep:tokio", "dep:tokio-util"]
+# Native mio frontend (readiness/non-blocking). The `MioClient` drives the
+# sans-IO `ClientDriver` over any `std::io::Read + Write` whose `WouldBlock`
+# signals readiness — which `mio::net::TcpStream` is — so the library needs no
+# dependency on `mio` itself; callers register the stream in their own `Poll`.
+mio = ["client"]
 # PAM session integration for the `sshd` binary. Default-on but opt-out:
 # building with `--no-default-features` (or `--features ...` without `pam`)
 # drops the libpam runtime dep entirely. The dep itself is also gated to
@@ -61,6 +72,13 @@ zeroize = { version = "1", default-features = false, features = ["alloc", "deriv
 # Runtime-agnostic async I/O traits (`AsyncRead`/`AsyncWrite`) plus their
 # `read`/`write_all` combinators, used only by the optional `async` frontend.
 futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }
+# The `tokio` feature needs tokio's `AsyncRead`/`AsyncWrite` traits to bound the
+# `connect_tokio`/`accept_tokio` constructors, and tokio-util's `compat` shim to
+# bridge them to the `futures` traits the async core speaks. `default-features
+# = false` keeps it to the io traits — no runtime, reactor, or scheduler is
+# linked into the library; the caller owns the tokio runtime (see dev-deps).
+tokio = { version = "1", default-features = false, optional = true }
+tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
 
 # Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
 # set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it
@@ -100,6 +118,11 @@ pam-client2 = { version = "0.5", default-features = false, optional = true }
 
 [dev-dependencies]
 hex = "0.4"
+# Real runtimes used only to exercise the native frontends in tests:
+# `--features tokio` drives `connect_tokio` on a tokio runtime; `--features mio`
+# drives the readiness frontend in a mio `Poll` loop. Neither is a library dep.
+tokio = { version = "1", default-features = false, features = ["rt", "net", "io-util"] }
+mio = { version = "1", default-features = false, features = ["net", "os-poll"] }
 
 [lib]
 name = "puressh"

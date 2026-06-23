@@ -651,7 +651,7 @@ fn try_ssh_askpass() -> std::io::Result<Option<Zeroizing<String>>> {
 /// infrastructure); users can pre-decrypt with `ssh-keygen -p`.
 pub fn load_identity(path: &str) -> Result<PrivateKey, String> {
     let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-    PrivateKey::parse_openssh_pem(&pem, None)
+    PrivateKey::parse_pem(&pem, None)
         .map_err(|e| format!("parse {path}: {e} (passphrase-protected keys not supported here)"))
 }
 
@@ -968,7 +968,7 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    match PrivateKey::parse_openssh_pem(&pem, None) {
+    match PrivateKey::parse_pem(&pem, None) {
         Ok(pk) => Ok(Some(pk)),
         Err(Error::Crypto("passphrase required")) => Ok(None),
         Err(e) => Err(format!("parse {}: {e}", path.display())),

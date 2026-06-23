@@ -25,6 +25,7 @@ use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
 
 pub(crate) mod base64;
+mod pkcs;
 mod writer;
 
 pub use writer::EcdsaCurve;

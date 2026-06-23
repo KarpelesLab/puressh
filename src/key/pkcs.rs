@@ -443,7 +443,8 @@ v5mIrMxqlNfjUdXxjqhQSuqNMC5f7tYuQ7qN4hdZ9A==
 MC4CAQAwBQYDK2VwBCIEIP25lZxmkjhgqz9jZyWGosODPfV94yOgGOShmCsQ0PE2
 -----END PRIVATE KEY-----
 "#;
-    const ED25519_PKCS8_PUB: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFc41t1QcqkM/1tPl3AjtTRpdgQ2GB/zwzSE9mfdlg6d";
+    const ED25519_PKCS8_PUB: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFc41t1QcqkM/1tPl3AjtTRpdgQ2GB/zwzSE9mfdlg6d";
 
     #[test]
     fn parse_ed25519_pkcs8() {
@@ -457,7 +458,8 @@ MC4CAQAwBQYDK2VwBCIEIP25lZxmkjhgqz9jZyWGosODPfV94yOgGOShmCsQ0PE2
 
     #[test]
     fn encrypted_pkcs8_is_rejected() {
-        let pem = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB\n-----END ENCRYPTED PRIVATE KEY-----\n";
+        let pem =
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB\n-----END ENCRYPTED PRIVATE KEY-----\n";
         let err = PrivateKey::parse_pem(pem, None).unwrap_err();
         assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
     }

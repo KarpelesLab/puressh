@@ -90,6 +90,12 @@ pub mod driver;
 #[cfg(feature = "async")]
 pub mod client_async;
 
+// Native readiness/non-blocking client frontend (mio-style) driving the same
+// `ClientDriver`. Generic over `std::io::Read + Write` (WouldBlock = not ready),
+// so it needs no dependency on `mio` itself. Opt-in.
+#[cfg(feature = "mio")]
+pub mod client_mio;
+
 // Runtime-agnostic async server connection driving `ServerDriver`. Opt-in
 // (needs both the async frontend and the server transport engine).
 #[cfg(all(feature = "async", feature = "server"))]

@@ -99,8 +99,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
 /// Tokio-native entry point (feature `tokio`).
 ///
 /// Accepts tokio's own `AsyncRead`/`AsyncWrite` streams — most commonly a
-/// [`tokio::net::TcpStream`] — and bridges them to the runtime-agnostic
-/// `futures` core with [`tokio_util::compat`], so the entire handshake / auth /
+/// `tokio::net::TcpStream` — and bridges them to the runtime-agnostic
+/// `futures` core with `tokio_util::compat`, so the entire handshake / auth /
 /// channel machinery is shared with [`AsyncClient::connect`]. The caller owns
 /// the tokio runtime; the library pulls in no runtime of its own.
 #[cfg(feature = "tokio")]

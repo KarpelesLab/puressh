@@ -23,9 +23,10 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 
 - **Library** — a sans-I/O protocol core (the `driver` state machines) plus
   high-level blocking `client` / `server` APIs built on top of it.
-- **Async** — optional runtime-agnostic async frontends (`AsyncClient`,
-  `AsyncServerConnection`) over `futures_io::AsyncRead`/`AsyncWrite`, driving the
-  same `ClientDriver` / `ServerDriver` as the blocking APIs (feature `async`).
+- **Async** — optional frontends driving the same `ClientDriver` / `ServerDriver`
+  as the blocking APIs: runtime-agnostic over `futures_io` (`async`), with native
+  entry points for **tokio** (`tokio`) and a readiness/non-blocking **mio**-style
+  client (`mio`).
 - **CLI suite** — drop-in `ssh`, `sftp`, `scp`, `sshd`, and `ssh-keygen` binaries
   built on the library.
 - **C ABI** — optional `ffi` feature exposing a `pcssh_*` C interface
@@ -76,6 +77,8 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 | `pam`          | yes     | PAM session integration for `sshd` (Linux only)        |
 | `multichannel` | yes     | Concurrent multi-channel client (`SharedClient`, `SftpSession`) |
 | `async`        | no      | Runtime-agnostic async frontends (`AsyncClient`, `AsyncServerConnection`) over `futures_io` |
+| `tokio`        | no      | Native tokio entry points (`connect_tokio` / `accept_tokio`) accepting `tokio::io` streams; builds on `async` |
+| `mio`          | no      | Native readiness frontend (`MioClient`) for a `mio`-style `Poll` loop; no `mio` dependency in the library |
 | `ffi`          | no      | C ABI surface (`pcssh_*`); implies `client` + `multichannel` |
 
 Disable defaults for `no_std`:
@@ -120,8 +123,21 @@ c.authenticate_password("alice", "hunter2").await?;
 let out = c.exec("uname -a").await?;
 ```
 
-Both frontends drive the same sans-I/O `ClientDriver`, so the handshake, auth,
-and channel logic is shared and tested once.
+Two further features expose **native** entry points on the same sans-I/O core,
+for callers who would rather not wire up the compat shim themselves:
+
+- **`tokio`** — `AsyncClient::connect_tokio` / `AsyncServerConnection::accept_tokio`
+  take tokio's own `AsyncRead`/`AsyncWrite` streams (e.g. `tokio::net::TcpStream`)
+  directly. The library links only tokio's io traits, never a runtime.
+- **`mio`** — `MioClient` is a readiness/non-blocking client for a `mio`-style
+  `Poll` loop: `pump_readable()` / `pump_writable()` advance the connection on
+  the matching readiness (WouldBlock = not ready) and `poll_event()` surfaces
+  `MioEvent`s. It is generic over `std::io::Read + Write`, so the library takes
+  no dependency on `mio` itself.
+
+Every frontend — blocking, `futures`, tokio, and mio — drives the same sans-I/O
+`ClientDriver` / `ServerDriver`, so the handshake, auth, and channel logic is
+written and tested once.
 
 ## CLI binaries
 
@@ -169,8 +185,9 @@ src/
 ├── ffi/             C ABI surface (feature `ffi`)
 ├── client.rs        high-level blocking client API (feature `client`)
 ├── server.rs        high-level blocking server API (feature `server`)
-├── client_async.rs  async client frontend (feature `async`)
-├── server_async.rs  async server frontend (feature `async`)
+├── client_async.rs  async client frontend (features `async`, `tokio`)
+├── server_async.rs  async server frontend (features `async`, `tokio`)
+├── client_mio.rs    readiness/non-blocking client frontend (feature `mio`)
 └── bin/             ssh, sftp, scp, sshd, ssh-keygen
 ```
 
@@ -194,8 +211,8 @@ and enforced by a dedicated CI job. Older toolchains are not supported.
 | OpenSSH certificates        | ✅ host + user certs, `@cert-authority`, `TrustedUserCAKeys`, KRL (`RevokedKeys`) |
 | Channels / sessions         | ✅ |
 | Sans-I/O drivers            | ✅ `ClientDriver` / `ServerDriver` |
-| Client API                  | ✅ blocking + async (`AsyncClient`) |
-| Server API                  | ✅ blocking + async (`AsyncServerConnection`) |
+| Client API                  | ✅ blocking + async (`AsyncClient`) + tokio + mio (`MioClient`) |
+| Server API                  | ✅ blocking + async (`AsyncServerConnection`) + tokio |
 | SFTP client + server        | ✅ incl. OpenSSH extensions |
 | SCP                         | ✅ |
 | Port / agent / X11 forwarding | ✅ |

@@ -54,8 +54,8 @@ pub struct AsyncServerConnection<S> {
 }
 
 /// Tokio-native server entry point (feature `tokio`). Accepts tokio's own
-/// `AsyncRead`/`AsyncWrite` streams (e.g. [`tokio::net::TcpStream`]) directly,
-/// bridging to the `futures` core with [`tokio_util::compat`].
+/// `AsyncRead`/`AsyncWrite` streams (e.g. `tokio::net::TcpStream`) directly,
+/// bridging to the `futures` core with `tokio_util::compat`.
 #[cfg(feature = "tokio")]
 impl<T> AsyncServerConnection<tokio_util::compat::Compat<T>>
 where

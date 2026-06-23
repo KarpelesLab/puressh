@@ -3,7 +3,7 @@
 //! [`MioClient`] drives the same sans-IO [`ClientDriver`] as the blocking
 //! [`Client`](crate::client::Client) and the async
 //! [`AsyncClient`](crate::client_async::AsyncClient), but in the
-//! *readiness / non-blocking* style that suits a [`mio`]-driven event loop:
+//! *readiness / non-blocking* style that suits a `mio`-driven event loop:
 //! there is no `async`/`await` and no blocking. The caller owns the `Poll`,
 //! registers the stream, and calls [`pump_readable`](MioClient::pump_readable) /
 //! [`pump_writable`](MioClient::pump_writable) when the corresponding readiness
@@ -11,7 +11,7 @@
 //! surfaces [`MioEvent`]s for the caller to react to.
 //!
 //! It is generic over any `std::io::Read + Write` whose `WouldBlock` signals
-//! "not ready" — exactly the contract of [`mio::net::TcpStream`] — so the
+//! "not ready" — exactly the contract of `mio::net::TcpStream` — so the
 //! library itself takes **no dependency on `mio`**. The crate is named in the
 //! feature only because that is the canonical event loop you would pair it with.
 //!
@@ -21,7 +21,7 @@
 //! poll.registry().register(&mut sock, TOK, Interest::READABLE | Interest::WRITABLE)?;
 //! let mut client = MioClient::new(sock, "host", 22, Config::insecure())?;
 //! loop {
-//!     poll.poll(&mut events, client.next_timeout_hint())?;
+//!     poll.poll(&mut events, None)?; // or a timeout derived from client.next_timeout()
 //!     for ev in &events {
 //!         if ev.is_writable() { client.pump_writable()?; }
 //!         if ev.is_readable() { client.pump_readable()?; }
@@ -131,7 +131,7 @@ enum Phase {
 }
 
 /// A non-blocking, readiness-driven SSH client over a caller-supplied
-/// `std::io::Read + Write` stream (typically [`mio::net::TcpStream`]).
+/// `std::io::Read + Write` stream (typically `mio::net::TcpStream`).
 ///
 /// Single-channel: one [`exec`](Self::exec) at a time. The caller owns the I/O
 /// readiness loop; this type never blocks and never touches a socket beyond the

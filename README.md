@@ -55,7 +55,7 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 | Cipher      | `aes{128,192,256}-ctr`                   |
 | MAC         | `hmac-sha2-{256,512}` (+ `-etm@openssh.com` variants) |
 | Compression | `none`, `zlib`, `zlib@openssh.com` (delayed) |
-| Auth        | `none`, `password`, `publickey`, `keyboard-interactive`, `hostbased` |
+| Auth        | `none`, `password`, `publickey`, `keyboard-interactive` |
 | Extensions  | RFC 8308 `ext-info` / `server-sig-algs`  |
 
 ## Cargo features
@@ -164,7 +164,7 @@ upgrade your toolchain.
 | Ciphers / MACs              | ✅ |
 | Host keys (ed25519/ecdsa/rsa) | ✅ incl. `server-sig-algs` upgrade |
 | OpenSSH key file parsing    | ✅ incl. encrypted keys (`bcrypt_pbkdf`) |
-| Userauth (RFC 4252)         | ✅ password / publickey / kbd-int / hostbased |
+| Userauth (RFC 4252)         | ✅ password / publickey / kbd-int (`hostbased` and `gssapi-with-mic` not yet implemented) |
 | OpenSSH certificates        | ✅ host + user certs, `@cert-authority`, `TrustedUserCAKeys`, KRL (`RevokedKeys`) |
 | Channels / sessions         | ✅ |
 | Client API                  | ✅ |

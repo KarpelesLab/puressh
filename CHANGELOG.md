@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.8](https://github.com/KarpelesLab/puressh/compare/v0.0.7...v0.0.8) - 2026-06-23
+
+### Added
+
+- *(mio)* native readiness/non-blocking client frontend
+- *(tokio)* native connect_tokio / accept_tokio frontends
+
+### Other
+
+- drop Implementation status section
+- fix broken intra-doc links in tokio/mio frontends; document features
+- rustfmt src/key/pkcs.rs (fix CI Format check)
+- refresh README for async frontends, sans-IO drivers, StreamLocal
+- note PKCS#1/SEC1/PKCS#8 private-key support
+- parse PEM/PKCS#8/SEC1 private keys, not just the OpenSSH container
+- stop claiming hostbased auth support
+- bump purecrypto 0.6.16 -> 0.6.17
+- bump purecrypto 0.6.14 -> 0.6.16
+
 ## [0.0.7](https://github.com/KarpelesLab/puressh/compare/v0.0.6...v0.0.7) - 2026-06-22
 
 ### Added

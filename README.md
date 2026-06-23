@@ -163,7 +163,7 @@ upgrade your toolchain.
 | KEX (all algorithms above)  | ✅ incl. PQ hybrid + GEX |
 | Ciphers / MACs              | ✅ |
 | Host keys (ed25519/ecdsa/rsa) | ✅ incl. `server-sig-algs` upgrade |
-| OpenSSH key file parsing    | ✅ incl. encrypted keys (`bcrypt_pbkdf`) |
+| Private key file parsing    | ✅ OpenSSH (incl. encrypted `bcrypt_pbkdf`), PKCS#1, SEC1, PKCS#8 PEM |
 | Userauth (RFC 4252)         | ✅ password / publickey / kbd-int (`hostbased` and `gssapi-with-mic` not yet implemented) |
 | OpenSSH certificates        | ✅ host + user certs, `@cert-authority`, `TrustedUserCAKeys`, KRL (`RevokedKeys`) |
 | Channels / sessions         | ✅ |

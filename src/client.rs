@@ -11,7 +11,7 @@
 
 #![cfg(feature = "std")]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
@@ -54,11 +54,30 @@ pub trait Transport: Read + Write + Send {
     /// Set the read timeout on the underlying transport. See
     /// [`TcpStream::set_read_timeout`].
     fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()>;
+
+    /// Set the write timeout on the underlying transport. Bounds how long a
+    /// single socket write may block before returning `WouldBlock` /
+    /// `TimedOut`, which the frontend treats as backpressure: the unsent
+    /// bytes stay buffered and are retried by the next pump instead of
+    /// wedging the shared transport lock across a stalled write. This is what
+    /// prevents the bidirectional-saturation deadlock where both peers block
+    /// in `write` and neither side ever reads.
+    ///
+    /// Transports that cannot honour a timeout (e.g. a pipe to a child
+    /// process, or a channel running over another connection) leave the
+    /// default no-op — they are never the multi-channel concurrent-pump case
+    /// the timeout exists to protect.
+    fn set_write_timeout(&mut self, _t: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl Transport for TcpStream {
     fn set_read_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_read_timeout(self, t)
+    }
+    fn set_write_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_write_timeout(self, t)
     }
 }
 
@@ -565,6 +584,14 @@ struct ServeRuntime {
 /// A blocking SSH client.
 pub struct Client {
     stream: Box<dyn Transport>,
+    /// Encoded transport bytes the driver has produced but the socket has not
+    /// yet accepted. Normally drained to empty inside [`Self::pump_out`]; only
+    /// holds bytes across calls when the socket's send buffer is full and a
+    /// write timeout is configured, in which case [`Self::flush_out_buf`]
+    /// reports backpressure rather than blocking the shared transport lock.
+    /// Bounded in practice by SSH per-channel send windows (we stop encoding
+    /// `CHANNEL_DATA` once the peer's window is exhausted).
+    out_buf: VecDeque<u8>,
     /// Connection multiplexer (channel bookkeeping). The frontend owns this:
     /// the sans-IO [`ClientDriver`] surfaces decoded application payloads
     /// (post-auth), which we feed into `conn`, and we hand `conn`'s
@@ -731,6 +758,7 @@ impl Client {
         let driver = ClientDriver::new(cfg.algorithms.clone(), verifier_factory);
         let mut me = Self {
             stream,
+            out_buf: VecDeque::new(),
             conn: ConnectionState::new(),
             driver,
             algo_overrides: cfg.algorithms,
@@ -953,7 +981,17 @@ impl Client {
     /// `ErrorKind::WouldBlock` / `ErrorKind::TimedOut` on subsequent
     /// reads (or only use code paths that fold those into a no-op).
     pub fn set_read_timeout(&mut self, t: Option<core::time::Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(t)
+        self.stream.set_read_timeout(t)?;
+        // Bound blocking writes by the same interval. A consumer that asks for
+        // a read timeout is, by construction, the concurrent-pump case: it
+        // releases and re-acquires the shared transport lock between pumps so
+        // siblings can make progress. A write that wedged the lock (full send
+        // buffer, peer not reading) would defeat that and deadlock both peers.
+        // With a write timeout set, `pump_out` buffers the unsent remainder
+        // and returns, so the lock is always released promptly. Clearing the
+        // read timeout (`None`) restores fully-blocking writes for the
+        // single-waiter path, where there is no sibling to starve.
+        self.stream.set_write_timeout(t)
     }
 
     /// Send `SSH_MSG_CHANNEL_CLOSE` for `channel`. Used to tear down a
@@ -2252,10 +2290,51 @@ impl Client {
         ))
     }
 
-    /// Flush every frame the driver has queued for transmission to the wire.
+    /// Move every frame the driver has queued into the outbound buffer, then
+    /// flush as much of that buffer to the wire as the transport will accept.
     pub(crate) fn pump_out(&mut self) -> Result<()> {
         while let Some(frame) = self.driver.poll_transmit() {
-            self.stream.write_all(&frame)?;
+            self.out_buf.extend(frame);
+        }
+        self.flush_out_buf()
+    }
+
+    /// Push buffered outbound bytes to the transport until either the buffer
+    /// drains or the transport refuses more.
+    ///
+    /// With no write timeout configured (the default, single-channel blocking
+    /// path) a socket `write` never reports `WouldBlock`, so this drains the
+    /// buffer completely — behaviourally identical to the old
+    /// `write_all`-per-frame loop.
+    ///
+    /// With a write timeout configured (set alongside the read timeout by the
+    /// concurrent-pump consumers — `SharedClient`'s mux splice and the serve
+    /// loop) a congested write returns `WouldBlock` / `TimedOut` once the
+    /// kernel send buffer is full. We treat that as backpressure and leave the
+    /// remainder queued: the caller releases the shared transport lock, a
+    /// sibling thread pumps inbound (the only way the peer's receive window —
+    /// and thus our send buffer — reopens), and the next `pump_out` flushes
+    /// the backlog. Without this a bidirectionally-saturated connection
+    /// deadlocks, both peers blocked in `write` with neither reading.
+    fn flush_out_buf(&mut self) -> Result<()> {
+        while !self.out_buf.is_empty() {
+            // `as_slices().0` is the leading contiguous run; non-empty
+            // whenever the deque is non-empty.
+            let front_len = self.out_buf.as_slices().0.len();
+            let n = match self.stream.write(self.out_buf.as_slices().0) {
+                Ok(0) => return Err(Error::Protocol("connection closed")),
+                Ok(n) => n,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(ref e)
+                    if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+                {
+                    // Send buffer full: keep the remainder for the next pump.
+                    return Ok(());
+                }
+                Err(e) => return Err(Error::Io(e)),
+            };
+            debug_assert!(n <= front_len);
+            self.out_buf.drain(..n);
         }
         Ok(())
     }

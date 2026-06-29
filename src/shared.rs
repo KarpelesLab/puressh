@@ -1162,8 +1162,9 @@ impl Write for OwnedChannelStream {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut g = lock_or_poison_io(&self.shared.inner)?;
+        let _ticket = LockTicket::new(&self.shared.lock_waiters);
         loop {
+            let mut g = lock_or_poison_io(&self.shared.inner)?;
             let (payload, taken) = g.client.conn.send_data(self.channel, buf).map_err(io_err)?;
             if taken > 0 {
                 g.client.write_payload(&payload).map_err(io_err)?;
@@ -1186,18 +1187,24 @@ impl Write for OwnedChannelStream {
                 for cv in g.notifiers.values() {
                     cv.notify_one();
                 }
+                // Release the lock before looping. Holding it across pump
+                // iterations (the previous behaviour) starves every sibling
+                // — including the reader thread that drains this channel's
+                // mailbox and replenishes the receive window — which can
+                // wedge the whole connection while one channel waits for a
+                // window-adjust. Mirror `channel_send_data` / `read_stream`,
+                // which both drop the guard each iteration.
+                drop(g);
                 res?;
             } else {
                 let cv = notifier_for(&mut g, self.channel);
-                g = cv
-                    .wait_timeout(g, WAIT_TIMEOUT)
-                    .map_err(|_| {
-                        std::io::Error::new(
-                            std::io::ErrorKind::BrokenPipe,
-                            "SharedClient mutex poisoned",
-                        )
-                    })?
-                    .0;
+                let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "SharedClient mutex poisoned",
+                    )
+                })?;
+                drop(waited.0);
             }
         }
     }

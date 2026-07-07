@@ -1922,7 +1922,8 @@ Match User alice
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("puressh-sshd-inc-{}-{nanos}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("puressh-sshd-inc-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(dir.join("sshd_config.d")).expect("mkdir");
         let write = |rel: &str, body: &str| {
             let p: PathBuf = dir.join(rel);
@@ -1932,7 +1933,10 @@ Match User alice
         };
         // A bare relative Include resolves against the root file's directory.
         write("sshd_config.d/10-port.conf", "Port 2022\n");
-        let root = write("sshd_config", "Include sshd_config.d/*.conf\nMaxAuthTries 3\n");
+        let root = write(
+            "sshd_config",
+            "Include sshd_config.d/*.conf\nMaxAuthTries 3\n",
+        );
 
         let cfg = SshServerConfig::load(&root).expect("load resolves Include");
         let base = cfg.resolve(&MatchContext::default(), ExecPolicy::Deny);

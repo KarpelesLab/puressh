@@ -1004,12 +1004,14 @@ pub fn load_client_config(
     if let Some(home) = std::env::var_os("HOME") {
         let user = PathBuf::from(home).join(".ssh").join("config");
         if user.exists() {
-            cfg = Some(SshClientConfig::load(&user).map_err(|e| format!("{}: {e}", user.display()))?);
+            cfg =
+                Some(SshClientConfig::load(&user).map_err(|e| format!("{}: {e}", user.display()))?);
         }
     }
     let system = Path::new("/etc/ssh/ssh_config");
     if system.exists() {
-        let sys = SshClientConfig::load(system).map_err(|e| format!("{}: {e}", system.display()))?;
+        let sys =
+            SshClientConfig::load(system).map_err(|e| format!("{}: {e}", system.display()))?;
         match cfg.as_mut() {
             Some(existing) => existing.append(sys),
             None => cfg = Some(sys),

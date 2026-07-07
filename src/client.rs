@@ -220,6 +220,10 @@ pub type HostKeyPromptFn = dyn Fn(&HostKeyPrompt<'_>) -> bool + Send + Sync;
 
 /// What to do when [`HostKeyPolicy::KnownHosts`] encounters an unknown
 /// host or a key that doesn't match any stored entry.
+///
+/// `#[non_exhaustive]`: new decision variants may be added in future minor
+/// releases, so downstream `match`es must include a wildcard arm.
+#[non_exhaustive]
 pub enum TofuAction {
     /// Refuse the connection — equivalent to OpenSSH's
     /// `StrictHostKeyChecking=yes` against an empty `known_hosts`.

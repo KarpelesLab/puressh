@@ -167,6 +167,57 @@ impl KnownHostsPolicy {
 /// key_blob) → accept?`.
 pub type TofuPromptFn = dyn Fn(&str, u16, &str, &[u8]) -> bool + Send + Sync;
 
+/// Why a host key needs an interactive decision, passed in [`HostKeyPrompt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostKeyChange {
+    /// The host is not in `known_hosts` at all — a first-contact (TOFU) add.
+    Unknown,
+    /// The host **is** known but presented a key that matches no stored
+    /// entry — an override of an existing trust record.
+    Changed,
+}
+
+/// Full context handed to a [`TofuAction::PromptDetailed`] callback so it can
+/// render its own host-key prompt (TUI/GUI/stdin) instead of relying on the
+/// built-in stderr banner.
+///
+/// On [`HostKeyChange::Changed`], [`existing`](Self::existing) holds the
+/// previously-trusted keys; [`existing_fingerprints`](Self::existing_fingerprints)
+/// formats them as `SHA256:…` strings for an "old key" line.
+#[non_exhaustive]
+pub struct HostKeyPrompt<'a> {
+    /// Whether this is a first-contact add or a changed-key override.
+    pub change: HostKeyChange,
+    /// Target host name (as passed to [`Client::connect_to_host`]).
+    pub host: &'a str,
+    /// Target port.
+    pub port: u16,
+    /// Key type the peer presented, e.g. `"ssh-ed25519"`.
+    pub key_type: &'a str,
+    /// Raw host-key blob the peer presented (SSH wire format).
+    pub key_blob: &'a [u8],
+    /// `SHA256:…` fingerprint of [`key_blob`](Self::key_blob).
+    pub fingerprint: String,
+    /// Previously-stored `(key_type, key_blob)` entries for this host.
+    /// Empty when [`change`](Self::change) is [`HostKeyChange::Unknown`].
+    pub existing: &'a [(String, Vec<u8>)],
+}
+
+impl HostKeyPrompt<'_> {
+    /// `SHA256:…` fingerprints of the [`existing`](Self::existing) stored
+    /// keys, for displaying the "old key" being replaced on an override.
+    pub fn existing_fingerprints(&self) -> Vec<String> {
+        self.existing
+            .iter()
+            .map(|(_, blob)| host_key_fingerprint(blob))
+            .collect()
+    }
+}
+
+/// Callback type for [`TofuAction::PromptDetailed`] — receives full
+/// [`HostKeyPrompt`] context and returns `true` to accept.
+pub type HostKeyPromptFn = dyn Fn(&HostKeyPrompt<'_>) -> bool + Send + Sync;
+
 /// What to do when [`HostKeyPolicy::KnownHosts`] encounters an unknown
 /// host or a key that doesn't match any stored entry.
 pub enum TofuAction {
@@ -186,6 +237,44 @@ pub enum TofuAction {
     /// Used for `on_unknown` it's silent like `Accept` but is included
     /// here for symmetry.
     AcceptWithWarning,
+    /// Like [`Prompt`](Self::Prompt), but the callback receives full
+    /// [`HostKeyPrompt`] context (change kind, ready `SHA256:…` fingerprint,
+    /// and the previously-stored keys on an override) and owns all
+    /// user-facing display. When used for `on_mismatch`, the built-in
+    /// stderr `REMOTE HOST IDENTIFICATION HAS CHANGED` banner is
+    /// **suppressed** so the callback can render its own warning.
+    ///
+    /// On accept, the new key is added (and rotated in over any prior keys
+    /// on a mismatch) exactly as for [`Prompt`](Self::Prompt).
+    ///
+    /// ```ignore
+    /// use std::io::{self, Write};
+    /// use std::sync::Arc;
+    /// use puressh::client::{HostKeyChange, HostKeyPrompt, TofuAction};
+    ///
+    /// let cb: Arc<puressh::client::HostKeyPromptFn> = Arc::new(|p: &HostKeyPrompt| {
+    ///     match p.change {
+    ///         HostKeyChange::Unknown => {
+    ///             println!("The authenticity of host '{}:{}' can't be established.", p.host, p.port);
+    ///             println!("{} key fingerprint is {}.", p.key_type, p.fingerprint);
+    ///         }
+    ///         HostKeyChange::Changed => {
+    ///             println!("WARNING: host key for {}:{} has CHANGED.", p.host, p.port);
+    ///             for old in p.existing_fingerprints() {
+    ///                 println!("  old: {old}");
+    ///             }
+    ///             println!("  new: {}", p.fingerprint);
+    ///         }
+    ///     }
+    ///     print!("Accept? [y/N] ");
+    ///     io::stdout().flush().ok();
+    ///     let mut line = String::new();
+    ///     io::stdin().read_line(&mut line).ok();
+    ///     matches!(line.trim(), "y" | "yes")
+    /// });
+    /// let _ = TofuAction::PromptDetailed(cb);
+    /// ```
+    PromptDetailed(Arc<HostKeyPromptFn>),
 }
 
 /// Client configuration knobs.
@@ -2809,10 +2898,11 @@ fn scp_proto(e: crate::scp::ScpError, _stage: &'static str) -> Error {
     }
 }
 
-/// `SHA256:<base64>` fingerprint, matching `ssh-keygen -lf`. Used by the
-/// in-tree mismatch warning so the user can manually cross-check the
-/// peer's key before deciding to clean up `known_hosts`.
-fn fingerprint_b64_sha256(blob: &[u8]) -> String {
+/// `SHA256:<base64>` fingerprint of a host-key blob, matching
+/// `ssh-keygen -lf`. Useful for rendering host-key prompts (see
+/// [`HostKeyPrompt`]) or cross-checking a peer's key against
+/// `known_hosts` by hand.
+pub fn host_key_fingerprint(blob: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let d = Sha256::digest(blob);
     let bytes: &[u8] = d.as_ref();
@@ -2875,12 +2965,12 @@ fn print_mismatch_banner(
         eprintln!("Old fingerprint: <none on file>");
     } else {
         for (kt, blob) in expected {
-            eprintln!("Old fingerprint: {} ({kt})", fingerprint_b64_sha256(blob));
+            eprintln!("Old fingerprint: {} ({kt})", host_key_fingerprint(blob));
         }
     }
     eprintln!(
         "New fingerprint: {} ({new_key_type})",
-        fingerprint_b64_sha256(new_key_blob),
+        host_key_fingerprint(new_key_blob),
     );
 }
 
@@ -3074,13 +3164,23 @@ pub(crate) fn build_verifier(
             match lookup {
                 LookupResult::Match => {}
                 LookupResult::Mismatch { expected } => {
-                    // ALWAYS print the OpenSSH-style loud banner on
-                    // mismatch, before any policy decision. Shows both
-                    // the previously-stored ("old") fingerprint(s) and
-                    // the new one the peer just presented so the user
-                    // can spot the change without digging through
-                    // known_hosts manually.
-                    print_mismatch_banner(target_host, target_port, &expected, &neg.host_key, k_s);
+                    // Print the OpenSSH-style loud banner on mismatch,
+                    // before any policy decision. Shows both the
+                    // previously-stored ("old") fingerprint(s) and the new
+                    // one the peer just presented so the user can spot the
+                    // change without digging through known_hosts manually.
+                    // Skipped for `PromptDetailed`: that callback receives
+                    // the same information via `HostKeyPrompt` and owns its
+                    // own user-facing display.
+                    if !matches!(&kh.on_mismatch, TofuAction::PromptDetailed(_)) {
+                        print_mismatch_banner(
+                            target_host,
+                            target_port,
+                            &expected,
+                            &neg.host_key,
+                            k_s,
+                        );
+                    }
 
                     let accept = match &kh.on_mismatch {
                         TofuAction::Reject => false,
@@ -3109,6 +3209,24 @@ pub(crate) fn build_verifier(
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
                             ok
                         }
+                        TofuAction::PromptDetailed(cb) => {
+                            // Hand the callback full context (no banner was
+                            // printed above) so it can render its own
+                            // changed-key warning, including the old keys.
+                            drop(store);
+                            let prompt = HostKeyPrompt {
+                                change: HostKeyChange::Changed,
+                                host: target_host,
+                                port: target_port,
+                                key_type: &neg.host_key,
+                                key_blob: k_s,
+                                fingerprint: host_key_fingerprint(k_s),
+                                existing: &expected,
+                            };
+                            let ok = cb(&prompt);
+                            store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                            ok
+                        }
                     };
                     if !accept {
                         return Err(Error::HostKeyRejected);
@@ -3118,7 +3236,10 @@ pub(crate) fn build_verifier(
                     // user typed `yes`. `AcceptWithWarning` (the
                     // StrictHostKeyChecking=no path) deliberately
                     // leaves the store untouched: OpenSSH does the same.
-                    if matches!(&kh.on_mismatch, TofuAction::Accept | TofuAction::Prompt(_)) {
+                    if matches!(
+                        &kh.on_mismatch,
+                        TofuAction::Accept | TofuAction::Prompt(_) | TofuAction::PromptDetailed(_)
+                    ) {
                         // Replace the existing entries so future
                         // connects don't keep tripping the mismatch
                         // path. Honours the same hash-new / save-path
@@ -3140,6 +3261,23 @@ pub(crate) fn build_verifier(
                             // shouldn't hold up other policy users.
                             drop(store);
                             let ok = cb(target_host, target_port, &neg.host_key, k_s);
+                            store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                            ok
+                        }
+                        TofuAction::PromptDetailed(cb) => {
+                            // First-contact (TOFU) add: no prior keys, so
+                            // `existing` is empty.
+                            drop(store);
+                            let prompt = HostKeyPrompt {
+                                change: HostKeyChange::Unknown,
+                                host: target_host,
+                                port: target_port,
+                                key_type: &neg.host_key,
+                                key_blob: k_s,
+                                fingerprint: host_key_fingerprint(k_s),
+                                existing: &[],
+                            };
+                            let ok = cb(&prompt);
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
                             ok
                         }
@@ -3983,6 +4121,163 @@ mod tests {
         assert!(matches!(err, Error::HostKeyRejected));
         // The server thread may have errored after our connect dropped — that's fine.
         let _ = server.join();
+    }
+
+    /// `PromptDetailed` on an unknown host: the callback sees
+    /// `HostKeyChange::Unknown`, a `SHA256:` fingerprint and an empty
+    /// `existing` slice; returning `true` adds the key (a later lookup of
+    /// the real server key matches).
+    #[test]
+    fn known_hosts_promptdetailed_unknown_adds_entry() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+
+        // (change, fingerprint, existing.len()) recorded by the callback.
+        type SeenUnknown = Arc<Mutex<Option<(HostKeyChange, String, usize)>>>;
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let seen: SeenUnknown = Arc::new(Mutex::new(None));
+        let seen_cb = seen.clone();
+        let cb: Arc<HostKeyPromptFn> = Arc::new(move |p: &HostKeyPrompt<'_>| {
+            *seen_cb.lock().unwrap() = Some((p.change, p.fingerprint.clone(), p.existing.len()));
+            true
+        });
+        let policy = KnownHostsPolicy {
+            store: store.clone(),
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::PromptDetailed(cb),
+            on_mismatch: TofuAction::Reject,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+        };
+
+        let _client =
+            Client::connect_to_host("127.0.0.1", addr.port(), cfg).expect("connect should succeed");
+        let _ = server.join();
+
+        let (change, fp, existing_len) = seen.lock().unwrap().take().expect("callback fired");
+        assert_eq!(change, HostKeyChange::Unknown);
+        assert!(fp.starts_with("SHA256:"), "fingerprint was {fp}");
+        assert_eq!(existing_len, 0);
+
+        // The real server key is now trusted.
+        let real_blob = Ed25519HostKey::from_seed(seed).public_blob();
+        assert!(matches!(
+            store
+                .lock()
+                .unwrap()
+                .lookup("127.0.0.1", addr.port(), "ssh-ed25519", &real_blob),
+            LookupResult::Match
+        ));
+    }
+
+    /// `PromptDetailed` returning `false` refuses the connection and adds
+    /// nothing to the store.
+    #[test]
+    fn known_hosts_promptdetailed_unknown_reject() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let cb: Arc<HostKeyPromptFn> = Arc::new(|_p: &HostKeyPrompt<'_>| false);
+        let policy = KnownHostsPolicy {
+            store: store.clone(),
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::PromptDetailed(cb),
+            on_mismatch: TofuAction::Reject,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+        };
+
+        let err = Client::connect_to_host("127.0.0.1", addr.port(), cfg)
+            .err()
+            .expect("connect must fail");
+        assert!(matches!(err, Error::HostKeyRejected));
+        let _ = server.join();
+
+        let real_blob = Ed25519HostKey::from_seed(seed).public_blob();
+        assert!(matches!(
+            store
+                .lock()
+                .unwrap()
+                .lookup("127.0.0.1", addr.port(), "ssh-ed25519", &real_blob),
+            LookupResult::Unknown
+        ));
+    }
+
+    /// `PromptDetailed` on a changed key: the callback sees
+    /// `HostKeyChange::Changed` plus the previously-stored key in
+    /// `existing`; returning `true` rotates the stored entry to the new key.
+    #[test]
+    fn known_hosts_promptdetailed_mismatch_rotates() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+
+        // Pre-seed the store with a *different* key for this host so the
+        // lookup trips the mismatch path.
+        let bogus_blob = Ed25519HostKey::from_seed([0x11u8; 32]).public_blob();
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        store
+            .lock()
+            .unwrap()
+            .add("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob, false);
+
+        // (change, existing fingerprints) recorded by the callback.
+        type SeenChanged = Arc<Mutex<Option<(HostKeyChange, Vec<String>)>>>;
+        let seen: SeenChanged = Arc::new(Mutex::new(None));
+        let seen_cb = seen.clone();
+        let cb: Arc<HostKeyPromptFn> = Arc::new(move |p: &HostKeyPrompt<'_>| {
+            *seen_cb.lock().unwrap() = Some((p.change, p.existing_fingerprints()));
+            true
+        });
+        let policy = KnownHostsPolicy {
+            store: store.clone(),
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Reject,
+            on_mismatch: TofuAction::PromptDetailed(cb),
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+        };
+
+        let _client =
+            Client::connect_to_host("127.0.0.1", addr.port(), cfg).expect("connect should succeed");
+        let _ = server.join();
+
+        let (change, old_fps) = seen.lock().unwrap().take().expect("callback fired");
+        assert_eq!(change, HostKeyChange::Changed);
+        assert_eq!(old_fps, vec![host_key_fingerprint(&bogus_blob)]);
+
+        // New key trusted, old key rotated out.
+        let real_blob = Ed25519HostKey::from_seed(seed).public_blob();
+        let guard = store.lock().unwrap();
+        assert!(matches!(
+            guard.lookup("127.0.0.1", addr.port(), "ssh-ed25519", &real_blob),
+            LookupResult::Match
+        ));
+        assert!(matches!(
+            guard.lookup("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob),
+            LookupResult::Mismatch { .. }
+        ));
     }
 
     #[test]

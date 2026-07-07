@@ -165,6 +165,15 @@ impl ClientDriver {
         self.runner.peer_ext_info()
     }
 
+    /// The compression algorithms chosen by the most recent key exchange, as
+    /// `(client→server, server→client)` — e.g. `("zlib@openssh.com",
+    /// "zlib@openssh.com")` or `("none", "none")`. `None` before the first
+    /// KEX completes. Reflects the live values, so a re-key that changes
+    /// compression is visible here.
+    pub fn negotiated_compression(&self) -> Option<(String, String)> {
+        self.runner.negotiated().map(|n| (n.comp_c2s, n.comp_s2c))
+    }
+
     /// True once the handshake has completed (post-NEWKEYS).
     pub fn handshake_done(&self) -> bool {
         self.phase == Phase::PostKex

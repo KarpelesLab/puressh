@@ -967,6 +967,21 @@ impl Client {
         self.driver.peer_ext_info()
     }
 
+    /// Compression algorithms chosen by the most recent key exchange, as
+    /// `(client→server, server→client)`. Both are `"none"` on an
+    /// uncompressed connection; requesting compression (`Config.compression =
+    /// Some(true)`, the `compress` feature enabled) and connecting to a peer
+    /// that offers it yields `"zlib@openssh.com"`. Returns `None` before the
+    /// first KEX completes.
+    ///
+    /// Note `zlib@openssh.com` is *delayed*: the codec advertises this name at
+    /// KEX but only starts compressing after `USERAUTH_SUCCESS`, so this
+    /// reflects the negotiated intent, not whether bytes are being compressed
+    /// yet.
+    pub fn negotiated_compression(&self) -> Option<(String, String)> {
+        self.driver.negotiated_compression()
+    }
+
     /// Convenience: try publickey authentication only.
     pub fn authenticate_publickey(
         &mut self,

@@ -79,18 +79,26 @@ jobs:
         run: sudo mkdir -p /run/sshd
 
       # These tests are `#[ignore]` by default (they need a real sshd), so the
-      # normal `cargo test` job skips them. Run the deterministic client-mode
-      # tests explicitly here: `exec_against_real_sshd` (baseline) and
-      # `compression_zlib_interop_against_real_sshd` (the `zlib@openssh.com`
-      # round-trip — our guard against the inflate-truncation class of bug).
-      # Single-threaded so the spawned sshd instances don't contend. The
-      # `interactive_shell_…chaff` test is intentionally excluded: it is
+      # normal `cargo test` job skips them. Run the deterministic ones here,
+      # single-threaded so spawned sshd instances don't contend.
+      #
+      # client mode (puressh client ↔ real sshd): `exec_against_real_sshd`
+      # (baseline) and `compression_zlib_interop_against_real_sshd` (the
+      # `zlib@openssh.com` round-trip — our guard against the inflate-truncation
+      # class of bug). The `interactive_shell_…chaff` test is excluded: it is
       # timing-sensitive and unsuitable for gating.
-      - name: Run compression interop against real sshd
+      - name: Run client-mode compression interop against real sshd
         run: >
           cargo test --test e2e_real_sshd --
           --ignored --test-threads=1 --nocapture
           exec_against_real_sshd compression_zlib_interop_against_real_sshd
+
+      # server mode (real `ssh -C` client ↔ puressh sshd): proves our server
+      # advertises, activates, and drives `zlib@openssh.com` compression.
+      - name: Run server-mode compression interop against real ssh client
+        run: >
+          cargo test --test e2e_server_compression --
+          --ignored --test-threads=1 --nocapture
 
   msrv:
     name: MSRV (Rust 1.88)

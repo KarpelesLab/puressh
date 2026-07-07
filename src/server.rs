@@ -1015,9 +1015,10 @@ pub struct Config {
     /// unknown, so any group-dependent criterion never matches.
     pub group_resolver: Option<GroupResolver>,
     /// `Compression` (sshd_config) — startup-only. `Some(Compression::No)`
-    /// strips any zlib names from the server's advertised compression list;
-    /// `yes` / `delayed` / `None` leave the built-in advert (currently
-    /// `none`-only, since puressh does not yet implement SSH-layer zlib).
+    /// advertises `none` only; `Delayed` (and `None`, the default) offers
+    /// `zlib@openssh.com` (post-auth) then `none`; `Yes` additionally offers
+    /// immediate `zlib`. Requires the `compress` feature to have any effect
+    /// beyond `none`.
     pub compression: Option<crate::config::Compression>,
     /// Connection-wide `AuthenticationMethods` default (space-separated
     /// alternatives, each a comma-chain — e.g. `["publickey,password"]`). Empty
@@ -4071,21 +4072,30 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
 
     let ciphers = owned_or_default(&cfg.ciphers, defaults::CIPHERS);
     let macs = owned_or_default(&cfg.macs, defaults::MACS);
-    // `Compression no` strips any zlib names from the advert. puressh only
-    // advertises `none` today, so this is a defensive no-op; it becomes
-    // load-bearing once SSH-layer zlib is added to `defaults::COMP`.
-    // `yes` / `delayed` keep the default advert.
-    let comp: Vec<String> = defaults::COMP
-        .iter()
-        .filter(|name| {
-            if cfg.compression == Some(crate::config::Compression::No) {
-                !name.contains("zlib")
-            } else {
-                true
+    // Advertised compression, from the `Compression` policy:
+    //   * `no`               → `none` only
+    //   * `delayed` / unset  → `zlib@openssh.com` (post-auth), then `none`
+    //   * `yes`              → also offer immediate `zlib`, then `none`
+    // Unset defaults to `delayed`, matching OpenSSH sshd and the documented
+    // `ServerOptions::compression` contract. `zlib@openssh.com` is always
+    // listed ahead of `none`, but negotiation only selects it when the client
+    // offers it too, so a default (non-`-C`) peer still ends up on `none`.
+    // Requires the `compress` feature; without it we can only speak `none`,
+    // so any zlib preference degrades cleanly to that.
+    let comp: Vec<String> = {
+        use crate::config::Compression;
+        let want = cfg.compression.unwrap_or(Compression::Delayed);
+        if cfg!(feature = "compress") && want != Compression::No {
+            let mut names = vec!["zlib@openssh.com".to_string()];
+            if want == Compression::Yes {
+                names.push("zlib".to_string());
             }
-        })
-        .map(|s| s.to_string())
-        .collect();
+            names.push("none".to_string());
+            names
+        } else {
+            vec!["none".to_string()]
+        }
+    };
 
     let algs = KexAlgorithmsOwned {
         kex,
@@ -6886,9 +6896,7 @@ mod tests {
 
     #[test]
     fn w7_compression_no_strips_zlib_from_advert() {
-        // The built-in advert is `none`-only, so a synthetic check: a comp list
-        // containing zlib has it stripped under Compression::No. We exercise the
-        // filter through build_server_kexinit by confirming `none` survives.
+        // `Compression no` advertises `none` only — no zlib names.
         let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
             vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
         let mut cfg = kexinit_test_config(host_keys);
@@ -6898,5 +6906,32 @@ mod tests {
         // `none` must remain advertised; no zlib name may appear.
         assert!(advert.comp_s2c.iter().any(|c| c == "none"));
         assert!(!advert.comp_s2c.iter().any(|c| c.contains("zlib")));
+    }
+
+    #[test]
+    #[cfg(feature = "compress")]
+    fn compression_policy_shapes_advert() {
+        use crate::config::Compression;
+        let build = |c: Option<Compression>| {
+            let host_keys: Vec<Box<dyn HostKey + Send + Sync>> =
+                vec![Box::new(Ed25519HostKey::from_seed(fresh_seed()))];
+            let mut cfg = kexinit_test_config(host_keys);
+            cfg.compression = c;
+            build_server_kexinit(&mut OsRng, &cfg).comp_s2c
+        };
+
+        // Unset defaults to `delayed`: offer delayed zlib then `none`.
+        assert_eq!(build(None), vec!["zlib@openssh.com", "none"]);
+        assert_eq!(
+            build(Some(Compression::Delayed)),
+            vec!["zlib@openssh.com", "none"]
+        );
+        // `yes` additionally offers immediate `zlib`.
+        assert_eq!(
+            build(Some(Compression::Yes)),
+            vec!["zlib@openssh.com", "zlib", "none"]
+        );
+        // `no` is `none`-only.
+        assert_eq!(build(Some(Compression::No)), vec!["none"]);
     }
 }

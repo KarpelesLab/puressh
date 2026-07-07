@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/puressh/compare/v0.1.1...v0.2.0) - 2026-07-07
+
+### Added
+
+- *(server)* implement SSH-layer zlib compression
+- *(client)* add TofuAction::PromptDetailed for custom host-key prompts
+
+### Fixed
+
+- *(compress)* drain zlib codec past CHUNK boundary; add interop test
+- *(config)* resolve Include directives in CLI config loading
+
+### Other
+
+- install libpam + create /run/sshd for the interop job
+- rustfmt CLI config loader; mark TofuAction non_exhaustive
+
 ## [0.1.1](https://github.com/KarpelesLab/puressh/compare/v0.1.0...v0.1.1) - 2026-06-29
 
 ### Fixed

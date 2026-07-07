@@ -66,9 +66,17 @@ jobs:
 
       # The interop tests spawn the system `sshd` (client-mode tests) and use
       # `ssh-keygen`; both come from the OpenSSH packages. The runner ships
-      # the client but not always the server.
-      - name: Install OpenSSH server + client
-        run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client
+      # the client but not always the server. `libpam0g-dev` is needed because
+      # building the test graph links our own `sshd` binary, which pulls in
+      # `pam-client2` (a default feature on Linux).
+      - name: Install OpenSSH server + client and libpam
+        run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client libpam0g-dev
+
+      # A non-root sshd still fatals without its privilege-separation
+      # directory; a fresh runner that never started the ssh service may not
+      # have created it.
+      - name: Ensure sshd privilege-separation dir exists
+        run: sudo mkdir -p /run/sshd
 
       # These tests are `#[ignore]` by default (they need a real sshd), so the
       # normal `cargo test` job skips them. Run the deterministic client-mode

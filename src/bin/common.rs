@@ -993,37 +993,38 @@ pub fn load_client_config(
 ) -> Result<puressh::config::SshClientConfig, String> {
     use puressh::config::SshClientConfig;
     if let Some(path) = explicit {
-        let src =
-            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        return SshClientConfig::parse(&src).map_err(|e| format!("{}: {e}", path.display()));
+        // File-based load so `Include` directives resolve (each anchored to
+        // the including file's own directory). `-F` means this file only.
+        return SshClientConfig::load(path).map_err(|e| format!("{}: {e}", path.display()));
     }
-    // Default search path: user file first (wins), then system file. The
-    // two are concatenated with a newline so block boundaries stay intact.
-    let mut combined = String::new();
+    // Default search path: user file first (wins), then system file. Each is
+    // loaded independently so its `Include`s anchor to that file's directory;
+    // the two block lists are then layered with the user file on top.
+    let mut cfg: Option<SshClientConfig> = None;
     if let Some(home) = std::env::var_os("HOME") {
         let user = PathBuf::from(home).join(".ssh").join("config");
-        if let Ok(s) = std::fs::read_to_string(&user) {
-            combined.push_str(&s);
-            combined.push('\n');
+        if user.exists() {
+            cfg = Some(SshClientConfig::load(&user).map_err(|e| format!("{}: {e}", user.display()))?);
         }
     }
     let system = Path::new("/etc/ssh/ssh_config");
-    if let Ok(s) = std::fs::read_to_string(system) {
-        combined.push_str(&s);
-        combined.push('\n');
+    if system.exists() {
+        let sys = SshClientConfig::load(system).map_err(|e| format!("{}: {e}", system.display()))?;
+        match cfg.as_mut() {
+            Some(existing) => existing.append(sys),
+            None => cfg = Some(sys),
+        }
     }
-    if combined.is_empty() {
-        return Ok(SshClientConfig::default());
-    }
-    SshClientConfig::parse(&combined).map_err(|e| format!("ssh_config: {e}"))
+    Ok(cfg.unwrap_or_default())
 }
 
 /// Load an `sshd_config(5)` for the `sshd` binary. Returns an error if the
 /// file is missing — server-side config is opt-in (`-f path`), so the caller
 /// asked for this exact file.
 pub fn load_server_config(path: &Path) -> Result<puressh::config::SshServerConfig, String> {
-    let src = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    puressh::config::SshServerConfig::parse(&src).map_err(|e| format!("{}: {e}", path.display()))
+    // File-based load so `Include` directives resolve, anchored to the
+    // including file's own directory.
+    puressh::config::SshServerConfig::load(path).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// OpenSSH precedence helper: returns the first `Some` of `cli`, `cfg`,

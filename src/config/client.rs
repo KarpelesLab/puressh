@@ -436,6 +436,22 @@ impl SshClientConfig {
         })
     }
 
+    /// Append every block of `other` after this config's own, preserving
+    /// source order.
+    ///
+    /// Used to layer a lower-precedence config (e.g. the system-wide
+    /// `/etc/ssh/ssh_config`) beneath a higher-precedence one (the user's
+    /// `~/.ssh/config`). Because [`lookup`](Self::lookup) is first-match-wins
+    /// for scalars, `self`'s blocks keep winning while `other` still
+    /// contributes to the cumulative list fields — the same result as
+    /// concatenating the two files' text, but with each file's `Include`
+    /// directives already resolved relative to its own directory. Both
+    /// implicit `Host *` globals survive; `self`'s comes first, so it wins
+    /// scalar options.
+    pub fn append(&mut self, other: SshClientConfig) {
+        self.blocks.extend(other.blocks);
+    }
+
     /// Permit `Match exec <cmd>` criteria to run `/bin/sh -c <cmd>` during
     /// lookup. Off by default because evaluating arbitrary shell commands
     /// during config resolution is a confused-deputy hazard: a config loaded
@@ -2208,6 +2224,22 @@ Match host gw
         assert_eq!(ObscureKeystrokeTiming::default_on().interval_ms(), Some(20));
         assert!(!ObscureKeystrokeTiming::Off.is_on());
         assert_eq!(ObscureKeystrokeTiming::Off.interval_ms(), None);
+    }
+
+    #[test]
+    fn append_layers_user_over_system() {
+        // Mimics the CLI's default search path: the user file is loaded
+        // first (higher precedence) and the system file appended below it.
+        let mut user = SshClientConfig::parse("Host gw\n  Port 2200\n  IdentityFile /u/key\n")
+            .expect("user parses");
+        let system = SshClientConfig::parse("Host gw\n  Port 22\n  IdentityFile /etc/key\n")
+            .expect("system parses");
+        user.append(system);
+        let eff = user.lookup("gw");
+        // First-match-wins scalar: the user file's Port survives.
+        assert_eq!(eff.port, Some(2200));
+        // Cumulative list: user entry first, then system.
+        assert_eq!(eff.identity_files, vec!["/u/key", "/etc/key"]);
     }
 
     // ----- Include-directive tests -------------------------------------

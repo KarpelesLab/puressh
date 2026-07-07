@@ -360,6 +360,20 @@ impl SshServerConfig {
         Self::from_lines(tokenize(src)?)
     }
 
+    /// Read `path` from disk and parse it, resolving `Include` directives
+    /// recursively. Relative paths inside `Include` are anchored to the
+    /// directory of the file containing the directive; `~` expands to
+    /// `$HOME`; `*` / `?` globs are expanded against the filesystem.
+    /// Recursion is capped at [`super::include::MAX_INCLUDE_DEPTH`] hops.
+    ///
+    /// Prefer this over [`Self::parse`] for on-disk `sshd_config` files:
+    /// `parse` has no filesystem context and rejects any `Include` line.
+    #[cfg(feature = "std")]
+    pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ConfigError> {
+        let lines = super::include::tokenize_file_with_includes(path.as_ref(), 0)?;
+        Self::from_lines(lines)
+    }
+
     /// Build an [`SshServerConfig`] from an already-tokenized line stream.
     /// Used by the `Include`-aware loader, which expands includes before
     /// handing the flattened stream here.
@@ -367,6 +381,18 @@ impl SshServerConfig {
         let mut global = ServerOptions::default();
         let mut match_blocks: Vec<ServerMatchBlock> = Vec::new();
         for line in lines {
+            if line.keyword == "include" {
+                // The Include-expansion pass runs before us when the caller
+                // uses SshServerConfig::load (the std-only, file-based entry
+                // point). Seeing an Include here means we were reached via
+                // SshServerConfig::parse(&str), which has no filesystem
+                // context — refuse rather than silently drop.
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: "Include requires file-based loading; use SshServerConfig::load() instead"
+                        .into(),
+                });
+            }
             if line.keyword == "match" {
                 let conditions = parse_match_line_server(&line.args, line.line_no)?;
                 match_blocks.push(ServerMatchBlock {
@@ -1868,5 +1894,51 @@ Match User alice
         assert_eq!(eff.max_sessions, Some(10));
         assert_eq!(eff.allow_tcp_forwarding, Some(TcpForwarding::No));
         assert_eq!(eff.force_command.as_deref(), Some("internal-sftp"));
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn include_unsupported_in_string_parse() {
+        // parse(&str) has no filesystem context, so Include must surface a
+        // friendly diagnostic rather than UnknownKeyword.
+        let err = SshServerConfig::parse("Include /etc/ssh/sshd_config.d/*.conf\n").unwrap_err();
+        match err {
+            ConfigError::Unsupported { line, msg } => {
+                assert_eq!(line, 1);
+                assert!(msg.contains("Include"), "msg = {msg}");
+            }
+            _ => panic!("wrong err: {err:?}"),
+        }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn load_resolves_include() {
+        use std::io::Write;
+        use std::path::PathBuf;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("puressh-sshd-inc-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sshd_config.d")).expect("mkdir");
+        let write = |rel: &str, body: &str| {
+            let p: PathBuf = dir.join(rel);
+            let mut f = std::fs::File::create(&p).expect("create");
+            f.write_all(body.as_bytes()).expect("write");
+            p
+        };
+        // A bare relative Include resolves against the root file's directory.
+        write("sshd_config.d/10-port.conf", "Port 2022\n");
+        let root = write("sshd_config", "Include sshd_config.d/*.conf\nMaxAuthTries 3\n");
+
+        let cfg = SshServerConfig::load(&root).expect("load resolves Include");
+        let base = cfg.resolve(&MatchContext::default(), ExecPolicy::Deny);
+        assert_eq!(base.port, Some(2022));
+        assert_eq!(base.max_auth_tries, Some(3));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

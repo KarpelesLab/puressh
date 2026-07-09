@@ -886,10 +886,16 @@ mod tests {
 
         // First connection presents a bad cookie and gets dropped.
         let mut bad = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
-        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0x00, 0x11, 0x22]);
-        bad.write_all(&pkt).expect("write bad packet");
+        // Arm the read timeout *before* sending the bad cookie, while the
+        // socket is still cleanly connected and the worker is blocked reading
+        // our not-yet-sent packet. Doing it afterwards races the worker's
+        // `shutdown(Both)`, and on macOS `setsockopt(SO_RCVTIMEO)` on a socket
+        // the peer has already torn down fails with EINVAL (a BSD quirk Linux
+        // doesn't share).
         bad.set_read_timeout(Some(Duration::from_secs(3)))
             .expect("read timeout");
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0x00, 0x11, 0x22]);
+        bad.write_all(&pkt).expect("write bad packet");
         let mut buf = [0u8; 1];
         let _ = bad.read(&mut buf); // expect EOF / shutdown, not a hang
         drop(bad);

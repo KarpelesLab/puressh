@@ -1097,15 +1097,18 @@ mod tests {
         b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
         let mut rng = OsRng;
         let payload = vec![b'q'; 4096];
-        // Prime the shared dictionary with a couple of packets.
-        let f1 = a.encode(&payload, &mut rng).unwrap();
-        assert_eq!(b.decode(&f1).unwrap().expect("frame 1").0, payload);
-        let _ = a.encode(&payload, &mut rng).unwrap(); // dictionary now non-empty
+
+        // Exchange a few packets so both DEFLATE streams build a shared
+        // dictionary (decode every frame to keep the inflate side in lockstep).
+        for _ in 0..3 {
+            let f = a.encode(&payload, &mut rng).unwrap();
+            assert_eq!(b.decode(&f).unwrap().expect("in-sync frame").0, payload);
+        }
 
         // Re-KEX resets ONLY the sender. A receiver that kept its old inflate
         // state (the previous buggy no-op guard) can no longer decode the
-        // sender's freshly-initialized DEFLATE stream — this is exactly the
-        // desync observed against OpenSSH.
+        // sender's freshly-initialized DEFLATE stream — exactly the desync
+        // observed against OpenSSH.
         a.install_outbound_compress(compress_by_name("zlib").unwrap());
         let f_desync = a.encode(&payload, &mut rng).unwrap();
         assert!(
@@ -1114,21 +1117,15 @@ mod tests {
         );
 
         // With BOTH sides reset in lockstep (a real re-KEX), decoding resumes.
-        let mut a2 = PacketCodec::new();
-        let mut b2 = PacketCodec::new();
-        install_chachapoly(&mut a2, &mut b2);
-        a2.install_outbound_compress(compress_by_name("zlib").unwrap());
-        b2.install_inbound_decompress(decompress_by_name("zlib").unwrap());
-        let _ = a2.encode(&payload, &mut rng).unwrap();
-        assert_eq!(b2.decode(&a2.encode(&payload, &mut rng).unwrap()).is_err(), false);
-        // Reset both, as NEWKEYS does on each side.
-        a2.install_outbound_compress(compress_by_name("zlib").unwrap());
-        b2.install_inbound_decompress(decompress_by_name("zlib").unwrap());
-        let f2 = a2.encode(&payload, &mut rng).unwrap();
-        assert_eq!(
-            b2.decode(&f2).unwrap().expect("both reset in lockstep").0,
-            payload
-        );
+        b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
+        a.install_outbound_compress(compress_by_name("zlib").unwrap());
+        for _ in 0..3 {
+            let f = a.encode(&payload, &mut rng).unwrap();
+            assert_eq!(
+                b.decode(&f).unwrap().expect("post-reset lockstep frame").0,
+                payload
+            );
+        }
     }
 
     #[cfg(feature = "compress")]

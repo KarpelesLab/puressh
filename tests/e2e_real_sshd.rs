@@ -1278,7 +1278,9 @@ fn idle_sharedclient_across_server_rekey() {
     // server crosses its 3s re-key threshold ~3 times. NOTHING reads the wire
     // meanwhile — we deliberately sleep instead of reading — mimicking an idle
     // gRPC tunnel with no in-flight RPC.
-    let mut stream = shared.exec_stream("sleep 9; echo alive-after-idle").expect("exec");
+    let mut stream = shared
+        .exec_stream("sleep 9; echo alive-after-idle")
+        .expect("exec");
 
     // Fully idle: no read/write on the SharedClient at all for 9s.
     std::thread::sleep(Duration::from_secs(9));
@@ -1296,7 +1298,12 @@ fn idle_sharedclient_across_server_rekey() {
             break Err("timed out reading delayed output".to_string());
         }
         match stream.read(&mut buf) {
-            Ok(0) => break Err(format!("channel EOF; got {:?}", String::from_utf8_lossy(&got))),
+            Ok(0) => {
+                break Err(format!(
+                    "channel EOF; got {:?}",
+                    String::from_utf8_lossy(&got)
+                ));
+            }
             Ok(n) => {
                 got.extend_from_slice(&buf[..n]);
                 if String::from_utf8_lossy(&got).contains("alive-after-idle") {

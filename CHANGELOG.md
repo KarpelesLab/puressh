@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/KarpelesLab/puressh/compare/v0.1.2...v0.1.3) - 2026-07-09
+
+### Fixed
+
+- fix lint: rustfmt, doc intra-link, clippy bool-assert in rekey tests
+- *(compress)* re-initialize compression context on every re-key
+
+### Other
+
+- *(x11)* arm read timeout before write to avoid macOS EINVAL race
+
 ## [0.1.2](https://github.com/KarpelesLab/puressh/compare/v0.1.1...v0.1.2) - 2026-07-07
 
 ### Added

@@ -217,22 +217,31 @@ impl PacketCodec {
     /// after NEWKEYS. Callers who never invoke this leave the codec on the
     /// default `"none"` pass-through.
     ///
-    /// Compression dictionaries are stateful, so re-installing the same
-    /// algorithm after a re-KEX would discard the shared dictionary the peer
-    /// relies on. This method therefore leaves the channel untouched when the
-    /// algorithm name matches the one already installed.
-    pub fn install_outbound_compress(&mut self, c: Box<dyn Compress>) {
-        if self.outbound_compress.name() == c.name() {
-            return;
+    /// RFC 4253 §6.2: "The compression context is initialized after each key
+    /// exchange." The DEFLATE stream therefore resets on *every* re-KEX, not
+    /// just the first — OpenSSH re-runs `deflateInit`/`inflateInit` on each
+    /// NEWKEYS, so a peer that instead carried its dictionary across a re-KEX
+    /// would desync and fail to inflate the next packet. We honour that by
+    /// always swapping in the fresh codec `c` (a reset stream). The only state
+    /// we carry over is the *delayed-start* activation: `zlib@openssh.com`
+    /// stays a pass-through until [`activate_compress`](Self::activate_compress)
+    /// fires after userauth, so if compression is already running we bring the
+    /// replacement up active too (otherwise a post-auth re-KEX would silently
+    /// drop back to pass-through mid-stream).
+    pub fn install_outbound_compress(&mut self, mut c: Box<dyn Compress>) {
+        if self.outbound_compress.name() != "none" && self.outbound_compress.active() {
+            c.activate();
         }
         self.outbound_compress = c;
     }
 
     /// Install the inbound decompression channel; counterpart to
-    /// [`install_outbound_compress`](Self::install_outbound_compress).
-    pub fn install_inbound_decompress(&mut self, d: Box<dyn Decompress>) {
-        if self.inbound_decompress.name() == d.name() {
-            return;
+    /// [`install_outbound_compress`](Self::install_outbound_compress). Resets
+    /// the inflate stream on every re-KEX for the same reason (RFC 4253 §6.2),
+    /// preserving only the delayed-start activation state.
+    pub fn install_inbound_decompress(&mut self, mut d: Box<dyn Decompress>) {
+        if self.inbound_decompress.name() != "none" && self.inbound_decompress.active() {
+            d.activate();
         }
         self.inbound_decompress = d;
     }
@@ -248,6 +257,19 @@ impl PacketCodec {
     /// Algorithm name currently in use for the outbound compression channel.
     pub fn outbound_compress_name(&self) -> &'static str {
         self.outbound_compress.name()
+    }
+
+    /// Test-only: whether the outbound compressor is currently active
+    /// (compressing) vs. in delayed pass-through mode.
+    #[cfg(test)]
+    pub(crate) fn outbound_compress_is_active_for_test(&self) -> bool {
+        self.outbound_compress.active()
+    }
+
+    /// Test-only: whether the inbound decompressor is currently active.
+    #[cfg(test)]
+    pub(crate) fn inbound_decompress_is_active_for_test(&self) -> bool {
+        self.inbound_decompress.active()
     }
 
     /// Algorithm name currently in use for the inbound decompression channel.
@@ -1060,13 +1082,14 @@ mod tests {
 
     #[cfg(feature = "compress")]
     #[test]
-    fn install_same_compression_keeps_dictionary() {
+    fn reinstall_compression_resets_stream_on_both_sides() {
         use crate::compress::{compress_by_name, decompress_by_name};
 
-        // After the first KEX installed "zlib", a re-KEX re-installs the same
-        // algorithm — we must NOT discard the dictionary that the peer has
-        // built up. install_outbound_compress is a no-op when the algorithm
-        // name matches; the same goes for the inbound side.
+        // RFC 4253 §6.2: the compression context is re-initialized after each
+        // key exchange. A re-KEX re-installs the algorithm and BOTH sides must
+        // reset the DEFLATE stream in lockstep — carrying a dictionary across
+        // the re-KEX (as an earlier no-op guard did) desyncs against a
+        // spec-compliant peer (OpenSSH), which re-runs deflateInit/inflateInit.
         let mut a = PacketCodec::new();
         let mut b = PacketCodec::new();
         install_chachapoly(&mut a, &mut b);
@@ -1074,17 +1097,65 @@ mod tests {
         b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
         let mut rng = OsRng;
         let payload = vec![b'q'; 4096];
+        // Prime the shared dictionary with a couple of packets.
         let f1 = a.encode(&payload, &mut rng).unwrap();
-        let (got1, _) = b.decode(&f1).unwrap().expect("frame 1");
-        assert_eq!(got1, payload);
-        // Re-install both sides — same name, dictionaries must survive.
+        assert_eq!(b.decode(&f1).unwrap().expect("frame 1").0, payload);
+        let _ = a.encode(&payload, &mut rng).unwrap(); // dictionary now non-empty
+
+        // Re-KEX resets ONLY the sender. A receiver that kept its old inflate
+        // state (the previous buggy no-op guard) can no longer decode the
+        // sender's freshly-initialized DEFLATE stream — this is exactly the
+        // desync observed against OpenSSH.
         a.install_outbound_compress(compress_by_name("zlib").unwrap());
-        b.install_inbound_decompress(decompress_by_name("zlib").unwrap());
-        let f2 = a.encode(&payload, &mut rng).unwrap();
-        let (got2, _) = b.decode(&f2).unwrap().expect("frame 2 (dict survived)");
-        assert_eq!(got2, payload);
-        // The shared dictionary means the second frame is at least as small
-        // as the first — the second compression draws on the prior content.
-        assert!(f2.len() <= f1.len());
+        let f_desync = a.encode(&payload, &mut rng).unwrap();
+        assert!(
+            b.decode(&f_desync).is_err(),
+            "stale receiver must fail once the sender has reset its stream"
+        );
+
+        // With BOTH sides reset in lockstep (a real re-KEX), decoding resumes.
+        let mut a2 = PacketCodec::new();
+        let mut b2 = PacketCodec::new();
+        install_chachapoly(&mut a2, &mut b2);
+        a2.install_outbound_compress(compress_by_name("zlib").unwrap());
+        b2.install_inbound_decompress(decompress_by_name("zlib").unwrap());
+        let _ = a2.encode(&payload, &mut rng).unwrap();
+        assert_eq!(b2.decode(&a2.encode(&payload, &mut rng).unwrap()).is_err(), false);
+        // Reset both, as NEWKEYS does on each side.
+        a2.install_outbound_compress(compress_by_name("zlib").unwrap());
+        b2.install_inbound_decompress(decompress_by_name("zlib").unwrap());
+        let f2 = a2.encode(&payload, &mut rng).unwrap();
+        assert_eq!(
+            b2.decode(&f2).unwrap().expect("both reset in lockstep").0,
+            payload
+        );
+    }
+
+    #[cfg(feature = "compress")]
+    #[test]
+    fn reinstall_preserves_delayed_activation_state() {
+        use crate::compress::{compress_by_name, decompress_by_name};
+
+        // A post-auth re-KEX must keep `zlib@openssh.com` ACTIVE: re-installing
+        // a fresh (inactive) codec while compression is running must not drop
+        // us back to pass-through mid-stream.
+        let mut a = PacketCodec::new();
+        a.install_outbound_compress(compress_by_name("zlib@openssh.com").unwrap());
+        assert!(!a.outbound_compress_is_active_for_test());
+        a.activate_compress();
+        assert!(a.outbound_compress_is_active_for_test());
+        // Re-KEX: fresh inactive codec installed, but active-state carries over.
+        a.install_outbound_compress(compress_by_name("zlib@openssh.com").unwrap());
+        assert!(
+            a.outbound_compress_is_active_for_test(),
+            "post-auth re-KEX must keep compression active"
+        );
+
+        // Inbound mirror.
+        let mut b = PacketCodec::new();
+        b.install_inbound_decompress(decompress_by_name("zlib@openssh.com").unwrap());
+        b.activate_compress();
+        b.install_inbound_decompress(decompress_by_name("zlib@openssh.com").unwrap());
+        assert!(b.inbound_decompress_is_active_for_test());
     }
 }

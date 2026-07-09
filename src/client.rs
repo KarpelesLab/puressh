@@ -868,6 +868,13 @@ impl Client {
         Ok(me)
     }
 
+    /// Override the re-key thresholds (defaults to [`RekeyPolicy::default`],
+    /// i.e. 1 GiB / 1 hour). Mirrors the server-side knob; mainly useful for
+    /// tests that need to force frequent client-initiated re-keys.
+    pub fn set_rekey_policy(&mut self, policy: crate::transport::RekeyPolicy) {
+        self.driver.set_rekey_policy(policy);
+    }
+
     /// Try every credential in order until one succeeds or all are refused.
     ///
     /// Builds a single [`ClientAuth`] driver carrying every credential and

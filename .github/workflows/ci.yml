@@ -93,12 +93,85 @@ jobs:
           --ignored --test-threads=1 --nocapture
           exec_against_real_sshd compression_zlib_interop_against_real_sshd
 
+      # Re-key interop (RFC 4253 §9). These force frequent re-keys via tiny
+      # `RekeyLimit` / client `RekeyPolicy` and assert the stream survives.
+      # `compressed_rekey_…` is the regression guard for the compression-context
+      # reset bug (RFC 4253 §6.2): with `zlib@openssh.com` on, a re-key must
+      # re-initialize the DEFLATE stream on both sides or inflate desyncs.
+      # `concurrent_write_…` / `idle_sharedclient_…` cover the `SharedClient`
+      # (mux) paths a forwarding tunnel uses.
+      - name: Run re-key interop against real sshd
+        run: >
+          cargo test --test e2e_real_sshd --
+          --ignored --test-threads=1 --nocapture
+          server_initiated_rekey_against_real_sshd
+          client_initiated_rekey_against_real_sshd
+          simultaneous_rekey_against_real_sshd
+          time_based_rekey_against_real_sshd
+          idle_server_time_rekey_against_real_sshd
+          gcm_rekey_against_real_sshd
+          compressed_rekey_against_real_sshd
+          concurrent_write_during_rekey_against_real_sshd
+          idle_sharedclient_across_server_rekey
+
       # server mode (real `ssh -C` client ↔ puressh sshd): proves our server
       # advertises, activates, and drives `zlib@openssh.com` compression.
       - name: Run server-mode compression interop against real ssh client
         run: >
           cargo test --test e2e_server_compression --
           --ignored --test-threads=1 --nocapture
+
+  interop-mlkem:
+    name: OpenSSH interop (ML-KEM, built sshd)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: interop-mlkem
+
+      # The distro `sshd` on the runner predates `mlkem768x25519-sha256`
+      # (default KEX in OpenSSH 9.9+), so client re-keys there always fall back
+      # to curve25519. Build a current OpenSSH into a throwaway prefix so the
+      # re-key suite actually exercises the post-quantum KEX real deployments
+      # negotiate. `--with-pam` keeps `UsePAM` a recognized keyword; libpam is
+      # also needed to link our own test-graph `sshd`.
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev libssl-dev libpam0g-dev
+
+      - name: Build OpenSSH (ML-KEM capable) into a local prefix
+        run: |
+          set -euo pipefail
+          ver=openssh-10.0p1
+          curl -sSL -o "$ver.tar.gz" "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/$ver.tar.gz"
+          tar xzf "$ver.tar.gz"
+          cd "$ver"
+          ./configure --prefix="$PWD/../ossh" --with-privsep-path="$PWD/../ossh/empty" --with-pam
+          make -j"$(nproc)"
+          make install-nokeys
+          "$PWD/../ossh/sbin/sshd" -T -f /dev/null -C user=x,host=x,addr=1.2.3.4 2>/dev/null | grep -i mlkem || \
+            "$PWD/../ossh/bin/ssh" -Q kex | grep -i mlkem
+          sudo mkdir -p /run/sshd
+
+      # Prepend the built binaries so the tests' `which("sshd"/"ssh-keygen")`
+      # resolves to the ML-KEM build. The re-key tests then negotiate
+      # `mlkem768x25519-sha256`, covering the KEX a modern server uses.
+      - name: Run re-key interop against ML-KEM sshd
+        run: |
+          export PATH="$PWD/ossh/sbin:$PWD/ossh/bin:$PATH"
+          cargo test --test e2e_real_sshd -- \
+            --ignored --test-threads=1 --nocapture \
+            server_initiated_rekey_against_real_sshd \
+            client_initiated_rekey_against_real_sshd \
+            simultaneous_rekey_against_real_sshd \
+            gcm_rekey_against_real_sshd \
+            compressed_rekey_against_real_sshd \
+            concurrent_write_during_rekey_against_real_sshd
 
   msrv:
     name: MSRV (Rust 1.88)

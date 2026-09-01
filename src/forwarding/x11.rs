@@ -584,8 +584,8 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         }
     };
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
-        out.push((nib(pair[0])? << 4) | nib(pair[1])?);
+    for &[hi, lo] in bytes.as_chunks::<2>().0 {
+        out.push((nib(hi)? << 4) | nib(lo)?);
     }
     Some(out)
 }

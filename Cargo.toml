@@ -60,10 +60,21 @@ mio = ["client"]
 pam = ["dep:pam-client2"]
 
 [dependencies]
-purecrypto = { version = "0.6.17", default-features = false, features = [
+# 0.7 made `ec` stop implying `alloc`, so the boxed multi-curve path, `CurveId`
+# and every DER/PEM codec now need `alloc` named explicitly. We already name it
+# (our own `alloc` feature forwards to `purecrypto/alloc`, and `std` implies
+# `alloc`), so the break is a no-op here — but a `no_std` consumer that enabled
+# only `purecrypto/ec` would lose those items.
+purecrypto = { version = "0.7.0", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem",
 ] }
-compcol = { version = "0.4.2", default-features = false, features = ["alloc", "zlib"], optional = true }
+# 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting
+# `StreamEnd` instead of stalling on trailing bytes, and 0.6.10 extended that to
+# the other terminal states. `src/compress/zlib.rs` drives the decoder to a
+# terminal status once per SSH packet, so a stall there is a hang, not a slow
+# path. The 0.6 break (`EncoderConfig`/`DecoderConfig` became `non_exhaustive`)
+# doesn't reach us: we construct both codecs with `new()` and no config literal.
+compcol = { version = "0.6.10", default-features = false, features = ["alloc", "zlib"], optional = true }
 # `zeroize` provides `Zeroizing<T>` (drop wipes the inner value) and a derive
 # for compound secrets. Kept default-on so `no_std + alloc` builds still get
 # secret-wiping for derived KDF output, password buffers carried across FFI,

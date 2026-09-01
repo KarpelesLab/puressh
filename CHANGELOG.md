@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/KarpelesLab/puressh/compare/v0.1.3...v0.1.4) - 2026-09-01
+
+### Fixed
+
+- fix lint: use as_chunks in hex_decode; bump README version pin
+
+### Other
+
+- purecrypto 0.6 -> 0.7, compcol 0.4 -> 0.6.10
+
 ## [0.1.3](https://github.com/KarpelesLab/puressh/compare/v0.1.2...v0.1.3) - 2026-07-09
 
 ### Fixed

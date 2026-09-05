@@ -16,9 +16,12 @@
 
 #![cfg(unix)]
 
+use std::io::Read;
 use std::net::{TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use puressh::auth::ClientCredential;
@@ -66,14 +69,78 @@ fn wait_for_tcp(port: u16, deadline: Duration) {
     }
 }
 
+/// Owns a spawned `sshd` plus the thread that drains its stderr.
+///
+/// `sshd` runs under `-e` with `LogLevel DEBUG*`, so it emits a steady stream
+/// of diagnostics on stderr. That pipe must never be left un-drained: the
+/// 64 KiB kernel buffer fills partway through a re-key-heavy test, `sshd`
+/// blocks in `write(2)`, stops servicing the connection, and the client sees
+/// the session die. The failure looks exactly like a protocol bug in our
+/// re-key handling, but it is the harness starving the server. How much a
+/// given test logs depends on the OpenSSH build, so the same code passes on
+/// one sshd version and hangs on the next.
+///
+/// The reader thread keeps the pipe empty and accumulates the log, so a
+/// failing test can print what the server actually said.
 struct SshdGuard {
     child: Child,
+    log: Arc<Mutex<Vec<u8>>>,
+    drain: Option<JoinHandle<()>>,
+}
+
+impl SshdGuard {
+    /// Spawns `sshd -D -e -f <config>` with its stderr drained into `log`.
+    fn spawn(sshd: &Path, config: &Path) -> Self {
+        let mut child = Command::new(sshd)
+            .args(["-D", "-e", "-f"])
+            .arg(config)
+            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("spawn sshd");
+
+        let mut stderr = child.stderr.take().expect("sshd stderr is piped");
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let drain = std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => sink
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .extend_from_slice(&buf[..n]),
+                }
+            }
+        });
+
+        Self {
+            child,
+            log,
+            drain: Some(drain),
+        }
+    }
 }
 
 impl Drop for SshdGuard {
     fn drop(&mut self) {
+        // Only worth printing when the test is already going down; on a green
+        // run this is several hundred lines of noise per test.
+        if std::thread::panicking() {
+            let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+            eprintln!(
+                "---- sshd log ----\n{}---- end sshd log ----",
+                String::from_utf8_lossy(&log)
+            );
+        }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Killing the child closes the pipe, which ends the reader thread.
+        if let Some(h) = self.drain.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -121,15 +188,7 @@ fn exec_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -217,15 +276,7 @@ fn compression_zlib_interop_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -333,15 +384,7 @@ fn interactive_shell_with_keystroke_chaff_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -458,15 +501,7 @@ fn server_initiated_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -561,15 +596,7 @@ fn client_initiated_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -667,15 +694,7 @@ fn time_based_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -766,15 +785,7 @@ fn idle_server_time_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -863,15 +874,7 @@ fn simultaneous_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -973,15 +976,7 @@ fn gcm_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -1082,15 +1077,7 @@ fn concurrent_write_during_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -1244,15 +1231,7 @@ fn idle_sharedclient_across_server_rekey() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 
@@ -1376,15 +1355,7 @@ fn compressed_rekey_against_real_sshd() {
     std::fs::write(&config, cfg_body).expect("write sshd_config");
 
     let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(&config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let _guard = SshdGuard { child };
+    let _guard = SshdGuard::spawn(&sshd, &config);
 
     wait_for_tcp(port, Duration::from_secs(5));
 

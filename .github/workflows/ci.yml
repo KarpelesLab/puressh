@@ -122,7 +122,7 @@ jobs:
           --ignored --test-threads=1 --nocapture
 
   interop-mlkem:
-    name: OpenSSH interop (ML-KEM, built sshd)
+    name: OpenSSH interop (ML-KEM + strict KEX, built sshd 10.4p1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -141,13 +141,19 @@ jobs:
       # re-key suite actually exercises the post-quantum KEX real deployments
       # negotiate. `--with-pam` keeps `UsePAM` a recognized keyword; libpam is
       # also needed to link our own test-graph `sshd`.
+      #
+      # Keep this at a *recent* OpenSSH, not merely an ML-KEM-capable one. 10.4
+      # enforces RFC 4253 §7.1 strictly, aborting the connection on any
+      # non-transport message received mid-KEX; 10.0 tolerated it. That
+      # enforcement is what caught us emitting CHANNEL_WINDOW_ADJUST during a
+      # re-key, so this job only has teeth if the built sshd is strict.
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev libssl-dev libpam0g-dev
 
       - name: Build OpenSSH (ML-KEM capable) into a local prefix
         run: |
           set -euo pipefail
-          ver=openssh-10.0p1
+          ver=openssh-10.4p1
           curl -sSL -o "$ver.tar.gz" "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/$ver.tar.gz"
           tar xzf "$ver.tar.gz"
           cd "$ver"

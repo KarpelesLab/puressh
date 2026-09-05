@@ -41,6 +41,10 @@ pub(crate) const SSH_MSG_KEX_ECDH_REPLY: u8 = 31;
 pub(crate) const SSH_MSG_KEXINIT: u8 = 20;
 pub(crate) const SSH_MSG_EXT_INFO: u8 = 7;
 pub(crate) const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
+/// Cap on egress buffered while a key exchange is in flight. A re-key settles
+/// in milliseconds, so anything approaching this means the KEX has wedged and
+/// we would rather fail than grow without bound.
+pub(crate) const MAX_DEFERRED_OUT_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const MAX_BANNER_LINE: usize = 1024;
 pub(crate) const MAX_BANNER_LINES: usize = 32;
 pub(crate) const MAX_BANNER_TOTAL_BYTES: usize = 64 * 1024;

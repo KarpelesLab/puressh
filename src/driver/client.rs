@@ -30,12 +30,12 @@ use crate::client::AlgoOverrides;
 use crate::error::{Error, Result};
 use crate::hostkey::HostKeyVerify;
 use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, pong_for_ping};
-use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
+use crate::transport::rekey::{RekeyPolicy, is_kex_msg, may_send_during_kex};
 use crate::transport::{ExtInfo, KexRunner, PacketCodec, Role, VersionExchange};
 
 use super::{
-    Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_INBOX_BYTES,
-    SSH_MSG_EXT_INFO, SSH_MSG_KEX_ECDH_REPLY, SSH_MSG_KEXINIT, keepalive_request,
+    Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_DEFERRED_OUT_BYTES,
+    MAX_INBOX_BYTES, SSH_MSG_EXT_INFO, SSH_MSG_KEX_ECDH_REPLY, SSH_MSG_KEXINIT, keepalive_request,
 };
 
 /// Builds the exchange-hash host-key verifier from the `SSH_MSG_KEX_ECDH_REPLY`
@@ -74,6 +74,11 @@ pub struct ClientDriver {
     /// Application packets received while a re-key was in flight (RFC 4253
     /// §7.3); replayed once NEWKEYS lands.
     deferred: VecDeque<Vec<u8>>,
+    /// Egress held back because a key exchange is in flight (RFC 4253 §7.1).
+    /// Stored as un-encoded payloads so the flush encrypts them under the
+    /// *new* keys, which is what the peer expects after NEWKEYS.
+    deferred_out: VecDeque<Vec<u8>>,
+    deferred_out_bytes: usize,
 
     v_s: Vec<u8>,
     session_id: Vec<u8>,
@@ -110,6 +115,8 @@ impl ClientDriver {
             outbox: VecDeque::new(),
             events: VecDeque::new(),
             deferred: VecDeque::new(),
+            deferred_out: VecDeque::new(),
+            deferred_out_bytes: 0,
             v_s: Vec::new(),
             session_id: Vec::new(),
             algo_overrides,
@@ -198,8 +205,39 @@ impl ClientDriver {
     /// Encode `payload` with the current keys and queue it for transmission.
     /// The sans-IO analog of the old `Client::write_payload`.
     pub fn enqueue_payload(&mut self, payload: &[u8]) -> Result<()> {
+        // RFC 4253 §7.1: between our KEXINIT and NEWKEYS only messages 1–49
+        // may go out. Holding the rest back is not politeness — a strict peer
+        // (OpenSSH 10.4+) aborts the connection over a single stray
+        // CHANNEL_WINDOW_ADJUST emitted mid-re-key.
+        let must_wait = match payload.first() {
+            Some(&b) => !may_send_during_kex(b),
+            None => false,
+        };
+        if must_wait && self.runner.is_kexing() {
+            self.deferred_out_bytes += payload.len();
+            if self.deferred_out_bytes > MAX_DEFERRED_OUT_BYTES {
+                return Err(Error::Protocol("re-key: deferred egress buffer too large"));
+            }
+            self.deferred_out.push_back(payload.to_vec());
+            return Ok(());
+        }
+        self.encode_and_queue(payload)
+    }
+
+    /// Encode `payload` under the current keys and queue the frame.
+    fn encode_and_queue(&mut self, payload: &[u8]) -> Result<()> {
         let frame = self.codec.encode(payload, &mut self.rng)?;
         self.outbox.push_back(frame);
+        Ok(())
+    }
+
+    /// Flush egress held back during a re-key, in the order it was queued.
+    /// Runs after NEWKEYS, so each payload is encoded under the new keys.
+    fn drain_deferred_out(&mut self) -> Result<()> {
+        while let Some(payload) = self.deferred_out.pop_front() {
+            self.encode_and_queue(&payload)?;
+        }
+        self.deferred_out_bytes = 0;
         Ok(())
     }
 
@@ -336,6 +374,7 @@ impl ClientDriver {
                         self.events.push_back(Event::HandshakeComplete);
                     }
                     self.last_kex = Some(now);
+                    self.drain_deferred_out()?;
                     self.drain_deferred()?;
                 }
                 Ok(())
@@ -687,5 +726,37 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         let _ = server_thread.join();
+    }
+
+    /// Regression: a `CHANNEL_WINDOW_ADJUST` (93) emitted while a key exchange
+    /// is in flight must be held back, not encoded onto the wire. RFC 4253
+    /// §7.1 forbids it, and OpenSSH 10.4+ aborts the connection with
+    /// "non-transport message 93 received from peer during key exchange".
+    #[test]
+    fn egress_during_kex_defers_connection_layer_but_not_transport() {
+        let mut d = ClientDriver::new(
+            AlgoOverrides::default(),
+            Box::new(|_p, _r| Err(Error::Protocol("no verifier in this test"))),
+        );
+        d.start(Instant::now()).expect("start");
+        assert!(d.is_kexing(), "start() leaves a KEX in flight");
+
+        // Drain the version line + KEXINIT that start() queued.
+        while d.poll_transmit().is_some() {}
+
+        // 93 is connection-layer: it must be withheld.
+        d.enqueue_payload(&[93, 0, 0, 0, 1, 0, 0, 0x40, 0])
+            .expect("enqueue window adjust");
+        assert!(
+            d.poll_transmit().is_none(),
+            "CHANNEL_WINDOW_ADJUST must not reach the wire during a KEX"
+        );
+
+        // A transport-range message still goes out immediately.
+        d.enqueue_payload(&[2, 0, 0, 0, 0]).expect("enqueue IGNORE");
+        assert!(
+            d.poll_transmit().is_some(),
+            "transport-layer messages stay allowed during a KEX"
+        );
     }
 }

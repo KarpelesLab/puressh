@@ -30,12 +30,12 @@ use crate::error::{Error, Result};
 use crate::hostkey::HostKey;
 use crate::server::{Config, build_server_kexinit, pick_host_key, server_ext_info};
 use crate::transport::ping::{SSH_MSG_PING, SSH_MSG_PONG, pong_for_ping};
-use crate::transport::rekey::{RekeyPolicy, is_kex_msg};
+use crate::transport::rekey::{RekeyPolicy, is_kex_msg, may_send_during_kex};
 use crate::transport::{ExtInfo, KexRunner, PacketCodec, Role, VersionExchange};
 
 use super::{
-    Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_INBOX_BYTES,
-    SSH_MSG_EXT_INFO, SSH_MSG_KEXINIT, keepalive_request,
+    Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_DEFERRED_OUT_BYTES,
+    MAX_INBOX_BYTES, SSH_MSG_EXT_INFO, SSH_MSG_KEXINIT, keepalive_request,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +64,11 @@ pub struct ServerDriver {
     outbox: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
     deferred: VecDeque<Vec<u8>>,
+    /// Egress held back because a key exchange is in flight (RFC 4253 §7.1).
+    /// Stored as un-encoded payloads so the flush encrypts them under the
+    /// *new* keys, which is what the peer expects after NEWKEYS.
+    deferred_out: VecDeque<Vec<u8>>,
+    deferred_out_bytes: usize,
 
     /// The peer's (client's) identification string.
     v_c: Vec<u8>,
@@ -97,6 +102,8 @@ impl ServerDriver {
             outbox: VecDeque::new(),
             events: VecDeque::new(),
             deferred: VecDeque::new(),
+            deferred_out: VecDeque::new(),
+            deferred_out_bytes: 0,
             v_c: Vec::new(),
             session_id: Vec::new(),
             rekey_policy: RekeyPolicy::default(),
@@ -174,8 +181,39 @@ impl ServerDriver {
 
     /// Encode `payload` with the current keys and queue it for transmission.
     pub fn enqueue_payload(&mut self, payload: &[u8]) -> Result<()> {
+        // RFC 4253 §7.1: between our KEXINIT and NEWKEYS only messages 1–49
+        // may go out. Holding the rest back is not politeness — a strict peer
+        // (OpenSSH 10.4+) aborts the connection over a single stray
+        // CHANNEL_WINDOW_ADJUST emitted mid-re-key.
+        let must_wait = match payload.first() {
+            Some(&b) => !may_send_during_kex(b),
+            None => false,
+        };
+        if must_wait && self.runner.is_kexing() {
+            self.deferred_out_bytes += payload.len();
+            if self.deferred_out_bytes > MAX_DEFERRED_OUT_BYTES {
+                return Err(Error::Protocol("re-key: deferred egress buffer too large"));
+            }
+            self.deferred_out.push_back(payload.to_vec());
+            return Ok(());
+        }
+        self.encode_and_queue(payload)
+    }
+
+    /// Encode `payload` under the current keys and queue the frame.
+    fn encode_and_queue(&mut self, payload: &[u8]) -> Result<()> {
         let frame = self.codec.encode(payload, &mut self.rng)?;
         self.outbox.push_back(frame);
+        Ok(())
+    }
+
+    /// Flush egress held back during a re-key, in the order it was queued.
+    /// Runs after NEWKEYS, so each payload is encoded under the new keys.
+    fn drain_deferred_out(&mut self) -> Result<()> {
+        while let Some(payload) = self.deferred_out.pop_front() {
+            self.encode_and_queue(&payload)?;
+        }
+        self.deferred_out_bytes = 0;
         Ok(())
     }
 
@@ -302,6 +340,7 @@ impl ServerDriver {
                         self.events.push_back(Event::HandshakeComplete);
                     }
                     self.last_kex = Some(now);
+                    self.drain_deferred_out()?;
                     self.drain_deferred()?;
                 }
                 Ok(())

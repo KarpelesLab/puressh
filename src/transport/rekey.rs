@@ -91,6 +91,23 @@ pub fn is_kex_msg(b: u8) -> bool {
     matches!(b, 20 | 21 | 30..=49)
 }
 
+/// May this message byte go out while a key exchange is in flight?
+///
+/// RFC 4253 §7.1: once a party has sent `SSH_MSG_KEXINIT`, until it has sent
+/// `SSH_MSG_NEWKEYS` it MUST NOT send anything but transport-layer generic
+/// messages (1–19), algorithm negotiation (20–29), and key-exchange-specific
+/// messages (30–49). Everything from 50 up — userauth, and the whole
+/// connection layer including `CHANNEL_DATA` and `CHANNEL_WINDOW_ADJUST` —
+/// has to wait for the new keys.
+///
+/// Peers differ in how hard they enforce this. OpenSSH 10.4 is strict: it
+/// aborts the connection with `non-transport message N received from peer
+/// during key exchange`, so a stray window adjust emitted mid-re-key kills
+/// the session outright.
+pub fn may_send_during_kex(b: u8) -> bool {
+    matches!(b, 1..=49)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,5 +184,21 @@ mod tests {
         assert!(!is_kex_msg(50));
         assert!(!is_kex_msg(0));
         assert!(!is_kex_msg(19));
+    }
+
+    #[test]
+    fn may_send_during_kex_allows_only_transport_range() {
+        // RFC 4253 §7.1: 1–49 may go out mid-KEX, 50+ may not.
+        assert!(may_send_during_kex(1)); // DISCONNECT
+        assert!(may_send_during_kex(7)); // EXT_INFO
+        assert!(may_send_during_kex(20)); // KEXINIT
+        assert!(may_send_during_kex(21)); // NEWKEYS
+        assert!(may_send_during_kex(49)); // top of the KEX-specific range
+
+        assert!(!may_send_during_kex(50)); // USERAUTH_REQUEST
+        assert!(!may_send_during_kex(90)); // CHANNEL_OPEN
+        assert!(!may_send_during_kex(93)); // CHANNEL_WINDOW_ADJUST — the regression
+        assert!(!may_send_during_kex(94)); // CHANNEL_DATA
+        assert!(!may_send_during_kex(255));
     }
 }

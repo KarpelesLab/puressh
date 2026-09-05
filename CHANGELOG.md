@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/KarpelesLab/puressh/compare/v0.1.4...v0.1.5) - 2026-09-05
+
+### Fixed
+
+- *(auth,scp)* user-cert auth and SCP download to a new local file
+- *(transport)* never send connection-layer messages during a re-key
+
+### Other
+
+- bump README version pin to 0.1.4
+- purecrypto 0.7 -> 0.8.1; MSRV 1.88 -> 1.89
+
 ## [0.1.4](https://github.com/KarpelesLab/puressh/compare/v0.1.3...v0.1.4) - 2026-09-01
 
 ### Fixed

@@ -121,6 +121,16 @@ jobs:
           cargo test --test e2e_server_compression --
           --ignored --test-threads=1 --nocapture
 
+      # SCP (puressh client ↔ puressh sshd) and OpenSSH certificate auth
+      # (puressh client ↔ real sshd). Neither suite ran in CI before, and both
+      # had rotted into permanent failure unnoticed: `e2e_scp` could not start
+      # our own sshd at all, and `e2e_cert` could not authenticate with a user
+      # certificate against any sshd that sends `server-sig-algs`.
+      - name: Run SCP and certificate interop
+        run: >
+          cargo test --test e2e_scp --test e2e_cert --
+          --ignored --test-threads=1 --nocapture
+
   interop-mlkem:
     name: OpenSSH interop (ML-KEM + strict KEX, built sshd 10.4p1)
     runs-on: ubuntu-latest

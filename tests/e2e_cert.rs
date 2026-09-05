@@ -18,7 +18,7 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -72,15 +72,8 @@ fn wait_for_tcp(port: u16, deadline: Duration) {
     }
 }
 
-struct SshdGuard {
-    child: Child,
-}
-impl Drop for SshdGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+mod common;
+use common::ChildGuard as SshdGuard;
 
 fn tempdir() -> PathBuf {
     let base = std::env::temp_dir().join(format!(
@@ -117,15 +110,7 @@ fn which(name: &str) -> PathBuf {
 
 fn spawn_sshd(config: &Path) -> SshdGuard {
     let sshd = which("sshd");
-    let child = Command::new(&sshd)
-        .args(["-D", "-e", "-f"])
-        .arg(config)
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    SshdGuard { child }
+    SshdGuard::spawn(Command::new(&sshd).args(["-D", "-e", "-f"]).arg(config))
 }
 
 /// puressh client presents a CA-signed USER cert to real sshd.

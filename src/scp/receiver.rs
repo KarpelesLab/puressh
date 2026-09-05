@@ -95,7 +95,26 @@ impl<S: Read + Write> Receiver<S> {
     /// unprivileged peer can't trick the receiver into materialising a
     /// tree at the wrong root.
     pub fn new(mut stream: S, base_path: &Path, opts: ScpRecvOptions) -> Result<Self, ScpError> {
-        let canon_base = fs::canonicalize(base_path).map_err(ScpError::Io)?;
+        // `canonicalize` requires the path to exist, but the ordinary
+        // `scp remote:foo /tmp/newfile` case names a destination file that
+        // does not exist yet. Canonicalizing the parent and re-attaching the
+        // basename keeps `base` symlink-resolved — which is what
+        // `guard_path` relies on — without demanding the target pre-exist.
+        // A missing *parent* is still an error: we will not create one.
+        let canon_base = match fs::canonicalize(base_path) {
+            Ok(p) => p,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let name = base_path
+                    .file_name()
+                    .ok_or(ScpError::Unexpected("scp: destination has no file name"))?;
+                let parent = match base_path.parent() {
+                    Some(p) if !p.as_os_str().is_empty() => p,
+                    _ => Path::new("."),
+                };
+                fs::canonicalize(parent).map_err(ScpError::Io)?.join(name)
+            }
+            Err(e) => return Err(ScpError::Io(e)),
+        };
         write_ok(&mut stream)?;
         Ok(Self {
             stream,

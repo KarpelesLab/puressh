@@ -15,7 +15,7 @@
 
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use puressh::auth::ClientCredential;
@@ -57,7 +57,7 @@ fn wait_for_tcp(port: u16, deadline: Duration) {
             return;
         }
         if start.elapsed() > deadline {
-            panic!("sshd never opened port {port}");
+            panic!("sshd never opened port {port} (see the server log above)");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -74,16 +74,8 @@ fn tempdir(label: &str) -> PathBuf {
     base
 }
 
-struct SshdGuard {
-    child: Child,
-}
-
-impl Drop for SshdGuard {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
+mod common;
+use common::ChildGuard as SshdGuard;
 
 /// Locate the in-tree `sshd` binary that Cargo has built. Tests run with
 /// the same target directory as the binaries, so `target/debug/sshd` is
@@ -159,18 +151,19 @@ fn fixture() -> Option<(PathBuf, PathBuf, u16, String, SshdGuard)> {
     // root, so PAM session-open is allowed to fail and the test still works
     // for non-PAM-required paths. The connection-level priv drop is a
     // no-op when we're already the right user, which is the case here.
-    let child = Command::new(&sshd_bin)
-        .args(["-p", &port.to_string()])
-        .args(["-h", &host_key.display().to_string()])
-        .args(["-A", &authorized.display().to_string()])
-        .args(["-u", &user])
+    // `--no-strict-modes` is required: the host key lives in a tempdir owned
+    // by the (non-root) user running the tests, and our sshd otherwise
+    // refuses to start with "host key ...: must be owned by root (uid 0)".
+    // The OpenSSH-based suites do the same thing with `StrictModes no`.
+    let guard = SshdGuard::spawn(
+        Command::new(&sshd_bin)
+            .args(["-p", &port.to_string()])
+            .args(["-h", &host_key.display().to_string()])
+            .args(["-A", &authorized.display().to_string()])
+            .args(["-u", &user])
+            .arg("--no-strict-modes"),
         // Default subsystems on; we don't need --no-sftp here.
-        .stderr(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stdin(Stdio::null())
-        .spawn()
-        .expect("spawn sshd");
-    let guard = SshdGuard { child };
+    );
 
     wait_for_tcp(port, Duration::from_secs(5));
 

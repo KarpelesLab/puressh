@@ -219,21 +219,28 @@ fn validate_rejects_dotdot_name() {
 }
 
 #[test]
-fn receiver_new_rejects_missing_base() {
-    // canonicalize() on a path that doesn't exist must surface as an
-    // Io error from `Receiver::new`. Use a freshly-allocated tmp name
-    // we explicitly never create.
-    let bogus = std::env::temp_dir().join(format!(
-        "puressh-scp-test-DOES-NOT-EXIST-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+fn receiver_new_rejects_a_base_whose_parent_is_missing() {
+    // A base path that cannot be resolved must surface as an Io error from
+    // `Receiver::new`. The receiver creates no directories, so a *missing
+    // parent* is unresolvable — unlike a missing leaf, which is the ordinary
+    // `scp remote:foo /tmp/newfile` case and is accepted (see
+    // `receiver_accepts_a_destination_file_that_does_not_exist_yet`).
+    let bogus = std::env::temp_dir()
+        .join(format!(
+            "puressh-scp-test-DOES-NOT-EXIST-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+        .join("file.txt");
     let (a, _b) = UnixStream::pair().expect("socketpair");
     let r = Receiver::new(a, &bogus, ScpRecvOptions::default());
-    assert!(r.is_err(), "expected Receiver::new to reject missing base");
+    assert!(
+        r.is_err(),
+        "expected Receiver::new to reject a base under a missing directory"
+    );
 }
 
 #[cfg(unix)]
@@ -353,4 +360,22 @@ fn round_trip_empty_file() {
 
     let got = std::fs::read(dst_dir.join("empty.txt")).expect("read dst");
     assert_eq!(got, Vec::<u8>::new());
+}
+
+/// `scp remote:foo /tmp/newfile` names a destination that does not exist yet.
+/// `Receiver::new` used to `canonicalize` the destination outright and fail
+/// with ENOENT, so downloading to a new filename was impossible — the error
+/// surfaced from `Client::scp_recv_from` as a bare `Io(NotFound)` with no
+/// hint that the destination was the problem.
+#[test]
+fn receiver_accepts_a_destination_file_that_does_not_exist_yet() {
+    let dir = fresh_tmp("recv-new-dest");
+    let dest = dir.join("not-created-yet.txt");
+    assert!(!dest.exists());
+
+    let stream = std::io::Cursor::new(Vec::new());
+    Receiver::new(stream, &dest, ScpRecvOptions::default())
+        .expect("a not-yet-existing destination file is a valid target");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

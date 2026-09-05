@@ -116,6 +116,17 @@ pub struct ClientAuth {
     pubkey_accepted: Option<Vec<String>>,
 }
 
+/// The signature algorithm a public-key algorithm actually signs with.
+///
+/// OpenSSH certificate algorithms (`*-cert-v01@openssh.com`) sign with their
+/// base algorithm — `ssh-ed25519-cert-v01@openssh.com` signs `ssh-ed25519`,
+/// `rsa-sha2-512-cert-v01@openssh.com` signs `rsa-sha2-512`. RFC 8308 §3.1
+/// `server-sig-algs` lists signature algorithms, so the certificate names
+/// never appear there and must be reduced before matching.
+fn signature_algorithm(algo: &str) -> &str {
+    algo.strip_suffix("-cert-v01@openssh.com").unwrap_or(algo)
+}
+
 impl ClientAuth {
     /// Build a new client. `session_id` is the SSH session identifier (the
     /// first KEX exchange hash `H`).
@@ -269,9 +280,18 @@ impl ClientAuth {
             // skipped entirely. If `server-sig-algs` was never sent we
             // keep the credential as-is — the server told us nothing, so
             // we fall back to old-OpenSSH behaviour and let it answer.
+            //
+            // Match on the *signature* algorithm, not the public-key
+            // algorithm: they differ for certificates. Unlike ssh_config's
+            // `PubkeyAcceptedAlgorithms` above — which does name certificate
+            // algorithms — `server-sig-algs` enumerates signature algorithms
+            // only, so OpenSSH never advertises `*-cert-v01@openssh.com`.
+            // Comparing a certificate credential on its certificate name
+            // matches nothing, drops the credential, and leaves the client
+            // reporting `AuthFailed` without ever sending a userauth request.
             let cred = match (cred, self.server_sig_algs.as_ref()) {
                 (ClientCredential::PublicKey(hk), Some(allowed)) => {
-                    let algo = hk.algorithm();
+                    let algo = signature_algorithm(hk.algorithm());
                     if allowed.iter().any(|a| a == algo) {
                         ClientCredential::PublicKey(hk)
                     } else {
@@ -507,6 +527,28 @@ impl ClientAuth {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn signature_algorithm_reduces_certificate_names() {
+        // `server-sig-algs` carries signature algorithms, so a certificate
+        // credential has to be matched on the algorithm it actually signs
+        // with, not on its certificate name.
+        assert_eq!(
+            signature_algorithm("ssh-ed25519-cert-v01@openssh.com"),
+            "ssh-ed25519"
+        );
+        assert_eq!(
+            signature_algorithm("rsa-sha2-512-cert-v01@openssh.com"),
+            "rsa-sha2-512"
+        );
+        assert_eq!(
+            signature_algorithm("ecdsa-sha2-nistp256-cert-v01@openssh.com"),
+            "ecdsa-sha2-nistp256"
+        );
+        // Plain algorithms pass through untouched.
+        assert_eq!(signature_algorithm("ssh-ed25519"), "ssh-ed25519");
+        assert_eq!(signature_algorithm("rsa-sha2-256"), "rsa-sha2-256");
+    }
     use super::*;
     use crate::auth::message::{ServiceAccept, UserauthFailure, UserauthRequest};
     use crate::hostkey::HostKey;

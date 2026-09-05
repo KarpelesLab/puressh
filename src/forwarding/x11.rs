@@ -980,9 +980,17 @@ mod tests {
         first.write_all(&pkt).expect("write setup packet");
         drop(first);
 
-        // Give the worker time to exit and release the port.
+        // Give the worker time to exit and release the port. This is a
+        // *liveness* assertion — the listener must be released eventually —
+        // so the bound only needs to exceed the worst plausible scheduling
+        // delay, and a generous one costs nothing on the happy path (the loop
+        // exits on the first successful bind, typically within 50 ms). The
+        // previous 2.5 s budget was tight enough to fail on a loaded macOS
+        // runner, one slow enough that a single KEX test in the same run took
+        // over 60 s.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
         let mut released = false;
-        for _ in 0..50 {
+        while std::time::Instant::now() < deadline {
             thread::sleep(Duration::from_millis(50));
             if TcpListener::bind(addr).is_ok() {
                 released = true;

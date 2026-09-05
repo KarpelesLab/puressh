@@ -76,13 +76,7 @@ mod common;
 use common::ChildGuard as SshdGuard;
 
 fn tempdir() -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "puressh_e2e_cert_{}_{}",
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    std::fs::create_dir_all(&base).expect("tempdir");
-    base
+    common::tempdir("puressh_e2e_cert")
 }
 
 fn chmod_600(path: &Path) {

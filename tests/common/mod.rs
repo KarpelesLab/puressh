@@ -6,6 +6,7 @@
 #![allow(dead_code)] // each test binary uses a different subset
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -94,4 +95,24 @@ impl Drop for ChildGuard {
             let _ = h.join();
         }
     }
+}
+
+/// A fresh temp directory, unique within this process.
+///
+/// The uniquifier has to be a monotonic counter. `Instant::now().elapsed()` is
+/// ~0 ns and does not uniquify anything: every test in a suite shares a pid,
+/// so two directories minted in quick succession land on the same path, the
+/// second `ssh-keygen` finds the first's key already there, and prompts
+/// "Overwrite (y/n)?" against a closed stdin — surfacing as a bare
+/// "ssh-keygen failed". Timing-dependent, so it passes locally and fails in CI.
+pub fn tempdir(prefix: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = std::env::temp_dir().join(format!(
+        "{prefix}_{}_{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&base).expect("tempdir");
+    base
 }

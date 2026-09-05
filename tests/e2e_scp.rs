@@ -64,14 +64,7 @@ fn wait_for_tcp(port: u16, deadline: Duration) {
 }
 
 fn tempdir(label: &str) -> PathBuf {
-    let base = std::env::temp_dir().join(format!(
-        "puressh_e2e_scp_{}_{}_{}",
-        label,
-        std::process::id(),
-        Instant::now().elapsed().as_nanos()
-    ));
-    std::fs::create_dir_all(&base).expect("tempdir");
-    base
+    common::tempdir(&format!("puressh_e2e_scp_{label}"))
 }
 
 mod common;

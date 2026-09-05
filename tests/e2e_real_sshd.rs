@@ -69,6 +69,8 @@ fn wait_for_tcp(port: u16, deadline: Duration) {
     }
 }
 
+mod common;
+
 /// Owns a spawned `sshd` plus the thread that drains its stderr.
 ///
 /// `sshd` runs under `-e` with `LogLevel DEBUG*`, so it emits a steady stream
@@ -1408,19 +1410,7 @@ fn compressed_rekey_against_real_sshd() {
 }
 
 fn tempdir() -> PathBuf {
-    // A monotonic counter keeps names unique across threads: the tests run in
-    // one process (same pid) and `Instant::now().elapsed()` is ~0 ns, so
-    // parallel runs would otherwise collide on the same directory and clobber
-    // each other's freshly-generated keys.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let base = std::env::temp_dir().join(format!(
-        "puressh_e2e_{}_{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    std::fs::create_dir_all(&base).expect("tempdir");
-    base
+    common::tempdir("puressh_e2e")
 }
 
 fn chmod_600(path: &PathBuf) {

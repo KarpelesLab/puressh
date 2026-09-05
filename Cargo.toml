@@ -2,7 +2,7 @@
 name = "puressh"
 version = "0.1.4"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 description = "A pure-Rust SSH (Secure Shell) protocol library, in the spirit of libssh, built on purecrypto."
 repository = "https://github.com/KarpelesLab/puressh"
@@ -65,7 +65,13 @@ pam = ["dep:pam-client2"]
 # (our own `alloc` feature forwards to `purecrypto/alloc`, and `std` implies
 # `alloc`), so the break is a no-op here — but a `no_std` consumer that enabled
 # only `purecrypto/ec` would lose those items.
-purecrypto = { version = "0.7.0", default-features = false, features = [
+#
+# 0.8's only break is an MSRV raise to Rust 1.89, which is why this crate's
+# `rust-version` moved with it. 0.8.1 is the floor rather than 0.8: it carries
+# a broad security-audit pass (constant-time and zeroization fixes across EC,
+# RSA, Falcon, the AEADs and the TLS/QUIC stacks) that we want as a minimum,
+# not merely as whatever a fresh resolve happens to pick.
+purecrypto = { version = "0.8.1", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem",
 ] }
 # 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting

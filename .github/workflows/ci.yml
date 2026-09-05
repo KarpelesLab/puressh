@@ -174,20 +174,20 @@ jobs:
             concurrent_write_during_rekey_against_real_sshd
 
   msrv:
-    name: MSRV (Rust 1.88)
+    name: MSRV (Rust 1.89)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      # Pin the exact MSRV declared in Cargo.toml (`rust-version = "1.88"`).
+      # Pin the exact MSRV declared in Cargo.toml (`rust-version = "1.89"`).
       # Keep this version in sync with that field. This job exists so that an
-      # accidental use of a newer-than-1.88 language/std feature — or a
+      # accidental use of a newer-than-1.89 language/std feature — or a
       # dependency bump that raises the floor (as purecrypto <=0.6.13 silently
       # did to 1.95) — fails here instead of quietly bumping the real MSRV.
       # Cargo.lock is gitignored, so dependencies resolve fresh and cargo's
-      # MSRV-aware resolver picks versions compatible with 1.88.
-      - name: Install Rust 1.88
-        uses: dtolnay/rust-toolchain@1.88
+      # MSRV-aware resolver picks versions compatible with 1.89.
+      - name: Install Rust 1.89
+        uses: dtolnay/rust-toolchain@1.89
 
       - name: Cache
         uses: Swatinem/rust-cache@v2

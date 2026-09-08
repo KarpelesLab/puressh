@@ -1736,18 +1736,10 @@ fn handle_connection_inner(
     );
 
     // Fold the authenticating user certificate's capability gates into the
-    // per-connection ceiling. The certificate's extensions are default-deny
-    // (an absent `permit-*` refuses pty/forwarding/agent/X11) and AND with the
-    // `sshd_config` gates already resolved above; its `force-command` critical
-    // option converges with the config `ForceCommand` machinery — when both are
-    // present the certificate's wins (it is the command actually enforced),
-    // matching OpenSSH. Plain-key / password auth leaves `cert_caps` `None`, so
-    // nothing here changes their behaviour.
+    // per-connection ceiling (see `fold_cert_caps`). Plain-key / password auth
+    // leaves `cert_caps` `None`, so nothing here changes their behaviour.
     if let Some(caps) = cert_caps {
-        if let Some(forced) = caps.force_command.clone() {
-            effective.force_command = Some(forced);
-        }
-        effective.cert_caps = Some(caps);
+        fold_cert_caps(&mut effective, caps);
     }
 
     // Connection-level hook: drop privileges to the authenticated user
@@ -1791,6 +1783,26 @@ fn ip_string(addr: &SocketAddr) -> Option<String> {
     } else {
         Some(ip.to_string())
     }
+}
+
+/// Fold an authenticating user certificate's capability gates into the
+/// per-connection ceiling.
+///
+/// The certificate's extensions are default-deny (an absent `permit-*` refuses
+/// pty/forwarding/agent/X11) and AND with the `sshd_config` gates already
+/// resolved into `effective`. Its `force-command` critical option converges
+/// with the config `ForceCommand` machinery with OpenSSH's precedence
+/// (`session.c` `do_exec`): the administrator's `ForceCommand`
+/// (`adm_forced_command`) wins; the certificate's `force-command` only applies
+/// when the config sets none. A cert can therefore never *loosen* what the
+/// operator forced.
+fn fold_cert_caps(effective: &mut EffectivePolicy, caps: crate::auth::AuthCertCaps) {
+    if effective.force_command.is_none()
+        && let Some(forced) = caps.force_command.clone()
+    {
+        effective.force_command = Some(forced);
+    }
+    effective.cert_caps = Some(caps);
 }
 
 /// Pre-auth (Phase 1) resolution result: the auth method set to advertise and
@@ -3471,76 +3483,9 @@ fn handle_channel_request(
             } else {
                 command
             };
-            // First-chance overlay: ask the ExecStreamHandler (if any)
-            // whether it wants to claim this command. The decision must
-            // happen synchronously — we can't take back a `request_success`
-            // reply, and the SubsystemRuntime we register here would
-            // deadlock the connection if no thread drained it. Once
-            // `claims` returns true we set up the runtime + spawn the
-            // handler thread the same way `ChannelRequest::Subsystem`
-            // below does.
-            if let Some(handler) = cfg.exec_stream_handler.clone()
-                && handler.claims(&command)
-            {
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
-                let (egress_tx, egress_rx) =
-                    mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
-                let cs = ChannelStream::new(ingress_rx, egress_tx);
-                let user_owned = user.to_string();
-                let command_owned = command.clone();
-                let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
-                let handler_for_thread = handler;
-                thread::spawn(move || {
-                    // Errors swallowed: the stream auto-emits
-                    // EOF + Close on drop, so the peer sees teardown.
-                    let _ = handler_for_thread.run(&user_owned, &env_snapshot, &command_owned, cs);
-                });
-                subsystems.insert(
-                    channel,
-                    SubsystemRuntime {
-                        ingress_tx,
-                        egress_rx,
-                        pending_data: Vec::new(),
-                        pending_eof: false,
-                        pending_close: false,
-                        eof_sent: false,
-                        close_sent: false,
-                    },
-                );
-                if want_reply {
-                    let p = conn.send_request_success(channel)?;
-                    srv_send(stream, driver, &p)?;
-                }
-                return Ok(());
-            }
-            // Not claimed — fall through to the buffered CommandHandler.
-            let env_ref = envs.get(&channel).unwrap_or(&empty_env);
-            let result = cfg.command_handler.handle(user, env_ref, &command);
-            if want_reply {
-                let p = conn.send_request_success(channel)?;
-                srv_send(stream, driver, &p)?;
-            }
-            drain_send(stream, driver, conn, channel, &result.stdout, None)?;
-            drain_send(
-                stream,
-                driver,
-                conn,
-                channel,
-                &result.stderr,
-                Some(SSH_EXTENDED_DATA_STDERR),
-            )?;
-            let p = conn.send_request(
-                channel,
-                ChannelRequest::ExitStatus {
-                    code: result.exit_status,
-                },
-                false,
-            )?;
-            srv_send(stream, driver, &p)?;
-            let p = conn.send_eof(channel)?;
-            srv_send(stream, driver, &p)?;
-            let p = conn.send_close(channel)?;
-            srv_send(stream, driver, &p)?;
+            return run_exec_command(
+                stream, driver, conn, cfg, user, channel, &command, want_reply, subsystems, envs,
+            );
         }
         ChannelRequest::PtyReq {
             term,
@@ -3715,6 +3660,28 @@ fn handle_channel_request(
             }
         }
         ChannelRequest::Subsystem { name } => {
+            // ForceCommand applies to subsystems too (OpenSSH runs every
+            // session — shell, exec *and* subsystem — through `do_exec`, where
+            // the forced command replaces whatever was asked for). Without
+            // this, a user confined to a forced command could sidestep it by
+            // requesting `subsystem sftp` and get the in-process SFTP server.
+            // The requested subsystem name is exposed as SSH_ORIGINAL_COMMAND;
+            // `internal-sftp` routes to SFTP, anything else runs the forced
+            // command exactly as an `exec` request would.
+            if let Some(forced) = effective.force_command.as_deref() {
+                envs.entry(channel)
+                    .or_default()
+                    .insert("SSH_ORIGINAL_COMMAND".to_string(), name.clone());
+                if forced.eq_ignore_ascii_case("internal-sftp") {
+                    return route_internal_sftp(
+                        stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
+                    );
+                }
+                let forced = forced.to_string();
+                return run_exec_command(
+                    stream, driver, conn, cfg, user, channel, &forced, want_reply, subsystems, envs,
+                );
+            }
             if let Some(handler) = cfg.subsystem_handler.clone() {
                 // Ingress: unbounded — the dispatcher must never block on
                 // its own dispatch path. Egress: bounded — the handler
@@ -3844,6 +3811,97 @@ fn handle_channel_request(
             }
         }
     }
+    Ok(())
+}
+
+/// Run `command` on a session channel: first offer it to the
+/// [`ExecStreamHandler`] overlay (if any), otherwise run it through the
+/// buffered [`CommandHandler`] and close the channel. Shared by the `exec`
+/// request path and by `subsystem` requests rewritten by `ForceCommand`, so a
+/// forced command behaves identically however the session was requested.
+#[allow(clippy::too_many_arguments)]
+fn run_exec_command(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    conn: &mut ConnectionState,
+    cfg: &Config,
+    user: &str,
+    channel: u32,
+    command: &str,
+    want_reply: bool,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    envs: &mut BTreeMap<u32, SessionEnv>,
+) -> Result<()> {
+    let empty_env = SessionEnv::new();
+    // First-chance overlay: ask the ExecStreamHandler (if any)
+    // whether it wants to claim this command. The decision must
+    // happen synchronously — we can't take back a `request_success`
+    // reply, and the SubsystemRuntime we register here would
+    // deadlock the connection if no thread drained it. Once
+    // `claims` returns true we set up the runtime + spawn the
+    // handler thread the same way `ChannelRequest::Subsystem`
+    // does.
+    if let Some(handler) = cfg.exec_stream_handler.clone()
+        && handler.claims(&command)
+    {
+        let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+        let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+        let cs = ChannelStream::new(ingress_rx, egress_tx);
+        let user_owned = user.to_string();
+        let command_owned = command.to_string();
+        let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
+        let handler_for_thread = handler;
+        thread::spawn(move || {
+            // Errors swallowed: the stream auto-emits
+            // EOF + Close on drop, so the peer sees teardown.
+            let _ = handler_for_thread.run(&user_owned, &env_snapshot, &command_owned, cs);
+        });
+        subsystems.insert(
+            channel,
+            SubsystemRuntime {
+                ingress_tx,
+                egress_rx,
+                pending_data: Vec::new(),
+                pending_eof: false,
+                pending_close: false,
+                eof_sent: false,
+                close_sent: false,
+            },
+        );
+        if want_reply {
+            let p = conn.send_request_success(channel)?;
+            srv_send(stream, driver, &p)?;
+        }
+        return Ok(());
+    }
+    // Not claimed — fall through to the buffered CommandHandler.
+    let env_ref = envs.get(&channel).unwrap_or(&empty_env);
+    let result = cfg.command_handler.handle(user, env_ref, &command);
+    if want_reply {
+        let p = conn.send_request_success(channel)?;
+        srv_send(stream, driver, &p)?;
+    }
+    drain_send(stream, driver, conn, channel, &result.stdout, None)?;
+    drain_send(
+        stream,
+        driver,
+        conn,
+        channel,
+        &result.stderr,
+        Some(SSH_EXTENDED_DATA_STDERR),
+    )?;
+    let p = conn.send_request(
+        channel,
+        ChannelRequest::ExitStatus {
+            code: result.exit_status,
+        },
+        false,
+    )?;
+    srv_send(stream, driver, &p)?;
+    let p = conn.send_eof(channel)?;
+    srv_send(stream, driver, &p)?;
+    let p = conn.send_close(channel)?;
+    srv_send(stream, driver, &p)?;
     Ok(())
 }
 
@@ -6724,6 +6782,110 @@ mod tests {
             thread::sleep(Duration::from_millis(20));
         }
         let _ = server_thread.join();
+    }
+
+    // ---- S9: ForceCommand precedence — config wins over cert force-command --
+
+    #[test]
+    fn s9_config_force_command_wins_over_cert_force_command() {
+        // OpenSSH `do_exec`: `adm_forced_command` (sshd_config ForceCommand)
+        // takes precedence over the key/cert `force_command`. A certificate
+        // must never be able to replace what the operator forced.
+        let mut eff = EffectivePolicy::unrestricted();
+        eff.force_command = Some("/from/config".to_string());
+        let mut caps = caps_all();
+        caps.force_command = Some("/from/cert".to_string());
+        fold_cert_caps(&mut eff, caps);
+        assert_eq!(eff.force_command.as_deref(), Some("/from/config"));
+        assert!(eff.cert_caps.is_some(), "cert gates still folded in");
+    }
+
+    #[test]
+    fn s9_cert_force_command_applies_when_config_sets_none() {
+        let mut eff = EffectivePolicy::unrestricted();
+        let mut caps = caps_all();
+        caps.force_command = Some("/from/cert".to_string());
+        fold_cert_caps(&mut eff, caps);
+        assert_eq!(eff.force_command.as_deref(), Some("/from/cert"));
+    }
+
+    // ---- S2: ForceCommand must also govern `subsystem` requests -----------
+
+    #[test]
+    fn s2_force_command_applies_to_subsystem_request() {
+        // A user confined by ForceCommand must not be able to sidestep it
+        // with `subsystem sftp`: the forced command runs instead, and the
+        // requested subsystem name is exposed as SSH_ORIGINAL_COMMAND.
+        let (mut client, st, sd) = w7_server_and_client("ForceCommand /forced/cmd\n", false);
+        let out = client.subsystem_once("sftp", b"").expect("subsystem");
+        let stdout = String::from_utf8_lossy(&out);
+        assert!(stdout.contains("CMD=/forced/cmd"), "stdout was {stdout:?}");
+        assert!(stdout.contains("ORIG=sftp"), "stdout was {stdout:?}");
+        w7_finish(client, st, sd);
+    }
+
+    #[test]
+    fn s2_force_command_internal_sftp_pins_subsystem_name() {
+        // `ForceCommand internal-sftp` routes every subsystem request to the
+        // in-process SFTP handler under the fixed name "sftp", whatever the
+        // client actually asked for.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let allowed_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+        let user = "s2-user".to_string();
+        let user_f = user.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: user_f.clone(),
+                allowed_blob: allowed_blob.clone(),
+            })
+        });
+        let policy =
+            crate::config::SshServerConfig::parse("ForceCommand internal-sftp\n").expect("parse");
+        let captured_name = Arc::new(Mutex::new(None));
+        let captured_user = Arc::new(Mutex::new(None));
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(EchoCommandHandler),
+        )
+        .with_policy(Arc::new(policy))
+        .with_subsystem(Arc::new(EchoUpperSubsystem {
+            captured_name: captured_name.clone(),
+            captured_user: captured_user.clone(),
+        }));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let st = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+            },
+        )
+        .expect("connect");
+        client
+            .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+            .expect("auth");
+        let out = client
+            .subsystem_once("not-sftp", b"hello")
+            .expect("subsystem");
+        assert_eq!(out, b"HELLO");
+        w7_finish(client, st, server_done);
+        assert_eq!(captured_name.lock().unwrap().as_deref(), Some("sftp"));
+        assert_eq!(captured_user.lock().unwrap().as_deref(), Some("s2-user"));
     }
 
     #[test]

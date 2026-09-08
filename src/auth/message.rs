@@ -121,11 +121,19 @@ impl ServiceAccept {
 /// comparison (`secret == "pw"`), so it can be dropped into the existing
 /// public API without touching call sites that build it from `&str`.
 ///
+/// Every equality comparison (`==` against another `SecretString`, a `str`
+/// or a `&str`) runs in constant time with respect to the *contents*: all
+/// bytes of the shorter-or-equal common prefix are always examined and the
+/// length difference is folded into the result rather than short-circuiting,
+/// so an authenticator that checks `password == expected` does not leak how
+/// many leading bytes matched through timing. (The lengths themselves are
+/// not hidden — the comparison walks the longer of the two.)
+///
 /// `Debug` is redacted: it never renders the secret. Note that the
 /// `AuthMethodPayload`/`AuthAttempt` `Debug` impls already substitute
 /// `"<redacted>"` for these fields; this is belt-and-suspenders so a
 /// stray `{:?}` directly on a `SecretString` cannot leak either.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct SecretString(zeroize::Zeroizing<String>);
 
 impl SecretString {
@@ -134,6 +142,35 @@ impl SecretString {
         self.0.as_bytes()
     }
 }
+
+/// Constant-time byte-string equality that does not short-circuit on a
+/// length mismatch: every position up to the longer length is visited, with
+/// out-of-range positions on the shorter side contributing a fixed
+/// difference, and the accumulated OR is reduced to a bool only at the end.
+fn ct_bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    let n = a.len().max(b.len());
+    let mut diff: u8 = 0;
+    for i in 0..n {
+        // `get` keeps the loop total-length-bound; a missing byte on either
+        // side is treated as a mismatch rather than ending the loop.
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    // Fold the length difference in without branching on it.
+    let len_diff = (a.len() ^ b.len()) as u64;
+    let len_bit = ((len_diff | len_diff.wrapping_neg()) >> 63) as u8;
+    diff |= len_bit;
+    core::hint::black_box(diff) == 0
+}
+
+impl PartialEq for SecretString {
+    fn eq(&self, other: &Self) -> bool {
+        ct_bytes_eq(self.as_bytes(), other.as_bytes())
+    }
+}
+
+impl Eq for SecretString {}
 
 impl From<String> for SecretString {
     fn from(s: String) -> Self {
@@ -156,13 +193,13 @@ impl core::ops::Deref for SecretString {
 
 impl PartialEq<&str> for SecretString {
     fn eq(&self, other: &&str) -> bool {
-        self.0.as_str() == *other
+        ct_bytes_eq(self.as_bytes(), other.as_bytes())
     }
 }
 
 impl PartialEq<str> for SecretString {
     fn eq(&self, other: &str) -> bool {
-        self.0.as_str() == other
+        ct_bytes_eq(self.as_bytes(), other.as_bytes())
     }
 }
 
@@ -846,6 +883,33 @@ mod tests {
             ),
             other => panic!("unexpected error variant: {other:?}"),
         }
+    }
+
+    #[test]
+    // The point of this test is to drive each `PartialEq` impl exactly as
+    // written (including the owned/empty forms clippy would rewrite).
+    #[allow(clippy::cmp_owned, clippy::comparison_to_empty)]
+    fn secret_string_equality_is_exact() {
+        let s = SecretString::from("hunter2");
+        // Equal strings compare equal, via every impl.
+        assert!(s == "hunter2");
+        assert!(s == *"hunter2");
+        assert!(s == SecretString::from("hunter2"));
+        // Different-length strings (prefix / extension / empty) are unequal.
+        assert!(s != "hunter");
+        assert!(s != "hunter22");
+        assert!(s != "");
+        assert!(SecretString::from("") != "x");
+        assert!(SecretString::from("") == "");
+        // Same length, differing in the first / last byte.
+        assert!(s != "Hunter2");
+        assert!(s != "hunter3");
+        assert!(s != SecretString::from("hunter3"));
+        // Direct check of the helper's length handling.
+        assert!(ct_bytes_eq(b"", b""));
+        assert!(!ct_bytes_eq(b"\x00", b""));
+        assert!(!ct_bytes_eq(b"", b"\x00"));
+        assert!(!ct_bytes_eq(b"ab\x00", b"ab"));
     }
 
     #[test]

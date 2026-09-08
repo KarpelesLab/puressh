@@ -225,6 +225,20 @@ fn verify_rsa(
     .map_err(|_| Error::BadSignature)
 }
 
+/// Check that `(p, q)` are a plausible factorisation of `n`: both odd, both
+/// at least 3 bits wide, distinct, and `p * q == n`. Shared by the RSA host
+/// key constructor and the private-key file parsers.
+#[cfg(feature = "alloc")]
+pub(crate) fn check_rsa_primes(n: &BoxedUint, p: &BoxedUint, q: &BoxedUint) -> Result<()> {
+    if p.bit_len() < 3 || q.bit_len() < 3 || !p.is_odd() || !q.is_odd() || p == q {
+        return Err(Error::Format("rsa: invalid prime factors"));
+    }
+    if &p.mul(q) != n {
+        return Err(Error::Format("rsa: prime factors do not match modulus"));
+    }
+    Ok(())
+}
+
 macro_rules! rsa_host_key {
     ($name:ident, $hash:expr, $algname:expr, $doc:expr, $upgrade:expr) => {
         #[cfg(feature = "alloc")]
@@ -240,12 +254,43 @@ macro_rules! rsa_host_key {
             /// Build a host key from its `(n, e, d)` components.
             ///
             /// Without the prime factors `(p, q)`, base-blinding is disabled
-            /// on the private path — see `BoxedRsaPrivateKey::from_components`.
+            /// on the private path — see `BoxedRsaPrivateKey::from_components`
+            /// — leaving signing exposed to remote timing analysis
+            /// (Brumley–Boneh). Prefer [`Self::from_components_with_primes`]
+            /// whenever the key file carries `p` and `q` (openssh-key-v1,
+            /// PKCS#1 and PKCS#8 all do).
             pub fn from_components(n: BoxedUint, e: BoxedUint, d: BoxedUint) -> Result<Self> {
                 let public = BoxedRsaPublicKey::try_new(n.clone(), e.clone())
                     .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
                 let k = n.bit_len().div_ceil(8);
                 let private = BoxedRsaPrivateKey::from_components(n, e, d);
+                Ok(Self {
+                    private: Some(private),
+                    public,
+                    k,
+                })
+            }
+
+            /// Build a host key from `(n, e, d)` **and** the prime factors
+            /// `(p, q)`, keeping purecrypto's base blinding (and CRT) enabled
+            /// on the signing path.
+            ///
+            /// The primes are checked against the modulus (`p * q == n`, both
+            /// odd and non-trivial) before use: purecrypto's constructor
+            /// performs no validation, and a corrupt key file with mismatched
+            /// primes would otherwise produce garbage CRT signatures.
+            pub fn from_components_with_primes(
+                n: BoxedUint,
+                e: BoxedUint,
+                d: BoxedUint,
+                p: BoxedUint,
+                q: BoxedUint,
+            ) -> Result<Self> {
+                check_rsa_primes(&n, &p, &q)?;
+                let public = BoxedRsaPublicKey::try_new(n.clone(), e.clone())
+                    .map_err(|_| Error::Crypto("rsa: modulus out of accepted range"))?;
+                let k = n.bit_len().div_ceil(8);
+                let private = BoxedRsaPrivateKey::from_components_with_primes(n, e, d, p, q);
                 Ok(Self {
                     private: Some(private),
                     public,

@@ -745,3 +745,208 @@ fn private_key_debug_is_redacted() {
         "public half missing: {s}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A8: RSA host keys built from a key file keep the primes (base blinding on)
+// and still round-trip against the verifier.
+// ---------------------------------------------------------------------------
+#[test]
+fn rsa_host_key_with_primes_signs_and_verifies() {
+    use crate::hostkey::HostKey;
+    use purecrypto::bignum::BoxedUint;
+    let sk = PrivateKey::parse_openssh_pem(RSA_PEM_UNENCRYPTED, None).unwrap();
+    let PrivateKey::Rsa { n, e, d, p, q, .. } = &sk else {
+        panic!("not RSA");
+    };
+    let u = |b: &[u8]| BoxedUint::from_be_bytes(trim_leading_zeros(b));
+    let hk = crate::hostkey::RsaSha2_512HostKey::from_components_with_primes(
+        u(n),
+        u(e),
+        u(d),
+        u(p),
+        u(q),
+    )
+    .unwrap();
+    let sig = hk.sign(b"blinded rsa").unwrap();
+    let verifier =
+        crate::hostkey::host_key_verify_by_name("rsa-sha2-512", &hk.public_blob()).unwrap();
+    verifier.verify(b"blinded rsa", &sig).unwrap();
+    // Same key via the file path: `into_host_key` must produce signatures
+    // the plain verifier accepts (and the same public blob).
+    let pub_blob = sk.public_key().wire_blob();
+    let hk2 = sk.into_host_key().unwrap();
+    assert_eq!(hk2.public_blob(), pub_blob);
+    let sig2 = hk2.sign(b"via into_host_key").unwrap();
+    verifier.verify(b"via into_host_key", &sig2).unwrap();
+
+    // Mismatched primes are refused rather than fed to the CRT path.
+    let sk = PrivateKey::parse_openssh_pem(RSA_PEM_UNENCRYPTED, None).unwrap();
+    let PrivateKey::Rsa { n, e, d, p, q, .. } = &sk else {
+        panic!("not RSA");
+    };
+    let mut bad_q = q.clone();
+    let last = bad_q.len() - 1;
+    bad_q[last] ^= 0x02;
+    assert!(
+        crate::hostkey::RsaSha2_512HostKey::from_components_with_primes(
+            u(n),
+            u(e),
+            u(d),
+            u(p),
+            u(&bad_q),
+        )
+        .is_err()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A12: the parser derives the public key from the secret and rejects a file
+// whose (consistent) public copies don't match it.
+// ---------------------------------------------------------------------------
+
+/// Re-encode `sk` as an unencrypted openssh-key-v1 PEM with the given
+/// public-key blob substituted in *both* places the file carries it (the
+/// outer cleartext blob and the inner private-section public field).
+fn pem_with_swapped_public(sk: &PrivateKey, evil_pub: &PublicKey) -> String {
+    let inner_pub = sk.public_key().wire_blob();
+    let evil_blob = evil_pub.wire_blob();
+    // Build the file the writer would, then patch the public copies.
+    let pem = sk.to_openssh_pem(None).unwrap();
+    let body: String = pem.lines().filter(|l| !l.starts_with("-----")).collect();
+    let raw = base64::decode(body.as_bytes()).unwrap();
+    // Outer blob: `string public_blob` right after nkeys.
+    let mut r = Reader::new(&raw[MAGIC.len()..]);
+    let _cipher = r.read_string().unwrap();
+    let _kdf = r.read_string().unwrap();
+    let _opts = r.read_string().unwrap();
+    let _nkeys = r.read_u32().unwrap();
+    let outer = r.read_string().unwrap().to_vec();
+    assert_eq!(outer, inner_pub);
+    let priv_section = r.read_string().unwrap().to_vec();
+    // Patch the inner section: it contains the public field verbatim.
+    let inner_field: Vec<u8> = match sk {
+        PrivateKey::Ed25519 { public, .. } => public.to_vec(),
+        PrivateKey::EcdsaP256 { point, .. }
+        | PrivateKey::EcdsaP384 { point, .. }
+        | PrivateKey::EcdsaP521 { point, .. } => point.clone(),
+        PrivateKey::Rsa { .. } => panic!("RSA handled separately"),
+    };
+    let evil_field: Vec<u8> = match evil_pub {
+        PublicKey::Ed25519 { raw, .. } => raw.to_vec(),
+        PublicKey::EcdsaP256 { point, .. }
+        | PublicKey::EcdsaP384 { point, .. }
+        | PublicKey::EcdsaP521 { point, .. } => point.clone(),
+        PublicKey::Rsa { .. } => panic!("RSA handled separately"),
+    };
+    assert_eq!(inner_field.len(), evil_field.len());
+    let pos = priv_section
+        .windows(inner_field.len())
+        .position(|w| w == inner_field.as_slice())
+        .expect("inner public field present");
+    let mut patched = priv_section.clone();
+    patched[pos..pos + inner_field.len()].copy_from_slice(&evil_field);
+    // For ed25519 the 64-byte secret field repeats the public key too.
+    if matches!(sk, PrivateKey::Ed25519 { .. }) {
+        let pos2 = pos
+            + inner_field.len()
+            + priv_section[pos + inner_field.len()..]
+                .windows(inner_field.len())
+                .position(|w| w == inner_field.as_slice())
+                .expect("public repeated in secret field");
+        patched[pos2..pos2 + inner_field.len()].copy_from_slice(&evil_field);
+    }
+
+    let mut w = Writer::new();
+    w.write_raw(MAGIC);
+    w.write_string(b"none");
+    w.write_string(b"none");
+    w.write_string(b"");
+    w.write_u32(1);
+    w.write_string(&evil_blob);
+    w.write_string(&patched);
+    let b64 = base64::encode(&w.into_vec());
+    format!("-----BEGIN OPENSSH PRIVATE KEY-----\n{b64}\n-----END OPENSSH PRIVATE KEY-----\n")
+}
+
+#[test]
+fn parse_rejects_public_key_not_derived_from_secret() {
+    let mut rng = purecrypto::rng::OsRng;
+    // ed25519: swap in another key's public half (consistently, in both
+    // places) — only derivation from the seed can catch this.
+    let sk = PrivateKey::generate_ed25519(&mut rng, "victim".to_string());
+    let other = PrivateKey::generate_ed25519(&mut rng, "other".to_string()).public_key();
+    let pem = pem_with_swapped_public(&sk, &other);
+    let err = PrivateKey::parse_openssh_pem(&pem, None).unwrap_err();
+    assert!(
+        matches!(err, Error::Format(m) if m.contains("does not match")),
+        "got {err:?}"
+    );
+    // ECDSA P-256 likewise.
+    let sk = PrivateKey::generate_ecdsa(&mut rng, EcdsaCurve::P256, "victim".to_string());
+    let other =
+        PrivateKey::generate_ecdsa(&mut rng, EcdsaCurve::P256, "other".to_string()).public_key();
+    let pem = pem_with_swapped_public(&sk, &other);
+    let err = PrivateKey::parse_openssh_pem(&pem, None).unwrap_err();
+    assert!(
+        matches!(err, Error::Format(m) if m.contains("does not match")),
+        "got {err:?}"
+    );
+    // The untouched keys still parse.
+    PrivateKey::parse_openssh_pem(&sk.to_openssh_pem(None).unwrap(), None).unwrap();
+}
+
+#[test]
+fn parse_rejects_rsa_with_inconsistent_private_components() {
+    // Corrupt `d` (keeping n, e, p, q intact): the file's public copies
+    // still agree with each other, so only the e*d ≡ 1 check catches it.
+    let sk = PrivateKey::parse_openssh_pem(RSA_PEM_UNENCRYPTED, None).unwrap();
+    let PrivateKey::Rsa {
+        n,
+        e,
+        d,
+        p,
+        q,
+        iqmp,
+        comment,
+    } = sk
+    else {
+        panic!("not RSA");
+    };
+    let mut bad_d = d.clone();
+    let last = bad_d.len() - 1;
+    bad_d[last] ^= 0x01;
+    let bad = PrivateKey::Rsa {
+        n: n.clone(),
+        e: e.clone(),
+        d: bad_d,
+        p: p.clone(),
+        q: q.clone(),
+        iqmp: iqmp.clone(),
+        comment: comment.clone(),
+    };
+    assert!(bad.check_consistency().is_err());
+    let pem = bad.to_openssh_pem(None).unwrap();
+    assert!(matches!(
+        PrivateKey::parse_openssh_pem(&pem, None),
+        Err(Error::Format(_))
+    ));
+    // Corrupt `q`: p * q != n.
+    let mut bad_q = q.clone();
+    let last = bad_q.len() - 1;
+    bad_q[last] ^= 0x02;
+    let bad = PrivateKey::Rsa {
+        n,
+        e,
+        d,
+        p,
+        q: bad_q,
+        iqmp,
+        comment,
+    };
+    assert!(bad.check_consistency().is_err());
+    let pem = bad.to_openssh_pem(None).unwrap();
+    assert!(matches!(
+        PrivateKey::parse_openssh_pem(&pem, None),
+        Err(Error::Format(_))
+    ));
+}

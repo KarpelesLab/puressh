@@ -148,7 +148,7 @@ fn parse_pkcs1_rsa_der(der: &[u8]) -> Result<PrivateKey> {
     let _dp = seq.read_unsigned_integer_bytes().map_err(der_err)?;
     let _dq = seq.read_unsigned_integer_bytes().map_err(der_err)?;
     let iqmp = seq.read_unsigned_integer_bytes().map_err(der_err)?.to_vec();
-    Ok(PrivateKey::Rsa {
+    let key = PrivateKey::Rsa {
         n,
         e,
         d,
@@ -156,7 +156,13 @@ fn parse_pkcs1_rsa_der(der: &[u8]) -> Result<PrivateKey> {
         q,
         iqmp,
         comment: String::new(),
-    })
+    };
+    // Unlike the EC / Ed25519 paths (which derive the public half), RSA
+    // carries every component verbatim — check `p * q == n` and that `d`
+    // inverts `e` so a corrupt file cannot feed inconsistent parameters
+    // to the CRT signing path.
+    key.check_consistency()?;
+    Ok(key)
 }
 
 /// SEC1 `ECPrivateKey` (RFC 5915 §3):

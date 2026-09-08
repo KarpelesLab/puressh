@@ -17,8 +17,9 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use purecrypto::bignum::BoxedUint;
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
-use purecrypto::ec::{BoxedEcdsaPublicKey, CurveId};
+use purecrypto::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey};
 use purecrypto::kdf::bcrypt_pbkdf;
 use zeroize::Zeroizing;
 
@@ -555,7 +556,6 @@ impl PrivateKey {
     ///
     /// For RSA keys, defaults to `rsa-sha2-512` (modern OpenSSH preference).
     pub fn into_host_key(self) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send>> {
-        use purecrypto::bignum::BoxedUint;
         match self {
             PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(
                 crate::hostkey::Ed25519HostKey::from_seed(seed),
@@ -569,13 +569,8 @@ impl PrivateKey {
             PrivateKey::EcdsaP521 { d, .. } => Ok(alloc::boxed::Box::new(
                 crate::hostkey::EcdsaP521HostKey::from_scalar(&d)?,
             )),
-            PrivateKey::Rsa { n, e, d, .. } => {
-                let n_u = BoxedUint::from_be_bytes(trim_leading_zeros(&n));
-                let e_u = BoxedUint::from_be_bytes(trim_leading_zeros(&e));
-                let d_u = BoxedUint::from_be_bytes(trim_leading_zeros(&d));
-                Ok(alloc::boxed::Box::new(
-                    crate::hostkey::RsaSha2_512HostKey::from_components(n_u, e_u, d_u)?,
-                ))
+            PrivateKey::Rsa { n, e, d, p, q, .. } => {
+                Ok(alloc::boxed::Box::new(rsa_host_key(&n, &e, &d, &p, &q)?))
             }
         }
     }
@@ -588,7 +583,6 @@ impl PrivateKey {
     pub fn into_host_key_sync(
         self,
     ) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send + Sync>> {
-        use purecrypto::bignum::BoxedUint;
         match self {
             PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(
                 crate::hostkey::Ed25519HostKey::from_seed(seed),
@@ -602,15 +596,40 @@ impl PrivateKey {
             PrivateKey::EcdsaP521 { d, .. } => Ok(alloc::boxed::Box::new(
                 crate::hostkey::EcdsaP521HostKey::from_scalar(&d)?,
             )),
-            PrivateKey::Rsa { n, e, d, .. } => {
-                let n_u = BoxedUint::from_be_bytes(trim_leading_zeros(&n));
-                let e_u = BoxedUint::from_be_bytes(trim_leading_zeros(&e));
-                let d_u = BoxedUint::from_be_bytes(trim_leading_zeros(&d));
-                Ok(alloc::boxed::Box::new(
-                    crate::hostkey::RsaSha2_512HostKey::from_components(n_u, e_u, d_u)?,
-                ))
+            PrivateKey::Rsa { n, e, d, p, q, .. } => {
+                Ok(alloc::boxed::Box::new(rsa_host_key(&n, &e, &d, &p, &q)?))
             }
         }
+    }
+
+    /// Check that the private material actually corresponds to the stored
+    /// public half, by *deriving* the public key from the secret:
+    ///
+    /// - Ed25519: `public == [seed]B`.
+    /// - ECDSA: `point == [d]G` (also range-checks `d`).
+    /// - RSA: `p * q == n` and `e * d ≡ 1 (mod p-1)` / `(mod q-1)` when the
+    ///   prime factors are present.
+    ///
+    /// The file parsers call this so a key whose public field was
+    /// tampered with (or whose secret half is corrupt) is rejected up front
+    /// instead of producing signatures that never verify — or, for RSA,
+    /// exposing the CRT signing path to inconsistent parameters.
+    pub fn check_consistency(&self) -> Result<()> {
+        match self {
+            PrivateKey::Ed25519 { seed, public, .. } => {
+                let derived = Ed25519PrivateKey::from_bytes(*seed).public_key().to_bytes();
+                if &derived != public {
+                    return Err(Error::Format(
+                        "ed25519: public key does not match private seed",
+                    ));
+                }
+            }
+            PrivateKey::EcdsaP256 { d, point, .. } => check_ecdsa(CurveId::P256, d, point)?,
+            PrivateKey::EcdsaP384 { d, point, .. } => check_ecdsa(CurveId::P384, d, point)?,
+            PrivateKey::EcdsaP521 { d, point, .. } => check_ecdsa(CurveId::P521, d, point)?,
+            PrivateKey::Rsa { n, e, d, p, q, .. } => check_rsa_private(n, e, d, p, q)?,
+        }
+        Ok(())
     }
 
     /// Derive the matching [`PublicKey`] (cloning the public parts).
@@ -699,8 +718,8 @@ impl PrivateKey {
             expected = expected.wrapping_add(1);
         }
 
-        // Sanity-check: the embedded public-key blob must match the private
-        // key's derived public side.
+        // Sanity-check: the outer (cleartext) public-key blob must match the
+        // inner private section's public fields ...
         let pk_with_comment = attach_comment(pk, comment);
         let embedded = PublicKey::parse_wire_blob(&public_blob)?;
         if !public_parts_match(&pk_with_comment.public_key(), &embedded) {
@@ -708,7 +727,75 @@ impl PrivateKey {
                 "openssh key: embedded public key does not match private fields",
             ));
         }
+        // ... and both must match what the *secret* actually derives to;
+        // comparing two file-supplied copies against each other would let
+        // a tampered file carry a public half unrelated to its private half.
+        pk_with_comment.check_consistency()?;
         Ok(pk_with_comment)
+    }
+}
+
+/// Derive the public point from an ECDSA scalar and compare it to `point`.
+fn check_ecdsa(curve: CurveId, d: &[u8], point: &[u8]) -> Result<()> {
+    let sk = BoxedEcdsaPrivateKey::from_bytes(curve, trim_leading_zeros(d))
+        .map_err(|_| Error::Crypto("ecdsa: private scalar out of range"))?;
+    if sk.public_key().to_sec1() != point {
+        return Err(Error::Format(
+            "ecdsa: public point does not match private scalar",
+        ));
+    }
+    Ok(())
+}
+
+/// True if the RSA prime factors are present (an RSA key built by hand, or
+/// read from a container that omits them, has empty `p`/`q`).
+fn rsa_has_primes(p: &[u8], q: &[u8]) -> bool {
+    !trim_leading_zeros(p).is_empty() && !trim_leading_zeros(q).is_empty()
+}
+
+/// Validate RSA private components: when the primes are present, require
+/// `p * q == n` and `e * d ≡ 1` modulo both `p - 1` and `q - 1` (i.e. `d`
+/// really is the inverse of `e` mod `λ(n)`).
+fn check_rsa_private(n: &[u8], e: &[u8], d: &[u8], p: &[u8], q: &[u8]) -> Result<()> {
+    if !rsa_has_primes(p, q) {
+        return Ok(());
+    }
+    let n_u = BoxedUint::from_be_bytes(trim_leading_zeros(n));
+    let p_u = BoxedUint::from_be_bytes(trim_leading_zeros(p));
+    let q_u = BoxedUint::from_be_bytes(trim_leading_zeros(q));
+    crate::hostkey::rsa::check_rsa_primes(&n_u, &p_u, &q_u)?;
+    let e_u = BoxedUint::from_be_bytes(trim_leading_zeros(e));
+    let d_u = BoxedUint::from_be_bytes(trim_leading_zeros(d));
+    let one = BoxedUint::from_u64(1);
+    let ed = e_u.mul(&d_u);
+    if ed.reduce(&p_u.sub(&one)) != one || ed.reduce(&q_u.sub(&one)) != one {
+        return Err(Error::Format(
+            "rsa: private exponent does not match public exponent and primes",
+        ));
+    }
+    Ok(())
+}
+
+/// Build the `rsa-sha2-512` signer for an RSA private key, keeping base
+/// blinding enabled by passing the prime factors through whenever the key
+/// carries them (openssh-key-v1, PKCS#1 and PKCS#8 all do). A key without
+/// primes falls back to the unblinded `(n, e, d)` constructor.
+fn rsa_host_key(
+    n: &[u8],
+    e: &[u8],
+    d: &[u8],
+    p: &[u8],
+    q: &[u8],
+) -> Result<crate::hostkey::RsaSha2_512HostKey> {
+    let n_u = BoxedUint::from_be_bytes(trim_leading_zeros(n));
+    let e_u = BoxedUint::from_be_bytes(trim_leading_zeros(e));
+    let d_u = BoxedUint::from_be_bytes(trim_leading_zeros(d));
+    if rsa_has_primes(p, q) {
+        let p_u = BoxedUint::from_be_bytes(trim_leading_zeros(p));
+        let q_u = BoxedUint::from_be_bytes(trim_leading_zeros(q));
+        crate::hostkey::RsaSha2_512HostKey::from_components_with_primes(n_u, e_u, d_u, p_u, q_u)
+    } else {
+        crate::hostkey::RsaSha2_512HostKey::from_components(n_u, e_u, d_u)
     }
 }
 

@@ -75,6 +75,14 @@ const MIT_MAGIC_COOKIE_1: &str = "MIT-MAGIC-COOKIE-1";
 #[cfg(feature = "server")]
 const MAX_X11_SETUP_PRELUDE: usize = 1 << 16;
 
+/// Total budget for receiving one connection's X11 setup packet (cookie
+/// handshake). This is an absolute deadline for the whole packet, not a
+/// per-read inactivity window: the handshake runs on the display's accept
+/// thread, so a local peer dribbling one byte per read-timeout would otherwise
+/// stall every other X11 connection of the session for as long as it liked.
+#[cfg(feature = "server")]
+const X11_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Per-setup decision about how to treat accepted local connections.
 #[cfg(feature = "server")]
 enum CookiePolicy {
@@ -468,17 +476,34 @@ fn spawn_tcp_splice_with_prelude(tcp: TcpStream, stream: ChannelStream, prelude:
 ///   then        : authorization-protocol-data, padded to a multiple of 4
 #[cfg(feature = "server")]
 fn read_and_check_cookie(conn: &mut TcpStream, expected: &[u8]) -> std::io::Result<Vec<u8>> {
+    read_and_check_cookie_until(
+        conn,
+        expected,
+        std::time::Instant::now() + X11_SETUP_TIMEOUT,
+    )
+}
+
+/// [`read_and_check_cookie`] with an explicit absolute `deadline` for the
+/// whole setup packet. Every read re-arms the socket timeout to the time
+/// *remaining*, so a peer that trickles bytes cannot extend the budget; once
+/// the deadline passes the read fails with `ErrorKind::TimedOut`.
+#[cfg(feature = "server")]
+fn read_and_check_cookie_until(
+    conn: &mut TcpStream,
+    expected: &[u8],
+    deadline: std::time::Instant,
+) -> std::io::Result<Vec<u8>> {
     use std::io::{Error as IoError, Read};
 
-    // A short read timeout keeps a silent/hostile local connection from
-    // pinning the accept-loop's splice thread indefinitely.
+    // The deadline keeps a silent/hostile local connection from pinning the
+    // display's accept thread; the prior timeout is restored on the way out.
     let prev_timeout = conn.read_timeout().ok().flatten();
-    conn.set_read_timeout(Some(Duration::from_secs(10)))?;
 
     let result = (|| {
         let mut buf = Vec::with_capacity(64);
 
-        // Helper: read until `buf.len() >= need`, capping total size.
+        // Helper: read until `buf.len() >= need`, capping total size and
+        // bounding the wall-clock spent by `deadline`.
         let mut read_until = |buf: &mut Vec<u8>, need: usize| -> std::io::Result<()> {
             if need > MAX_X11_SETUP_PRELUDE {
                 return Err(IoError::new(
@@ -488,6 +513,14 @@ fn read_and_check_cookie(conn: &mut TcpStream, expected: &[u8]) -> std::io::Resu
             }
             let mut chunk = [0u8; 4096];
             while buf.len() < need {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Err(IoError::new(
+                        ErrorKind::TimedOut,
+                        "x11-forward: setup packet not received before the deadline",
+                    ));
+                }
+                conn.set_read_timeout(Some(remaining))?;
                 let want = (need - buf.len()).min(chunk.len());
                 let n = conn.read(&mut chunk[..want])?;
                 if n == 0 {
@@ -908,6 +941,47 @@ mod tests {
             "non-single_connection: port should remain bound after a rejected connection"
         );
         drop(handle);
+    }
+
+    /// C3: the setup-packet read is bounded by an absolute deadline. A peer
+    /// that keeps the socket alive by trickling one byte at a time (each
+    /// well inside any per-read timeout) is still cut off once the overall
+    /// budget is spent, so it cannot pin the display's accept thread.
+    #[test]
+    fn cookie_handshake_enforces_total_deadline_against_trickling_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let dripper = thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            // A valid-looking start ('B' byte order) then one byte every
+            // 40 ms for up to 3 s — never enough for the 12-byte header
+            // before a 300 ms deadline, never idle long enough to trip a
+            // per-read timeout of that size on its own.
+            let _ = s.write_all(b"B");
+            let start = std::time::Instant::now();
+            while start.elapsed() < Duration::from_secs(3) {
+                thread::sleep(Duration::from_millis(40));
+                if s.write_all(&[0u8]).is_err() {
+                    break;
+                }
+            }
+        });
+        let (mut conn, _) = listener.accept().expect("accept");
+        let start = std::time::Instant::now();
+        let deadline = start + Duration::from_millis(300);
+        let err = read_and_check_cookie_until(&mut conn, b"cookie", deadline)
+            .expect_err("trickling peer must not pass the cookie gate");
+        assert!(
+            matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock),
+            "expected a timeout, got {err:?}"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "deadline not enforced: took {:?}",
+            start.elapsed()
+        );
+        drop(conn);
+        dripper.join().expect("dripper");
     }
 
     /// `permit_unauthenticated()` opts back into the legacy splice-everything

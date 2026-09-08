@@ -75,9 +75,12 @@ const USAGE: &str = "usage: ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C com
 struct Args {
     type_: Option<String>,
     bits: Option<usize>,
-    new_pass: Option<String>,
+    /// `-N`: new passphrase. `Zeroizing` so the copy taken off argv is
+    /// wiped on drop (argv itself is the kernel's; we can't help that).
+    new_pass: Option<Zeroizing<String>>,
     new_pass_set: bool,
-    old_pass: Option<String>,
+    /// `-P`: old passphrase (see `new_pass`).
+    old_pass: Option<Zeroizing<String>>,
     comment: Option<String>,
     file: Option<String>,
     fingerprint: bool,
@@ -128,13 +131,13 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 let v = args
                     .get(i)
                     .ok_or("-N requires a value (use \"\" for none)")?;
-                out.new_pass = Some(v.clone());
+                out.new_pass = Some(Zeroizing::new(v.clone()));
                 out.new_pass_set = true;
             }
             "-P" => {
                 i += 1;
                 let v = args.get(i).ok_or("-P requires a value")?;
-                out.old_pass = Some(v.clone());
+                out.old_pass = Some(Zeroizing::new(v.clone()));
             }
             "-C" => {
                 i += 1;
@@ -254,6 +257,29 @@ fn read_passphrase_interactive(prompt: &str) -> Result<Zeroizing<String>, String
         }
     }
     Ok(Zeroizing::new(s))
+}
+
+/// Ask for a *new* passphrase the way `ssh-keygen(1)` does: prompt, then
+/// `Enter same passphrase again:`, and loop until the two match. An empty
+/// passphrase (twice) means "unencrypted".
+///
+/// Without a terminal on stdin there is nothing to ask — return the empty
+/// passphrase so the key is written unencrypted, which is what OpenSSH does
+/// when `-N` is absent and no tty is available. We never read a passphrase
+/// off a redirected stdin.
+fn read_new_passphrase_confirmed(prompt: &str) -> Result<Zeroizing<String>, String> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return Ok(Zeroizing::new(String::new()));
+    }
+    loop {
+        let first = read_passphrase_interactive(prompt)?;
+        let second = read_passphrase_interactive("Enter same passphrase again: ")?;
+        if first == second {
+            return Ok(first);
+        }
+        eprintln!("Passphrases do not match.  Try again.");
+    }
 }
 
 #[cfg(unix)]
@@ -382,9 +408,21 @@ fn run_generate(args: &Args) -> Result<i32, String> {
         other => return Err(format!("unsupported key type: {other}")),
     };
 
-    let passphrase = args.new_pass.as_deref().filter(|p| !p.is_empty());
+    // `-N` given ⇒ use it verbatim (empty ⇒ unencrypted). Otherwise ask on
+    // the terminal, twice, like OpenSSH; with no terminal the key is written
+    // unencrypted (OpenSSH behaviour) rather than reading a passphrase off
+    // a redirected stdin.
+    let passphrase: Zeroizing<String> = if args.new_pass_set {
+        args.new_pass.clone().unwrap_or_default()
+    } else {
+        read_new_passphrase_confirmed("Enter passphrase (empty for no passphrase): ")?
+    };
     let pem = sk
-        .to_openssh_pem(passphrase.map(|s| s.as_bytes()))
+        .to_openssh_pem(if passphrase.is_empty() {
+            None
+        } else {
+            Some(passphrase.as_bytes())
+        })
         .map_err(|e| format!("encode: {e}"))?;
 
     let pub_line = sk.public_key().to_authorized_keys_line();
@@ -422,8 +460,12 @@ fn run_fingerprint(args: &Args) -> Result<i32, String> {
 fn run_extract_public(args: &Args) -> Result<i32, String> {
     let file = ensure_file_in(&args.file)?;
     let text = read_to_string(&file)?;
-    let pem_pass = args.new_pass.as_deref().filter(|p| !p.is_empty());
-    let sk = match PrivateKey::parse_openssh_pem(&text, pem_pass.map(|s| s.as_bytes())) {
+    let pem_pass = args
+        .new_pass
+        .as_deref()
+        .map(String::as_str)
+        .filter(|p| !p.is_empty());
+    let sk = match PrivateKey::parse_openssh_pem(&text, pem_pass.map(str::as_bytes)) {
         Ok(sk) => sk,
         Err(_) if pem_pass.is_none() => {
             let pp = read_passphrase_interactive("Enter passphrase: ")?;
@@ -447,8 +489,12 @@ fn run_extract_public(args: &Args) -> Result<i32, String> {
 fn run_change_passphrase(args: &Args) -> Result<i32, String> {
     let file = ensure_file_in(&args.file)?;
     let text = read_to_string(&file)?;
-    let old_pass = args.old_pass.as_deref().filter(|p| !p.is_empty());
-    let sk = match PrivateKey::parse_openssh_pem(&text, old_pass.map(|s| s.as_bytes())) {
+    let old_pass = args
+        .old_pass
+        .as_deref()
+        .map(String::as_str)
+        .filter(|p| !p.is_empty());
+    let sk = match PrivateKey::parse_openssh_pem(&text, old_pass.map(str::as_bytes)) {
         Ok(sk) => sk,
         Err(_) if old_pass.is_none() => {
             let pp = read_passphrase_interactive("Enter old passphrase: ")?;
@@ -466,9 +512,9 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
     };
 
     let new_pass: Zeroizing<String> = if args.new_pass_set {
-        Zeroizing::new(args.new_pass.clone().unwrap_or_default())
+        args.new_pass.clone().unwrap_or_default()
     } else {
-        read_passphrase_interactive("Enter new passphrase: ")?
+        read_new_passphrase_confirmed("Enter new passphrase (empty for no passphrase): ")?
     };
 
     let pem = sk

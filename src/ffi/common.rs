@@ -71,6 +71,17 @@ pub(crate) fn map_error(err: &Error) -> c_int {
     }
 }
 
+/// Is `len` a legal length for [`core::slice::from_raw_parts`]?
+///
+/// The slice constructors require the total byte size to be at most
+/// `isize::MAX`; a C caller passing a larger `size_t` would otherwise
+/// hand us an invalid slice (undefined behaviour) before any bound
+/// check. Every `(ptr, len)` entry point must consult this and return
+/// [`PCSSH_ERR_INVALID_ARGUMENT`] on `false`.
+pub(crate) fn slice_len_ok(len: usize) -> bool {
+    len <= isize::MAX as usize
+}
+
 /// Run `f` on the `&str` view of `ptr`. NULL or non-UTF-8 yields `None`
 /// (and `f` is not called).
 ///
@@ -198,6 +209,15 @@ mod tests {
     fn error_message_unknown_returns_null() {
         assert!(pcssh_error_message(12345).is_null());
         assert!(pcssh_error_message(-12345).is_null());
+    }
+
+    #[test]
+    fn slice_len_ok_bounds_at_isize_max() {
+        assert!(slice_len_ok(0));
+        assert!(slice_len_ok(1));
+        assert!(slice_len_ok(isize::MAX as usize));
+        assert!(!slice_len_ok(isize::MAX as usize + 1));
+        assert!(!slice_len_ok(usize::MAX));
     }
 
     #[test]

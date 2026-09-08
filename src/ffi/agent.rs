@@ -19,7 +19,7 @@ use std::sync::Mutex;
 
 use super::common::{
     PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK, catch,
-    map_error, with_cstr,
+    map_error, slice_len_ok, with_cstr,
 };
 use crate::agent::{Agent, AgentIdentity};
 
@@ -312,16 +312,18 @@ pub unsafe extern "C" fn pcssh_agent_sign(
         if (key_blob.is_null() && key_blob_len != 0)
             || (data.is_null() && data_len != 0)
             || (sig_buf.is_null() && sig_cap != 0)
+            || !slice_len_ok(key_blob_len)
+            || !slice_len_ok(data_len)
         {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        // SAFETY: caller contract; len=0 → empty.
+        // SAFETY: caller contract; len=0 → empty; len bounded above.
         let key_slice = if key_blob_len == 0 {
             &[][..]
         } else {
             unsafe { slice::from_raw_parts(key_blob, key_blob_len) }
         };
-        // SAFETY: caller contract; len=0 → empty.
+        // SAFETY: caller contract; len=0 → empty; len bounded above.
         let data_slice = if data_len == 0 {
             &[][..]
         } else {

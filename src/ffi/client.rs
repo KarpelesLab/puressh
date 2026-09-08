@@ -15,14 +15,14 @@
 use core::ffi::{c_char, c_int};
 use core::ptr;
 use std::ffi::CStr;
-use std::net::ToSocketAddrs;
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::slice;
 use std::time::Duration;
 use zeroize::Zeroizing;
 
 use super::common::{
     PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK, catch,
-    map_error, with_cstr,
+    map_error, slice_len_ok, with_cstr,
 };
 use crate::auth::ClientCredential;
 use crate::client::{Client, Config, HostKeyPolicy};
@@ -62,7 +62,115 @@ pub struct PcSshClient {
     pub(crate) inner: SharedClient,
 }
 
+/// Translate the C-side `timeout_ms` into the library's optional
+/// [`Duration`]. `timeout_ms <= 0` means "no timeout" — documented in
+/// `include/puressh.h` for every connect entry point.
+pub(crate) fn timeout_from_ms(timeout_ms: i32) -> Option<Duration> {
+    if timeout_ms > 0 {
+        Some(Duration::from_millis(timeout_ms as u64))
+    } else {
+        None
+    }
+}
+
+/// Open a TCP connection to `sa`, bounding the connect itself by
+/// `timeout` when one is given, then apply the same read/write timeout
+/// so every later socket operation (banner, KEX, auth, channel I/O) is
+/// bounded too. Mirrors what [`Client::connect`] does after its own
+/// unbounded `TcpStream::connect`.
+fn tcp_connect(sa: SocketAddr, timeout: Option<Duration>) -> std::io::Result<TcpStream> {
+    let stream = match timeout {
+        Some(t) => TcpStream::connect_timeout(&sa, t)?,
+        None => TcpStream::connect(sa)?,
+    };
+    if timeout.is_some() {
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)?;
+    }
+    stream.set_nodelay(true)?;
+    Ok(stream)
+}
+
+/// Accept `[::1]`-style bracketed IPv6 literals as well as bare ones so
+/// every FFI connect entry point takes the same host spellings. The
+/// stripped form is what `(host, port)` resolution and `known_hosts`
+/// lookups expect.
+fn strip_ipv6_brackets(host: &str) -> &str {
+    host.strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host)
+}
+
+/// Shared connect path for every FFI `pcssh_client_connect*` entry
+/// point: resolve `host:port`, try each address in turn, run the SSH
+/// handshake over the first TCP connection that succeeds.
+///
+/// Two security properties live here:
+///
+/// - **`timeout` bounds the whole connect.** The TCP connect uses
+///   [`TcpStream::connect_timeout`] and the socket's read/write timeouts
+///   are set *before* the stream is handed to [`Client::connect_via`],
+///   so the version exchange and KEX are bounded too. (Name resolution
+///   goes through the system resolver and is not bounded — see the
+///   header.)
+/// - **A non-I/O failure ends the attempt.** Only a TCP connect failure
+///   or an [`Error::Io`] during the handshake moves on to the next
+///   resolved address. A host-key rejection, KEX/protocol error, etc. is
+///   returned immediately so the client never talks to a second peer
+///   after refusing the first one (and the caller sees the real reason
+///   rather than a later address's `PCSSH_ERR_CONNECT`).
+///
+/// `make_cfg` is called once per address because [`Config`] is not
+/// `Clone` (the `KnownHosts` policy variant holds `Arc`s the caller can
+/// re-clone cheaply).
+///
+/// Returns the mapped C error code on failure.
+pub(crate) fn connect_bounded(
+    host: &str,
+    port: u16,
+    timeout: Option<Duration>,
+    mut make_cfg: impl FnMut() -> Config,
+) -> Result<Client, c_int> {
+    let host = strip_ipv6_brackets(host);
+    let addrs = match (host, port).to_socket_addrs() {
+        Ok(a) => a,
+        Err(_) => return Err(PCSSH_ERR_CONNECT),
+    };
+    for sa in addrs {
+        let stream = match tcp_connect(sa, timeout) {
+            Ok(s) => s,
+            // TCP-level failure (refused, unreachable, connect timeout):
+            // the next address is fair game.
+            Err(_) => continue,
+        };
+        match Client::connect_via(Box::new(stream), host, port, make_cfg()) {
+            Ok(c) => return Ok(c),
+            // The peer closed / reset / timed out mid-handshake. Keep
+            // the historical `PCSSH_ERR_CONNECT` mapping and try the
+            // next address.
+            Err(Error::Io(_)) => continue,
+            // Anything else (host key rejected, no common algorithm,
+            // protocol violation, ...) is final.
+            Err(e) => return Err(map_error(&e)),
+        }
+    }
+    Err(PCSSH_ERR_CONNECT)
+}
+
 /// Connect to `host:port` with an explicit host-key policy.
+///
+/// `timeout_ms > 0` bounds the TCP connect and every subsequent socket
+/// read/write (so the handshake cannot hang on a silent peer);
+/// `timeout_ms <= 0` means no timeout at all. Name resolution is not
+/// bounded. `host` may be a hostname, an IPv4 literal, or an IPv6
+/// literal with or without surrounding brackets (`::1` and `[::1]` are
+/// equivalent).
+///
+/// Resolution may yield several addresses; they are tried in order,
+/// moving on only after a TCP-level or I/O failure. A host-key
+/// rejection (or any other non-I/O error) on one address ends the
+/// attempt immediately and is reported as-is — see the private
+/// `connect_bounded` helper for the exact rule.
 ///
 /// `policy` is one of `PCSSH_HOSTKEY_POLICY_*`:
 ///
@@ -148,52 +256,28 @@ pub unsafe extern "C" fn pcssh_client_connect_ex(
                 _ => return PCSSH_ERR_INVALID_ARGUMENT,
             };
 
-            let addr = format!("{host_str}:{port}");
-            let addrs = match addr.to_socket_addrs() {
-                Ok(a) => a,
-                Err(_) => return PCSSH_ERR_CONNECT,
-            };
-
-            let timeout = if timeout_ms > 0 {
-                Some(Duration::from_millis(timeout_ms as u64))
-            } else {
-                None
-            };
-
-            let mut last_err: Option<Error> = None;
-            for sa in addrs {
-                // We have to rebuild the policy per loop iteration because
-                // `HostKeyPolicy` is not `Clone` (the `KnownHosts` variant
-                // holds an `Arc<Mutex<...>>` — but it's currently rejected
-                // above for the FFI path, so for `AcceptAny` / `AcceptFingerprint`
-                // we can just copy the bytes).
-                let policy_for_iter = match &host_key_policy {
+            let timeout = timeout_from_ms(timeout_ms);
+            // `Config` / `HostKeyPolicy` are not `Clone`; the two
+            // variants reachable here are trivially rebuilt per address.
+            let make_cfg = || Config {
+                host_key_policy: match &host_key_policy {
                     HostKeyPolicy::AcceptAny => HostKeyPolicy::AcceptAny,
                     HostKeyPolicy::AcceptFingerprint(fp) => HostKeyPolicy::AcceptFingerprint(*fp),
                     HostKeyPolicy::KnownHosts(_) => unreachable!("rejected above"),
-                };
-                let cfg = Config {
-                    host_key_policy: policy_for_iter,
-                    timeout,
-                    algorithms: Default::default(),
-                };
-                match Client::connect(sa, cfg) {
-                    Ok(c) => {
-                        let boxed = Box::new(PcSshClient {
-                            inner: SharedClient::from(c),
-                        });
-                        // SAFETY: `out` is non-NULL and writable per caller contract.
-                        unsafe { *out = Box::into_raw(boxed) };
-                        return PCSSH_OK;
-                    }
-                    Err(e) => last_err = Some(e),
+                },
+                timeout,
+                algorithms: Default::default(),
+            };
+            match connect_bounded(host_str, port, timeout, make_cfg) {
+                Ok(c) => {
+                    let boxed = Box::new(PcSshClient {
+                        inner: SharedClient::from(c),
+                    });
+                    // SAFETY: `out` is non-NULL and writable per caller contract.
+                    unsafe { *out = Box::into_raw(boxed) };
+                    PCSSH_OK
                 }
-            }
-
-            match last_err {
-                Some(Error::Io(_)) => PCSSH_ERR_CONNECT,
-                Some(e) => map_error(&e),
-                None => PCSSH_ERR_CONNECT,
+                Err(code) => code,
             }
         })
         .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
@@ -243,11 +327,12 @@ pub unsafe extern "C" fn pcssh_client_connect(
 
 /// Authenticate using a password.
 ///
-/// **Memory note** (Finding #8): the password bytes are borrowed from
-/// caller-owned storage; the FFI never makes a heap copy here so there
-/// is nothing for the library to zeroize. The caller is responsible for
-/// wiping the C-side buffer (e.g. with `explicit_bzero(3)`) once this
-/// call returns.
+/// **Memory note** (Finding #8): the FFI layer itself only borrows the
+/// caller's bytes, but the library copies them into a zeroize-on-drop
+/// `SecretString` (see [`ClientCredential::Password`]) for the duration
+/// of the auth exchange; that copy is wiped when the call returns. The
+/// caller remains responsible for wiping the C-side buffer (e.g. with
+/// `explicit_bzero(3)`) once this call returns.
 ///
 /// # Safety
 ///
@@ -289,6 +374,12 @@ pub unsafe extern "C" fn pcssh_client_auth_password(
 /// `passphrase` is optional; pass NULL for an unencrypted key. An empty
 /// string is treated the same as NULL.
 ///
+/// **Memory note**: the caller owns both the PEM buffer and the
+/// passphrase; neither is retained after this call returns. The library
+/// keeps its own copies in zeroize-on-drop storage while the key is
+/// being parsed and used, but the caller should wipe the C-side buffers
+/// themselves (e.g. `explicit_bzero(3)`) once the call returns.
+///
 /// # Safety
 ///
 /// - `client` must be a valid handle returned from `pcssh_client_connect`.
@@ -304,12 +395,13 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
     passphrase: *const c_char,
 ) -> c_int {
     catch(|| {
-        if client.is_null() || private_key_pem.is_null() {
+        if client.is_null() || private_key_pem.is_null() || !slice_len_ok(private_key_pem_len) {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
         with_cstr(user, |user_s| {
-            // SAFETY: caller guarantees at least `private_key_pem_len` readable bytes.
+            // SAFETY: caller guarantees at least `private_key_pem_len` readable
+            // bytes; the length was bounded to `isize::MAX` above.
             let pem_bytes =
                 unsafe { slice::from_raw_parts(private_key_pem as *const u8, private_key_pem_len) };
             let pem_str = match core::str::from_utf8(pem_bytes) {
@@ -370,6 +462,11 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
 /// caller can then resize and retry — though note that the command has
 /// already completed; the exec is not re-executed on retry.
 ///
+/// On any other error (`PCSSH_ERR_INVALID_ARGUMENT` aside, where the
+/// out-pointers may themselves be the invalid argument) the out-params
+/// are reset to `0` / `0` / `-1` before the command is attempted, so a
+/// caller that ignores the return code never reads stale values.
+///
 /// # Safety
 ///
 /// - `client` must be a valid handle.
@@ -401,6 +498,15 @@ pub unsafe extern "C" fn pcssh_client_exec(
         }
         if (stdout_buf.is_null() && stdout_cap != 0) || (stderr_buf.is_null() && stderr_cap != 0) {
             return PCSSH_ERR_INVALID_ARGUMENT;
+        }
+
+        // Reset the out-params up front so an early error leaves them in
+        // a defined state (empty output, "no exit status").
+        // SAFETY: out-pointers checked non-NULL above.
+        unsafe {
+            *stdout_out_len = 0;
+            *stderr_out_len = 0;
+            *exit_status_out = -1;
         }
 
         // SAFETY: caller contract.
@@ -503,6 +609,79 @@ mod tests {
         let rc = unsafe { pcssh_client_connect(ptr::null(), 22, 100, &mut out) };
         assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
         assert!(out.is_null());
+    }
+
+    #[test]
+    fn timeout_from_ms_nonpositive_means_none() {
+        assert_eq!(timeout_from_ms(0), None);
+        assert_eq!(timeout_from_ms(-1), None);
+        assert_eq!(timeout_from_ms(i32::MIN), None);
+        assert_eq!(timeout_from_ms(250), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn strip_ipv6_brackets_accepts_both_spellings() {
+        assert_eq!(strip_ipv6_brackets("[::1]"), "::1");
+        assert_eq!(strip_ipv6_brackets("::1"), "::1");
+        assert_eq!(strip_ipv6_brackets("example.com"), "example.com");
+        // Unbalanced brackets are left alone for the resolver to reject.
+        assert_eq!(strip_ipv6_brackets("[::1"), "[::1");
+        assert_eq!(strip_ipv6_brackets("::1]"), "::1]");
+    }
+
+    #[test]
+    fn connect_ex_bounds_tcp_connect_by_timeout() {
+        // A non-routable address (RFC 5737 TEST-NET-1) black-holes the
+        // SYN; without `connect_timeout` this would sit in the kernel's
+        // retry schedule for a minute or more. Firewalls that answer
+        // with RST make it fail even faster, which is fine too.
+        let host = CString::new("192.0.2.1").unwrap();
+        let mut out: *mut PcSshClient = ptr::null_mut();
+        let started = std::time::Instant::now();
+        // SAFETY: well-formed inputs.
+        let rc = unsafe {
+            pcssh_client_connect_ex(
+                host.as_ptr(),
+                22,
+                300,
+                PCSSH_HOSTKEY_POLICY_ACCEPT_ANY,
+                ptr::null(),
+                &mut out,
+            )
+        };
+        assert_eq!(rc, PCSSH_ERR_CONNECT);
+        assert!(out.is_null());
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "connect was not bounded by timeout_ms: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn connect_ex_accepts_bracketed_ipv6_literal() {
+        // Both spellings must reach the resolver as `::1`. Port 1 is
+        // closed (or IPv6 loopback is absent); either way the outcome is
+        // a plain PCSSH_ERR_CONNECT rather than a resolution failure —
+        // which is the same code, so assert on the shared path instead:
+        // neither spelling may be rejected as an invalid argument.
+        for spelling in ["[::1]", "::1"] {
+            let host = CString::new(spelling).unwrap();
+            let mut out: *mut PcSshClient = ptr::null_mut();
+            // SAFETY: well-formed inputs.
+            let rc = unsafe {
+                pcssh_client_connect_ex(
+                    host.as_ptr(),
+                    1,
+                    300,
+                    PCSSH_HOSTKEY_POLICY_ACCEPT_ANY,
+                    ptr::null(),
+                    &mut out,
+                )
+            };
+            assert_eq!(rc, PCSSH_ERR_CONNECT, "spelling {spelling}");
+            assert!(out.is_null());
+        }
     }
 
     #[test]

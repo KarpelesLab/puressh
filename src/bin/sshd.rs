@@ -3173,7 +3173,27 @@ mod imp {
         argv0_c: std::ffi::CString,
     }
 
+    /// The authenticated user's identity as resolved by the session-open
+    /// hook from the *real* passwd database, before any `ChrootDirectory`.
+    /// Fork's copy-on-write isolates it per connection. Once set,
+    /// [`lookup_user`] answers for that name from here, so a jail without an
+    /// `/etc/passwd` still works and a jail *with* a writable one cannot
+    /// feed the daemon a different uid/home/shell.
+    static SESSION_USER: Mutex<Option<UserInfo>> = Mutex::new(None);
+
+    fn remember_session_user(info: &UserInfo) {
+        if let Ok(mut g) = SESSION_USER.lock() {
+            *g = Some(info.clone());
+        }
+    }
+
     fn lookup_user(name: &str) -> puressh::Result<UserInfo> {
+        if let Ok(g) = SESSION_USER.lock()
+            && let Some(info) = g.as_ref()
+            && info.name == name
+        {
+            return Ok(info.clone());
+        }
         let user = nix::unistd::User::from_name(name)
             .map_err(nix_io)?
             .ok_or_else(|| {
@@ -3799,13 +3819,14 @@ mod imp {
         Ok(())
     }
 
-    /// Resolve, validate, and `chroot()` into `template` for `user`, then
-    /// `chdir("/")` inside the new root. Must run **while still root**, before
-    /// any `setuid` — `chroot(2)` requires `CAP_SYS_CHROOT`. Called from
+    /// Resolve, validate, and `chroot()` into `template` for the user `info`
+    /// (already looked up from the real passwd database), then `chdir("/")`
+    /// inside the new root. Must run **while still root**, before any
+    /// `setuid` — `chroot(2)` requires `CAP_SYS_CHROOT`. Called from
     /// `Config::on_session_open` ahead of [`drop_to_user`].
-    fn apply_chroot(user: &str, template: &str, debug: bool) -> puressh::Result<()> {
-        let info = lookup_user(user)?;
-        let resolved = expand_pct_tokens(template, &info).map_err(|e| {
+    fn apply_chroot(info: &UserInfo, template: &str, debug: bool) -> puressh::Result<()> {
+        let user = info.name.as_str();
+        let resolved = expand_pct_tokens(template, info).map_err(|e| {
             puressh::Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
         validate_chroot_dir(&resolved).map_err(|e| {
@@ -3819,13 +3840,22 @@ mod imp {
         Ok(())
     }
 
-    /// Drop the calling process to `user`'s primary uid/gid (with supplementary
-    /// groups via `initgroups`). Idempotent — if we already match `info`'s
-    /// ids, the function is a no-op. Called from `Config::on_session_open`
-    /// once per connection, after PAM session-open succeeded.
-    fn drop_to_user(user: &str, debug: bool) -> puressh::Result<()> {
-        let info = lookup_user(user)?;
-        if already_matches(&info) {
+    /// Drop the calling process to `info`'s uid/gid with the supplementary
+    /// group list `gids` — both resolved by the caller from the **real**
+    /// passwd/group databases *before* any `ChrootDirectory` was applied.
+    /// Nothing here consults `/etc/passwd` or `/etc/group` (which, inside
+    /// the jail, may be missing or attacker-writable): the ids are installed
+    /// with `setgroups(2)` on the pre-resolved list, never `initgroups(3)`.
+    /// Idempotent — if we already match `info`'s ids, the function is a
+    /// no-op. Called from `Config::on_session_open` once per connection,
+    /// after PAM session-open succeeded.
+    fn drop_to_user(
+        info: &UserInfo,
+        gids: &[nix::unistd::Gid],
+        debug: bool,
+    ) -> puressh::Result<()> {
+        let user = info.name.as_str();
+        if already_matches(info) {
             if debug {
                 eprintln!(
                     "sshd: connection already running as {user} (uid={})",
@@ -3834,24 +3864,35 @@ mod imp {
             }
             return Ok(());
         }
-        // setgroups([]) → setgid → initgroups → setuid. Clearing
-        // supplementary groups *before* initgroups guarantees the post-drop
-        // process starts from an empty list (a misconfigured /etc/group
-        // could leave initgroups a no-op that retains daemon groups).
+        // setgroups([]) → setgid → setgroups(list) → setuid. Clearing first
+        // guarantees the post-drop process starts from an empty list even
+        // if installing the resolved list somehow retained daemon groups.
         // setuid is the point of no return; we verify the result
         // afterwards to catch any silent capability/policy failure.
         setgroups_clear().map_err(nix_io)?;
         nix::unistd::setgid(info.gid).map_err(nix_io)?;
-        initgroups_libc(&info.name_c, info.gid).map_err(nix_io)?;
+        setgroups_list(gids).map_err(nix_io)?;
         nix::unistd::setuid(info.uid).map_err(nix_io)?;
         verify_post_setuid(info.uid, info.gid).map_err(nix_io)?;
         if debug {
             eprintln!(
-                "sshd: dropped connection to {user} (uid={} gid={})",
-                info.uid, info.gid
+                "sshd: dropped connection to {user} (uid={} gid={} groups={})",
+                info.uid,
+                info.gid,
+                gids.len()
             );
         }
         Ok(())
+    }
+
+    /// Install `gids` as the supplementary group list (`setgroups(2)`), via
+    /// libc for the same portability reasons as [`setgroups_clear`].
+    fn setgroups_list(gids: &[nix::unistd::Gid]) -> nix::Result<()> {
+        let raw: Vec<libc::gid_t> = gids.iter().map(|g| g.as_raw()).collect();
+        // SAFETY: `raw` is a live, correctly-sized array of gid_t for the
+        // duration of the call; the count argument matches its length.
+        let rc = unsafe { libc::setgroups(raw.len() as _, raw.as_ptr()) };
+        if rc == 0 { Ok(()) } else { Err(Errno::last()) }
     }
 
     /// Empty the process environment in the post-fork child, before the
@@ -4915,7 +4956,18 @@ mod imp {
             // startup) so it reflects the current database and the `Match`
             // blocks that apply to this connection.
             let permit_root_login = conn_permit_root_login(&hook_policy, user);
-            if resolves_to_root(user) && !permit_root_login.permits_publickey() {
+            // Resolve the identity we will drop to — uid, gid, supplementary
+            // groups — from the REAL passwd/group databases now, before any
+            // ChrootDirectory is entered. Everything below uses this resolved
+            // value; nothing re-reads `<jail>/etc/passwd` or `<jail>/etc/group`
+            // (a jail without them would fail closed, and a jail whose /etc is
+            // writable by the user could otherwise map the login to uid 0 and
+            // skip the drop entirely). The value is also cached so later
+            // per-handler lookups (shell, home) inside the jail see it.
+            let info = lookup_user(user)?;
+            let gids = group_gids(&info.name, info.gid);
+            let is_root = user == "root" || resolves_to_root(user) || info.uid.is_root();
+            if is_root && !permit_root_login.permits_publickey() {
                 if debug {
                     eprintln!(
                         "sshd: refusing session for root user {user}: PermitRootLogin forbids it"
@@ -4926,6 +4978,7 @@ mod imp {
                     "root login not permitted",
                 )));
             }
+            remember_session_user(&info);
             // Stash the resolved PrintMotd for this connection so the PTY shell
             // handler (which runs later, in a COW-isolated forked child) can
             // read it. Default-off; only printed when PrintMotd=yes — which
@@ -4941,9 +4994,9 @@ mod imp {
             // The path is validated StrictModes-style (root-owned, not
             // group/world-writable) before the chroot.
             if let Some(dir) = ctx.chroot_directory {
-                apply_chroot(user, dir, debug)?;
+                apply_chroot(&info, dir, debug)?;
             }
-            drop_to_user(user, debug)
+            drop_to_user(&info, &gids, debug)
         });
 
         // Plumb finding-#1 (env allowlist) and finding-#2 (pre-auth
@@ -5689,6 +5742,25 @@ mod imp {
         }
 
         #[test]
+        fn session_user_cache_answers_lookup_without_passwd() {
+            // Once the session-open hook has resolved the identity, a lookup
+            // for that name is served from the cache (as it would be inside a
+            // jail with no /etc/passwd), and other names still hit the
+            // database.
+            let mut info = lookup_user_for_test();
+            info.name = "puressh-cached-user-xyzzy".to_string();
+            info.home_str = "/cached-home".to_string();
+            remember_session_user(&info);
+            let got = lookup_user("puressh-cached-user-xyzzy").expect("served from cache");
+            assert_eq!(got.home_str, "/cached-home");
+            assert_eq!(got.uid, info.uid);
+            assert!(lookup_user("\u{0}no-such-user-xyzzy").is_err());
+            if let Ok(mut g) = SESSION_USER.lock() {
+                *g = None;
+            }
+        }
+
+        #[test]
         fn chroot_validation_rejects_non_root_owned() {
             // A temp dir created by the (non-root) test process is owned by the
             // test user, not root ⇒ the StrictModes-style check must refuse it.
@@ -5761,7 +5833,8 @@ mod imp {
             // SAFETY: single-threaded test child; only does fs reads + _exit.
             match unsafe { fork() }.expect("fork") {
                 ForkResult::Child => {
-                    let ok = apply_chroot("root", jail.to_str().unwrap(), false).is_ok()
+                    let root = lookup_user("root").expect("root passwd entry");
+                    let ok = apply_chroot(&root, jail.to_str().unwrap(), false).is_ok()
                         && std::fs::read("/marker")
                             .map(|b| b == b"inside")
                             .unwrap_or(false)

@@ -19,6 +19,47 @@
 extern "C" {
 #endif
 
+/* ----- Attributes -------------------------------------------------------- */
+
+/* PCSSH_DEPRECATED(msg): tags a prototype so callers get a compile-time
+ * warning (with `msg`) when they use it. Expands to nothing on compilers
+ * we don't recognise. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define PCSSH_DEPRECATED(msg) __attribute__((deprecated(msg)))
+#elif defined(_MSC_VER)
+#  define PCSSH_DEPRECATED(msg) __declspec(deprecated(msg))
+#else
+#  define PCSSH_DEPRECATED(msg)
+#endif
+
+/* ----- Threading and lifetime contract ---------------------------------- *
+ *
+ * PcSshClient, PcSshSftp, PcSshKnownHosts and PcSshAgent are safe to share
+ * across threads: every call on them takes an internal mutex for the
+ * duration of that one call, so concurrent callers serialise. A mutex
+ * poisoned by a panic on another thread surfaces as PCSSH_ERR_GENERIC.
+ *
+ * PcSshSftpFile / PcSshSftpDir carry per-handle state (cursor, readdir
+ * position) with no lock of their own — never use one of them from two
+ * threads at once.
+ *
+ * Every handle is freed with its own pcssh_*_free; freeing NULL is a
+ * no-op. Parent/child order is NOT enforced, and getting it "wrong" is
+ * memory-safe:
+ *   - pcssh_sftp_free while file/dir handles are live: those children
+ *     return PCSSH_ERR_INVALID_HANDLE from then on (and still need their
+ *     own _free).
+ *   - pcssh_client_free while PcSshSftp handles are live: each SFTP
+ *     session keeps its own reference to the connection, so the
+ *     connection stays open until the last PcSshSftp is freed.
+ * A handle must never be used after its own _free (that is a plain
+ * use-after-free, not something the library can detect).
+ *
+ * Buffers passed in by the caller are only borrowed for the duration of
+ * the call; (ptr, len) pairs with len > PTRDIFF_MAX are rejected with
+ * PCSSH_ERR_INVALID_ARGUMENT before any dereference.
+ */
+
 /* ----- Error codes ------------------------------------------------------- */
 
 #define PCSSH_OK                      0
@@ -57,16 +98,41 @@ typedef struct PcSshClient PcSshClient;
 /* ----- API --------------------------------------------------------------- */
 
 /*
+ * Common connect semantics (pcssh_client_connect_ex and
+ * pcssh_client_connect_known_hosts):
+ *
+ * `host`        hostname, IPv4 literal, or IPv6 literal with or without
+ *               brackets ("::1" and "[::1]" are equivalent).
+ * `timeout_ms`  > 0: bounds the TCP connect and every subsequent socket
+ *               read/write (so the handshake cannot hang on a silent
+ *               peer). <= 0: NO timeout at all. Name resolution goes
+ *               through the system resolver and is not bounded.
+ *
+ * When the name resolves to several addresses they are tried in order.
+ * Only a TCP-level failure or an I/O error during the handshake moves on
+ * to the next address (reported as PCSSH_ERR_CONNECT if none succeed).
+ * Any other failure — a host-key rejection above all — ends the attempt
+ * immediately and is reported as-is, so the client never talks to a
+ * second peer after refusing the first one.
+ */
+
+/*
  * DEPRECATED.  Connect to `host:port` with the AcceptAny host-key policy.
  *
  * Insecure: the client trusts whatever key the server presents. Prefer
  * pcssh_client_connect_ex (explicit policy enum) or
- * pcssh_client_connect_known_hosts (real TOFU/known_hosts verifier).
+ * pcssh_client_connect_known_hosts (real TOFU/known_hosts verifier). If
+ * you really want no verification, say so explicitly:
+ *   pcssh_client_connect_ex(host, port, timeout_ms,
+ *                           PCSSH_HOSTKEY_POLICY_ACCEPT_ANY, NULL, &out);
  *
  * Kept as a thin shim so existing C callers continue to link.
  *
  * Returns PCSSH_OK on success, a negative PCSSH_ERR_* otherwise.
  */
+PCSSH_DEPRECATED("accepts any host key; use pcssh_client_connect_ex with an "
+                 "explicit PCSSH_HOSTKEY_POLICY_* or "
+                 "pcssh_client_connect_known_hosts")
 int pcssh_client_connect(
     const char *host,
     uint16_t port,
@@ -76,7 +142,8 @@ int pcssh_client_connect(
 
 /*
  * Connect to `host:port` and complete version-exchange + KEX with an
- * explicit host-key policy.
+ * explicit host-key policy. See "Common connect semantics" above for
+ * `host` / `timeout_ms` / multi-address behaviour.
  *
  * `policy`           one of PCSSH_HOSTKEY_POLICY_*.
  * `fingerprint_b64`  used only when policy == ACCEPT_FINGERPRINT; a NUL-
@@ -102,9 +169,11 @@ int pcssh_client_connect_ex(
 /*
  * Authenticate using a password. Returns PCSSH_OK on success.
  *
- * NOTE: the password bytes are borrowed from caller-owned storage; the
- * FFI does not heap-copy them, so the caller is responsible for wiping
- * (e.g. explicit_bzero) the buffer once this call returns.
+ * NOTE: the password is borrowed from caller-owned storage for the
+ * duration of the call. The library copies it into zeroize-on-drop
+ * storage while the auth exchange runs and wipes that copy before
+ * returning; the caller is responsible for wiping (e.g. explicit_bzero)
+ * their own buffer once this call returns.
  */
 int pcssh_client_auth_password(
     PcSshClient *client,
@@ -118,6 +187,10 @@ int pcssh_client_auth_password(
  * `private_key_pem`     pointer to PEM text (UTF-8, NOT scanned for NUL).
  * `private_key_pem_len` number of bytes at `private_key_pem`.
  * `passphrase`          NULL or empty string for unencrypted keys.
+ *
+ * The caller owns the PEM buffer and the passphrase; neither is retained
+ * after the call returns (the library's own working copies are
+ * zeroize-on-drop). Wipe both C-side buffers once this call returns.
  *
  * Returns PCSSH_OK on success.
  */
@@ -134,8 +207,14 @@ int pcssh_client_auth_publickey(
  * function writes captured output and (POSIX) exit status.
  *
  * On PCSSH_ERR_BUFFER_TOO_SMALL, *stdout_out_len / *stderr_out_len are set
- * to the required sizes. `*exit_status_out` is -1 when the server did not
- * report an exit code (e.g. signal termination).
+ * to the required sizes. Note the command has already run by then: calling
+ * again with bigger buffers executes it a second time; the output is not
+ * cached. `*exit_status_out` is -1 when the server did
+ * not report an exit code (e.g. signal termination).
+ *
+ * On any other error the out-params hold 0 / 0 / -1 — except
+ * PCSSH_ERR_INVALID_ARGUMENT when an out-pointer itself is NULL, in which
+ * case nothing is written.
  *
  * Returns PCSSH_OK on success.
  */
@@ -195,12 +274,19 @@ typedef struct PcSshSftpAttrs {
  * Multi-handle concurrency contract:
  *   - One PcSshClient supports any combination of SFTP / shell / exec /
  *     forward channels open simultaneously (SharedClient layer).
- *   - PcSshSftp / PcSshSftpFile / PcSshSftpDir each hold a back-pointer
- *     to their parent; the caller MUST NOT free a parent while any
- *     child handle is live.
- *   - Per-handle state (file cursor, dir read position) is NOT
- *     thread-safe — do not share one file/dir handle across threads.
+ *   - PcSshSftp handles may be shared across threads (calls serialise on
+ *     the connection). Per-handle state on PcSshSftpFile / PcSshSftpDir
+ *     (file cursor, dir read position) is NOT thread-safe — do not share
+ *     one file/dir handle across threads.
+ *   - Free order between parent and children is not enforced; see the
+ *     "Threading and lifetime contract" block near the top of this file.
  */
+
+/* Largest payload moved by a single SFTP wire request (256 KiB minus 1 KiB
+ * of framing headroom, matching OpenSSH's SFTP_MAX_READ_LENGTH). One
+ * pcssh_sftp_read call returns at most this many bytes; pcssh_sftp_write
+ * splits larger buffers into requests of this size. */
+#define PCSSH_SFTP_MAX_IO    261120u
 
 /* Lifecycle. */
 int  pcssh_sftp_open(PcSshClient *client, PcSshSftp **out_sftp);
@@ -210,8 +296,21 @@ void pcssh_sftp_free(PcSshSftp *sftp);
 int  pcssh_sftp_open_file(PcSshSftp *sftp, const char *path,
                           uint32_t flags, uint32_t mode,
                           PcSshSftpFile **out_file);
+/*
+ * Read up to `cap` bytes at the cursor; *out_len is the count actually
+ * read (0 at EOF). A single call issues one wire request and so returns
+ * at most PCSSH_SFTP_MAX_IO bytes even when `cap` is larger — loop until
+ * *out_len == 0.
+ */
 int  pcssh_sftp_read(PcSshSftpFile *file,
                      uint8_t *buf, size_t cap, size_t *out_len);
+/*
+ * Write `len` bytes at the cursor. On PCSSH_OK the whole buffer has been
+ * acknowledged and the cursor advanced by `len`. Buffers larger than
+ * PCSSH_SFTP_MAX_IO are sent as several requests; if a later one fails
+ * the error is returned and the cursor has advanced only past the
+ * acknowledged prefix (pcssh_sftp_tell reports how much landed).
+ */
 int  pcssh_sftp_write(PcSshSftpFile *file,
                       const uint8_t *buf, size_t len);
 int  pcssh_sftp_seek(PcSshSftpFile *file, uint64_t offset);
@@ -225,6 +324,11 @@ int  pcssh_sftp_opendir(PcSshSftp *sftp, const char *path,
 /*
  * Read one directory entry. EOF is signalled by PCSSH_OK with
  * *name_len == 0 and out_attrs->flags == 0.
+ *
+ * Two-pass friendly: *name_len and *longname_len are always written with
+ * the required sizes before any capacity check, so a call with NULL
+ * buffers / zero caps returns PCSSH_ERR_BUFFER_TOO_SMALL with both sizes
+ * filled in and the entry still pending for the retry.
  */
 int  pcssh_sftp_readdir(PcSshSftpDir *dir,
                         uint8_t *name_buf,     size_t name_cap,     size_t *name_len,
@@ -328,6 +432,18 @@ typedef struct PcSshKnownHosts PcSshKnownHosts;
  * the store and on_unknown == PCSSH_TOFU_PROMPT. Return 1 to accept the
  * key (caller is responsible for showing the fingerprint to the user),
  * 0 to refuse.
+ *
+ * Contract:
+ *   - Runs synchronously on the thread that called
+ *     pcssh_client_connect_known_hosts, in the middle of the handshake;
+ *     the connect blocks until it returns.
+ *   - `host`, `algorithm` and `key_blob` point into library-owned storage
+ *     that is valid ONLY for the duration of the callback — copy anything
+ *     you need to keep.
+ *   - The store is not locked while the callback runs, so calling
+ *     pcssh_known_hosts_* on the same PcSshKnownHosts handle from inside
+ *     the callback is allowed.
+ *   - `ctx` is the `prompt_ctx` given to the connect, passed through.
  */
 typedef int (*PcSshTofuPromptCb)(
     void *ctx,
@@ -363,7 +479,8 @@ void pcssh_known_hosts_free(PcSshKnownHosts *kh);
 /*
  * Connect with a known_hosts-backed host-key policy. On an unknown host
  * the policy follows on_unknown (REJECT / ACCEPT / PROMPT). Mismatch is
- * always a hard reject.
+ * always a hard reject. `host` / `timeout_ms` / multi-address behaviour
+ * are as described under "Common connect semantics" above.
  *
  * save_path (if non-NULL) is the file the store is persisted back to on
  * a successful TOFU accept. hash_new != 0 stores newly added entries

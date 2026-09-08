@@ -2,7 +2,8 @@
  * ffi_smoke.c — link-and-invariants smoke test for libpuressh.
  *
  * 1. pcssh_version() returns a non-NULL string.
- * 2. pcssh_client_connect to 127.0.0.1:1 fails (negative return, NULL handle).
+ * 2. pcssh_client_connect_ex to 127.0.0.1:1 fails (negative return, NULL
+ *    handle).
  * 3. pcssh_client_free(NULL) does not crash.
  * 4. pcssh_error_message(PCSSH_OK) is non-NULL.
  * 5. pcssh_error_message(unknown) is NULL.
@@ -38,10 +39,18 @@ int main(void) {
         EXPECT(strlen(ver) > 0, "pcssh_version returned empty string");
     }
 
-    /* 2. connect to a port that should refuse */
+    /* 2. connect to a port that should refuse.
+     *
+     * PCSSH_HOSTKEY_POLICY_ACCEPT_ANY is deliberate here: this smoke test
+     * only ever targets loopback (a closed port, or a throwaway local test
+     * server), where there is no host identity worth verifying. Real
+     * callers should pass ACCEPT_FINGERPRINT or use
+     * pcssh_client_connect_known_hosts. The old pcssh_client_connect shim
+     * is deprecated precisely because it hid this choice. */
     PcSshClient *c = (PcSshClient *)0xDEADBEEF;
-    int rc = pcssh_client_connect("127.0.0.1", 1, 1000, &c);
-    EXPECT(rc < 0, "pcssh_client_connect to 127.0.0.1:1 should have failed");
+    int rc = pcssh_client_connect_ex("127.0.0.1", 1, 1000,
+                                     PCSSH_HOSTKEY_POLICY_ACCEPT_ANY, NULL, &c);
+    EXPECT(rc < 0, "pcssh_client_connect_ex to 127.0.0.1:1 should have failed");
     EXPECT(c == NULL, "client pointer should be NULL on connect failure");
     if (rc < 0) {
         const char *msg = pcssh_error_message(rc);
@@ -93,9 +102,33 @@ int main(void) {
            "pcssh_error_message(unknown negative) should be NULL");
 
     /* Invalid-argument smoke: NULL out pointer to connect. */
-    rc = pcssh_client_connect("127.0.0.1", 22, 100, NULL);
+    rc = pcssh_client_connect_ex("127.0.0.1", 22, 100,
+                                 PCSSH_HOSTKEY_POLICY_ACCEPT_ANY, NULL, NULL);
     EXPECT(rc == PCSSH_ERR_INVALID_ARGUMENT,
-           "connect with NULL out should be PCSSH_ERR_INVALID_ARGUMENT");
+           "connect_ex with NULL out should be PCSSH_ERR_INVALID_ARGUMENT");
+
+    /* Bracketed and bare IPv6 loopback literals are both accepted (and
+     * both fail the same way against a closed port). */
+    PcSshClient *c6 = (PcSshClient *)0xDEADBEEF;
+    rc = pcssh_client_connect_ex("[::1]", 1, 300,
+                                 PCSSH_HOSTKEY_POLICY_ACCEPT_ANY, NULL, &c6);
+    EXPECT(rc == PCSSH_ERR_CONNECT,
+           "connect_ex to [::1]:1 should fail with PCSSH_ERR_CONNECT");
+    EXPECT(c6 == NULL, "client pointer should be NULL on connect failure");
+    c6 = (PcSshClient *)0xDEADBEEF;
+    rc = pcssh_client_connect_ex("::1", 1, 300,
+                                 PCSSH_HOSTKEY_POLICY_ACCEPT_ANY, NULL, &c6);
+    EXPECT(rc == PCSSH_ERR_CONNECT,
+           "connect_ex to ::1 port 1 should fail with PCSSH_ERR_CONNECT");
+    EXPECT(c6 == NULL, "client pointer should be NULL on connect failure");
+
+    /* Oversized (ptr, len) pairs are rejected before any dereference. */
+    PcSshKnownHosts *kh = (PcSshKnownHosts *)0xDEADBEEF;
+    uint8_t one_byte = 0;
+    rc = pcssh_known_hosts_from_bytes(&one_byte, SIZE_MAX, &kh);
+    EXPECT(rc == PCSSH_ERR_INVALID_ARGUMENT,
+           "known_hosts_from_bytes with len=SIZE_MAX should be PCSSH_ERR_INVALID_ARGUMENT");
+    EXPECT(kh == NULL, "known_hosts pointer should be NULL on rejection");
 
     /* connect_ex: unknown policy id is rejected. */
     PcSshClient *c2 = (PcSshClient *)0xDEADBEEF;

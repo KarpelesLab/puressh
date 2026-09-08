@@ -2925,7 +2925,10 @@ fn run_forwarding(
         {
             use puressh::forwarding::agent::splice_to_local_agent_callback;
             let cb = splice_to_local_agent_callback().ok_or_else(|| {
-                "-A: $SSH_AUTH_SOCK is unset or names a socket that doesn't exist".to_string()
+                "-A: $SSH_AUTH_SOCK is unset, or names a socket that failed validation \
+                 (must exist, be a socket, not a symlink, owned by you, mode 0?00); \
+                 refusing to forward the agent"
+                    .to_string()
             })?;
             handlers = handlers.with_auth_agent(cb);
             let id = client

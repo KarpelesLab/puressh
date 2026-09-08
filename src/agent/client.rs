@@ -203,8 +203,10 @@ impl Agent {
 
 /// Validate a candidate `SSH_AUTH_SOCK` path. See [`Agent::connect_env`]
 /// for the security rationale. Returns the human-readable reason on
-/// failure so callers can log it.
-fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
+/// failure so callers can log it. Crate-visible so agent *forwarding*
+/// (`forwarding::agent`) applies the same trust check before splicing a
+/// remote `auth-agent@openssh.com` channel into the local agent.
+pub(crate) fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
     // `symlink_metadata` does not follow symlinks; combined with the
     // `is_symlink()` check this means a symlink anywhere in the *final*
     // component is rejected outright. We intentionally do NOT canonicalize

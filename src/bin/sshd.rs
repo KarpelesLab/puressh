@@ -1221,6 +1221,45 @@ mod imp {
             .collect())
     }
 
+    /// Longest peer-controlled string echoed into a log line.
+    const LOG_FIELD_MAX: usize = 128;
+
+    /// Make a peer-controlled string safe to print in a log line: every
+    /// control byte (`< 0x20` and `0x7f`) becomes `?` so a client cannot forge
+    /// log lines / move the terminal cursor with embedded `\n`, `\r`, or
+    /// escape sequences, and the result is truncated to [`LOG_FIELD_MAX`]
+    /// characters (with a `…` marker) so a multi-kilobyte username cannot
+    /// flood the log.
+    fn sanitize_log(s: &str) -> String {
+        let mut out = String::with_capacity(s.len().min(LOG_FIELD_MAX + 1));
+        for (i, c) in s.chars().enumerate() {
+            if i >= LOG_FIELD_MAX {
+                out.push('…');
+                break;
+            }
+            if c.is_control() {
+                out.push('?');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// Longest username accepted on the wire, in bytes. POSIX login names are
+    /// far shorter (`LOGIN_NAME_MAX` is 256 on Linux including the NUL); a
+    /// longer one cannot name a real account and is refused up front.
+    const USERNAME_MAX: usize = 255;
+
+    /// Whether a username received in a USERAUTH_REQUEST is acceptable at all:
+    /// non-empty, at most [`USERNAME_MAX`] bytes, and free of control
+    /// characters (which could never be a passwd name and would otherwise be
+    /// echoed into log lines). Rejected names never reach access control, the
+    /// passwd lookup, or the debug logs unsanitised.
+    fn valid_username(user: &str) -> bool {
+        !user.is_empty() && user.len() <= USERNAME_MAX && !user.chars().any(|c| c.is_control())
+    }
+
     /// Decode an SSH `string` (4-byte BE length + bytes) into UTF-8. Used for
     /// the inner payload of certificate critical options (`force-command`,
     /// `source-address`), which are themselves length-prefixed strings.
@@ -1703,7 +1742,20 @@ mod imp {
         /// Bind / verify the connection username. Returns `false` if the client
         /// switched usernames mid-userauth (OpenSSH rejects this). The first
         /// call binds; subsequent calls must match.
+        ///
+        /// A syntactically invalid username (see [`valid_username`]) never
+        /// binds and always returns `false`, so no later step logs or resolves
+        /// it.
         fn check_user_binding(&mut self, user: &str) -> bool {
+            if !valid_username(user) {
+                if self.debug {
+                    eprintln!(
+                        "sshd: auth: refusing invalid username {:?}",
+                        sanitize_log(user)
+                    );
+                }
+                return false;
+            }
             match &self.bound_user {
                 None => {
                     self.bound_user = Some(user.to_string());
@@ -1958,7 +2010,7 @@ mod imp {
             match attempt {
                 AuthAttempt::None { user } => {
                     if self.debug {
-                        eprintln!("sshd: auth none rejected for user {user}");
+                        eprintln!("sshd: auth none rejected for user {}", sanitize_log(&user));
                     }
                     AuthDecision::Reject
                 }
@@ -1970,14 +2022,27 @@ mod imp {
                     cert,
                     ..
                 } => {
-                    // Always run *both* checks unconditionally so an
+                    // An invalid username, or a username switched
+                    // mid-userauth, is refused before anything else. Both
+                    // verdicts depend only on the client's own input (never on
+                    // whether an account exists), so the early return leaks
+                    // nothing. Every `{user}` logged below has passed this
+                    // check and is therefore free of control characters.
+                    if !self.check_user_binding(&user) {
+                        if self.debug {
+                            eprintln!(
+                                "sshd: auth publickey: username rejected or changed mid-userauth"
+                            );
+                        }
+                        return AuthDecision::Reject;
+                    }
+                    // Always run *both* remaining checks unconditionally so an
                     // attacker can't distinguish "unknown user" from
                     // "known user / wrong key" via wall-clock timing.
                     // The access check (DenyUsers/AllowUsers/DenyGroups/
                     // AllowGroups, with a memoized group lookup) and the
                     // linear scan over authorized_blobs both run for every
                     // attempt so the paths stay uniform.
-                    let user_bound = self.check_user_binding(&user);
                     let user_ok = self.access_allowed(&user);
                     // For a certificate, "blob_ok" becomes: the CA is trusted,
                     // the login user is an authorized principal, and any
@@ -2023,7 +2088,7 @@ mod imp {
                     // user-enumeration timing signal.
                     let is_root = self.is_root(&user);
                     let root_denied = is_root && !self.permit_root_login.permits_publickey();
-                    let allow = user_bound && user_ok && blob_ok && !root_denied;
+                    let allow = user_ok && blob_ok && !root_denied;
 
                     // probe_only attempts (no signature) only need
                     // user+blob to be acceptable so the client knows it
@@ -2185,9 +2250,9 @@ mod imp {
         fn on_user_resolved(&mut self, user: &str, methods: &[String]) {
             // Bind the username on first sight (the publickey/password arms also
             // bind, but this fires first via the server's re-resolve hook).
-            let _ = self.check_user_binding(user);
+            let bound = self.check_user_binding(user);
             self.chains = parse_auth_method_chains(methods);
-            if self.debug && !self.chains.is_empty() {
+            if self.debug && bound && !self.chains.is_empty() {
                 eprintln!(
                     "sshd: auth: multi-factor chains for {user}: {:?}",
                     self.chains
@@ -2319,7 +2384,7 @@ mod imp {
             // force-command path lives here.
             if self.debug {
                 if self.debug_commands {
-                    eprintln!("sshd: exec by {user}: {command}");
+                    eprintln!("sshd: exec by {user}: {}", sanitize_log(command));
                 } else {
                     // Log only the first token (the program name) plus an
                     // argument count, so operators can see *what* ran
@@ -2328,7 +2393,10 @@ mod imp {
                     // codepoint and don't allocate a Vec to count args.
                     let name = command.split_whitespace().next().unwrap_or("");
                     let extra = command.split_whitespace().skip(1).count();
-                    eprintln!("sshd: exec by {user}: {name} (+{extra} args, redacted)");
+                    eprintln!(
+                        "sshd: exec by {user}: {} (+{extra} args, redacted)",
+                        sanitize_log(name)
+                    );
                 }
             }
 
@@ -2962,7 +3030,10 @@ mod imp {
         ) -> puressh::Result<()> {
             if name != "sftp" {
                 if self.debug {
-                    eprintln!("sshd: refusing unknown subsystem '{name}' for {user}");
+                    eprintln!(
+                        "sshd: refusing unknown subsystem '{}' for {user}",
+                        sanitize_log(name)
+                    );
                 }
                 return Ok(()); // dropping `stream` sends EOF + Close
             }
@@ -4663,6 +4734,37 @@ mod imp {
                 parse_peer_ip("[2001:db8::1]:22"),
                 Some("2001:db8::1".parse().unwrap())
             );
+        }
+
+        #[test]
+        fn sanitize_log_strips_control_chars_and_truncates() {
+            assert_eq!(sanitize_log("alice"), "alice");
+            assert_eq!(sanitize_log("a\nb\rc\x1b[2Jd\x7f"), "a?b?c?[2Jd?");
+            let long = "x".repeat(LOG_FIELD_MAX + 10);
+            let out = sanitize_log(&long);
+            assert_eq!(out.chars().count(), LOG_FIELD_MAX + 1);
+            assert!(out.ends_with('…'));
+        }
+
+        #[test]
+        fn invalid_usernames_never_bind() {
+            assert!(valid_username("alice"));
+            assert!(!valid_username(""));
+            assert!(!valid_username("ali\nce"));
+            assert!(!valid_username(&"a".repeat(USERNAME_MAX + 1)));
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            assert!(!a.check_user_binding("eve\x1b[2J"));
+            assert!(a.bound_user.is_none(), "an invalid name must not bind");
+            // A publickey attempt with such a name is refused outright.
+            let decision = a.evaluate(AuthAttempt::PublicKey {
+                user: "eve\r\nforged: line".into(),
+                algorithm: "ssh-ed25519".into(),
+                public_blob: vec![1, 2, 3],
+                probe_only: true,
+                verified: false,
+                cert: None,
+            });
+            assert!(matches!(decision, AuthDecision::Reject));
         }
 
         #[test]

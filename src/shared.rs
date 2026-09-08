@@ -838,6 +838,14 @@ fn notifier_for(g: &mut Inner, channel: u32) -> Arc<Condvar> {
 /// the under-lock open helpers both go through this so the CV
 /// notification can't be forgotten on one path and not the other.
 fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
+    // Peer-initiated opens (we accept none on a SharedClient) and global
+    // requests that want a reply (sshd keepalives) are answered here, on
+    // the pump path, so no consumer thread has to know about them. Best
+    // effort: a write failure surfaces on the next pump / write anyway.
+    if let Ok(Some(p)) = crate::client::unsolicited_reply(&mut g.client.conn, &ev) {
+        let _ = g.client.write_payload(&p);
+        return;
+    }
     let target = match &ev {
         ChannelEvent::Data { channel, .. }
         | ChannelEvent::ExtendedData { channel, .. }
@@ -861,6 +869,13 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
 /// dropped (we don't currently expose a global event API on the shared
 /// client).
 ///
+/// Only channels with a **registered** mailbox (created by the open
+/// helpers, removed when the owning [`OwnedChannelStream`] drops) are
+/// filed into. Late data / EOF / Close for a channel whose stream is
+/// already gone is dropped on the floor: re-creating the mailbox here
+/// would leave a queue nobody drains or reaps, which a peer could keep
+/// feeding until the channel's window ran dry — for every closed channel.
+///
 /// Pure routing — does **not** notify any [`Condvar`]. Use
 /// [`dispatch_event`] from runtime paths; this helper is kept separate
 /// so it can be unit-tested without constructing an [`Inner`] (which
@@ -868,18 +883,25 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
 fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
     match ev {
         ChannelEvent::Data { channel, data } => {
-            queues.entry(channel).or_default().data.extend(data);
+            if let Some(q) = queues.get_mut(&channel) {
+                q.data.extend(data);
+            }
         }
         ChannelEvent::ExtendedData { channel, data, .. } => {
-            queues.entry(channel).or_default().stderr.extend(data);
+            if let Some(q) = queues.get_mut(&channel) {
+                q.stderr.extend(data);
+            }
         }
         ChannelEvent::Eof { channel } => {
-            queues.entry(channel).or_default().remote_eof = true;
+            if let Some(q) = queues.get_mut(&channel) {
+                q.remote_eof = true;
+            }
         }
         ChannelEvent::Close { channel } => {
-            let q = queues.entry(channel).or_default();
-            q.remote_eof = true;
-            q.remote_close = true;
+            if let Some(q) = queues.get_mut(&channel) {
+                q.remote_eof = true;
+                q.remote_close = true;
+            }
         }
         ChannelEvent::Request {
             channel, request, ..
@@ -888,7 +910,9 @@ fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
             // surface a meaningful exit code from an interactive shell
             // / exec stream. All other request types (eow, env, etc.)
             // are silently dropped — we don't currently surface them.
-            let q = queues.entry(channel).or_default();
+            let Some(q) = queues.get_mut(&channel) else {
+                return;
+            };
             match request {
                 ChannelRequest::ExitStatus { code } => q.exit_status = Some(code as i32),
                 ChannelRequest::ExitSignal { name, .. } => q.exit_signal = Some(name),
@@ -1442,9 +1466,45 @@ mod tests {
         assert_eq!(q.data.iter().copied().collect::<Vec<_>>(), b"std");
     }
 
+    /// Data / stderr / EOF / Close for a channel with no registered
+    /// mailbox (its stream already dropped, or never opened by us) must
+    /// not conjure one up — such a queue would never be drained or reaped.
+    #[test]
+    fn stash_event_drops_events_for_unregistered_channels() {
+        let mut queues: BTreeMap<u32, ChannelQueue> = BTreeMap::new();
+        queues.insert(1, ChannelQueue::default());
+        for ev in [
+            ChannelEvent::Data {
+                channel: 5,
+                data: b"late".to_vec(),
+            },
+            ChannelEvent::ExtendedData {
+                channel: 5,
+                code: 1,
+                data: b"late".to_vec(),
+            },
+            ChannelEvent::Eof { channel: 5 },
+            ChannelEvent::Close { channel: 5 },
+            ChannelEvent::Request {
+                channel: 5,
+                request: ChannelRequest::ExitStatus { code: 1 },
+                want_reply: false,
+            },
+        ] {
+            stash_event(&mut queues, ev);
+        }
+        assert_eq!(queues.len(), 1, "no mailbox may be created for channel 5");
+        assert!(!queues.contains_key(&5));
+        // The registered channel is unaffected.
+        assert!(queues[&1].data.is_empty());
+        assert!(!queues[&1].remote_close);
+    }
+
     #[test]
     fn stash_event_data_appends_to_right_channel() {
         let mut queues: BTreeMap<u32, ChannelQueue> = BTreeMap::new();
+        queues.insert(7, ChannelQueue::default());
+        queues.insert(9, ChannelQueue::default());
         stash_event(
             &mut queues,
             ChannelEvent::Data {
@@ -1476,6 +1536,7 @@ mod tests {
     #[test]
     fn stash_event_eof_and_close_set_flags() {
         let mut queues: BTreeMap<u32, ChannelQueue> = BTreeMap::new();
+        queues.insert(3, ChannelQueue::default());
         stash_event(&mut queues, ChannelEvent::Eof { channel: 3 });
         assert!(queues[&3].remote_eof);
         assert!(!queues[&3].remote_close);

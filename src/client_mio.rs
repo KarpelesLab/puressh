@@ -57,7 +57,7 @@ use crate::channel::{
 };
 use crate::client::{
     AlgoOverrides, Config, HOST_KEY_MISMATCH_DISABLED, auth_packet_blocked_after_mismatch,
-    build_verifier, filter_credentials_after_mismatch, unix_now,
+    build_verifier, filter_credentials_after_mismatch, unix_now, unsolicited_reply,
 };
 use crate::driver::client::VerifierFactory;
 use crate::driver::{ClientDriver, Event};
@@ -425,7 +425,16 @@ impl<S: Read + Write> MioClient<S> {
                 }
             }
             other => {
-                // No active consumer for app data in this phase; preserve it.
+                // No active consumer for app data in this phase; preserve
+                // it. While idle-authenticated the server may still send a
+                // keepalive global request or an unsolicited CHANNEL_OPEN,
+                // both of which owe a reply (RFC 4254 §4 / §5.1) — answer
+                // them so an sshd with ClientAliveInterval doesn't drop us.
+                if matches!(other, Phase::Authenticated)
+                    && let Ok(ev) = self.conn.on_packet(payload)
+                {
+                    self.handle_unsolicited(&ev)?;
+                }
                 self.phase = other;
             }
         }
@@ -499,7 +508,17 @@ impl<S: Read + Write> MioClient<S> {
                     st.close_sent = true;
                 }
             }
-            _ => {}
+            other => self.handle_unsolicited(&other)?,
+        }
+        Ok(())
+    }
+
+    /// Queue whatever reply the peer is owed for an event the exec loop
+    /// doesn't otherwise handle (unsolicited opens, keepalive-style global
+    /// requests); see [`unsolicited_reply`].
+    fn handle_unsolicited(&mut self, ev: &ChannelEvent) -> Result<()> {
+        if let Some(p) = unsolicited_reply(&mut self.conn, ev)? {
+            self.driver.enqueue_payload(&p)?;
         }
         Ok(())
     }

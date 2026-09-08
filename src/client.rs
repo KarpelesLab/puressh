@@ -182,6 +182,40 @@ pub(crate) fn auth_packet_blocked_after_mismatch(payload: &[u8]) -> bool {
     }
 }
 
+/// The reply the connection layer owes the peer for an event that a
+/// single-channel loop would otherwise ignore, if any:
+///
+/// - a peer-initiated `CHANNEL_OPEN` we have no handler for →
+///   `CHANNEL_OPEN_FAILURE` (`SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`), which
+///   also drops the phantom [`ChannelState`](crate::channel::ChannelState)
+///   `on_packet` allocated (RFC 4254 §5.1 requires a reply);
+/// - an open the connection layer already refused
+///   ([`ChannelEvent::OpenRejected`]) → its pre-built failure payload;
+/// - a `GLOBAL_REQUEST` with `want_reply` (e.g. sshd's
+///   `keepalive@openssh.com` probe) → `REQUEST_FAILURE`, without which a
+///   `ClientAliveInterval` server drops long transfers.
+///
+/// Shared by every frontend (blocking, [`Client::serve`], `SharedClient`,
+/// async, mio) so no dispatcher forgets one of these.
+pub(crate) fn unsolicited_reply(
+    conn: &mut ConnectionState,
+    ev: &ChannelEvent,
+) -> Result<Option<Vec<u8>>> {
+    match ev {
+        ChannelEvent::OpenRequest { channel, .. } => Ok(Some(conn.reject_open(
+            *channel,
+            SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+            "channel type not supported",
+            "",
+        )?)),
+        ChannelEvent::OpenRejected { payload, .. } => Ok(Some(payload.clone())),
+        ChannelEvent::GlobalRequest {
+            want_reply: true, ..
+        } => Ok(Some(conn.send_global_failure())),
+        _ => Ok(None),
+    }
+}
+
 /// Policy for accepting (or rejecting) a server's host key.
 pub enum HostKeyPolicy {
     /// Trust whatever the server presents — equivalent to OpenSSH's
@@ -1044,6 +1078,15 @@ impl Client {
         self.host_key_mismatched.load(Ordering::SeqCst)
     }
 
+    /// Send whatever reply [`unsolicited_reply`] says the peer is owed for
+    /// `ev`; the catch-all arm of every single-channel packet loop.
+    pub(crate) fn handle_unsolicited(&mut self, ev: &ChannelEvent) -> Result<()> {
+        if let Some(p) = unsolicited_reply(&mut self.conn, ev)? {
+            self.write_payload(&p)?;
+        }
+        Ok(())
+    }
+
     /// Override the re-key thresholds (defaults to
     /// [`RekeyPolicy::default`](crate::transport::RekeyPolicy), i.e. 1 GiB /
     /// 1 hour). Mirrors the server-side knob; mainly useful for tests that
@@ -1221,7 +1264,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("agent-forward: channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1267,7 +1310,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("x11-forward: channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1506,7 +1549,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1537,7 +1580,7 @@ impl Client {
                 ChannelEvent::Failure { channel } if channel == local_id => {
                     return Err(Error::Protocol("exec request denied"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1615,7 +1658,7 @@ impl Client {
                     }
                 }
                 ChannelEvent::WindowAdjust { .. } => {}
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1659,7 +1702,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1790,7 +1833,7 @@ impl Client {
                     }
                 }
                 ChannelEvent::WindowAdjust { .. } => {}
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1829,7 +1872,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1916,7 +1959,7 @@ impl Client {
                     }
                 }
                 ChannelEvent::WindowAdjust { .. } => {}
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -1959,7 +2002,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -2031,7 +2074,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("exec_stream: channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -2107,7 +2150,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("direct-tcpip: open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -2160,7 +2203,7 @@ impl Client {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("direct-streamlocal: open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
 
@@ -2591,7 +2634,7 @@ impl Client {
                     let _ = what; // for future tracing
                     return Err(Error::Protocol("global request denied"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
         Err(Error::Protocol(
@@ -2613,7 +2656,7 @@ impl Client {
                     let _ = what; // for future tracing
                     return Err(Error::Protocol("shell: channel request denied"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other)?,
             }
         }
         Err(Error::Protocol(
@@ -2831,7 +2874,7 @@ impl ClientChannelStream<'_> {
                     self.local_close_sent = true;
                 }
             }
-            _ => {}
+            other => self.client.handle_unsolicited(&other).map_err(io_err)?,
         }
         Ok(())
     }
@@ -4050,6 +4093,9 @@ fn serve_dispatch_packet(
             let p = client.conn.send_global_failure();
             client.write_payload(&p)?;
         }
+        // An open the connection layer already refused (channel cap):
+        // forward its pre-built OPEN_FAILURE so the peer gets its reply.
+        ChannelEvent::OpenRejected { payload, .. } => client.write_payload(&payload)?,
         // Other events (OpenConfirmed/Failed for opens *we* initiated,
         // Request, GlobalSuccess/GlobalFailure for our keepalive probes,
         // etc.) need no action here — the keepalive bookkeeping in `serve`
@@ -4204,6 +4250,84 @@ mod tests {
         drop(ingress_rx);
         assert_eq!(rt.offer_ingress(Some(vec![4; 40])), 0);
         assert!(rt.ingress_backlog.is_empty());
+    }
+
+    /// Every dispatcher answers the peer's unsolicited events through
+    /// `unsolicited_reply`: a server-initiated open we don't handle gets
+    /// OPEN_FAILURE (and its phantom channel state is dropped), an open the
+    /// connection layer already refused has its payload forwarded, and a
+    /// `want_reply` global request (sshd keepalive) gets REQUEST_FAILURE.
+    #[test]
+    fn unsolicited_reply_answers_opens_and_global_requests() {
+        use crate::channel::{
+            GlobalRequest, MSG_CHANNEL_OPEN_FAILURE, MSG_REQUEST_FAILURE,
+            SSH_OPEN_RESOURCE_SHORTAGE,
+        };
+        let mut peer = ConnectionState::new();
+        let mut conn = ConnectionState::new();
+
+        // Peer opens a channel at us.
+        let (_peer_id, open) = peer
+            .open(ChannelOpen::ForwardedTcpip {
+                dest_host: "h".into(),
+                dest_port: 1,
+                orig_host: "o".into(),
+                orig_port: 2,
+            })
+            .unwrap();
+        let ev = conn.on_packet(&open).unwrap();
+        let ChannelEvent::OpenRequest { channel, .. } = &ev else {
+            panic!("expected OpenRequest, got {ev:?}");
+        };
+        let local_id = *channel;
+        assert!(
+            conn.channel(local_id).is_some(),
+            "state allocated by on_packet"
+        );
+        let reply = unsolicited_reply(&mut conn, &ev)
+            .unwrap()
+            .expect("open must be answered");
+        assert_eq!(reply[0], MSG_CHANNEL_OPEN_FAILURE);
+        assert!(conn.channel(local_id).is_none(), "phantom state dropped");
+        // The peer understands the reply as a rejection of its open.
+        assert!(matches!(
+            peer.on_packet(&reply).unwrap(),
+            ChannelEvent::OpenFailed {
+                reason: SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                ..
+            }
+        ));
+
+        // Pre-rejected open: payload is passed through verbatim.
+        let ev = ChannelEvent::OpenRejected {
+            payload: vec![MSG_CHANNEL_OPEN_FAILURE, 9],
+            reason: SSH_OPEN_RESOURCE_SHORTAGE,
+        };
+        assert_eq!(
+            unsolicited_reply(&mut conn, &ev).unwrap().unwrap(),
+            vec![MSG_CHANNEL_OPEN_FAILURE, 9]
+        );
+
+        // Keepalive-style global request with want_reply → REQUEST_FAILURE;
+        // without want_reply → nothing.
+        let probe = peer.send_global_request(GlobalRequest::Keepalive, true);
+        let ev = conn.on_packet(&probe).unwrap();
+        let reply = unsolicited_reply(&mut conn, &ev).unwrap().unwrap();
+        assert_eq!(reply, vec![MSG_REQUEST_FAILURE]);
+        assert!(matches!(
+            peer.on_packet(&reply).unwrap(),
+            ChannelEvent::GlobalFailure
+        ));
+        let silent = peer.send_global_request(GlobalRequest::Keepalive, false);
+        let ev = conn.on_packet(&silent).unwrap();
+        assert!(unsolicited_reply(&mut conn, &ev).unwrap().is_none());
+
+        // Events that need no reply.
+        assert!(
+            unsolicited_reply(&mut conn, &ChannelEvent::GlobalFailure)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -37,7 +37,7 @@ use crate::channel::{
 use crate::client::{
     AlgoOverrides, Config, ExecOutput, HOST_KEY_MISMATCH_DISABLED,
     auth_packet_blocked_after_mismatch, build_verifier, filter_credentials_after_mismatch,
-    unix_now,
+    unix_now, unsolicited_reply,
 };
 use crate::driver::client::VerifierFactory;
 use crate::driver::{ClientDriver, Event};
@@ -206,7 +206,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
                 ChannelEvent::Failure { channel } if channel == local_id => {
                     return Err(Error::Protocol("exec request denied"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other).await?,
             }
         }
         if !accepted {
@@ -276,7 +276,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
                         close_sent = true;
                     }
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other).await?,
             }
         }
         if !(remote_close && close_sent) {
@@ -329,7 +329,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
                 ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
                     return Err(Error::Protocol("channel open failed"));
                 }
-                _ => {}
+                other => self.handle_unsolicited(&other).await?,
             }
         }
         Err(Error::Protocol("open: loop did not converge"))
@@ -415,6 +415,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
         }
         Ok(())
     }
+
+    /// Send whatever reply the peer is owed for an event our single-channel
+    /// loops don't otherwise handle (unsolicited opens, keepalive-style
+    /// global requests); see [`unsolicited_reply`].
+    async fn handle_unsolicited(&mut self, ev: &ChannelEvent) -> Result<()> {
+        if let Some(p) = unsolicited_reply(&mut self.conn, ev)? {
+            self.write_payload(&p).await?;
+        }
+        Ok(())
+    }
 }
 
 /// A raw byte channel (e.g. `direct-tcpip`) over an [`AsyncClient`], exposing
@@ -456,7 +466,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncChannel<'_, S> {
                     self.remote_eof = true;
                     return Ok(0);
                 }
-                _ => {}
+                other => self.client.handle_unsolicited(&other).await?,
             }
         }
     }
@@ -472,7 +482,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncChannel<'_, S> {
                 // Window full — pump one inbound packet to collect a
                 // WINDOW_ADJUST, then retry.
                 let p = self.client.read_one_packet().await?;
-                let _ = self.client.conn.on_packet(&p)?;
+                let ev = self.client.conn.on_packet(&p)?;
+                self.client.handle_unsolicited(&ev).await?;
                 continue;
             }
             data = &data[taken..];

@@ -710,7 +710,54 @@ impl SftpServerSession {
     fn op_readlink(&mut self, id: u32, path: Vec<u8>) -> Result<Packet, SftpError> {
         let p = self.resolve(&path)?;
         let tgt = fs::read_link(&p)?;
-        let bytes = tgt.to_string_lossy().into_owned().into_bytes();
+        // Jail: never echo a target that leaves the jail (that would disclose
+        // host paths to the client and describe exactly what the jail hides),
+        // and present in-jail absolute targets relative to the jail root the
+        // same way `op_realpath` does under `hide_jail_in_realpath`.
+        let display = match self.opts.root.as_deref() {
+            None => tgt,
+            Some(root) => {
+                let root_clean = lexically_clean(root);
+                if tgt.is_absolute() {
+                    let cleaned = lexically_clean(&tgt);
+                    if !is_inside(&cleaned, &root_clean) {
+                        return Ok(status_pkt(
+                            id,
+                            FxpStatus::PermissionDenied,
+                            "symlink target escapes jail",
+                        ));
+                    }
+                    if self.opts.hide_jail_in_realpath {
+                        let mut out = PathBuf::from("/");
+                        if let Ok(suffix) = cleaned.strip_prefix(&root_clean) {
+                            out.push(suffix);
+                        }
+                        out
+                    } else {
+                        cleaned
+                    }
+                } else {
+                    // Relative target: resolve lexically against the link's
+                    // parent (where it will be followed from) and refuse it if
+                    // it walks above the jail — mirrors `op_symlink`'s
+                    // create-time check for links planted out-of-band.
+                    let link_parent = p.parent().unwrap_or(Path::new("/"));
+                    let cleaned = lexically_clean(&link_parent.join(&tgt));
+                    let has_parent_residue = cleaned
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir));
+                    if has_parent_residue || !is_inside(&cleaned, &root_clean) {
+                        return Ok(status_pkt(
+                            id,
+                            FxpStatus::PermissionDenied,
+                            "symlink target escapes jail",
+                        ));
+                    }
+                    tgt
+                }
+            }
+        };
+        let bytes = display.to_string_lossy().into_owned().into_bytes();
         Ok(Packet::Name {
             id,
             entries: vec![NameEntry {

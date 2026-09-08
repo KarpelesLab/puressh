@@ -436,6 +436,122 @@ fn jailed_symlink_with_absolute_target_rejected() {
     h.join().unwrap();
 }
 
+// --- security: readlink must not disclose paths outside the jail (C1) ---
+
+fn expect_permission_denied(r: Result<Vec<u8>, SftpError>) {
+    match r {
+        Err(SftpError::Status { code, .. }) => assert_eq!(code, FxpStatus::PermissionDenied),
+        Err(other) => panic!("expected PermissionDenied, got {other:?}"),
+        Ok(v) => panic!(
+            "expected PermissionDenied, got target {:?}",
+            String::from_utf8_lossy(&v)
+        ),
+    }
+}
+
+#[test]
+fn jailed_readlink_absolute_target_outside_jail_denied() {
+    let tmp = TempDir::new("readlink-jail-abs-out");
+    let jail = tmp.path().to_path_buf();
+    std::os::unix::fs::symlink("/etc/passwd", jail.join("escape")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    expect_permission_denied(client.readlink(b"escape"));
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_readlink_relative_escape_denied() {
+    let tmp = TempDir::new("readlink-jail-rel-out");
+    let jail = tmp.path().to_path_buf();
+    fs::create_dir_all(jail.join("sub")).unwrap();
+    // From `sub/`, `../../etc/passwd` lexically leaves the jail.
+    std::os::unix::fs::symlink("../../etc/passwd", jail.join("sub/trap")).unwrap();
+    // A target with more `..` than there are ancestors is refused too.
+    std::os::unix::fs::symlink("../../../../../../x", jail.join("deep")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    expect_permission_denied(client.readlink(b"sub/trap"));
+    expect_permission_denied(client.readlink(b"deep"));
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_readlink_absolute_target_inside_jail_rewritten() {
+    let tmp = TempDir::new("readlink-jail-abs-in");
+    let jail = tmp.path().to_path_buf();
+    fs::create_dir_all(jail.join("sub")).unwrap();
+    fs::write(jail.join("sub/file"), b"x").unwrap();
+    // Absolute host path to a file inside the jail.
+    std::os::unix::fs::symlink(jail.join("sub/file"), jail.join("abs")).unwrap();
+
+    // Default: hide the jail prefix, like realpath.
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let tgt = client.readlink(b"abs").unwrap();
+    assert_eq!(String::from_utf8_lossy(&tgt), "/sub/file");
+    drop(client);
+    h.join().unwrap();
+
+    // Explicit opt-out keeps the host path (still inside the jail).
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone())
+        .with_root(jail.clone())
+        .hide_jail_in_realpath(false);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let tgt = client.readlink(b"abs").unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&tgt),
+        jail.join("sub/file").to_string_lossy()
+    );
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_readlink_relative_target_inside_jail_verbatim() {
+    let tmp = TempDir::new("readlink-jail-rel-in");
+    let jail = tmp.path().to_path_buf();
+    fs::create_dir_all(jail.join("sub")).unwrap();
+    std::os::unix::fs::symlink("../sub/file", jail.join("sub/rel")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let tgt = client.readlink(b"sub/rel").unwrap();
+    assert_eq!(String::from_utf8_lossy(&tgt), "../sub/file");
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn unjailed_readlink_returns_absolute_target_verbatim() {
+    let tmp = TempDir::new("readlink-nojail");
+    let dir = tmp.path().to_path_buf();
+    std::os::unix::fs::symlink("/etc/passwd", dir.join("abs")).unwrap();
+
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(dir);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    let tgt = client.readlink(b"abs").unwrap();
+    assert_eq!(String::from_utf8_lossy(&tgt), "/etc/passwd");
+    drop(client);
+    h.join().unwrap();
+}
+
 #[test]
 fn jailed_realpath_strips_jail_prefix_when_opted_in() {
     let tmp = TempDir::new("realpath-jail");

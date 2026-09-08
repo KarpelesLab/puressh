@@ -151,14 +151,12 @@ impl HostKey for AgentHostKey {
 
 /// Read the first SSH `string` (`uint32 length || bytes`) from `buf`.
 fn first_string(buf: &[u8]) -> Option<String> {
-    if buf.len() < 4 {
-        return None;
-    }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if buf.len() < 4 + len {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&buf[4..4 + len]).into_owned())
+    // `Reader` bounds-checks the length prefix without the unchecked
+    // `4 + len` arithmetic that could wrap on 32-bit targets.
+    crate::format::Reader::new(buf)
+        .read_string()
+        .ok()
+        .map(|s| String::from_utf8_lossy(s).into_owned())
 }
 
 #[cfg(test)]

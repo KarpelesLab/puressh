@@ -35,19 +35,12 @@ impl AgentIdentity {
     /// Extract the algorithm name (first SSH `string` inside `key_blob`).
     /// Returns the empty string if the blob is malformed.
     pub fn algorithm(&self) -> String {
-        if self.key_blob.len() < 4 {
-            return String::new();
-        }
-        let len = u32::from_be_bytes([
-            self.key_blob[0],
-            self.key_blob[1],
-            self.key_blob[2],
-            self.key_blob[3],
-        ]) as usize;
-        if self.key_blob.len() < 4 + len {
-            return String::new();
-        }
-        String::from_utf8_lossy(&self.key_blob[4..4 + len]).into_owned()
+        // `Reader` bounds-checks the length prefix without the unchecked
+        // `4 + len` arithmetic that could wrap on 32-bit targets.
+        crate::format::Reader::new(&self.key_blob)
+            .read_string()
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .unwrap_or_default()
     }
 
     /// Free-form comment.

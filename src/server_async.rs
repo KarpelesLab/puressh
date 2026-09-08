@@ -22,6 +22,28 @@
 //! blocking [`CommandHandler`](crate::server::CommandHandler) /
 //! [`ShellHandler`](crate::server::ShellHandler) model onto async tasks) can
 //! layer on top.
+//!
+//! # Pre-auth resource bounds
+//!
+//! The connection applies the same pre-auth limits as the blocking
+//! [`Server`](crate::server::Server):
+//!
+//! - [`Config::login_grace_time`] is an **absolute** deadline for the whole
+//!   pre-auth phase (handshake + userauth), checked before every transport
+//!   read. A slow-loris peer that keeps dribbling bytes is dropped with
+//!   `Error::Io`/`TimedOut` once the deadline passes. Being runtime-agnostic,
+//!   this crate has no timer: a peer that sends *nothing at all* leaves the
+//!   read pending, so wrap [`accept`](AsyncServerConnection::accept) /
+//!   [`authenticate`](AsyncServerConnection::authenticate) in your executor's
+//!   timeout (e.g. `tokio::time::timeout_at` with
+//!   [`preauth_deadline`](AsyncServerConnection::preauth_deadline)) to cover
+//!   that case.
+//! - [`Config::max_auth_tries`] bounds failed authentication attempts per
+//!   connection (default 6); the userauth exchange is additionally capped at a
+//!   fixed number of round-trips.
+//! - There is no `MaxStartups`-style admission control here: the caller owns
+//!   the listener and must bound the number of concurrently unauthenticated
+//!   connections it hands to `accept`.
 
 #![cfg(all(feature = "async", feature = "server"))]
 
@@ -39,7 +61,10 @@ use crate::driver::{Event, ServerDriver};
 use crate::error::{Error, Result};
 use crate::server::Config;
 
-const MAX_AUTH_STEPS: usize = 256;
+/// Round-trip cap on the userauth exchange. Same value as the blocking
+/// server: with `max_auth_tries` bounding *failed* attempts this only has to
+/// absorb keyboard-interactive / multi-factor chatter.
+const MAX_AUTH_STEPS: usize = 64;
 const READ_CHUNK: usize = 16 * 1024;
 
 /// An async SSH server connection over a caller-supplied `futures` transport.
@@ -51,6 +76,10 @@ pub struct AsyncServerConnection<S> {
     stream: S,
     driver: ServerDriver,
     conn: ConnectionState,
+    cfg: Arc<Config>,
+    /// Absolute `LoginGraceTime` deadline for the pre-auth phase; `None` once
+    /// the peer has authenticated (or when the grace time is zero).
+    deadline: Option<Instant>,
 }
 
 /// Tokio-native server entry point (feature `tokio`). Accepts tokio's own
@@ -72,15 +101,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
     /// Run the server handshake over an accepted `stream`. `cfg` supplies the
     /// host keys and algorithm policy.
     pub async fn accept(stream: S, cfg: Arc<Config>) -> Result<Self> {
-        let driver = ServerDriver::new(cfg);
+        // `LoginGraceTime`: absolute budget for handshake + userauth, mirroring
+        // the blocking server. Zero ⇒ no budget.
+        let grace = cfg.login_grace_time;
+        let deadline = if grace.is_zero() {
+            None
+        } else {
+            Some(Instant::now() + grace)
+        };
+        let driver = ServerDriver::new(cfg.clone());
         let mut me = Self {
             stream,
             driver,
             conn: ConnectionState::new(),
+            cfg,
+            deadline,
         };
         me.driver.start(Instant::now())?;
         me.drive_handshake().await?;
         Ok(me)
+    }
+
+    /// The absolute pre-auth deadline derived from [`Config::login_grace_time`]
+    /// — `None` after authentication succeeds, or when the grace time is zero.
+    /// Feed it to your executor's timeout so a fully silent peer is dropped too
+    /// (see the module docs).
+    pub fn preauth_deadline(&self) -> Option<Instant> {
+        self.deadline
     }
 
     /// The session identifier (exchange hash `H`).
@@ -101,6 +148,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
         methods: Vec<&'static str>,
     ) -> Result<String> {
         let mut auth = ServerAuth::new(self.driver.session_id().to_vec(), methods, authenticator);
+        // `MaxAuthTries`: the async front-end has no per-address policy
+        // resolution, so the config-level fallback applies directly.
+        auth.set_max_auth_tries(self.cfg.max_auth_tries);
         for _ in 0..MAX_AUTH_STEPS {
             let payload = self.next_packet().await?;
             match auth.on_packet(&payload)? {
@@ -108,6 +158,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
                 ServerStep::Authenticated { payload, user, .. } => {
                     self.send(&payload).await?;
                     self.driver.notify_auth_success();
+                    // Past userauth-success: lift the grace deadline.
+                    self.deadline = None;
                     return Ok(user);
                 }
                 ServerStep::Disconnect(reason) => return Err(Error::Protocol(reason)),
@@ -164,6 +216,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
     }
 
     async fn read_into_driver(&mut self) -> Result<()> {
+        // Absolute pre-auth deadline, checked before every read so a peer
+        // dribbling bytes can't stretch the budget (the blocking server
+        // re-arms the socket timeout to the remaining time for the same
+        // reason). A peer that never sends anything needs an executor
+        // timeout on top — see the module docs.
+        if let Some(deadline) = self.deadline
+            && Instant::now() >= deadline
+        {
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "pre-auth inactivity timeout (LoginGraceTime)",
+            )));
+        }
         let mut tmp = [0u8; READ_CHUNK];
         let n = self.stream.read(&mut tmp).await.map_err(Error::Io)?;
         if n == 0 {
@@ -289,6 +354,61 @@ mod tests {
         let mut s = [0u8; 32];
         OsRng.fill_bytes(&mut s);
         s
+    }
+
+    /// S11: a peer that keeps dribbling bytes pre-auth is dropped once
+    /// `login_grace_time` elapses, rather than holding the connection open
+    /// indefinitely.
+    #[test]
+    fn async_server_drops_slow_loris_peer_at_login_grace_deadline() {
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(fresh_seed()));
+        let factory: Arc<dyn AuthenticatorFactory> =
+            Arc::new(|| Box::new(RejectAuth) as Box<dyn Authenticator>);
+        let cfg = Arc::new(
+            ServerConfig::new(
+                vec![host_key],
+                factory,
+                vec!["publickey"],
+                Arc::new(UnusedHandler),
+            )
+            .with_login_grace_time(std::time::Duration::from_millis(200)),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        // Drip one byte every 50 ms for up to 5 s (or until the server hangs
+        // up on us). Never a full banner line, never silent for long.
+        let peer = thread::spawn(move || {
+            let mut s = TcpStream::connect(addr).expect("connect");
+            let start = std::time::Instant::now();
+            while start.elapsed() < std::time::Duration::from_secs(5) {
+                if s.write_all(b"S").is_err() {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+
+        let (sock, _peer) = listener.accept().expect("accept");
+        let start = std::time::Instant::now();
+        let err = block_on(async move {
+            AsyncServerConnection::accept(BlockingAsync(sock), cfg)
+                .await
+                .err()
+                .expect("slow-loris peer must not complete the handshake")
+        });
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(4),
+            "deadline was not enforced (took {:?})",
+            start.elapsed()
+        );
+        match err {
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected TimedOut io error, got {other:?}"),
+        }
+        peer.join().expect("peer thread");
     }
 
     #[test]

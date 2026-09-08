@@ -186,36 +186,37 @@ impl PrivateKey {
         let inner = encode_inner_block(rng, self, block);
         let pub_blob = self.public_key().wire_blob();
 
-        let (ciphername, kdfname, kdfoptions, payload) = if let Some(pass) = non_empty_pass {
-            let mut salt = [0u8; SALT_LEN];
-            rng.fill_bytes(&mut salt);
-            // `derived` is a wrapping passphrase-equivalent secret: from
-            // it you can reconstruct the AES key and IV that protect the
-            // private key blob. Wrap in `Zeroizing` so it is wiped from
-            // memory at scope exit — without this it would linger in the
-            // heap until the allocator reused the slot.
-            let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
-                bcrypt_pbkdf(pass, &salt, BCRYPT_ROUNDS, KEY_LEN + IV_LEN)
-                    .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
-            );
-            // `key` and `iv` are derived material too; wrap so the stack
-            // copies are wiped when the block ends. The `Aes256` instance
-            // takes a copy internally but that is owned by the Ctr cipher
-            // and dropped at end of scope; the copies we hold are wiped.
-            let mut key: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new([0u8; KEY_LEN]);
-            key.copy_from_slice(&derived[..KEY_LEN]);
-            let mut iv: Zeroizing<[u8; IV_LEN]> = Zeroizing::new([0u8; IV_LEN]);
-            iv.copy_from_slice(&derived[KEY_LEN..KEY_LEN + IV_LEN]);
-            let mut buf = inner;
-            let mut ctr = Ctr::new(Aes256::new(&key), &iv);
-            ctr.apply_keystream(&mut buf);
-            let mut opts = Writer::new();
-            opts.write_string(&salt);
-            opts.write_u32(BCRYPT_ROUNDS);
-            ("aes256-ctr", "bcrypt", opts.into_vec(), buf)
-        } else {
-            ("none", "none", Vec::new(), inner)
-        };
+        let (ciphername, kdfname, kdfoptions, payload): (_, _, _, Zeroizing<Vec<u8>>) =
+            if let Some(pass) = non_empty_pass {
+                let mut salt = [0u8; SALT_LEN];
+                rng.fill_bytes(&mut salt);
+                // `derived` is a wrapping passphrase-equivalent secret: from
+                // it you can reconstruct the AES key and IV that protect the
+                // private key blob. Wrap in `Zeroizing` so it is wiped from
+                // memory at scope exit — without this it would linger in the
+                // heap until the allocator reused the slot.
+                let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
+                    bcrypt_pbkdf(pass, &salt, BCRYPT_ROUNDS, KEY_LEN + IV_LEN)
+                        .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
+                );
+                // `key` and `iv` are derived material too; wrap so the stack
+                // copies are wiped when the block ends. The `Aes256` instance
+                // takes a copy internally but that is owned by the Ctr cipher
+                // and dropped at end of scope; the copies we hold are wiped.
+                let mut key: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new([0u8; KEY_LEN]);
+                key.copy_from_slice(&derived[..KEY_LEN]);
+                let mut iv: Zeroizing<[u8; IV_LEN]> = Zeroizing::new([0u8; IV_LEN]);
+                iv.copy_from_slice(&derived[KEY_LEN..KEY_LEN + IV_LEN]);
+                let mut buf = inner;
+                let mut ctr = Ctr::new(Aes256::new(&key), &iv);
+                ctr.apply_keystream(&mut buf);
+                let mut opts = Writer::new();
+                opts.write_string(&salt);
+                opts.write_u32(BCRYPT_ROUNDS);
+                ("aes256-ctr", "bcrypt", opts.into_vec(), buf)
+            } else {
+                ("none", "none", Vec::new(), inner)
+            };
 
         let mut w = Writer::new();
         w.write_raw(MAGIC);
@@ -225,9 +226,12 @@ impl PrivateKey {
         w.write_u32(1);
         w.write_string(&pub_blob);
         w.write_string(&payload);
-        let bin = w.into_vec();
+        // For an unencrypted key `bin` (and its base64 form) carry the
+        // cleartext secret; wipe the intermediates, leaving only the
+        // returned PEM string as the caller's responsibility.
+        let bin: Zeroizing<Vec<u8>> = Zeroizing::new(w.into_vec());
 
-        let b64 = base64::encode(&bin);
+        let b64: Zeroizing<String> = Zeroizing::new(base64::encode(&bin));
         Ok(wrap_pem(&b64))
     }
 }
@@ -242,6 +246,10 @@ impl PrivateKey {
     /// check-ints or the trailing block padding — the agent frame is not an
     /// encrypted blob, so neither applies. The caller wraps the returned
     /// bytes in an agent message frame (`encode_message`).
+    ///
+    /// The returned `Vec` contains the cleartext private key; callers
+    /// should wrap it in [`zeroize::Zeroizing`] (as the agent client does)
+    /// so it is wiped once the request has been written.
     pub fn to_agent_add_body(&self) -> Vec<u8> {
         let mut w = Writer::new();
         match self {
@@ -252,10 +260,10 @@ impl PrivateKey {
             } => {
                 w.write_string(b"ssh-ed25519");
                 w.write_string(public);
-                let mut sk = [0u8; 64];
+                let mut sk: Zeroizing<[u8; 64]> = Zeroizing::new([0u8; 64]);
                 sk[..32].copy_from_slice(seed);
                 sk[32..].copy_from_slice(public);
-                w.write_string(&sk);
+                w.write_string(&sk[..]);
                 w.write_string(comment.as_bytes());
             }
             PrivateKey::EcdsaP256 { d, point, comment } => {
@@ -302,11 +310,14 @@ impl PrivateKey {
     }
 }
 
+/// Encode the cleartext inner block (check-ints, private fields, comment,
+/// padding). The result is the secret itself, so it is returned wrapped in
+/// [`Zeroizing`] and wiped once the caller has encrypted / serialised it.
 fn encode_inner_block<R: CryptoRng + RngCore>(
     rng: &mut R,
     pk: &PrivateKey,
     block: usize,
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let mut check = [0u8; 4];
     rng.fill_bytes(&mut check);
     let checkint = u32::from_be_bytes(check);
@@ -322,10 +333,10 @@ fn encode_inner_block<R: CryptoRng + RngCore>(
         } => {
             w.write_string(b"ssh-ed25519");
             w.write_string(public);
-            let mut sk = [0u8; 64];
+            let mut sk: Zeroizing<[u8; 64]> = Zeroizing::new([0u8; 64]);
             sk[..32].copy_from_slice(seed);
             sk[32..].copy_from_slice(public);
-            w.write_string(&sk);
+            w.write_string(&sk[..]);
             w.write_string(comment.as_bytes());
         }
         PrivateKey::EcdsaP256 { d, point, comment } => {
@@ -368,7 +379,7 @@ fn encode_inner_block<R: CryptoRng + RngCore>(
             w.write_string(comment.as_bytes());
         }
     }
-    let mut buf = w.into_vec();
+    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(w.into_vec());
     let pad_remainder = buf.len() % block;
     if pad_remainder != 0 {
         let pad_n = block - pad_remainder;

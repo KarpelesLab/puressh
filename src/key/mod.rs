@@ -20,6 +20,7 @@ use alloc::vec::Vec;
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
 use purecrypto::ec::{BoxedEcdsaPublicKey, CurveId};
 use purecrypto::kdf::bcrypt_pbkdf;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
@@ -163,7 +164,12 @@ pub enum PublicKey {
 }
 
 /// SSH private key, tagged by algorithm.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented manually and renders only the algorithm, the
+/// comment and the public half; the seed / scalar / RSA private components
+/// are replaced by `"<redacted>"` so a stray `{:?}` (a `tracing` field, an
+/// `unwrap` panic message, `dbg!`) cannot leak key material into logs.
+#[derive(Clone)]
 pub enum PrivateKey {
     /// `ssh-ed25519` — 32-byte seed + 32-byte public.
     Ed25519 {
@@ -218,6 +224,17 @@ pub enum PrivateKey {
         /// Trailing comment.
         comment: String,
     },
+}
+
+impl core::fmt::Debug for PrivateKey {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PrivateKey")
+            .field("algorithm", &self.algorithm())
+            .field("comment", &self.comment())
+            .field("public", &self.public_key())
+            .field("secret", &"<redacted>")
+            .finish()
+    }
 }
 
 const ED25519: &str = "ssh-ed25519";
@@ -633,7 +650,10 @@ impl PrivateKey {
     /// [`Error::Crypto`]`("wrong passphrase")`.
     pub fn parse_openssh_pem(pem: &str, passphrase: Option<&[u8]>) -> Result<Self> {
         let body = strip_pem(pem)?;
-        let raw = base64::decode(body.as_bytes())?;
+        // `raw` holds the (possibly still encrypted) private-key container;
+        // for an unencrypted key that *is* the cleartext secret. Wipe it on
+        // every exit path.
+        let raw: Zeroizing<Vec<u8>> = Zeroizing::new(base64::decode(body.as_bytes())?);
         if raw.len() < MAGIC.len() || &raw[..MAGIC.len()] != MAGIC {
             return Err(Error::Format("openssh key: bad magic"));
         }
@@ -827,14 +847,14 @@ fn decrypt_payload(
     kdfoptions: &[u8],
     encrypted: &[u8],
     passphrase: Option<&[u8]>,
-) -> Result<Vec<u8>> {
+) -> Result<Zeroizing<Vec<u8>>> {
     if ciphername == b"none" {
         if kdfname != b"none" {
             return Err(Error::Format(
                 "openssh key: cipher 'none' with non-none kdf",
             ));
         }
-        return Ok(encrypted.to_vec());
+        return Ok(Zeroizing::new(encrypted.to_vec()));
     }
 
     // Treat an empty passphrase as "no passphrase". Callers occasionally
@@ -883,26 +903,31 @@ fn decrypt_payload(
         ));
     }
 
-    let derived = bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
-        .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?;
+    // `derived` is passphrase-equivalent (it yields the AES key + IV that
+    // protect the private key); `k`/`iv` are copies of it and `out` is the
+    // cleartext private section. All are wiped on drop.
+    let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
+        bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
+            .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
+    );
 
     if !encrypted.len().is_multiple_of(16) {
         return Err(Error::Format("openssh key: encrypted length not aligned"));
     }
 
-    let mut iv = [0u8; 16];
+    let mut iv: Zeroizing<[u8; 16]> = Zeroizing::new([0u8; 16]);
     iv.copy_from_slice(&derived[key_len..key_len + iv_len]);
 
-    let mut out = encrypted.to_vec();
+    let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(encrypted.to_vec());
     match ciphername {
         b"aes256-ctr" => {
-            let mut k = [0u8; 32];
+            let mut k: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
             k.copy_from_slice(&derived[..32]);
             let mut ctr = Ctr::new(Aes256::new(&k), &iv);
             ctr.apply_keystream(&mut out);
         }
         b"aes128-ctr" => {
-            let mut k = [0u8; 16];
+            let mut k: Zeroizing<[u8; 16]> = Zeroizing::new([0u8; 16]);
             k.copy_from_slice(&derived[..16]);
             let mut ctr = Ctr::new(Aes128::new(&k), &iv);
             ctr.apply_keystream(&mut out);

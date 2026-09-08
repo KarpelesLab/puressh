@@ -167,8 +167,11 @@ impl Agent {
     /// protocol error on `SSH_AGENT_FAILURE` (e.g. the agent refuses to add
     /// keys, or doesn't support the key type).
     pub fn add_identity(&mut self, key: &crate::key::PrivateKey) -> Result<()> {
-        let body = key.to_agent_add_body();
-        self.write_frame(&encode_message(SSH_AGENTC_ADD_IDENTITY, &body))?;
+        // Both the request body and the framed message carry the cleartext
+        // private key; wipe them once written.
+        let body = zeroize::Zeroizing::new(key.to_agent_add_body());
+        let frame = zeroize::Zeroizing::new(encode_message(SSH_AGENTC_ADD_IDENTITY, &body));
+        self.write_frame(&frame)?;
         let (msg_type, _) = self.read_frame()?;
         match msg_type {
             SSH_AGENT_SUCCESS => Ok(()),

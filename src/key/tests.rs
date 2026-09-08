@@ -716,3 +716,32 @@ fn options_parser_rejects_unquoted_principals() {
     let line = format!("principals=alice {ED25519_PUB_LINE}");
     assert!(PublicKey::parse_authorized_keys_line_with_options(&line).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// A6: `PrivateKey`'s Debug output must never render secret material.
+// ---------------------------------------------------------------------------
+#[test]
+fn private_key_debug_is_redacted() {
+    let sk = PrivateKey::parse_openssh_pem(RSA_PEM_UNENCRYPTED, None).unwrap();
+    let PrivateKey::Rsa { d, p, q, iqmp, .. } = &sk else {
+        panic!("not RSA");
+    };
+    let s = format!("{sk:?}");
+    assert!(s.contains("ssh-rsa"), "{s}");
+    assert!(s.contains("rsa@puressh"), "{s}");
+    assert!(s.contains("<redacted>"), "{s}");
+    for secret in [d, p, q, iqmp] {
+        let rendered = format!("{:?}", trim_leading_zeros(secret));
+        assert!(!s.contains(&rendered), "secret leaked into Debug: {s}");
+    }
+    let sk = PrivateKey::parse_openssh_pem(ED25519_PEM_UNENCRYPTED, None).unwrap();
+    let PrivateKey::Ed25519 { seed, public, .. } = &sk else {
+        panic!("not ed25519");
+    };
+    let s = format!("{sk:?}");
+    assert!(!s.contains(&format!("{seed:?}")), "seed leaked: {s}");
+    assert!(
+        s.contains(&format!("{public:?}")),
+        "public half missing: {s}"
+    );
+}

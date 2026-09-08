@@ -21,11 +21,15 @@
 //!
 //! ## Lifetime
 //!
-//! `PcSshSftpFile` / `PcSshSftpDir` hold a raw pointer back to their
-//! parent `PcSshSftp` (used for every read/write/readdir). The C caller
-//! must not free the parent while a file/dir handle is still live; doing
-//! so dereferences a dangling pointer on the next file/dir op. This
-//! mirrors libssh2's session ownership model.
+//! `PcSshSftpFile` / `PcSshSftpDir` hold an `Arc` to a shared cell that
+//! the parent `PcSshSftp` also owns (see `SftpCell` below). Freeing the
+//! parent first is *safe*: it empties the cell, and every later op on a
+//! surviving child returns `PCSSH_ERR_INVALID_HANDLE` instead of
+//! touching freed memory. Freeing the `PcSshClient` while an SFTP
+//! session is live is also safe — the session holds its own reference
+//! to the shared connection, which therefore stays open until the last
+//! `PcSshSftp` is freed. Children are freed with their own `_free`
+//! entry points regardless of order.
 
 use core::ffi::{c_char, c_int};
 use core::ptr;
@@ -36,10 +40,20 @@ use super::client::PcSshClient;
 use super::common::{
     PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_GENERIC, PCSSH_ERR_INVALID_ARGUMENT,
     PCSSH_ERR_INVALID_HANDLE, PCSSH_ERR_IO, PCSSH_ERR_PARSE, PCSSH_ERR_PROTOCOL, PCSSH_OK, catch,
-    with_cstr, with_two_cstr,
+    slice_len_ok, with_cstr, with_two_cstr,
 };
+use crate::sftp::packet::MAX_PACKET_SIZE;
 use crate::sftp::{Attrs, NameEntry, SftpError};
 use crate::shared::SftpSession;
+
+/// Largest payload one `SSH_FXP_READ` request asks for / one
+/// `SSH_FXP_WRITE` request carries. Every SFTP packet — including the
+/// 4-byte length prefix, type, request id, handle string and offset —
+/// must fit in [`MAX_PACKET_SIZE`] (256 KiB, OpenSSH's
+/// `SFTP_MAX_MSG_LENGTH`); leaving 1 KiB of headroom for the framing
+/// matches OpenSSH's own `SFTP_MAX_READ_LENGTH`. Exposed to C as
+/// `PCSSH_SFTP_MAX_IO` in `include/puressh.h` — keep the two in sync.
+pub const PCSSH_SFTP_MAX_IO: usize = (MAX_PACKET_SIZE as usize) - 1024;
 
 /// Shared cell holding the live SFTP session. The parent `PcSshSftp`
 /// owns one strong `Arc<SftpCell>`; every child `PcSshSftpFile` /
@@ -293,6 +307,11 @@ pub unsafe extern "C" fn pcssh_sftp_open(
 /// Free an SFTP session handle. The underlying SSH channel is closed in
 /// `Drop` (best-effort). Safe to call with NULL.
 ///
+/// May be called while child file/dir handles are still live: they keep
+/// working memory-safely and report `PCSSH_ERR_INVALID_HANDLE` from then
+/// on; free them with their own `_free` calls. This also releases the
+/// session's reference to the underlying connection.
+///
 /// # Safety
 ///
 /// `sftp` must either be NULL or a pointer returned by `pcssh_sftp_open`
@@ -401,6 +420,10 @@ pub unsafe extern "C" fn pcssh_sftp_open_file(
 /// Read up to `cap` bytes from `file` at the current cursor. Advances
 /// the cursor by the number of bytes returned. `*out_len = 0` on EOF.
 ///
+/// One call issues one wire request, which is capped at
+/// [`PCSSH_SFTP_MAX_IO`] bytes, so `*out_len` may be less than `cap`
+/// even before EOF; loop until `*out_len == 0`.
+///
 /// # Safety
 ///
 /// - `file` must be live and not yet closed.
@@ -430,8 +453,11 @@ pub unsafe extern "C" fn pcssh_sftp_read(
             unsafe { *out_len = 0 };
             return PCSSH_OK;
         }
-        // Clamp request length to u32 — SFTP wire is 32-bit.
-        let want = cap.min(u32::MAX as usize) as u32;
+        // Clamp the request to what fits in one SFTP packet. The wire
+        // field is 32-bit, but a peer honouring a 4 GiB request would
+        // produce a reply our own framing (`MAX_PACKET_SIZE`) rejects,
+        // so anything above `PCSSH_SFTP_MAX_IO` is pointless at best.
+        let want = cap.min(PCSSH_SFTP_MAX_IO) as u32;
         let handle = f.handle.clone();
         let offset = f.offset;
         let mut got_buf: Option<Vec<u8>> = None;
@@ -450,8 +476,8 @@ pub unsafe extern "C" fn pcssh_sftp_read(
         // `sess.read` implementation) could in principle return more
         // bytes than `want`. Cap the copy at the caller's buffer size
         // so we can never overflow `buf` — the per-call read clamp
-        // (`want = cap.min(u32::MAX)`) already bounded the *request*
-        // to `cap` bytes, so honest peers never trip this path.
+        // (`want = cap.min(PCSSH_SFTP_MAX_IO)`) already bounded the
+        // *request* to `cap` bytes, so honest peers never trip this path.
         let got = chunk.len().min(cap);
         if got > 0 {
             // SAFETY: cap > 0 → buf non-NULL per check above; got <= cap by the min above.
@@ -464,8 +490,15 @@ pub unsafe extern "C" fn pcssh_sftp_read(
     })
 }
 
-/// Write `len` bytes from `buf` at the current cursor. Advances the
-/// cursor by `len`. SFTP write is all-or-nothing per call.
+/// Write `len` bytes from `buf` at the current cursor. On success the
+/// whole buffer has been acknowledged by the server and the cursor has
+/// advanced by `len`.
+///
+/// Buffers larger than [`PCSSH_SFTP_MAX_IO`] are split into that many
+/// bytes per wire request (each of which is all-or-nothing on the
+/// server side). If a later chunk fails, the error is returned and the
+/// cursor has advanced only past the chunks the server acknowledged —
+/// read it back with `pcssh_sftp_tell` to find out how much landed.
 ///
 /// # Safety
 ///
@@ -481,7 +514,7 @@ pub unsafe extern "C" fn pcssh_sftp_write(
         if file.is_null() {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
-        if buf.is_null() && len != 0 {
+        if (buf.is_null() && len != 0) || !slice_len_ok(len) {
             return PCSSH_ERR_INVALID_ARGUMENT;
         }
         // SAFETY: caller contract.
@@ -492,18 +525,24 @@ pub unsafe extern "C" fn pcssh_sftp_write(
         if len == 0 {
             return PCSSH_OK;
         }
-        // SAFETY: len > 0 → buf non-NULL per check above; caller contract.
+        // SAFETY: len > 0 → buf non-NULL per check above; len bounded to
+        // isize::MAX above; caller contract.
         let data = unsafe { slice::from_raw_parts(buf, len) };
         let handle = f.handle.clone();
-        let offset = f.offset;
-        let rc = with_parent(&f.sftp, |sess| match sess.write(&handle, offset, data) {
-            Ok(()) => PCSSH_OK,
-            Err(e) => map_sftp_err(&e),
-        });
-        if rc != PCSSH_OK {
-            return rc;
+        // Chunk so no single SSH_FXP_WRITE exceeds the packet limit (and
+        // so a `len` beyond u32 can never truncate the wire length
+        // prefix). The cursor is advanced per acknowledged chunk.
+        for chunk in data.chunks(PCSSH_SFTP_MAX_IO) {
+            let offset = f.offset;
+            let rc = with_parent(&f.sftp, |sess| match sess.write(&handle, offset, chunk) {
+                Ok(()) => PCSSH_OK,
+                Err(e) => map_sftp_err(&e),
+            });
+            if rc != PCSSH_OK {
+                return rc;
+            }
+            f.offset = f.offset.saturating_add(chunk.len() as u64);
         }
-        f.offset = f.offset.saturating_add(len as u64);
         PCSSH_OK
     })
 }
@@ -739,10 +778,19 @@ pub unsafe extern "C" fn pcssh_sftp_readdir(
             return PCSSH_OK;
         };
 
+        // Publish BOTH required lengths before any capacity check, so a
+        // two-pass caller (NULL buffers, zero caps) learns both sizes from
+        // a single PCSSH_ERR_BUFFER_TOO_SMALL — bailing on the name alone
+        // would leave `*longname_len` unwritten.
+        // SAFETY: both out lens checked non-NULL above.
+        unsafe {
+            *name_len = e.filename.len();
+            *longname_len = e.longname.len();
+        }
+
         // Bounds-check BOTH caller buffers before consuming the entry.
-        // `copy_to_caller_buf` always writes the required length into the
-        // `*_len` out-params (even on truncation), so the caller learns how
-        // big a buffer to allocate.
+        // `copy_to_caller_buf` re-writes the required length into the
+        // `*_len` out-param it is given (harmless — same value as above).
         // SAFETY: pointer/cap checked by the helper.
         let rc_name = unsafe { copy_to_caller_buf(&e.filename, name_buf, name_cap, name_len) };
         if rc_name != PCSSH_OK {
@@ -1252,7 +1300,8 @@ pub unsafe extern "C" fn pcssh_sftp_realpath(
 
 /// Materialise a `(ptr, len)` pair as a byte slice. Returns `Some(&[])`
 /// for `(NULL, 0)` so callers can treat that as the empty path; returns
-/// `None` when `ptr` is NULL with non-zero length.
+/// `None` when `ptr` is NULL with non-zero length, or when `len`
+/// exceeds `isize::MAX` (no slice that large can exist).
 ///
 /// # Safety
 ///
@@ -1267,7 +1316,11 @@ unsafe fn bytes_from_raw<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
         }
         return None;
     }
-    // SAFETY: caller contract — ptr/len name a readable buffer of `len` octets.
+    if !slice_len_ok(len) {
+        return None;
+    }
+    // SAFETY: caller contract — ptr/len name a readable buffer of `len`
+    // octets; `len` bounded to isize::MAX just above.
     Some(unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
@@ -1863,6 +1916,44 @@ mod tests {
             pcssh_sftp_file_free(std::ptr::null_mut());
             pcssh_sftp_dir_free(std::ptr::null_mut());
         }
+    }
+
+    #[test]
+    fn bytes_from_raw_oversized_len_is_none() {
+        let src = [0u8; 4];
+        // SAFETY: the helper must reject the length before constructing
+        // any slice, so the (too-small) backing buffer is never read.
+        let s = unsafe { bytes_from_raw(src.as_ptr(), usize::MAX) };
+        assert!(s.is_none());
+        let s = unsafe { bytes_from_raw(src.as_ptr(), (isize::MAX as usize) + 1) };
+        assert!(s.is_none());
+    }
+
+    #[test]
+    fn write_rejects_oversized_len() {
+        // A `len` no slice can represent must be refused before any
+        // dereference (F5) rather than chunked (F4).
+        let cell: Arc<SftpCell> = Arc::new(Mutex::new(None));
+        let mut f = PcSshSftpFile {
+            sftp: cell,
+            handle: vec![1],
+            offset: 0,
+            closed: false,
+        };
+        let byte = 0u8;
+        // SAFETY: exercising the argument validation path only; the
+        // length is rejected before `buf` is read.
+        let rc = unsafe { pcssh_sftp_write(&mut f, &byte, (isize::MAX as usize) + 1) };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+        assert_eq!(f.offset, 0);
+    }
+
+    #[test]
+    fn max_io_fits_in_a_packet() {
+        assert!(PCSSH_SFTP_MAX_IO < MAX_PACKET_SIZE as usize);
+        assert!(PCSSH_SFTP_MAX_IO <= u32::MAX as usize);
+        // Header value must stay in sync (256 KiB - 1 KiB).
+        assert_eq!(PCSSH_SFTP_MAX_IO, 261_120);
     }
 
     #[test]

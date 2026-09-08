@@ -161,43 +161,103 @@ pub fn parse_userhost_path(target: &str) -> Option<(Option<String>, String, Stri
     Some((user, host, path))
 }
 
-/// Read a passphrase from stdin (or `$SSH_ASKPASS` if set) without
-/// echoing it. Returns a [`Zeroizing<String>`] so the buffer is wiped on
-/// drop — callers should not clone the inner `String` and should drop
-/// the wrapper as soon as auth completes.
+/// A handle on the controlling terminal for interactive prompts (host-key
+/// confirmation, passwords, keyboard-interactive answers).
 ///
-/// Lookup order:
-/// 1. `$SSH_ASKPASS` is set AND we have no controlling tty (matches
-///    OpenSSH): run the named helper, take its first stdout line.
-/// 2. Stdin is a TTY (Unix): disable echo via `tcsetattr(ECHO off)`,
-///    read one line, restore the old settings via a `Drop` guard.
-/// 3. Anything else (non-TTY stdin, no helper, or non-Unix platform):
-///    fall back to plain `read_line` with a warning printed once — the
-///    password *will* be echoed.
-pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
-    // Honour $SSH_ASKPASS the OpenSSH way: only use it when there's no
-    // controlling tty (or when SSH_ASKPASS_REQUIRE=force).
-    if let Some(out) = try_ssh_askpass()? {
-        return Ok(out);
-    }
+/// On Unix this is `/dev/tty` opened read+write — **not** stdin/stderr — so a
+/// redirected stdin (`ssh host < data`, `yes | ssh …`, a CI job) can never
+/// answer a prompt by accident, and a hostile server offering `password`
+/// auth cannot harvest whatever the first lines of the user's stdin data
+/// happen to be. This mirrors OpenSSH's `readpass.c`, which opens `/dev/tty`
+/// and fails closed when it cannot.
+///
+/// On non-Unix platforms there is no `/dev/tty`; we fall back to stdin +
+/// stderr, but only when stdin is actually a terminal.
+struct PromptTty {
+    input: Box<dyn Read>,
+    output: Box<dyn Write>,
+    /// Raw descriptor of the terminal, for `termios` echo control.
+    #[cfg(unix)]
+    fd: libc::c_int,
+}
 
-    eprint!("password: ");
-    std::io::stderr().flush()?;
-
+/// Open the controlling terminal for prompting. Returns `None` when there is
+/// none (daemonised, stdin redirected on non-Unix, `setsid` without a tty…);
+/// callers must treat that as "cannot ask" and fail closed.
+fn open_prompt_tty() -> Option<PromptTty> {
     #[cfg(unix)]
     {
-        if let Some(out) = read_password_no_echo_unix()? {
-            return Ok(out);
-        }
+        use std::os::unix::io::AsRawFd;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()?;
+        let output = file.try_clone().ok()?;
+        let fd = file.as_raw_fd();
+        Some(PromptTty {
+            input: Box::new(file),
+            output: Box::new(output),
+            fd,
+        })
     }
+    #[cfg(not(unix))]
+    {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() {
+            return None;
+        }
+        Some(PromptTty {
+            input: Box::new(std::io::stdin()),
+            output: Box::new(std::io::stderr()),
+        })
+    }
+}
 
-    // Non-Unix or non-tty stdin: warn once, then read with echo. This
-    // mirrors the v0 behaviour but at least announces it.
-    eprintln!();
-    eprintln!("(warning: terminal echo could not be disabled; password will be visible)");
-    let mut buf = String::new();
-    read_one_line(&mut buf, 4096)?;
-    Ok(Zeroizing::new(buf))
+/// Whether `$SSH_ASKPASS` names a helper we are allowed to run
+/// (`SSH_ASKPASS_REQUIRE=never` vetoes it).
+fn askpass_configured() -> bool {
+    let set = matches!(std::env::var_os("SSH_ASKPASS"), Some(v) if !v.is_empty());
+    let vetoed = matches!(std::env::var_os("SSH_ASKPASS_REQUIRE"), Some(req) if req == "never");
+    set && !vetoed
+}
+
+/// Whether an interactive secret (password / keyboard-interactive answer)
+/// can be obtained at all: either an askpass helper is configured or a
+/// controlling terminal can be opened. When this is `false` the binaries
+/// must not offer `password` / `keyboard-interactive` auth — exactly like
+/// OpenSSH under `BatchMode yes` — instead of reading answers from a
+/// non-terminal stdin.
+pub fn secret_prompt_available() -> bool {
+    askpass_configured() || open_prompt_tty().is_some()
+}
+
+/// Read a password (for `password` userauth) without echoing it. Returns a
+/// [`Zeroizing<String>`] so the buffer is wiped on drop — callers should not
+/// clone the inner `String` and should drop the wrapper as soon as auth
+/// completes.
+///
+/// Lookup order:
+/// 1. `$SSH_ASKPASS` is set (and `SSH_ASKPASS_REQUIRE` is not `never`): run
+///    the named helper, take its first stdout line.
+/// 2. The controlling terminal (`/dev/tty` on Unix; stdin-if-a-terminal
+///    elsewhere): print the prompt there, disable echo via
+///    `tcsetattr(ECHO off)` where supported, read one line, restore the old
+///    settings via a `Drop` guard.
+/// 3. Neither available: return an error. The password is **never** read
+///    from a redirected stdin — see [`PromptTty`] for why.
+///
+/// The historical name is kept so the three client binaries keep compiling;
+/// the source is no longer stdin.
+pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
+    const PROMPT: &str = "password: ";
+    if let Some(out) = try_ssh_askpass(PROMPT)? {
+        return Ok(out);
+    }
+    let mut tty = open_prompt_tty().ok_or_else(no_tty_error)?;
+    tty.output.write_all(PROMPT.as_bytes())?;
+    tty.output.flush()?;
+    read_secret_line(&mut tty)
 }
 
 /// Read one keyboard-interactive (RFC 4256) answer for `prompt`. When `echo`
@@ -205,40 +265,49 @@ pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
 /// the terminal echo bit is suppressed exactly like the password reader. Used
 /// by the `ssh` binary's keyboard-interactive responder.
 ///
+/// Like [`read_password_from_stdin`], the answer comes from `$SSH_ASKPASS`
+/// or the controlling terminal — never from a redirected stdin — and an
+/// error is returned when neither is available.
+///
 /// The returned buffer is [`Zeroizing`] so even echo-on answers (which may
 /// still be secret-adjacent) are wiped on drop.
 pub fn read_kbdint_response(prompt: &str, echo: bool) -> std::io::Result<Zeroizing<String>> {
     // The prompt is server-supplied and arrives pre-trust; scrub control
     // bytes so it cannot rewrite the terminal or spoof another prompt.
     let prompt = sanitize_terminal_str(prompt);
-    eprint!("{prompt}");
-    std::io::stderr().flush()?;
-
-    if !echo {
-        #[cfg(unix)]
-        {
-            if let Some(out) = read_password_no_echo_unix()? {
-                return Ok(out);
-            }
-        }
-        // Non-Unix / non-tty: warn, then read with echo.
-        eprintln!();
-        eprintln!("(warning: terminal echo could not be disabled; input will be visible)");
+    let Some(mut tty) = open_prompt_tty() else {
+        // No terminal: an askpass helper is the only acceptable source
+        // (OpenSSH routes keyboard-interactive prompts through it too).
+        return try_ssh_askpass(&prompt)?.ok_or_else(no_tty_error);
+    };
+    tty.output.write_all(prompt.as_bytes())?;
+    tty.output.flush()?;
+    if echo {
+        let mut buf = String::new();
+        read_one_line(&mut tty.input, &mut buf, 4096)?;
+        Ok(Zeroizing::new(buf))
+    } else {
+        read_secret_line(&mut tty)
     }
-
-    let mut buf = String::new();
-    read_one_line(&mut buf, 4096)?;
-    Ok(Zeroizing::new(buf))
 }
 
-/// Pull one line off stdin into `buf`, stopping at `\n` (which is
+/// The error returned when a secret is requested but there is no terminal
+/// to ask on and no askpass helper.
+fn no_tty_error() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no controlling terminal to prompt on and $SSH_ASKPASS is not set \
+         (refusing to read a secret from a redirected stdin)",
+    )
+}
+
+/// Pull one line off `r` into `buf`, stopping at `\n` (which is
 /// consumed but not appended). `\r` is dropped. Capped at `max_len`
 /// bytes to bound memory if the source is unbounded.
-fn read_one_line(buf: &mut String, max_len: usize) -> std::io::Result<()> {
+fn read_one_line(r: &mut dyn Read, buf: &mut String, max_len: usize) -> std::io::Result<()> {
     let mut byte = [0u8; 1];
-    let mut stdin = std::io::stdin();
     loop {
-        let n = stdin.read(&mut byte)?;
+        let n = r.read(&mut byte)?;
         if n == 0 || byte[0] == b'\n' {
             break;
         }
@@ -253,23 +322,20 @@ fn read_one_line(buf: &mut String, max_len: usize) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Unix-only no-echo password read. Returns `Ok(None)` if stdin isn't
-/// a tty (so caller falls back to plain read with the warning). On
-/// success the terminal echo bit is restored via a `Drop` guard,
-/// even if the read fails or panics.
+/// Unix no-echo secret read from the prompt terminal. The terminal's echo
+/// bit is cleared for the duration of the read and restored via a `Drop`
+/// guard, even if the read fails or panics. Should `tcgetattr`/`tcsetattr`
+/// fail (it should not on `/dev/tty`), the read proceeds with echo after a
+/// one-line warning rather than silently exposing the secret.
 #[cfg(unix)]
-fn read_password_no_echo_unix() -> std::io::Result<Option<Zeroizing<String>>> {
-    use std::os::unix::io::AsRawFd;
-    let fd = std::io::stdin().as_raw_fd();
+fn read_secret_line(tty: &mut PromptTty) -> std::io::Result<Zeroizing<String>> {
+    let fd = tty.fd;
     // SAFETY: zero-init is the documented way to allocate a termios
     // struct before tcgetattr fills it in.
     let mut term: libc::termios = unsafe { core::mem::zeroed() };
-    // SAFETY: `fd` is a valid file descriptor (stdin); `term` is a
-    // writable termios.
-    if unsafe { libc::tcgetattr(fd, &mut term as *mut _) } != 0 {
-        // Not a tty (or some other failure); fall back.
-        return Ok(None);
-    }
+    // SAFETY: `fd` is the open `/dev/tty` descriptor owned by `tty`;
+    // `term` is a writable termios.
+    let got = unsafe { libc::tcgetattr(fd, &mut term as *mut _) } == 0;
     let original = term;
 
     // Drop guard restores echo even on panic/early-return.
@@ -279,27 +345,44 @@ fn read_password_no_echo_unix() -> std::io::Result<Option<Zeroizing<String>>> {
     }
     impl Drop for EchoGuard {
         fn drop(&mut self) {
-            // SAFETY: we captured the original termios just above; the
-            // fd is still stdin, valid for the lifetime of the process.
+            // SAFETY: we captured the original termios just above; the fd
+            // outlives this guard (it belongs to the enclosing `PromptTty`).
             unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
         }
     }
 
     term.c_lflag &= !libc::ECHO;
-    // SAFETY: `term` is a valid termios value derived from
-    // `tcgetattr`, with only ECHO cleared.
-    if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } != 0 {
-        return Ok(None);
+    // SAFETY: `term` is a valid termios value derived from `tcgetattr`,
+    // with only ECHO cleared.
+    let no_echo = got && unsafe { libc::tcsetattr(fd, libc::TCSANOW, &term) } == 0;
+    let _guard = no_echo.then_some(EchoGuard { fd, original });
+    if !no_echo {
+        let _ = writeln!(
+            tty.output,
+            "\n(warning: terminal echo could not be disabled; input will be visible)"
+        );
     }
-    let _guard = EchoGuard { fd, original };
 
     let mut buf = String::new();
-    let res = read_one_line(&mut buf, 4096);
+    let res = read_one_line(&mut tty.input, &mut buf, 4096);
     // Print the missing newline so subsequent output doesn't run into
     // the prompt line.
-    eprintln!();
+    let _ = tty.output.write_all(b"\n");
     res?;
-    Ok(Some(Zeroizing::new(buf)))
+    Ok(Zeroizing::new(buf))
+}
+
+/// Non-Unix secret read: we have no portable way to clear the console echo
+/// bit without extra dependencies, so warn once and read with echo.
+#[cfg(not(unix))]
+fn read_secret_line(tty: &mut PromptTty) -> std::io::Result<Zeroizing<String>> {
+    let _ = writeln!(
+        tty.output,
+        "\n(warning: terminal echo could not be disabled; input will be visible)"
+    );
+    let mut buf = String::new();
+    read_one_line(&mut tty.input, &mut buf, 4096)?;
+    Ok(Zeroizing::new(buf))
 }
 
 /// Drop-guard wrapper around a saved `termios` snapshot that switches
@@ -605,26 +688,20 @@ fn uninstall_signal_handler() {
     termios_signal::INSTALLED.store(false, Ordering::Release);
 }
 
-/// Honour `$SSH_ASKPASS` when set: invoke the named helper, take its
-/// first stdout line as the password. The helper conventionally takes
-/// the prompt string as its sole argument. Returns `Ok(None)` if the
-/// env var is unset.
-fn try_ssh_askpass() -> std::io::Result<Option<Zeroizing<String>>> {
-    let askpass = match std::env::var_os("SSH_ASKPASS") {
-        Some(v) if !v.is_empty() => v,
-        _ => return Ok(None),
-    };
-    // OpenSSH consults SSH_ASKPASS_REQUIRE: `force` -> always, `prefer`
-    // -> always if SSH_ASKPASS is set, `never` -> never. We treat any
-    // other value (including unset) as `prefer`, mirroring how the
-    // helper is typically wired up.
-    if let Some(req) = std::env::var_os("SSH_ASKPASS_REQUIRE")
-        && req == "never"
-    {
+/// Honour `$SSH_ASKPASS` when set: invoke the named helper with `prompt` as
+/// its sole argument and take its first stdout line as the answer. Returns
+/// `Ok(None)` if no helper is configured (or `SSH_ASKPASS_REQUIRE=never`), or
+/// if the helper could not be run / exited non-zero.
+fn try_ssh_askpass(prompt: &str) -> std::io::Result<Option<Zeroizing<String>>> {
+    if !askpass_configured() {
         return Ok(None);
     }
+    let askpass = match std::env::var_os("SSH_ASKPASS") {
+        Some(v) => v,
+        None => return Ok(None),
+    };
     let mut cmd = std::process::Command::new(askpass);
-    cmd.arg("password: ");
+    cmd.arg(prompt);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::inherit());
@@ -646,10 +723,50 @@ fn try_ssh_askpass() -> std::io::Result<Option<Zeroizing<String>>> {
     Ok(Some(Zeroizing::new(s)))
 }
 
+/// OpenSSH's `sshkey_perm_ok` check: a private key file owned by the
+/// calling user must not be group- or world-accessible (`mode & 0o077`).
+/// Returns `Err` with OpenSSH's exact banner when the file is too open;
+/// `Ok(())` otherwise (including for files owned by another user, which
+/// OpenSSH also leaves to that user's discretion, and on non-Unix
+/// platforms where the mode bits carry no meaning).
+///
+/// The check is a metadata lookup on `path` *before* it is read, so a
+/// too-open key never even enters memory.
+pub fn check_identity_perms(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let euid = nix::unistd::geteuid().as_raw();
+        let mode = md.mode() & 0o777;
+        if md.uid() == euid && (mode & 0o077) != 0 {
+            return Err(format!(
+                "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                 @         WARNING: UNPROTECTED PRIVATE KEY FILE!          @\n\
+                 @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                 Permissions {mode:04o} for '{}' are too open.\n\
+                 It is required that your private key files are NOT accessible by others.\n\
+                 This private key will be ignored.",
+                path.display()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 /// Read an OpenSSH PEM identity file off disk and parse it. We refuse
 /// passphrase-protected keys here (the bins don't have the prompting
 /// infrastructure); users can pre-decrypt with `ssh-keygen -p`.
+///
+/// A key file that is group/world-accessible is refused outright with
+/// OpenSSH's `UNPROTECTED PRIVATE KEY FILE!` banner
+/// (see [`check_identity_perms`]).
 pub fn load_identity(path: &str) -> Result<PrivateKey, String> {
+    check_identity_perms(Path::new(path))?;
     let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     PrivateKey::parse_pem(&pem, None)
         .map_err(|e| format!("parse {path}: {e} (passphrase-protected keys not supported here)"))
@@ -741,16 +858,22 @@ pub fn base64_no_pad(bytes: &[u8]) -> String {
 }
 
 /// The first-time / unknown-host TOFU prompt — mimics OpenSSH's
-/// wording so muscle-memory ports. Returns `true` if the user answers
-/// `yes` (or `y`), `false` otherwise (including on stdin EOF).
+/// wording so muscle-memory ports. Returns `true` only if the user types
+/// `yes` (case-insensitive) on the controlling terminal; anything else —
+/// including `y`, an empty line, EOF, or the absence of a terminal — is a
+/// refusal.
+///
+/// The answer is read from `/dev/tty` (see [`PromptTty`]), never from
+/// stdin, so `ssh host < file` / `yes | ssh host` / a CI runner can never
+/// accept an unknown key by accident. Without a terminal this fails closed
+/// with `Host key verification failed`, like OpenSSH.
 ///
 /// **Do not** reuse this for the mismatch path: a "yes" here is a
 /// trust-on-first-use decision, not a "the key I trusted yesterday is
 /// gone and I'm fine with that" decision. See [`tofu_mismatch_prompt`]
 /// for the mismatch variant, which is preceded by the loud
 /// `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` banner (emitted
-/// by `client::build_verifier`) and requires the user to type `yes`
-/// in full — no `y` shortcut.
+/// by `client::build_verifier`).
 pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
     let fp = fingerprint_b64_sha256(key_blob);
     let target = if port == 22 {
@@ -758,12 +881,14 @@ pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bo
     } else {
         format!("[{host}]:{port}")
     };
-    eprintln!("The authenticity of host '{target}' can't be established.");
-    eprintln!("{key_type} key fingerprint is {fp}.");
-    eprint!("Are you sure you want to continue connecting (yes/no)? ");
-    let _ = std::io::stderr().flush();
-    let answer = read_short_stdin_line();
-    matches!(answer.as_str(), "yes" | "y")
+    let banner = format!(
+        "The authenticity of host '{target}' can't be established.\n\
+         {key_type} key fingerprint is {fp}.\n"
+    );
+    confirm_yes_on_tty(
+        &banner,
+        "Are you sure you want to continue connecting (yes/no)? ",
+    )
 }
 
 /// The mismatch TOFU prompt — used when the host IS already in
@@ -773,16 +898,11 @@ pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bo
 /// already printed by the verifier in `client::build_verifier` before
 /// this function runs.
 ///
-/// Compared to [`tofu_prompt`] this is intentionally more frictional:
-///
-/// - Default on empty input is **deny**, same as `tofu_prompt`, but
-///   here it really matters — users have muscle-memory for hitting
-///   Enter through TOFU prompts.
-/// - The shortcut `y` is **not** accepted; the user must type `yes`
-///   in full.
-///
-/// This matches OpenSSH's `StrictHostKeyChecking=ask` behaviour for
-/// mismatches: refuse unless the user types something deliberate.
+/// Like [`tofu_prompt`] this reads its answer from the controlling
+/// terminal only and requires the full word `yes` — no `y` shortcut, and
+/// the default on empty input / EOF / no terminal is **deny**. Here that
+/// really matters: users have muscle-memory for hitting Enter through
+/// TOFU prompts, and a changed key is the MITM signature.
 pub fn tofu_mismatch_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
     let fp = fingerprint_b64_sha256(key_blob);
     let target = if port == 22 {
@@ -790,43 +910,46 @@ pub fn tofu_mismatch_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u
     } else {
         format!("[{host}]:{port}")
     };
-    eprintln!(
+    let banner = format!(
         "Host key verification for '{target}' FAILED: the {key_type} key the server presented \
-         ({fp}) does not match any entry in your known_hosts file."
-    );
-    eprintln!(
-        "If you are absolutely sure this is the new legitimate key for this host, type `yes` \
+         ({fp}) does not match any entry in your known_hosts file.\n\
+         If you are absolutely sure this is the new legitimate key for this host, type `yes` \
          to accept it and overwrite the trusted entry. Anything else (including just pressing \
-         Enter) will refuse the connection."
+         Enter) will refuse the connection.\n"
     );
-    eprint!("Accept the new key and replace the trusted entry (type `yes` to confirm)? ");
-    let _ = std::io::stderr().flush();
-    let answer = read_short_stdin_line();
-    // Deliberately strict: `y` is NOT accepted, only the full word
-    // `yes`. Forces the user to slow down past the muscle-memory point.
-    answer == "yes"
+    confirm_yes_on_tty(
+        &banner,
+        "Accept the new key and replace the trusted entry (type `yes` to confirm)? ",
+    )
 }
 
-/// Read a single short line from stdin, lowercase + trim it, and cap
-/// at 16 bytes (longer answers are truncated since we only care about
-/// `yes`/`no`/short variants). Returns an empty string on EOF.
-fn read_short_stdin_line() -> String {
-    let mut line = String::new();
-    let mut byte = [0u8; 1];
-    let mut stdin = std::io::stdin();
-    while let Ok(n) = stdin.read(&mut byte) {
-        if n == 0 || byte[0] == b'\n' {
-            break;
-        }
-        if byte[0] == b'\r' {
-            continue;
-        }
-        line.push(byte[0] as char);
-        if line.len() > 16 {
-            break;
-        }
+/// Print `banner` + `question` on the controlling terminal and return
+/// whether the user typed exactly `yes` (case-insensitive, surrounding
+/// whitespace ignored). Any read error, EOF, other answer, or a missing
+/// terminal yields `false`.
+fn confirm_yes_on_tty(banner: &str, question: &str) -> bool {
+    let Some(mut tty) = open_prompt_tty() else {
+        eprint!("{banner}");
+        eprintln!(
+            "Host key verification failed: no controlling terminal to confirm the key on \
+             (add the key to known_hosts, or use StrictHostKeyChecking=accept-new)."
+        );
+        return false;
+    };
+    if tty
+        .output
+        .write_all(banner.as_bytes())
+        .and_then(|()| tty.output.write_all(question.as_bytes()))
+        .and_then(|()| tty.output.flush())
+        .is_err()
+    {
+        return false;
     }
-    line.trim().to_ascii_lowercase()
+    let mut line = String::new();
+    if read_one_line(&mut tty.input, &mut line, 256).is_err() {
+        return false;
+    }
+    line.trim().eq_ignore_ascii_case("yes")
 }
 
 /// Build the [`HostKeyPolicy`] for a given strict mode + optional override
@@ -957,6 +1080,8 @@ pub fn default_identity_paths() -> Vec<PathBuf> {
 ///     "encrypted, no key material" from "broken file" via the
 ///     `Error::Crypto("passphrase required")` sentinel produced by
 ///     `PrivateKey::parse_openssh_pem`.
+///   - `Ok(None)` (after printing OpenSSH's `UNPROTECTED PRIVATE KEY
+///     FILE!` banner) when the file is group/world-accessible.
 ///   - `Ok(Some(_))` when the key parsed.
 ///   - `Err(_)` when the file exists but is malformed — surfaced
 ///     so the caller can warn once, since a broken default identity
@@ -968,6 +1093,13 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
+    // Too-open default identities are skipped with OpenSSH's loud warning
+    // rather than treated as a hard error: the user didn't name this key,
+    // discovery did, and OpenSSH behaves the same way.
+    if let Err(banner) = check_identity_perms(path) {
+        eprintln!("{banner}");
+        return Ok(None);
+    }
     match PrivateKey::parse_pem(&pem, None) {
         Ok(pk) => Ok(Some(pk)),
         Err(Error::Crypto("passphrase required")) => Ok(None),
@@ -986,8 +1118,9 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
 /// `/etc/ssh/ssh_config` are read in that order — the user file wins for
 /// scalar options and both contribute to cumulative lists.
 ///
-/// A missing file is silently skipped; the only error path is a file that
-/// exists but won't parse.
+/// A missing file is silently skipped. Errors: a file that exists but won't
+/// parse, or a `~/.ssh/config` with bad ownership / permissions (see
+/// [`check_user_config_perms`]).
 pub fn load_client_config(
     explicit: Option<&Path>,
 ) -> Result<puressh::config::SshClientConfig, String> {
@@ -1004,6 +1137,7 @@ pub fn load_client_config(
     if let Some(home) = std::env::var_os("HOME") {
         let user = PathBuf::from(home).join(".ssh").join("config");
         if user.exists() {
+            check_user_config_perms(&user)?;
             cfg =
                 Some(SshClientConfig::load(&user).map_err(|e| format!("{}: {e}", user.display()))?);
         }
@@ -1018,6 +1152,34 @@ pub fn load_client_config(
         }
     }
     Ok(cfg.unwrap_or_default())
+}
+
+/// OpenSSH's `SSHCONF_CHECKPERM` rule for the per-user client config: the
+/// file must be owned by the calling user or root and must not be group- or
+/// world-writable, otherwise it is refused with `Bad owner or permissions on
+/// <path>`. A writable config lets another local user inject `ProxyCommand`
+/// (arbitrary command execution), `IdentityFile`, `StrictHostKeyChecking no`,
+/// and friends into every session the victim starts.
+///
+/// Only `~/.ssh/config` is checked, exactly like OpenSSH: `-F file` is an
+/// explicit user choice and `/etc/ssh/ssh_config` is root-managed. Files
+/// pulled in via `Include` are *not* checked because the config loader does
+/// not expose the list of files it read. No-op on non-Unix.
+fn check_user_config_perms(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let euid = nix::unistd::geteuid().as_raw();
+        if (md.uid() != 0 && md.uid() != euid) || (md.mode() & 0o022) != 0 {
+            return Err(format!("Bad owner or permissions on {}", path.display()));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
 /// Load an `sshd_config(5)` for the `sshd` binary. Returns an error if the
@@ -1280,6 +1442,98 @@ mod keystroke_obfuscator_tests {
         o.enqueue(b"a", 0);
         assert!(o.take_started_log());
         assert!(!o.take_started_log());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod perm_tests {
+    //! Owner / mode checks for `~/.ssh/config` and private identity files.
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    struct Scratch(PathBuf);
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir()
+                .join(format!("puressh-perm-{tag}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+        fn file(&self, name: &str, mode: u32) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, b"x").unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn identity_too_open_is_refused_with_openssh_banner() {
+        let s = Scratch::new("id");
+        for mode in [0o644, 0o640, 0o604, 0o660, 0o777] {
+            let p = s.file(&format!("key-{mode:o}"), mode);
+            let err = check_identity_perms(&p).unwrap_err();
+            assert!(
+                err.contains("UNPROTECTED PRIVATE KEY FILE"),
+                "{mode:o}: {err}"
+            );
+            assert!(err.contains(&format!("Permissions {mode:04o}")), "{err}");
+            assert!(err.contains("will be ignored"), "{err}");
+        }
+        for mode in [0o600, 0o400, 0o700] {
+            let p = s.file(&format!("key-{mode:o}"), mode);
+            assert!(check_identity_perms(&p).is_ok(), "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn identity_too_open_is_rejected_by_both_loaders() {
+        let s = Scratch::new("load");
+        let p = s.file("id_ed25519", 0o644);
+        let err = load_identity(p.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("UNPROTECTED"), "{err}");
+        // Default-discovery path: skipped (warning printed), not an error.
+        assert!(matches!(try_load_default_identity(&p), Ok(None)));
+    }
+
+    #[test]
+    fn identity_missing_is_a_read_error_not_a_perm_error() {
+        let s = Scratch::new("missing");
+        let err = check_identity_perms(&s.0.join("nope")).unwrap_err();
+        assert!(err.starts_with("read "), "{err}");
+    }
+
+    #[test]
+    fn user_config_group_or_world_writable_is_refused() {
+        let s = Scratch::new("cfg");
+        for mode in [0o664, 0o646, 0o666, 0o622] {
+            let p = s.file(&format!("config-{mode:o}"), mode);
+            let err = check_user_config_perms(&p).unwrap_err();
+            assert!(
+                err.starts_with("Bad owner or permissions on "),
+                "{mode:o}: {err}"
+            );
+        }
+        for mode in [0o644, 0o600, 0o444, 0o755] {
+            let p = s.file(&format!("config-{mode:o}"), mode);
+            assert!(check_user_config_perms(&p).is_ok(), "{mode:o}");
+        }
+    }
+
+    #[test]
+    fn user_config_missing_is_an_error() {
+        let s = Scratch::new("cfgmissing");
+        assert!(check_user_config_perms(&s.0.join("config")).is_err());
     }
 }
 

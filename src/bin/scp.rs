@@ -39,10 +39,10 @@ use common::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: scp [-v[v[v]]] [-r] [-p] [-F configfile] [-P port] [-i identity_file] [-l user] \
+const USAGE: &str = "usage: scp [-v[v[v]]] [-r] [-p] [-B] [-F configfile] [-P port] [-i identity_file] [-l user] \
                      [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
                      [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
-                     [-o IdentitiesOnly={yes,no}] \
+                     [-o IdentitiesOnly={yes,no}] [-o BatchMode={yes,no}] \
                      SOURCE [SOURCE...] TARGET";
 
 struct Cli {
@@ -59,6 +59,9 @@ struct Cli {
     known_hosts_path: Option<PathBuf>,
     hash_known_hosts: Option<bool>,
     identities_only: Option<bool>,
+    /// `-B` / `-o BatchMode=yes`: never prompt (no password, no host-key
+    /// question). `None` ⇒ the ssh_config `BatchMode` decides.
+    batch_mode: Option<bool>,
     /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
     /// See [`common::set_verbose`].
     verbose: u8,
@@ -77,6 +80,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut known_hosts_path: Option<PathBuf> = None;
     let mut hash_known_hosts: Option<bool> = None;
     let mut identities_only: Option<bool> = None;
+    let mut batch_mode: Option<bool> = None;
     let mut verbose: u8 = 0;
     let mut positional: Vec<String> = Vec::new();
 
@@ -137,6 +141,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         identities_only =
                             Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
                     }
+                    "batchmode" => {
+                        batch_mode =
+                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+                    }
                     other => {
                         return Err(format!("unsupported -o option: {other}={val}"));
                     }
@@ -151,8 +159,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             "-vvv" => {
                 verbose = 3;
             }
+            // scp(1) `-B`: batch mode — never prompt for passwords or
+            // host-key confirmation.
+            "-B" => batch_mode = Some(true),
             // Ignore harmless flags scp(1) users sometimes set.
-            "-q" | "-B" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
+            "-q" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
             s if s.starts_with('-') => {
                 return Err(format!("unknown flag: {s}"));
             }
@@ -183,6 +194,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         known_hosts_path,
         hash_known_hosts,
         identities_only,
+        batch_mode,
         verbose,
         positional,
     })
@@ -221,7 +233,13 @@ fn open_authenticated(
 
     let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
     let user = resolve_user(cli_user.as_deref(), user_in_endpoint)?;
-    let strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    let batch = common::pick(cli.batch_mode, cfg_block.batch_mode, false);
+    let mut strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
+    // BatchMode never prompts: OpenSSH promotes `ask` to `yes` (refuse
+    // unknown hosts) rather than blocking on a question nobody can answer.
+    if batch && strict == StrictMode::Ask {
+        strict = StrictMode::Yes;
+    }
     let known_hosts_path = cli
         .known_hosts_path
         .clone()
@@ -342,6 +360,23 @@ fn open_authenticated(
         false
     };
     if !authed {
+        // Password auth needs somewhere safe to ask. Under BatchMode, or
+        // with no controlling terminal and no $SSH_ASKPASS, fail closed like
+        // OpenSSH instead of reading the password off a redirected stdin.
+        if batch {
+            return Err(
+                "Permission denied (publickey); BatchMode is on, not prompting for a \
+                        password"
+                    .into(),
+            );
+        }
+        if !common::secret_prompt_available() {
+            return Err(
+                "Permission denied (publickey); no controlling terminal to prompt for a \
+                        password and $SSH_ASKPASS is unset"
+                    .into(),
+            );
+        }
         vlog(1, &format!("trying password auth as {user}"));
         let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
         client

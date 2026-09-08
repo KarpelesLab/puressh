@@ -401,6 +401,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 let (k, val) = v
                     .split_once('=')
                     .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
+                // The unrecognised-keyword path below joins every `-o` with
+                // `\n` into a synthetic config that the real parser reads;
+                // a value carrying a line break would smuggle in extra
+                // directives. Refuse up front for every keyword.
+                if v.contains(['\n', '\r']) {
+                    return Err(format!(
+                        "-o value for {k} must not contain a newline or carriage return"
+                    ));
+                }
                 match k.to_ascii_lowercase().as_str() {
                     "stricthostkeychecking" => {
                         strict = Some(match val.to_ascii_lowercase().as_str() {
@@ -780,11 +789,15 @@ impl KeyboardInteractiveResponder for StdinKbdResponder {
         if !instruction.is_empty() {
             eprintln!("{}", sanitize_terminal_str(instruction));
         }
+        // The trait returns plain `String`s (the driver zeroizes the
+        // encoded packet, not these). Move each answer out of its
+        // `Zeroizing` buffer rather than cloning it so there is exactly one
+        // plaintext copy alive, owned by the auth driver.
         prompts
             .iter()
             .map(|(prompt, echo)| {
                 read_kbdint_response(prompt, *echo)
-                    .map(|z| z.to_string())
+                    .map(|mut z| core::mem::take(&mut *z))
                     // On read error, send an empty answer (the server will
                     // reject); never abort the whole exchange here.
                     .unwrap_or_default()
@@ -822,8 +835,20 @@ fn authenticate_client(
         .unwrap_or(true);
     // OpenSSH default is 3 attempts.
     let max_prompts = cfg_block.number_of_password_prompts.unwrap_or(3);
-    let password_enabled = !batch && password_allowed_by_prefs && max_prompts > 0;
-    let kbdint_enabled = !batch && kbdint_allowed_by_prefs;
+    // Without a controlling terminal or an askpass helper there is nowhere
+    // safe to ask: OpenSSH fails closed rather than reading answers from a
+    // redirected stdin (which a hostile server could otherwise harvest by
+    // offering `password`). Treat that exactly like BatchMode.
+    let can_prompt = batch || common::secret_prompt_available();
+    if !batch && !can_prompt {
+        vlog(
+            1,
+            "no controlling terminal and $SSH_ASKPASS unset: password and \
+             keyboard-interactive auth disabled",
+        );
+    }
+    let password_enabled = !batch && can_prompt && password_allowed_by_prefs && max_prompts > 0;
+    let kbdint_enabled = !batch && can_prompt && kbdint_allowed_by_prefs;
 
     let mut auth = client.new_auth_driver(user);
     if !credentials.is_empty() {
@@ -851,7 +876,10 @@ fn authenticate_client(
             }
             attempts += 1;
             match read_password_from_stdin() {
-                Ok(z) => Some(SecretString::from(z.to_string())),
+                // `SecretString` wraps its own `Zeroizing`; moving the
+                // `String` out of ours (leaving an empty, already-wiped
+                // buffer behind) avoids a second plaintext copy.
+                Ok(mut z) => Some(SecretString::from(core::mem::take(&mut *z))),
                 Err(e) => {
                     eprintln!("read password: {e}");
                     None
@@ -3196,6 +3224,46 @@ fn main() -> ExitCode {
             eprintln!("ssh: {msg}");
             ExitCode::from(255)
         }
+    }
+}
+
+#[cfg(test)]
+mod extra_o_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn dash_o_rejects_embedded_newline() {
+        // A line break in a `-o` value would smuggle a second directive
+        // into the synthetic config the real parser reads.
+        let err = parse_args(&args(&["-o", "User=x\nProxyCommand=evil", "host"]))
+            .err()
+            .unwrap();
+        assert!(err.contains("newline"), "{err}");
+        let err = parse_args(&args(&["-o", "StrictHostKeyChecking=no\r", "host"]))
+            .err()
+            .unwrap();
+        assert!(err.contains("newline"), "{err}");
+        // Plain values still parse.
+        assert!(parse_args(&args(&["-o", "User=x", "host"])).is_ok());
+    }
+
+    #[test]
+    fn dash_o_control_path_overlays_block() {
+        let mut block = puressh::config::ClientOptions::default();
+        apply_extra_o(
+            &mut block,
+            &args(&["ControlPath /tmp/cm-%C", "ControlMaster auto"]),
+        )
+        .unwrap();
+        assert_eq!(block.control_path.as_deref(), Some("/tmp/cm-%C"));
+        assert_eq!(
+            block.control_master,
+            Some(puressh::config::ControlMaster::Auto)
+        );
     }
 }
 

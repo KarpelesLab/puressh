@@ -51,6 +51,18 @@ use crate::transport::{ExtInfo, KexAlgorithmsOwned, KexInit};
 // live inside the sans-IO `ServerDriver`; the frontend keeps only the
 // auth-step and connection/drain loop caps.
 const MAX_AUTH_STEPS: usize = 64;
+
+/// Default `MaxAuthTries` when neither [`Config::max_auth_tries`] nor an
+/// `sshd_config` `MaxAuthTries` says otherwise. Matches OpenSSH's default of
+/// 6 failed attempts per connection.
+pub const DEFAULT_MAX_AUTH_TRIES: u32 = 6;
+
+/// Default per-connection ceiling on live `tcpip-forward` /
+/// `streamlocal-forward@openssh.com` bindings (see
+/// [`Config::max_forward_bindings`]). Each binding costs a listener plus an
+/// accept thread, so an authenticated peer must not be able to request an
+/// unbounded number of them.
+pub const DEFAULT_MAX_FORWARD_BINDINGS: usize = 64;
 const MAX_CONNECTION_STEPS: usize = 10_000_000;
 const MAX_DRAIN_STEPS: usize = 1_000_000;
 
@@ -990,6 +1002,23 @@ pub struct Config {
     /// means unlimited. Defaults to `Some(256)`. Has no effect on
     /// [`Server::accept_one`], which never spawns.
     pub max_connections: Option<usize>,
+    /// `MaxAuthTries` fallback — the number of failed authentication attempts
+    /// a peer may make on one connection before it is disconnected. An
+    /// `sshd_config` `MaxAuthTries` in [`Config::policy`] (global or
+    /// `Match`-scoped) takes precedence; this value applies when the policy
+    /// doesn't set one, or when there is no policy at all. Defaults to
+    /// `Some(`[`DEFAULT_MAX_AUTH_TRIES`]`)` (6, as in OpenSSH). `None` means
+    /// unlimited and must be requested explicitly via
+    /// [`Config::with_max_auth_tries`] — it lets a peer spend the whole
+    /// `LoginGraceTime` guessing passwords, so only use it behind another
+    /// rate limiter.
+    pub max_auth_tries: Option<u32>,
+    /// Per-connection ceiling on live remote-forward bindings — the sum of
+    /// `tcpip-forward` and `streamlocal-forward@openssh.com` global requests
+    /// accepted and not yet cancelled. Requests past the ceiling fail with
+    /// `REQUEST_FAILURE` without touching the handler. `None` means
+    /// unlimited. Defaults to `Some(`[`DEFAULT_MAX_FORWARD_BINDINGS`]`)`.
+    pub max_forward_bindings: Option<usize>,
     /// `Ciphers` override (sshd_config) — advertised cipher preference list
     /// for both directions. `None` ⇒ built-in default.
     pub ciphers: Option<Vec<String>>,
@@ -1290,6 +1319,8 @@ impl Config {
             accept_env: Vec::new(),
             login_grace_time: Duration::from_secs(120),
             max_connections: Some(256),
+            max_auth_tries: Some(DEFAULT_MAX_AUTH_TRIES),
+            max_forward_bindings: Some(DEFAULT_MAX_FORWARD_BINDINGS),
             ciphers: None,
             macs: None,
             kex_algorithms: None,
@@ -1383,6 +1414,24 @@ impl Config {
     /// `None` disables the cap (unlimited). Defaults to `Some(256)`.
     pub fn with_max_connections(mut self, max: Option<usize>) -> Self {
         self.max_connections = max;
+        self
+    }
+
+    /// Set the fallback `MaxAuthTries` (failed auth attempts tolerated per
+    /// connection) used when the `sshd_config` policy doesn't set one. Defaults
+    /// to `Some(`[`DEFAULT_MAX_AUTH_TRIES`]`)`. Passing `None` removes the cap
+    /// entirely — see [`Config::max_auth_tries`] for why that is a bad idea on
+    /// an exposed listener.
+    pub fn with_max_auth_tries(mut self, max: Option<u32>) -> Self {
+        self.max_auth_tries = max;
+        self
+    }
+
+    /// Set the per-connection ceiling on live `tcpip-forward` /
+    /// `streamlocal-forward` bindings. Defaults to
+    /// `Some(`[`DEFAULT_MAX_FORWARD_BINDINGS`]`)`; `None` disables the cap.
+    pub fn with_max_forward_bindings(mut self, max: Option<usize>) -> Self {
+        self.max_forward_bindings = max;
         self
     }
 
@@ -1819,7 +1868,8 @@ struct PreAuthPolicy {
 
 /// Phase 1: resolve the policy with an address-only context. Without a policy
 /// this reproduces the historical behaviour (static `allowed_auth_methods`,
-/// no banner, no MaxAuthTries).
+/// no banner) with `MaxAuthTries` taken from [`Config::max_auth_tries`]; with a
+/// policy, its `MaxAuthTries` (if set) wins over the config fallback.
 fn resolve_preauth_policy(
     cfg: &Config,
     address: Option<&str>,
@@ -1829,7 +1879,7 @@ fn resolve_preauth_policy(
     let Some(policy) = cfg.policy.as_ref() else {
         return PreAuthPolicy {
             methods: cfg.allowed_auth_methods.clone(),
-            max_auth_tries: None,
+            max_auth_tries: cfg.max_auth_tries,
             banner: None,
         };
     };
@@ -1848,7 +1898,7 @@ fn resolve_preauth_policy(
         .and_then(|p| std::fs::read_to_string(p).ok());
     PreAuthPolicy {
         methods,
-        max_auth_tries: opts.max_auth_tries,
+        max_auth_tries: opts.max_auth_tries.or(cfg.max_auth_tries),
         banner,
     }
 }
@@ -3280,6 +3330,21 @@ fn dispatch_app_packet(
     Ok(())
 }
 
+/// True iff this connection may add one more remote-forward binding under
+/// [`Config::max_forward_bindings`]. Counts `tcpip-forward` and
+/// `streamlocal-forward` bindings together: both cost a listener plus an
+/// accept thread, and the cap exists to bound that per connection.
+fn forward_bindings_below_cap(
+    cfg: &Config,
+    forward: &ForwardConn,
+    streamlocal_forward: &StreamlocalForwardConn,
+) -> bool {
+    match cfg.max_forward_bindings {
+        None => true,
+        Some(cap) => forward.owned_bindings.len() + streamlocal_forward.owned_bindings.len() < cap,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_global_request(
     stream: &mut TcpStream,
@@ -3306,7 +3371,8 @@ fn handle_global_request(
             // GatewayPorts rewrites the bind address the handler will use.
             let policy_ok = effective.remote_forwarding_allowed()
                 && (bind_port > u16::MAX as u32
-                    || effective.permit_listen_allows(&bind_address, bind_port as u16));
+                    || effective.permit_listen_allows(&bind_address, bind_port as u16))
+                && forward_bindings_below_cap(cfg, forward, streamlocal_forward);
             let effective_bind = crate::forwarding::reverse::apply_gateway_ports(
                 effective.gateway_ports,
                 &bind_address,
@@ -3390,7 +3456,9 @@ fn handle_global_request(
             // remote-forwarding gate. PermitListen is host:port-based and does
             // not apply to Unix-socket paths, so path filtering is left to the
             // handler's own policy.
-            let bound = if !effective.remote_forwarding_allowed() {
+            let bound = if !effective.remote_forwarding_allowed()
+                || !forward_bindings_below_cap(cfg, forward, streamlocal_forward)
+            {
                 false
             } else if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
                 let ctx = StreamlocalForwardContext::new(streamlocal_forward.req_tx.clone());
@@ -5935,6 +6003,84 @@ mod tests {
     }
 
     #[test]
+    fn c2_tcpip_forward_bindings_capped_per_connection() {
+        // A connection may hold at most `max_forward_bindings` live remote
+        // forwards; the next request is answered REQUEST_FAILURE without
+        // touching the handler, and cancelling one frees a slot.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let allowed_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+        let user = "c2-forward-cap-user".to_string();
+        let user_f = user.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: user_f.clone(),
+                allowed_blob: allowed_blob.clone(),
+            })
+        });
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"unused\n".to_vec(),
+            }),
+        )
+        .with_tcpip_forward(Arc::new(
+            crate::forwarding::reverse::DefaultTcpipForwardHandler::permit_all_interfaces(),
+        ))
+        .with_max_forward_bindings(Some(2));
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind ssh");
+        let ssh_addr = server.local_addr().expect("ssh addr");
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let server_thread = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+
+        let mut client = Client::connect(
+            ssh_addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+            },
+        )
+        .expect("client connect");
+        client
+            .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+            .expect("authenticate");
+
+        let p1 = client
+            .request_tcpip_forward("127.0.0.1", 0)
+            .expect("first bind");
+        let p2 = client
+            .request_tcpip_forward("127.0.0.1", 0)
+            .expect("second bind");
+        assert!(p1 > 0 && p2 > 0 && p1 != p2);
+        match client.request_tcpip_forward("127.0.0.1", 0) {
+            Ok(p) => panic!("third bind must be refused past the cap, got port {p}"),
+            Err(Error::Protocol(_)) => {}
+            Err(other) => panic!("expected Error::Protocol, got {other:?}"),
+        }
+        // Cancelling one frees a slot.
+        client
+            .cancel_tcpip_forward("127.0.0.1", p1)
+            .expect("cancel");
+        let p3 = client
+            .request_tcpip_forward("127.0.0.1", 0)
+            .expect("bind after cancel");
+        assert!(p3 > 0);
+
+        w7_finish(client, server_thread, server_done);
+    }
+
+    #[test]
     fn loopback_tcpip_forward_unconfigured_refused() {
         // Without a tcpip_forward_handler attached the global request
         // must be answered REQUEST_FAILURE; the client surfaces that
@@ -6302,6 +6448,45 @@ mod tests {
         let cfg = policy_cfg("MaxAuthTries 3\n");
         let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
         assert_eq!(pre.max_auth_tries, Some(3));
+    }
+
+    // ---- S8: MaxAuthTries defaults to 6 (OpenSSH) instead of unlimited ----
+
+    #[test]
+    fn s8_max_auth_tries_defaults_to_six_without_policy() {
+        let cfg = policy_cfg("Port 22\n");
+        let no_policy = Config {
+            policy: None,
+            ..cfg
+        };
+        let pre = resolve_preauth_policy(&no_policy, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, Some(DEFAULT_MAX_AUTH_TRIES));
+        assert_eq!(DEFAULT_MAX_AUTH_TRIES, 6);
+    }
+
+    #[test]
+    fn s8_max_auth_tries_defaults_to_six_when_policy_is_silent() {
+        let cfg = policy_cfg("Port 22\n");
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, Some(DEFAULT_MAX_AUTH_TRIES));
+    }
+
+    #[test]
+    fn s8_policy_max_auth_tries_wins_over_config_fallback() {
+        let cfg = policy_cfg("MaxAuthTries 3\n").with_max_auth_tries(Some(9));
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, Some(3));
+    }
+
+    #[test]
+    fn s8_config_can_override_or_disable_the_fallback() {
+        let cfg = policy_cfg("Port 22\n").with_max_auth_tries(Some(9));
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, Some(9));
+        // Unlimited only when explicitly requested.
+        let cfg = policy_cfg("Port 22\n").with_max_auth_tries(None);
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, None);
     }
 
     // ---- F5: mid-userauth Match User / Match Group method re-resolve --------

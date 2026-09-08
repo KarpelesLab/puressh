@@ -16,7 +16,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -98,6 +98,18 @@ const MAX_EXEC_ITER: usize = 1_000_000;
 /// enough to absorb a few full-window writes before the handler thread has
 /// to block on its `Write::write`.
 const SERVE_EGRESS_BACKLOG: usize = 32;
+/// Cap on the per-channel *ingress* mpsc inside [`Client::serve`] (chunks
+/// handed to a handler thread but not yet read by it). Chunks beyond this
+/// are parked dispatcher-side without crediting the SSH receive window, so
+/// a fast peer is throttled by flow control instead of growing an unbounded
+/// queue. See [`ServeRuntime`].
+const SERVE_INGRESS_BACKLOG: usize = 32;
+/// Cap on the stderr (extended-data) bytes a [`ClientChannelStream`] keeps
+/// for [`ClientChannelStream::take_stderr`]. Nothing drains that buffer
+/// while the channel is in use, so rather than withholding window credit
+/// (which would stall the channel forever on a chatty stderr) the buffer
+/// keeps only the most recent `STREAM_STDERR_CAP` bytes.
+const STREAM_STDERR_CAP: usize = 1024 * 1024;
 /// Outer-loop step cap for [`Client::serve`] — generous because each step is
 /// either one packet or one 50 ms timeout tick.
 const MAX_SERVE_STEPS: usize = 100_000_000;
@@ -708,7 +720,7 @@ struct PendingOutboundOpen {
     stream: Option<ChannelStream>,
     /// Pre-built ingress sender; moves into the [`ServeRuntime`] on
     /// `OpenConfirmed`.
-    ingress_tx: Sender<Option<Vec<u8>>>,
+    ingress_tx: SyncSender<Option<Vec<u8>>>,
     /// Pre-built egress receiver; moves into the [`ServeRuntime`] on
     /// `OpenConfirmed`.
     egress_rx: Option<Receiver<ChannelEgress>>,
@@ -719,11 +731,27 @@ struct PendingOutboundOpen {
 /// Per-channel state for an in-process handler running underneath
 /// [`Client::serve`]. Parallel to the server's `SubsystemRuntime` —
 /// dispatcher-side mailbox for one open channel.
+///
+/// # Inbound memory bound
+///
+/// Peer bytes are handed to the handler thread through a **bounded**
+/// `sync_channel` of [`SERVE_INGRESS_BACKLOG`] chunks. The dispatcher never
+/// blocks on it: chunks that don't fit are parked on `ingress_backlog` and
+/// retried every tick. Crucially, the SSH receive window is credited back
+/// to the peer only for chunks that actually reached the handler's queue —
+/// bytes sitting in `ingress_backlog` stay uncredited, so a peer that
+/// streams faster than the handler drains runs out of window and stalls.
+/// Per channel that caps inbound memory at roughly one receive window
+/// (backlog) plus `SERVE_INGRESS_BACKLOG` × max-packet (queued) plus one
+/// chunk (the handler's own buffer), whatever the peer does.
 struct ServeRuntime {
     /// Push peer-sent bytes (or `None` for EOF) to the handler thread.
-    /// Unbounded so the dispatcher never blocks on its own dispatch path —
-    /// memory is bounded by the SSH receive window.
-    ingress_tx: Sender<Option<Vec<u8>>>,
+    /// Bounded; see the type-level note. Only ever used with `try_send`.
+    ingress_tx: SyncSender<Option<Vec<u8>>>,
+    /// Inbound chunks (and a trailing `None` EOF marker) that did not fit
+    /// in `ingress_tx` yet. Window credit for these is withheld until they
+    /// are delivered, so their total size never exceeds the receive window.
+    ingress_backlog: VecDeque<Option<Vec<u8>>>,
     /// Drain bytes the handler wants to ship out.
     egress_rx: Receiver<ChannelEgress>,
     /// Egress data that didn't fit in the remote window on the last tick;
@@ -737,6 +765,67 @@ struct ServeRuntime {
     eof_sent: bool,
     /// Whether we've already sent `CHANNEL_CLOSE` on the wire.
     close_sent: bool,
+}
+
+impl ServeRuntime {
+    fn new(ingress_tx: SyncSender<Option<Vec<u8>>>, egress_rx: Receiver<ChannelEgress>) -> Self {
+        Self {
+            ingress_tx,
+            ingress_backlog: VecDeque::new(),
+            egress_rx,
+            pending_data: Vec::new(),
+            pending_eof: false,
+            pending_close: false,
+            eof_sent: false,
+            close_sent: false,
+        }
+    }
+
+    /// Hand `item` to the handler thread if its queue has room, otherwise
+    /// park it. Returns the number of payload bytes that were **delivered**
+    /// (and may therefore be credited back to the peer's window): `0` when
+    /// the item was parked, when it was an EOF marker, or when the handler
+    /// is gone (its backlog is discarded — the channel is on its way to
+    /// Close and no further credit is owed).
+    fn offer_ingress(&mut self, item: Option<Vec<u8>>) -> usize {
+        if !self.ingress_backlog.is_empty() {
+            self.ingress_backlog.push_back(item);
+            return 0;
+        }
+        let len = item.as_ref().map_or(0, Vec::len);
+        match self.ingress_tx.try_send(item) {
+            Ok(()) => len,
+            Err(mpsc::TrySendError::Full(item)) => {
+                self.ingress_backlog.push_back(item);
+                0
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.ingress_backlog.clear();
+                0
+            }
+        }
+    }
+
+    /// Retry parked ingress. Returns the number of payload bytes delivered
+    /// this call, for window credit.
+    fn flush_ingress(&mut self) -> usize {
+        let mut delivered = 0usize;
+        while let Some(item) = self.ingress_backlog.pop_front() {
+            let len = item.as_ref().map_or(0, Vec::len);
+            match self.ingress_tx.try_send(item) {
+                Ok(()) => delivered += len,
+                Err(mpsc::TrySendError::Full(item)) => {
+                    self.ingress_backlog.push_front(item);
+                    break;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.ingress_backlog.clear();
+                    break;
+                }
+            }
+        }
+        delivered
+    }
 }
 
 /// A blocking SSH client.
@@ -2414,9 +2503,14 @@ impl Client {
                 break Err(e);
             }
 
-            // Per-tick: ship pending egress from each runtime onto the wire,
-            // then reap any runtime whose close has been fully emitted.
+            // Per-tick: retry parked ingress (crediting the receive window
+            // only for what the handlers actually took), ship pending egress
+            // from each runtime onto the wire, then reap any runtime whose
+            // close has been fully emitted.
             if !self.driver.is_kexing() {
+                if let Err(e) = serve_flush_ingress(self, &mut runtimes) {
+                    break Err(e);
+                }
                 if let Err(e) = serve_drain_runtimes(self, &mut runtimes) {
                     break Err(e);
                 }
@@ -2660,6 +2754,9 @@ impl Client {
 /// diagnostic output (notably [`Client::scp_send_to`] /
 /// [`Client::scp_recv_from`]) drain it via [`Self::take_stderr`]. The SFTP
 /// subsystem doesn't emit extended data, so the buffer stays empty there.
+/// The buffer is capped at 1 MiB: once full, the **oldest** bytes are
+/// discarded so the tail (where a remote error message lands) is kept and
+/// a peer cannot exhaust memory through stderr.
 pub struct ClientChannelStream<'a> {
     client: &'a mut Client,
     channel: u32,
@@ -2705,7 +2802,15 @@ impl ClientChannelStream<'_> {
                 data,
             } if channel == self.channel => {
                 let n = data.len() as u32;
+                // Bounded: keep only the newest `STREAM_STDERR_CAP` bytes
+                // (the tail carries the useful diagnostics) so a chatty or
+                // malicious peer cannot grow this buffer without limit. The
+                // window is still credited so the channel keeps flowing.
                 self.stderr_buf.extend_from_slice(&data);
+                if self.stderr_buf.len() > STREAM_STDERR_CAP {
+                    let excess = self.stderr_buf.len() - STREAM_STDERR_CAP;
+                    self.stderr_buf.drain(..excess);
+                }
                 if let Some(adj) = self
                     .client
                     .conn
@@ -3526,7 +3631,8 @@ fn serve_drain_commands(
                     orig_port: orig_port as u32,
                 })?;
                 client.write_payload(&open_payload)?;
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SERVE_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
                 let stream = ChannelStream::new(ingress_rx, egress_tx);
@@ -3545,7 +3651,8 @@ fn serve_drain_commands(
                     .conn
                     .open(ChannelOpen::DirectStreamlocal { socket_path })?;
                 client.write_payload(&open_payload)?;
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SERVE_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
                 let stream = ChannelStream::new(ingress_rx, egress_tx);
@@ -3562,6 +3669,43 @@ fn serve_drain_commands(
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => break,
         }
+    }
+    Ok(())
+}
+
+/// Credit `n` consumed bytes back to the peer's window on `channel`,
+/// emitting a `CHANNEL_WINDOW_ADJUST` when the threshold is reached. A
+/// channel we have already closed (or that is gone) is silently skipped:
+/// deferred credit can legitimately outlive the channel.
+fn serve_credit_window(client: &mut Client, channel: u32, n: usize) -> Result<()> {
+    if n == 0 {
+        return Ok(());
+    }
+    let n = u32::try_from(n).unwrap_or(u32::MAX);
+    match client.conn.replenish_window(channel, n) {
+        Ok(Some(adj)) => client.write_payload(&adj),
+        Ok(None) | Err(Error::BadChannelState) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Per-tick: retry every runtime's parked ingress and credit the receive
+/// window for whatever the handlers accepted this time.
+fn serve_flush_ingress(
+    client: &mut Client,
+    runtimes: &mut BTreeMap<u32, ServeRuntime>,
+) -> Result<()> {
+    let channels: Vec<u32> = runtimes
+        .iter()
+        .filter(|(_, rt)| !rt.ingress_backlog.is_empty())
+        .map(|(ch, _)| *ch)
+        .collect();
+    for ch in channels {
+        let delivered = match runtimes.get_mut(&ch) {
+            Some(rt) => rt.flush_ingress(),
+            None => 0,
+        };
+        serve_credit_window(client, ch, delivered)?;
     }
     Ok(())
 }
@@ -3692,18 +3836,7 @@ fn serve_dispatch_packet(
                     client.write_payload(&p)?;
                     return Ok(());
                 }
-                runtimes.insert(
-                    channel,
-                    ServeRuntime {
-                        ingress_tx: po.ingress_tx,
-                        egress_rx,
-                        pending_data: Vec::new(),
-                        pending_eof: false,
-                        pending_close: false,
-                        eof_sent: false,
-                        close_sent: false,
-                    },
-                );
+                runtimes.insert(channel, ServeRuntime::new(po.ingress_tx, egress_rx));
             }
         }
         ChannelEvent::OpenFailed { channel, .. } => {
@@ -3743,7 +3876,8 @@ fn serve_dispatch_packet(
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
 
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (ingress_tx, ingress_rx) =
+                        mpsc::sync_channel::<Option<Vec<u8>>>(SERVE_INGRESS_BACKLOG);
                     let (egress_tx, egress_rx) =
                         mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3756,18 +3890,7 @@ fn serve_dispatch_packet(
                     thread::spawn(move || {
                         cb(origin, cs);
                     });
-                    runtimes.insert(
-                        channel,
-                        ServeRuntime {
-                            ingress_tx,
-                            egress_rx,
-                            pending_data: Vec::new(),
-                            pending_eof: false,
-                            pending_close: false,
-                            eof_sent: false,
-                            close_sent: false,
-                        },
-                    );
+                    runtimes.insert(channel, ServeRuntime::new(ingress_tx, egress_rx));
                 } else {
                     let p = client.conn.reject_open(
                         channel,
@@ -3797,7 +3920,8 @@ fn serve_dispatch_packet(
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
 
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (ingress_tx, ingress_rx) =
+                        mpsc::sync_channel::<Option<Vec<u8>>>(SERVE_INGRESS_BACKLOG);
                     let (egress_tx, egress_rx) =
                         mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3805,18 +3929,7 @@ fn serve_dispatch_packet(
                     thread::spawn(move || {
                         cb(origin, cs);
                     });
-                    runtimes.insert(
-                        channel,
-                        ServeRuntime {
-                            ingress_tx,
-                            egress_rx,
-                            pending_data: Vec::new(),
-                            pending_eof: false,
-                            pending_close: false,
-                            eof_sent: false,
-                            close_sent: false,
-                        },
-                    );
+                    runtimes.insert(channel, ServeRuntime::new(ingress_tx, egress_rx));
                 } else {
                     let p = client.conn.reject_open(
                         channel,
@@ -3832,25 +3945,15 @@ fn serve_dispatch_packet(
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
 
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (ingress_tx, ingress_rx) =
+                        mpsc::sync_channel::<Option<Vec<u8>>>(SERVE_INGRESS_BACKLOG);
                     let (egress_tx, egress_rx) =
                         mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
                     thread::spawn(move || {
                         cb(cs);
                     });
-                    runtimes.insert(
-                        channel,
-                        ServeRuntime {
-                            ingress_tx,
-                            egress_rx,
-                            pending_data: Vec::new(),
-                            pending_eof: false,
-                            pending_close: false,
-                            eof_sent: false,
-                            close_sent: false,
-                        },
-                    );
+                    runtimes.insert(channel, ServeRuntime::new(ingress_tx, egress_rx));
                 } else {
                     let p = client.conn.reject_open(
                         channel,
@@ -3869,25 +3972,15 @@ fn serve_dispatch_packet(
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
 
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (ingress_tx, ingress_rx) =
+                        mpsc::sync_channel::<Option<Vec<u8>>>(SERVE_INGRESS_BACKLOG);
                     let (egress_tx, egress_rx) =
                         mpsc::sync_channel::<ChannelEgress>(SERVE_EGRESS_BACKLOG);
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
                     thread::spawn(move || {
                         cb(cs);
                     });
-                    runtimes.insert(
-                        channel,
-                        ServeRuntime {
-                            ingress_tx,
-                            egress_rx,
-                            pending_data: Vec::new(),
-                            pending_eof: false,
-                            pending_close: false,
-                            eof_sent: false,
-                            close_sent: false,
-                        },
-                    );
+                    runtimes.insert(channel, ServeRuntime::new(ingress_tx, egress_rx));
                 } else {
                     let p = client.conn.reject_open(
                         channel,
@@ -3909,12 +4002,16 @@ fn serve_dispatch_packet(
             }
         },
         ChannelEvent::Data { channel, data } => {
-            if let Some(rt) = runtimes.get_mut(&channel) {
-                let _ = rt.ingress_tx.send(Some(data.clone()));
-            }
-            if let Some(adj) = client.conn.replenish_window(channel, data.len() as u32)? {
-                client.write_payload(&adj)?;
-            }
+            // Credit the window only for bytes the handler's (bounded)
+            // queue accepted; anything parked in the backlog is credited
+            // when `serve_flush_ingress` later delivers it. Data for a
+            // channel with no runtime (already torn down) is dropped and
+            // credited so the peer isn't left with a dead window.
+            let delivered = match runtimes.get_mut(&channel) {
+                Some(rt) => rt.offer_ingress(Some(data)),
+                None => data.len(),
+            };
+            serve_credit_window(client, channel, delivered)?;
         }
         ChannelEvent::ExtendedData { channel, data, .. } => {
             // forwarded-tcpip channels shouldn't carry extended-data, but if
@@ -3926,8 +4023,9 @@ fn serve_dispatch_packet(
         ChannelEvent::Eof { channel } => {
             if let Some(rt) = runtimes.get_mut(&channel) {
                 // None = EOF marker; the handler's `Read::read` returns
-                // `Ok(0)` next time it drains its buffer.
-                let _ = rt.ingress_tx.send(None);
+                // `Ok(0)` next time it drains its buffer. Queued behind any
+                // parked data so ordering is preserved.
+                let _ = rt.offer_ingress(None);
             }
         }
         ChannelEvent::Close { channel } => {
@@ -4070,6 +4168,42 @@ mod tests {
         assert!(matches!(err, Err(Error::Config(_))));
         let err = build_verifier(&reply, &policy, &runner, "host", 0, None, 0, &flag);
         assert!(matches!(err, Err(Error::Config(_))));
+    }
+
+    /// The serve-loop ingress path is bounded: chunks beyond the handler
+    /// queue's capacity are parked (uncredited) and only delivered — and
+    /// credited — once the handler drains, with EOF kept in order behind
+    /// parked data.
+    #[test]
+    fn serve_runtime_ingress_is_bounded_and_credits_on_delivery() {
+        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(2);
+        let (_egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(1);
+        let mut rt = ServeRuntime::new(ingress_tx, egress_rx);
+
+        assert_eq!(rt.offer_ingress(Some(vec![1; 10])), 10);
+        assert_eq!(rt.offer_ingress(Some(vec![2; 20])), 20);
+        // Queue full: parked, no credit.
+        assert_eq!(rt.offer_ingress(Some(vec![3; 30])), 0);
+        assert_eq!(rt.offer_ingress(None), 0);
+        assert_eq!(rt.ingress_backlog.len(), 2);
+        // Still full: nothing moves.
+        assert_eq!(rt.flush_ingress(), 0);
+
+        // Handler drains one chunk → one parked chunk fits and is credited;
+        // the EOF marker still waits behind nothing else but a full queue.
+        assert_eq!(ingress_rx.try_recv().unwrap().unwrap().len(), 10);
+        assert_eq!(rt.flush_ingress(), 30);
+        assert_eq!(rt.ingress_backlog.len(), 1);
+        assert_eq!(ingress_rx.try_recv().unwrap().unwrap().len(), 20);
+        assert_eq!(rt.flush_ingress(), 0); // EOF delivered, 0 bytes
+        assert!(rt.ingress_backlog.is_empty());
+        assert_eq!(ingress_rx.try_recv().unwrap().unwrap().len(), 30);
+        assert!(ingress_rx.try_recv().unwrap().is_none());
+
+        // Handler gone: parked data is discarded rather than retained.
+        drop(ingress_rx);
+        assert_eq!(rt.offer_ingress(Some(vec![4; 40])), 0);
+        assert!(rt.ingress_backlog.is_empty());
     }
 
     #[test]

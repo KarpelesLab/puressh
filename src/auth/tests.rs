@@ -1655,3 +1655,58 @@ fn cert_userauth_rejects_unknown_cert_name() {
     );
     assert_failure(s.on_packet(&req).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// A2: a first request rejected as "method not advertised" must still pin the
+// username, so a second request under a different name is a username change
+// (disconnect), not a fresh evaluation under the first user's policy.
+// ---------------------------------------------------------------------------
+#[test]
+fn server_unadvertised_rejection_pins_username() {
+    // Advertised set: password only. Request 1 uses a bogus method for
+    // user "alice" and is rejected by the server loop via
+    // `reject_unadvertised` (never reaching `on_packet`).
+    let mut s = ServerAuth::new(TEST_SID.to_vec(), vec!["password"], Box::new(AlwaysReject));
+    let _ = s.on_packet(
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    );
+    let req_alice = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::Other {
+            method: "bogus".into(),
+            tail: Vec::new(),
+        },
+    }
+    .encode();
+    // Mirror the server loop: peek, see an unadvertised method, reject.
+    let (user, method) = ServerAuth::peek_request(&req_alice).expect("decodes");
+    assert_eq!(user, "alice");
+    assert!(!s.accepted_methods().contains(&method));
+    match s.reject_unadvertised(&user).unwrap() {
+        ServerStep::Send(p) => {
+            UserauthFailure::decode(&p).unwrap();
+        }
+        _ => panic!("expected Send(failure)"),
+    }
+    // Request 2 switches to "bob" with an advertised method: must be treated
+    // as a username change and disconnect, never evaluated.
+    let req_bob = UserauthRequest {
+        user: "bob".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::Password {
+            new_password: None,
+            password: "x".into(),
+        },
+    }
+    .encode();
+    match s.on_packet(&req_bob).unwrap() {
+        ServerStep::Disconnect(reason) => {
+            assert_eq!(reason, "auth: username changed mid-authentication");
+        }
+        _ => panic!("expected Disconnect"),
+    }
+}

@@ -2050,7 +2050,7 @@ fn do_server_auth(
                     };
                     srv_send(stream, driver, &banner.encode())?;
                 }
-                resolved_user = Some(user);
+                resolved_user = Some(user.clone());
             }
 
             // If the re-resolved policy forbids the method the client is
@@ -2059,7 +2059,7 @@ fn do_server_auth(
             // `none` probe is always allowed through so the client still
             // learns the (possibly empty) advertised set.
             if method != "none" && !server_auth.accepted_methods().contains(&method) {
-                match server_auth.reject_unadvertised()? {
+                match server_auth.reject_unadvertised(&user)? {
                     ServerStep::Send(p) => {
                         srv_send(stream, driver, &p)?;
                         continue;

@@ -443,8 +443,39 @@ impl ServerAuth {
     /// `MaxAuthTries` and emits `USERAUTH_FAILURE` (or `Disconnect` once the
     /// limit is exceeded) carrying the *current* method set — without ever
     /// consulting the [`Authenticator`].
-    pub fn reject_unadvertised(&mut self) -> Result<ServerStep> {
+    ///
+    /// `user` is the username the rejected request carried (from
+    /// [`Self::peek_request`]). It is pinned exactly as [`Self::on_packet`]
+    /// pins it: the first username seen on the connection is the only one
+    /// accepted for the rest of userauth, and a later request under a
+    /// different name yields [`ServerStep::Disconnect`]. Without this, a
+    /// client whose *first* request was rejected here could switch names on
+    /// its second request and have it evaluated under the first user's
+    /// re-resolved policy.
+    pub fn reject_unadvertised(&mut self, user: &str) -> Result<ServerStep> {
+        if let Some(step) = self.pin_user(user) {
+            return Ok(step);
+        }
         self.emit_failure()
+    }
+
+    /// Pin the connection's username to the first request's value. OpenSSH
+    /// disconnects if the client changes the login name mid-userauth; every
+    /// probe and every real attempt for a connection must carry the same
+    /// name. (The `none`- and pubkey-probe flows all reuse the same
+    /// username, so this only fires on an actual switch.) Returns the
+    /// `Disconnect` step on a switch, `None` when the name is consistent.
+    fn pin_user(&mut self, user: &str) -> Option<ServerStep> {
+        match &self.first_user {
+            Some(prev) if prev != user => Some(ServerStep::Disconnect(
+                "auth: username changed mid-authentication",
+            )),
+            None => {
+                self.first_user = Some(user.into());
+                None
+            }
+            _ => None,
+        }
     }
 
     /// Opt in to letting the [`Authenticator`] see `AuthAttempt::None`.
@@ -491,6 +522,12 @@ impl ServerAuth {
                     return Err(Error::Protocol("auth: expected USERAUTH_REQUEST"));
                 }
                 let req = UserauthRequest::decode(payload)?;
+                // Pin the username before *any* verdict on this request —
+                // including the service-name rejection below — so no
+                // rejected first request leaves the name unpinned.
+                if let Some(step) = self.pin_user(&req.user) {
+                    return Ok(step);
+                }
                 if req.service != self.service {
                     return self.emit_failure();
                 }
@@ -529,20 +566,8 @@ impl ServerAuth {
 
     fn handle_request(&mut self, req: UserauthRequest) -> Result<ServerStep> {
         let user = req.user.clone();
-        // Pin the username to the first request's value. OpenSSH disconnects
-        // if the client changes the login name mid-userauth; every probe and
-        // every real attempt for a connection must carry the same name. (The
-        // `none`- and pubkey-probe flows all reuse the same username, so this
-        // only fires on an actual switch.)
-        match &self.first_user {
-            Some(prev) if *prev != user => {
-                return Ok(ServerStep::Disconnect(
-                    "auth: username changed mid-authentication",
-                ));
-            }
-            None => self.first_user = Some(user.clone()),
-            _ => {}
-        }
+        // The username was pinned by `on_packet` (see `pin_user`) before we
+        // got here.
         match req.method {
             AuthMethodPayload::None => {
                 // Hard gate: refuse `"none"` unless the caller explicitly
@@ -774,6 +799,12 @@ impl ServerAuth {
         self.failed_attempts
     }
 
+    /// The username pinned by the first USERAUTH_REQUEST, if any.
+    #[cfg(test)]
+    fn pinned_user(&self) -> Option<&str> {
+        self.first_user.as_deref()
+    }
+
     fn emit_failure(&mut self) -> Result<ServerStep> {
         // A USERAUTH_FAILURE (without partial success) is a failed attempt;
         // count it and disconnect once MaxAuthTries is exceeded. OpenSSH
@@ -889,10 +920,52 @@ mod tests {
         sa.set_accepted_methods(vec![]);
         assert!(sa.accepted_methods().is_empty());
         assert!(matches!(
-            sa.reject_unadvertised().unwrap(),
+            sa.reject_unadvertised("alice").unwrap(),
             ServerStep::Send(_)
         ));
         assert_eq!(sa.failed_attempts(), 1);
+        // The rejected request's username is pinned exactly like a request
+        // that reached the authenticator would have been.
+        assert_eq!(sa.pinned_user(), Some("alice"));
+        // A later unadvertised attempt under a different name disconnects
+        // without counting as another failure.
+        assert!(matches!(
+            sa.reject_unadvertised("bob").unwrap(),
+            ServerStep::Disconnect(_)
+        ));
+        assert_eq!(sa.failed_attempts(), 1);
+    }
+
+    #[test]
+    fn service_mismatch_rejection_still_pins_username() {
+        // A first request refused for naming the wrong service must still
+        // pin its username, so the next request cannot switch names.
+        let mut sa = ServerAuth::new(vec![1, 2, 3], vec!["password"], Box::new(RejectAll));
+        sa.on_packet(&service_req()).unwrap();
+        let bad_service = UserauthRequest {
+            user: "alice".into(),
+            service: "not-ssh-connection".into(),
+            method: AuthMethodPayload::None,
+        }
+        .encode();
+        assert!(matches!(
+            sa.on_packet(&bad_service).unwrap(),
+            ServerStep::Send(_)
+        ));
+        assert_eq!(sa.pinned_user(), Some("alice"));
+        let bob = UserauthRequest {
+            user: "bob".into(),
+            service: "ssh-connection".into(),
+            method: AuthMethodPayload::Password {
+                password: SecretString::from("x"),
+                new_password: None,
+            },
+        }
+        .encode();
+        assert!(matches!(
+            sa.on_packet(&bob).unwrap(),
+            ServerStep::Disconnect(_)
+        ));
     }
 
     #[test]

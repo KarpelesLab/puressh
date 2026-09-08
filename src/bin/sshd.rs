@@ -30,6 +30,13 @@
 //! listener fd so the daemon can be restarted on the same port without
 //! waiting on `SO_REUSEADDR` semantics.
 //!
+//! The parent tracks every live child (pid → peer IP, auth state) and
+//! reaps in its accept loop, never from the signal handler. `MaxStartups`
+//! (`--max-startups`) caps the number of children that have not yet
+//! authenticated — each child reports userauth success over an inherited
+//! pipe — and `--per-source-max` caps live children per peer IP for their
+//! whole lifetime.
+//!
 //! Interactive shells (`pty-req` + `shell`) allocate a PTY with
 //! `openpty()` and fork manually so the slave path is known up-front —
 //! the PAM session is opened with `PAM_TTY = /dev/pts/N` *before* the
@@ -64,16 +71,17 @@ mod imp {
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::net::IpAddr;
-    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, ExitCode};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
     use nix::libc;
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use nix::sys::signal::{SigHandler, Signal, kill, signal};
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
     use nix::unistd::{ForkResult, Pid, execvp, fork};
@@ -747,11 +755,14 @@ mod imp {
         /// `--login-grace-time SECONDS`: pre-auth inactivity timeout
         /// applied to the connection's read side. 0 disables.
         login_grace_time: Option<u32>,
-        /// `--max-startups N`: cap on concurrent unauthenticated /
-        /// authenticated children (0 = unlimited).
+        /// `--max-startups N`: cap on concurrent *unauthenticated*
+        /// connection children, as OpenSSH's `MaxStartups` (0 = unlimited).
+        /// A child leaves the count once it reports authentication success
+        /// to the parent (see `AUTH_NOTIFY_FD`).
         max_startups: Option<u32>,
-        /// `--per-source-max N`: cap on simultaneous connections from any
-        /// single peer IP (0 = unlimited).
+        /// `--per-source-max N`: cap on simultaneous connections (for their
+        /// whole lifetime, authenticated or not) from any single peer IP
+        /// (0 = unlimited).
         per_source_max: u32,
         /// `--permit-root-login yes|no|prohibit-password`: whether the root
         /// account (uid 0) may authenticate. Default (config/built-in) is
@@ -4360,60 +4371,30 @@ mod imp {
     // -------------------------------------------------------------------------
     // Parent-side state for connection caps and graceful shutdown.
     //
-    // All three of these are touched from `extern "C"` signal handlers, so
-    // they must use only async-signal-safe primitives. `AtomicUsize` and
-    // `AtomicBool` qualify (lock-free on every target we ship to); a
-    // `Mutex<HashMap>` would not. Per-IP counts are kept in a parking-lot
-    // `Mutex<HashMap>` accessed only from the main accept loop (never
-    // from signal context) — see `OnIpScope` below.
+    // The signal handlers touch ONLY the two atomics below (async-signal-
+    // safe). Everything else — the child table with its per-IP counts and
+    // auth-notification pipes — is owned by the accept loop and reconciled
+    // there (`ChildTable::reap` / `ChildTable::poll_auth`), never from signal
+    // context.
     // -------------------------------------------------------------------------
 
-    /// Live (unreaped + serving) connection children.  Incremented after
-    /// a successful `fork()`, decremented on `SIGCHLD` once `waitpid`
-    /// confirms the child exited.
-    static LIVE_CHILDREN: AtomicUsize = AtomicUsize::new(0);
+    /// Set by the SIGCHLD handler; the accept loop reaps on its next pass. The
+    /// handler installs without `SA_RESTART`, so a child exit also wakes a
+    /// `poll()` that is waiting for connections.
+    static SIGCHLD_PENDING: AtomicBool = AtomicBool::new(false);
 
     /// Set to `true` by the SIGTERM/SIGINT handler. The accept loop polls
     /// it before each `accept()` and exits cleanly when it flips, letting
-    /// in-flight children drain to their own SIGCHLD without orphaning
-    /// them.
+    /// in-flight children drain on their own without orphaning them.
     static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-    /// Per-peer-IP simultaneous-connection counts. Touched only by the
-    /// main accept loop (`OnIpScope::new` / `OnIpScope::drop`) — never
-    /// from signal context — so a `Mutex` is fine. Wrapped in a
-    /// `OnceLock` so we get a stable-API one-shot initialiser without
-    /// pulling in `once_cell`.
-    static PER_IP_COUNTS: OnceLock<Mutex<HashMap<IpAddr, usize>>> = OnceLock::new();
-
-    fn per_ip_counts() -> &'static Mutex<HashMap<IpAddr, usize>> {
-        PER_IP_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    /// SIGCHLD handler: drain every reapable child via `waitpid(WNOHANG)`
-    /// and decrement `LIVE_CHILDREN` per kid. Replaces the previous
-    /// `SIG_IGN` setup so we keep an accurate live-children count for
-    /// `--max-startups`.
+    /// SIGCHLD handler: just raise the flag. Reaping (`waitpid`) and the
+    /// bookkeeping it drives happen in the accept loop, where a `Mutex` /
+    /// `HashMap` may be touched.
     ///
-    /// SAFETY: handler runs in signal context; uses only async-signal-safe
-    /// calls (`waitpid` and atomic ops).
+    /// SAFETY: signal-context safe — a single relaxed atomic store.
     extern "C" fn sigchld_handler(_sig: libc::c_int) {
-        loop {
-            // SAFETY: WNOHANG waitpid in a signal handler is documented
-            // safe on every Unix we target.
-            let r = unsafe { libc::waitpid(-1, core::ptr::null_mut(), libc::WNOHANG) };
-            if r > 0 {
-                // Reaped one. Saturate at 0 in case of double-decrement
-                // races (shouldn't happen, but cheap insurance).
-                let prev = LIVE_CHILDREN.load(Ordering::Relaxed);
-                if prev > 0 {
-                    LIVE_CHILDREN.fetch_sub(1, Ordering::Relaxed);
-                }
-                continue;
-            }
-            // 0: no more reapable. <0: error (typically ECHILD).
-            break;
-        }
+        SIGCHLD_PENDING.store(true, Ordering::Relaxed);
     }
 
     /// SIGTERM / SIGINT handler: flip the shutdown flag so the accept
@@ -4426,9 +4407,8 @@ mod imp {
         SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
     }
 
-    /// Install SIGCHLD (zombie reaper + live-count tracking) and
-    /// SIGTERM/SIGINT (graceful shutdown). Replaces the prior
-    /// `install_parent_sigchld` SIG_IGN setup.
+    /// Install SIGCHLD (wake the accept loop to reap) and SIGTERM/SIGINT
+    /// (graceful shutdown).
     fn install_parent_signals() -> Result<(), String> {
         // SAFETY: `sigaction` with caller-owned `sigaction` structs is
         // POSIX-defined; the handler funcs we install reference only
@@ -4437,10 +4417,10 @@ mod imp {
             let mut sa: libc::sigaction = core::mem::zeroed();
             sa.sa_sigaction = sigchld_handler as *const () as usize;
             // SA_NOCLDSTOP: don't notify on stopped/continued children.
-            // SA_RESTART:  let accept() restart on EINTR rather than
-            //              fail out — the loop already handles EAGAIN
-            //              backoff but spurious EINTR shouldn't error.
-            sa.sa_flags = libc::SA_NOCLDSTOP | libc::SA_RESTART;
+            // No SA_RESTART: a child exit must interrupt the accept loop's
+            // `poll()` so the exit is reaped promptly (the loop treats
+            // EINTR as "go around again").
+            sa.sa_flags = libc::SA_NOCLDSTOP;
             libc::sigemptyset(&mut sa.sa_mask);
             if libc::sigaction(libc::SIGCHLD, &sa, core::ptr::null_mut()) != 0 {
                 return Err(format!(
@@ -4451,7 +4431,7 @@ mod imp {
             let mut sa: libc::sigaction = core::mem::zeroed();
             sa.sa_sigaction = shutdown_handler as *const () as usize;
             // Deliberately no SA_RESTART: we *want* SIGTERM/SIGINT to
-            // wake a blocked accept() so the loop can observe the flag.
+            // wake the blocked poll() so the loop can observe the flag.
             sa.sa_flags = 0;
             libc::sigemptyset(&mut sa.sa_mask);
             if libc::sigaction(libc::SIGTERM, &sa, core::ptr::null_mut()) != 0 {
@@ -4470,54 +4450,171 @@ mod imp {
         Ok(())
     }
 
-    /// RAII guard that increments `PER_IP_COUNTS[ip]` on construction and
-    /// decrements on drop. Returned by [`admit_connection`] when the new
-    /// connection is allowed under both caps; held by the parent for the
-    /// lifetime of the child PID so a `kill -9` of the parent simply
-    /// vaporises the counts (no cleanup needed). Held by the *parent*,
-    /// not the forked child — drop runs only when the parent loop drops
-    /// the guard at child-spawn time, so the live count is the count of
-    /// in-flight admits, not of finished children. To reconcile: the
-    /// SIGCHLD handler bounds the lifetime via `LIVE_CHILDREN`.
-    struct OnIpScope {
-        ip: IpAddr,
+    /// The byte a connection child writes to its auth-notification pipe once
+    /// userauth has succeeded.
+    const AUTH_OK_BYTE: u8 = b'A';
+
+    /// Write end of *this* connection child's auth-notification pipe, as a raw
+    /// fd (`-1` = none). The parent stores it just before `fork()` and clears
+    /// it right after; fork's copy-on-write leaves the child with its own
+    /// value, which the session-open hook consumes via
+    /// [`notify_parent_authenticated`].
+    static AUTH_NOTIFY_FD: AtomicI32 = AtomicI32::new(-1);
+
+    /// Tell the daemon parent that this connection has authenticated, so it
+    /// stops counting against `MaxStartups`: write one byte and close the
+    /// pipe. Idempotent; a no-op when no pipe was set up (tests, or a
+    /// pipe() failure at accept time).
+    fn notify_parent_authenticated() {
+        let fd = AUTH_NOTIFY_FD.swap(-1, Ordering::Relaxed);
+        if fd >= 0 {
+            // SAFETY: the fd was created by `pipe2` in the parent and its
+            // ownership handed to this static at fork; nothing else closes it.
+            let tx = unsafe { OwnedFd::from_raw_fd(fd) };
+            let _ = nix::unistd::write(&tx, &[AUTH_OK_BYTE]);
+            drop(tx);
+        }
     }
 
-    impl Drop for OnIpScope {
-        fn drop(&mut self) {
-            if let Ok(mut m) = per_ip_counts().lock()
-                && let Some(c) = m.get_mut(&self.ip)
-            {
-                *c = c.saturating_sub(1);
-                if *c == 0 {
-                    m.remove(&self.ip);
+    /// One forked connection child, as tracked by the daemon parent.
+    struct ChildRecord {
+        /// Peer IP, for `--per-source-max`. Counted for the child's whole
+        /// lifetime.
+        ip: IpAddr,
+        /// Read end of the auth-notification pipe, held while the child has
+        /// not yet reported success. `None` once it has (or once it closed
+        /// the pipe without doing so, e.g. exited pre-auth).
+        auth_rx: Option<OwnedFd>,
+        /// True once the child reported userauth success; such children no
+        /// longer count against `MaxStartups`.
+        authenticated: bool,
+    }
+
+    /// The daemon parent's table of live connection children, keyed by pid.
+    /// Owned by the accept loop; never touched from signal context.
+    #[derive(Default)]
+    struct ChildTable {
+        children: HashMap<Pid, ChildRecord>,
+    }
+
+    impl ChildTable {
+        fn len(&self) -> usize {
+            self.children.len()
+        }
+
+        /// Children that have not yet reported authentication success.
+        fn unauthenticated(&self) -> usize {
+            self.children.values().filter(|c| !c.authenticated).count()
+        }
+
+        /// Live children (any auth state) from `ip`.
+        fn count_from_ip(&self, ip: IpAddr) -> usize {
+            self.children.values().filter(|c| c.ip == ip).count()
+        }
+
+        /// Record a freshly forked child.
+        fn insert(&mut self, pid: Pid, ip: IpAddr, auth_rx: Option<OwnedFd>) {
+            self.children.insert(
+                pid,
+                ChildRecord {
+                    ip,
+                    auth_rx,
+                    authenticated: false,
+                },
+            );
+        }
+
+        /// Reap every exited child (`waitpid(WNOHANG)` loop) and drop its
+        /// record — releasing its per-IP slot and closing its pipe.
+        fn reap(&mut self, debug: bool) {
+            loop {
+                match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) | Err(_) => break,
+                    Ok(status) => {
+                        if let Some(pid) = status.pid()
+                            && self.children.remove(&pid).is_some()
+                            && debug
+                        {
+                            eprintln!(
+                                "sshd: reaped connection pid {} (live={}, unauth={})",
+                                pid.as_raw(),
+                                self.len(),
+                                self.unauthenticated()
+                            );
+                        }
+                    }
                 }
             }
         }
-    }
 
-    /// Apply the two connection caps (global `--max-startups` and
-    /// per-source `--per-source-max`) atomically. Returns the per-IP
-    /// scope guard on admission, or `Err(reason)` for refusal — the
-    /// caller logs the reason and closes the socket.
-    fn admit_connection(
-        peer: &std::net::SocketAddr,
-        max_startups: u32,
-        per_source_max: u32,
-    ) -> Result<OnIpScope, &'static str> {
-        if max_startups > 0 && LIVE_CHILDREN.load(Ordering::Relaxed) >= max_startups as usize {
-            return Err("max-startups");
+        /// Collect auth-success notifications: a non-blocking `poll()` over
+        /// every unauthenticated child's pipe. A child that wrote
+        /// [`AUTH_OK_BYTE`] moves to the authenticated column; a pipe that
+        /// closed without it (child exited pre-auth) is just released — the
+        /// record itself goes when the child is reaped.
+        fn poll_auth(&mut self) {
+            let pids: Vec<Pid> = self
+                .children
+                .iter()
+                .filter(|(_, c)| c.auth_rx.is_some())
+                .map(|(pid, _)| *pid)
+                .collect();
+            if pids.is_empty() {
+                return;
+            }
+            let mut fds: Vec<PollFd<'_>> = pids
+                .iter()
+                .map(|pid| {
+                    let rx = self.children[pid].auth_rx.as_ref().expect("filtered above");
+                    PollFd::new(rx.as_fd(), PollFlags::POLLIN)
+                })
+                .collect();
+            match poll(&mut fds, PollTimeout::ZERO) {
+                Ok(n) if n > 0 => {}
+                _ => return,
+            }
+            let ready: Vec<Pid> = pids
+                .iter()
+                .zip(fds.iter())
+                .filter(|(_, f)| f.any().unwrap_or(false))
+                .map(|(pid, _)| *pid)
+                .collect();
+            drop(fds);
+            for pid in ready {
+                let Some(rec) = self.children.get_mut(&pid) else {
+                    continue;
+                };
+                let Some(rx) = rec.auth_rx.take() else {
+                    continue;
+                };
+                let mut byte = [0u8; 1];
+                if matches!(nix::unistd::read(&rx, &mut byte), Ok(1)) && byte[0] == AUTH_OK_BYTE {
+                    rec.authenticated = true;
+                }
+                // `rx` drops here: the parent's read end is closed either way.
+            }
         }
-        let ip = peer.ip();
-        if per_source_max > 0 {
-            let mut m = per_ip_counts().lock().map_err(|_| "per-ip-lock")?;
-            let c = m.entry(ip).or_insert(0);
-            if *c >= per_source_max as usize {
+
+        /// Apply the two connection caps: `MaxStartups` over the
+        /// *unauthenticated* children only (an authenticated peer cannot
+        /// exhaust it, and a flood of idle pre-auth connections cannot block
+        /// logins beyond its own budget), and `--per-source-max` over every
+        /// live child from the peer's IP. `Err(reason)` ⇒ refuse (the caller
+        /// logs and closes the socket).
+        fn admit(
+            &self,
+            peer: &std::net::SocketAddr,
+            max_startups: u32,
+            per_source_max: u32,
+        ) -> Result<(), &'static str> {
+            if max_startups > 0 && self.unauthenticated() >= max_startups as usize {
+                return Err("max-startups");
+            }
+            if per_source_max > 0 && self.count_from_ip(peer.ip()) >= per_source_max as usize {
                 return Err("per-source-max");
             }
-            *c += 1;
+            Ok(())
         }
-        Ok(OnIpScope { ip })
     }
 
     fn run() -> Result<i32, String> {
@@ -4948,6 +5045,11 @@ mod imp {
         let hook_policy = conn_policy.clone();
         config = config.on_session_open(move |ctx: &SessionOpenContext<'_>| {
             let user = ctx.user;
+            // Userauth has succeeded by the time this hook runs: tell the
+            // daemon parent so this connection stops counting against
+            // `MaxStartups` (whatever happens below, it is no longer an
+            // unauthenticated connection an attacker could be holding open).
+            notify_parent_authenticated();
             // PermitRootLogin backstop, evaluated at login time before we
             // open a PAM session or drop privilege. The authenticator already
             // denies root during userauth; this re-checks against the live
@@ -5105,16 +5207,48 @@ mod imp {
         const FORK_BACKOFF_MAX_MS: u64 = 1_000;
         let mut fork_backoff_ms: u64 = FORK_BACKOFF_MIN_MS;
 
+        // Live connection children: per-IP accounting for `--per-source-max`
+        // and the unauthenticated count for `MaxStartups`. Reconciled at the
+        // top of every pass (reap exits, collect auth notifications) — the
+        // only place the caps are consulted is right before a fork, so that
+        // is exactly when the table must be current.
+        let mut children = ChildTable::default();
+        // How long `poll()` waits for a connection before the loop goes
+        // around anyway to reap / check the shutdown flag. A signal (SIGCHLD,
+        // SIGTERM) interrupts it earlier — `poll()` is not restarted on
+        // EINTR, unlike std's `accept()`, which retries internally and would
+        // otherwise swallow the wake-up.
+        let accept_tick = PollTimeout::from(1_000u16);
+
         loop {
             if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
                 eprintln!("sshd: shutdown requested, exiting accept loop");
                 break;
             }
+            if SIGCHLD_PENDING.swap(false, Ordering::Relaxed) || children.len() > 0 {
+                children.reap(cli.debug);
+            }
+            children.poll_auth();
+
+            let mut wait = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut wait, accept_tick) {
+                Ok(0) => continue, // tick: reconcile and wait again
+                Ok(_) => {}
+                Err(Errno::EINTR) => continue, // signal: flags checked above
+                Err(e) => {
+                    eprintln!("sshd: poll: {e}");
+                    std::thread::sleep(std::time::Duration::from_millis(FORK_BACKOFF_MIN_MS));
+                    continue;
+                }
+            }
             let (stream, peer) = match listener.accept() {
                 Ok(p) => p,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
-                    // Was probably our SIGTERM/SIGINT — loop and let the
-                    // shutdown flag check catch it.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) =>
+                {
                     continue;
                 }
                 Err(e) => {
@@ -5126,16 +5260,36 @@ mod imp {
             // Enforce both connection caps *before* fork so a flood
             // can't OOM us via per-process accounting. On refusal we
             // simply drop the socket — RST tells the client to retry.
-            let scope = match admit_connection(&peer, max_startups, cli.per_source_max) {
-                Ok(s) => s,
-                Err(reason) => {
-                    if cli.debug {
-                        eprintln!("sshd: refused {peer}: {reason}");
-                    }
-                    drop(stream);
-                    continue;
+            if let Err(reason) = children.admit(&peer, max_startups, cli.per_source_max) {
+                if cli.debug {
+                    eprintln!(
+                        "sshd: refused {peer}: {reason} (live={}, unauth={}, from-ip={})",
+                        children.len(),
+                        children.unauthenticated(),
+                        children.count_from_ip(peer.ip())
+                    );
+                }
+                drop(stream);
+                continue;
+            }
+
+            // Auth-notification pipe: the child writes one byte on userauth
+            // success so the parent moves it out of the `MaxStartups`
+            // count. Close-on-exec on both ends, so no program the child
+            // later spawns inherits either. If the pipe cannot be created
+            // the child is simply counted as unauthenticated for life
+            // (fail closed for the cap; the connection still works).
+            let (auth_rx, auth_tx) = match nix::unistd::pipe2(OFlag::O_CLOEXEC) {
+                Ok(p) => (Some(p.0), Some(p.1)),
+                Err(e) => {
+                    eprintln!("sshd: pipe for auth notification: {e}");
+                    (None, None)
                 }
             };
+            AUTH_NOTIFY_FD.store(
+                auth_tx.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(-1),
+                Ordering::Relaxed,
+            );
 
             // SAFETY: the daemon parent is single-threaded — no `thread::spawn`
             // in this loop — so the `fork()` is followed by ordinary Rust
@@ -5145,30 +5299,35 @@ mod imp {
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child }) => {
                     fork_backoff_ms = FORK_BACKOFF_MIN_MS;
-                    // Account the child against `--max-startups` once we
-                    // know fork() succeeded; SIGCHLD will decrement it
-                    // back on reap.
-                    LIVE_CHILDREN.fetch_add(1, Ordering::Relaxed);
+                    // The write end now belongs to the child alone: close
+                    // ours so its EOF is observable, and forget the fd.
+                    AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
+                    drop(auth_tx);
+                    // Account the child (per-IP slot, unauthenticated) for as
+                    // long as it lives; `reap` releases it.
+                    children.insert(child, peer.ip(), auth_rx);
                     if cli.debug {
                         eprintln!(
-                            "sshd: forked connection {peer} -> pid {} (live={})",
+                            "sshd: forked connection {peer} -> pid {} (live={}, unauth={})",
                             child.as_raw(),
-                            LIVE_CHILDREN.load(Ordering::Relaxed),
+                            children.len(),
+                            children.unauthenticated(),
                         );
                     }
                     // Parent has no further use for this socket — its
                     // refcount in the child keeps it alive.
                     drop(stream);
-                    // OnIpScope auto-drops at end of iteration —
-                    // explicit drop here makes the lifetime clear.
-                    drop(scope);
                 }
                 Ok(ForkResult::Child) => {
-                    // Child doesn't own the parent's per-IP scope.
-                    // `mem::forget` so dropping in the child doesn't
-                    // touch the parent's count and *decrement someone
-                    // else's per-IP entry*.
-                    core::mem::forget(scope);
+                    // The child owns nothing in the parent's table: close the
+                    // inherited read ends (this one's and every sibling's).
+                    // Its own write end is now owned by `AUTH_NOTIFY_FD`, so
+                    // the `OwnedFd` wrapper must not close it here.
+                    drop(children);
+                    drop(auth_rx);
+                    if let Some(tx) = auth_tx {
+                        core::mem::forget(tx);
+                    }
                     // CRUCIAL: release the listener fd before we enter the
                     // long session loop. Without this, restarting the
                     // daemon on the same port keeps hitting EADDRINUSE
@@ -5211,8 +5370,10 @@ mod imp {
                 }
                 Err(e) => {
                     eprintln!("sshd: fork: {e} (backoff {fork_backoff_ms}ms)");
+                    AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
+                    drop(auth_tx);
+                    drop(auth_rx);
                     drop(stream);
-                    drop(scope);
                     // Bounded exponential backoff so a sustained EAGAIN
                     // (rlimit, OOM-killer pressure) doesn't pin a core.
                     std::thread::sleep(std::time::Duration::from_millis(fork_backoff_ms));
@@ -6357,6 +6518,92 @@ mod imp {
                 cert: None,
             });
             assert!(matches!(decision, AuthDecision::Reject));
+        }
+
+        // ---- S3/S4: parent-side child accounting ---------------------------
+
+        #[test]
+        fn child_table_caps_count_unauthenticated_and_per_ip_for_lifetime() {
+            let ip4: IpAddr = "10.0.0.1".parse().unwrap();
+            let peer_a: std::net::SocketAddr = "10.0.0.1:1000".parse().unwrap();
+            let peer_b: std::net::SocketAddr = "10.0.0.2:1000".parse().unwrap();
+            let mut t = ChildTable::default();
+            t.insert(Pid::from_raw(100_001), ip4, None);
+            t.insert(Pid::from_raw(100_002), ip4, None);
+            assert_eq!(t.len(), 2);
+            assert_eq!(t.unauthenticated(), 2);
+            assert_eq!(t.count_from_ip(ip4), 2);
+            // MaxStartups over unauthenticated children.
+            assert_eq!(t.admit(&peer_b, 2, 0), Err("max-startups"));
+            assert_eq!(t.admit(&peer_b, 3, 0), Ok(()));
+            // Per-source cap over live children from that IP.
+            assert_eq!(t.admit(&peer_a, 0, 2), Err("per-source-max"));
+            assert_eq!(t.admit(&peer_b, 0, 2), Ok(()));
+            // An authenticated child leaves the MaxStartups count but keeps
+            // its per-IP slot for life.
+            t.children
+                .get_mut(&Pid::from_raw(100_001))
+                .unwrap()
+                .authenticated = true;
+            assert_eq!(t.unauthenticated(), 1);
+            assert_eq!(t.admit(&peer_b, 2, 0), Ok(()));
+            assert_eq!(t.admit(&peer_a, 0, 2), Err("per-source-max"));
+            // Caps of 0 are unlimited.
+            assert_eq!(t.admit(&peer_a, 0, 0), Ok(()));
+        }
+
+        #[test]
+        fn child_table_auth_pipe_and_reap_with_real_child() {
+            // Fork a real child that reports auth success through the pipe
+            // exactly as the session-open hook does, then exits. The parent
+            // must see it move to "authenticated" and then be reaped (per-IP
+            // slot released).
+            let ip: IpAddr = "192.0.2.7".parse().unwrap();
+            let (rx, tx) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe2");
+            AUTH_NOTIFY_FD.store(tx.as_raw_fd(), Ordering::Relaxed);
+            // SAFETY: single-threaded test child; it only writes a byte and exits.
+            let pid = match unsafe { fork() }.expect("fork") {
+                ForkResult::Child => {
+                    core::mem::forget(tx);
+                    notify_parent_authenticated();
+                    unsafe { libc::_exit(0) };
+                }
+                ForkResult::Parent { child } => child,
+            };
+            AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
+            drop(tx);
+            let mut t = ChildTable::default();
+            t.insert(pid, ip, Some(rx));
+            assert_eq!(t.unauthenticated(), 1);
+            // Wait for the byte (bounded), then collect it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while t.unauthenticated() == 1 && std::time::Instant::now() < deadline {
+                t.poll_auth();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(t.unauthenticated(), 0, "auth notification not received");
+            assert_eq!(t.count_from_ip(ip), 1, "per-IP slot held until reaped");
+            // Now reap: the child has exited.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while t.len() == 1 && std::time::Instant::now() < deadline {
+                t.reap(false);
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert_eq!(t.len(), 0, "exited child not reaped");
+            assert_eq!(t.count_from_ip(ip), 0);
+        }
+
+        #[test]
+        fn child_table_pipe_closed_without_success_stays_unauthenticated() {
+            let ip: IpAddr = "192.0.2.8".parse().unwrap();
+            let (rx, tx) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe2");
+            let mut t = ChildTable::default();
+            t.insert(Pid::from_raw(100_003), ip, Some(rx));
+            // Peer "exits pre-auth": write end closed with no byte.
+            drop(tx);
+            t.poll_auth();
+            assert_eq!(t.unauthenticated(), 1);
+            assert!(t.children[&Pid::from_raw(100_003)].auth_rx.is_none());
         }
 
         // ---- Multi-step keyboard-interactive bridge ------------------------

@@ -8,9 +8,10 @@
 //! [`SshServerConfig::global`], and each `Match` block is recorded as a
 //! [`ServerMatchBlock`] carrying its conditions plus its own
 //! [`ServerOptions`]. Per-connection resolution
-//! ([`SshServerConfig::resolve`]) starts from the global options and merges
-//! every matching block with OpenSSH semantics: **first-match-wins** for
-//! scalars and **concatenation** for cumulative list fields.
+//! ([`SshServerConfig::resolve`]) merges every matching block with
+//! `sshd_config(5)` semantics: **first-match-wins** for scalars among the
+//! matching blocks, whose values **override** the global section (global is
+//! only the fallback), and **concatenation** for cumulative list fields.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -67,7 +68,8 @@ impl PermitRootLogin {
 /// Every field is `Option`-typed (or an empty `Vec`) so the binary can apply
 /// OpenSSH precedence — CLI flag > config file > built-in default — using a
 /// `pick(cli, cfg, default)` helper, and so [`SshServerConfig::resolve`] can
-/// merge blocks with first-match-wins scalars and concatenated lists.
+/// merge blocks with first-match-wins scalars (Match blocks overriding
+/// global) and concatenated lists.
 ///
 /// Auth/access keywords: `PasswordAuthentication`,
 /// `KbdInteractiveAuthentication`, multi-factor `AuthenticationMethods` chains,
@@ -104,8 +106,13 @@ pub struct ServerOptions {
     /// authenticate as. When unset, the login user must itself appear in the
     /// certificate's principals list.
     pub authorized_principals_file: Option<String>,
-    /// `AuthorizedKeysFile`.
-    pub authorized_keys_file: Option<String>,
+    /// `AuthorizedKeysFile` — one or more path *templates* (space-separated
+    /// on the config line), each resolved per login user: `%u` (username),
+    /// `%h` (home directory) and `%%` are expanded, and a relative path is
+    /// taken relative to the user's home directory. `none` ⇒ `Some(vec![])`
+    /// (no file is consulted). `None` ⇒ the OpenSSH default
+    /// `.ssh/authorized_keys .ssh/authorized_keys2`.
+    pub authorized_keys_file: Option<Vec<String>>,
     /// `AllowUsers` — cumulative; empty ⇒ "current user only" (matches the
     /// existing CLI default behaviour).
     pub allow_users: Vec<String>,
@@ -419,22 +426,33 @@ impl SshServerConfig {
         })
     }
 
-    /// Resolve the effective [`ServerOptions`] for `ctx`: start from the
-    /// global options, then merge each `Match` block whose conditions all
-    /// match, in source order. Scalars are first-match-wins (an earlier
-    /// contributor — global counts as earliest — keeps its value); list
-    /// fields concatenate.
+    /// Resolve the effective [`ServerOptions`] for `ctx` with `sshd_config(5)`
+    /// semantics: every `Match` block whose conditions all match is merged in
+    /// source order — for a scalar keyword the *first* matching block that
+    /// sets it wins — and the resulting values **override** the global
+    /// section, which only supplies a keyword no matching block set. List
+    /// fields concatenate (matching blocks first, then global).
     ///
     /// `policy` controls `Match exec` evaluation (default-deny on the server;
     /// see [`ExecPolicy`]).
     pub fn resolve(&self, ctx: &MatchContext<'_>, policy: ExecPolicy) -> ServerOptions {
-        let mut out = self.global.clone();
+        let mut out = ServerOptions::default();
         for block in &self.match_blocks {
             if all_match(&block.conditions, ctx, policy) {
                 merge_server_options(&mut out, &block.opts);
             }
         }
+        merge_server_options(&mut out, &self.global);
         out
+    }
+
+    /// Every options block in the file — the global section followed by each
+    /// `Match` block's options in source order — regardless of what matches.
+    /// Lets a daemon pre-validate / pre-load every file path that *could*
+    /// apply to some connection (`TrustedUserCAKeys`, `RevokedKeys`, …) at
+    /// startup, so a bad path fails loudly instead of at login time.
+    pub fn all_blocks(&self) -> impl Iterator<Item = &ServerOptions> {
+        core::iter::once(&self.global).chain(self.match_blocks.iter().map(|b| &b.opts))
     }
 }
 
@@ -530,6 +548,10 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "include",
         "subsystem",
         "permittunnel",
+        // `AcceptEnv` is valid in a Match block in OpenSSH, but this server
+        // applies the env allow-list once, connection-wide, from the global
+        // section; a per-block list would be silently ignored, so refuse it.
+        "acceptenv",
     ];
     if INVALID_IN_MATCH.contains(&line.keyword.as_str()) {
         return Err(ConfigError::Unsupported {
@@ -565,7 +587,20 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             opts.authorized_principals_file = Some(one_arg(line)?);
         }
         "authorizedkeysfile" => {
-            opts.authorized_keys_file = Some(one_arg(line)?);
+            if line.args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected one or more file paths, or none".into(),
+                });
+            }
+            // `none` disables the file entirely (OpenSSH); otherwise each
+            // argument is a path template resolved per user by the daemon.
+            if line.args.len() == 1 && line.args[0].eq_ignore_ascii_case("none") {
+                opts.authorized_keys_file = Some(Vec::new());
+            } else {
+                opts.authorized_keys_file = Some(line.args.clone());
+            }
         }
         "allowusers" => {
             if line.args.is_empty() {
@@ -1255,7 +1290,10 @@ StrictModes yes
             cfg.host_key_files,
             vec!["/etc/ssh/ssh_host_ed25519_key".to_string()]
         );
-        assert_eq!(cfg.authorized_keys_file.as_deref(), Some("/etc/authkeys"));
+        assert_eq!(
+            cfg.authorized_keys_file.as_deref(),
+            Some(&["/etc/authkeys".to_string()][..])
+        );
         assert_eq!(
             cfg.allow_users,
             vec!["alice".to_string(), "bob".to_string()]
@@ -1310,10 +1348,10 @@ AllowUsers bob carol
         let src = "\
 Match User alice
   MaxAuthTries 1
-  AcceptEnv FOO
+  DenyUsers foo
 Match Group dev
   MaxAuthTries 2
-  AcceptEnv BAR
+  DenyUsers bar
 ";
         let cfg = SshServerConfig::parse(src).unwrap();
         let groups = vec!["dev".to_string()];
@@ -1326,8 +1364,152 @@ Match Group dev
         let eff = cfg.resolve(&ctx, ExecPolicy::Deny);
         // First matching block sets the scalar; the later one does not override.
         assert_eq!(eff.max_auth_tries, Some(1));
-        // AcceptEnv concatenates across both matching blocks.
-        assert_eq!(eff.accept_env, vec!["FOO".to_string(), "BAR".to_string()]);
+        // DenyUsers concatenates across both matching blocks.
+        assert_eq!(eff.deny_users, vec!["foo".to_string(), "bar".to_string()]);
+    }
+
+    #[test]
+    fn match_block_overrides_global_scalar() {
+        // sshd_config(5): a keyword set in a matching Match block overrides
+        // the global section; global is only the fallback. The security-
+        // relevant direction is a global "yes" narrowed to "no" for some
+        // peers — that must take effect, never be shadowed by global.
+        let src = "\
+PasswordAuthentication yes
+PermitRootLogin yes
+MaxAuthTries 6
+Match Address 10.0.0.0/8
+  PasswordAuthentication no
+  PermitRootLogin no
+";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        let inside = MatchContext {
+            host: "h",
+            address: Some("10.1.2.3"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&inside, ExecPolicy::Deny);
+        assert_eq!(eff.password_authentication, Some(false));
+        assert_eq!(eff.permit_root_login, Some(PermitRootLogin::No));
+        // A scalar the block does not set falls back to global.
+        assert_eq!(eff.max_auth_tries, Some(6));
+        let outside = MatchContext {
+            host: "h",
+            address: Some("192.0.2.1"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&outside, ExecPolicy::Deny);
+        assert_eq!(eff.password_authentication, Some(true));
+        assert_eq!(eff.permit_root_login, Some(PermitRootLogin::Yes));
+    }
+
+    #[test]
+    fn match_access_keywords_resolve_per_connection() {
+        // Access-control keywords inside Match blocks resolve into the
+        // per-connection options (the daemon applies them at login time).
+        let src = "\
+AllowUsers alice bob
+TrustedUserCAKeys /etc/ssh/ca_global.pub
+Match Address 10.0.0.0/8
+  DenyUsers *
+  AuthorizedKeysFile /etc/ssh/keys/%u
+  AuthorizedPrincipalsFile /etc/ssh/principals/%u
+  TrustedUserCAKeys /etc/ssh/ca_lan.pub
+  RevokedKeys /etc/ssh/lan.krl
+  PermitEmptyPasswords yes
+Match Group ops
+  AllowGroups ops
+  DenyGroups contractors
+";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        let groups = vec!["ops".to_string()];
+        let lan = MatchContext {
+            host: "h",
+            user: Some("carol"),
+            groups: Some(&groups),
+            address: Some("10.9.9.9"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&lan, ExecPolicy::Deny);
+        assert_eq!(eff.deny_users, vec!["*".to_string()]);
+        assert_eq!(
+            eff.allow_users,
+            vec!["alice".to_string(), "bob".to_string()]
+        );
+        assert_eq!(
+            eff.authorized_keys_file.as_deref(),
+            Some(&["/etc/ssh/keys/%u".to_string()][..])
+        );
+        assert_eq!(
+            eff.authorized_principals_file.as_deref(),
+            Some("/etc/ssh/principals/%u")
+        );
+        assert_eq!(
+            eff.trusted_user_ca_keys.as_deref(),
+            Some("/etc/ssh/ca_lan.pub")
+        );
+        assert_eq!(eff.revoked_keys.as_deref(), Some("/etc/ssh/lan.krl"));
+        assert_eq!(eff.permit_empty_passwords, Some(true));
+        assert_eq!(eff.allow_groups, vec!["ops".to_string()]);
+        assert_eq!(eff.deny_groups, vec!["contractors".to_string()]);
+        // Outside the LAN block: global values only.
+        let wan = MatchContext {
+            host: "h",
+            user: Some("carol"),
+            address: Some("192.0.2.1"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&wan, ExecPolicy::Deny);
+        assert!(eff.deny_users.is_empty());
+        assert_eq!(
+            eff.trusted_user_ca_keys.as_deref(),
+            Some("/etc/ssh/ca_global.pub")
+        );
+        assert_eq!(eff.revoked_keys, None);
+        assert_eq!(eff.permit_empty_passwords, None);
+        // `all_blocks` enumerates global + every Match block for preloading.
+        let paths: Vec<_> = cfg
+            .all_blocks()
+            .filter_map(|o| o.trusted_user_ca_keys.clone())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/etc/ssh/ca_global.pub".to_string(),
+                "/etc/ssh/ca_lan.pub".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn accept_env_rejected_in_match() {
+        let err = SshServerConfig::parse("Match User alice\n  AcceptEnv FOO\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::Unsupported { line: 2, .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn authorized_keys_file_list_and_none() {
+        let cfg =
+            SshServerConfig::parse("AuthorizedKeysFile .ssh/authorized_keys /etc/ssh/keys/%u\n")
+                .unwrap()
+                .global;
+        assert_eq!(
+            cfg.authorized_keys_file.as_deref(),
+            Some(
+                &[
+                    ".ssh/authorized_keys".to_string(),
+                    "/etc/ssh/keys/%u".to_string()
+                ][..]
+            )
+        );
+        let none = SshServerConfig::parse("AuthorizedKeysFile none\n")
+            .unwrap()
+            .global;
+        assert_eq!(none.authorized_keys_file.as_deref(), Some(&[][..]));
+        assert!(SshServerConfig::parse("AuthorizedKeysFile\n").is_err());
     }
 
     #[test]
@@ -1890,8 +2072,8 @@ Match User alice
             ..MatchContext::default()
         };
         let eff = cfg.resolve(&ctx, ExecPolicy::Deny);
-        // First-match-wins: global set MaxSessions 10 first, so it stays.
-        assert_eq!(eff.max_sessions, Some(10));
+        // A matching Match block overrides the global scalar (sshd_config(5)).
+        assert_eq!(eff.max_sessions, Some(1));
         assert_eq!(eff.allow_tcp_forwarding, Some(TcpForwarding::No));
         assert_eq!(eff.force_command.as_deref(), Some("internal-sftp"));
     }

@@ -5,6 +5,24 @@
 //!      [-u allowed_user]... [--x11-forward]
 //! ```
 //!
+//! Public keys are looked up **per user**, as OpenSSH does: `AuthorizedKeysFile`
+//! (default `.ssh/authorized_keys .ssh/authorized_keys2`) names one or more
+//! path templates, `%u` / `%h` / `%%` are expanded against the login user's
+//! passwd entry, a relative path is taken under that user's home directory,
+//! and the resulting files are read — while the daemon still holds root, so
+//! `~/.ssh` may be mode 0700 — and StrictModes-checked against that user
+//! (file and every ancestor owned by root or the user, none group/world
+//! writable). `cert-authority` lines in a user's own file trust that CA for
+//! that user only, and honour `principals="a,b"`.
+//!
+//! `-A FILE` is different and deliberately narrow: it names ONE global
+//! `authorized_keys` file whose every key logs in as the single allowed user.
+//! It is refused unless exactly one literal user is allowed (`-u USER`, or
+//! one `AllowUsers` name with no wildcard / `@host`), because a shared file
+//! plus several allowed users would let any listed key log in as any of
+//! them. It exists for single-user / test deployments; production setups
+//! should use `AuthorizedKeysFile`.
+//!
 //! Each accepted connection is handled by a freshly `fork()`ed child
 //! process. The daemon parent keeps the listener and immediately returns
 //! to `accept()`. Killing the daemon does **not** kill live sessions —
@@ -693,6 +711,8 @@ mod imp {
         listen_addresses: Vec<String>,
         host_key_files: Vec<String>,
         host_certificate_files: Vec<String>,
+        /// `-A FILE`: one global authorized_keys file for the single allowed
+        /// user (see the module docs). `None` ⇒ per-user `AuthorizedKeysFile`.
         authorized_keys_file: Option<String>,
         allowed_users: Vec<String>,
         debug: bool,
@@ -1141,23 +1161,53 @@ mod imp {
         }
     }
 
-    /// `(authorized_blobs, ca_blobs)` returned by [`load_authorized_keys_and_cas`].
-    type AuthorizedAndCaBlobs = (Vec<Vec<u8>>, Vec<Vec<u8>>);
+    /// The parsed contents of one user's `authorized_keys` file(s).
+    #[derive(Clone, Debug, Default)]
+    struct AuthorizedKeys {
+        /// Wire blobs of directly-authorized plain keys.
+        blobs: Vec<Vec<u8>>,
+        /// `cert-authority` lines: the CA key blob plus, when the line carries
+        /// a `principals="a,b"` option, the principal patterns a certificate
+        /// must match (replacing the login-user-must-be-a-principal rule).
+        /// `None` ⇒ no `principals=` option on that line.
+        cas: Vec<(Vec<u8>, Option<Vec<String>>)>,
+    }
 
-    /// Parse an `authorized_keys` file, returning `(authorized_blobs, ca_blobs)`:
-    /// the wire blobs of directly-authorized keys, and the CA key blobs from any
-    /// `cert-authority` lines (trusted to sign user certificates). Lines that
-    /// fail the strict option-aware parser are logged and skipped.
+    impl AuthorizedKeys {
+        fn append(&mut self, mut other: AuthorizedKeys) {
+            self.blobs.append(&mut other.blobs);
+            self.cas.append(&mut other.cas);
+        }
+    }
+
+    /// The OpenSSH default `AuthorizedKeysFile` list, relative to the login
+    /// user's home directory.
+    fn default_authorized_keys_files() -> Vec<String> {
+        vec![
+            ".ssh/authorized_keys".to_string(),
+            ".ssh/authorized_keys2".to_string(),
+        ]
+    }
+
+    /// Parse an `authorized_keys` file: directly-authorized keys, plus the CA
+    /// keys (and any `principals=` restriction) from `cert-authority` lines.
+    /// Lines that fail the strict option-aware parser are logged and skipped.
+    ///
+    /// Under StrictModes the file must be owned by root or `owner_uid` (the
+    /// login user, for a per-user file; `None` for the global `-A` file), not
+    /// group/world writable, and every ancestor directory must satisfy the
+    /// same rule — so a user cannot plant keys in another user's file, and a
+    /// writable `~` or `~/.ssh` cannot be used to swap the file out.
     fn load_authorized_keys_and_cas(
         path: &str,
         strict_modes: bool,
-    ) -> Result<AuthorizedAndCaBlobs, String> {
+        owner_uid: Option<nix::unistd::Uid>,
+    ) -> Result<AuthorizedKeys, String> {
         if strict_modes {
-            check_mode_strict(path, 0o022, "authorized_keys file", None)?;
+            check_mode_strict(path, 0o022, "authorized_keys file", owner_uid)?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        let mut authorized: Vec<Vec<u8>> = Vec::new();
-        let mut cas: Vec<Vec<u8>> = Vec::new();
+        let mut out = AuthorizedKeys::default();
         for (idx, line) in body.lines().enumerate() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -1166,17 +1216,70 @@ mod imp {
             match PublicKey::parse_authorized_keys_line_with_options(trimmed) {
                 Ok((blob, opts)) => {
                     if opts.cert_authority {
-                        cas.push(blob);
+                        // The option parser yields an empty list both for a
+                        // missing `principals=` and for `principals=""`; the
+                        // latter must restrict (to nothing), never widen, so
+                        // the raw line is consulted for the option's presence.
+                        let restricted =
+                            !opts.principals.is_empty() || trimmed.contains("principals=");
+                        let principals = restricted.then_some(opts.principals);
+                        out.cas.push((blob, principals));
                     } else {
-                        authorized.push(blob);
+                        out.blobs.push(blob);
                     }
                 }
                 Err(e) => {
-                    eprintln!("sshd: skipping authorized_keys line {}: {e}", idx + 1);
+                    eprintln!("sshd: skipping {path} line {}: {e}", idx + 1);
                 }
             }
         }
-        Ok((authorized, cas))
+        Ok(out)
+    }
+
+    /// Whether a `-u` / `AllowUsers` token names exactly one literal user (no
+    /// glob metacharacters, no negation, no `@host` half).
+    fn is_literal_user_token(token: &str) -> bool {
+        !token.is_empty() && !token.contains(['*', '?', '!', '@'])
+    }
+
+    /// The effective `AllowUsers` token list for a connection: CLI `-u`
+    /// tokens, then the config's (global + matched `Match` blocks). When
+    /// nothing is configured the historical puressh default applies — only
+    /// the daemon's own user (`$USER`) may log in — and if even that is
+    /// unknown the list is a never-matching pattern, i.e. nobody. (An empty
+    /// list would mean "no restriction" downstream, which must never happen
+    /// by accident.)
+    fn effective_allow_users(
+        cli: &[String],
+        cfg: &[String],
+        default_user: Option<&str>,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = cli.to_vec();
+        out.extend(cfg.iter().cloned());
+        if out.is_empty() {
+            out.push(match default_user {
+                Some(u) => u.to_string(),
+                None => "!*".to_string(),
+            });
+        }
+        out
+    }
+
+    /// Load and parse a binary KRL (`ssh-keygen -k`). A configured but
+    /// unreadable / unparsable file is a hard error — failing closed beats
+    /// silently running with no revocation.
+    fn load_krl(path: &str, debug: bool) -> Result<puressh::krl::Krl, String> {
+        let bytes = std::fs::read(path).map_err(|e| format!("RevokedKeys {path}: {e}"))?;
+        let krl = puressh::krl::Krl::parse(&bytes)
+            .map_err(|e| format!("RevokedKeys {path}: parse failed: {e}"))?;
+        if debug {
+            eprintln!(
+                "sshd: loaded RevokedKeys from {path} ({} bytes, empty={})",
+                bytes.len(),
+                krl.is_empty()
+            );
+        }
+        Ok(krl)
     }
 
     /// Load a file of CA public keys (one `authorized_keys`-style key per line),
@@ -1447,16 +1550,37 @@ mod imp {
         allow_groups: Vec<puressh::config::HostPattern>,
         /// `DenyGroups` patterns (glob).
         deny_groups: Vec<puressh::config::HostPattern>,
-        authorized_blobs: Vec<Vec<u8>>,
-        /// CA public-key blobs trusted to sign user certificates, from
-        /// `TrustedUserCAKeys` and any `cert-authority` lines in
-        /// `authorized_keys`. A user cert whose `ca_key_blob` is in this set is
-        /// CA-trusted (principal authorization is checked separately).
+        /// `-A FILE`: the one global authorized_keys set, loaded at startup
+        /// for the single allowed user. `None` ⇒ per-user files.
+        global_authorized_keys: Option<Arc<AuthorizedKeys>>,
+        /// `AuthorizedKeysFile` path templates in force for this connection
+        /// (`%u`/`%h`/`%%` tokens; relative ⇒ under the user's home).
+        authorized_keys_files: Vec<String>,
+        /// The bound user's authorized keys, loaded lazily on the first
+        /// publickey attempt (see [`Self::resolved_authorized_keys`]). `None`
+        /// until then.
+        authorized_keys: Option<AuthorizedKeys>,
+        /// CA public-key blobs from `TrustedUserCAKeys` (the file in force for
+        /// this connection). A user cert signed by one of these is CA-trusted;
+        /// principal authorization is checked separately. CAs from the user's
+        /// own `authorized_keys` `cert-authority` lines live in
+        /// `authorized_keys` and are trusted for that user only.
         trusted_user_ca_blobs: Vec<Vec<u8>>,
-        /// Parsed `RevokedKeys` KRL, shared read-only across connections.
-        /// `None` ⇒ no revocation list configured. A publickey / certificate
+        /// Parsed `RevokedKeys` KRL in force for this connection (shared,
+        /// read-only). `None` ⇒ no revocation list. A publickey / certificate
         /// the KRL covers is refused regardless of any other trust.
-        revoked_keys: Arc<Option<puressh::krl::Krl>>,
+        revoked_keys: Option<Arc<puressh::krl::Krl>>,
+        /// The parsed `sshd_config` plus the startup inputs needed to re-derive
+        /// the access policy per connection from `Match` blocks
+        /// (`on_user_resolved`). `None` ⇒ no config file / unit tests: the
+        /// fields above stay at their global values.
+        policy: Option<Arc<ConnPolicy>>,
+        /// Set when the per-connection policy names a `TrustedUserCAKeys` /
+        /// `RevokedKeys` file that was not preloaded at startup. Cannot happen
+        /// for a config the daemon itself loaded; if it does, every attempt on
+        /// this connection is refused rather than evaluated with a partial
+        /// trust / revocation set.
+        policy_broken: bool,
         /// `AuthorizedPrincipalsFile` path *template* (may contain `%u`/`%h`/
         /// `%%` tokens), or `None` when no file is configured. Resolved and
         /// loaded lazily per connection once the login user is known (the home
@@ -1619,42 +1743,50 @@ mod imp {
                 }
             }
 
-            // 1. Is the signing CA trusted?
-            if !self.trusted_user_ca_blobs.contains(&ci.ca_key_blob) {
+            // 1 + 2. Is the signing CA trusted, and is the login user an
+            //        authorized principal? Two independent routes, either of
+            //        which suffices (OpenSSH tries authorized_keys first, then
+            //        TrustedUserCAKeys):
+            //
+            //   a. a `cert-authority` line in the *user's own* authorized_keys
+            //      names this CA. With a `principals="..."` option the cert
+            //      must carry a principal matching that list (and the login
+            //      user need not be one); without it, rule (b)'s principal
+            //      check applies.
+            //   b. the CA is in `TrustedUserCAKeys`, and the login user is an
+            //      authorized principal: with an AuthorizedPrincipalsFile the
+            //      login user must map to a principal the cert also lists;
+            //      without one the login user must itself be a cert principal
+            //      (an empty cert principal list authorizes any).
+            //
+            // Both routes are evaluated unconditionally so the cost does not
+            // depend on which one decides.
+            let standard_ok = self.login_user_is_principal(ci, user);
+            let ca_line: Option<Option<Vec<String>>> = self
+                .resolved_authorized_keys(user)
+                .cas
+                .iter()
+                .find(|(blob, _)| *blob == ci.ca_key_blob)
+                .map(|(_, principals)| principals.clone());
+            let line_ok = match &ca_line {
+                None => false,
+                Some(Some(list)) => principals_match_option(list, &ci.valid_principals),
+                Some(None) => standard_ok,
+            };
+            let global_ok = self.trusted_user_ca_blobs.contains(&ci.ca_key_blob) && standard_ok;
+            if ca_line.is_none()
+                && !global_ok
+                && !self.trusted_user_ca_blobs.contains(&ci.ca_key_blob)
+            {
                 if self.debug {
                     eprintln!(
-                        "sshd: cert auth: signing CA is not trusted (key-id {:?})",
+                        "sshd: cert auth: signing CA is not trusted for {user} (key-id {:?})",
                         ci.key_id
                     );
                 }
                 return false;
             }
-
-            // 2. Is the login user an authorized principal?
-            //    - With an AuthorizedPrincipalsFile, the login user must map to
-            //      a principal that the cert also lists.
-            //    - Without one, the login user must itself be in the cert's
-            //      principals (an empty cert principal list authorizes any).
-            // The file path is `%u`/`%h`-expanded and loaded lazily for this
-            // user the first time it is needed.
-            let resolved = self.resolved_principals(user);
-            let principal_ok = match resolved {
-                Some(allowed) => {
-                    // The user is authorized iff some name they're allowed to
-                    // use (from the file) is also present in the cert.
-                    !ci.valid_principals.is_empty()
-                        && allowed
-                            .iter()
-                            .any(|p| ci.valid_principals.iter().any(|vp| vp == p))
-                        // and the login user must be one of the file's mapped
-                        // principals too (the file maps login → allowed principals).
-                        && allowed.iter().any(|p| p == user)
-                }
-                None => {
-                    ci.valid_principals.is_empty() || ci.valid_principals.iter().any(|p| p == user)
-                }
-            };
-            if !principal_ok {
+            if !(line_ok || global_ok) {
                 if self.debug {
                     eprintln!("sshd: cert auth: user {user} not an authorized principal");
                 }
@@ -1682,6 +1814,172 @@ mod imp {
                 }
             }
             true
+        }
+
+        /// The `TrustedUserCAKeys` principal rule: with an
+        /// `AuthorizedPrincipalsFile`, the login user must map to a principal
+        /// the certificate also lists; without one, the login user must itself
+        /// be a cert principal (an empty cert principal list authorizes any).
+        /// The file path is `%u`/`%h`-expanded and loaded lazily for this user
+        /// the first time it is needed.
+        fn login_user_is_principal(&mut self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
+            match self.resolved_principals(user) {
+                Some(allowed) => {
+                    // The user is authorized iff some name they're allowed to
+                    // use (from the file) is also present in the cert, and the
+                    // login user is one of the file's mapped principals too
+                    // (the file maps login → allowed principals).
+                    !ci.valid_principals.is_empty()
+                        && allowed
+                            .iter()
+                            .any(|p| ci.valid_principals.iter().any(|vp| vp == p))
+                        && allowed.iter().any(|p| p == user)
+                }
+                None => {
+                    ci.valid_principals.is_empty() || ci.valid_principals.iter().any(|p| p == user)
+                }
+            }
+        }
+
+        /// The bound user's authorized keys, loaded on first use: the global
+        /// `-A` set when one is configured, otherwise every
+        /// `AuthorizedKeysFile` template expanded and read for `user`.
+        fn resolved_authorized_keys(&mut self, user: &str) -> &AuthorizedKeys {
+            if self.authorized_keys.is_none() {
+                let set = match &self.global_authorized_keys {
+                    Some(g) => (**g).clone(),
+                    None => self.load_authorized_keys_for(user),
+                };
+                self.authorized_keys = Some(set);
+            }
+            // Safe: just populated above.
+            self.authorized_keys.as_ref().unwrap()
+        }
+
+        /// Expand every `AuthorizedKeysFile` template for `user` and read the
+        /// files that exist, StrictModes-checked against `user`'s uid. Any
+        /// failure (unknown user, bad template, StrictModes refusal,
+        /// unreadable file) contributes no keys — never a wider set. A file
+        /// that simply does not exist is silently skipped, as in OpenSSH.
+        fn load_authorized_keys_for(&self, user: &str) -> AuthorizedKeys {
+            let mut out = AuthorizedKeys::default();
+            let info = match lookup_user(user) {
+                Ok(i) => i,
+                Err(e) => {
+                    if self.debug {
+                        eprintln!("sshd: AuthorizedKeysFile: user lookup failed for {user}: {e}");
+                    }
+                    return out;
+                }
+            };
+            for template in &self.authorized_keys_files {
+                let path = match expand_pct_tokens(template, &info) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        if self.debug {
+                            eprintln!(
+                                "sshd: AuthorizedKeysFile: bad path template {template:?}: {e}"
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let path = if path.starts_with('/') {
+                    path
+                } else {
+                    let home = if info.home_str.is_empty() {
+                        "/"
+                    } else {
+                        info.home_str.as_str()
+                    };
+                    format!("{}/{path}", home.trim_end_matches('/'))
+                };
+                if !std::path::Path::new(&path).exists() {
+                    if self.debug {
+                        eprintln!("sshd: AuthorizedKeysFile {path}: not present");
+                    }
+                    continue;
+                }
+                match load_authorized_keys_and_cas(&path, self.strict_modes, Some(info.uid)) {
+                    Ok(set) => {
+                        if self.debug {
+                            eprintln!(
+                                "sshd: AuthorizedKeysFile {path}: {} key(s), {} cert-authority line(s)",
+                                set.blobs.len(),
+                                set.cas.len()
+                            );
+                        }
+                        out.append(set);
+                    }
+                    Err(e) => {
+                        if self.debug {
+                            eprintln!("sshd: AuthorizedKeysFile {path}: {e}");
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// Re-derive the per-connection access policy from the `sshd_config`
+        /// `Match` blocks that apply to `(user, groups, peer, local socket)`,
+        /// replacing the global values this authenticator was built with.
+        /// Called once, from `on_user_resolved`, before the first attempt is
+        /// evaluated.
+        fn apply_conn_policy(&mut self, pol: &ConnPolicy, user: &str) {
+            let groups = match self.group_cache.get(user) {
+                Some(g) => g.clone(),
+                None => {
+                    let g = (self.group_lookup)(user);
+                    self.group_cache.insert(user.to_string(), g.clone());
+                    g
+                }
+            };
+            let opts = resolve_conn_options(&pol.config, user, &groups, self.peer.as_deref());
+
+            self.allow_users = UserHostPattern::parse_all(&effective_allow_users(
+                &pol.cli_allow_users,
+                &opts.allow_users,
+                pol.default_allow_user.as_deref(),
+            ));
+            self.deny_users = UserHostPattern::parse_all(&opts.deny_users);
+            self.allow_groups = puressh::config::HostPattern::parse_all(&opts.allow_groups);
+            self.deny_groups = puressh::config::HostPattern::parse_all(&opts.deny_groups);
+            self.permit_root_login = pol
+                .cli_permit_root_login
+                .or(opts.permit_root_login)
+                .unwrap_or(puressh::config::PermitRootLogin::ProhibitPassword);
+            self.permit_empty_passwords = opts.permit_empty_passwords == Some(true);
+            self.authorized_principals_file = opts.authorized_principals_file;
+            self.authorized_principals = None;
+            if self.global_authorized_keys.is_none() {
+                self.authorized_keys_files = opts
+                    .authorized_keys_file
+                    .unwrap_or_else(default_authorized_keys_files);
+                self.authorized_keys = None;
+            }
+            self.trusted_user_ca_blobs = match &opts.trusted_user_ca_keys {
+                None => Vec::new(),
+                Some(path) => match pol.ca_files.get(path) {
+                    Some(cas) => (**cas).clone(),
+                    None => {
+                        eprintln!("sshd: TrustedUserCAKeys {path}: not preloaded; refusing auth");
+                        self.policy_broken = true;
+                        Vec::new()
+                    }
+                },
+            };
+            self.revoked_keys = match &opts.revoked_keys {
+                None => None,
+                Some(path) => match pol.krls.get(path) {
+                    Some(k) => Some(k.clone()),
+                    None => {
+                        eprintln!("sshd: RevokedKeys {path}: not preloaded; refusing auth");
+                        self.policy_broken = true;
+                        None
+                    }
+                },
+            };
         }
 
         /// Resolve (and cache) the `AuthorizedPrincipalsFile` contents for the
@@ -2007,6 +2305,9 @@ mod imp {
 
     impl Authenticator for LocalAuthenticator {
         fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+            if self.policy_broken {
+                return AuthDecision::Reject;
+            }
             match attempt {
                 AuthAttempt::None { user } => {
                     if self.debug {
@@ -2041,8 +2342,9 @@ mod imp {
                     // "known user / wrong key" via wall-clock timing.
                     // The access check (DenyUsers/AllowUsers/DenyGroups/
                     // AllowGroups, with a memoized group lookup) and the
-                    // linear scan over authorized_blobs both run for every
-                    // attempt so the paths stay uniform.
+                    // scan over the user's authorized keys (loaded once per
+                    // connection) both run for every attempt so the paths
+                    // stay uniform.
                     let user_ok = self.access_allowed(&user);
                     // For a certificate, "blob_ok" becomes: the CA is trusted,
                     // the login user is an authorized principal, and any
@@ -2076,7 +2378,10 @@ mod imp {
                     let blob_ok = !blob_revoked
                         && match &cert {
                             Some(ci) => self.cert_trusted(ci, &user),
-                            None => self.authorized_blobs.contains(&public_blob),
+                            None => self
+                                .resolved_authorized_keys(&user)
+                                .blobs
+                                .contains(&public_blob),
                         };
                     // PermitRootLogin gate: if the requested user resolves to
                     // the root account (uid 0) and policy forbids it, deny
@@ -2199,7 +2504,7 @@ mod imp {
         }
 
         fn evaluate_interactive(&mut self, user: &str, responses: Vec<String>) -> AuthDecision {
-            if !self.kbd_interactive_enabled {
+            if !self.kbd_interactive_enabled || self.policy_broken {
                 return AuthDecision::Reject;
             }
             // Username must not change mid-conversation.
@@ -2251,6 +2556,13 @@ mod imp {
             // Bind the username on first sight (the publickey/password arms also
             // bind, but this fires first via the server's re-resolve hook).
             let bound = self.check_user_binding(user);
+            // Match-block access policy for this (user, peer, local socket):
+            // AllowUsers/DenyUsers/AllowGroups/DenyGroups, PermitRootLogin,
+            // PermitEmptyPasswords, AuthorizedKeysFile,
+            // AuthorizedPrincipalsFile, TrustedUserCAKeys, RevokedKeys.
+            if bound && let Some(pol) = self.policy.clone() {
+                self.apply_conn_policy(&pol, user);
+            }
             self.chains = parse_auth_method_chains(methods);
             if self.debug && bound && !self.chains.is_empty() {
                 eprintln!(
@@ -2292,18 +2604,109 @@ mod imp {
         chains
     }
 
+    /// Whether any of `list` (OpenSSH pattern-list entries, globs allowed)
+    /// matches one of the certificate's principals. An empty certificate
+    /// principal list never matches — a `principals=` option demands a named
+    /// principal.
+    fn principals_match_option(list: &[String], cert_principals: &[String]) -> bool {
+        let pats = puressh::config::HostPattern::parse_all(list);
+        cert_principals
+            .iter()
+            .any(|p| puressh::config::glob::host_matches(&pats, p))
+    }
+
+    /// Startup inputs the authenticator (and the session-open hook) need to
+    /// re-derive the access policy per connection from `Match` blocks.
+    struct ConnPolicy {
+        /// The whole parsed `sshd_config` (global + `Match` blocks).
+        config: Arc<puressh::config::SshServerConfig>,
+        /// CLI `-u` tokens: always in force, ahead of any config `AllowUsers`.
+        cli_allow_users: Vec<String>,
+        /// The daemon's own user, the only login allowed when no `AllowUsers`
+        /// / `-u` applies. `None` if `$USER` is unknown (⇒ nobody).
+        default_allow_user: Option<String>,
+        /// `--permit-root-login`, which wins over every config block.
+        cli_permit_root_login: Option<puressh::config::PermitRootLogin>,
+        /// Every `TrustedUserCAKeys` file named anywhere in the config, loaded
+        /// at startup, keyed by path.
+        ca_files: HashMap<String, Arc<Vec<Vec<u8>>>>,
+        /// Every `RevokedKeys` KRL named anywhere in the config, parsed at
+        /// startup, keyed by path.
+        krls: HashMap<String, Arc<puressh::krl::Krl>>,
+    }
+
+    /// Per-connection socket addresses `(peer, local)`, recorded by the forked
+    /// child before it enters the session loop. Fork's copy-on-write isolates
+    /// the value per connection; the daemon parent never sets it. Read by the
+    /// `Match LocalAddress` / `Match LocalPort` context and the session-open
+    /// hook's peer lookup.
+    static CONN_ADDRS: Mutex<Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)>> =
+        Mutex::new(None);
+
+    fn conn_addrs() -> Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)> {
+        CONN_ADDRS.lock().ok().and_then(|g| *g)
+    }
+
+    /// The connection's peer IP in the textual form `Match Address` uses, or
+    /// `None` when unknown / unspecified (then `Match Address` never matches).
+    fn conn_peer_ip() -> Option<String> {
+        conn_addrs()
+            .map(|(peer, _)| peer.ip())
+            .filter(|ip| !ip.is_unspecified())
+            .map(|ip| ip.to_string())
+    }
+
+    /// Resolve the `sshd_config` policy for a connection once the login user
+    /// is known: user, groups, peer address, and this child's local socket
+    /// (for `Match LocalAddress` / `LocalPort`).
+    fn resolve_conn_options(
+        config: &puressh::config::SshServerConfig,
+        user: &str,
+        groups: &[String],
+        peer_ip: Option<&str>,
+    ) -> puressh::config::ServerOptions {
+        let local = conn_addrs().and_then(|(_, local)| local);
+        let local_ip = local.map(|a| a.ip().to_string());
+        let ctx = puressh::config::MatchContext {
+            host: "",
+            user: Some(user),
+            groups: Some(groups),
+            address: peer_ip,
+            local_address: local_ip.as_deref(),
+            local_port: local.map(|a| a.port()),
+            ..puressh::config::MatchContext::default()
+        };
+        config.resolve(&ctx, puressh::config::match_block::ExecPolicy::Deny)
+    }
+
+    /// The `PermitRootLogin` in force for `user` on this connection: CLI flag
+    /// > matched `Match` blocks > global > built-in `prohibit-password`.
+    fn conn_permit_root_login(pol: &ConnPolicy, user: &str) -> puressh::config::PermitRootLogin {
+        let groups = lookup_user_groups(user);
+        let peer = conn_peer_ip();
+        let opts = resolve_conn_options(&pol.config, user, &groups, peer.as_deref());
+        pol.cli_permit_root_login
+            .or(opts.permit_root_login)
+            .unwrap_or(puressh::config::PermitRootLogin::ProhibitPassword)
+    }
+
     #[derive(Clone)]
     struct LocalAuthFactory {
         allow_users: Arc<Vec<UserHostPattern>>,
         deny_users: Arc<Vec<UserHostPattern>>,
         allow_groups: Arc<Vec<puressh::config::HostPattern>>,
         deny_groups: Arc<Vec<puressh::config::HostPattern>>,
-        authorized_blobs: Arc<Vec<Vec<u8>>>,
-        /// Trusted user-CA blobs (TrustedUserCAKeys ++ authorized_keys
-        /// cert-authority lines), shared across connections.
+        /// `-A FILE`: the one global authorized_keys set. `None` ⇒ per-user.
+        global_authorized_keys: Option<Arc<AuthorizedKeys>>,
+        /// Global `AuthorizedKeysFile` templates (a `Match` block may replace
+        /// them per connection).
+        authorized_keys_files: Vec<String>,
+        /// Trusted user-CA blobs from the global `TrustedUserCAKeys`.
         trusted_user_ca_blobs: Arc<Vec<Vec<u8>>>,
-        /// Parsed `RevokedKeys` KRL, shared read-only across connections.
-        revoked_keys: Arc<Option<puressh::krl::Krl>>,
+        /// Parsed global `RevokedKeys` KRL, shared read-only across connections.
+        revoked_keys: Option<Arc<puressh::krl::Krl>>,
+        /// Match-block policy inputs (see [`ConnPolicy`]).
+        policy: Option<Arc<ConnPolicy>>,
         /// `AuthorizedPrincipalsFile` path *template* (may contain `%u`/`%h`/
         /// `%%`), shared across connections. `None` ⇒ no file configured. Each
         /// connection expands + loads it lazily for its own login user.
@@ -2327,9 +2730,13 @@ mod imp {
                 deny_users: (*self.deny_users).clone(),
                 allow_groups: (*self.allow_groups).clone(),
                 deny_groups: (*self.deny_groups).clone(),
-                authorized_blobs: (*self.authorized_blobs).clone(),
+                global_authorized_keys: self.global_authorized_keys.clone(),
+                authorized_keys_files: self.authorized_keys_files.clone(),
+                authorized_keys: None,
                 trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
                 revoked_keys: self.revoked_keys.clone(),
+                policy: self.policy.clone(),
+                policy_broken: false,
                 authorized_principals_file: self.authorized_principals_file.clone(),
                 strict_modes: self.strict_modes,
                 authorized_principals: None,
@@ -4091,10 +4498,10 @@ mod imp {
         // so every `pick()` falls through to the CLI value or the built-in
         // default. CLI flags always win over the config file (so adminstrators
         // can override a baked-in config without editing it).
-        let sshd_cfg = match cli.config_file.as_deref() {
+        let sshd_cfg = Arc::new(match cli.config_file.as_deref() {
             Some(p) => load_server_config(std::path::Path::new(p))?,
             None => puressh::config::SshServerConfig::default(),
-        };
+        });
 
         // LogLevel (sshd_config): VERBOSE/DEBUG* (level >= 1) turns on the same
         // verbose diagnostics as `-d`, so the config keyword actually controls
@@ -4157,12 +4564,9 @@ mod imp {
             );
         }
 
-        let authorized_keys_file = cli
-            .authorized_keys_file
-            .clone()
-            .or_else(|| sshd_cfg.global.authorized_keys_file.clone());
-
-        // CLI `-u`, then `AllowUsers` from config (cumulative across blocks).
+        // CLI `-u`, then `AllowUsers` from the global section. `AllowUsers`
+        // lines inside `Match` blocks are added per connection by the
+        // authenticator once the user / peer are known.
         let mut allowed_user_list = cli.allowed_users.clone();
         allowed_user_list.extend(sshd_cfg.global.allow_users.iter().cloned());
 
@@ -4207,44 +4611,100 @@ mod imp {
         host_certificate_files.extend(sshd_cfg.global.host_certificate_files.iter().cloned());
         let host_keys =
             load_host_keys_with_certs(&host_key_files, &host_certificate_files, strict_modes)?;
-        // authorized_keys: plain authorized key blobs, plus any CA blobs from
-        // `cert-authority` lines (their keys are trusted to sign user certs).
-        let (authorized_blobs, ak_ca_blobs): (Vec<Vec<u8>>, Vec<Vec<u8>>) =
-            match &authorized_keys_file {
-                Some(path) => load_authorized_keys_and_cas(path, strict_modes)?,
-                None => (Vec::new(), Vec::new()),
-            };
-
-        // Trusted user-CA set = TrustedUserCAKeys file ++ authorized_keys
-        // cert-authority lines.
-        let mut trusted_user_ca_blobs = ak_ca_blobs;
-        if let Some(path) = &sshd_cfg.global.trusted_user_ca_keys {
-            match load_ca_keys_file(path, strict_modes) {
-                Ok(mut cas) => trusted_user_ca_blobs.append(&mut cas),
-                Err(e) => return Err(format!("TrustedUserCAKeys: {e}")),
+        // Authorized keys come in two mutually exclusive modes:
+        //
+        //  * Per-user (the default, OpenSSH semantics): `AuthorizedKeysFile`
+        //    templates, expanded and read by each connection for its own
+        //    login user (`LocalAuthenticator::resolved_authorized_keys`),
+        //    StrictModes-checked against that user. Nothing is read here.
+        //
+        //  * `-A FILE`: ONE global file whose every key authorizes the single
+        //    allowed user. Loaded now, as the daemon's user, with the
+        //    root-owned StrictModes rule. Because the file cannot say *which*
+        //    user a key belongs to, it is refused unless exactly one literal
+        //    user is allowed anywhere in the configuration.
+        let global_authorized_keys: Option<Arc<AuthorizedKeys>> = match &cli.authorized_keys_file {
+            Some(path) => {
+                let mut all_allowed: Vec<String> = allowed_user_list.clone();
+                for block in &sshd_cfg.match_blocks {
+                    all_allowed.extend(block.opts.allow_users.iter().cloned());
+                }
+                all_allowed.sort();
+                all_allowed.dedup();
+                let single = match all_allowed.as_slice() {
+                    [] => current_user()?,
+                    [one] if is_literal_user_token(one) => one.clone(),
+                    _ => {
+                        return Err(format!(
+                            "-A {path}: a global authorized_keys file authorizes every key in it \
+                             for every allowed user, so it requires exactly one literal allowed \
+                             user (-u USER, or a single AllowUsers name with no wildcard/@host); \
+                             configured: {all_allowed:?}. Use AuthorizedKeysFile (per-user, \
+                             with %u/%h tokens) instead."
+                        ));
+                    }
+                };
+                let set = load_authorized_keys_and_cas(path, strict_modes, None)?;
+                eprintln!(
+                    "sshd: -A {path}: {} key(s) and {} cert-authority line(s) authorize user \
+                     {single:?} (global file; every listed key logs in as that user)",
+                    set.blobs.len(),
+                    set.cas.len()
+                );
+                Some(Arc::new(set))
+            }
+            None => None,
+        };
+        let authorized_keys_files: Vec<String> = sshd_cfg
+            .global
+            .authorized_keys_file
+            .clone()
+            .unwrap_or_else(default_authorized_keys_files);
+        // A template with no per-user token is one shared file: every key in
+        // it logs in as any allowed user. Legal (as in OpenSSH), but loud.
+        for block in sshd_cfg.all_blocks() {
+            for t in block.authorized_keys_file.iter().flatten() {
+                if t.starts_with('/') && !t.contains("%u") && !t.contains("%h") {
+                    eprintln!(
+                        "sshd: WARNING: AuthorizedKeysFile {t} has no %u/%h token: every key in \
+                         it can log in as ANY allowed user"
+                    );
+                }
             }
         }
 
-        // RevokedKeys: load and parse the binary KRL once at startup. A
-        // configured-but-unreadable / unparsable KRL is a hard startup error —
-        // failing closed beats silently running with no revocation. Parsed once
-        // and shared read-only across all connections.
-        let revoked_keys: Arc<Option<puressh::krl::Krl>> = match &sshd_cfg.global.revoked_keys {
-            Some(path) => {
-                let bytes = std::fs::read(path).map_err(|e| format!("RevokedKeys {path}: {e}"))?;
-                let krl = puressh::krl::Krl::parse(&bytes)
-                    .map_err(|e| format!("RevokedKeys {path}: parse failed: {e}"))?;
-                if cli.debug {
-                    eprintln!(
-                        "sshd: loaded RevokedKeys from {path} ({} bytes, empty={})",
-                        bytes.len(),
-                        krl.is_empty()
-                    );
-                }
-                Arc::new(Some(krl))
+        // TrustedUserCAKeys / RevokedKeys: load every file named in the global
+        // section *or any Match block* now, so a bad path is a startup error
+        // (failing closed beats silently running with no revocation), and each
+        // connection just picks the set its matched blocks name.
+        let mut ca_files: HashMap<String, Arc<Vec<Vec<u8>>>> = HashMap::new();
+        let mut krls: HashMap<String, Arc<puressh::krl::Krl>> = HashMap::new();
+        for block in sshd_cfg.all_blocks() {
+            if let Some(path) = &block.trusted_user_ca_keys
+                && !ca_files.contains_key(path)
+            {
+                let cas = load_ca_keys_file(path, strict_modes)
+                    .map_err(|e| format!("TrustedUserCAKeys: {e}"))?;
+                ca_files.insert(path.clone(), Arc::new(cas));
             }
-            None => Arc::new(None),
-        };
+            if let Some(path) = &block.revoked_keys
+                && !krls.contains_key(path)
+            {
+                krls.insert(path.clone(), Arc::new(load_krl(path, cli.debug)?));
+            }
+        }
+        let trusted_user_ca_blobs: Vec<Vec<u8>> = sshd_cfg
+            .global
+            .trusted_user_ca_keys
+            .as_ref()
+            .and_then(|p| ca_files.get(p))
+            .map(|v| (**v).clone())
+            .unwrap_or_default();
+        let revoked_keys: Option<Arc<puressh::krl::Krl>> = sshd_cfg
+            .global
+            .revoked_keys
+            .as_ref()
+            .and_then(|p| krls.get(p).cloned());
 
         // AuthorizedPrincipalsFile: keep the raw path *template* (it may carry
         // `%u`/`%h` tokens). Each connection expands it against its own login
@@ -4255,13 +4715,18 @@ mod imp {
 
         // AllowUsers is matched as OpenSSH `Host`-style globs (a literal name
         // is just a glob with no metacharacters). Empty ⇒ the historical
-        // "current user only" default, seeded as a single literal pattern.
-        let allow_user_tokens: Vec<String> = if allowed_user_list.is_empty() {
-            vec![current_user()?]
+        // "current user only" default, seeded as a single literal pattern
+        // (required to resolve when nothing else is configured).
+        let default_allow_user: Option<String> = if allowed_user_list.is_empty() {
+            Some(current_user()?)
         } else {
-            allowed_user_list
+            current_user().ok()
         };
-        let allow_users = UserHostPattern::parse_all(&allow_user_tokens);
+        let allow_users = UserHostPattern::parse_all(&effective_allow_users(
+            &cli.allowed_users,
+            &sshd_cfg.global.allow_users,
+            default_allow_user.as_deref(),
+        ));
         let deny_users = UserHostPattern::parse_all(&sshd_cfg.global.deny_users);
         let allow_groups = puressh::config::HostPattern::parse_all(&sshd_cfg.global.allow_groups);
         let deny_groups = puressh::config::HostPattern::parse_all(&sshd_cfg.global.deny_groups);
@@ -4335,14 +4800,25 @@ mod imp {
             .clone()
             .unwrap_or_default();
 
+        let conn_policy = Arc::new(ConnPolicy {
+            config: sshd_cfg.clone(),
+            cli_allow_users: cli.allowed_users.clone(),
+            default_allow_user,
+            cli_permit_root_login: cli.permit_root_login,
+            ca_files,
+            krls,
+        });
+
         let factory = Arc::new(LocalAuthFactory {
             allow_users: Arc::new(allow_users),
             deny_users: Arc::new(deny_users),
             allow_groups: Arc::new(allow_groups),
             deny_groups: Arc::new(deny_groups),
-            authorized_blobs: Arc::new(authorized_blobs),
+            global_authorized_keys,
+            authorized_keys_files,
             trusted_user_ca_blobs: Arc::new(trusted_user_ca_blobs),
             revoked_keys,
+            policy: Some(conn_policy.clone()),
             authorized_principals_file,
             strict_modes,
             permit_root_login,
@@ -4428,6 +4904,7 @@ mod imp {
         let debug = cli.debug;
         let session_pam = pam_gate.clone();
         let session_print_motd = print_motd_flag.clone();
+        let hook_policy = conn_policy.clone();
         config = config.on_session_open(move |ctx: &SessionOpenContext<'_>| {
             let user = ctx.user;
             // PermitRootLogin backstop, evaluated at login time before we
@@ -4435,7 +4912,9 @@ mod imp {
             // denies root during userauth; this re-checks against the live
             // passwd database so a uid-0 login cannot proceed even if it
             // reached session-open by some other path. Resolved here (not at
-            // startup) so it reflects the current database.
+            // startup) so it reflects the current database and the `Match`
+            // blocks that apply to this connection.
+            let permit_root_login = conn_permit_root_login(&hook_policy, user);
             if resolves_to_root(user) && !permit_root_login.permits_publickey() {
                 if debug {
                     eprintln!(
@@ -4526,7 +5005,7 @@ mod imp {
         // post-auth user/groups) to gate the auth method set, banner, and
         // forwarding capabilities. The group resolver feeds `Match group`.
         config = config
-            .with_policy(Arc::new(sshd_cfg))
+            .with_policy(sshd_cfg.clone())
             .with_group_resolver(group_lookup);
 
         let cfg = Arc::new(config);
@@ -4657,6 +5136,12 @@ mod imp {
                     // copy — set_peer mutates state behind a Mutex but
                     // post-fork COW means only this child sees it.
                     pam_gate.set_peer(peer.to_string());
+                    // Likewise record this connection's socket addresses for
+                    // the `Match LocalAddress`/`LocalPort` context and the
+                    // session-open hook (COW-isolated per child).
+                    if let Ok(mut g) = CONN_ADDRS.lock() {
+                        *g = Some((peer, stream.local_addr().ok()));
+                    }
 
                     let rc = match handle_session_with_peer(stream, peer, cfg.clone()) {
                         Ok(()) => 0,
@@ -4822,9 +5307,13 @@ mod imp {
                 deny_users: to_uh(deny_users),
                 allow_groups: to_pats(allow_groups),
                 deny_groups: to_pats(deny_groups),
-                authorized_blobs: Vec::new(),
+                global_authorized_keys: None,
+                authorized_keys_files: Vec::new(),
+                authorized_keys: Some(AuthorizedKeys::default()),
                 trusted_user_ca_blobs: Vec::new(),
-                revoked_keys: std::sync::Arc::new(None),
+                revoked_keys: None,
+                policy: None,
+                policy_broken: false,
                 authorized_principals_file: None,
                 strict_modes: false,
                 authorized_principals: None,
@@ -5343,8 +5832,11 @@ mod imp {
 
             // Build an authenticator that *authorizes* the key, then revokes it.
             let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
-            a.authorized_blobs = vec![blob.clone()];
-            a.revoked_keys = std::sync::Arc::new(Some(krl));
+            a.authorized_keys = Some(AuthorizedKeys {
+                blobs: vec![blob.clone()],
+                cas: Vec::new(),
+            });
+            a.revoked_keys = Some(std::sync::Arc::new(krl));
 
             // A verified publickey attempt for an authorized-but-revoked key is
             // rejected.
@@ -5408,7 +5900,7 @@ mod imp {
 
             let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
             b.trusted_user_ca_blobs = vec![ca_blob];
-            b.revoked_keys = std::sync::Arc::new(Some(krl));
+            b.revoked_keys = Some(std::sync::Arc::new(krl));
             let decision = b.evaluate(AuthAttempt::PublicKey {
                 user: "alice".into(),
                 algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
@@ -5418,6 +5910,380 @@ mod imp {
                 cert: Some(ci),
             });
             assert!(matches!(decision, AuthDecision::Reject), "{decision:?}");
+        }
+
+        /// The fixture user key as an `authorized_keys` line.
+        const USERKEY_LINE: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINrIw2f/9CPMdm0gq/9PJiCID0Iep+LFikcQCJLkkFR/ test";
+
+        fn cert_attempt(user: &str, ci: &puressh::auth::CertInfo) -> AuthAttempt {
+            AuthAttempt::PublicKey {
+                user: user.into(),
+                algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
+                public_blob: b"cert-blob".to_vec(),
+                probe_only: false,
+                verified: true,
+                cert: Some(ci.clone()),
+            }
+        }
+
+        // ---- S7: principals= on cert-authority lines ------------------------
+
+        #[test]
+        fn cert_authority_line_principals_option_replaces_username_check() {
+            let ca = b"fake-ca-blob-1".to_vec();
+            // A CA trusted only via the user's own authorized_keys, restricted
+            // to certs carrying the `deploy` principal.
+            let ak = AuthorizedKeys {
+                blobs: Vec::new(),
+                cas: vec![(ca.clone(), Some(vec!["deploy".to_string()]))],
+            };
+            // Cert lists `deploy` but NOT the login user: accepted, because the
+            // principals= list replaces the login-user-must-be-a-principal rule.
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_keys = Some(ak.clone());
+            let ci = cert_info_for(&ca, &["deploy"]);
+            assert!(matches!(
+                a.evaluate(cert_attempt("alice", &ci)),
+                AuthDecision::Accept
+            ));
+
+            // Cert lists the login user but not `deploy`: refused.
+            let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
+            b.authorized_keys = Some(ak.clone());
+            let ci = cert_info_for(&ca, &["alice"]);
+            assert!(matches!(
+                b.evaluate(cert_attempt("alice", &ci)),
+                AuthDecision::Reject
+            ));
+
+            // A cert with NO principals never satisfies a principals= list.
+            let mut c = auth_with(&["*"], &[], &[], &[], Default::default());
+            c.authorized_keys = Some(ak);
+            let ci = cert_info_for(&ca, &[]);
+            assert!(matches!(
+                c.evaluate(cert_attempt("alice", &ci)),
+                AuthDecision::Reject
+            ));
+
+            // Without principals=, the standard rule applies: login user must
+            // be a principal.
+            let plain = AuthorizedKeys {
+                blobs: Vec::new(),
+                cas: vec![(ca.clone(), None)],
+            };
+            let mut d = auth_with(&["*"], &[], &[], &[], Default::default());
+            d.authorized_keys = Some(plain.clone());
+            let ci = cert_info_for(&ca, &["alice"]);
+            assert!(matches!(
+                d.evaluate(cert_attempt("alice", &ci)),
+                AuthDecision::Accept
+            ));
+            let mut e = auth_with(&["*"], &[], &[], &[], Default::default());
+            e.authorized_keys = Some(plain);
+            let ci = cert_info_for(&ca, &["bob"]);
+            assert!(matches!(
+                e.evaluate(cert_attempt("alice", &ci)),
+                AuthDecision::Reject
+            ));
+
+            // An unrelated CA is not trusted at all.
+            let mut f = auth_with(&["*"], &[], &[], &[], Default::default());
+            f.authorized_keys = Some(AuthorizedKeys::default());
+            let ci = cert_info_for(&ca, &["alice"]);
+            assert!(matches!(
+                f.evaluate(cert_attempt("alice", &ci)),
+                AuthDecision::Reject
+            ));
+        }
+
+        #[test]
+        fn principals_option_matching_is_glob() {
+            let list = vec!["deploy-*".to_string(), "ops".to_string()];
+            assert!(principals_match_option(&list, &["deploy-eu".to_string()]));
+            assert!(principals_match_option(
+                &list,
+                &["x".to_string(), "ops".to_string()]
+            ));
+            assert!(!principals_match_option(&list, &["dev".to_string()]));
+            assert!(!principals_match_option(&list, &[]));
+            assert!(!principals_match_option(&[], &["ops".to_string()]));
+        }
+
+        #[test]
+        fn authorized_keys_principals_option_parsed_from_file() {
+            let dir = tempdir_for_test("ak-principals");
+            let path = dir.join("authorized_keys");
+            std::fs::write(
+                &path,
+                format!(
+                    "cert-authority,principals=\"deploy,ops-*\" {USERKEY_LINE}\n\
+                     cert-authority {USERKEY_LINE}\n\
+                     cert-authority,principals=\"\" {USERKEY_LINE}\n\
+                     {USERKEY_LINE}\n"
+                ),
+            )
+            .expect("write");
+            let set =
+                load_authorized_keys_and_cas(path.to_str().unwrap(), false, None).expect("load");
+            assert_eq!(set.blobs, vec![unhex(USERKEY_BLOB_HEX)]);
+            assert_eq!(set.cas.len(), 3);
+            assert_eq!(
+                set.cas[0].1.as_deref(),
+                Some(&["deploy".to_string(), "ops-*".to_string()][..])
+            );
+            assert_eq!(set.cas[1].1, None);
+            // `principals=""` restricts to nothing rather than widening.
+            assert_eq!(set.cas[2].1.as_deref(), Some(&[][..]));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // ---- S1: per-user AuthorizedKeysFile -------------------------------
+
+        fn tempdir_for_test(tag: &str) -> std::path::PathBuf {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "puressh-sshd-{tag}-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            dir
+        }
+
+        #[test]
+        fn authorized_keys_file_expands_u_token_per_user() {
+            let info = lookup_user_for_test();
+            let dir = tempdir_for_test("akf");
+            // Only the real test user's file carries the key; another user's
+            // file (same template) does not exist.
+            std::fs::write(dir.join(format!("{}.keys", info.name)), USERKEY_LINE).expect("write");
+            let template = format!("{}/%u.keys", dir.display());
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_keys = None; // force the lazy per-user load
+            a.authorized_keys_files = vec![template];
+            a.strict_modes = false;
+            let set = a.resolved_authorized_keys(&info.name).clone();
+            assert_eq!(set.blobs, vec![unhex(USERKEY_BLOB_HEX)]);
+
+            // The key authorizes that user…
+            let decision = a.evaluate(AuthAttempt::PublicKey {
+                user: info.name.clone(),
+                algorithm: "ssh-ed25519".into(),
+                public_blob: unhex(USERKEY_BLOB_HEX),
+                probe_only: false,
+                verified: true,
+                cert: None,
+            });
+            assert!(matches!(decision, AuthDecision::Accept), "{decision:?}");
+
+            // …and nobody else: a different (nonexistent-file) user gets an
+            // empty set from the same template.
+            let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
+            b.authorized_keys = None;
+            b.authorized_keys_files = a.authorized_keys_files.clone();
+            b.strict_modes = false;
+            assert!(b.load_authorized_keys_for("root").blobs.is_empty() || info.name == "root");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn authorized_keys_file_unknown_user_or_bad_template_is_empty() {
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.strict_modes = false;
+            a.authorized_keys_files = vec!["/nonexistent/%u".to_string(), "%z".to_string()];
+            assert!(
+                a.load_authorized_keys_for("\u{0}no-such-user")
+                    .blobs
+                    .is_empty()
+            );
+            let info = lookup_user_for_test();
+            assert!(a.load_authorized_keys_for(&info.name).blobs.is_empty());
+        }
+
+        #[test]
+        fn global_authorized_keys_set_is_used_verbatim() {
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_keys = None;
+            a.global_authorized_keys = Some(std::sync::Arc::new(AuthorizedKeys {
+                blobs: vec![vec![9, 9, 9]],
+                cas: Vec::new(),
+            }));
+            assert_eq!(
+                a.resolved_authorized_keys("anyone").blobs,
+                vec![vec![9, 9, 9]]
+            );
+        }
+
+        #[test]
+        fn allow_users_default_and_literal_token_rules() {
+            assert!(is_literal_user_token("alice"));
+            assert!(!is_literal_user_token("dev-*"));
+            assert!(!is_literal_user_token("!alice"));
+            assert!(!is_literal_user_token("alice@10.*"));
+            assert!(!is_literal_user_token(""));
+            assert_eq!(
+                effective_allow_users(&["a".into()], &["b".into()], Some("me")),
+                vec!["a".to_string(), "b".to_string()]
+            );
+            assert_eq!(
+                effective_allow_users(&[], &[], Some("me")),
+                vec!["me".to_string()]
+            );
+            // Nothing configured and no daemon user ⇒ nobody, never everybody.
+            let nobody = UserHostPattern::parse_all(&effective_allow_users(&[], &[], None));
+            assert!(!user_host_list_matches(&nobody, "anyone", None));
+        }
+
+        // ---- S6: Match-block access policy per connection ------------------
+
+        fn conn_policy_for(src: &str) -> std::sync::Arc<ConnPolicy> {
+            std::sync::Arc::new(ConnPolicy {
+                config: std::sync::Arc::new(
+                    puressh::config::SshServerConfig::parse(src).expect("parse config"),
+                ),
+                cli_allow_users: Vec::new(),
+                default_allow_user: Some("me".to_string()),
+                cli_permit_root_login: None,
+                ca_files: HashMap::new(),
+                krls: HashMap::new(),
+            })
+        }
+
+        #[test]
+        fn match_address_deny_users_applies_per_connection() {
+            let pol =
+                conn_policy_for("AllowUsers alice\nMatch Address 10.0.0.0/8\n  DenyUsers *\n");
+            let mut lan =
+                auth_with_peer(&["*"], &[], &[], &[], Default::default(), Some("10.1.2.3"));
+            lan.policy = Some(pol.clone());
+            lan.on_user_resolved("alice", &[]);
+            assert!(
+                !lan.access_allowed("alice"),
+                "DenyUsers inside Match Address must apply"
+            );
+
+            let mut wan =
+                auth_with_peer(&["*"], &[], &[], &[], Default::default(), Some("192.0.2.1"));
+            wan.policy = Some(pol);
+            wan.on_user_resolved("alice", &[]);
+            assert!(wan.access_allowed("alice"));
+            // Global AllowUsers still applies: bob is not listed.
+            assert!(!wan.access_allowed("bob"));
+        }
+
+        #[test]
+        fn match_user_root_login_and_empty_passwords_apply_per_connection() {
+            let pol = conn_policy_for(
+                "PermitRootLogin yes\nMatch User alice\n  PermitRootLogin no\n  PermitEmptyPasswords yes\n",
+            );
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.policy = Some(pol.clone());
+            a.on_user_resolved("alice", &[]);
+            assert_eq!(a.permit_root_login, puressh::config::PermitRootLogin::No);
+            assert!(a.permit_empty_passwords);
+
+            let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
+            b.policy = Some(pol);
+            b.on_user_resolved("bob", &[]);
+            assert_eq!(b.permit_root_login, puressh::config::PermitRootLogin::Yes);
+            assert!(!b.permit_empty_passwords);
+        }
+
+        #[test]
+        fn match_group_allow_groups_uses_group_resolver() {
+            let pol = conn_policy_for(
+                "AllowUsers carol dave\nMatch Group ops\n  AllowGroups ops\n  DenyGroups contractors\n",
+            );
+            let mut groups = std::collections::HashMap::new();
+            groups.insert(
+                "carol".to_string(),
+                vec!["ops".to_string(), "contractors".to_string()],
+            );
+            groups.insert("dave".to_string(), vec!["ops".to_string()]);
+            let mut carol = auth_with(&["*"], &[], &[], &[], groups.clone());
+            carol.policy = Some(pol.clone());
+            carol.on_user_resolved("carol", &[]);
+            assert!(
+                !carol.access_allowed("carol"),
+                "DenyGroups from the matched block applies"
+            );
+            let mut dave = auth_with(&["*"], &[], &[], &[], groups);
+            dave.policy = Some(pol);
+            dave.on_user_resolved("dave", &[]);
+            assert!(dave.access_allowed("dave"));
+        }
+
+        #[test]
+        fn match_block_file_paths_select_preloaded_sets() {
+            let mut pol_inner = ConnPolicy {
+                config: std::sync::Arc::new(
+                    puressh::config::SshServerConfig::parse(
+                        "TrustedUserCAKeys /ca/global\nMatch User alice\n  TrustedUserCAKeys /ca/alice\n  RevokedKeys /krl/alice\n  AuthorizedKeysFile /keys/%u\n  AuthorizedPrincipalsFile /principals/%u\n",
+                    )
+                    .expect("parse"),
+                ),
+                cli_allow_users: Vec::new(),
+                default_allow_user: Some("me".to_string()),
+                cli_permit_root_login: None,
+                ca_files: HashMap::new(),
+                krls: HashMap::new(),
+            };
+            pol_inner.ca_files.insert(
+                "/ca/global".into(),
+                std::sync::Arc::new(vec![b"g".to_vec()]),
+            );
+            pol_inner
+                .ca_files
+                .insert("/ca/alice".into(), std::sync::Arc::new(vec![b"a".to_vec()]));
+            let krl = puressh::krl::Krl::parse(&unhex(KRL_EXPLICIT_HEX)).expect("krl");
+            pol_inner
+                .krls
+                .insert("/krl/alice".into(), std::sync::Arc::new(krl));
+            let pol = std::sync::Arc::new(pol_inner);
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.policy = Some(pol.clone());
+            a.on_user_resolved("alice", &[]);
+            assert_eq!(a.trusted_user_ca_blobs, vec![b"a".to_vec()]);
+            assert!(a.revoked_keys.is_some());
+            assert_eq!(a.authorized_keys_files, vec!["/keys/%u".to_string()]);
+            assert_eq!(
+                a.authorized_principals_file.as_deref(),
+                Some("/principals/%u")
+            );
+            assert!(!a.policy_broken);
+
+            let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
+            b.policy = Some(pol);
+            b.on_user_resolved("bob", &[]);
+            assert_eq!(b.trusted_user_ca_blobs, vec![b"g".to_vec()]);
+            assert!(b.revoked_keys.is_none());
+            assert_eq!(b.authorized_keys_files, default_authorized_keys_files());
+        }
+
+        #[test]
+        fn match_block_naming_unloaded_file_fails_closed() {
+            let pol = conn_policy_for("Match User alice\n  RevokedKeys /krl/missing\n");
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_keys = Some(AuthorizedKeys {
+                blobs: vec![unhex(USERKEY_BLOB_HEX)],
+                cas: Vec::new(),
+            });
+            a.policy = Some(pol);
+            a.on_user_resolved("alice", &[]);
+            assert!(a.policy_broken);
+            let decision = a.evaluate(AuthAttempt::PublicKey {
+                user: "alice".into(),
+                algorithm: "ssh-ed25519".into(),
+                public_blob: unhex(USERKEY_BLOB_HEX),
+                probe_only: false,
+                verified: true,
+                cert: None,
+            });
+            assert!(matches!(decision, AuthDecision::Reject));
         }
 
         // ---- Multi-step keyboard-interactive bridge ------------------------
@@ -5566,7 +6432,10 @@ mod imp {
             // rejection above is attributable to revocation, not the harness.
             let blob = unhex(USERKEY_BLOB_HEX);
             let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
-            a.authorized_blobs = vec![blob.clone()];
+            a.authorized_keys = Some(AuthorizedKeys {
+                blobs: vec![blob.clone()],
+                cas: Vec::new(),
+            });
             let decision = a.evaluate(AuthAttempt::PublicKey {
                 user: "alice".into(),
                 algorithm: "ssh-ed25519".into(),

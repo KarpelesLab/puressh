@@ -19,6 +19,11 @@ use super::message::{
 /// never rendered — it is replaced by `"<redacted>"`. This prevents
 /// accidental leakage through `tracing::debug!`, `dbg!`, `Result::unwrap`'s
 /// `{:?}` formatter, and similar developer-ergonomics paths.
+// `PublicKey` carries the parsed certificate facts inline; the other variants
+// are a username and (for `Password`) one secret. The asymmetry is inherent —
+// the attempt is short-lived and never stored in bulk — so boxing `CertInfo`
+// would only add an allocation per publickey attempt.
+#[allow(clippy::large_enum_variant)]
 pub enum AuthAttempt {
     /// `none` — bare probe.
     None {

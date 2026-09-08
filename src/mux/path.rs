@@ -9,9 +9,13 @@
 //!
 //! A Unix-domain socket address is bounded by `sun_path` (~108 bytes including
 //! the NUL terminator on Linux). An expanded `ControlPath` longer than that
-//! cannot be `bind()`ed, so [`socket_path_for`] falls back to a short,
-//! collision-resistant `<dir>/<sha256-prefix>` name in the same directory.
+//! cannot be `bind()`ed, so [`socket_path_for`] rejects it with
+//! [`ControlPathTooLong`] — the same `ControlPath too long` hard error OpenSSH
+//! raises. (An earlier version silently substituted a deterministic name
+//! under `std::env::temp_dir()`; that put the socket somewhere the user never
+//! chose, at a name any local user could predict and pre-create.)
 
+use std::fmt;
 use std::path::PathBuf;
 
 use purecrypto::hash::sha256;
@@ -104,14 +108,40 @@ pub fn local_hostname() -> String {
     String::new()
 }
 
+/// An expanded `ControlPath` does not fit in a Unix-domain socket address.
+///
+/// Mirrors OpenSSH's `ControlPath too long` fatal error. Users should shorten
+/// the template (e.g. use `%C`, the connection hash, instead of `%r@%h:%p`)
+/// or point it at a shorter directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPathTooLong {
+    /// The fully expanded path that was rejected.
+    pub path: String,
+    /// The maximum byte length accepted.
+    pub max: usize,
+}
+
+impl fmt::Display for ControlPathTooLong {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "ControlPath too long ({} bytes, max {}): {}",
+            self.path.len(),
+            self.max,
+            self.path
+        )
+    }
+}
+
+impl std::error::Error for ControlPathTooLong {}
+
 /// Fully resolve a `ControlPath` template to a concrete filesystem path,
-/// applying `~`/token expansion and the `sun_path` length fallback.
+/// applying `~`/token expansion and the `sun_path` length check.
 ///
 /// `tilde` expands a leading `~`/`~/` (pass the binary's `expand_tilde`). If
-/// the expanded path's byte length exceeds the conservative `sun_path` limit,
-/// it is replaced by `<parent>/ssh-mux-<sha256hex>` so the socket can actually
-/// be bound; the hash is taken over the *full* expanded path so distinct long
-/// paths stay distinct.
+/// the expanded path's byte length exceeds the conservative `sun_path` limit
+/// the result is [`ControlPathTooLong`]; there is deliberately no fallback
+/// location (see the module docs).
 pub fn expand_control_path(
     template: &str,
     localhost: &str,
@@ -119,31 +149,23 @@ pub fn expand_control_path(
     port: u16,
     user: &str,
     tilde: impl Fn(&str) -> String,
-) -> PathBuf {
+) -> Result<PathBuf, ControlPathTooLong> {
     let expanded = tilde(&expand_tokens_with_hash(
         template, localhost, host, port, user,
     ));
     socket_path_for(&expanded)
 }
 
-/// Apply the `sun_path` length fallback to an already-expanded path string.
-/// Returns the path unchanged when it fits, otherwise a short hashed name in
-/// the same parent directory.
-pub fn socket_path_for(expanded: &str) -> PathBuf {
+/// Apply the `sun_path` length check to an already-expanded path string.
+/// Returns the path unchanged when it fits, otherwise [`ControlPathTooLong`].
+pub fn socket_path_for(expanded: &str) -> Result<PathBuf, ControlPathTooLong> {
     if expanded.len() <= SUN_PATH_MAX {
-        return PathBuf::from(expanded);
-    }
-    let digest = sha256(expanded.as_bytes());
-    let short = format!("ssh-mux-{}", hex(&digest[..16]));
-    let parent = PathBuf::from(expanded)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .filter(|p| !p.as_os_str().is_empty());
-    match parent {
-        Some(dir) if dir.as_os_str().len() + 1 + short.len() <= SUN_PATH_MAX => dir.join(short),
-        // Even the parent dir is too long (or absent): fall back to a temp
-        // directory, which is guaranteed short.
-        _ => std::env::temp_dir().join(short),
+        Ok(PathBuf::from(expanded))
+    } else {
+        Err(ControlPathTooLong {
+            path: expanded.to_string(),
+            max: SUN_PATH_MAX,
+        })
     }
 }
 
@@ -191,41 +213,36 @@ mod tests {
 
     #[test]
     fn short_path_unchanged() {
-        let p = socket_path_for("/tmp/ssh-mux-abc");
+        let p = socket_path_for("/tmp/ssh-mux-abc").unwrap();
         assert_eq!(p, PathBuf::from("/tmp/ssh-mux-abc"));
     }
 
     #[test]
-    fn overlong_path_is_hashed_in_same_dir() {
+    fn overlong_path_is_rejected() {
         let long_name: String = "x".repeat(200);
         let full = format!("/tmp/{long_name}");
-        let p = socket_path_for(&full);
-        assert!(p.as_os_str().len() <= SUN_PATH_MAX, "result fits sun_path");
-        assert_eq!(p.parent().unwrap(), std::path::Path::new("/tmp"));
+        let err = socket_path_for(&full).unwrap_err();
+        assert_eq!(err.path, full);
+        assert_eq!(err.max, SUN_PATH_MAX);
         assert!(
-            p.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("ssh-mux-"),
-            "hashed name uses ssh-mux- prefix"
+            err.to_string().starts_with("ControlPath too long"),
+            "OpenSSH-style message: {err}"
         );
-        // Distinct long paths ⇒ distinct hashed names.
-        let other = format!("/tmp/{}", "y".repeat(200));
-        assert_ne!(p, socket_path_for(&other));
     }
 
     #[test]
-    fn overlong_parent_falls_back_to_tempdir() {
+    fn overlong_parent_is_rejected_not_relocated() {
+        // Regression: this used to land in `std::env::temp_dir()` under a
+        // predictable name any local user could pre-create.
         let deep = format!("/{}/sock", "d".repeat(200));
-        let p = socket_path_for(&deep);
-        assert!(p.as_os_str().len() <= SUN_PATH_MAX + 64);
-        assert!(
-            p.file_name()
-                .unwrap()
-                .to_str()
-                .unwrap()
-                .starts_with("ssh-mux-")
-        );
+        assert!(socket_path_for(&deep).is_err());
+    }
+
+    #[test]
+    fn expand_control_path_propagates_length_error() {
+        let tilde = |s: &str| s.to_string();
+        assert!(expand_control_path("/tmp/cm-%C", "lh", "h", 22, "u", tilde).is_ok());
+        let long = format!("/tmp/{}-%C", "z".repeat(150));
+        assert!(expand_control_path(&long, "lh", "h", 22, "u", tilde).is_err());
     }
 }

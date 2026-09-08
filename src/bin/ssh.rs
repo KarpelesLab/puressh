@@ -559,6 +559,9 @@ fn apply_extra_o(
         bind_address,
         identity_agent,
         obscure_keystroke_timing,
+        control_master,
+        control_path,
+        control_persist,
     );
     // Cumulative lists: append whatever the -o block contributed.
     cfg_block.identity_files.extend(o.identity_files);
@@ -1242,7 +1245,7 @@ fn run() -> Result<i32, String> {
     // Resolve the control settings once. The honoring is Unix-only; the
     // resolved values just sit unused on other platforms.
     #[cfg(unix)]
-    let mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user);
+    let mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user)?;
 
     // `-O check|exit|stop`: a control command, not a session. Resolve the
     // ControlPath, talk to the master, and return — never connect/auth.
@@ -1261,6 +1264,15 @@ fn run() -> Result<i32, String> {
         // Client role: if master is auto/no and a live master answers, attach
         // to it and run the session as a new channel — no second TCP/KEX/auth.
         if matches!(dec.master, ControlMaster::Auto | ControlMaster::No) {
+            // Trust check first: a symlink, a non-socket, or a socket owned
+            // by / accessible to another user at the ControlPath is never
+            // attached to (the mux client refuses internally too) and never
+            // silently replaced — surface the reason and stop.
+            match puressh::mux::validate_control_socket(&dec.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(format!("mux: refusing ControlPath: {e}")),
+            }
             match puressh::mux::probe_master(&dec.path) {
                 puressh::mux::ProbeOutcome::Live => {
                     // `-L` / `-D` ride the mux carrier: each accepted local
@@ -1557,17 +1569,21 @@ struct MuxDecision {
 }
 
 /// Resolve ControlMaster/ControlPath/ControlPersist into a [`MuxDecision`].
-/// Returns `None` when multiplexing is disabled (no `ControlPath`, or
-/// `ControlMaster no` with no path — i.e. nothing to do).
+/// Returns `Ok(None)` when multiplexing is disabled (no `ControlPath`, or
+/// `ControlMaster no` with no path — i.e. nothing to do), and `Err` when the
+/// expanded `ControlPath` is too long for a Unix socket address (OpenSSH:
+/// `ControlPath too long`).
 #[cfg(unix)]
 fn resolve_mux(
     cfg_block: &puressh::config::ClientOptions,
     connect_host: &str,
     port: u16,
     user: &str,
-) -> Option<MuxDecision> {
+) -> Result<Option<MuxDecision>, String> {
     use puressh::config::{ControlMaster, ControlPersist};
-    let template = cfg_block.control_path.as_deref()?;
+    let Some(template) = cfg_block.control_path.as_deref() else {
+        return Ok(None);
+    };
     let master = cfg_block.control_master.unwrap_or(ControlMaster::No);
     // ControlMaster no + a path still permits *attaching* as a client; only
     // skip entirely when there is no path. (Handled by the `?` above.)
@@ -1579,7 +1595,8 @@ fn resolve_mux(
         port,
         user,
         expand_tilde,
-    );
+    )
+    .map_err(|e| format!("ControlPath: {e}"))?;
     let persist = match cfg_block.control_persist {
         Some(ControlPersist::No) | None => puressh::mux::Persist::No,
         Some(ControlPersist::Yes) => puressh::mux::Persist::Yes,
@@ -1588,12 +1605,12 @@ fn resolve_mux(
     // Become master only for auto/yes (the live-master check happens at the
     // call site; if a live master answered we'd have taken the client path).
     let become_master = matches!(master, ControlMaster::Auto | ControlMaster::Yes);
-    Some(MuxDecision {
+    Ok(Some(MuxDecision {
         path,
         master,
         become_master,
         persist,
-    })
+    }))
 }
 
 /// Handle `ssh -O check|exit|stop`: talk to the master at `path` and report.

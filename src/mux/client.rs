@@ -23,9 +23,69 @@ pub enum ProbeOutcome {
     Live,
     /// The socket file does not exist (nothing to reuse).
     Absent,
-    /// The path exists but no live master answered (stale socket / wrong
-    /// version / connect refused). Safe to unlink and replace.
+    /// The path exists but no live master we trust answered: a stale socket,
+    /// wrong protocol version, connect refused — or something we refuse to
+    /// talk to at all (a symlink, a non-socket, a socket owned by another
+    /// user or accessible to others; see [`validate_control_socket`]).
+    /// Nothing at the path is ever connected to in that last case; callers
+    /// that want to report *why* should run [`validate_control_socket`]
+    /// themselves before probing.
     Stale,
+}
+
+/// Trust check for a `ControlPath` before connecting to it.
+///
+/// The master binds its socket at a user-chosen path (often under `/tmp`),
+/// so another local user could plant a socket there — or a symlink to one —
+/// and impersonate the master, capturing every session the victim then
+/// runs through it. Mirroring the `SSH_AUTH_SOCK` check in
+/// [`crate::agent::Agent::connect_env`], the final path component must:
+///
+/// - not be a symlink (`symlink_metadata`, no canonicalisation),
+/// - be a Unix-domain socket,
+/// - be owned by our effective uid,
+/// - have no group/other permission bits (`mode & 0o077 == 0`; the master
+///   chmods its socket to `0600`).
+///
+/// `NotFound` is passed through unchanged so callers can distinguish
+/// "nothing there" from "something suspicious there"; every rejection is
+/// reported as `PermissionDenied` with a human-readable reason.
+pub fn validate_control_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let md = std::fs::symlink_metadata(path)?;
+    let reject = |why: String| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("control socket {}: {why}", path.display()),
+        )
+    };
+    if md.file_type().is_symlink() {
+        return Err(reject("is a symlink; refusing to follow it".into()));
+    }
+    if !md.file_type().is_socket() {
+        return Err(reject("is not a Unix-domain socket".into()));
+    }
+    let euid = nix::unistd::geteuid().as_raw();
+    if md.uid() != euid {
+        return Err(reject(format!(
+            "is owned by uid {} but we are euid {euid}; refusing to trust another user's master",
+            md.uid()
+        )));
+    }
+    let mode = md.mode() & 0o777;
+    if (mode & 0o077) != 0 {
+        return Err(reject(format!(
+            "is group/world-accessible (mode {mode:04o}); refusing to use it"
+        )));
+    }
+    Ok(())
+}
+
+/// [`validate_control_socket`] followed by `UnixStream::connect`. Every
+/// client-side connect in this module goes through here.
+fn connect_control_socket(path: &Path) -> io::Result<UnixStream> {
+    validate_control_socket(path)?;
+    UnixStream::connect(path)
 }
 
 /// The session a mux client wants the master to open on its behalf.
@@ -64,7 +124,7 @@ pub fn open_forward(
     orig_host: &str,
     orig_port: u16,
 ) -> Result<UnixStream, MuxError> {
-    let mut sock = UnixStream::connect(path).map_err(MuxError::Io)?;
+    let mut sock = connect_control_socket(path).map_err(MuxError::Io)?;
 
     write_frame(
         &mut sock,
@@ -192,8 +252,14 @@ impl TryCloneStream for std::net::TcpStream {
 /// This is non-destructive — it never unlinks anything. The caller decides
 /// what to do with a [`ProbeOutcome::Stale`] result.
 pub fn probe_master(path: &Path) -> ProbeOutcome {
-    if !path.exists() {
+    // `symlink_metadata` so a dangling or hostile symlink is seen as
+    // *present* (and then rejected below) rather than as `Absent`, which
+    // would invite the caller to bind a new master through it.
+    if std::fs::symlink_metadata(path).is_err() {
         return ProbeOutcome::Absent;
+    }
+    if validate_control_socket(path).is_err() {
+        return ProbeOutcome::Stale;
     }
     match UnixStream::connect(path) {
         Ok(mut sock) => {
@@ -243,8 +309,12 @@ pub enum ControlCommand {
 /// Connection / protocol failures against an *existing* path surface as `Err`;
 /// a missing socket is reported as `Ok(false)` for `Check`.
 pub fn send_control_command(path: &Path, cmd: ControlCommand) -> Result<bool, MuxError> {
-    let mut sock = match UnixStream::connect(path) {
+    let mut sock = match connect_control_socket(path) {
         Ok(s) => s,
+        // A path that fails the trust check is an error even for `Check`:
+        // "no master" would be misleading when someone else's socket sits
+        // there.
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => return Err(MuxError::Io(e)),
         // No live master to talk to.
         Err(_) if cmd == ControlCommand::Check => return Ok(false),
         Err(e) => return Err(MuxError::Io(e)),
@@ -303,7 +373,7 @@ pub fn run_client(
     req: &SessionRequest,
     resize: Option<Arc<dyn Fn() -> (u32, u32) + Send + Sync>>,
 ) -> Result<i32, MuxError> {
-    let mut sock = UnixStream::connect(path).map_err(MuxError::Io)?;
+    let mut sock = connect_control_socket(path).map_err(MuxError::Io)?;
 
     // HELLO handshake.
     write_frame(
@@ -450,4 +520,79 @@ pub fn run_client(
         drop(h);
     }
     Ok(exit_code)
+}
+
+#[cfg(test)]
+mod control_socket_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixListener;
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        // `/tmp` rather than `temp_dir()`: short enough for `sun_path` on
+        // macOS too.
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
+            "p-mux-{tag}-{:x}-{:x}",
+            std::process::id(),
+            nanos as u32
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn missing_path_is_not_found() {
+        let dir = scratch("missing");
+        let e = validate_control_socket(&dir.join("nope")).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert_eq!(probe_master(&dir.join("nope")), ProbeOutcome::Absent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn regular_file_is_rejected() {
+        let dir = scratch("file");
+        let p = dir.join("sock");
+        std::fs::write(&p, b"").unwrap();
+        let e = validate_control_socket(&p).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        assert!(e.to_string().contains("not a Unix-domain socket"), "{e}");
+        assert_eq!(probe_master(&p), ProbeOutcome::Stale);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn symlink_to_socket_is_rejected() {
+        let dir = scratch("link");
+        let real = dir.join("real");
+        let _l = UnixListener::bind(&real).unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_control_socket(&real).is_ok());
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let e = validate_control_socket(&link).unwrap_err();
+        assert!(e.to_string().contains("symlink"), "{e}");
+        // A symlink is "present but not trusted", never "absent".
+        assert_eq!(probe_master(&link), ProbeOutcome::Stale);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_or_world_accessible_socket_is_rejected() {
+        let dir = scratch("mode");
+        let p = dir.join("sock");
+        let _l = UnixListener::bind(&p).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o660)).unwrap();
+        let e = validate_control_socket(&p).unwrap_err();
+        assert!(e.to_string().contains("group/world-accessible"), "{e}");
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_control_socket(&p).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

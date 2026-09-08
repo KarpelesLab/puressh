@@ -37,7 +37,8 @@ pub use codec::{Frame, FrameCodec, MAX_FRAME_LEN, MuxError, PROTOCOL_VERSION};
 
 mod path;
 pub use path::{
-    connection_hash, expand_control_path, expand_tokens_with_hash, local_hostname, socket_path_for,
+    ControlPathTooLong, connection_hash, expand_control_path, expand_tokens_with_hash,
+    local_hostname, socket_path_for,
 };
 
 // The master / client *roles* drive a real connection and need
@@ -54,7 +55,7 @@ mod client;
 #[cfg(feature = "multichannel")]
 pub use client::{
     ControlCommand, ProbeOutcome, SessionRequest, TryCloneStream, open_forward, probe_master,
-    run_client, send_control_command, splice_forward,
+    run_client, send_control_command, splice_forward, validate_control_socket,
 };
 
 /// Read exactly one framed message from `r`, blocking until a full frame is

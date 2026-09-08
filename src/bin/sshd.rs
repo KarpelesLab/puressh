@@ -3952,6 +3952,21 @@ mod imp {
         puressh::Error::Io(std::io::Error::from_raw_os_error(e as i32))
     }
 
+    /// `pipe(2)` with both ends marked close-on-exec.
+    ///
+    /// `pipe2(O_CLOEXEC)` would do this atomically, but nix only exposes it on
+    /// Linux and the BSDs — macOS has no `pipe2` — and CI lints every target.
+    /// The tiny window between `pipe` and `fcntl` only matters if another
+    /// thread forks in between; every caller runs on the single-threaded
+    /// accept loop (or in a test), so `pipe` + `F_SETFD` is equivalent here.
+    fn pipe_cloexec() -> nix::Result<(OwnedFd, OwnedFd)> {
+        let (rx, tx) = nix::unistd::pipe()?;
+        for fd in [rx.as_fd(), tx.as_fd()] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        }
+        Ok((rx, tx))
+    }
+
     fn spawn_pty_shell(
         pam: &Arc<pam_gate::PamGate>,
         user: &str,
@@ -4468,7 +4483,7 @@ mod imp {
     fn notify_parent_authenticated() {
         let fd = AUTH_NOTIFY_FD.swap(-1, Ordering::Relaxed);
         if fd >= 0 {
-            // SAFETY: the fd was created by `pipe2` in the parent and its
+            // SAFETY: the fd was created by `pipe_cloexec` in the parent and its
             // ownership handed to this static at fork; nothing else closes it.
             let tx = unsafe { OwnedFd::from_raw_fd(fd) };
             let _ = nix::unistd::write(&tx, &[AUTH_OK_BYTE]);
@@ -5279,7 +5294,7 @@ mod imp {
             // later spawns inherits either. If the pipe cannot be created
             // the child is simply counted as unauthenticated for life
             // (fail closed for the cap; the connection still works).
-            let (auth_rx, auth_tx) = match nix::unistd::pipe2(OFlag::O_CLOEXEC) {
+            let (auth_rx, auth_tx) = match pipe_cloexec() {
                 Ok(p) => (Some(p.0), Some(p.1)),
                 Err(e) => {
                     eprintln!("sshd: pipe for auth notification: {e}");
@@ -6559,7 +6574,7 @@ mod imp {
             // must see it move to "authenticated" and then be reaped (per-IP
             // slot released).
             let ip: IpAddr = "192.0.2.7".parse().unwrap();
-            let (rx, tx) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe2");
+            let (rx, tx) = pipe_cloexec().expect("pipe");
             AUTH_NOTIFY_FD.store(tx.as_raw_fd(), Ordering::Relaxed);
             // SAFETY: single-threaded test child; it only writes a byte and exits.
             let pid = match unsafe { fork() }.expect("fork") {
@@ -6596,7 +6611,7 @@ mod imp {
         #[test]
         fn child_table_pipe_closed_without_success_stays_unauthenticated() {
             let ip: IpAddr = "192.0.2.8".parse().unwrap();
-            let (rx, tx) = nix::unistd::pipe2(OFlag::O_CLOEXEC).expect("pipe2");
+            let (rx, tx) = pipe_cloexec().expect("pipe");
             let mut t = ChildTable::default();
             t.insert(Pid::from_raw(100_003), ip, Some(rx));
             // Peer "exits pre-auth": write end closed with no byte.

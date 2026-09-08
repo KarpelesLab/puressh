@@ -45,7 +45,9 @@
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::{String, ToString};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 use std::io::{ErrorKind, Read, Write};
 use std::time::Instant;
 
@@ -53,7 +55,10 @@ use crate::auth::{ClientAuth, ClientCredential, ClientStep};
 use crate::channel::{
     ChannelEvent, ChannelOpen, ChannelRequest, ConnectionState, SSH_EXTENDED_DATA_STDERR,
 };
-use crate::client::{AlgoOverrides, Config, build_verifier, unix_now};
+use crate::client::{
+    AlgoOverrides, Config, HOST_KEY_MISMATCH_DISABLED, auth_packet_blocked_after_mismatch,
+    build_verifier, filter_credentials_after_mismatch, unix_now,
+};
 use crate::driver::client::VerifierFactory;
 use crate::driver::{ClientDriver, Event};
 use crate::error::{Error, Result};
@@ -147,6 +152,9 @@ pub struct MioClient<S> {
     /// `WouldBlock`). `out_pos` is the unflushed offset.
     outbuf: Vec<u8>,
     out_pos: usize,
+    /// Set by the verifier when a changed host key was accepted via
+    /// `TofuAction::AcceptWithWarning`; see [`Self::host_key_mismatched`].
+    host_key_mismatched: Arc<AtomicBool>,
 }
 
 impl<S: Read + Write> MioClient<S> {
@@ -158,6 +166,8 @@ impl<S: Read + Write> MioClient<S> {
         let host_key_policy = cfg.host_key_policy;
         let target_host = host.to_string();
         let ca_sig_algos = cfg.algorithms.ca_signature_algorithms.clone();
+        let host_key_mismatched = Arc::new(AtomicBool::new(false));
+        let mismatched_flag = host_key_mismatched.clone();
         let verifier_factory: VerifierFactory = Box::new(move |reply, runner| {
             build_verifier(
                 reply,
@@ -167,6 +177,7 @@ impl<S: Read + Write> MioClient<S> {
                 port,
                 ca_sig_algos.as_deref(),
                 unix_now(),
+                &mismatched_flag,
             )
         });
         let driver = ClientDriver::new(cfg.algorithms.clone(), verifier_factory);
@@ -179,6 +190,7 @@ impl<S: Read + Write> MioClient<S> {
             events: VecDeque::new(),
             outbuf: Vec::new(),
             out_pos: 0,
+            host_key_mismatched,
         };
         me.driver.start(Instant::now())?;
         // Buffer the version banner + initial KEXINIT but do NOT write yet: a
@@ -194,6 +206,14 @@ impl<S: Read + Write> MioClient<S> {
     /// has completed.
     pub fn session_id(&self) -> &[u8] {
         self.driver.session_id()
+    }
+
+    /// `true` if the session rides on a host key that did not match
+    /// `known_hosts` and was accepted only by `TofuAction::AcceptWithWarning`.
+    /// While set, password and keyboard-interactive credentials are refused
+    /// (see [`crate::client::Client::host_key_mismatched`]).
+    pub fn host_key_mismatched(&self) -> bool {
+        self.host_key_mismatched.load(Ordering::SeqCst)
     }
 
     /// Mutable access to the underlying stream, for (re)registering it with a
@@ -236,6 +256,12 @@ impl<S: Read + Write> MioClient<S> {
                 "authenticate: handshake not complete or auth already in progress",
             ));
         }
+        // Only public-key credentials may cross a changed host key.
+        let credentials = if self.host_key_mismatched() {
+            filter_credentials_after_mismatch(credentials)?
+        } else {
+            credentials
+        };
         let mut auth = ClientAuth::new(user, self.driver.session_id().to_vec());
         if let Some(accepted) = self.algo_overrides.pubkey_accepted_algorithms.clone() {
             auth.set_pubkey_accepted(accepted);
@@ -364,6 +390,14 @@ impl<S: Read + Write> MioClient<S> {
         // owning the in-flight auth/exec state, then store the next phase back.
         match core::mem::replace(&mut self.phase, Phase::Done) {
             Phase::Authenticating(mut auth) => match auth.on_packet(payload)? {
+                // Backstop: no password / keyboard-interactive packet may
+                // leave over a changed host key.
+                ClientStep::Send(p)
+                    if self.host_key_mismatched() && auth_packet_blocked_after_mismatch(&p) =>
+                {
+                    self.phase = Phase::Failed;
+                    return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+                }
                 ClientStep::Send(p) => {
                     self.driver.enqueue_payload(&p)?;
                     self.phase = Phase::Authenticating(auth);

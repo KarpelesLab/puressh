@@ -105,6 +105,71 @@ const MAX_SERVE_STEPS: usize = 100_000_000;
 /// one live channel runtime to drain. Reverts to blocking when idle.
 const SERVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Error text used when a credential or feature is refused because the
+/// session was established through a *changed* host key that
+/// [`TofuAction::AcceptWithWarning`] (StrictHostKeyChecking=no) let
+/// through. Mirrors OpenSSH, which in that situation disables password and
+/// keyboard-interactive authentication plus agent / X11 / port forwarding
+/// so a man-in-the-middle cannot harvest a password or piggyback on the
+/// user's agent and displays.
+pub const HOST_KEY_MISMATCH_DISABLED: &str = "password/keyboard-interactive authentication and \
+     agent/X11/port forwarding are disabled because the host key changed and \
+     StrictHostKeyChecking=no accepted it (man-in-the-middle protection)";
+
+/// Drop the credentials OpenSSH refuses to use over a changed host key
+/// (`password`, the re-promptable password closure, and
+/// `keyboard-interactive`), warning on stderr for each one removed.
+/// Public-key credentials (including agent-backed signers) are kept: a
+/// signature never reveals the secret to an eavesdropper. Fails with
+/// [`Error::Config`] if nothing usable remains.
+pub(crate) fn filter_credentials_after_mismatch(
+    credentials: Vec<ClientCredential>,
+) -> Result<Vec<ClientCredential>> {
+    let mut kept = Vec::with_capacity(credentials.len());
+    for c in credentials {
+        match c {
+            ClientCredential::Password(_) | ClientCredential::PasswordPrompt(_) => {
+                eprintln!(
+                    "Password authentication is disabled to avoid man-in-the-middle attacks."
+                );
+            }
+            ClientCredential::KeyboardInteractive(_) => {
+                eprintln!(
+                    "Keyboard-interactive authentication is disabled to avoid \
+                     man-in-the-middle attacks."
+                );
+            }
+            other => kept.push(other),
+        }
+    }
+    if kept.iter().all(|c| matches!(c, ClientCredential::None)) {
+        return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+    }
+    Ok(kept)
+}
+
+/// Is `payload` an outbound userauth packet that must not go out over a
+/// changed host key? True for `SSH_MSG_USERAUTH_REQUEST` with method
+/// `password` or `keyboard-interactive`, and for any
+/// `SSH_MSG_USERAUTH_INFO_RESPONSE` (which carries keyboard-interactive
+/// answers). This is the last-line gate in `run_auth`, covering
+/// [`ClientAuth`] drivers the caller assembled themselves.
+pub(crate) fn auth_packet_blocked_after_mismatch(payload: &[u8]) -> bool {
+    use crate::auth::message::{SSH_MSG_USERAUTH_INFO_RESPONSE, SSH_MSG_USERAUTH_REQUEST};
+    match payload.first() {
+        Some(&SSH_MSG_USERAUTH_INFO_RESPONSE) => true,
+        Some(&SSH_MSG_USERAUTH_REQUEST) => {
+            let mut r = crate::format::Reader::new(&payload[1..]);
+            let method = r
+                .read_string()
+                .and_then(|_user| r.read_string())
+                .and_then(|_service| r.read_string());
+            matches!(method, Ok(b"password") | Ok(b"keyboard-interactive"))
+        }
+        _ => false,
+    }
+}
+
 /// Policy for accepting (or rejecting) a server's host key.
 pub enum HostKeyPolicy {
     /// Trust whatever the server presents — equivalent to OpenSSH's
@@ -752,6 +817,11 @@ pub struct Client {
     /// a `forwarded-streamlocal@openssh.com` open is rejected only when there
     /// are **zero** outstanding grants.
     streamlocal_forward_grants: Vec<String>,
+    /// Set by the host-key verifier when a *changed* key was accepted via
+    /// [`TofuAction::AcceptWithWarning`]. Shared with the verifier closure
+    /// (which runs on every KEX, including re-keys). See
+    /// [`Self::host_key_mismatched`].
+    host_key_mismatched: Arc<AtomicBool>,
 }
 
 /// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
@@ -836,6 +906,8 @@ impl Client {
         let host_key_policy = cfg.host_key_policy;
         let target_host = host.to_string();
         let ca_sig_algos = cfg.algorithms.ca_signature_algorithms.clone();
+        let host_key_mismatched = Arc::new(AtomicBool::new(false));
+        let mismatched_flag = host_key_mismatched.clone();
         let verifier_factory: crate::driver::client::VerifierFactory =
             Box::new(move |reply: &[u8], runner: &KexRunner| {
                 build_verifier(
@@ -846,6 +918,7 @@ impl Client {
                     port,
                     ca_sig_algos.as_deref(),
                     unix_now(),
+                    &mismatched_flag,
                 )
             });
         let driver = ClientDriver::new(cfg.algorithms.clone(), verifier_factory);
@@ -862,10 +935,24 @@ impl Client {
             request_pty: None,
             tcpip_forward_grants: Vec::new(),
             streamlocal_forward_grants: Vec::new(),
+            host_key_mismatched,
         };
         me.driver.start(Instant::now())?;
         me.drive_handshake()?;
         Ok(me)
+    }
+
+    /// `true` if this session was established over a host key that did
+    /// **not** match the `known_hosts` entry and was let through only by
+    /// [`TofuAction::AcceptWithWarning`] (OpenSSH's
+    /// `StrictHostKeyChecking=no`). While set, the client — like OpenSSH —
+    /// refuses to send password or keyboard-interactive credentials
+    /// (`authenticate` / `run_auth` fail with [`Error::Config`]), does not
+    /// request agent or X11 forwarding, and refuses to set up port
+    /// forwards, so a man-in-the-middle cannot harvest a password or reach
+    /// the local agent / display. Public-key authentication still works.
+    pub fn host_key_mismatched(&self) -> bool {
+        self.host_key_mismatched.load(Ordering::SeqCst)
     }
 
     /// Override the re-key thresholds (defaults to
@@ -885,6 +972,14 @@ impl Client {
     /// userauth exchange*, which is what a multi-factor server expects (the
     /// driver advances on each USERAUTH_FAILURE / partial-success).
     pub fn authenticate(&mut self, user: &str, credentials: Vec<ClientCredential>) -> Result<()> {
+        // Over a changed host key only public-key credentials may be used
+        // (see `host_key_mismatched`); this fails outright if nothing
+        // usable remains.
+        let credentials = if self.host_key_mismatched() {
+            filter_credentials_after_mismatch(credentials)?
+        } else {
+            credentials
+        };
         let mut auth = ClientAuth::new(user, self.driver.session_id().to_vec());
         // Local PubkeyAcceptedAlgorithms policy from ssh_config, applied
         // before any server-sig-algs filtering.
@@ -916,11 +1011,19 @@ impl Client {
         let first = auth.start();
         self.write_payload(&first)?;
 
+        let mismatched = self.host_key_mismatched();
         for _ in 0..MAX_AUTH_STEPS {
             // `read_one_packet` surfaces post-NEWKEYS payloads (userauth here)
             // from the driver; transport concerns stay inside it.
             let payload = self.read_one_packet()?;
             match auth.on_packet(&payload)? {
+                // Never let a password / keyboard-interactive answer out
+                // over a changed host key, whatever the caller put in the
+                // driver. `authenticate` filters these up front; this is
+                // the backstop for hand-built `ClientAuth` drivers.
+                ClientStep::Send(p) if mismatched && auth_packet_blocked_after_mismatch(&p) => {
+                    return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+                }
                 ClientStep::Send(p) => self.write_payload(&p)?,
                 ClientStep::Success => {
                     // Hand the post-auth transitions (compression + EXT_INFO
@@ -1011,6 +1114,9 @@ impl Client {
     /// unlinks the socket and stops accepting agent calls. See
     /// [`crate::forwarding::agent`] for the server side.
     pub fn open_session_for_agent_forward(&mut self) -> Result<u32> {
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
         let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
         self.write_payload(&open_payload)?;
 
@@ -1054,6 +1160,9 @@ impl Client {
         auth_cookie: &str,
         screen: u32,
     ) -> Result<u32> {
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
         let (local_id, open_payload) = self.conn.open(ChannelOpen::Session)?;
         self.write_payload(&open_payload)?;
 
@@ -1144,7 +1253,9 @@ impl Client {
     /// Called by every session-channel helper between OpenConfirmed and
     /// the matching shell/exec/subsystem request.
     pub(crate) fn maybe_send_auth_agent_req(&mut self, channel: u32) -> Result<()> {
-        if self.request_auth_agent {
+        // Never expose the local agent to a server whose key changed
+        // (`host_key_mismatched`) — OpenSSH clears ForwardAgent there too.
+        if self.request_auth_agent && !self.host_key_mismatched() {
             let p = self
                 .conn
                 .send_request(channel, ChannelRequest::AuthAgentReq, false)?;
@@ -1185,6 +1296,10 @@ impl Client {
     /// shell/exec/subsystem request, right after
     /// [`Self::maybe_send_auth_agent_req`].
     pub(crate) fn maybe_send_x11_req(&mut self, channel: u32) -> Result<()> {
+        // No X11 forwarding over a changed host key (`host_key_mismatched`).
+        if self.host_key_mismatched() {
+            return Ok(());
+        }
         if let Some(args) = self.request_x11.clone() {
             let p = self.conn.send_request(
                 channel,
@@ -2105,6 +2220,9 @@ impl Client {
     /// channel-opens back to the client) lands in a follow-up commit.
     pub fn request_tcpip_forward(&mut self, bind_address: &str, bind_port: u16) -> Result<u16> {
         use crate::channel::GlobalRequest;
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
         let payload = self.conn.send_global_request(
             GlobalRequest::TcpipForward {
                 bind_address: bind_address.to_string(),
@@ -2182,6 +2300,9 @@ impl Client {
     /// `REQUEST_FAILURE`.
     pub fn request_streamlocal_forward(&mut self, socket_path: &str) -> Result<()> {
         use crate::channel::GlobalRequest;
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
         let payload = self.conn.send_global_request(
             GlobalRequest::StreamlocalForward {
                 socket_path: socket_path.to_string(),
@@ -3095,6 +3216,14 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Build the exchange-hash verifier for the host key carried in
+/// `reply_payload`, making the trust decision per `policy` first.
+///
+/// `host_key_mismatched` is set to `true` (never cleared) when a *changed*
+/// key was let through by [`TofuAction::AcceptWithWarning`]; the frontends
+/// capture the same flag so they can disable password / keyboard-interactive
+/// auth and forwarding for the session (see [`Client::host_key_mismatched`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_verifier(
     reply_payload: &[u8],
     policy: &HostKeyPolicy,
@@ -3103,6 +3232,7 @@ pub(crate) fn build_verifier(
     target_port: u16,
     ca_signature_algorithms: Option<&[String]>,
     now: u64,
+    host_key_mismatched: &AtomicBool,
 ) -> Result<Box<dyn HostKeyVerify>> {
     if reply_payload.len() < 5 {
         return Err(Error::Format("kex-ecdh-reply too short"));
@@ -3244,6 +3374,11 @@ pub(crate) fn build_verifier(
                                 "Connecting anyway because StrictHostKeyChecking is set to no; \
                                  the trusted entry in known_hosts is NOT being updated."
                             );
+                            // Remember that this session rides on an
+                            // unverified key so the frontends can refuse
+                            // password / keyboard-interactive auth and
+                            // forwarding, exactly as OpenSSH does.
+                            host_key_mismatched.store(true, Ordering::SeqCst);
                             true
                         }
                         TofuAction::Prompt(cb) => {
@@ -3368,6 +3503,15 @@ fn serve_drain_commands(
 ) -> Result<()> {
     loop {
         match cmd_rx.try_recv() {
+            // Local port forwards (`-L` / `-D`) are refused over a changed
+            // host key, as OpenSSH does; the requester gets a clear error
+            // instead of a channel.
+            Ok(ServeCommand::OpenDirectTcpip { reply, .. })
+            | Ok(ServeCommand::OpenDirectStreamlocal { reply, .. })
+                if client.host_key_mismatched() =>
+            {
+                let _ = reply.send(Err(Error::Config(HOST_KEY_MISMATCH_DISABLED)));
+            }
             Ok(ServeCommand::OpenDirectTcpip {
                 dest_host,
                 dest_port,
@@ -3921,9 +4065,10 @@ mod tests {
         // is consulted, so we don't need a real KEX outcome.
         let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];
         reply.extend_from_slice(&0u32.to_be_bytes());
-        let err = build_verifier(&reply, &policy, &runner, "", 22, None, 0);
+        let flag = AtomicBool::new(false);
+        let err = build_verifier(&reply, &policy, &runner, "", 22, None, 0, &flag);
         assert!(matches!(err, Err(Error::Config(_))));
-        let err = build_verifier(&reply, &policy, &runner, "host", 0, None, 0);
+        let err = build_verifier(&reply, &policy, &runner, "host", 0, None, 0, &flag);
         assert!(matches!(err, Err(Error::Config(_))));
     }
 
@@ -4433,6 +4578,125 @@ mod tests {
             LookupResult::Match
         ));
         assert!(!out.contains(&crate::key::base64::encode(&bogus_blob)));
+    }
+
+    /// StrictHostKeyChecking=no over a *changed* key connects, but the
+    /// session is flagged and — as in OpenSSH — password authentication,
+    /// agent / X11 forwarding and port forwarding are refused with a
+    /// clear error before anything hits the wire.
+    #[test]
+    fn accept_with_warning_on_changed_key_disables_password_and_forwarding() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+
+        let bogus_blob = Ed25519HostKey::from_seed([0x33u8; 32]).public_blob();
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        store
+            .lock()
+            .unwrap()
+            .add("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob, false);
+        let policy = KnownHostsPolicy {
+            store: store.clone(),
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Reject,
+            on_mismatch: TofuAction::AcceptWithWarning,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+        };
+
+        let mut client =
+            Client::connect_to_host("127.0.0.1", addr.port(), cfg).expect("connect should succeed");
+        let _ = server.join();
+        assert!(client.host_key_mismatched());
+
+        let blocked =
+            |r: Result<()>| matches!(r, Err(Error::Config(m)) if m == HOST_KEY_MISMATCH_DISABLED);
+        assert!(blocked(client.authenticate_password("alice", "hunter2")));
+        assert!(blocked(
+            client.authenticate("alice", vec![ClientCredential::None])
+        ));
+        assert!(blocked(
+            client.request_tcpip_forward("127.0.0.1", 0).map(drop)
+        ));
+        assert!(blocked(client.request_streamlocal_forward("/tmp/x.sock")));
+        assert!(blocked(client.open_session_for_agent_forward().map(drop)));
+        assert!(blocked(
+            client
+                .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", "00", 0)
+                .map(drop)
+        ));
+        // The stored (old) key was NOT rotated.
+        assert!(matches!(
+            store
+                .lock()
+                .unwrap()
+                .lookup("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob),
+            LookupResult::Match
+        ));
+    }
+
+    #[test]
+    fn filter_credentials_after_mismatch_keeps_only_publickey() {
+        let key: Box<dyn HostKey> = Box::new(Ed25519HostKey::from_seed([1u8; 32]));
+        let kept = filter_credentials_after_mismatch(vec![
+            ClientCredential::Password("pw".into()),
+            ClientCredential::None,
+            ClientCredential::PublicKey(key),
+            ClientCredential::PasswordPrompt(Box::new(|_| None)),
+        ])
+        .expect("publickey survives");
+        assert_eq!(kept.len(), 2);
+        assert!(matches!(kept[0], ClientCredential::None));
+        assert!(matches!(kept[1], ClientCredential::PublicKey(_)));
+
+        let err = filter_credentials_after_mismatch(vec![
+            ClientCredential::Password("pw".into()),
+            ClientCredential::None,
+        ])
+        .err()
+        .expect("nothing usable left");
+        assert!(matches!(err, Error::Config(m) if m == HOST_KEY_MISMATCH_DISABLED));
+    }
+
+    #[test]
+    fn auth_packet_gate_blocks_password_and_kbdint_only() {
+        use crate::auth::message::{SSH_MSG_USERAUTH_INFO_RESPONSE, SSH_MSG_USERAUTH_REQUEST};
+        use crate::format::Writer;
+        let req = |method: &str| {
+            let mut w = Writer::new();
+            w.write_u8(SSH_MSG_USERAUTH_REQUEST);
+            w.write_string(b"alice");
+            w.write_string(b"ssh-connection");
+            w.write_string(method.as_bytes());
+            w.into_vec()
+        };
+        assert!(auth_packet_blocked_after_mismatch(&req("password")));
+        assert!(auth_packet_blocked_after_mismatch(&req(
+            "keyboard-interactive"
+        )));
+        assert!(!auth_packet_blocked_after_mismatch(&req("publickey")));
+        assert!(!auth_packet_blocked_after_mismatch(&req("none")));
+        assert!(auth_packet_blocked_after_mismatch(&[
+            SSH_MSG_USERAUTH_INFO_RESPONSE,
+            0,
+            0,
+            0,
+            0
+        ]));
+        // Truncated / unrelated packets are not blocked (they are not
+        // credentials); the auth driver rejects garbage on its own.
+        assert!(!auth_packet_blocked_after_mismatch(&[
+            SSH_MSG_USERAUTH_REQUEST
+        ]));
+        assert!(!auth_packet_blocked_after_mismatch(&[5, 0, 0, 0, 0]));
+        assert!(!auth_packet_blocked_after_mismatch(&[]));
     }
 
     #[test]

@@ -21,6 +21,78 @@ use nix::fcntl::{FcntlArg, OFlag, fcntl};
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
 use crate::client::Transport;
+use crate::error::{Error, Result};
+
+/// Is `host` safe to substitute into a shell command line?
+///
+/// Mirrors OpenSSH's `valid_hostname()` (the CVE-2023-51385 fix): only
+/// ASCII alphanumerics, `.`, `-` and `_`, plus the IPv6-literal
+/// characters `:`, `[`, `]` and `%` (zone id), are allowed; the name must
+/// be non-empty and must not start with `-` (so it can never be parsed as
+/// an option by the helper it is handed to).
+pub fn valid_hostname(host: &str) -> bool {
+    if host.is_empty() || host.starts_with('-') {
+        return false;
+    }
+    host.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']' | b'%')
+    })
+}
+
+/// Is `user` safe to substitute into a shell command line?
+///
+/// Mirrors OpenSSH's `valid_ruser()` (a strict superset of its deny-list):
+/// rejects a leading `-`, any whitespace or control character, and the
+/// shell metacharacters `` ' ` \ " ; & | ( ) { } < > $ ``. Any other
+/// character is accepted, as OpenSSH allows locale-specific login names.
+pub fn valid_ruser(user: &str) -> bool {
+    if user.starts_with('-') {
+        return false;
+    }
+    !user.chars().any(|c| {
+        c.is_whitespace()
+            || c.is_control()
+            || matches!(
+                c,
+                '\'' | '`' | '\\' | '"' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '<' | '>' | '$'
+            )
+    })
+}
+
+/// [`expand_tokens`] for strings that will be handed to `/bin/sh -c`
+/// (`ProxyCommand`): the `%h` host and `%r` user are validated with
+/// [`valid_hostname`] / [`valid_ruser`] before being spliced in, so a
+/// hostname such as `` `id` `` or `-oProxyCommand=...` coming from an
+/// untrusted source (a `.git/config`, a URL, a `ProxyJump` chain) cannot
+/// inject shell syntax or options into the helper command. Only tokens
+/// that actually appear in `s` are checked. Returns [`Error::Config`]
+/// on an invalid value.
+pub fn expand_tokens_checked(s: &str, host: &str, port: u16, user: &str) -> Result<String> {
+    if uses_token(s, 'h') && !valid_hostname(host) {
+        return Err(Error::Config(
+            "ProxyCommand: hostname contains characters that are not permitted \
+             in a shell command",
+        ));
+    }
+    if uses_token(s, 'r') && !valid_ruser(user) {
+        return Err(Error::Config(
+            "ProxyCommand: remote user name contains characters that are not \
+             permitted in a shell command",
+        ));
+    }
+    Ok(expand_tokens(s, host, port, user))
+}
+
+/// Does `s` contain the `%<tok>` sequence (with `%%` escaping honoured)?
+fn uses_token(s: &str, tok: char) -> bool {
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' && chars.next() == Some(tok) {
+            return true;
+        }
+    }
+    false
+}
 
 /// Expand OpenSSH-style `%`-tokens in a `ProxyCommand` / `ProxyJump` host
 /// string.
@@ -34,6 +106,10 @@ use crate::client::Transport;
 /// Any other `%x` sequence is passed through verbatim (the `%` and the
 /// following char are both kept), matching OpenSSH's lenient handling of
 /// unknown tokens in these particular directives.
+///
+/// This performs **no validation** of `host` / `user` and is suitable for
+/// values that are not interpreted by a shell (e.g. `ControlPath`). For a
+/// string destined for `/bin/sh -c` use [`expand_tokens_checked`].
 pub fn expand_tokens(s: &str, host: &str, port: u16, user: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -225,6 +301,91 @@ mod tests {
         );
         assert_eq!(expand_tokens("login=%r", "h", 22, "bob"), "login=bob");
         assert_eq!(expand_tokens("100%%done", "h", 22, "u"), "100%done");
+    }
+
+    #[test]
+    fn valid_hostname_matches_openssh_rules() {
+        for ok in [
+            "example.com",
+            "10.0.0.1",
+            "[::1]",
+            "::1",
+            "fe80::1%eth0",
+            "host_1",
+            "a-b.c",
+            "LOCALHOST",
+        ] {
+            assert!(valid_hostname(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "",
+            "`id`",
+            "$(id)",
+            "a;b",
+            "-oProxyCommand=x",
+            "-",
+            "a b",
+            "a|b",
+            "a&b",
+            "a'b",
+            "a\"b",
+            "a\\b",
+            "a/b",
+            "a\nb",
+            "a\tb",
+            "hôst",
+            "a>b",
+            "a<b",
+            "a(b)",
+        ] {
+            assert!(!valid_hostname(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn valid_ruser_matches_openssh_rules() {
+        for ok in ["alice", "bob.smith", "user_1", "u-1", "", "李雷", "a@b"] {
+            assert!(valid_ruser(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "-bob", "a b", "a;b", "$(id)", "`id`", "a|b", "a&b", "a'b", "a\"b", "a\\b", "a(b",
+            "a)b", "a<b", "a>b", "a\nb", "a\x1bb",
+        ] {
+            assert!(!valid_ruser(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn expand_tokens_checked_rejects_shell_metacharacters() {
+        // Injection via the host or user reaching a `%h` / `%r` token fails
+        // closed with a config error rather than reaching `/bin/sh -c`.
+        for host in ["`id`", "$(id)", "a;b", "-oProxyCommand=x"] {
+            let err = expand_tokens_checked("nc %h %p", host, 22, "u")
+                .err()
+                .unwrap_or_else(|| panic!("{host:?} must be rejected"));
+            assert!(matches!(err, Error::Config(_)));
+        }
+        for user in ["-x", "a;b", "$(id)"] {
+            assert!(expand_tokens_checked("ssh -l %r jump", "h", 22, user).is_err());
+        }
+        // Valid values expand exactly like the unchecked variant.
+        for host in ["example.com", "10.0.0.1", "[::1]", "host_1"] {
+            assert_eq!(
+                expand_tokens_checked("nc %h %p", host, 2222, "u").unwrap(),
+                format!("nc {host} 2222")
+            );
+        }
+        // Values are only checked when the corresponding token is used —
+        // a command that never interpolates the host cannot be injected
+        // through it — and `%%h` is an escaped literal, not a token.
+        assert_eq!(
+            expand_tokens_checked("nc proxy 3128", "`id`", 22, "$(id)").unwrap(),
+            "nc proxy 3128"
+        );
+        assert_eq!(
+            expand_tokens_checked("echo 100%%h", "`id`", 22, "u").unwrap(),
+            "echo 100%h"
+        );
     }
 
     #[test]

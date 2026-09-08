@@ -1393,7 +1393,13 @@ fn run() -> Result<i32, String> {
             // poll-with-deadline read), so the serve / forwarding poll loops
             // tick correctly over the pipe carrier. `-L`/`-R`/`-D`/`-N` are
             // therefore supported here, same as a direct connection.
-            let cmd = puressh::proc_transport::expand_tokens(&cmd_raw, &connect_host, port, &user);
+            let cmd = puressh::proc_transport::expand_tokens_checked(
+                &cmd_raw,
+                &connect_host,
+                port,
+                &user,
+            )
+            .map_err(|e| format!("ProxyCommand: {e}"))?;
             vlog(1, &format!("proxycommand: spawning {cmd:?}"));
             let proc = puressh::proc_transport::ProcTransport::spawn(&cmd)
                 .map_err(|e| format!("ProxyCommand: spawn failed: {e}"))?;

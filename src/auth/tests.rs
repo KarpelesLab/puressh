@@ -1286,3 +1286,194 @@ fn server_username_change_disconnects() {
         _ => panic!("expected Disconnect"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Certificate userauth helpers shared by the cert-hardening tests below.
+// ---------------------------------------------------------------------------
+
+/// A "now" inside the fixtures' 2020..2099 validity window.
+const CERT_NOW: u64 = 1_700_000_000;
+
+/// Accepts any *verified* publickey attempt (and any probe) — the trust
+/// decision is not what these tests exercise.
+struct AcceptVerified;
+impl Authenticator for AcceptVerified {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                probe_only,
+                verified,
+                ..
+            } if probe_only || verified => AuthDecision::Accept,
+            _ => AuthDecision::Reject,
+        }
+    }
+}
+
+fn cert_server() -> ServerAuth {
+    let mut s = ServerAuth::new(
+        TEST_SID.to_vec(),
+        vec!["publickey"],
+        Box::new(AcceptVerified),
+    );
+    s.set_now(CERT_NOW);
+    let _ = s.on_packet(
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    );
+    s
+}
+
+/// A signed publickey USERAUTH_REQUEST for `user` offering `algorithm` /
+/// `blob`, with the signature produced by `signer`.
+fn signed_pubkey_request(
+    user: &str,
+    algorithm: &str,
+    blob: &[u8],
+    signer: &dyn HostKey,
+) -> Vec<u8> {
+    let signed =
+        super::message::publickey_signed_data(TEST_SID, user, "ssh-connection", algorithm, blob);
+    let sig = signer.sign(&signed).unwrap();
+    UserauthRequest {
+        user: user.into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::PublicKey {
+            signature_present: true,
+            algorithm: algorithm.into(),
+            public_blob: blob.to_vec(),
+            signature: Some(sig),
+        },
+    }
+    .encode()
+}
+
+fn assert_failure(step: ServerStep) {
+    match step {
+        ServerStep::Send(p) => {
+            UserauthFailure::decode(&p).expect("USERAUTH_FAILURE");
+        }
+        ServerStep::Authenticated { .. } => panic!("must not authenticate"),
+        ServerStep::Disconnect(r) => panic!("unexpected disconnect: {r}"),
+    }
+}
+
+/// Build a signed ed25519 user certificate blob in process, wrapping the
+/// public key of `user_key` and signed by `ca`. `critical` is the sorted
+/// list of `(name, raw payload)` critical options.
+fn build_ed25519_user_cert(
+    ca: &Ed25519HostKey,
+    user_key: &Ed25519HostKey,
+    principals: &[&str],
+    critical: &[(&str, Vec<u8>)],
+) -> Vec<u8> {
+    use crate::format::Writer;
+    let mut w = Writer::new();
+    w.write_string(b"ssh-ed25519-cert-v01@openssh.com");
+    w.write_string(&[0x42u8; 16]); // nonce
+    w.write_string(&user_key.public_bytes());
+    w.write_u64(7); // serial
+    w.write_u32(1); // type = user
+    w.write_string(b"unit"); // key id
+    let mut princ = Writer::new();
+    for p in principals {
+        princ.write_string(p.as_bytes());
+    }
+    w.write_string(&princ.into_vec());
+    w.write_u64(0); // valid after
+    w.write_u64(u64::MAX); // valid before
+    let mut crit = Writer::new();
+    for (name, data) in critical {
+        crit.write_string(name.as_bytes());
+        crit.write_string(data);
+    }
+    w.write_string(&crit.into_vec());
+    w.write_string(b""); // extensions
+    w.write_string(b""); // reserved
+    w.write_string(&ca.public_blob()); // signature key
+    let signed = w.into_vec();
+    let signature = ca.sign(&signed).unwrap();
+    let mut full = signed;
+    let mut sw = Writer::new();
+    sw.write_string(&signature);
+    full.extend_from_slice(&sw.into_vec());
+    full
+}
+
+fn ssh_string(s: &[u8]) -> Vec<u8> {
+    let mut w = crate::format::Writer::new();
+    w.write_string(s);
+    w.into_vec()
+}
+
+// ---------------------------------------------------------------------------
+// A5: malformed critical-option payloads fail closed.
+// ---------------------------------------------------------------------------
+#[test]
+fn cert_userauth_malformed_force_command_fails_closed() {
+    let ca = Ed25519HostKey::from_seed([0x11; 32]);
+    let user_key = Ed25519HostKey::from_seed([0x22; 32]);
+
+    // Positive control: a well-formed force-command is decoded into the caps.
+    let cert = build_ed25519_user_cert(
+        &ca,
+        &user_key,
+        &["alice"],
+        &[("force-command", ssh_string(b"/usr/bin/uptime"))],
+    );
+    let mut s = cert_server();
+    let req = signed_pubkey_request(
+        "alice",
+        "ssh-ed25519-cert-v01@openssh.com",
+        &cert,
+        &user_key,
+    );
+    match s.on_packet(&req).unwrap() {
+        ServerStep::Authenticated { cert_caps, .. } => {
+            let caps = cert_caps.expect("cert caps");
+            assert_eq!(caps.force_command.as_deref(), Some("/usr/bin/uptime"));
+        }
+        _ => panic!("expected Authenticated"),
+    }
+
+    // A payload that is not a well-formed SSH string must reject the cert
+    // (OpenSSH: "certificate has unparseable critical option") rather than
+    // authenticate with `force_command: None`.
+    for bad in [
+        vec![0xffu8, 0xff, 0xff, 0xff],
+        vec![0x00u8, 0x00, 0x00, 0x09, b'/', b'b', b'i', b'n'],
+        Vec::new(),
+    ] {
+        let cert = build_ed25519_user_cert(
+            &ca,
+            &user_key,
+            &["alice"],
+            &[("force-command", bad.clone())],
+        );
+        let mut s = cert_server();
+        let req = signed_pubkey_request(
+            "alice",
+            "ssh-ed25519-cert-v01@openssh.com",
+            &cert,
+            &user_key,
+        );
+        assert_failure(s.on_packet(&req).unwrap());
+    }
+    // Same for source-address.
+    let cert = build_ed25519_user_cert(
+        &ca,
+        &user_key,
+        &["alice"],
+        &[("source-address", vec![0xffu8, 0xff, 0xff, 0xff])],
+    );
+    let mut s = cert_server();
+    let req = signed_pubkey_request(
+        "alice",
+        "ssh-ed25519-cert-v01@openssh.com",
+        &cert,
+        &user_key,
+    );
+    assert_failure(s.on_packet(&req).unwrap());
+}

@@ -246,10 +246,17 @@ impl AuthCertCaps {
     /// Build the capability view from a verified user certificate's `CertInfo`.
     /// The `force-command` payload is itself a length-prefixed SSH `string`; it
     /// is decoded here so callers don't repeat the unwrap.
+    ///
+    /// A malformed `force-command` payload decodes to `None` here; the auth
+    /// layer never reaches this point with one, because
+    /// [`crate::cert::Certificate::require_known_critical_options`] rejects
+    /// the certificate (fail-closed) before the userauth signature is even
+    /// checked. Callers constructing this from their own `CertInfo` should
+    /// apply the same check first.
     pub fn from_cert_info(ci: &CertInfo) -> Self {
         let force_command = ci
             .critical_option("force-command")
-            .and_then(decode_ssh_string);
+            .and_then(crate::cert::decode_option_string);
         AuthCertCaps {
             permit_pty: ci.has_extension("permit-pty"),
             permit_port_forwarding: ci.has_extension("permit-port-forwarding"),
@@ -258,19 +265,6 @@ impl AuthCertCaps {
             force_command,
         }
     }
-}
-
-/// Decode an SSH `string` (4-byte BE length + bytes) into UTF-8. Used for the
-/// `force-command` critical-option payload, which is itself a length-prefixed
-/// string.
-#[cfg(feature = "alloc")]
-fn decode_ssh_string(data: &[u8]) -> Option<String> {
-    let mut r = crate::format::Reader::new(data);
-    let s = r.read_string().ok()?;
-    if !r.is_empty() {
-        return None;
-    }
-    core::str::from_utf8(s).ok().map(String::from)
 }
 
 /// What the harness should do next on behalf of the server.

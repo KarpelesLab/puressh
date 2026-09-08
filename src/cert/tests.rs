@@ -438,6 +438,46 @@ fn rsa_ca_key_with_oversized_exponent_rejected_at_verify() {
     ));
 }
 
+#[test]
+fn malformed_critical_option_payload_rejected() {
+    // `force-command` / `source-address` payloads are themselves SSH
+    // strings. A payload that does not decode as exactly one string must
+    // fail closed (OpenSSH rejects the cert) rather than being treated as
+    // "no force-command".
+    let base = Certificate::parse(&load_cert_blob("u_ed25519-cert.pub")).unwrap();
+    for bad in [
+        alloc::vec![0xffu8, 0xff, 0xff, 0xff], // length overruns the payload
+        alloc::vec![0x00u8, 0x00, 0x00, 0x02, b'a'], // truncated string
+        {
+            let mut v = encode_str(b"/bin/true");
+            v.push(0x00); // trailing garbage after the string
+            v
+        },
+        alloc::vec![0x00u8, 0x00, 0x00, 0x01, 0xff], // not UTF-8
+        Vec::new(),                                  // empty payload
+    ] {
+        let mut cert = base.clone();
+        cert.critical_options = alloc::vec![("force-command".to_string(), bad.clone())];
+        assert!(
+            cert.require_known_critical_options().is_err(),
+            "force-command payload {bad:?} must be rejected"
+        );
+        let mut cert = base.clone();
+        cert.critical_options = alloc::vec![("source-address".to_string(), bad.clone())];
+        assert!(
+            cert.require_known_critical_options().is_err(),
+            "source-address payload {bad:?} must be rejected"
+        );
+    }
+    // Well-formed payloads still pass.
+    let mut cert = base.clone();
+    cert.critical_options = alloc::vec![
+        ("force-command".to_string(), encode_str(b"/usr/bin/uptime")),
+        ("source-address".to_string(), encode_str(b"10.0.0.0/8")),
+    ];
+    cert.require_known_critical_options().unwrap();
+}
+
 /// Helper mirroring SSH string encoding for the force-command assertion.
 fn encode_str(s: &[u8]) -> Vec<u8> {
     let mut w = Writer::new();

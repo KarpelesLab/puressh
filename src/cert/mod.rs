@@ -558,17 +558,33 @@ impl Certificate {
             .collect()
     }
 
-    /// Convenience: reject the certificate outright if it carries any critical
-    /// option we don't understand.
+    /// Reject the certificate outright if it carries any critical option we
+    /// don't understand, **or** a known critical option whose payload is
+    /// malformed.
+    ///
+    /// The `force-command` and `source-address` payloads are themselves SSH
+    /// `string`s (PROTOCOL.certkeys). A payload that does not decode as
+    /// exactly one UTF-8 string with no trailing bytes cannot be honoured,
+    /// and — exactly like an unknown option — must fail closed: OpenSSH
+    /// refuses the certificate rather than silently dropping the
+    /// restriction.
     pub fn require_known_critical_options(&self) -> Result<()> {
-        if self.unknown_critical_options().is_empty() {
-            Ok(())
-        } else {
-            Err(Error::CertUnknownCriticalOption)
+        if !self.unknown_critical_options().is_empty() {
+            return Err(Error::CertUnknownCriticalOption);
         }
+        for (name, data) in &self.critical_options {
+            if matches!(name.as_str(), "force-command" | "source-address")
+                && decode_option_string(data).is_none()
+            {
+                return Err(Error::Format("cert: malformed critical option payload"));
+            }
+        }
+        Ok(())
     }
 
-    /// The data for a critical option by name, if present.
+    /// The data for a critical option by name, if present. The raw payload
+    /// is returned; for `force-command` / `source-address` it is itself an
+    /// SSH `string` — see [`Self::critical_option_string`].
     pub fn critical_option(&self, name: &str) -> Option<&[u8]> {
         self.critical_options
             .iter()
@@ -576,10 +592,30 @@ impl Certificate {
             .map(|(_, d)| d.as_slice())
     }
 
+    /// The decoded payload of a string-valued critical option
+    /// (`force-command`, `source-address`): the payload must be exactly one
+    /// UTF-8 SSH `string` with nothing after it. `None` if the option is
+    /// absent **or** malformed — callers that need to distinguish the two
+    /// should run [`Self::require_known_critical_options`] first.
+    pub fn critical_option_string(&self, name: &str) -> Option<String> {
+        self.critical_option(name).and_then(decode_option_string)
+    }
+
     /// True if the named extension is present.
     pub fn has_extension(&self, name: &str) -> bool {
         self.extensions.iter().any(|(n, _)| n == name)
     }
+}
+
+/// Decode a critical-option payload that is itself an SSH `string` (4-byte BE
+/// length + bytes): exactly one string, no trailing bytes, valid UTF-8.
+pub(crate) fn decode_option_string(data: &[u8]) -> Option<String> {
+    let mut r = Reader::new(data);
+    let s = r.read_string().ok()?;
+    if !r.is_empty() {
+        return None;
+    }
+    core::str::from_utf8(s).ok().map(String::from)
 }
 
 #[cfg(test)]

@@ -450,7 +450,7 @@ impl KexRunner {
         let backend_is_gex = matches!(self.backend, Some(KexBackend::Gex));
         let mut adv = match (&self.phase, msg) {
             (Phase::SentKexInit, super::kexinit::SSH_MSG_KEXINIT) => {
-                self.handle_peer_kexinit(rng, payload, v_c, v_s)?
+                self.handle_peer_kexinit(rng, codec.seq_in, payload, v_c, v_s)?
             }
             // ECDH and fixed-group DH: bytes 30/31 are INIT/REPLY. For GEX
             // the same bytes mean GEX_REQUEST_OLD/GEX_GROUP, so the backend
@@ -608,9 +608,14 @@ impl KexRunner {
         self.accept_ext_info_now = false;
     }
 
+    /// `seq_in_after_kexinit` is the codec's inbound sequence counter *after*
+    /// the peer's KEXINIT was decoded (the codec increments it per packet,
+    /// so a KEXINIT that arrived at sequence number 0 is handled with the
+    /// counter at 1).
     fn handle_peer_kexinit<R: RngCore + CryptoRng>(
         &mut self,
         rng: &mut R,
+        seq_in_after_kexinit: u32,
         payload: &[u8],
         _v_c: &[u8],
         _v_s: &[u8],
@@ -623,6 +628,18 @@ impl KexRunner {
             Role::Server => (&peer, &self.our_advert_owned),
         };
         let neg = negotiate(client_init, server_init)?;
+        // Strict-kex (OpenSSH PROTOCOL §1.10): on the initial key exchange
+        // the peer's KEXINIT must be the very first packet of the
+        // connection. Anything before it (an IGNORE, a DEBUG, ...) was an
+        // unauthenticated packet slipped into the cleartext preamble —
+        // exactly what Terrapin-style prefix truncation relies on. The
+        // driver cannot enforce this on its own: it only learns that
+        // strict-kex applies once this KEXINIT has been negotiated.
+        if neg.strict_kex_enabled && self.session_id.is_none() && seq_in_after_kexinit != 1 {
+            return Err(Error::Protocol(
+                "strict-kex: KEXINIT was not the first packet",
+            ));
+        }
         self.backend = Some(KexBackend::from_name(&neg.kex)?);
         // Latch strict-kex across re-keys: once on, stays on.
         if neg.strict_kex_enabled {
@@ -1756,9 +1773,13 @@ mod tests {
 
         // Pre-poison the sequence counters: if strict-kex resets, they'll
         // be 0 after install. Otherwise they'd continue from these values.
-        client_codec.seq_in = 7;
+        // `seq_in` must read 1 when the peer KEXINIT is handled (the codec
+        // has decoded exactly one packet by then) or the strict-kex
+        // first-packet check refuses the exchange; the loopback below
+        // bypasses `PacketCodec::decode`, so set it by hand.
+        client_codec.seq_in = 1;
         client_codec.seq_out = 11;
-        server_codec.seq_in = 11;
+        server_codec.seq_in = 1;
         server_codec.seq_out = 7;
 
         let mut from_client: Vec<Vec<u8>> = client.start(&mut rng).unwrap().outbound;
@@ -1788,6 +1809,58 @@ mod tests {
         let frame = client_codec.encode(b"strict-kex c2s", &mut rng).unwrap();
         let (got, _) = server_codec.decode(&frame).unwrap().expect("c2s");
         assert_eq!(got, b"strict-kex c2s");
+    }
+
+    /// Strict-kex (OpenSSH PROTOCOL §1.10): on the initial KEX the peer's
+    /// KEXINIT must be the first packet of the connection. The codec has
+    /// already bumped `seq_in` for the KEXINIT itself, so "first packet"
+    /// reads as `seq_in == 1` when the runner handles it.
+    #[test]
+    fn strict_kex_rejects_kexinit_that_was_not_the_first_packet() {
+        let mut rng = OsRng;
+        let v_c = LOCAL_VERSION.as_bytes();
+        let v_s = LOCAL_VERSION.as_bytes();
+        let cipher = "chacha20-poly1305@openssh.com";
+        let mac = "hmac-sha2-256";
+        let strict: &'static [&'static str] = &[
+            "curve25519-sha256",
+            crate::transport::kex::STRICT_KEX_CLIENT_MARKER,
+            crate::transport::kex::STRICT_KEX_SERVER_MARKER,
+        ];
+        let lax: &'static [&'static str] = &["curve25519-sha256"];
+
+        let mut run =
+            |ours: &'static [&'static str], theirs: &'static [&'static str], seq_in: u32| {
+                let mut server =
+                    KexRunner::new(Role::Server, make_advert_with_kex_list(ours, cipher, mac));
+                let client_advert = make_advert_with_kex_list(theirs, cipher, mac);
+                let mut codec = PacketCodec::new();
+                server.start(&mut rng).unwrap();
+                // Pretend the codec decoded `seq_in` packets so far (the
+                // KEXINIT included).
+                codec.seq_in = seq_in;
+                server.on_packet(
+                    &mut rng,
+                    &mut codec,
+                    &client_advert.encode(),
+                    None,
+                    None,
+                    v_c,
+                    v_s,
+                )
+            };
+
+        // Strict negotiated, KEXINIT first: fine.
+        run(strict, strict, 1).expect("KEXINIT at seq 0 is accepted");
+        // Strict negotiated, something came before the KEXINIT: refused.
+        match run(strict, strict, 2) {
+            Err(Error::Protocol(msg)) => {
+                assert_eq!(msg, "strict-kex: KEXINIT was not the first packet")
+            }
+            other => panic!("expected strict-kex first-packet error, got {other:?}"),
+        }
+        // Not strict (peer lacks the marker): the position is not policed.
+        run(strict, lax, 2).expect("non-strict KEX tolerates an earlier packet");
     }
 
     #[test]

@@ -51,7 +51,7 @@ pub struct KexInitOut {
 /// via a partial destructure (E0509) — use `core::mem::take(&mut out.k)`
 /// / `core::mem::take(&mut out.h)` instead, which leaves an empty
 /// `Vec` behind that the drop glue can safely wipe.
-#[derive(Debug, Clone, zeroize::ZeroizeOnDrop)]
+#[derive(Clone, zeroize::ZeroizeOnDrop)]
 pub struct KexOutput {
     /// The shared secret `K` as an SSH `mpint` byte string (length-prefixed,
     /// two's-complement). This is what RFC 4253 §7.2 feeds into the KDF.
@@ -62,4 +62,32 @@ pub struct KexOutput {
     /// callers expect to be able to publish it.
     #[zeroize(skip)]
     pub h: Vec<u8>,
+}
+
+impl core::fmt::Debug for KexOutput {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // `k` is the shared secret: redacted on purpose so a stray `{:?}`
+        // in a log line cannot leak it. `h` is public material.
+        f.debug_struct("KexOutput")
+            .field("h", &self.h)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn kex_output_debug_redacts_shared_secret() {
+        let out = KexOutput {
+            k: alloc::vec![0xAA; 8],
+            h: alloc::vec![0x11, 0x22],
+        };
+        let s = format!("{out:?}");
+        assert!(s.contains("h: [17, 34]"), "{s}");
+        assert!(!s.contains("170"), "shared secret leaked: {s}");
+        assert!(!s.contains("k:"), "shared secret field printed: {s}");
+    }
 }

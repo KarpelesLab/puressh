@@ -114,6 +114,32 @@ pub(crate) fn check_rsa_modulus_mpint(n_raw: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Maximum accepted RSA public exponent size, in bits.
+///
+/// A signature verification costs one modular exponentiation whose work is
+/// linear in `bit_len(e)`. purecrypto only requires `3 <= e < n`, so an
+/// unauthenticated peer could otherwise present a 16384-bit modulus with a
+/// ~16383-bit exponent and burn seconds of CPU per verify — before any
+/// authorization decision is made. Real keys use `e = 65537` (17 bits);
+/// OpenSSL refuses `e` wider than 64 bits (`OPENSSL_RSA_MAX_PUBEXP_BITS`),
+/// and Go / BoringSSL are stricter still.
+#[cfg(feature = "alloc")]
+pub(crate) const MAX_RSA_EXPONENT_BITS: usize = 64;
+
+/// Validate a raw RSA public-exponent `mpint` (as it appears in a public-key
+/// or certificate blob): reject negative encodings and enforce the
+/// [`MAX_RSA_EXPONENT_BITS`] cap. Shared by the plain-key parser and the
+/// certificate parser so the cap cannot be bypassed by wrapping the key in
+/// a certificate.
+#[cfg(feature = "alloc")]
+pub(crate) fn check_rsa_exponent_mpint(e_raw: &[u8]) -> Result<()> {
+    let e = mpint_to_uint(e_raw)?;
+    if e.bit_len() > MAX_RSA_EXPONENT_BITS {
+        return Err(Error::Format("rsa: public exponent wider than 64 bits"));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "alloc")]
 fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, usize)> {
     let mut r = Reader::new(blob);
@@ -126,6 +152,9 @@ fn parse_rsa_public_blob(blob: &[u8]) -> Result<(BoxedRsaPublicKey, usize)> {
     if !r.is_empty() {
         return Err(Error::Format("rsa: public key trailing data"));
     }
+    // Cap `e` before building the verifier: a huge exponent is the cheap
+    // way for an unauthenticated peer to make each verify cost seconds.
+    check_rsa_exponent_mpint(e_raw)?;
     let e = mpint_to_uint(e_raw)?;
     let n = mpint_to_uint(n_raw)?;
     if n.is_zero() {
@@ -471,6 +500,47 @@ mod tests {
             Err(other) => panic!("expected Format(2048), got {other:?}"),
             Ok(_) => panic!("expected 1024-bit modulus to be rejected"),
         }
+    }
+
+    /// Encode a public blob by hand so the exponent can be any width
+    /// (`from_public_components` would go through purecrypto, which does
+    /// not cap `e`).
+    fn raw_rsa_blob(e_mag: &[u8], n_mag: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_string(SshRsa::NAME.as_bytes());
+        write_mpint(&mut w, e_mag);
+        write_mpint(&mut w, n_mag);
+        w.into_vec()
+    }
+
+    #[test]
+    fn rsa_parse_rejects_oversized_exponent() {
+        // A 2048-bit modulus with a 2047-bit exponent: legal for purecrypto
+        // (3 <= e < n) but a verify-cost DoS. Must be refused at parse time.
+        let (n, _) = known_n_e();
+        let n_mag = n.to_be_bytes(256);
+        let mut e_mag = alloc::vec![0xffu8; 256];
+        e_mag[0] = 0x7f;
+        let blob = raw_rsa_blob(&e_mag, &n_mag);
+        match RsaSha2_256HostKey::from_public_blob(&blob) {
+            Err(Error::Format(msg)) => assert!(msg.contains("exponent"), "got {msg:?}"),
+            Err(other) => panic!("expected Format(exponent), got {other:?}"),
+            Ok(_) => panic!("expected oversized exponent to be rejected"),
+        }
+        // 65-bit exponent: one over the cap.
+        let mut e65 = alloc::vec![0xffu8; 9];
+        e65[0] = 0x01;
+        assert!(matches!(
+            RsaSha2_256HostKey::from_public_blob(&raw_rsa_blob(&e65, &n_mag)),
+            Err(Error::Format(_))
+        ));
+        // Exactly 64 bits (odd) still parses.
+        let e64 = alloc::vec![0xffu8; 8];
+        RsaSha2_256HostKey::from_public_blob(&raw_rsa_blob(&e64, &n_mag))
+            .expect("64-bit exponent must be accepted");
+        // And the common case, of course.
+        RsaSha2_256HostKey::from_public_blob(&raw_rsa_blob(&[0x01, 0x00, 0x01], &n_mag))
+            .expect("e = 65537 must be accepted");
     }
 
     #[test]

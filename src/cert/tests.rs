@@ -335,6 +335,11 @@ fn embedded_verifier_matches_underlying_key() {
 /// does not verify it, and the modulus floor is enforced *before* any
 /// signature work, so a too-short modulus must be rejected at parse.
 fn build_rsa_cert_blob(n_bits: usize) -> Vec<u8> {
+    build_rsa_cert_blob_with_e(n_bits, &[0x01u8, 0x00, 0x01]) // e = 65537
+}
+
+/// [`build_rsa_cert_blob`] with an explicit public-exponent mpint.
+fn build_rsa_cert_blob_with_e(n_bits: usize, e_mpint: &[u8]) -> Vec<u8> {
     assert_eq!(n_bits % 8, 0);
     let n_len = n_bits / 8;
     // Modulus: top bit of the leading magnitude byte set, so the value is
@@ -344,12 +349,11 @@ fn build_rsa_cert_blob(n_bits: usize) -> Vec<u8> {
     n_mag[0] = 0x80;
     let mut n_mpint = alloc::vec![0x00u8];
     n_mpint.extend_from_slice(&n_mag);
-    let e_mpint = [0x01u8, 0x00, 0x01]; // 65537
 
     let mut w = Writer::new();
     w.write_string(b"ssh-rsa-cert-v01@openssh.com");
     w.write_string(&[0u8; 16]); // nonce
-    w.write_string(&e_mpint); // mpint e
+    w.write_string(e_mpint); // mpint e
     w.write_string(&n_mpint); // mpint n
     w.write_u64(1); // serial
     w.write_u32(1); // type = user
@@ -389,6 +393,49 @@ fn rsa_cert_with_2048_modulus_parses() {
     let blob = build_rsa_cert_blob(2048);
     let cert = Certificate::parse(&blob).expect("2048-bit embedded RSA must parse");
     assert_eq!(cert.embedded_algorithm(), "ssh-rsa");
+}
+
+#[test]
+fn rsa_cert_with_oversized_exponent_rejected_at_parse() {
+    // A cert whose embedded RSA key carries a 2047-bit `e` must be refused
+    // at parse time (verify cost is linear in the exponent width), just
+    // like the plain-key parser refuses it.
+    let mut e_mpint = alloc::vec![0xffu8; 256];
+    e_mpint[0] = 0x7f;
+    let blob = build_rsa_cert_blob_with_e(2048, &e_mpint);
+    match Certificate::parse(&blob) {
+        Err(Error::Format(msg)) => assert!(msg.contains("exponent"), "got {msg:?}"),
+        Err(other) => panic!("expected Format(exponent), got {other:?}"),
+        Ok(_) => panic!("expected oversized embedded exponent to be rejected at parse"),
+    }
+}
+
+#[test]
+fn rsa_ca_key_with_oversized_exponent_rejected_at_verify() {
+    // The CA key is parsed lazily by `verify_ca_signature`; a hostile CA
+    // blob with a huge `e` must be refused there (before any modexp) with
+    // the usual CA-signature error rather than burning CPU.
+    let mut n_mag = alloc::vec![0xa5u8; 256];
+    n_mag[0] = 0x80;
+    let mut e_mag = alloc::vec![0xffu8; 256];
+    e_mag[0] = 0x7f;
+    let mut ca = Writer::new();
+    ca.write_string(b"ssh-rsa");
+    crate::format::write_mpint(&mut ca, &e_mag);
+    crate::format::write_mpint(&mut ca, &n_mag);
+    let ca_blob = ca.into_vec();
+
+    let mut cert = Certificate::parse(&load_cert_blob("u_ed25519-cert.pub")).unwrap();
+    cert.signature_key_blob = ca_blob;
+    // Claim an RSA CA signature so the RSA parser is the one consulted.
+    let mut sig = Writer::new();
+    sig.write_string(b"rsa-sha2-512");
+    sig.write_string(&[0u8; 256]);
+    cert.signature = sig.into_vec();
+    assert!(matches!(
+        cert.verify_ca_signature(CA_ALGOS),
+        Err(Error::CertBadCaSignature)
+    ));
 }
 
 /// Helper mirroring SSH string encoding for the force-command assertion.

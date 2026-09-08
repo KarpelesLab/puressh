@@ -286,6 +286,10 @@ fn read_embedded_pubkey(key_type: &str, r: &mut Reader<'_>) -> Result<Vec<u8>> {
             // (<2048-bit) RSA key would parse successfully and the floor would
             // only bite later if/when an embedded verifier was built.
             crate::hostkey::rsa::check_rsa_modulus_mpint(n)?;
+            // Likewise cap the public exponent (verify cost is linear in
+            // its width) so a cert cannot smuggle a DoS-sized `e` past the
+            // plain-key parser's cap.
+            crate::hostkey::rsa::check_rsa_exponent_mpint(e)?;
             w.write_string(b"ssh-rsa");
             w.write_string(e);
             w.write_string(n);

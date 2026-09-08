@@ -35,7 +35,8 @@ use crate::transport::{ExtInfo, KexRunner, PacketCodec, Role, VersionExchange};
 
 use super::{
     Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_DEFERRED_OUT_BYTES,
-    MAX_INBOX_BYTES, SSH_MSG_EXT_INFO, SSH_MSG_KEX_ECDH_REPLY, SSH_MSG_KEXINIT, keepalive_request,
+    MAX_INBOX_BYTES, SSH_MSG_EXT_INFO, SSH_MSG_KEX_ECDH_REPLY, SSH_MSG_KEXINIT, defer_inbound,
+    generic_msg_during_initial_kex, keepalive_request,
 };
 
 /// Builds the exchange-hash host-key verifier from the `SSH_MSG_KEX_ECDH_REPLY`
@@ -72,8 +73,11 @@ pub struct ClientDriver {
     outbox: VecDeque<Vec<u8>>,
     events: VecDeque<Event>,
     /// Application packets received while a re-key was in flight (RFC 4253
-    /// §7.3); replayed once NEWKEYS lands.
+    /// §7.3); replayed once NEWKEYS lands. Only ever filled *before* the
+    /// peer's KEXINIT arrives — see [`Self::route_packet`].
     deferred: VecDeque<Vec<u8>>,
+    /// Total payload bytes in `deferred`, capped at `MAX_DEFERRED_IN_BYTES`.
+    deferred_bytes: usize,
     /// Egress held back because a key exchange is in flight (RFC 4253 §7.1).
     /// Stored as un-encoded payloads so the flush encrypts them under the
     /// *new* keys, which is what the peer expects after NEWKEYS.
@@ -115,6 +119,7 @@ impl ClientDriver {
             outbox: VecDeque::new(),
             events: VecDeque::new(),
             deferred: VecDeque::new(),
+            deferred_bytes: 0,
             deferred_out: VecDeque::new(),
             deferred_out_bytes: 0,
             v_s: Vec::new(),
@@ -344,8 +349,21 @@ impl ClientDriver {
     /// `Client::read_one_packet` match).
     fn route_packet(&mut self, payload: &[u8], now: Instant) -> Result<()> {
         self.note_activity(now);
+        // Until the first NEWKEYS nothing on the wire is authenticated, so
+        // only the KEX stream itself may flow. Anything the application
+        // would act on is refused outright rather than buffered for replay
+        // after the keys are in (which is what an on-path injector wants).
+        let initial_kex = self.phase == Phase::Kex;
         match payload.first().copied() {
             Some(1) => Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
+            // Generic transport messages during the initial KEX: fatal under
+            // strict-kex, dropped otherwise. A PING gets no PONG here — the
+            // peer has no business probing an unkeyed connection.
+            Some(2) | Some(3) | Some(4) | Some(SSH_MSG_PING) | Some(SSH_MSG_PONG)
+                if initial_kex =>
+            {
+                generic_msg_during_initial_kex(self.runner.strict_kex_enabled())
+            }
             Some(2) | Some(3) | Some(4) => Ok(()),
             Some(SSH_MSG_PING) => {
                 let pong = pong_for_ping(payload)?;
@@ -380,9 +398,19 @@ impl ClientDriver {
                 Ok(())
             }
             _ => {
+                if initial_kex {
+                    return Err(Error::Protocol("non-KEX message before first NEWKEYS"));
+                }
                 if self.runner.is_kexing() {
-                    self.deferred.push_back(payload.to_vec());
-                    return Ok(());
+                    // Re-key. The peer may still be sending application
+                    // traffic only while it has not seen our KEXINIT — i.e.
+                    // its own KEXINIT has not reached us yet. Once it has,
+                    // RFC 4253 §7.1 forbids anything but KEX messages from
+                    // it, so this packet is an injection or a broken peer.
+                    if !self.runner.awaiting_peer_kexinit() {
+                        return Err(Error::Protocol("non-KEX message during key re-exchange"));
+                    }
+                    return defer_inbound(&mut self.deferred, &mut self.deferred_bytes, payload);
                 }
                 self.runner.note_inbound_other();
                 self.route_app(payload)
@@ -422,6 +450,7 @@ impl ClientDriver {
             let Some(payload) = self.deferred.pop_front() else {
                 break;
             };
+            self.deferred_bytes = self.deferred_bytes.saturating_sub(payload.len());
             self.runner.note_inbound_other();
             self.route_app(&payload)?;
         }
@@ -448,6 +477,19 @@ impl ClientDriver {
     fn note_activity(&mut self, now: Instant) {
         self.last_activity = now;
         self.missed_keepalives = 0;
+    }
+
+    /// Test hook: the live transport codec, so a test can forge frames under
+    /// the current keys (to play a misbehaving peer).
+    #[cfg(test)]
+    pub(crate) fn codec_mut(&mut self) -> &mut PacketCodec {
+        &mut self.codec
+    }
+
+    /// Test hook: start a re-key right now, regardless of the policy.
+    #[cfg(test)]
+    pub(crate) fn force_rekey(&mut self) -> Result<()> {
+        self.initiate_rekey()
     }
 }
 
@@ -758,5 +800,149 @@ mod tests {
             d.poll_transmit().is_some(),
             "transport-layer messages stay allowed during a KEX"
         );
+    }
+
+    // --- initial key exchange: nothing but the KEX stream may flow ---
+
+    /// A cleartext frame, as the wire looks before the first NEWKEYS.
+    fn cleartext(payload: &[u8]) -> Vec<u8> {
+        PacketCodec::new()
+            .encode(payload, &mut OsRng)
+            .expect("cleartext frame")
+    }
+
+    /// A server KEXINIT that agrees with the driver's default advert, with or
+    /// without the server-side strict-kex marker.
+    fn peer_server_kexinit(strict: bool) -> Vec<u8> {
+        use crate::transport::KexInit;
+        use crate::transport::kex::{KexAlgorithms, STRICT_KEX_SERVER_MARKER};
+        let kex: &[&str] = if strict {
+            &["curve25519-sha256", STRICT_KEX_SERVER_MARKER]
+        } else {
+            &["curve25519-sha256"]
+        };
+        let algs = KexAlgorithms {
+            kex,
+            server_host_key: &["ssh-ed25519"],
+            ciphers_c2s: &["chacha20-poly1305@openssh.com"],
+            ciphers_s2c: &["chacha20-poly1305@openssh.com"],
+            macs_c2s: &["hmac-sha2-256"],
+            macs_s2c: &["hmac-sha2-256"],
+            comp_c2s: &["none"],
+            comp_s2c: &["none"],
+            lang_c2s: &[],
+            lang_s2c: &[],
+        };
+        KexInit::from_algorithms(&algs, [7u8; 16]).encode()
+    }
+
+    /// A client driver that has sent its KEXINIT and consumed the peer's
+    /// version line: the initial KEX is in flight, nothing decoded yet.
+    fn client_in_initial_kex() -> ClientDriver {
+        let mut d = ClientDriver::new(
+            AlgoOverrides::default(),
+            Box::new(|_p, _r| Err(Error::Protocol("no verifier in this test"))),
+        );
+        d.start(Instant::now()).expect("start");
+        while d.poll_transmit().is_some() {}
+        d.handle_input(b"SSH-2.0-peer\r\n", Instant::now())
+            .expect("version line");
+        assert!(d.is_kexing() && !d.handshake_done());
+        d
+    }
+
+    fn protocol_err(res: Result<()>) -> &'static str {
+        match res {
+            Err(Error::Protocol(msg)) => msg,
+            other => panic!("expected a protocol error, got {other:?}"),
+        }
+    }
+
+    /// Regression (T1/L1): an application-layer packet received during the
+    /// initial (cleartext, unauthenticated) key exchange used to be queued
+    /// and replayed to the application after NEWKEYS. It must be fatal,
+    /// both before and after the peer's KEXINIT.
+    #[test]
+    fn initial_kex_rejects_application_packets() {
+        // Before the peer's KEXINIT.
+        let mut d = client_in_initial_kex();
+        let err = protocol_err(d.handle_input(&cleartext(&[50, 0, 0, 0, 0]), Instant::now()));
+        assert_eq!(err, "non-KEX message before first NEWKEYS");
+        assert!(
+            d.poll_event().is_none(),
+            "nothing surfaced to the application"
+        );
+
+        // After the peer's KEXINIT (mid-exchange, awaiting ECDH_REPLY).
+        for strict in [true, false] {
+            let mut d = client_in_initial_kex();
+            d.handle_input(&cleartext(&peer_server_kexinit(strict)), Instant::now())
+                .expect("peer kexinit");
+            let channel_data = [94, 0, 0, 0, 0, 0, 0, 0, 1, b'x'];
+            let err = protocol_err(d.handle_input(&cleartext(&channel_data), Instant::now()));
+            assert_eq!(err, "non-KEX message before first NEWKEYS");
+            assert!(d.poll_event().is_none());
+        }
+    }
+
+    /// Regression (T1/L1): `IGNORE`/`DEBUG`/`UNIMPLEMENTED`/`PING`/`PONG`
+    /// during the initial KEX terminate the connection when strict-kex was
+    /// negotiated (OpenSSH PROTOCOL §1.10) and are dropped otherwise.
+    #[test]
+    fn initial_kex_generic_messages_follow_strict_kex() {
+        let ignore = [2u8, 0, 0, 0, 0];
+        let debug = [4u8, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let ping = [SSH_MSG_PING, 0, 0, 0, 0];
+
+        // Strict: fatal.
+        for msg in [&ignore[..], &debug[..], &ping[..]] {
+            let mut d = client_in_initial_kex();
+            d.handle_input(&cleartext(&peer_server_kexinit(true)), Instant::now())
+                .expect("peer kexinit");
+            let err = protocol_err(d.handle_input(&cleartext(msg), Instant::now()));
+            assert_eq!(
+                err,
+                "strict-kex: unexpected message during initial key exchange"
+            );
+        }
+
+        // Not strict: tolerated (and a PING draws no PONG), but application
+        // packets are still refused.
+        let mut d = client_in_initial_kex();
+        d.handle_input(&cleartext(&peer_server_kexinit(false)), Instant::now())
+            .expect("peer kexinit");
+        while d.poll_transmit().is_some() {} // drop our ECDH_INIT
+        for msg in [&ignore[..], &debug[..], &ping[..]] {
+            d.handle_input(&cleartext(msg), Instant::now())
+                .expect("tolerated without strict-kex");
+        }
+        assert!(
+            d.poll_transmit().is_none(),
+            "no PONG before the connection is keyed"
+        );
+        assert!(d.poll_event().is_none());
+        let err = protocol_err(d.handle_input(&cleartext(&[50, 0, 0, 0, 0]), Instant::now()));
+        assert_eq!(err, "non-KEX message before first NEWKEYS");
+    }
+
+    /// Regression (T2, through the driver): a packet slipped in ahead of the
+    /// peer's KEXINIT is tolerated at the time (strictness is not known yet)
+    /// but makes a strict-kex negotiation fail — the KEXINIT was not the
+    /// first packet.
+    #[test]
+    fn initial_kex_packet_before_kexinit_fails_strict_negotiation() {
+        let mut d = client_in_initial_kex();
+        d.handle_input(&cleartext(&[2, 0, 0, 0, 0]), Instant::now())
+            .expect("IGNORE before KEXINIT is not yet known to be strict");
+        let err =
+            protocol_err(d.handle_input(&cleartext(&peer_server_kexinit(true)), Instant::now()));
+        assert_eq!(err, "strict-kex: KEXINIT was not the first packet");
+
+        // Without strict-kex the same sequence is accepted.
+        let mut d = client_in_initial_kex();
+        d.handle_input(&cleartext(&[2, 0, 0, 0, 0]), Instant::now())
+            .expect("IGNORE");
+        d.handle_input(&cleartext(&peer_server_kexinit(false)), Instant::now())
+            .expect("non-strict KEXINIT after an IGNORE");
     }
 }

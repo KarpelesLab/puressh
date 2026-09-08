@@ -383,6 +383,19 @@ impl KexRunner {
         matches!(self.phase, Phase::Completed)
     }
 
+    /// `true` while our KEXINIT is out but the peer's has not arrived yet.
+    ///
+    /// This is the only window of a re-key in which the peer may still
+    /// legitimately send non-KEX packets (it has not seen our KEXINIT and
+    /// has not sent its own). RFC 4253 §7.1: once a party has sent
+    /// `SSH_MSG_KEXINIT` it must not send anything but transport-generic
+    /// (1–19), negotiation (20–29) and KEX-specific (30–49) messages until
+    /// its NEWKEYS, so a non-KEX packet arriving after the peer's KEXINIT
+    /// is a protocol violation, not something to buffer.
+    pub fn awaiting_peer_kexinit(&self) -> bool {
+        matches!(self.phase, Phase::SentKexInit)
+    }
+
     /// Feed one decoded inbound payload into the runner.
     ///
     /// `host_key` must be supplied on the server when handling

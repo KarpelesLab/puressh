@@ -1477,3 +1477,181 @@ fn cert_userauth_malformed_force_command_fails_closed() {
     );
     assert_failure(s.on_packet(&req).unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// A4: certificate userauth binds the offered algorithm name to the cert type
+// and to the signature algorithm.
+// ---------------------------------------------------------------------------
+
+/// Read a `tests/fixtures/cert/` file.
+fn cert_fixture(name: &str) -> String {
+    let path = format!(
+        "{}/tests/fixtures/cert/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        name
+    );
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+}
+
+/// The decoded blob of a `*-cert.pub` fixture.
+fn cert_fixture_blob(name: &str) -> Vec<u8> {
+    let text = cert_fixture(name);
+    let b64 = text.split_whitespace().nth(1).expect("base64 field");
+    crate::key::base64::decode(b64.as_bytes()).expect("decode cert")
+}
+
+fn probe_pubkey_request(user: &str, algorithm: &str, blob: &[u8]) -> Vec<u8> {
+    UserauthRequest {
+        user: user.into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::PublicKey {
+            signature_present: false,
+            algorithm: algorithm.into(),
+            public_blob: blob.to_vec(),
+            signature: None,
+        },
+    }
+    .encode()
+}
+
+fn trim_zeros(b: &[u8]) -> &[u8] {
+    let mut i = 0;
+    while i + 1 < b.len() && b[i] == 0 {
+        i += 1;
+    }
+    &b[i..]
+}
+
+/// The fixture RSA user key as `rsa-sha2-512` and `rsa-sha2-256` signers
+/// over the same key material.
+fn rsa_fixture_signers() -> (
+    crate::hostkey::RsaSha2_512HostKey,
+    crate::hostkey::RsaSha2_256HostKey,
+) {
+    use purecrypto::bignum::BoxedUint;
+    let pem = cert_fixture("u_rsa");
+    let key = crate::key::PrivateKey::parse_openssh_pem(&pem, None).unwrap();
+    let crate::key::PrivateKey::Rsa { n, e, d, .. } = key else {
+        panic!("fixture is not RSA");
+    };
+    let parts = || {
+        (
+            BoxedUint::from_be_bytes(trim_zeros(&n)),
+            BoxedUint::from_be_bytes(trim_zeros(&e)),
+            BoxedUint::from_be_bytes(trim_zeros(&d)),
+        )
+    };
+    let (n1, e1, d1) = parts();
+    let (n2, e2, d2) = parts();
+    (
+        crate::hostkey::RsaSha2_512HostKey::from_components(n1, e1, d1).unwrap(),
+        crate::hostkey::RsaSha2_256HostKey::from_components(n2, e2, d2).unwrap(),
+    )
+}
+
+#[test]
+fn cert_userauth_rsa_sha512_name_with_sha512_signature_is_accepted() {
+    // Positive control: the negotiated name and the signature agree.
+    let cert = cert_fixture_blob("u_rsa-cert.pub");
+    let (s512, _) = rsa_fixture_signers();
+    let mut s = cert_server();
+    let req = signed_pubkey_request("carol", "rsa-sha2-512-cert-v01@openssh.com", &cert, &s512);
+    match s.on_packet(&req).unwrap() {
+        ServerStep::Authenticated {
+            user, cert_caps, ..
+        } => {
+            assert_eq!(user, "carol");
+            assert!(cert_caps.is_some());
+        }
+        _ => panic!("expected Authenticated"),
+    }
+}
+
+#[test]
+fn cert_userauth_rsa_sha256_name_with_sha256_signature_is_accepted() {
+    // `rsa-sha2-256-cert-v01@openssh.com` legitimately pins SHA-256.
+    let cert = cert_fixture_blob("u_rsa-cert.pub");
+    let (_, s256) = rsa_fixture_signers();
+    let mut s = cert_server();
+    let req = signed_pubkey_request("carol", "rsa-sha2-256-cert-v01@openssh.com", &cert, &s256);
+    assert!(matches!(
+        s.on_packet(&req).unwrap(),
+        ServerStep::Authenticated { .. }
+    ));
+}
+
+#[test]
+fn cert_userauth_rejects_signature_algorithm_weaker_than_negotiated_name() {
+    // Offer `rsa-sha2-512-cert-v01@openssh.com` but sign with a *genuine*
+    // rsa-sha2-256 signature over the same key. Before the fix the verifier
+    // was built from the signature blob's own name, so this was accepted.
+    let cert = cert_fixture_blob("u_rsa-cert.pub");
+    let (_, s256) = rsa_fixture_signers();
+    let mut s = cert_server();
+    let req = signed_pubkey_request("carol", "rsa-sha2-512-cert-v01@openssh.com", &cert, &s256);
+    assert_failure(s.on_packet(&req).unwrap());
+}
+
+#[test]
+fn cert_userauth_rejects_name_from_other_key_family() {
+    // An ed25519 user cert offered under an RSA cert name (with a valid
+    // ed25519 signature by its own key) must be refused — both the signed
+    // step and the probe.
+    let pem = cert_fixture("u_ed25519");
+    let signer = crate::key::PrivateKey::parse_openssh_pem(&pem, None)
+        .unwrap()
+        .into_host_key()
+        .unwrap();
+    let cert = cert_fixture_blob("u_ed25519-cert.pub");
+
+    let mut s = cert_server();
+    let req = signed_pubkey_request(
+        "alice",
+        "rsa-sha2-512-cert-v01@openssh.com",
+        &cert,
+        signer.as_ref(),
+    );
+    assert_failure(s.on_packet(&req).unwrap());
+
+    let mut s = cert_server();
+    let probe = probe_pubkey_request("alice", "rsa-sha2-512-cert-v01@openssh.com", &cert);
+    assert_failure(s.on_packet(&probe).unwrap());
+
+    // And under its own name it still works, signed and probed.
+    let mut s = cert_server();
+    let probe = probe_pubkey_request("alice", "ssh-ed25519-cert-v01@openssh.com", &cert);
+    match s.on_packet(&probe).unwrap() {
+        ServerStep::Send(p) => {
+            UserauthPkOk::decode(&p).expect("PK_OK");
+        }
+        _ => panic!("expected PK_OK"),
+    }
+    let req = signed_pubkey_request(
+        "alice",
+        "ssh-ed25519-cert-v01@openssh.com",
+        &cert,
+        signer.as_ref(),
+    );
+    assert!(matches!(
+        s.on_packet(&req).unwrap(),
+        ServerStep::Authenticated { .. }
+    ));
+}
+
+#[test]
+fn cert_userauth_rejects_unknown_cert_name() {
+    let pem = cert_fixture("u_ed25519");
+    let signer = crate::key::PrivateKey::parse_openssh_pem(&pem, None)
+        .unwrap()
+        .into_host_key()
+        .unwrap();
+    let cert = cert_fixture_blob("u_ed25519-cert.pub");
+    let mut s = cert_server();
+    let req = signed_pubkey_request(
+        "alice",
+        "ssh-dss-cert-v01@openssh.com",
+        &cert,
+        signer.as_ref(),
+    );
+    assert_failure(s.on_packet(&req).unwrap());
+}

@@ -602,9 +602,15 @@ impl ServerAuth {
             // not yet require CA validity — the binding signature comes next.
             let cert_info = if is_cert {
                 match crate::cert::Certificate::parse(&public_blob) {
-                    Ok(c) => Some(CertInfo::from_certificate(&c)?),
+                    // The offered algorithm name must be one we know and
+                    // must belong to the embedded key's family, exactly as
+                    // for the signed step — otherwise the PK_OK we would
+                    // echo back invites a signature we can never accept.
+                    Ok(c) if cert_plain_algorithm(&algorithm, &c).is_some() => {
+                        Some(CertInfo::from_certificate(&c)?)
+                    }
                     // A malformed cert blob is not a probe we can honour.
-                    Err(_) => return self.emit_failure(),
+                    _ => return self.emit_failure(),
                 }
             } else {
                 None
@@ -648,6 +654,21 @@ impl ServerAuth {
                 Ok(c) => c,
                 Err(_) => return self.emit_failure(),
             };
+            // Bind the request's `algorithm` to the certificate and to the
+            // signature (RFC 8332 §3.2, OpenSSH `sshkey_check_sigtype`): the
+            // cert name must be one we know, its plain form must belong to
+            // the embedded key's family, and the signature blob must be
+            // made with exactly that plain algorithm. Otherwise a client
+            // could offer `rsa-sha2-512-cert-v01@openssh.com` and sign with
+            // `rsa-sha2-256` (or SHA-1 `ssh-rsa`, if enabled) — the
+            // advertised hash would be meaningless.
+            let plain = match cert_plain_algorithm(&algorithm, &cert) {
+                Some(p) => p,
+                None => return self.emit_failure(),
+            };
+            if signature_algorithm(&sig) != Some(plain) {
+                return self.emit_failure();
+            }
             if cert.check_type(crate::cert::CertType::User).is_err()
                 || cert.check_validity(self.now).is_err()
                 || cert.require_known_critical_options().is_err()
@@ -665,7 +686,10 @@ impl ServerAuth {
             if cert.verify_ca_signature(&ca_algos).is_err() {
                 return self.emit_failure();
             }
-            let v = match cert.embedded_verifier(&sig) {
+            // The verifier is keyed on the *negotiated* plain name (which
+            // also applies the `ssh-rsa` SHA-1 gate), never on whatever
+            // name the signature blob happens to carry.
+            let v = match host_key_verify_by_name(plain, cert.embedded_pubkey_blob()) {
                 Ok(v) => v,
                 Err(_) => return self.emit_failure(),
             };
@@ -770,6 +794,26 @@ impl ServerAuth {
         };
         Ok(ServerStep::Send(failure.encode()))
     }
+}
+
+/// Resolve the plain signature-algorithm name a userauth `algorithm` of
+/// certificate type pins, checking it against the certificate's embedded key
+/// family. `None` if the name is unknown or names a different key family
+/// (an ed25519 cert offered as `rsa-sha2-512-cert-v01@openssh.com`, say).
+/// Mirrors the KEX-side check in [`host_key_verify_by_name`]'s cert branch.
+fn cert_plain_algorithm(algorithm: &str, cert: &crate::cert::Certificate) -> Option<&'static str> {
+    let plain = crate::cert::cert_name_to_plain(algorithm)?;
+    let family_ok = match cert.embedded_algorithm() {
+        "ssh-rsa" => matches!(plain, "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa"),
+        other => plain == other,
+    };
+    family_ok.then_some(plain)
+}
+
+/// The leading algorithm-name string of an SSH signature blob.
+fn signature_algorithm(sig_blob: &[u8]) -> Option<&str> {
+    let mut r = crate::format::Reader::new(sig_blob);
+    core::str::from_utf8(r.read_string().ok()?).ok()
 }
 
 #[cfg(test)]

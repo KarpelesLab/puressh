@@ -114,6 +114,12 @@ pub struct CertInfo {
     /// The CA's public-key blob (`signature_key_blob`) — the key the
     /// authenticator must check against its trusted-CA set.
     pub ca_key_blob: Vec<u8>,
+    /// The plain wire blob of the key *embedded* in the certificate (the key
+    /// the client actually signed with). A KRL that revokes this key as a
+    /// plain key must also refuse any certificate wrapping it — OpenSSH checks
+    /// the embedded key, not the certificate blob, for explicit-key /
+    /// fingerprint revocations.
+    pub embedded_pubkey_blob: Vec<u8>,
     /// The CA's signature algorithm (e.g. `"ssh-ed25519"`, `"rsa-sha2-512"`).
     pub ca_algorithm: String,
     /// The certificate's key-id (free-form CA-stamped identity, for logging).
@@ -138,6 +144,7 @@ impl CertInfo {
     pub fn from_certificate(cert: &crate::cert::Certificate) -> Result<Self> {
         Ok(CertInfo {
             ca_key_blob: cert.signature_key_blob.clone(),
+            embedded_pubkey_blob: cert.embedded_pubkey_blob.clone(),
             ca_algorithm: cert.ca_algorithm()?.into(),
             key_id: cert.key_id.clone(),
             serial: cert.serial,

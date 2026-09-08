@@ -1984,14 +1984,23 @@ mod imp {
                     // understood, before producing a `verified` cert attempt.)
                     // KRL revocation applies uniformly to plain keys and to a
                     // certificate's full wire blob (OpenSSH's explicit-key /
-                    // fingerprint sections can name a cert blob directly). A
-                    // revoked blob forces `blob_ok` false regardless of the
-                    // authorized-keys / cert-trust verdict.
+                    // fingerprint sections can name a cert blob directly). For
+                    // a certificate the key *embedded* in it is checked as
+                    // well: revoking a plain key must also refuse every
+                    // certificate wrapping that key (OpenSSH checks the
+                    // embedded key, not just the cert). A revoked blob forces
+                    // `blob_ok` false regardless of the authorized-keys /
+                    // cert-trust verdict.
                     let blob_revoked = self
                         .revoked_keys
                         .as_ref()
                         .as_ref()
-                        .map(|krl| krl.is_revoked_key(&public_blob))
+                        .map(|krl| {
+                            krl.is_revoked_key(&public_blob)
+                                || cert
+                                    .as_ref()
+                                    .is_some_and(|ci| krl.is_revoked_key(&ci.embedded_pubkey_blob))
+                        })
                         .unwrap_or(false);
                     if blob_revoked && self.debug {
                         eprintln!("sshd: auth publickey: key/cert blob revoked by KRL for {user}");
@@ -5233,6 +5242,67 @@ mod imp {
                 cert: None,
             });
             assert!(matches!(decision, AuthDecision::Reject));
+        }
+
+        /// A `CertInfo` wrapping `USERKEY_BLOB_HEX` as its embedded key, signed
+        /// by a (fake) CA blob, with `alice` as its sole principal. The CA
+        /// signature was already verified by the auth layer by the time the
+        /// authenticator sees a `verified` attempt, so no real signature is
+        /// needed to exercise the trust gate.
+        fn cert_info_for(ca_blob: &[u8], principals: &[&str]) -> puressh::auth::CertInfo {
+            puressh::auth::CertInfo {
+                ca_key_blob: ca_blob.to_vec(),
+                embedded_pubkey_blob: unhex(USERKEY_BLOB_HEX),
+                ca_algorithm: "ssh-ed25519".into(),
+                key_id: "test-cert".into(),
+                serial: 7,
+                valid_principals: principals.iter().map(|s| s.to_string()).collect(),
+                critical_options: Vec::new(),
+                extensions: Vec::new(),
+                valid_after: 0,
+                valid_before: u64::MAX,
+            }
+        }
+
+        #[test]
+        fn krl_revoked_plain_key_also_refuses_certificate_wrapping_it() {
+            // The KRL revokes the plain user key. A certificate whose
+            // *embedded* key is that plain key must be refused even though the
+            // cert blob itself (a different byte string) is not listed and the
+            // CA is trusted.
+            let krl =
+                puressh::krl::Krl::parse(&unhex(KRL_EXPLICIT_HEX)).expect("parse fixture KRL");
+            let ca_blob =
+                b"\x00\x00\x00\x0bssh-ed25519\x00\x00\x00\x20fakeCAfakeCAfakeCAfakeCAfakeCAfa"
+                    .to_vec();
+            let ci = cert_info_for(&ca_blob, &["alice"]);
+            let cert_blob = b"not-the-plain-key-blob".to_vec();
+
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.trusted_user_ca_blobs = vec![ca_blob.clone()];
+            // Sanity: without a KRL the certificate is accepted.
+            let ok = a.evaluate(AuthAttempt::PublicKey {
+                user: "alice".into(),
+                algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
+                public_blob: cert_blob.clone(),
+                probe_only: false,
+                verified: true,
+                cert: Some(ci.clone()),
+            });
+            assert!(matches!(ok, AuthDecision::Accept), "{ok:?}");
+
+            let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
+            b.trusted_user_ca_blobs = vec![ca_blob];
+            b.revoked_keys = std::sync::Arc::new(Some(krl));
+            let decision = b.evaluate(AuthAttempt::PublicKey {
+                user: "alice".into(),
+                algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
+                public_blob: cert_blob,
+                probe_only: false,
+                verified: true,
+                cert: Some(ci),
+            });
+            assert!(matches!(decision, AuthDecision::Reject), "{decision:?}");
         }
 
         // ---- Multi-step keyboard-interactive bridge ------------------------

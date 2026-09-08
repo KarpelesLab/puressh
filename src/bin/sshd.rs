@@ -6616,9 +6616,23 @@ mod imp {
             t.insert(Pid::from_raw(100_003), ip, Some(rx));
             // Peer "exits pre-auth": write end closed with no byte.
             drop(tx);
-            t.poll_auth();
+            // Poll until the hang-up is observed rather than once: a sibling
+            // test in this binary forks a real child, and `fork` copies every
+            // open descriptor — including our `tx` — into it (close-on-exec
+            // only applies at `exec`). Until that child exits the pipe still
+            // has a writer and `poll` reports nothing, which made this test
+            // flake on CI when the two ran concurrently.
+            let pid = Pid::from_raw(100_003);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while t.children[&pid].auth_rx.is_some() && std::time::Instant::now() < deadline {
+                t.poll_auth();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
             assert_eq!(t.unauthenticated(), 1);
-            assert!(t.children[&Pid::from_raw(100_003)].auth_rx.is_none());
+            assert!(
+                t.children[&pid].auth_rx.is_none(),
+                "pipe hang-up never observed"
+            );
         }
 
         // ---- Multi-step keyboard-interactive bridge ------------------------

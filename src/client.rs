@@ -225,10 +225,12 @@ pub enum HostKeyPolicy {
     /// bytes, exactly as `ssh-keygen -lf` reports them) matches.
     AcceptFingerprint([u8; 32]),
     /// Verify against an OpenSSH-format `known_hosts` store. Requires the
-    /// host name + port to be threaded in via [`Client::connect_to_host`];
-    /// constructors that take a bare socket address (`Client::connect`)
-    /// degrade to `AcceptAny` when this variant is configured because we
-    /// don't have an address-independent identifier to look up.
+    /// host name + port to be threaded in via [`Client::connect_to_host`]
+    /// (or [`Client::connect_via`]). Constructors that take a bare socket
+    /// address (`Client::connect`) have no address-independent name to look
+    /// up, so with this variant configured they **fail closed** — the
+    /// handshake is refused with [`Error::Config`] rather than silently
+    /// downgrading to `AcceptAny`.
     ///
     /// See [`KnownHostsPolicy`] for the knobs.
     KnownHosts(KnownHostsPolicy),
@@ -1015,7 +1017,8 @@ impl Client {
     /// Shared construction: build the [`Client`] struct over `stream`,
     /// recording `host`/`port` for host-key lookups, then run version
     /// exchange + KEX. `host` may be empty (e.g. plain `connect`), in which
-    /// case `KnownHosts` policy degrades to AcceptAny.
+    /// case a `KnownHosts` policy fails closed with [`Error::Config`] (see
+    /// [`HostKeyPolicy::KnownHosts`]).
     fn from_transport(
         stream: Box<dyn Transport>,
         host: &str,
@@ -2257,8 +2260,8 @@ impl Client {
             Ok(()) => Ok(()),
             Err(e) => {
                 if !stderr.is_empty() {
-                    let msg = String::from_utf8_lossy(&stderr).trim().to_string();
-                    eprintln!("scp_send_to: remote stderr: {}", msg);
+                    let msg = sanitize_for_terminal(&stderr);
+                    eprintln!("scp_send_to: remote stderr: {}", msg.trim());
                 }
                 Err(e)
             }
@@ -2328,8 +2331,8 @@ impl Client {
             Ok(()) => Ok(()),
             Err(e) => {
                 if !stderr.is_empty() {
-                    let msg = String::from_utf8_lossy(&stderr).trim().to_string();
-                    eprintln!("scp_recv_from: remote stderr: {}", msg);
+                    let msg = sanitize_for_terminal(&stderr);
+                    eprintln!("scp_recv_from: remote stderr: {}", msg.trim());
                 }
                 Err(e)
             }
@@ -3915,6 +3918,21 @@ fn serve_dispatch_packet(
                     client.write_payload(&p)?;
                     return Ok(());
                 }
+                // The wire carries ports as u32; anything above 65535 is not
+                // a TCP port. Reject rather than clamp, so a handler never
+                // sees a fabricated `65535` origin.
+                let (Ok(bound_port), Ok(orig_port)) =
+                    (u16::try_from(dest_port), u16::try_from(orig_port))
+                else {
+                    let p = client.conn.reject_open(
+                        channel,
+                        SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                        "port out of range",
+                        "",
+                    )?;
+                    client.write_payload(&p)?;
+                    return Ok(());
+                };
                 if let Some(cb) = handlers.on_forwarded_tcpip.clone() {
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
@@ -3926,9 +3944,9 @@ fn serve_dispatch_packet(
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
                     let origin = ForwardedTcpipOrigin {
                         bound_address: dest_host,
-                        bound_port: clamp_u16(dest_port),
+                        bound_port,
                         orig_address: orig_host,
-                        orig_port: clamp_u16(orig_port),
+                        orig_port,
                     };
                     thread::spawn(move || {
                         cb(origin, cs);
@@ -4105,15 +4123,22 @@ fn serve_dispatch_packet(
     Ok(())
 }
 
-/// Saturating cast from the wire-format u32 port to a u16. The SSH spec
-/// allows u32 but only 0..=65535 are meaningful; clamp rather than failing
-/// so the handler still gets called with a sensible value.
-fn clamp_u16(v: u32) -> u16 {
-    if v > u16::MAX as u32 {
-        u16::MAX
-    } else {
-        v as u16
-    }
+/// Make peer-supplied bytes safe to print on a terminal: lossy UTF-8, with
+/// every control character (C0, DEL and the C1 range — so ESC / CSI escape
+/// sequences and OSC hyperlinks included) other than `\n` and `\t` replaced
+/// by `?`. Used for the remote `scp`'s stderr, which an attacker-controlled
+/// server can fill with terminal escape sequences.
+fn sanitize_for_terminal(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .map(|c| {
+            if c.is_control() && c != '\n' && c != '\t' {
+                '?'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -4328,6 +4353,17 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn sanitize_for_terminal_strips_escape_sequences() {
+        // ESC-based CSI, a C1 CSI (U+009B), OSC/BEL, DEL, CR and a NUL are
+        // all neutralised; newline / tab and ordinary text survive.
+        let raw = b"ok\x1b[31mred\x1b[0m \xc2\x9b2J \x1b]8;;http://x\x07link \x7f\r\x00\nnext\tcol";
+        let out = sanitize_for_terminal(raw);
+        assert_eq!(out, "ok?[31mred?[0m ?2J ?]8;;http://x?link ???\nnext\tcol");
+        // Invalid UTF-8 is replaced rather than dropped or passed through.
+        assert_eq!(sanitize_for_terminal(b"a\xffb"), "a\u{fffd}b");
     }
 
     #[test]

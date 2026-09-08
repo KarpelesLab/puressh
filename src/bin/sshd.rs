@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! sshd [-d] [-p port] [-h host_key_file]... [-A authorized_keys_file]
-//!      [-u allowed_user]...
+//!      [-u allowed_user]... [--x11-forward]
 //! ```
 //!
 //! Each accepted connection is handled by a freshly `fork()`ed child
@@ -54,7 +54,7 @@ mod imp {
     use std::sync::{Arc, Mutex, OnceLock};
 
     use nix::errno::Errno;
-    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
     use nix::libc;
     use nix::sys::signal::{SigHandler, Signal, kill, signal};
     use nix::sys::wait::{WaitPidFlag, WaitStatus, waitpid};
@@ -79,7 +79,7 @@ mod imp {
                          [-h host_key_file]... [-A authorized_keys_file] \
                          [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
                          [--sftp-root PATH] [--no-scp] [--no-agent-forward] \
-                         [--no-x11-forward] [--no-strict-modes] [--debug-commands] \
+                         [--x11-forward] [--no-strict-modes] [--debug-commands] \
                          [--accept-env GLOB]... [--login-grace-time SECONDS] \
                          [--max-startups N] [--per-source-max N] \
                          [--permit-root-login yes|no|prohibit-password]";
@@ -710,8 +710,10 @@ mod imp {
         /// it. When off, any client `auth-agent-req@openssh.com` is
         /// refused.
         agent_forward: Option<bool>,
-        /// X11 forwarding on by default; `--no-x11-forward` disables it.
-        /// When off, any client `x11-req` is refused.
+        /// X11 forwarding is **off** by default (OpenSSH's default);
+        /// `--x11-forward` (or `X11Forwarding yes`) enables it. When off,
+        /// any client `x11-req` is refused. `--no-x11-forward` is still
+        /// accepted and forces it off over the config.
         x11_forward: Option<bool>,
         /// `--no-strict-modes`: skip the 0o077 / 0o022 file-permission
         /// checks on host keys / authorized_keys.
@@ -835,6 +837,7 @@ mod imp {
                 }
                 "--no-scp" => scp = Some(false),
                 "--no-agent-forward" => agent_forward = Some(false),
+                "--x11-forward" => x11_forward = Some(true),
                 "--no-x11-forward" => x11_forward = Some(false),
                 "--no-strict-modes" => strict_modes = Some(false),
                 "--debug-commands" => debug_commands = true,
@@ -3457,6 +3460,15 @@ mod imp {
         // pam_systemd, pam_lastlog, …) can stat it; `forkpty` doesn't
         // expose that path pre-fork, hence the manual split.
         let pty = nix::pty::openpty(Some(&ws), None).map_err(nix_io)?;
+        // Both ends close-on-exec: this connection process may later spawn
+        // other children (an `exec` request's command, a second shell) and
+        // none of them may inherit this channel's PTY master — a sibling
+        // session could otherwise read/inject on the first one's terminal.
+        // The slave is `dup2`'d onto stdio in the shell child below, which
+        // clears the flag on the new descriptors, so it is harmless there.
+        for fd in [pty.master.as_fd(), pty.slave.as_fd()] {
+            fcntl(fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC)).map_err(nix_io)?;
+        }
 
         // pty_setowner parity with OpenSSH: while still root and before the
         // fork hands the slave to the unprivileged shell, set the slave's
@@ -4056,7 +4068,8 @@ mod imp {
             sshd_cfg.global.allow_agent_forwarding,
             true,
         );
-        let x11_forward = pick(cli.x11_forward, sshd_cfg.global.x11_forwarding, true);
+        // X11Forwarding defaults to `no`, as in OpenSSH.
+        let x11_forward = pick(cli.x11_forward, sshd_cfg.global.x11_forwarding, false);
         let login_grace_time = pick(
             cli.login_grace_time,
             sshd_cfg.global.login_grace_time,

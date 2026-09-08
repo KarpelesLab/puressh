@@ -3910,7 +3910,7 @@ fn run_exec_command(
     // handler thread the same way `ChannelRequest::Subsystem`
     // does.
     if let Some(handler) = cfg.exec_stream_handler.clone()
-        && handler.claims(&command)
+        && handler.claims(command)
     {
         let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
         let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
@@ -3944,7 +3944,7 @@ fn run_exec_command(
     }
     // Not claimed — fall through to the buffered CommandHandler.
     let env_ref = envs.get(&channel).unwrap_or(&empty_env);
-    let result = cfg.command_handler.handle(user, env_ref, &command);
+    let result = cfg.command_handler.handle(user, env_ref, command);
     if want_reply {
         let p = conn.send_request_success(channel)?;
         srv_send(stream, driver, &p)?;

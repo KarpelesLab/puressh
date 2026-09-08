@@ -28,6 +28,12 @@ pub enum LookupResult {
     },
     /// No entry's host matched. The caller decides whether to TOFU-add.
     Unknown,
+    /// An `@revoked` line matched both the host and the presented key.
+    /// This is a hard failure: no policy (`StrictHostKeyChecking=no`,
+    /// prompt, silent accept) may override it, and the store must not be
+    /// rotated. Matches OpenSSH, which aborts the connection outright on
+    /// a revoked host key.
+    Revoked,
 }
 
 /// In-memory model of a `known_hosts` file. Preserves comments,
@@ -185,10 +191,16 @@ impl KnownHosts {
     ///
     /// Per OpenSSH semantics, `@revoked` is evaluated **first** across
     /// every entry in the file — a revoke line elsewhere in the file
-    /// outranks any non-revoked match. After that, the first matching
-    /// (host, key) pair wins; if any entry's host matches but no
-    /// matching key is found, the result is `Mismatch` with the list of
-    /// expected keys.
+    /// outranks any non-revoked match and yields [`LookupResult::Revoked`].
+    /// After that, the first matching (host, key) pair wins; if any
+    /// entry's host matches but no matching key is found, the result is
+    /// `Mismatch` with the list of expected keys.
+    ///
+    /// `@cert-authority` lines are **not** consulted for a plain (non
+    /// certificate) host key: a CA line says "trust certificates signed by
+    /// this key", not "this key is the host's key", so it neither counts as
+    /// a host match nor as an expected key here. Certificates go through
+    /// [`Self::verify_host_cert`] instead.
     pub fn lookup(&self, host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> LookupResult {
         // Pass 1: any `@revoked` line whose host AND key matches refuses
         // the candidate unconditionally.
@@ -199,13 +211,12 @@ impl KnownHosts {
                 && e.key_type == key_type
                 && e.key_blob == key_blob
             {
-                return LookupResult::Mismatch {
-                    expected: vec![(e.key_type.clone(), e.key_blob.clone())],
-                };
+                return LookupResult::Revoked;
             }
         }
 
-        // Pass 2: normal Match / Mismatch / Unknown evaluation.
+        // Pass 2: normal Match / Mismatch / Unknown evaluation over the
+        // plain (marker-less) entries only.
         let mut host_matched = false;
         let mut expected: Vec<(String, Vec<u8>)> = Vec::new();
         for slot in &self.lines {
@@ -213,19 +224,19 @@ impl KnownHosts {
                 Slot::Entry(e) => e,
                 _ => continue,
             };
+            // Marker lines carry no evidence about the host's plain key:
+            // a `@revoked` line that didn't fire in pass 1 is irrelevant,
+            // and a `@cert-authority` line only vouches for certificates.
+            // Treating a CA line as a plain key would report a spurious
+            // "HOST KEY CHANGED" for a plain-key host under a CA wildcard,
+            // and would accept a host presenting the CA's own public key.
+            if e.marker.is_some() {
+                continue;
+            }
             if !host_field_matches(&e.host_spec, host, port) {
                 continue;
             }
-            // Revoked lines are not evidence of "known"; if pass 1
-            // didn't fire, they have nothing useful to contribute.
-            if e.marker == Some(Marker::Revoked) {
-                continue;
-            }
             host_matched = true;
-            // Cert-authority entries indicate the key signs certs for the
-            // host; we don't speak ssh-{ed25519,rsa}-cert-v01 yet, so
-            // record the CA key as "expected" but only count it as a
-            // match if the candidate equals it exactly.
             if e.key_type == key_type && e.key_blob == key_blob {
                 return LookupResult::Match;
             }
@@ -333,8 +344,45 @@ impl KnownHosts {
         }));
     }
 
-    /// Remove every entry matching `host[:port]`. Returns the count
-    /// removed.
+    /// Remove only the plain entries that name **exactly** `host[:port]`:
+    /// marker-less lines whose host field is the single literal pattern
+    /// [`format_host_pattern`]`(host, port)` (compared ASCII
+    /// case-insensitively, as host patterns are), or a hashed token for
+    /// exactly that host and port. Returns the count removed.
+    ///
+    /// Unlike [`Self::remove`], this never touches wildcard / negated /
+    /// multi-host pattern lines, nor `@cert-authority` or `@revoked`
+    /// markers — entries that are typically shared with other hosts and
+    /// must survive a key rotation for *this* host. This is the method
+    /// the client uses when a user accepts a changed host key; `remove`
+    /// keeps its broad `ssh-keygen -R` semantics for explicit CLI use.
+    pub fn remove_exact(&mut self, host: &str, port: u16) -> usize {
+        let literal = format_host_pattern(host, port);
+        let mut removed = 0usize;
+        for slot in self.lines.iter_mut() {
+            let Slot::Entry(e) = slot else { continue };
+            if e.marker.is_some() {
+                continue;
+            }
+            let exact = match &e.host_spec {
+                HostSpec::Patterns(pats) => {
+                    pats.len() == 1 && pats[0].eq_ignore_ascii_case(&literal)
+                }
+                HostSpec::Hashed(_) => host_field_matches(&e.host_spec, host, port),
+            };
+            if exact {
+                removed += 1;
+                *slot = Slot::Removed;
+            }
+        }
+        removed
+    }
+
+    /// Remove every entry whose host field matches `host[:port]`,
+    /// including wildcard patterns and `@cert-authority` / `@revoked`
+    /// markers — the semantics of `ssh-keygen -R`. Returns the count
+    /// removed. For the narrower "replace this one host's key" case use
+    /// [`Self::remove_exact`].
     pub fn remove(&mut self, host: &str, port: u16) -> usize {
         let mut removed = 0usize;
         for slot in self.lines.iter_mut() {

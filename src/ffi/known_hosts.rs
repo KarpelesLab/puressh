@@ -316,6 +316,11 @@ pub unsafe extern "C" fn pcssh_known_hosts_lookup(
                 LookupResult::Match => PCSSH_KH_MATCH,
                 LookupResult::Mismatch { .. } => PCSSH_KH_MISMATCH,
                 LookupResult::Unknown => PCSSH_KH_UNKNOWN,
+                // A revoked key is reported as a mismatch at the C ABI (the
+                // fail-closed answer); the Rust `LookupResult::Revoked`
+                // variant is what the in-crate client refuses on
+                // unconditionally.
+                LookupResult::Revoked => PCSSH_KH_MISMATCH,
             };
             // SAFETY: out_result non-NULL.
             unsafe { *out_result = r };

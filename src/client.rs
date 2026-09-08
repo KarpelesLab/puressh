@@ -3190,6 +3190,28 @@ pub(crate) fn build_verifier(
             let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
             match lookup {
                 LookupResult::Match => {}
+                LookupResult::Revoked => {
+                    // A `@revoked` host key is a hard failure regardless of
+                    // `on_mismatch` — no `StrictHostKeyChecking=no` accept,
+                    // no prompt, no rotation of the store. OpenSSH aborts
+                    // the connection here too.
+                    eprintln!(
+                        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                         @       WARNING: REVOKED HOST KEY DETECTED!               @\n\
+                         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+                         The {} host key for {} is revoked.\n\
+                         This could mean that a stolen key is being used to \
+                         impersonate this host.\n\
+                         Host key verification failed: host key is revoked.",
+                        neg.host_key,
+                        if target_port == 22 {
+                            target_host.to_string()
+                        } else {
+                            format!("[{target_host}]:{target_port}")
+                        },
+                    );
+                    return Err(Error::HostKeyRejected);
+                }
                 LookupResult::Mismatch { expected } => {
                     // Print the OpenSSH-style loud banner on mismatch,
                     // before any policy decision. Shows both the
@@ -3271,7 +3293,15 @@ pub(crate) fn build_verifier(
                         // connects don't keep tripping the mismatch
                         // path. Honours the same hash-new / save-path
                         // knobs as the Unknown path.
-                        let _ = store.remove(target_host, target_port);
+                        //
+                        // `remove_exact` only drops marker-less lines
+                        // naming exactly this host[:port] (literal or
+                        // hashed). Wildcard / multi-host patterns and
+                        // `@cert-authority` / `@revoked` markers are
+                        // shared with other hosts and must survive a
+                        // single host's key rotation — the broad
+                        // `remove` would silently delete them.
+                        let _ = store.remove_exact(target_host, target_port);
                         store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
                         if let Some(path) = &kh.save_path {
                             store.save(path).map_err(Error::from)?;
@@ -4305,6 +4335,104 @@ mod tests {
             guard.lookup("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob),
             LookupResult::Mismatch { .. }
         ));
+    }
+
+    /// A `@revoked` host key is refused no matter how lenient `on_mismatch`
+    /// is — here `AcceptWithWarning` (StrictHostKeyChecking=no) — and the
+    /// store is left exactly as it was (no rotation, no deleted marker).
+    #[test]
+    fn known_hosts_revoked_key_fails_closed_regardless_of_policy() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+
+        let real_blob = Ed25519HostKey::from_seed(seed).public_blob();
+        let line = format!(
+            "@revoked [127.0.0.1]:{} ssh-ed25519 {}\n",
+            addr.port(),
+            crate::key::base64::encode(&real_blob)
+        );
+        let store = Arc::new(Mutex::new(KnownHosts::from_bytes(line.as_bytes())));
+        let policy = KnownHostsPolicy {
+            store: store.clone(),
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Accept,
+            on_mismatch: TofuAction::AcceptWithWarning,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+        };
+
+        let err = Client::connect_to_host("127.0.0.1", addr.port(), cfg)
+            .err()
+            .expect("revoked host key must be refused");
+        assert!(matches!(err, Error::HostKeyRejected), "got {err:?}");
+        let _ = server.join();
+
+        // Store untouched: the revoke line survives and still fires.
+        let guard = store.lock().unwrap();
+        assert_eq!(guard.to_bytes(), line.as_bytes());
+        assert!(matches!(
+            guard.lookup("127.0.0.1", addr.port(), "ssh-ed25519", &real_blob),
+            LookupResult::Revoked
+        ));
+    }
+
+    /// Accepting a changed key rotates only the literal entry for this
+    /// host; a `@cert-authority` wildcard (and a plain wildcard) shared
+    /// with other hosts must survive the rotation.
+    #[test]
+    fn known_hosts_rotation_spares_shared_marker_and_wildcard_lines() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+
+        let bogus_blob = Ed25519HostKey::from_seed([0x22u8; 32]).public_blob();
+        // Both wildcard lines genuinely match this host:port (a bare `*`
+        // only covers port 22), so the broad `remove` would have deleted
+        // them along with the literal entry.
+        let shared = format!(
+            "@cert-authority [*]:{p} ssh-ed25519 AAAA\n[*]:{p} ssh-rsa AAAB\n",
+            p = addr.port()
+        );
+        let store = Arc::new(Mutex::new(KnownHosts::from_bytes(shared.as_bytes())));
+        store
+            .lock()
+            .unwrap()
+            .add("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob, false);
+        let policy = KnownHostsPolicy {
+            store: store.clone(),
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Reject,
+            on_mismatch: TofuAction::Accept,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+        };
+
+        let _client =
+            Client::connect_to_host("127.0.0.1", addr.port(), cfg).expect("connect should succeed");
+        let _ = server.join();
+
+        let real_blob = Ed25519HostKey::from_seed(seed).public_blob();
+        let guard = store.lock().unwrap();
+        let out = String::from_utf8(guard.to_bytes()).unwrap();
+        assert!(out.starts_with(&shared), "shared lines must survive: {out}");
+        assert!(matches!(
+            guard.lookup("127.0.0.1", addr.port(), "ssh-ed25519", &real_blob),
+            LookupResult::Match
+        ));
+        assert!(!out.contains(&crate::key::base64::encode(&bogus_blob)));
     }
 
     #[test]

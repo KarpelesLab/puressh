@@ -147,30 +147,155 @@ fn revoked_marker_refuses_matching_key() {
     let kh = KnownHosts::from_bytes(src);
     // We parsed AAAA as the key blob; reconstruct it and check refusal.
     let blob = crate::key::base64::decode(b"AAAA").unwrap();
-    match kh.lookup("example.com", 22, "ssh-ed25519", &blob) {
-        LookupResult::Mismatch { expected } => {
-            assert_eq!(expected.len(), 1);
-            assert_eq!(expected[0].0, "ssh-ed25519");
-        }
-        r => panic!("expected Mismatch (revoked), got {r:?}"),
-    }
+    // A revoked key is a distinct, fail-closed verdict — not a `Mismatch`
+    // that a lenient `on_mismatch` policy could wave through.
+    assert!(matches!(
+        kh.lookup("example.com", 22, "ssh-ed25519", &blob),
+        LookupResult::Revoked
+    ));
+}
+
+/// `@revoked` outranks a plain entry for the same host and key, wherever
+/// the two lines sit in the file, and a revoked key for one host must not
+/// affect a different host.
+#[test]
+fn revoked_marker_outranks_plain_entry_and_is_host_scoped() {
+    let src = b"example.com ssh-ed25519 AAAA\n\
+                @revoked example.com ssh-ed25519 AAAA\n\
+                other.example.com ssh-ed25519 AAAA\n";
+    let kh = KnownHosts::from_bytes(src);
+    let blob = crate::key::base64::decode(b"AAAA").unwrap();
+    assert!(matches!(
+        kh.lookup("example.com", 22, "ssh-ed25519", &blob),
+        LookupResult::Revoked
+    ));
+    // Same key, unrevoked host: still a plain match.
+    assert!(matches!(
+        kh.lookup("other.example.com", 22, "ssh-ed25519", &blob),
+        LookupResult::Match
+    ));
+    // A different key for the revoked host is an ordinary mismatch.
+    assert!(matches!(
+        kh.lookup("example.com", 22, "ssh-ed25519", &ed25519_blob(9)),
+        LookupResult::Mismatch { .. }
+    ));
 }
 
 #[test]
-fn cert_authority_marker_records_expected_but_does_not_match_arbitrary_keys() {
-    // We don't speak ssh-{ed25519,rsa}-cert-v01 yet, so the CA key is
-    // only treated as a match if the candidate equals it exactly.
+fn cert_authority_marker_is_ignored_for_plain_host_keys() {
+    // A `@cert-authority` line vouches for *certificates* signed by the CA
+    // key; it says nothing about the host's plain key. So a plain-key host
+    // under a CA wildcard is simply Unknown (not a false "HOST KEY
+    // CHANGED"), and a host presenting the CA's own public key as its host
+    // key must not be accepted on the strength of the CA line.
     let src = b"@cert-authority *.example.com ssh-ed25519 AAAA\n";
     let kh = KnownHosts::from_bytes(src);
     let ca_blob = crate::key::base64::decode(b"AAAA").unwrap();
     let other = ed25519_blob(42);
-    match kh.lookup("host.example.com", 22, "ssh-ed25519", &other) {
-        LookupResult::Mismatch { .. } => {}
-        r => panic!("expected Mismatch (non-CA candidate), got {r:?}"),
-    }
-    // Exact match against the CA key blob still counts as Match.
+    assert!(matches!(
+        kh.lookup("host.example.com", 22, "ssh-ed25519", &other),
+        LookupResult::Unknown
+    ));
     assert!(matches!(
         kh.lookup("host.example.com", 22, "ssh-ed25519", &ca_blob),
+        LookupResult::Unknown
+    ));
+    // The CA line still exists for cert verification / `find`.
+    assert_eq!(kh.find("host.example.com", 22).len(), 1);
+}
+
+/// Plain entries next to a CA wildcard behave normally: the plain key
+/// decides Match / Mismatch, and the CA key is never listed as "expected".
+#[test]
+fn plain_entry_beside_cert_authority_wildcard_decides_alone() {
+    let src = b"@cert-authority *.example.com ssh-ed25519 AAAA\n\
+                host.example.com ssh-ed25519 AAAB\n";
+    let kh = KnownHosts::from_bytes(src);
+    let plain = crate::key::base64::decode(b"AAAB").unwrap();
+    assert!(matches!(
+        kh.lookup("host.example.com", 22, "ssh-ed25519", &plain),
+        LookupResult::Match
+    ));
+    match kh.lookup("host.example.com", 22, "ssh-ed25519", &ed25519_blob(7)) {
+        LookupResult::Mismatch { expected } => {
+            assert_eq!(expected.len(), 1, "CA key must not be reported as expected");
+            assert_eq!(expected[0].1, plain);
+        }
+        r => panic!("expected Mismatch, got {r:?}"),
+    }
+}
+
+/// `remove_exact` (the key-rotation primitive) only drops marker-less
+/// lines naming exactly this host — wildcard, multi-host, negated,
+/// `@cert-authority` and `@revoked` lines shared with other hosts survive.
+#[test]
+fn remove_exact_spares_shared_and_marker_lines() {
+    let src = b"@cert-authority *.example.com ssh-ed25519 AAAA\n\
+                @revoked host.example.com ssh-ed25519 AAAB\n\
+                *.example.com ssh-ed25519 AAAC\n\
+                host.example.com,alias.example.com ssh-ed25519 AAAD\n\
+                !bad.example.com,host.example.com ssh-ed25519 AAAE\n\
+                HOST.example.com ssh-ed25519 AAAF\n\
+                host.example.com ssh-rsa AAAG\n\
+                [host.example.com]:2222 ssh-ed25519 AAAH\n";
+    let mut kh = KnownHosts::from_bytes(src);
+    // Sanity: the broad `remove` would take every one of these lines.
+    assert_eq!(kh.find("host.example.com", 22).len(), 7);
+
+    // Only the two literal `host.example.com` lines (case-insensitive) go.
+    assert_eq!(kh.remove_exact("host.example.com", 22), 2);
+    let out = String::from_utf8(kh.to_bytes()).unwrap();
+    assert!(out.contains("@cert-authority *.example.com"));
+    assert!(out.contains("@revoked host.example.com"));
+    assert!(out.contains("*.example.com ssh-ed25519 AAAC"));
+    assert!(out.contains("host.example.com,alias.example.com"));
+    assert!(out.contains("!bad.example.com,host.example.com"));
+    assert!(out.contains("[host.example.com]:2222"));
+    assert!(!out.contains("HOST.example.com ssh-ed25519 AAAF"));
+    assert!(!out.contains("host.example.com ssh-rsa AAAG"));
+
+    // Revocation and CA trust are untouched by the rotation.
+    let revoked = crate::key::base64::decode(b"AAAB").unwrap();
+    assert!(matches!(
+        kh.lookup("host.example.com", 22, "ssh-ed25519", &revoked),
+        LookupResult::Revoked
+    ));
+
+    // Hashed entries for exactly this host are removed too; a hashed
+    // entry for another host is not.
+    let mut kh = KnownHosts::new();
+    kh.add(
+        "host.example.com",
+        22,
+        "ssh-ed25519",
+        &ed25519_blob(1),
+        true,
+    );
+    kh.add(
+        "host.example.com",
+        2222,
+        "ssh-ed25519",
+        &ed25519_blob(2),
+        true,
+    );
+    kh.add(
+        "other.example.com",
+        22,
+        "ssh-ed25519",
+        &ed25519_blob(3),
+        true,
+    );
+    assert_eq!(kh.remove_exact("host.example.com", 22), 1);
+    assert!(matches!(
+        kh.lookup("host.example.com", 22, "ssh-ed25519", &ed25519_blob(1)),
+        LookupResult::Unknown
+    ));
+    assert!(matches!(
+        kh.lookup("host.example.com", 2222, "ssh-ed25519", &ed25519_blob(2)),
+        LookupResult::Match
+    ));
+    assert!(matches!(
+        kh.lookup("other.example.com", 22, "ssh-ed25519", &ed25519_blob(3)),
         LookupResult::Match
     ));
 }
@@ -316,15 +441,16 @@ fn marker_round_trips_through_save_load() {
     std::fs::write(&path, src).unwrap();
 
     let kh = KnownHosts::load(&path).expect("load");
-    // CA exact-key match.
+    // A CA line never vouches for a plain host key — even the CA's own
+    // public key presented as a host key is just Unknown.
     assert!(matches!(
         kh.lookup("host.example.com", 22, "ssh-ed25519", &blob),
-        LookupResult::Match
+        LookupResult::Unknown
     ));
-    // Revoked refuses the same blob.
+    // Revoked refuses the same blob, fail-closed.
     assert!(matches!(
         kh.lookup("bad.example.com", 22, "ssh-ed25519", &blob),
-        LookupResult::Mismatch { .. }
+        LookupResult::Revoked
     ));
 
     // Save + reload survives — both the wildcard cert-authority and
@@ -341,7 +467,7 @@ fn marker_round_trips_through_save_load() {
     assert!(markers.contains(&Some(Marker::CertAuthority)));
     assert!(matches!(
         kh2.lookup("bad.example.com", 22, "ssh-ed25519", &blob),
-        LookupResult::Mismatch { .. }
+        LookupResult::Revoked
     ));
 }
 

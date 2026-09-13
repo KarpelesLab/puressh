@@ -540,7 +540,7 @@ fn server_initiated_rekey_against_real_sshd() {
 #[test]
 #[ignore]
 fn client_initiated_rekey_against_real_sshd() {
-    use puressh::transport::RekeyPolicy;
+    use puressh::driver::RekeyPolicy;
 
     let tmp = tempdir();
     let host_key = tmp.join("host_ed25519");
@@ -633,7 +633,7 @@ fn client_initiated_rekey_against_real_sshd() {
 #[test]
 #[ignore]
 fn time_based_rekey_against_real_sshd() {
-    use puressh::transport::RekeyPolicy;
+    use puressh::driver::RekeyPolicy;
 
     let tmp = tempdir();
     let host_key = tmp.join("host_ed25519");
@@ -803,7 +803,7 @@ fn idle_server_time_rekey_against_real_sshd() {
 #[test]
 #[ignore]
 fn simultaneous_rekey_against_real_sshd() {
-    use puressh::transport::RekeyPolicy;
+    use puressh::driver::RekeyPolicy;
 
     let tmp = tempdir();
     let host_key = tmp.join("host_ed25519");
@@ -899,7 +899,7 @@ fn simultaneous_rekey_against_real_sshd() {
 #[ignore]
 fn gcm_rekey_against_real_sshd() {
     use puressh::client::AlgoOverrides;
-    use puressh::transport::RekeyPolicy;
+    use puressh::driver::RekeyPolicy;
 
     let tmp = tempdir();
     let host_key = tmp.join("host_ed25519");
@@ -1060,7 +1060,7 @@ fn concurrent_write_during_rekey_against_real_sshd() {
     // client via a matching byte policy. Under the mux, client re-keys are
     // initiated from the pump (reader) thread while the writer thread is mid
     // flight — the real simultaneous-collision-under-load case.
-    let mut rekey = puressh::transport::RekeyPolicy::default();
+    let mut rekey = puressh::driver::RekeyPolicy::default();
     rekey.max_bytes = 32 * 1024;
     client.set_rekey_policy(rekey);
 

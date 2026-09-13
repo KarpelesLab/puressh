@@ -8,26 +8,35 @@
 //! Built on [`purecrypto`] for all cryptographic primitives, with no
 //! foreign code in the dependency tree.
 //!
-//! The crate is split along the layers of RFC 4251–4254:
+//! The public API comes in three tiers:
 //!
-//! - [`mod@format`] — SSH wire format primitives (`mpint`, `string`, `name-list`).
-//! - [`transport`] — binary packet protocol, version exchange, KEX state machine.
-//! - [`kex`]      — key-exchange algorithms (`curve25519-sha256`, `ecdh-sha2-nistp*`).
-//! - [`cipher`]   — symmetric ciphers (`aes*-ctr`, `aes*-gcm`, `chacha20-poly1305`).
-//! - [`mac`]      — message authentication codes (`hmac-sha2-*`, `*-etm`).
-//! - [`hostkey`]  — host-key/signature algorithms (`ssh-ed25519`, `ecdsa-sha2-*`, `rsa-sha2-*`).
-//! - [`auth`]     — userauth (RFC 4252).
-//! - [`channel`]  — channels (RFC 4254).
-//! - [`key`]      — OpenSSH key file parsing and serialisation.
-//! - [`client`]   — high-level blocking client API (feature `client`).
-//! - [`server`]   — high-level blocking server API (feature `server`).
-//! - `driver`     — sans-IO connection drivers (features `client` / `server`).
-//! - `client_async` — runtime-agnostic async client (feature `async`).
+//! 1. **High-level clients and servers** plus the tooling around them:
+//!    - [`client`]   — blocking client (feature `client`); [`shared`] adds the
+//!      concurrent multi-channel [`SharedClient`](shared::SharedClient).
+//!    - [`server`]   — blocking server (feature `server`).
+//!    - `client_async` / `server_async` — runtime-agnostic async frontends
+//!      (feature `async`, native tokio entry points with `tokio`);
+//!      `client_mio` — readiness/non-blocking frontend (feature `mio`).
+//!    - [`sftp`], [`scp`], [`known_hosts`], [`agent`], [`forwarding`],
+//!      [`config`], [`cert`], [`krl`], [`key`], [`stream`], [`mux`],
+//!      [`proc_transport`], [`error`].
+//!    - [`hostkey`]  — host keys, certificates and fingerprints; [`auth`] —
+//!      the user-facing halves of userauth ([`Authenticator`](auth::Authenticator),
+//!      [`ClientCredential`](auth::ClientCredential), …).
+//! 2. **Sans-IO drivers** — [`driver`]: [`ClientDriver`](driver::ClientDriver) /
+//!    [`ServerDriver`](driver::ServerDriver) state machines for callers that
+//!    bring their own I/O and clock (features `client` / `server`).
+//! 3. **C ABI** — `ffi` (feature `ffi`).
+//!
+//! Everything below the drivers lives under [`hazmat`]: the wire format,
+//! binary packet protocol, key exchange, ciphers, MACs, compression and the
+//! RFC 4254 channel multiplexer. Those modules carry no stability promise and
+//! are easy to misuse; see the [`hazmat`] module docs before reaching for them.
 //!
 //! # Sans-IO core and frontends
 //!
-//! The protocol layers above ([`mod@format`], [`transport`], [`channel`],
-//! [`auth`]) are *sans-IO*: they transform byte buffers and never touch a
+//! The protocol layers under [`hazmat`] (`format`, `transport`, `channel`,
+//! `auth`) are *sans-IO*: they transform byte buffers and never touch a
 //! socket. The `driver` module lifts the connection *orchestration* — the
 //! state machine that sequences version exchange → key exchange →
 //! authentication → application channels and drives re-key/keepalive timers —
@@ -51,24 +60,29 @@
 extern crate alloc;
 
 pub mod auth;
-pub mod channel;
-pub mod cipher;
 pub mod error;
-pub mod format;
+pub mod hazmat;
 pub mod hostkey;
-pub mod kex;
 pub mod key;
-pub mod mac;
-pub mod transport;
+
+// Crate-private short paths for the protocol layers that live under
+// `hazmat`. Everything inside the crate keeps saying `crate::transport::…`;
+// only the public path changed.
+pub(crate) use hazmat::{cipher, format, kex, mac, transport};
+
+#[cfg(feature = "alloc")]
+pub(crate) use hazmat::compress;
+
+// `channel` is only consumed by the drivers and the frontends built on them;
+// an `alloc`-only build would otherwise trip `unused_imports`.
+#[cfg(any(feature = "client", feature = "server"))]
+pub(crate) use hazmat::channel;
 
 #[cfg(feature = "alloc")]
 pub mod cert;
 
 #[cfg(feature = "alloc")]
 pub mod krl;
-
-#[cfg(feature = "alloc")]
-pub mod compress;
 
 #[cfg(feature = "alloc")]
 pub mod config;
@@ -111,8 +125,8 @@ pub mod proc_transport;
 // `ControlPersist`) over a Unix-domain control socket. Unix-only and gated on
 // `client` (which pulls in `std`); the master/accept side additionally needs
 // `multichannel` for `SharedClient` and is gated again inside the module. The
-// codec + path helpers compile with just `client`, so Windows and
-// no_std+alloc builds skip the whole module via its inner
+// path helpers compile with just `client`, so Windows and no_std+alloc
+// builds skip the whole module via its inner
 // `#![cfg(all(unix, feature = "client"))]`.
 #[cfg(all(unix, feature = "client"))]
 pub mod mux;

@@ -397,7 +397,7 @@ fn puressh_fresh_seed() -> [u8; 32] {
 // `EffectivePolicy`, fed from the authenticating cert's `AuthCertCaps`.
 // ---------------------------------------------------------------------------
 
-use puressh::format::Writer;
+use puressh::hazmat::format::Writer;
 use puressh::server::{PtySpec, ShellExitStatus, ShellHandler, ShellSession};
 
 /// Build a signed ed25519 user certificate blob in process.
@@ -775,7 +775,7 @@ fn r2_cert_force_command_overrides_interactive_shell() {
 /// Extract the raw 32-byte ed25519 public key from a wire `ssh-ed25519` blob
 /// (`string "ssh-ed25519"`, `string <32 bytes>`).
 fn raw_ed25519_from_blob(blob: &[u8]) -> [u8; 32] {
-    use puressh::format::Reader;
+    use puressh::hazmat::format::Reader;
     let mut r = Reader::new(blob);
     let _algo = r.read_string().expect("algo");
     let pk = r.read_string().expect("pk");

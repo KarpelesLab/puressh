@@ -136,6 +136,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
     }
 
     /// Mutable access to the connection multiplexer for channel handling.
+    ///
+    /// Escape hatch into [`crate::hazmat::channel`]; carries the same
+    /// (non-)stability promise as the rest of `hazmat`.
+    #[doc(hidden)]
     pub fn conn_mut(&mut self) -> &mut ConnectionState {
         &mut self.conn
     }

@@ -28,6 +28,10 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
   client (`mio`).
 - **CLI suite** — drop-in `ssh`, `sftp`, `scp`, `sshd`, and `ssh-keygen` binaries
   built on the library.
+- **`hazmat`** — the raw protocol layers the drivers are assembled from (wire
+  format, packet codec, KEX, ciphers, MACs, channels). Public for people
+  building their own frontends or tooling, but with no stability promise and
+  plenty of ways to weaken security if misused; ordinary users never need it.
 - **C ABI** — optional `ffi` feature exposing a `pcssh_*` C interface
   (`staticlib` / `cdylib`), with bytes-path SFTP variants for non-UTF-8 paths.
 
@@ -163,18 +167,19 @@ All of them understand `ssh_config` (including `Match` blocks and `Include`),
 src/
 ├── lib.rs           public re-exports
 ├── error.rs         Error / Result
-├── format/          SSH wire format (Reader, Writer, mpint, name-list)
-├── transport/       binary packet protocol, version exchange, KEX runner
-├── kex/             curve25519, ecdh-nistp*, group-DH, GEX, mlkem768x25519
-├── cipher/          aes-ctr, aes-gcm, chacha20-poly1305
-├── mac/             hmac-sha2-* (incl. -etm)
-├── hostkey/         ed25519, ecdsa-*, rsa-*
-├── auth/            userauth state machine (RFC 4252)
-├── channel/         RFC 4254 channels
+├── hazmat/          low-level sans-I/O protocol layers (no stability promise)
+│   ├── format/      SSH wire format (Reader, Writer, mpint, name-list)
+│   ├── transport/   binary packet protocol, version exchange, KEX runner
+│   ├── kex/         curve25519, ecdh-nistp*, group-DH, GEX, mlkem768x25519
+│   ├── cipher/      aes-ctr, aes-gcm, chacha20-poly1305
+│   ├── mac/         hmac-sha2-* (incl. -etm)
+│   ├── channel/     RFC 4254 channels
+│   └── compress/    zlib / zlib@openssh.com
+├── hostkey/         ed25519, ecdsa-*, rsa-*, certificates
+├── auth/            userauth (RFC 4252): Authenticator, ClientCredential, …
 ├── key/             private/public key files: OpenSSH, PKCS#1, SEC1, PKCS#8
 ├── known_hosts/     known_hosts store + verification
 ├── config/          ssh_config / sshd_config parsing (Match, Include)
-├── compress/        zlib / zlib@openssh.com
 ├── forwarding/      direct-tcpip, reverse, agent, X11, StreamLocal
 ├── sftp/            SFTP client + server (with OpenSSH @openssh.com extensions)
 ├── scp/             SCP protocol

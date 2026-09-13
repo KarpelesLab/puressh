@@ -1,7 +1,8 @@
 //! Sans-IO connection drivers.
 //!
-//! The protocol layers (`format`, `transport`, `channel`, `auth`) are already
-//! sans-IO: they operate on byte buffers and never touch sockets. This module
+//! The protocol layers ([`crate::hazmat`]: `format`, `transport`, `channel`,
+//! `auth`) are already sans-IO: they operate on byte buffers and never touch
+//! sockets. This module
 //! lifts the *orchestration* — the state machine that sequences version
 //! exchange → key exchange → authentication → application channels, drives
 //! re-key/keepalive timers, and accumulates/decodes inbound bytes — out of the
@@ -29,6 +30,11 @@ pub mod server;
 pub use client::{ClientDriver, VerifierFactory};
 #[cfg(feature = "server")]
 pub use server::ServerDriver;
+
+// The two transport-level knobs a frontend needs to configure a driver. They
+// are defined in `hazmat::transport` but documented here because the
+// `client::Config` / `server::Config` setters take them by value.
+pub use crate::hazmat::transport::{ext_info::ExtInfo, rekey::RekeyPolicy};
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;

@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/puressh/compare/v0.1.6...v0.2.0) - 2026-09-13
+
+### Fixed
+
+- *(forwarding)* reset accepted sockets to blocking mode after accept
+- *(sshd)* use pipe + FD_CLOEXEC instead of pipe2 for macOS builds
+- *(client)* reject out-of-range forwarded ports, sanitise remote scp stderr, doc fixes (L10, B8)
+- *(client)* answer unsolicited opens and global requests in every dispatcher (L7, L9, L8)
+- *(agent)* bounds-check blob parsing through Reader (A11)
+- *(transport)* let packet sequence numbers wrap per RFC 4253 §6.4 (T3)
+
+### Other
+
+- make internal helpers crate-private
+- hide auth wire messages and state machines behind hazmat
+- move sans-IO protocol layers under puressh::hazmat
+- mark user-built structs #[non_exhaustive], add constructors
+- mark library-produced structs #[non_exhaustive]
+- mark open-set enums #[non_exhaustive]
+- raise purecrypto floor to 0.8.3, move nix to 0.31
+- *(sshd)* poll for auth-pipe hang-up with a deadline
+- *(server)* drop needless borrows in run_exec_command
+
+### Security
+
+- *(client)* bound inbound buffering in serve and channel streams (L6)
+- *(proc_transport)* validate %h/%r before splicing into ProxyCommand (L5/B1)
+- *(client)* disable password auth and forwarding after an accepted host-key mismatch (L4)
+- *(known_hosts)* fail closed on @revoked keys, narrow rotation, ignore CA lines for plain keys (L2, L3, A10)
+- *(sshd)* real per-source and MaxStartups accounting in the accept loop (S3, S4)
+- *(sshd)* resolve the drop-to identity before ChrootDirectory (S5)
+- *(sshd,config)* per-user AuthorizedKeysFile with %u/%h expansion; Match-block access keywords (S1, S7, S6)
+- *(sshd)* sanitise peer-controlled strings in logs; refuse invalid usernames (S13)
+- *(sshd)* default X11Forwarding to no and add --x11-forward (S10)
+- *(auth,sshd)* apply plain-key KRL revocations to the key embedded in a certificate (A3)
+- *(key,hostkey)* keep RSA primes for blinding; derive public keys on parse (A8, A12)
+- *(key)* redact PrivateKey Debug and zeroize key-file temporaries (A6, A7)
+- *(auth)* make SecretString equality constant-time (A9)
+- *(auth)* pin the username on every rejected first request (A2)
+- *(auth)* bind cert userauth algorithm to cert type and signature (A4)
+- *(cert,auth)* fail closed on malformed critical-option payloads (A5)
+- *(hostkey,cert)* cap RSA public exponent at 64 bits (A1)
+- *(bin)* read host-key and password prompts from /dev/tty, fail closed without one (B2, B3, B4, B5, B7, B11, B12)
+- *(ssh-keygen)* confirm new passphrases and keep -N/-P in Zeroizing buffers (B10, B11)
+- *(agent)* apply the SSH_AUTH_SOCK trust check to -A agent forwarding (B9)
+- *(mux)* reject overlong ControlPath and validate the control socket before connecting (B6)
+- *(ffi)* deprecate pcssh_client_connect with an attribute and document the ABI contracts (F6, F7)
+- *(ffi)* clamp SFTP read/write to the packet limit and fix readdir two-pass contract (F3, F4, F5)
+- *(ffi)* bound connect by timeout_ms and stop retrying after non-I/O failures (F1, F2, F5, F7)
+- *(kex)* redact the shared secret from KexOutput's Debug output (T5)
+- *(driver)* reject non-KEX packets during the initial key exchange (T1/L1)
+- *(transport)* require the peer's KEXINIT to be the first packet under strict-kex (T2)
+- *(x11)* bound the cookie handshake with a total deadline (C3)
+- *(sftp)* stop readlink disclosing paths outside the jail (C1)
+- *(server_async)* enforce LoginGraceTime deadline and MaxAuthTries (S11)
+- *(server)* default MaxAuthTries to 6; cap remote-forward bindings per connection (S8, C2)
+- *(server)* apply ForceCommand to subsystem requests; config wins over cert (S2, S9)
+
 ## [0.1.6](https://github.com/KarpelesLab/puressh/compare/v0.1.5...v0.1.6) - 2026-09-05
 
 ### Fixed

@@ -256,14 +256,24 @@ impl AgentForwardHandler for DefaultAgentForwardHandler {
         let handle = thread::spawn(move || {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
-                    Ok((conn, _peer)) => match ctx.open_auth_agent() {
-                        Ok(channel_stream) => {
-                            spawn_unix_splice(conn, channel_stream);
+                    Ok((conn, _peer)) => {
+                        // BSD-family kernels (macOS, the BSDs) hand out accepted
+                        // sockets that inherit the listener's O_NONBLOCK; Linux
+                        // does not. The splice threads below do blocking I/O, so
+                        // put the connection back into blocking mode explicitly.
+                        // A failure here leaves a socket we cannot use; drop it.
+                        if conn.set_nonblocking(false).is_err() {
+                            continue;
                         }
-                        Err(_) => {
-                            let _ = conn.shutdown(std::net::Shutdown::Both);
+                        match ctx.open_auth_agent() {
+                            Ok(channel_stream) => {
+                                spawn_unix_splice(conn, channel_stream);
+                            }
+                            Err(_) => {
+                                let _ = conn.shutdown(std::net::Shutdown::Both);
+                            }
                         }
-                    },
+                    }
                     Err(e) if e.kind() == ErrorKind::WouldBlock => {
                         thread::sleep(ACCEPT_POLL_INTERVAL);
                     }

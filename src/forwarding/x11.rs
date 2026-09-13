@@ -271,6 +271,14 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((mut conn, peer)) => {
+                        // BSD-family kernels (macOS, the BSDs) hand out accepted
+                        // sockets that inherit the listener's O_NONBLOCK; Linux
+                        // does not. The splice threads below do blocking I/O, so
+                        // put the connection back into blocking mode explicitly.
+                        // A failure here leaves a socket we cannot use; drop it.
+                        if conn.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         // Validate the X11 authorisation cookie on the first
                         // setup packet before doing anything else. On any
                         // failure, drop the connection without opening a

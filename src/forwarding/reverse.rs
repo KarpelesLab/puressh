@@ -392,6 +392,14 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
                     Ok((conn, peer)) => {
+                        // BSD-family kernels (macOS, the BSDs) hand out accepted
+                        // sockets that inherit the listener's O_NONBLOCK; Linux
+                        // does not. The splice threads below do blocking I/O, so
+                        // put the connection back into blocking mode explicitly.
+                        // A failure here leaves a socket we cannot use; drop it.
+                        if conn.set_nonblocking(false).is_err() {
+                            continue;
+                        }
                         // Ask the per-connection server loop to open a
                         // `forwarded-tcpip` channel back to the client.
                         // Blocks until OPEN_CONFIRMATION / OPEN_FAILURE

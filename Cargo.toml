@@ -67,11 +67,15 @@ pam = ["dep:pam-client2"]
 # only `purecrypto/ec` would lose those items.
 #
 # 0.8's only break is an MSRV raise to Rust 1.89, which is why this crate's
-# `rust-version` moved with it. 0.8.1 is the floor rather than 0.8: it carries
-# a broad security-audit pass (constant-time and zeroization fixes across EC,
-# RSA, Falcon, the AEADs and the TLS/QUIC stacks) that we want as a minimum,
-# not merely as whatever a fresh resolve happens to pick.
-purecrypto = { version = "0.8.1", default-features = false, features = [
+# `rust-version` moved with it. The floor is a patch release rather than 0.8
+# because the patch line carries security fixes we want as a minimum, not
+# merely as whatever a fresh resolve happens to pick: 0.8.1 brought a broad
+# constant-time / zeroization audit across EC, RSA, Falcon and the AEADs;
+# 0.8.2 tightened RSA key-import validation and wiped private-op scratch,
+# bounded custom DH-group validation (our `diffie-hellman-group-exchange`
+# path), and zeroized ChaCha20, ML-KEM and X25519 stack temporaries; 0.8.3
+# only touches DTLS/QUIC/Falcon but is the current tip of that line.
+purecrypto = { version = "0.8.3", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem",
 ] }
 # 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting
@@ -110,8 +114,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["compat"],
 #   ioctl   — TIOCSWINSZ
 #   user    — User::from_name, setuid/setgid/initgroups, geteuid/getegid
 #   poll    — poll(2) for the ProxyCommand non-blocking read-with-deadline
+#
+# 0.31's breaking changes (removal of `PartialEq` on `SigHandler` and of a
+# NetBSD `IFF_NOTRAILERS` flag; libc floor 0.2.181) touch nothing we use.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.30", default-features = false, features = [
+nix = { version = "0.31", default-features = false, features = [
     "process", "signal", "term", "fs", "ioctl", "user", "poll",
 ] }
 # `libc` for the few low-level POSIX bits the binaries need (terminal

@@ -67,11 +67,7 @@ fn pub_field(name: &str) -> (String, String) {
 struct StaticHandler(Vec<u8>);
 impl CommandHandler for StaticHandler {
     fn handle(&self, _user: &str, _env: &SessionEnv, _command: &str) -> ExecResult {
-        ExecResult {
-            stdout: self.0.clone(),
-            stderr: Vec::new(),
-            exit_status: 0,
-        }
+        ExecResult::new(self.0.clone(), Vec::new(), 0)
     }
 }
 
@@ -155,11 +151,7 @@ fn ca_known_hosts(host: &str, port: u16, ca_pub_fixture: &str) -> Arc<Mutex<Know
 }
 
 fn client_cfg(policy: HostKeyPolicy) -> ClientConfig {
-    ClientConfig {
-        host_key_policy: policy,
-        timeout: Some(Duration::from_secs(15)),
-        algorithms: Default::default(),
-    }
+    ClientConfig::new(policy).with_timeout(Duration::from_secs(15))
 }
 
 fn ca_policy(store: Arc<Mutex<KnownHosts>>) -> HostKeyPolicy {
@@ -556,11 +548,11 @@ impl CommandHandler for CmdRecorder {
     fn handle(&self, _user: &str, env: &SessionEnv, command: &str) -> ExecResult {
         let orig = env.get("SSH_ORIGINAL_COMMAND").unwrap_or("").to_string();
         *self.last.lock().unwrap() = Some((command.to_string(), orig.clone()));
-        ExecResult {
-            stdout: format!("CMD={command}\nORIG={orig}\n").into_bytes(),
-            stderr: Vec::new(),
-            exit_status: 0,
-        }
+        ExecResult::new(
+            format!("CMD={command}\nORIG={orig}\n").into_bytes(),
+            Vec::new(),
+            0,
+        )
     }
 }
 

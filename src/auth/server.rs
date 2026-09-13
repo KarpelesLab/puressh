@@ -116,6 +116,7 @@ impl core::fmt::Debug for AuthAttempt {
 /// `AuthorizedPrincipalsFile`?), plus honoring critical options.
 #[derive(Debug, Clone)]
 #[cfg(feature = "alloc")]
+#[non_exhaustive]
 pub struct CertInfo {
     /// The CA's public-key blob (`signature_key_blob`) — the key the
     /// authenticator must check against its trusted-CA set.
@@ -146,6 +147,33 @@ pub struct CertInfo {
 
 #[cfg(feature = "alloc")]
 impl CertInfo {
+    /// Build a `CertInfo` by hand — for authenticator tests and tooling that
+    /// has no wire certificate to parse. The validity window defaults to
+    /// "always valid" (`0..u64::MAX`) and `critical_options` / `extensions`
+    /// start empty; assign those fields afterwards as needed. Real
+    /// connections go through [`CertInfo::from_certificate`].
+    pub fn new(
+        ca_key_blob: Vec<u8>,
+        embedded_pubkey_blob: Vec<u8>,
+        ca_algorithm: impl Into<String>,
+        key_id: impl Into<String>,
+        serial: u64,
+        valid_principals: Vec<String>,
+    ) -> Self {
+        CertInfo {
+            ca_key_blob,
+            embedded_pubkey_blob,
+            ca_algorithm: ca_algorithm.into(),
+            key_id: key_id.into(),
+            serial,
+            valid_principals,
+            critical_options: Vec::new(),
+            extensions: Vec::new(),
+            valid_after: 0,
+            valid_before: u64::MAX,
+        }
+    }
+
     /// Build a `CertInfo` view from a parsed [`crate::cert::Certificate`].
     pub fn from_certificate(cert: &crate::cert::Certificate) -> Result<Self> {
         Ok(CertInfo {

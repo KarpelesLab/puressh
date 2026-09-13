@@ -43,7 +43,8 @@ pub const ADVERTISED_EXTENSIONS: &[(&str, &str)] = &[
 /// Wire-format payload for the `statvfs@openssh.com` / `fstatvfs@openssh.com`
 /// reply. Fields mirror the POSIX `struct statvfs`.
 #[cfg(unix)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct StatvfsReply {
     /// `f_bsize` — fundamental block size.
     pub bsize: u64,

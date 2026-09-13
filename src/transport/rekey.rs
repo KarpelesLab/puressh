@@ -18,6 +18,7 @@ use crate::transport::packet::PacketCodec;
 /// Re-key trigger thresholds. All three are evaluated and any one tripping
 /// is enough to start a new KEX.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct RekeyPolicy {
     /// Per-direction byte cap on the on-wire stream — start a new KEX once
     /// either inbound or outbound has flowed more than this many bytes

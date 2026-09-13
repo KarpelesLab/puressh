@@ -186,6 +186,7 @@ impl ObscureKeystrokeTiming {
 /// One `DynamicForward` entry — a local SOCKS proxy listener. Wire form
 /// `[bind:]port`, e.g. `1080` or `127.0.0.1:1080`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DynamicForwardSpec {
     /// Local bind address; `None` ⇒ loopback (subject to `GatewayPorts`).
     pub bind_addr: Option<String>,
@@ -193,9 +194,20 @@ pub struct DynamicForwardSpec {
     pub listen_port: u16,
 }
 
+impl DynamicForwardSpec {
+    /// Build a spec; `bind_addr = None` binds loopback.
+    pub fn new(bind_addr: Option<String>, listen_port: u16) -> Self {
+        Self {
+            bind_addr,
+            listen_port,
+        }
+    }
+}
+
 /// One `LocalForward` entry. Wire form `[bind:]port host:hostport`, e.g.
 /// `8080 example.com:80` or `127.0.0.1:8080 example.com:80`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct LocalForwardSpec {
     /// Local bind address; `None` ⇒ loopback (`127.0.0.1`).
     pub bind_addr: Option<String>,
@@ -207,9 +219,27 @@ pub struct LocalForwardSpec {
     pub remote_port: u16,
 }
 
+impl LocalForwardSpec {
+    /// Build a spec; `bind_addr = None` binds loopback.
+    pub fn new(
+        bind_addr: Option<String>,
+        listen_port: u16,
+        remote_host: impl Into<String>,
+        remote_port: u16,
+    ) -> Self {
+        Self {
+            bind_addr,
+            listen_port,
+            remote_host: remote_host.into(),
+            remote_port,
+        }
+    }
+}
+
 /// One `RemoteForward` entry. Wire form `[bind:]port host:hostport`, e.g.
 /// `8080 127.0.0.1:8080`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct RemoteForwardSpec {
     /// Remote bind address; `None` ⇒ loopback on the server side.
     pub bind_addr: Option<String>,
@@ -219,6 +249,23 @@ pub struct RemoteForwardSpec {
     pub local_host: String,
     /// Local destination port.
     pub local_port: u16,
+}
+
+impl RemoteForwardSpec {
+    /// Build a spec; `bind_addr = None` binds loopback on the server side.
+    pub fn new(
+        bind_addr: Option<String>,
+        remote_port: u16,
+        local_host: impl Into<String>,
+        local_port: u16,
+    ) -> Self {
+        Self {
+            bind_addr,
+            remote_port,
+            local_host: local_host.into(),
+            local_port,
+        }
+    }
 }
 
 /// Per-host options. Every field is `Option`-typed so callers can distinguish

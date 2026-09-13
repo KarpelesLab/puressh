@@ -4,6 +4,7 @@ use crate::key::base64;
 
 /// A single non-blank, non-comment `known_hosts` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Entry {
     /// Marker line (`@cert-authority`, `@revoked`), or `None` for plain.
     pub marker: Option<Marker>,
@@ -15,6 +16,26 @@ pub struct Entry {
     pub key_blob: Vec<u8>,
     /// Optional trailing comment (everything after the key blob).
     pub comment: String,
+}
+
+impl Entry {
+    /// Build an entry from its parts. `marker` is `None` for a plain
+    /// (non-`@cert-authority`, non-`@revoked`) line.
+    pub fn new(
+        marker: Option<Marker>,
+        host_spec: HostSpec,
+        key_type: impl Into<String>,
+        key_blob: Vec<u8>,
+        comment: impl Into<String>,
+    ) -> Self {
+        Self {
+            marker,
+            host_spec,
+            key_type: key_type.into(),
+            key_blob,
+            comment: comment.into(),
+        }
+    }
 }
 
 /// Marker prefix on a known_hosts entry.

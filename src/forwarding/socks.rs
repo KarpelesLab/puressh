@@ -68,6 +68,7 @@ const MAX_HOST_LEN: usize = 255;
 /// The CONNECT target a SOCKS client asked us to reach. The SSH client opens
 /// a `direct-tcpip` channel to `(host, port)`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SocksTarget {
     /// Destination host — a domain name or a textual IP literal.
     pub host: String,
@@ -76,6 +77,17 @@ pub struct SocksTarget {
     /// Which SOCKS version the request arrived on (needed to format the
     /// reply correctly once the channel open succeeds or fails).
     pub version: SocksVersion,
+}
+
+impl SocksTarget {
+    /// Build a target by hand (the handshake parser is the usual producer).
+    pub fn new(host: impl Into<String>, port: u16, version: SocksVersion) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            version,
+        }
+    }
 }
 
 /// SOCKS protocol version of an accepted request.

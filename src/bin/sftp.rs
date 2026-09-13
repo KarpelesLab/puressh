@@ -382,10 +382,8 @@ impl<T: Read + Write> Repl<T> {
                         }
                     };
                     let abs = remote_join(&self.remote_cwd, cmd[2]);
-                    let attrs = Attrs {
-                        permissions: Some(mode),
-                        ..Attrs::default()
-                    };
+                    let mut attrs = Attrs::default();
+                    attrs.permissions = Some(mode);
                     if let Err(e) = self.sftp.setstat(&abs, attrs) {
                         eprintln!("chmod: {}", sftp_err_to_string(e));
                     }
@@ -583,19 +581,15 @@ fn run() -> Result<i32, String> {
         .unwrap_or_else(|| cli.host.clone());
 
     let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
-    let cfg = Config {
-        host_key_policy: policy,
-        timeout: None,
-        algorithms: AlgoOverrides {
-            ciphers: cfg_block.ciphers.clone(),
-            macs: cfg_block.macs.clone(),
-            kex_algorithms: cfg_block.kex_algorithms.clone(),
-            host_key_algorithms: cfg_block.host_key_algorithms.clone(),
-            pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
-            ca_signature_algorithms: cfg_block.ca_signature_algorithms.clone(),
-            compression: cfg_block.compression,
-        },
-    };
+    let mut algorithms = AlgoOverrides::default();
+    algorithms.ciphers = cfg_block.ciphers.clone();
+    algorithms.macs = cfg_block.macs.clone();
+    algorithms.kex_algorithms = cfg_block.kex_algorithms.clone();
+    algorithms.host_key_algorithms = cfg_block.host_key_algorithms.clone();
+    algorithms.pubkey_accepted_algorithms = cfg_block.pubkey_accepted_algorithms.clone();
+    algorithms.ca_signature_algorithms = cfg_block.ca_signature_algorithms.clone();
+    algorithms.compression = cfg_block.compression;
+    let cfg = Config::new(policy).with_algorithms(algorithms);
     vlog(1, &format!("connecting to {connect_host}:{port}"));
     // Use connect_to_host so KnownHosts can look the host up by its
     // user-supplied name (HostKeyPolicy::KnownHosts now fails hard if

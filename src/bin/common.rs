@@ -999,13 +999,12 @@ pub fn build_host_key_policy(
         _ => (TofuAction::Reject, TofuAction::Reject),
     };
 
-    Ok(HostKeyPolicy::KnownHosts(KnownHostsPolicy {
-        store: Arc::new(Mutex::new(store)),
-        save_path: Some(path),
-        hash_new: hash_known_hosts,
-        on_unknown,
-        on_mismatch,
-    }))
+    let mut policy = KnownHostsPolicy::strict(Arc::new(Mutex::new(store)));
+    policy.save_path = Some(path);
+    policy.hash_new = hash_known_hosts;
+    policy.on_unknown = on_unknown;
+    policy.on_mismatch = on_mismatch;
+    Ok(HostKeyPolicy::KnownHosts(policy))
 }
 
 /// Binary-local verbosity level (`-v` / `-vv` / `-vvv`). One copy per

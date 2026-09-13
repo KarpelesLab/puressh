@@ -90,7 +90,11 @@ fn connect_control_socket(path: &Path) -> io::Result<UnixStream> {
 }
 
 /// The session a mux client wants the master to open on its behalf.
-#[derive(Clone, Debug)]
+///
+/// `Default` is a non-PTY interactive shell with no environment; set
+/// `command` / `want_pty` and friends by field assignment.
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct SessionRequest {
     /// Request a PTY for the session.
     pub want_pty: bool,

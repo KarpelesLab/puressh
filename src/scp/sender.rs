@@ -17,6 +17,7 @@ use super::protocol::{Header, ScpError, read_ack, write_header, write_payload_te
 
 /// Knobs for [`Sender`].
 #[derive(Default, Clone, Copy)]
+#[non_exhaustive]
 pub struct ScpSendOptions {
     /// Walk directories recursively (`scp -r`).
     pub recursive: bool,

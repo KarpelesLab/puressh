@@ -90,11 +90,7 @@ fn locate_sshd_binary() -> PathBuf {
 fn open_client(port: u16, user: &str, client_key: &Path) -> Client {
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(10)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(10)),
     )
     .expect("connect");
 
@@ -222,10 +218,8 @@ fn scp_round_trip_directory_tree() {
     std::fs::create_dir(&dst_dir).expect("mkdir recv-tree");
 
     let mut client = open_client(port, &user, &client_key);
-    let opts = ScpSendOptions {
-        recursive: true,
-        preserve_times: false,
-    };
+    let mut opts = ScpSendOptions::default();
+    opts.recursive = true;
     client
         .scp_send_to(&[&src_tree], &dst_dir.display().to_string(), opts)
         .expect("scp_send_to recursive");

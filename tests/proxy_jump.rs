@@ -65,11 +65,7 @@ struct StaticHandler {
 
 impl CommandHandler for StaticHandler {
     fn handle(&self, _user: &str, _env: &SessionEnv, _command: &str) -> ExecResult {
-        ExecResult {
-            stdout: self.out.clone(),
-            stderr: Vec::new(),
-            exit_status: 0,
-        }
+        ExecResult::new(self.out.clone(), Vec::new(), 0)
     }
 }
 
@@ -138,11 +134,7 @@ fn spawn_server(banner: &[u8], with_direct_tcpip: bool) -> TestServer {
 }
 
 fn client_cfg(policy: HostKeyPolicy) -> ClientConfig {
-    ClientConfig {
-        host_key_policy: policy,
-        timeout: Some(Duration::from_secs(15)),
-        algorithms: Default::default(),
-    }
+    ClientConfig::new(policy).with_timeout(Duration::from_secs(15))
 }
 
 #[test]

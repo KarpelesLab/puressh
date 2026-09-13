@@ -5,6 +5,7 @@ extern crate alloc;
 
 /// Algorithm preference lists advertised by one side.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct KexAlgorithms<'a> {
     /// Key exchange algorithms (e.g. `curve25519-sha256`).
     pub kex: &'a [&'a str],
@@ -26,6 +27,26 @@ pub struct KexAlgorithms<'a> {
     pub lang_c2s: &'a [&'a str],
     /// Languages, server→client (usually empty).
     pub lang_s2c: &'a [&'a str],
+}
+
+impl Default for KexAlgorithms<'_> {
+    /// Every list empty. Assign the lists you care about afterwards; an
+    /// empty list is never negotiable, so a default instance fails
+    /// negotiation rather than silently picking something.
+    fn default() -> Self {
+        Self {
+            kex: &[],
+            server_host_key: &[],
+            ciphers_c2s: &[],
+            ciphers_s2c: &[],
+            macs_c2s: &[],
+            macs_s2c: &[],
+            comp_c2s: &[],
+            comp_s2c: &[],
+            lang_c2s: &[],
+            lang_s2c: &[],
+        }
+    }
 }
 
 /// The algorithms agreed by both sides after the KEXINIT exchange.

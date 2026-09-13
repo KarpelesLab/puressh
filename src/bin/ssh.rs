@@ -183,29 +183,26 @@ fn parse_dynamic_forward(s: &str) -> Result<puressh::config::DynamicForwardSpec,
         let listen_port = port
             .parse::<u16>()
             .map_err(|_| format!("-D: bad port in {s:?}"))?;
-        return Ok(puressh::config::DynamicForwardSpec {
-            bind_addr: Some(addr.to_string()),
+        return Ok(puressh::config::DynamicForwardSpec::new(
+            Some(addr.to_string()),
             listen_port,
-        });
+        ));
     }
     match s.rsplit_once(':') {
         Some((addr, port)) => {
             let listen_port = port
                 .parse::<u16>()
                 .map_err(|_| format!("-D: bad port in {s:?}"))?;
-            Ok(puressh::config::DynamicForwardSpec {
-                bind_addr: Some(addr.to_string()),
+            Ok(puressh::config::DynamicForwardSpec::new(
+                Some(addr.to_string()),
                 listen_port,
-            })
+            ))
         }
         None => {
             let listen_port = s
                 .parse::<u16>()
                 .map_err(|_| format!("-D expects [bind:]port, got {s:?}"))?;
-            Ok(puressh::config::DynamicForwardSpec {
-                bind_addr: None,
-                listen_port,
-            })
+            Ok(puressh::config::DynamicForwardSpec::new(None, listen_port))
         }
     }
 }
@@ -948,22 +945,18 @@ fn config_for_host(
         puressh::hostkey::set_allow_rsa_sha1(true);
     }
 
-    Ok(Config {
-        host_key_policy: policy,
-        timeout: None,
-        algorithms: AlgoOverrides {
-            ciphers: cfg_block.ciphers.clone(),
-            macs: cfg_block.macs.clone(),
-            kex_algorithms: cfg_block.kex_algorithms.clone(),
-            host_key_algorithms: cfg_block.host_key_algorithms.clone(),
-            pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
-            ca_signature_algorithms: cfg_block.ca_signature_algorithms.clone(),
-            // -o Compression / config Compression. The keyword is rejected
-            // up front (in run()) when the `compress` feature is absent, so
-            // by the time we get here Some(true) is honourable.
-            compression: cli.compression.or(cfg_block.compression),
-        },
-    })
+    let mut algorithms = AlgoOverrides::default();
+    algorithms.ciphers = cfg_block.ciphers.clone();
+    algorithms.macs = cfg_block.macs.clone();
+    algorithms.kex_algorithms = cfg_block.kex_algorithms.clone();
+    algorithms.host_key_algorithms = cfg_block.host_key_algorithms.clone();
+    algorithms.pubkey_accepted_algorithms = cfg_block.pubkey_accepted_algorithms.clone();
+    algorithms.ca_signature_algorithms = cfg_block.ca_signature_algorithms.clone();
+    // -o Compression / config Compression. The keyword is rejected
+    // up front (in run()) when the `compress` feature is absent, so
+    // by the time we get here Some(true) is honourable.
+    algorithms.compression = cli.compression.or(cfg_block.compression);
+    Ok(Config::new(policy).with_algorithms(algorithms))
 }
 
 /// Walk the ProxyJump chain, returning the `SharedClient` for the *last*
@@ -1861,14 +1854,13 @@ fn run_mux_client(
             (false, String::new(), 0, 0)
         }
     };
-    let req = puressh::mux::SessionRequest {
-        want_pty,
-        term,
-        cols,
-        rows,
-        env,
-        command: cli.command.clone(),
-    };
+    let mut req = puressh::mux::SessionRequest::default();
+    req.want_pty = want_pty;
+    req.term = term;
+    req.cols = cols;
+    req.rows = rows;
+    req.env = env;
+    req.command = cli.command.clone();
 
     // Put the local terminal in raw mode for an interactive PTY session so
     // keystrokes reach the remote unprocessed (mirrors the direct path).
@@ -1928,10 +1920,7 @@ fn become_master<F>(
 where
     F: FnOnce(&puressh::shared::SharedClient) -> i32 + Send + 'static,
 {
-    let cfg = puressh::mux::MasterConfig {
-        control_path: dec.path.clone(),
-        persist: dec.persist,
-    };
+    let cfg = puressh::mux::MasterConfig::new(dec.path.clone(), dec.persist);
 
     // ControlPersist no: master lives and dies with the foreground session in
     // this process. No daemonization.

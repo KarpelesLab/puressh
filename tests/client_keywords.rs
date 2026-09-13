@@ -67,11 +67,7 @@ struct EchoEnvHandler;
 impl CommandHandler for EchoEnvHandler {
     fn handle(&self, _user: &str, env: &SessionEnv, _command: &str) -> ExecResult {
         let val = env.get("PURESSH_TEST").unwrap_or("<unset>").to_string();
-        ExecResult {
-            stdout: val.into_bytes(),
-            stderr: Vec::new(),
-            exit_status: 0,
-        }
+        ExecResult::new(val.into_bytes(), Vec::new(), 0)
     }
 }
 
@@ -81,11 +77,7 @@ struct StaticHandler {
 
 impl CommandHandler for StaticHandler {
     fn handle(&self, _user: &str, _env: &SessionEnv, _command: &str) -> ExecResult {
-        ExecResult {
-            stdout: self.out.clone(),
-            stderr: Vec::new(),
-            exit_status: 0,
-        }
+        ExecResult::new(self.out.clone(), Vec::new(), 0)
     }
 }
 
@@ -151,11 +143,7 @@ fn spawn_server<H: CommandHandler + 'static>(
 }
 
 fn client_cfg() -> ClientConfig {
-    ClientConfig {
-        host_key_policy: HostKeyPolicy::AcceptAny,
-        timeout: Some(Duration::from_secs(15)),
-        algorithms: Default::default(),
-    }
+    ClientConfig::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(15))
 }
 
 fn connect_auth(server: &TestServer) -> Client {

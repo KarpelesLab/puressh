@@ -196,11 +196,7 @@ fn exec_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(10)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(10)),
     )
     .expect("connect");
 
@@ -282,17 +278,13 @@ fn compression_zlib_interop_against_real_sshd() {
 
     wait_for_tcp(port, Duration::from_secs(5));
 
-    let mut client = Client::connect(
-        ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(10)),
-            algorithms: AlgoOverrides {
-                compression: Some(true),
-                ..Default::default()
-            },
-        },
-    )
+    let mut client = Client::connect(("127.0.0.1", port), {
+        let mut algorithms = AlgoOverrides::default();
+        algorithms.compression = Some(true);
+        Config::new(HostKeyPolicy::AcceptAny)
+            .with_timeout(Duration::from_secs(10))
+            .with_algorithms(algorithms)
+    })
     .expect("connect");
 
     let pem = std::fs::read_to_string(&client_key).expect("client key pem");
@@ -392,11 +384,7 @@ fn interactive_shell_with_keystroke_chaff_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(10)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(10)),
     )
     .expect("connect");
 
@@ -509,11 +497,7 @@ fn server_initiated_rekey_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
@@ -604,19 +588,14 @@ fn client_initiated_rekey_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
     // Force our side to re-key every 32 KiB of traffic.
-    client.set_rekey_policy(RekeyPolicy {
-        max_bytes: 32 * 1024,
-        ..RekeyPolicy::default()
-    });
+    let mut rekey = RekeyPolicy::default();
+    rekey.max_bytes = 32 * 1024;
+    client.set_rekey_policy(rekey);
 
     let pem = std::fs::read_to_string(&client_key).expect("client key pem");
     let pk = PrivateKey::parse_openssh_pem(&pem, None).expect("parse client key");
@@ -702,19 +681,14 @@ fn time_based_rekey_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
     // Re-key on wall-clock alone: 2s, with bytes/seq caps left at defaults.
-    client.set_rekey_policy(RekeyPolicy {
-        max_duration: Duration::from_secs(2),
-        ..RekeyPolicy::default()
-    });
+    let mut rekey = RekeyPolicy::default();
+    rekey.max_duration = Duration::from_secs(2);
+    client.set_rekey_policy(rekey);
 
     let pem = std::fs::read_to_string(&client_key).expect("client key pem");
     let pk = PrivateKey::parse_openssh_pem(&pem, None).expect("parse client key");
@@ -793,11 +767,7 @@ fn idle_server_time_rekey_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
@@ -882,19 +852,14 @@ fn simultaneous_rekey_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
     // Same 32 KiB limit as the server: both sides trip at ~the same offset.
-    client.set_rekey_policy(RekeyPolicy {
-        max_bytes: 32 * 1024,
-        ..RekeyPolicy::default()
-    });
+    let mut rekey = RekeyPolicy::default();
+    rekey.max_bytes = 32 * 1024;
+    client.set_rekey_policy(rekey);
 
     let pem = std::fs::read_to_string(&client_key).expect("client key pem");
     let pk = PrivateKey::parse_openssh_pem(&pem, None).expect("parse client key");
@@ -982,23 +947,18 @@ fn gcm_rekey_against_real_sshd() {
 
     wait_for_tcp(port, Duration::from_secs(5));
 
-    let mut client = Client::connect(
-        ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: AlgoOverrides {
-                ciphers: Some(vec!["aes256-gcm@openssh.com".to_string()]),
-                ..Default::default()
-            },
-        },
-    )
+    let mut client = Client::connect(("127.0.0.1", port), {
+        let mut algorithms = AlgoOverrides::default();
+        algorithms.ciphers = Some(vec!["aes256-gcm@openssh.com".to_string()]);
+        Config::new(HostKeyPolicy::AcceptAny)
+            .with_timeout(Duration::from_secs(30))
+            .with_algorithms(algorithms)
+    })
     .expect("connect");
 
-    client.set_rekey_policy(RekeyPolicy {
-        max_bytes: 32 * 1024,
-        ..RekeyPolicy::default()
-    });
+    let mut rekey = RekeyPolicy::default();
+    rekey.max_bytes = 32 * 1024;
+    client.set_rekey_policy(rekey);
 
     let pem = std::fs::read_to_string(&client_key).expect("client key pem");
     let pk = PrivateKey::parse_openssh_pem(&pem, None).expect("parse client key");
@@ -1085,11 +1045,7 @@ fn concurrent_write_during_rekey_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
@@ -1104,10 +1060,9 @@ fn concurrent_write_during_rekey_against_real_sshd() {
     // client via a matching byte policy. Under the mux, client re-keys are
     // initiated from the pump (reader) thread while the writer thread is mid
     // flight — the real simultaneous-collision-under-load case.
-    client.set_rekey_policy(puressh::transport::RekeyPolicy {
-        max_bytes: 32 * 1024,
-        ..puressh::transport::RekeyPolicy::default()
-    });
+    let mut rekey = puressh::transport::RekeyPolicy::default();
+    rekey.max_bytes = 32 * 1024;
+    client.set_rekey_policy(rekey);
 
     let shared = SharedClient::from(client);
     shared
@@ -1239,11 +1194,7 @@ fn idle_sharedclient_across_server_rekey() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(30)),
     )
     .expect("connect");
 
@@ -1361,17 +1312,13 @@ fn compressed_rekey_against_real_sshd() {
 
     wait_for_tcp(port, Duration::from_secs(5));
 
-    let mut client = Client::connect(
-        ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(30)),
-            algorithms: AlgoOverrides {
-                compression: Some(true),
-                ..Default::default()
-            },
-        },
-    )
+    let mut client = Client::connect(("127.0.0.1", port), {
+        let mut algorithms = AlgoOverrides::default();
+        algorithms.compression = Some(true);
+        Config::new(HostKeyPolicy::AcceptAny)
+            .with_timeout(Duration::from_secs(30))
+            .with_algorithms(algorithms)
+    })
     .expect("connect");
 
     let pem = std::fs::read_to_string(&client_key).expect("client key pem");

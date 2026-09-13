@@ -102,6 +102,7 @@ impl FxpStatus {
 
 /// SFTP attribute record. Only fields whose `Option` is `Some` are sent on the wire.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Attrs {
     /// File size in bytes.
     pub size: Option<u64>,
@@ -134,6 +135,7 @@ impl Attrs {
 
 /// One directory entry returned by `SSH_FXP_READDIR`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct NameEntry {
     /// Bare file name (no path components).
     pub filename: Vec<u8>,
@@ -141,6 +143,17 @@ pub struct NameEntry {
     pub longname: Vec<u8>,
     /// File attributes.
     pub attrs: Attrs,
+}
+
+impl NameEntry {
+    /// Build a directory entry from its name, `ls -l` line and attributes.
+    pub fn new(filename: Vec<u8>, longname: Vec<u8>, attrs: Attrs) -> Self {
+        Self {
+            filename,
+            longname,
+            attrs,
+        }
+    }
 }
 
 /// Error type returned by SFTP client / server operations.

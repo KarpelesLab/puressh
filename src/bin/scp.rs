@@ -253,19 +253,15 @@ fn open_authenticated(
         .unwrap_or_else(|| host.to_string());
 
     let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
-    let cfg = Config {
-        host_key_policy: policy,
-        timeout: None,
-        algorithms: AlgoOverrides {
-            ciphers: cfg_block.ciphers.clone(),
-            macs: cfg_block.macs.clone(),
-            kex_algorithms: cfg_block.kex_algorithms.clone(),
-            host_key_algorithms: cfg_block.host_key_algorithms.clone(),
-            pubkey_accepted_algorithms: cfg_block.pubkey_accepted_algorithms.clone(),
-            ca_signature_algorithms: cfg_block.ca_signature_algorithms.clone(),
-            compression: cfg_block.compression,
-        },
-    };
+    let mut algorithms = AlgoOverrides::default();
+    algorithms.ciphers = cfg_block.ciphers.clone();
+    algorithms.macs = cfg_block.macs.clone();
+    algorithms.kex_algorithms = cfg_block.kex_algorithms.clone();
+    algorithms.host_key_algorithms = cfg_block.host_key_algorithms.clone();
+    algorithms.pubkey_accepted_algorithms = cfg_block.pubkey_accepted_algorithms.clone();
+    algorithms.ca_signature_algorithms = cfg_block.ca_signature_algorithms.clone();
+    algorithms.compression = cfg_block.compression;
+    let cfg = Config::new(policy).with_algorithms(algorithms);
     vlog(1, &format!("connecting to {connect_host}:{port}"));
     let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)
         .map_err(|e| format!("connect: {e}"))?;
@@ -449,10 +445,9 @@ fn run() -> Result<i32, String> {
         let path_refs: Vec<&std::path::Path> = local_paths.iter().map(|p| p.as_path()).collect();
 
         let mut client = open_authenticated(&host, user.as_deref(), &cli, &ssh_cfg)?;
-        let opts = ScpSendOptions {
-            recursive: cli.recursive,
-            preserve_times: cli.preserve_times,
-        };
+        let mut opts = ScpSendOptions::default();
+        opts.recursive = cli.recursive;
+        opts.preserve_times = cli.preserve_times;
         client
             .scp_send_to(&path_refs, &remote_path, opts)
             .map_err(|e| format!("upload: {e}"))?;
@@ -472,12 +467,11 @@ fn run() -> Result<i32, String> {
             .expect("one remote source");
 
         let mut client = open_authenticated(&host, user.as_deref(), &cli, &ssh_cfg)?;
-        let opts = ScpRecvOptions {
-            recursive: cli.recursive,
-            preserve_times: cli.preserve_times,
-            // Let scp_recv_from auto-detect based on the local target.
-            target_is_file: false,
-        };
+        let mut opts = ScpRecvOptions::default();
+        opts.recursive = cli.recursive;
+        opts.preserve_times = cli.preserve_times;
+        // Let scp_recv_from auto-detect based on the local target.
+        opts.target_is_file = false;
         client
             .scp_recv_from(&remote_path, &local_target, opts)
             .map_err(|e| format!("download: {e}"))?;

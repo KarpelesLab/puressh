@@ -158,11 +158,7 @@ fn user_cert_against_real_sshd() {
 
     let mut client = Client::connect(
         ("127.0.0.1", port),
-        Config {
-            host_key_policy: HostKeyPolicy::AcceptAny,
-            timeout: Some(Duration::from_secs(10)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(10)),
     )
     .expect("connect");
 
@@ -251,11 +247,7 @@ fn host_cert_against_real_sshd() {
     let mut client = Client::connect_to_host(
         "localhost",
         port,
-        Config {
-            host_key_policy: HostKeyPolicy::KnownHosts(policy),
-            timeout: Some(Duration::from_secs(10)),
-            algorithms: Default::default(),
-        },
+        Config::new(HostKeyPolicy::KnownHosts(policy)).with_timeout(Duration::from_secs(10)),
     )
     .expect("connect + host-cert verify against real sshd");
 

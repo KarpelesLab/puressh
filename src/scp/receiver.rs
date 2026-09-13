@@ -23,6 +23,7 @@ pub const DEFAULT_MAX_FILE_SIZE: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Knobs for [`Receiver`].
 #[derive(Default, Clone, Copy)]
+#[non_exhaustive]
 pub struct ScpRecvOptions {
     /// Accept `D`/`E` headers (`scp -r`). When false, any `D`/`E` is a
     /// protocol violation.

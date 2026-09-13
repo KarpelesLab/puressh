@@ -244,6 +244,7 @@ pub enum HostKeyPolicy {
 /// locks it just long enough to look up and optionally append a TOFU
 /// entry. `save_path` (if set) is the file rewritten when a TOFU accept
 /// adds a new entry; absent it, accepts stay in memory only.
+#[non_exhaustive]
 pub struct KnownHostsPolicy {
     /// The in-memory store. Locked just long enough for lookup / add.
     pub store: Arc<Mutex<KnownHosts>>,
@@ -405,6 +406,7 @@ pub enum TofuAction {
 /// the trust decision explicit at the call site — see [`Config::insecure`]
 /// for an explicit opt-in equivalent of the old default, or
 /// [`Config::with_known_hosts`] for the OpenSSH-style strict policy.
+#[non_exhaustive]
 pub struct Config {
     /// How to decide whether a server's host key is acceptable.
     pub host_key_policy: HostKeyPolicy,
@@ -425,6 +427,7 @@ pub struct Config {
 /// resolution, so a `KexAlgorithms` override can never disable the Terrapin
 /// (CVE-2023-48795) mitigation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AlgoOverrides {
     /// `Ciphers` — applied to both directions.
     pub ciphers: Option<Vec<String>>,
@@ -451,6 +454,31 @@ pub struct AlgoOverrides {
 }
 
 impl Config {
+    /// Build a config with an explicit host-key policy, no socket timeout and
+    /// the built-in algorithm preference lists. Adjust `timeout` /
+    /// `algorithms` by field assignment afterwards; the struct is
+    /// `#[non_exhaustive]` so it cannot be built with a struct literal from
+    /// outside the crate.
+    pub fn new(host_key_policy: HostKeyPolicy) -> Self {
+        Self {
+            host_key_policy,
+            timeout: None,
+            algorithms: AlgoOverrides::default(),
+        }
+    }
+
+    /// Set the per-operation socket timeout (chainable).
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// Replace the algorithm preference overrides (chainable).
+    pub fn with_algorithms(mut self, algorithms: AlgoOverrides) -> Self {
+        self.algorithms = algorithms;
+        self
+    }
+
     /// Explicit, audit-friendly constructor for "trust whatever the peer
     /// presents" — the old behaviour of `Config::default()`. Replaces
     /// the removed `Default` impl so the trust decision shows up in

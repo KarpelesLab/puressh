@@ -2680,15 +2680,12 @@ mod imp {
     ) -> puressh::config::ServerOptions {
         let local = conn_addrs().and_then(|(_, local)| local);
         let local_ip = local.map(|a| a.ip().to_string());
-        let ctx = puressh::config::MatchContext {
-            host: "",
-            user: Some(user),
-            groups: Some(groups),
-            address: peer_ip,
-            local_address: local_ip.as_deref(),
-            local_port: local.map(|a| a.port()),
-            ..puressh::config::MatchContext::default()
-        };
+        let mut ctx = puressh::config::MatchContext::default();
+        ctx.user = Some(user);
+        ctx.groups = Some(groups);
+        ctx.address = peer_ip;
+        ctx.local_address = local_ip.as_deref();
+        ctx.local_port = local.map(|a| a.port());
         config.resolve(&ctx, puressh::config::match_block::ExecPolicy::Deny)
     }
 
@@ -2826,11 +2823,11 @@ mod imp {
             let info = match lookup_user(user) {
                 Ok(i) => i,
                 Err(e) => {
-                    return ExecResult {
-                        stdout: Vec::new(),
-                        stderr: format!("sshd: user lookup failed: {e}\n").into_bytes(),
-                        exit_status: 255,
-                    };
+                    return ExecResult::new(
+                        Vec::new(),
+                        format!("sshd: user lookup failed: {e}\n").into_bytes(),
+                        255,
+                    );
                 }
             };
 
@@ -2842,11 +2839,11 @@ mod imp {
             let mut envs = match self.pam.ensure(user, "ssh") {
                 Ok(e) => e,
                 Err(e) => {
-                    return ExecResult {
-                        stdout: Vec::new(),
-                        stderr: format!("sshd: PAM session open failed: {e}\n").into_bytes(),
-                        exit_status: 255,
-                    };
+                    return ExecResult::new(
+                        Vec::new(),
+                        format!("sshd: PAM session open failed: {e}\n").into_bytes(),
+                        255,
+                    );
                 }
             };
             apply_login_envs(&mut envs, &info);
@@ -2926,12 +2923,11 @@ mod imp {
             let mut child = match cmd.spawn() {
                 Ok(c) => c,
                 Err(e) => {
-                    return ExecResult {
-                        stdout: Vec::new(),
-                        stderr: format!("sshd: failed to spawn {}: {e}\n", info.shell_str)
-                            .into_bytes(),
-                        exit_status: 255,
-                    };
+                    return ExecResult::new(
+                        Vec::new(),
+                        format!("sshd: failed to spawn {}: {e}\n", info.shell_str).into_bytes(),
+                        255,
+                    );
                 }
             };
 
@@ -2946,11 +2942,11 @@ mod imp {
             let status = match child.wait() {
                 Ok(s) => s,
                 Err(e) => {
-                    return ExecResult {
-                        stdout: Vec::new(),
-                        stderr: format!("sshd: wait failed: {e}\n").into_bytes(),
-                        exit_status: 255,
-                    };
+                    return ExecResult::new(
+                        Vec::new(),
+                        format!("sshd: wait failed: {e}\n").into_bytes(),
+                        255,
+                    );
                 }
             };
             let (mut stdout_buf, stdout_overflow) = out_thr.join().unwrap_or_default();
@@ -2972,11 +2968,7 @@ mod imp {
             } else {
                 code_u32
             };
-            ExecResult {
-                stdout: stdout_buf,
-                stderr: stderr_buf,
-                exit_status: final_code,
-            }
+            ExecResult::new(stdout_buf, stderr_buf, final_code)
         }
     }
 
@@ -3597,14 +3589,13 @@ mod imp {
             match parsed.role {
                 ScpRole::To => {
                     // `scp -t` — the peer is the sender, we receive.
-                    let opts = ScpRecvOptions {
-                        recursive: parsed.recursive,
-                        preserve_times: parsed.preserve_times,
-                        // If the local destination already exists as a
-                        // directory we use it as the parent; otherwise it's
-                        // the literal file path.
-                        target_is_file: !abs_path.is_dir(),
-                    };
+                    let mut opts = ScpRecvOptions::default();
+                    opts.recursive = parsed.recursive;
+                    opts.preserve_times = parsed.preserve_times;
+                    // If the local destination already exists as a
+                    // directory we use it as the parent; otherwise it's
+                    // the literal file path.
+                    opts.target_is_file = !abs_path.is_dir();
                     let mut rx = ScpReceiver::new(stream, &abs_path, opts).map_err(|e| {
                         puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
                     })?;
@@ -3614,10 +3605,9 @@ mod imp {
                 }
                 ScpRole::From => {
                     // `scp -f` — we read from disk and send to the peer.
-                    let opts = ScpSendOptions {
-                        recursive: parsed.recursive,
-                        preserve_times: parsed.preserve_times,
-                    };
+                    let mut opts = ScpSendOptions::default();
+                    opts.recursive = parsed.recursive;
+                    opts.preserve_times = parsed.preserve_times;
                     let mut tx = ScpSender::new(stream).map_err(|e| {
                         puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
                     })?;
@@ -6108,18 +6098,14 @@ mod imp {
         /// authenticator sees a `verified` attempt, so no real signature is
         /// needed to exercise the trust gate.
         fn cert_info_for(ca_blob: &[u8], principals: &[&str]) -> puressh::auth::CertInfo {
-            puressh::auth::CertInfo {
-                ca_key_blob: ca_blob.to_vec(),
-                embedded_pubkey_blob: unhex(USERKEY_BLOB_HEX),
-                ca_algorithm: "ssh-ed25519".into(),
-                key_id: "test-cert".into(),
-                serial: 7,
-                valid_principals: principals.iter().map(|s| s.to_string()).collect(),
-                critical_options: Vec::new(),
-                extensions: Vec::new(),
-                valid_after: 0,
-                valid_before: u64::MAX,
-            }
+            puressh::auth::CertInfo::new(
+                ca_blob.to_vec(),
+                unhex(USERKEY_BLOB_HEX),
+                "ssh-ed25519",
+                "test-cert",
+                7,
+                principals.iter().map(|s| s.to_string()).collect(),
+            )
         }
 
         #[test]

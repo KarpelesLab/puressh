@@ -69,11 +69,7 @@ struct BannerHandler {
 
 impl CommandHandler for BannerHandler {
     fn handle(&self, _user: &str, _env: &SessionEnv, _command: &str) -> ExecResult {
-        ExecResult {
-            stdout: self.out.clone(),
-            stderr: Vec::new(),
-            exit_status: 0,
-        }
+        ExecResult::new(self.out.clone(), Vec::new(), 0)
     }
 }
 
@@ -85,11 +81,7 @@ fn fresh_seed() -> [u8; 32] {
 }
 
 fn client_cfg() -> ClientConfig {
-    ClientConfig {
-        host_key_policy: HostKeyPolicy::AcceptAny,
-        timeout: Some(Duration::from_secs(15)),
-        algorithms: Default::default(),
-    }
+    ClientConfig::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(15))
 }
 
 struct TestServer {
@@ -183,10 +175,7 @@ fn mux_client_reuses_connection_without_second_auth() {
     // alive while the mux client attaches and runs.
     let release = Arc::new(AtomicBool::new(false));
     let fg_release = release.clone();
-    let cfg = MasterConfig {
-        control_path: sock.clone(),
-        persist: Persist::No,
-    };
+    let cfg = MasterConfig::new(sock.clone(), Persist::No);
 
     // run_master blocks on the foreground, so drive it from a thread.
     let master = thread::spawn(move || {
@@ -209,14 +198,8 @@ fn mux_client_reuses_connection_without_second_auth() {
     }
 
     // Attach a mux client and run a command over the existing connection.
-    let req = SessionRequest {
-        want_pty: false,
-        term: String::new(),
-        cols: 0,
-        rows: 0,
-        env: vec![],
-        command: Some("echo hi".into()),
-    };
+    let mut req = SessionRequest::default();
+    req.command = Some("echo hi".into());
     let status = puressh::mux::run_client(&sock, &req, None).expect("mux client run");
     assert_eq!(status, 0, "remote exec exit status");
 
@@ -246,11 +229,10 @@ fn control_persist_seconds_master_exits_after_idle() {
     let shared = connect_and_auth(&srv);
 
     let sock = unique_socket_path("persist");
-    let cfg = MasterConfig {
-        control_path: sock.clone(),
+    let cfg = {
         // Linger 1 second after the (immediately-finishing) foreground +
         // last client detach, then unlink and exit.
-        persist: Persist::Seconds(1),
+        MasterConfig::new(sock.clone(), Persist::Seconds(1))
     };
 
     // Foreground returns immediately; under Persist::Seconds the master keeps
@@ -297,10 +279,7 @@ fn run_master_daemon_serves_then_exits_after_idle() {
     assert_eq!(srv.accepts.load(Ordering::SeqCst), 1, "one auth at master");
 
     let sock = unique_socket_path("daemon");
-    let cfg = MasterConfig {
-        control_path: sock.clone(),
-        persist: Persist::Seconds(1),
-    };
+    let cfg = MasterConfig::new(sock.clone(), Persist::Seconds(1));
 
     // run_master_daemon blocks until shutdown, so drive it from a thread.
     let daemon = thread::spawn(move || {
@@ -318,14 +297,8 @@ fn run_master_daemon_serves_then_exits_after_idle() {
     }
 
     // A mux client runs a command over the daemon's connection — no 2nd auth.
-    let req = SessionRequest {
-        want_pty: false,
-        term: String::new(),
-        cols: 0,
-        rows: 0,
-        env: vec![],
-        command: Some("echo hi".into()),
-    };
+    let mut req = SessionRequest::default();
+    req.command = Some("echo hi".into());
     let status = puressh::mux::run_client(&sock, &req, None).expect("mux client run");
     assert_eq!(status, 0, "remote exec exit status over daemon");
     assert_eq!(
@@ -368,10 +341,9 @@ fn control_command_check_and_exit() {
         "check on an absent control path must report no master"
     );
 
-    let cfg = MasterConfig {
-        control_path: sock.clone(),
+    let cfg = {
         // Yes so the master keeps running while we probe + exit it.
-        persist: Persist::Yes,
+        MasterConfig::new(sock.clone(), Persist::Yes)
     };
     let release = Arc::new(AtomicBool::new(false));
     let fg_release = release.clone();
@@ -518,10 +490,7 @@ fn local_forward_over_mux_client() {
     let sock = unique_socket_path("lforward");
     let release = Arc::new(AtomicBool::new(false));
     let fg_release = release.clone();
-    let cfg = MasterConfig {
-        control_path: sock.clone(),
-        persist: Persist::No,
-    };
+    let cfg = MasterConfig::new(sock.clone(), Persist::No);
     let master = thread::spawn(move || {
         puressh::mux::run_master(cfg, shared, move |_s| {
             while !fg_release.load(Ordering::SeqCst) {

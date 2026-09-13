@@ -230,6 +230,7 @@ pub enum MatchCondition {
 /// is treated as **not matching** — i.e. we don't silently pretend a wildcard
 /// matched.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct MatchContext<'a> {
     /// Effective connection target (post-`HostName` substitution).
     pub host: &'a str,

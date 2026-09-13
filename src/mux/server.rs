@@ -39,11 +39,22 @@ pub enum Persist {
 }
 
 /// Inputs to [`run_master`].
+#[non_exhaustive]
 pub struct MasterConfig {
     /// Resolved control-socket path (already length-checked).
     pub control_path: PathBuf,
     /// ControlPersist behaviour.
     pub persist: Persist,
+}
+
+impl MasterConfig {
+    /// Pair a (length-checked) control-socket path with a persist policy.
+    pub fn new(control_path: PathBuf, persist: Persist) -> Self {
+        Self {
+            control_path,
+            persist,
+        }
+    }
 }
 
 /// Shared liveness state for the accept loop and the reaper.

@@ -100,6 +100,7 @@ const SSH_DISCONNECT_HOST_NOT_ALLOWED: u32 = 9;
 
 /// Result returned by a [`CommandHandler`] after running a command.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ExecResult {
     /// Captured stdout bytes.
     pub stdout: Vec<u8>,
@@ -107,6 +108,17 @@ pub struct ExecResult {
     pub stderr: Vec<u8>,
     /// POSIX-style exit code.
     pub exit_status: u32,
+}
+
+impl ExecResult {
+    /// Build a result from the captured output streams and the exit code.
+    pub fn new(stdout: Vec<u8>, stderr: Vec<u8>, exit_status: u32) -> Self {
+        Self {
+            stdout,
+            stderr,
+            exit_status,
+        }
+    }
 }
 
 /// Per-session environment-variable bag, surfaced to every handler that
@@ -748,6 +760,7 @@ impl AgentForwardContext {
 /// inserts the handle into a per-session-channel map and drops it when the
 /// session closes. Dropping the handle must tear down the listener thread
 /// and unlink the on-disk socket.
+#[non_exhaustive]
 pub struct AgentForwardHandle {
     /// Path that should be exposed as `SSH_AUTH_SOCK` in the environment of
     /// programs spawned on this session. Typically inside `$XDG_RUNTIME_DIR`
@@ -757,6 +770,20 @@ pub struct AgentForwardHandle {
     /// accept loop and removes the socket. The dispatcher does not look
     /// inside this box — it just drops it on session close.
     pub stopper: Box<dyn core::any::Any + Send + Sync>,
+}
+
+impl AgentForwardHandle {
+    /// Pair the `SSH_AUTH_SOCK` path with the guard whose `Drop` tears the
+    /// listener down.
+    pub fn new(
+        auth_sock_path: std::path::PathBuf,
+        stopper: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            auth_sock_path,
+            stopper,
+        }
+    }
 }
 
 /// Server-side hook for `auth-agent-req@openssh.com`
@@ -854,6 +881,7 @@ impl X11ForwardContext {
 /// inserts the handle into a per-session-channel map and drops it when the
 /// session closes. Dropping the handle must tear down the listener thread
 /// and release the display number.
+#[non_exhaustive]
 pub struct X11ForwardHandle {
     /// Display string to expose as `DISPLAY` in the environment of programs
     /// spawned on this session, typically `"localhost:<N>.<screen>"` where
@@ -866,6 +894,22 @@ pub struct X11ForwardHandle {
     /// accept loop and releases the display. The dispatcher does not look
     /// inside this box — it just drops it on session close.
     pub stopper: Box<dyn core::any::Any + Send + Sync>,
+}
+
+impl X11ForwardHandle {
+    /// Pair the `DISPLAY` string and display number with the guard whose
+    /// `Drop` releases the listener.
+    pub fn new(
+        display_env: impl Into<String>,
+        display_number: u16,
+        stopper: Box<dyn core::any::Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            display_env: display_env.into(),
+            display_number,
+            stopper,
+        }
+    }
 }
 
 /// Server-side hook for `x11-req` (the channel request OpenSSH sends when

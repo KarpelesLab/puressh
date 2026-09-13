@@ -442,7 +442,7 @@ pub struct AlgoOverrides {
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
     /// `CASignatureAlgorithms` — signature algorithms accepted from a CA when
     /// verifying a host certificate. `None` ⇒ built-in default
-    /// ([`crate::config::algos::CA_SIGNATURE_DEFAULTS`]).
+    /// (`config::algos::CA_SIGNATURE_DEFAULTS`).
     pub ca_signature_algorithms: Option<Vec<String>>,
     /// `Compression` — `Some(true)` advertises `zlib@openssh.com` ahead of
     /// `none` in both directions; `Some(false)` / `None` advertises `none`

@@ -40,7 +40,7 @@ const T_OPEN_FAIL: u8 = 15;
 pub enum Frame {
     /// First frame in either direction: protocol-version handshake.
     Hello {
-        /// Sender's [`PROTOCOL_VERSION`].
+        /// Sender's `PROTOCOL_VERSION`.
         version: u32,
     },
     /// Client → master: open a new session channel.
@@ -213,6 +213,7 @@ impl Frame {
     /// Decode a complete `length | type | payload` frame from `bytes`.
     /// Convenience for tests; the streaming reader strips the length prefix
     /// itself and calls [`Frame::decode_body`].
+    #[cfg(test)]
     pub fn decode(bytes: &[u8]) -> Result<Frame, MuxError> {
         if bytes.len() < 4 {
             return Err(MuxError::Malformed("frame shorter than length prefix"));
@@ -300,23 +301,6 @@ impl Frame {
     }
 }
 
-/// Stateless codec marker. The actual work lives on [`Frame`]; this type
-/// exists so callers can name the codec in signatures / docs.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct FrameCodec;
-
-impl FrameCodec {
-    /// Encode one frame (delegates to [`Frame::encode`]).
-    pub fn encode(frame: &Frame) -> Vec<u8> {
-        frame.encode()
-    }
-
-    /// Decode one complete frame (delegates to [`Frame::decode`]).
-    pub fn decode(bytes: &[u8]) -> Result<Frame, MuxError> {
-        Frame::decode(bytes)
-    }
-}
-
 /// Errors from the mux codec / framed I/O layer.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -327,7 +311,7 @@ pub enum MuxError {
     Malformed(&'static str),
     /// The type tag is not one this version understands.
     UnknownType(u8),
-    /// Peer reported an incompatible [`PROTOCOL_VERSION`] in its `HELLO`.
+    /// Peer reported an incompatible `PROTOCOL_VERSION` in its `HELLO`.
     VersionMismatch {
         /// Version this build speaks.
         ours: u32,
@@ -559,12 +543,5 @@ mod tests {
         // including bytes that look like a tag.
         let f = Frame::StdoutData(vec![T_EOF, T_HELLO, 0, 0]);
         round_trip(f);
-    }
-
-    #[test]
-    fn framecodec_delegates() {
-        let f = Frame::AliveCheck;
-        let b = FrameCodec::encode(&f);
-        assert_eq!(FrameCodec::decode(&b).unwrap(), f);
     }
 }

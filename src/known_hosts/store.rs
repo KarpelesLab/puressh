@@ -347,7 +347,7 @@ impl KnownHosts {
 
     /// Remove only the plain entries that name **exactly** `host[:port]`:
     /// marker-less lines whose host field is the single literal pattern
-    /// [`format_host_pattern`]`(host, port)` (compared ASCII
+    /// `format_host_pattern(host, port)` (compared ASCII
     /// case-insensitively, as host patterns are), or a hashed token for
     /// exactly that host and port. Returns the count removed.
     ///

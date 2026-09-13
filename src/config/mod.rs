@@ -2,8 +2,8 @@
 //!
 //! `puressh::config` parses the two configuration files OpenSSH ships
 //! (`ssh_config(5)` and `sshd_config(5)`). The grammar is shared, so this
-//! crate exposes a single low-level tokenizer in [`parser`] and two
-//! semantic layers on top — [`SshClientConfig`] for the client side, and
+//! crate exposes a single low-level tokenizer ([`ParsedLine`],
+//! [`tokenize_file_with_includes`]) and two semantic layers on top — [`SshClientConfig`] for the client side, and
 //! [`SshServerConfig`] for the daemon side. Both round-trip through
 //! [`str::parse`]-like entry points and return a typed [`ConfigError`] on
 //! bad input.
@@ -34,14 +34,14 @@
 
 use alloc::string::String;
 
-pub mod algos;
+pub(crate) mod algos;
 pub mod client;
-pub mod glob;
-pub mod host_port;
+pub(crate) mod glob;
+pub(crate) mod host_port;
 #[cfg(feature = "std")]
-pub mod include;
-pub mod match_block;
-pub mod parser;
+pub(crate) mod include;
+pub(crate) mod match_block;
+pub(crate) mod parser;
 pub mod server;
 
 pub use client::{
@@ -49,9 +49,12 @@ pub use client::{
     IdentityAgent, LocalForwardSpec, ObscureKeystrokeTiming, RemoteForwardSpec, RequestTty,
     SshClientConfig, StrictMode,
 };
-pub use glob::HostPattern;
+pub use glob::{HostPattern, host_matches};
 pub use host_port::{parse_host_port, parse_host_port_pattern};
-pub use match_block::{AddressKind, AddressPattern, MatchCondition, MatchContext};
+#[cfg(feature = "std")]
+pub use include::tokenize_file_with_includes;
+pub use match_block::{AddressKind, AddressPattern, ExecPolicy, MatchCondition, MatchContext};
+pub use parser::ParsedLine;
 pub use server::{
     Compression, HostPort, PermitRootLogin, RekeyLimit, ServerMatchBlock, ServerOptions,
     SshServerConfig, TcpForwarding,

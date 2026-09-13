@@ -371,7 +371,7 @@ pub fn send_control_command(path: &Path, cmd: ControlCommand) -> Result<bool, Mu
 /// exit status (0–255), or 255 if the session ended without a status.
 ///
 /// `resize` is an optional callback returning the current `(cols, rows)`; when
-/// supplied, a watcher thread sends [`Frame::WindowChange`] on changes (the
+/// supplied, a watcher thread sends `Frame::WindowChange` on changes (the
 /// `ssh` binary wires this to its SIGWINCH handler). Pass `None` for the
 /// non-PTY path.
 pub fn run_client(

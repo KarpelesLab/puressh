@@ -787,7 +787,7 @@ mod imp {
     fn load_server_config(
         path: &std::path::Path,
     ) -> Result<puressh::config::SshServerConfig, String> {
-        let lines = puressh::config::include::tokenize_file_with_includes(path, 0)
+        let lines = puressh::config::tokenize_file_with_includes(path, 0)
             .map_err(|e| format!("{}: {e}", path.display()))?;
         puressh::config::SshServerConfig::from_lines(lines)
             .map_err(|e| format!("{}: {e}", path.display()))
@@ -1507,15 +1507,14 @@ mod imp {
         /// half (if present) is matched against `peer`; a `user@host` token
         /// with no known peer address never matches.
         fn positive_match(&self, user: &str, peer: Option<&str>) -> bool {
-            let user_ok =
-                puressh::config::glob::host_matches(core::slice::from_ref(&self.user), user);
+            let user_ok = puressh::config::host_matches(core::slice::from_ref(&self.user), user);
             if !user_ok {
                 return false;
             }
             match &self.host {
                 None => true,
                 Some(h) => match peer {
-                    Some(p) => puressh::config::glob::host_matches(core::slice::from_ref(h), p),
+                    Some(p) => puressh::config::host_matches(core::slice::from_ref(h), p),
                     None => false,
                 },
             }
@@ -1689,7 +1688,7 @@ mod imp {
             let in_group = |pats: &[puressh::config::HostPattern]| {
                 groups
                     .iter()
-                    .any(|g| puressh::config::glob::host_matches(pats, g))
+                    .any(|g| puressh::config::host_matches(pats, g))
             };
 
             // 1. DenyUsers wins outright.
@@ -2625,7 +2624,7 @@ mod imp {
         let pats = puressh::config::HostPattern::parse_all(list);
         cert_principals
             .iter()
-            .any(|p| puressh::config::glob::host_matches(&pats, p))
+            .any(|p| puressh::config::host_matches(&pats, p))
     }
 
     /// Startup inputs the authenticator (and the session-open hook) need to
@@ -2686,7 +2685,7 @@ mod imp {
         ctx.address = peer_ip;
         ctx.local_address = local_ip.as_deref();
         ctx.local_port = local.map(|a| a.port());
-        config.resolve(&ctx, puressh::config::match_block::ExecPolicy::Deny)
+        config.resolve(&ctx, puressh::config::ExecPolicy::Deny)
     }
 
     /// The `PermitRootLogin` in force for `user` on this connection: CLI flag

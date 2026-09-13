@@ -137,7 +137,7 @@ impl Agent {
 
     /// Ask the agent to sign `data` under the identity whose public
     /// blob equals `key_blob`. `flags` is the bitmask from
-    /// [`super::protocol`] (`SSH_AGENT_RSA_SHA2_*` for RSA).
+    /// the agent protocol module (`SSH_AGENT_RSA_SHA2_*` for RSA).
     ///
     /// Returns the SSH wire-format signature blob (`string algorithm ||
     /// string raw_sig`).

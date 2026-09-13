@@ -157,7 +157,7 @@ pub struct ServerOptions {
     pub host_key_algorithms: Option<Vec<String>>,
     /// `CASignatureAlgorithms` — resolved set of signature algorithms accepted
     /// from a CA when verifying a user certificate. `None` ⇒ built-in default
-    /// ([`super::algos::CA_SIGNATURE_DEFAULTS`]).
+    /// (`algos::CA_SIGNATURE_DEFAULTS`).
     pub ca_signature_algorithms: Option<Vec<String>>,
     /// `PubkeyAuthentication` (yes/no). `no` ⇒ public-key auth is dropped from
     /// the advertised method set, which (since it is the only honorable
@@ -379,7 +379,7 @@ impl SshServerConfig {
     /// recursively. Relative paths inside `Include` are anchored to the
     /// directory of the file containing the directive; `~` expands to
     /// `$HOME`; `*` / `?` globs are expanded against the filesystem.
-    /// Recursion is capped at [`super::include::MAX_INCLUDE_DEPTH`] hops.
+    /// Recursion is capped at `include::MAX_INCLUDE_DEPTH` hops.
     ///
     /// Prefer this over [`Self::parse`] for on-disk `sshd_config` files:
     /// `parse` has no filesystem context and rejects any `Include` line.

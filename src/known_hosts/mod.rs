@@ -30,11 +30,12 @@
 
 #![cfg(feature = "std")]
 
-pub mod format;
-pub mod hash;
-pub mod store;
+pub(crate) mod format;
+mod hash;
+mod store;
 
 #[cfg(test)]
 mod tests;
 
+pub use format::{Entry, HostSpec, Marker, format_entry};
 pub use store::{KnownHosts, LookupResult};

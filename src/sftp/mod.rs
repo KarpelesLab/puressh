@@ -7,19 +7,19 @@
 //!
 //! # Layering
 //!
-//! - [`types`] — wire constants, [`Attrs`], [`FxpStatus`], [`SftpError`].
-//! - [`packet`] — message types and encode/decode.
-//! - [`path`] — virtual-cwd resolution with optional jail-root checking.
-//! - [`server`] — [`SftpServerSession`].
-//! - [`client`] — [`SftpClient`].
-//! - [`extensions`] — `*@openssh.com` SFTP extensions advertised by the server.
+//! - wire constants, [`Attrs`], [`FxpStatus`], [`SftpError`] — re-exported here;
+//! - [`SftpServerSession`] — the server side;
+//! - [`SftpClient`] — the client side.
+//!
+//! The packet codec, virtual-cwd path resolution and the `*@openssh.com`
+//! extension tables are crate-private implementation details.
 
-pub mod client;
-pub mod extensions;
-pub mod packet;
-pub mod path;
-pub mod server;
-pub mod types;
+mod client;
+pub(crate) mod extensions;
+pub(crate) mod packet;
+pub(crate) mod path;
+mod server;
+mod types;
 
 #[cfg(test)]
 mod tests;

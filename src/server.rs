@@ -1108,7 +1108,7 @@ pub struct Config {
     pub default_auth_methods: Vec<String>,
     /// `CASignatureAlgorithms` — the signature algorithms a CA may use when
     /// signing a user certificate. Empty ⇒ the built-in default set
-    /// ([`crate::config::algos::CA_SIGNATURE_DEFAULTS`]). Threaded into the
+    /// (`config::algos::CA_SIGNATURE_DEFAULTS`). Threaded into the
     /// per-connection [`ServerAuth`] for certificate verification.
     pub ca_signature_algorithms: Vec<String>,
 }

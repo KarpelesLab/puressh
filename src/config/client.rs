@@ -321,7 +321,7 @@ pub struct ClientOptions {
     pub pubkey_accepted_algorithms: Option<Vec<String>>,
     /// `CASignatureAlgorithms` — resolved set of signature algorithms accepted
     /// from a CA when verifying a host certificate. `None` ⇒ built-in default
-    /// ([`super::algos::CA_SIGNATURE_DEFAULTS`]).
+    /// (`algos::CA_SIGNATURE_DEFAULTS`).
     pub ca_signature_algorithms: Option<Vec<String>>,
     /// `ProxyCommand` — shell command (with `%h`/`%p`/`%r`/`%%` tokens
     /// un-expanded) to spawn and use as the connection transport. The
@@ -463,7 +463,7 @@ impl SshClientConfig {
     /// recursively. Relative paths inside `Include` are anchored to the
     /// directory of the file containing the directive; `~` expands to
     /// `$HOME`; `*` / `?` globs are expanded against the filesystem.
-    /// Recursion is capped at [`super::include::MAX_INCLUDE_DEPTH`] hops.
+    /// Recursion is capped at `include::MAX_INCLUDE_DEPTH` hops.
     #[cfg(feature = "std")]
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ConfigError> {
         let lines = super::include::tokenize_file_with_includes(path.as_ref(), 0)?;

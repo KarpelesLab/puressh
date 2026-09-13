@@ -49,7 +49,7 @@ use crate::shared::SftpSession;
 /// Largest payload one `SSH_FXP_READ` request asks for / one
 /// `SSH_FXP_WRITE` request carries. Every SFTP packet — including the
 /// 4-byte length prefix, type, request id, handle string and offset —
-/// must fit in [`MAX_PACKET_SIZE`] (256 KiB, OpenSSH's
+/// must fit in `MAX_PACKET_SIZE` (256 KiB, OpenSSH's
 /// `SFTP_MAX_MSG_LENGTH`); leaving 1 KiB of headroom for the framing
 /// matches OpenSSH's own `SFTP_MAX_READ_LENGTH`. Exposed to C as
 /// `PCSSH_SFTP_MAX_IO` in `include/puressh.h` — keep the two in sync.

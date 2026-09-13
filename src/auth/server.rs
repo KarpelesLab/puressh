@@ -427,7 +427,7 @@ impl ServerAuth {
 
     /// Set the resolved `CASignatureAlgorithms` allow-list used when verifying
     /// a user certificate's CA signature. Empty (the default) ⇒ the built-in
-    /// default set ([`crate::config::algos::CA_SIGNATURE_DEFAULTS`]).
+    /// default set (`config::algos::CA_SIGNATURE_DEFAULTS`).
     pub fn set_ca_signature_algorithms(&mut self, algos: Vec<String>) -> &mut Self {
         self.ca_signature_algorithms = algos;
         self
@@ -875,7 +875,7 @@ impl ServerAuth {
 /// certificate type pins, checking it against the certificate's embedded key
 /// family. `None` if the name is unknown or names a different key family
 /// (an ed25519 cert offered as `rsa-sha2-512-cert-v01@openssh.com`, say).
-/// Mirrors the KEX-side check in [`host_key_verify_by_name`]'s cert branch.
+/// Mirrors the KEX-side check in `host_key_verify_by_name`'s cert branch.
 fn cert_plain_algorithm(algorithm: &str, cert: &crate::cert::Certificate) -> Option<&'static str> {
     let plain = crate::cert::cert_name_to_plain(algorithm)?;
     let family_ok = match cert.embedded_algorithm() {

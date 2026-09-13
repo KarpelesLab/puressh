@@ -15,14 +15,14 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "alloc")]
-pub mod cert;
-pub mod ecdsa;
-pub mod ed25519;
-pub mod rsa;
+mod cert;
+mod ecdsa;
+mod ed25519;
+pub(crate) mod rsa;
 
 /// Process-wide opt-in for the legacy `ssh-rsa` (SHA-1) signature algorithm.
 ///
-/// Defaults to `false`. When `false`, [`host_key_verify_by_name`] refuses the
+/// Defaults to `false`. When `false`, the crate's signature verifiers refuse the
 /// `"ssh-rsa"` name with [`crate::Error::Unsupported`]. The modern
 /// `"rsa-sha2-256"` / `"rsa-sha2-512"` (RFC 8332) names are unaffected and
 /// remain available regardless of this flag — only the SHA-1 form is gated.
@@ -58,7 +58,8 @@ pub use ed25519::Ed25519HostKey;
 pub use rsa::{RsaSha1HostKey, RsaSha2_256HostKey, RsaSha2_512HostKey};
 
 /// Host-key / public-key signature algorithm names this build can verify
-/// via [`host_key_verify_by_name`], in descending preference order.
+/// (host-key signatures, publickey userauth, certificate CA signatures), in
+/// descending preference order.
 ///
 /// This is the canonical list config keywords (`HostKeyAlgorithms`,
 /// `PubkeyAcceptedAlgorithms`) validate against. Legacy bare `ssh-rsa`
@@ -78,14 +79,14 @@ pub const HOST_KEY_VERIFY_NAMES: &[&str] = &[
 /// the KEX host-key list (host certs) and the userauth publickey method (user
 /// certs) when certificate authentication is in play.
 ///
-/// A name from this list passed to [`host_key_verify_by_name`] yields a
+/// A name from this list passed to `host_key_verify_by_name` yields a
 /// verifier over the certificate's *embedded* key (the cert blob is parsed and
 /// the embedded key reconstructed); the CA-trust decision is made elsewhere.
 #[cfg(feature = "alloc")]
 pub const HOST_KEY_CERT_VERIFY_NAMES: &[&str] = crate::cert::CERT_KEY_NAMES;
 
 /// A signature algorithm exposed to the rest of the crate.
-pub trait HostKeyAlgorithm {
+pub(crate) trait HostKeyAlgorithm {
     /// SSH algorithm name (e.g. `"ssh-ed25519"`, `"rsa-sha2-256"`).
     const NAME: &'static str;
 }
@@ -141,7 +142,10 @@ pub trait HostKeyVerify {
 /// public-key blob layout — RFC 8332 §3 — so the same `(n, e)` blob is
 /// reusable across hash choices; only the resulting signature blob differs.
 #[cfg(feature = "alloc")]
-pub fn host_key_verify_by_name(name: &str, blob: &[u8]) -> crate::Result<Box<dyn HostKeyVerify>> {
+pub(crate) fn host_key_verify_by_name(
+    name: &str,
+    blob: &[u8],
+) -> crate::Result<Box<dyn HostKeyVerify>> {
     match name {
         "ssh-ed25519" => Ok(Box::new(Ed25519HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp256" => Ok(Box::new(EcdsaP256HostKey::from_public_blob(blob)?)),

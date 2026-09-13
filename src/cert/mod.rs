@@ -149,7 +149,7 @@ pub struct Certificate {
     /// The 16- (or 32-) byte CA-chosen nonce, defeating hash-collision tricks.
     pub nonce: Vec<u8>,
     /// The reconstructed *plain* public-key blob of the embedded key, in the
-    /// wire format [`host_key_verify_by_name`] understands.
+    /// wire format `host_key_verify_by_name` understands.
     pub embedded_pubkey_blob: Vec<u8>,
     /// Monotonic CA-assigned serial number (0 if unset).
     pub serial: u64,

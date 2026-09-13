@@ -20,7 +20,7 @@
 //! ignored, mirroring OpenSSH which warns but continues). Failure to
 //! **parse** an included file is a hard error.
 //!
-//! Recursion depth is capped at [`MAX_INCLUDE_DEPTH`] (16, matching OpenSSH).
+//! Recursion depth is capped at `MAX_INCLUDE_DEPTH` (16, matching OpenSSH).
 //!
 //! This module is `std`-only because it touches the filesystem.
 
@@ -44,12 +44,12 @@ pub const MAX_INCLUDE_DEPTH: usize = 16;
 /// replaced by the tokens of their targets (in source order).
 ///
 /// `depth` is the recursion depth of the current file (top-level is 0).
-/// Exceeding [`MAX_INCLUDE_DEPTH`] returns a hard error.
+/// Exceeding `MAX_INCLUDE_DEPTH` returns a hard error.
 ///
 /// Errors:
 /// - `Err` for failure to **parse** this file or any included file (lexer
 ///   errors, malformed Include lines, bad Match criteria, …).
-/// - `Err` if recursion depth exceeds [`MAX_INCLUDE_DEPTH`].
+/// - `Err` if recursion depth exceeds `MAX_INCLUDE_DEPTH`.
 ///
 /// I/O failures opening the *top-level* `path` are returned as
 /// [`ConfigError::Syntax`] with `line: 0` — the caller asked us to read this

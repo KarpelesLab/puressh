@@ -17,12 +17,12 @@
 
 #![cfg(all(feature = "std", unix))]
 
-pub mod client;
-pub mod host_key;
-pub mod protocol;
+pub(crate) mod client;
+mod host_key;
+mod protocol;
 
 #[cfg(test)]
 mod tests;
 
 pub use client::{Agent, AgentIdentity};
-pub use host_key::AgentHostKey;
+pub use host_key::{AgentHostKey, RsaHash};

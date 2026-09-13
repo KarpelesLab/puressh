@@ -20,7 +20,7 @@ use std::process::ExitCode;
 use purecrypto::rng::{OsRng, RngCore};
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
 use puressh::known_hosts::KnownHosts;
-use puressh::known_hosts::format::format_entry;
+use puressh::known_hosts::format_entry;
 use zeroize::Zeroizing;
 
 /// Open a file with `create_new` semantics, applying the requested Unix mode

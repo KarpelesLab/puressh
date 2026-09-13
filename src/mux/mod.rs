@@ -17,29 +17,32 @@
 //! ```
 //!
 //! `length` counts the type byte plus the payload. Multi-byte integers are
-//! big-endian; strings are `u32` length-prefixed byte blobs. See [`Frame`] for
-//! the message set and [`Frame::encode`] / [`Frame::decode`] for the codec.
+//! big-endian; strings are `u32` length-prefixed byte blobs. The frame codec
+//! is crate-private (it is an implementation detail shared by the two roles);
+//! only `MuxError` surfaces from it.
 //!
-//! The codec ([`Frame`], [`FrameCodec`]) is pure and I/O-free, so it is unit-
-//! testable in isolation. The networking pieces ([`run_master`],
-//! [`run_client`]) live behind the same `cfg(all(unix, feature = "client"))`
-//! gate as this module and are only reachable from the `ssh` binary.
+//! The networking pieces (`run_master`, `run_client`) and the codec need the
+//! `multichannel` feature on top of this module's `cfg(all(unix, feature =
+//! "client"))` gate and are only reachable from the `ssh` binary; the
+//! `ControlPath` expansion helpers compile with just `client`.
 //!
 //! [`Client`]: crate::client::Client
 //! [`SharedClient`]: crate::shared::SharedClient
 
 #![cfg(all(unix, feature = "client"))]
 
+#[cfg(feature = "multichannel")]
 use std::io::{self, Read, Write};
 
+#[cfg(feature = "multichannel")]
 mod codec;
-pub use codec::{Frame, FrameCodec, MAX_FRAME_LEN, MuxError, PROTOCOL_VERSION};
+#[cfg(feature = "multichannel")]
+pub use codec::MuxError;
+#[cfg(feature = "multichannel")]
+pub(crate) use codec::{Frame, MAX_FRAME_LEN};
 
 mod path;
-pub use path::{
-    ControlPathTooLong, connection_hash, expand_control_path, expand_tokens_with_hash,
-    local_hostname, socket_path_for,
-};
+pub use path::{ControlPathTooLong, expand_control_path, local_hostname};
 
 // The master / client *roles* drive a real connection and need
 // `SharedClient` (master side) / blocking socket I/O. They live behind the
@@ -58,10 +61,11 @@ pub use client::{
     run_client, send_control_command, splice_forward, validate_control_socket,
 };
 
+#[cfg(feature = "multichannel")]
 /// Read exactly one framed message from `r`, blocking until a full frame is
 /// available. Returns `Ok(None)` on a clean EOF *between* frames (the peer
 /// closed without starting a new frame).
-pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, MuxError> {
+pub(crate) fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, MuxError> {
     let mut len_buf = [0u8; 4];
     match r.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -82,15 +86,17 @@ pub fn read_frame<R: Read>(r: &mut R) -> Result<Option<Frame>, MuxError> {
 }
 
 /// Encode `frame` and write it to `w` in one shot (length prefix + body).
-pub fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> Result<(), MuxError> {
+#[cfg(feature = "multichannel")]
+pub(crate) fn write_frame<W: Write>(w: &mut W, frame: &Frame) -> Result<(), MuxError> {
     let bytes = frame.encode();
     w.write_all(&bytes).map_err(MuxError::Io)?;
     w.flush().map_err(MuxError::Io)?;
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "multichannel"))]
 mod tests {
+    use super::codec::PROTOCOL_VERSION;
     use super::*;
 
     #[test]

@@ -27,8 +27,10 @@ pub const EXT_HARDLINK: &str = "hardlink@openssh.com";
 pub const EXT_FSYNC: &str = "fsync@openssh.com";
 
 /// OpenSSH's `SSH_FXE_STATVFS_ST_RDONLY` mount-flag bit. Wire-level value.
+#[cfg(unix)]
 pub const SSH_FXE_STATVFS_ST_RDONLY: u64 = 0x1;
 /// OpenSSH's `SSH_FXE_STATVFS_ST_NOSUID` mount-flag bit. Wire-level value.
+#[cfg(unix)]
 pub const SSH_FXE_STATVFS_ST_NOSUID: u64 = 0x2;
 
 /// The `(name, version)` pairs we advertise in our `SSH_FXP_VERSION` reply.

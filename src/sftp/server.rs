@@ -52,7 +52,7 @@ pub struct SftpServerOptions {
     pub read_only: bool,
     /// Maximum file size a client may set via `setstat`/`fsetstat`. Larger
     /// requests are refused with [`FxpStatus::PermissionDenied`]. Defaults
-    /// to [`DEFAULT_MAX_SET_LEN`] (1 GiB).
+    /// to `DEFAULT_MAX_SET_LEN` (1 GiB).
     pub max_set_len: u64,
     /// If `false` (the default), the high bits of an incoming `permissions`
     /// attribute are masked to `0o0777` — refusing to honour setuid/setgid/
@@ -70,7 +70,7 @@ pub struct SftpServerOptions {
     /// Maximum number of simultaneously open file/dir handles per
     /// session. Once this is exceeded `op_open`/`op_opendir` return
     /// [`FxpStatus::Failure`] until the client closes some handles.
-    /// Defaults to [`DEFAULT_MAX_HANDLES`].
+    /// Defaults to `DEFAULT_MAX_HANDLES`.
     pub max_handles: usize,
 }
 

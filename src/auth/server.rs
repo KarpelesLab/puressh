@@ -24,6 +24,7 @@ use super::message::{
 // the attempt is short-lived and never stored in bulk — so boxing `CertInfo`
 // would only add an allocation per publickey attempt.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum AuthAttempt {
     /// `none` — bare probe.
     None {
@@ -177,6 +178,7 @@ impl CertInfo {
 
 /// Authenticator's verdict on an attempt.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum AuthDecision {
     /// Accept fully — emit USERAUTH_SUCCESS.
     Accept,
@@ -280,6 +282,7 @@ impl AuthCertCaps {
 }
 
 /// What the harness should do next on behalf of the server.
+#[non_exhaustive]
 pub enum ServerStep {
     /// Send this payload to the peer.
     Send(Vec<u8>),

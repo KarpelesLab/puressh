@@ -2511,6 +2511,8 @@ mod imp {
                     let user = user.clone();
                     self.kbd_pump(&user)
                 }
+                // An auth method this binary predates: never accept it.
+                _ => AuthDecision::Reject,
             }
         }
 

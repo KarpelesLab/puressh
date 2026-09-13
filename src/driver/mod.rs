@@ -115,6 +115,7 @@ pub(crate) fn keepalive_request() -> Vec<u8> {
 /// (feeding the rest to its own [`ConnectionState`](crate::channel::ConnectionState)).
 /// Transport concerns never surface.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum Event {
     /// The transport handshake (version exchange + first key exchange) has
     /// completed; the connection is keyed and ready for authentication.

@@ -8,6 +8,7 @@ use crate::format::{Reader, Writer};
 
 /// A decoded global-request body.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GlobalRequest {
     /// `"tcpip-forward"` — ask the server to listen on `bind_address:bind_port`
     /// and forward incoming connections (RFC 4254 §7.1).

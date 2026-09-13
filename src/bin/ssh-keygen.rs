@@ -340,6 +340,8 @@ fn algorithm_label(pk: &PublicKey) -> &'static str {
         PublicKey::EcdsaP384 { .. } => "ECDSA",
         PublicKey::EcdsaP521 { .. } => "ECDSA",
         PublicKey::Rsa { .. } => "RSA",
+        // A key family added to the library after this binary was written.
+        _ => "UNKNOWN",
     }
 }
 

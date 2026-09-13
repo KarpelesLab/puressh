@@ -36,6 +36,7 @@ const T_OPEN_FAIL: u8 = 15;
 
 /// A decoded mux control-socket message.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Frame {
     /// First frame in either direction: protocol-version handshake.
     Hello {
@@ -318,6 +319,7 @@ impl FrameCodec {
 
 /// Errors from the mux codec / framed I/O layer.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum MuxError {
     /// Underlying socket I/O failed.
     Io(std::io::Error),

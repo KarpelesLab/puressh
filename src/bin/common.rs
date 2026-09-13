@@ -995,6 +995,8 @@ pub fn build_host_key_policy(
         // OpenSSH does the same: the warning is the deterrent, not a
         // silent key rotation.
         StrictMode::No => (TofuAction::Accept, TofuAction::AcceptWithWarning),
+        // A keyword value this binary predates: fail closed.
+        _ => (TofuAction::Reject, TofuAction::Reject),
     };
 
     Ok(HostKeyPolicy::KnownHosts(KnownHostsPolicy {

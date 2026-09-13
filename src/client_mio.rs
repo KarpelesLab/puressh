@@ -73,6 +73,7 @@ const READ_CHUNK: usize = 16 * 1024;
 /// [`Authenticated`](MioEvent::Authenticated), and collecting output from
 /// [`Data`](MioEvent::Data) until [`ExecClosed`](MioEvent::ExecClosed).
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum MioEvent {
     /// Transport handshake (version exchange + first key exchange) completed;
     /// ready for [`authenticate`](MioClient::authenticate).

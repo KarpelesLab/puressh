@@ -33,6 +33,7 @@ pub const ATTR_EXTENDED: u32 = 0x80000000;
 
 /// SFTP status code (`SSH_FX_*`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum FxpStatus {
     /// `SSH_FX_OK` — success.
     Ok,
@@ -144,6 +145,7 @@ pub struct NameEntry {
 
 /// Error type returned by SFTP client / server operations.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SftpError {
     /// Underlying transport I/O failed.
     Io(io::Error),

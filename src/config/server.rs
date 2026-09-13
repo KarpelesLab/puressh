@@ -34,6 +34,7 @@ use super::parser::{ParsedLine, tokenize};
 /// `authorized_keys` parser carries no `command=` restriction — so it is
 /// rejected at parse time rather than silently behaving like `No`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PermitRootLogin {
     /// Root may log in (by key — the only method puressh offers).
     Yes,
@@ -253,6 +254,7 @@ pub struct ServerOptions {
 
 /// `AllowTcpForwarding` policy: which forwarding directions are permitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TcpForwarding {
     /// `no` — neither direction.
     No,
@@ -277,6 +279,7 @@ impl TcpForwarding {
 
 /// `GatewayPorts` policy for remote-forward binds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GatewayPorts {
     /// `no` — force the listener onto loopback regardless of the client's ask.
     No,
@@ -288,6 +291,7 @@ pub enum GatewayPorts {
 
 /// `Compression` policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     /// `no` — never offer zlib.
     No,
@@ -299,6 +303,7 @@ pub enum Compression {
 
 /// `AddressFamily` policy restricting the listener's address family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AddressFamily {
     /// `any` — both IPv4 and IPv6.
     Any,

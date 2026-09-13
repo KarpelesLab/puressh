@@ -1120,7 +1120,8 @@ fn want_exec_pty(cli: &Cli, cfg_block: &puressh::config::ClientOptions) -> bool 
     match cli.request_tty.or(cfg_block.request_tty) {
         Some(Force) | Some(Yes) => true,
         Some(No) => false,
-        Some(Auto) | None => stdin_is_tty(),
+        // Auto, unset, or a keyword value this binary predates.
+        _ => stdin_is_tty(),
     }
 }
 
@@ -1154,6 +1155,8 @@ fn apply_identity_agent(setting: Option<&puressh::config::IdentityAgent>, _ident
                 std::env::set_var("SSH_AUTH_SOCK", &expanded);
             }
         }
+        // A keyword value this binary predates: leave the inherited socket.
+        Some(_) => {}
     }
 }
 
@@ -1341,6 +1344,11 @@ fn run() -> Result<i32, String> {
                     // No live master: fall through to a normal connection.
                     // Under auto/yes we'll become the master after auth.
                     vlog(1, "mux: no live master, connecting normally");
+                }
+                _ => {
+                    // A probe outcome this binary predates: treat it like
+                    // "no usable master" rather than guessing.
+                    vlog(1, "mux: unrecognised probe outcome, connecting normally");
                 }
             }
         }
@@ -1544,7 +1552,8 @@ fn run() -> Result<i32, String> {
         let use_pty = match cli.request_tty.or(cfg_block.request_tty) {
             Some(Force) | Some(Yes) => true,
             Some(No) => false,
-            Some(Auto) | None => stdin_is_tty(),
+            // Auto, unset, or a keyword value this binary predates.
+            _ => stdin_is_tty(),
         };
         // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms). Only
         // meaningful for the PTY (interactive) path; the pipe path ignores it.
@@ -1635,6 +1644,8 @@ fn resolve_mux(
         Some(ControlPersist::No) | None => puressh::mux::Persist::No,
         Some(ControlPersist::Yes) => puressh::mux::Persist::Yes,
         Some(ControlPersist::Seconds(n)) => puressh::mux::Persist::Seconds(n),
+        // A keyword value this binary predates: don't linger.
+        Some(_) => puressh::mux::Persist::No,
     };
     // Become master only for auto/yes (the live-master check happens at the
     // call site; if a live master answered we'd have taken the client path).
@@ -1840,7 +1851,8 @@ fn run_mux_client(
         let use_pty = match cli.request_tty.or(cfg_block.request_tty) {
             Some(Force) | Some(Yes) => true,
             Some(No) => false,
-            Some(Auto) | None => stdin_is_tty(),
+            // Auto, unset, or a keyword value this binary predates.
+            _ => stdin_is_tty(),
         };
         if use_pty {
             let (c, r, _, _) = query_window_size();
@@ -2627,6 +2639,8 @@ fn resolve_bind_addr(gateway: puressh::config::GatewayPorts, spec: Option<&str>)
         No => "127.0.0.1".to_string(),
         Yes => "0.0.0.0".to_string(),
         ClientSpecified => spec.unwrap_or("127.0.0.1").to_string(),
+        // A keyword value this binary predates: stay on loopback.
+        _ => "127.0.0.1".to_string(),
     }
 }
 
@@ -2653,6 +2667,8 @@ fn dial_tcp(
             AddressFamily::Any => true,
             AddressFamily::Inet => a.is_ipv4(),
             AddressFamily::Inet6 => a.is_ipv6(),
+            // A family this binary predates: don't filter.
+            _ => true,
         })
         .collect();
     if addrs.is_empty() {

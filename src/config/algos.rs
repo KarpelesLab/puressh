@@ -44,6 +44,7 @@ use crate::transport::kex::{defaults, is_strict_kex_marker};
 /// Which algorithm family a directive selects, used to pick the catalogue of
 /// known names and the default preference list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AlgoCategory {
     /// `Ciphers` — symmetric encryption suites.
     Cipher,

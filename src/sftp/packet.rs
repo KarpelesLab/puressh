@@ -81,6 +81,7 @@ pub type Extensions = Vec<(Vec<u8>, Vec<u8>)>;
 /// One SFTP message, before/after wire encoding.
 #[allow(missing_docs)]
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Packet {
     Init {
         version: u32,

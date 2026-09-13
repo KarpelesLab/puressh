@@ -124,6 +124,7 @@ fn split_options(list: &str) -> Result<Vec<String>> {
 
 /// SSH public key, tagged by algorithm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PublicKey {
     /// `ssh-ed25519` — 32-byte raw public key.
     Ed25519 {
@@ -171,6 +172,7 @@ pub enum PublicKey {
 /// are replaced by `"<redacted>"` so a stray `{:?}` (a `tracing` field, an
 /// `unwrap` panic message, `dbg!`) cannot leak key material into logs.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum PrivateKey {
     /// `ssh-ed25519` — 32-byte seed + 32-byte public.
     Ed25519 {

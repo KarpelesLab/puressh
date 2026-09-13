@@ -91,6 +91,7 @@ pub enum SocksVersion {
 /// refuse it (BIND/UDP, auth method); `Protocol` means malformed input.
 /// Either way the caller should drop the connection.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum SocksError {
     /// Underlying socket I/O failed.
     Io(io::Error),

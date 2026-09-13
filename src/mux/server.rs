@@ -28,6 +28,7 @@ use super::{read_frame, write_frame};
 
 /// ControlPersist policy for a master, matching the parsed config value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Persist {
     /// Exit as soon as the foreground session ends.
     No,

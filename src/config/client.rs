@@ -29,6 +29,7 @@ use super::parser::{ParsedLine, tokenize};
 /// TOFU policy. Re-exported as `puressh::config::StrictMode` and re-exported
 /// once more from `src/bin/common.rs` so existing binaries keep compiling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum StrictMode {
     /// `yes`: refuse Unknown; reject Mismatch.
     Yes,
@@ -44,6 +45,7 @@ pub enum StrictMode {
 /// stdin is a tty" — the binary needs the original token so it can decide
 /// late.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RequestTty {
     /// `no`: never allocate.
     No,
@@ -59,6 +61,7 @@ pub enum RequestTty {
 /// `AddressFamily` value — filters the addresses a hostname resolves to
 /// before we attempt a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AddressFamily {
     /// `any`: no filtering (default).
     Any,
@@ -71,6 +74,7 @@ pub enum AddressFamily {
 /// `GatewayPorts` value — controls the bind address of client-side
 /// `-L` / `-D` listeners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum GatewayPorts {
     /// `no`: bind loopback (`127.0.0.1`) only (default).
     No,
@@ -84,6 +88,7 @@ pub enum GatewayPorts {
 /// `IdentityAgent` value — overrides which ssh-agent socket the client
 /// talks to.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum IdentityAgent {
     /// `none`: never consult an agent.
     None,
@@ -101,6 +106,7 @@ pub enum IdentityAgent {
 /// [`ConfigError::Unsupported`] rather than silently downgraded to `yes`
 /// (which would defeat the user's explicit request to be asked).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlMaster {
     /// `no` (default): never multiplex. Open a fresh connection.
     No,
@@ -115,6 +121,7 @@ pub enum ControlMaster {
 /// `ControlPersist` value — how long a master lingers after its foreground
 /// session ends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlPersist {
     /// `no`: the master exits as soon as its own foreground session ends
     /// (still serving any clients that attached, but tearing down once the
@@ -138,6 +145,7 @@ pub enum ControlPersist {
 /// an OpenSSH time value with unit suffixes (`interval:1s`). The OpenSSH
 /// default when the option is unset is `yes` at 20 ms.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ObscureKeystrokeTiming {
     /// `no`: disabled — keystrokes are sent immediately as today.
     Off,

@@ -25,6 +25,7 @@ use std::io::{ErrorKind, Read, Write};
 
 /// SCP protocol error.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ScpError {
     /// Wrapped `std::io::Error` from the underlying transport.
     Io(std::io::Error),

@@ -218,6 +218,7 @@ impl core::fmt::Debug for SecretString {
 /// secret fields are [`SecretString`], so their backing bytes are also
 /// zeroized when the payload is dropped.
 #[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthMethodPayload {
     None,
     Password {

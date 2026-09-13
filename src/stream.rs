@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 /// packets. Handlers don't emit `ChannelEgress` directly — they just
 /// use `Read` / `Write` on the stream, and the EOF / Close pair is sent
 /// automatically when the stream drops.
+#[non_exhaustive]
 pub enum ChannelEgress {
     /// Bytes destined for `CHANNEL_DATA`.
     Data(Vec<u8>),

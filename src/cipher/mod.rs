@@ -105,6 +105,7 @@ pub fn by_name(name: &str) -> Option<&'static CipherSpec> {
 ///   the length field, [`SshCipher::cp_tag`] / [`SshCipher::cp_verify_tag`] to
 ///   produce or check the Poly1305 tag, and [`SshCipher::cp_xor_payload`] to
 ///   apply the payload keystream once the tag has been verified.
+#[non_exhaustive]
 pub enum SshCipher {
     /// `aes128-ctr` / `aes192-ctr` / `aes256-ctr`.
     Ctr(AesCtr),

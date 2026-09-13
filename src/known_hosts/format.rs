@@ -19,6 +19,7 @@ pub struct Entry {
 
 /// Marker prefix on a known_hosts entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Marker {
     /// `@cert-authority` — CA key for any host matching the host spec.
     CertAuthority,
@@ -60,6 +61,7 @@ impl HostSpec {
 
 /// Outcome of parsing one line.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ParsedLine {
     /// A real entry.
     Entry(Entry),

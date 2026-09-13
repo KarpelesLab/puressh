@@ -14,6 +14,7 @@ use super::hash::{check_hashed, hash_new, parse_hashed};
 
 /// Outcome of looking up a host in a [`KnownHosts`] store.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum LookupResult {
     /// At least one entry's host and key match the candidate exactly.
     /// Connection is safe to proceed.

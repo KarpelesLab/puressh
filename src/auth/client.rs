@@ -22,6 +22,7 @@ pub trait KeyboardInteractiveResponder: Send {
 }
 
 /// A credential the client offers in turn.
+#[non_exhaustive]
 pub enum ClientCredential {
     /// `none` — used as a probe to learn allowed methods.
     None,
@@ -54,6 +55,7 @@ impl ClientCredential {
 }
 
 /// What the harness should do next on behalf of the client.
+#[non_exhaustive]
 pub enum ClientStep {
     /// Emit this payload as the next outbound packet.
     Send(Vec<u8>),

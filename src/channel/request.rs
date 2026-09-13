@@ -10,6 +10,7 @@ use crate::format::{Reader, Writer};
 /// of `SSH_MSG_CHANNEL_REQUEST` are handled by [`super::ConnectionState`]; the
 /// variants here carry only the request-type-specific payload.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChannelRequest {
     /// `"pty-req"` — allocate a pseudo-terminal.
     PtyReq {

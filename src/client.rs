@@ -217,6 +217,7 @@ pub(crate) fn unsolicited_reply(
 }
 
 /// Policy for accepting (or rejecting) a server's host key.
+#[non_exhaustive]
 pub enum HostKeyPolicy {
     /// Trust whatever the server presents — equivalent to OpenSSH's
     /// `StrictHostKeyChecking=no`. Insecure; do not use against untrusted peers.
@@ -282,6 +283,7 @@ pub type TofuPromptFn = dyn Fn(&str, u16, &str, &[u8]) -> bool + Send + Sync;
 
 /// Why a host key needs an interactive decision, passed in [`HostKeyPrompt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostKeyChange {
     /// The host is not in `known_hosts` at all — a first-contact (TOFU) add.
     Unknown,
@@ -655,6 +657,7 @@ impl ClientHandlers {
 /// [`ServeContext`]. Currently the only variant is outbound `direct-tcpip`
 /// open; future ones (e.g. agent-channel open for Phase 8) plug in the same
 /// way.
+#[non_exhaustive]
 pub enum ServeCommand {
     /// Open a `direct-tcpip` channel; on confirmation, send the resulting
     /// [`ChannelStream`] back through `reply`. On peer rejection, send

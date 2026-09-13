@@ -76,6 +76,7 @@ impl ChannelState {
 
 /// Channel-open kinds: the type-specific tail of `CHANNEL_OPEN` (RFC 4254 §5.1, §7.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ChannelOpen {
     /// `"session"` — RFC 4254 §6.1.
     Session,
@@ -266,6 +267,7 @@ impl ChannelOpen {
 
 /// A decoded inbound event, surfaced by [`ConnectionState::on_packet`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ChannelEvent {
     /// `SSH_MSG_CHANNEL_OPEN` from the peer.
     OpenRequest {

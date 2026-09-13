@@ -16,6 +16,7 @@ use alloc::vec::Vec;
 /// One token from a `Host`/`Match Host` pattern list. `Any` is a small
 /// optimisation for the global-block fallthrough where every host matches.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum HostPattern {
     /// `*` (literal): matches every host without scanning.
     Any,

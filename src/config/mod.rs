@@ -64,6 +64,7 @@ pub use server::{AddressFamily as ServerAddressFamily, GatewayPorts as ServerGat
 
 /// Errors produced while parsing or evaluating an SSH config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ConfigError {
     /// Lexical/structural failure (unterminated quote, bad block header, …).
     Syntax {

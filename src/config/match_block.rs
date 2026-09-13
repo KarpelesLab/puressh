@@ -172,6 +172,7 @@ pub fn address_matches(patterns: &[AddressPattern], addr_str: &str) -> bool {
 /// A `Match` block matches iff **all** of its conditions evaluate to true
 /// (logical AND, per ssh_config(5)).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MatchCondition {
     /// `Match host <pattern-list>` — matches against the connection target
     /// (i.e. the post-`HostName`-substitution name).
@@ -459,6 +460,7 @@ fn parse_match_pattern_list(s: &str) -> Vec<HostPattern> {
 /// Default-deny: the parser is happy to record `Match exec` blocks, but the
 /// resolver skips (i.e. does not match) them unless the caller has opted in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ExecPolicy {
     /// `Match exec` always evaluates to "did not match" (block is skipped).
     Deny,

@@ -221,6 +221,7 @@ pub struct PtySpec {
 
 /// How a [`ShellSession`]'s child process terminated.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum ShellExitStatus {
     /// Process exited normally with this status code.
     Exited(u32),

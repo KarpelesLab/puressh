@@ -18,6 +18,7 @@ use super::{read_frame, write_frame};
 
 /// What a [`probe_master`] connection attempt found at a `ControlPath`.
 #[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ProbeOutcome {
     /// A live master answered `HELLO` with a compatible version — reuse it.
     Live,
@@ -289,6 +290,7 @@ pub fn probe_master(path: &Path) -> ProbeOutcome {
 
 /// A `ssh -O` control command directed at a running master.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ControlCommand {
     /// `-O check`: probe whether the master is alive (HELLO + ALIVE_CHECK).
     Check,

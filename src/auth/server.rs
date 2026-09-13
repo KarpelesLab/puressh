@@ -241,6 +241,7 @@ pub trait Authenticator: Send {
 /// leaves every capability allowed, exactly as before certificates existed.
 #[derive(Debug, Clone)]
 #[cfg(feature = "alloc")]
+#[non_exhaustive]
 pub struct AuthCertCaps {
     /// `permit-pty` extension present ⇒ a `pty-req` may be honoured.
     pub permit_pty: bool,

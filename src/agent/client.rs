@@ -24,6 +24,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 /// `key_blob` is the SSH wire-format public-key blob; the algorithm
 /// name is the first `string` field inside it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct AgentIdentity {
     /// SSH wire-format public key (`string algorithm || …`).
     pub key_blob: Vec<u8>,

@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 
 /// SSH-side identifier and key/iv/block geometry for a cipher suite.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct CipherSpec {
     /// On-the-wire SSH name (e.g. `"aes256-ctr"`).
     pub name: &'static str,

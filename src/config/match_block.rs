@@ -39,6 +39,7 @@ use super::glob::{HostPattern, glob_match, host_matches};
 ///   string form when it contains `*` / `?`. This is the documented OpenSSH
 ///   fallback for hosts whose address can't be parsed as a CIDR.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AddressPattern {
     /// Whether a match on `kind` *excludes* the address (`!`-prefixed).
     pub negated: bool,

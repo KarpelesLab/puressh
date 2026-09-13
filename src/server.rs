@@ -204,6 +204,7 @@ impl ShellRuntime {
 ///
 /// [`modes`]: Self::modes
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct PtySpec {
     /// Value for the `TERM` environment variable, e.g. `"xterm-256color"`.
     pub term: String,
@@ -310,6 +311,7 @@ struct SubsystemRuntime {
 /// Carries the values resolved from the per-connection [`EffectivePolicy`]
 /// that the hook must act on while the server may still hold root.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct SessionOpenContext<'a> {
     /// The authenticated username.
     pub user: &'a str,
@@ -387,6 +389,7 @@ pub trait ExecStreamHandler: Send + Sync {
 /// string orig_host, uint32 orig_port`. We deliberately surface them
 /// borrowed (`&str`) so handlers don't need to take ownership.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DirectTcpipRequest<'a> {
     /// Destination hostname/IP the client wants the server to dial.
     pub dest_host: &'a str,
@@ -429,6 +432,7 @@ pub trait DirectTcpipHandler: Send + Sync {
 /// reserved`; only the socket path is meaningful, and it is surfaced
 /// borrowed so handlers don't need to take ownership.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct DirectStreamlocalRequest<'a> {
     /// Filesystem path of the Unix-domain socket the client wants the server
     /// to connect to.
@@ -895,6 +899,7 @@ pub trait X11ForwardHandler: Send + Sync {
 }
 
 /// Server configuration: host keys, authentication, and the exec hook.
+#[non_exhaustive]
 pub struct Config {
     /// Host keys the server presents and signs the KEX with. At least one
     /// required.
@@ -1074,6 +1079,7 @@ pub type GroupResolver = Arc<dyn Fn(&str) -> Vec<String> + Send + Sync>;
 /// `Match` options and consulted at the existing channel-dispatch points; it
 /// never rebuilds handlers, it only gates the maximal set attached at startup.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EffectivePolicy {
     /// `AllowAgentForwarding` — when `Some(false)`, `auth-agent-req` is
     /// refused even if an agent-forward handler is attached.

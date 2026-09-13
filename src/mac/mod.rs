@@ -28,6 +28,7 @@ use zeroize::ZeroizeOnDrop;
 
 /// SSH-side identifier and key/tag geometry for a MAC.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct MacSpec {
     /// On-the-wire SSH name.
     pub name: &'static str,

@@ -142,6 +142,7 @@ fn blob_type_to_plain(name: &str) -> Option<&'static str> {
 /// All owned fields are bounded by [`MAX_CERT_BLOB`] and the per-list caps
 /// applied at [`parse`](Certificate::parse) time.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Certificate {
     /// The cert key-type name, e.g. `"ssh-ed25519-cert-v01@openssh.com"`.
     pub key_type: String,

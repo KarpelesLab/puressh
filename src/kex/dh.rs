@@ -263,6 +263,7 @@ dh_fixed_group_impl!(Group18Sha512, group18, Sha512);
 
 /// Client wishes for `(min, n, max)` from RFC 4419.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct GexRequest {
     /// Minimum acceptable prime bit size.
     pub min: u32,

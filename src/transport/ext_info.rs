@@ -50,6 +50,7 @@ pub fn is_ext_info_marker(name: &str) -> bool {
 /// `(name, value)` pairs so callers can inspect forward-compatible
 /// extensions we don't model directly.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtInfo {
     /// RFC 8308 §3.1 — comma-separated list of signature algorithm names
     /// the **server** accepts on a `publickey` userauth signature.

@@ -32,6 +32,7 @@ pub const DEFAULT_MAX_HANDLES: usize = 256;
 
 /// Tunables for a single SFTP server session.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SftpServerOptions {
     /// Initial virtual cwd for relative-path requests.
     pub cwd: PathBuf,

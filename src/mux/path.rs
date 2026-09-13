@@ -114,6 +114,7 @@ pub fn local_hostname() -> String {
 /// the template (e.g. use `%C`, the connection hash, instead of `%r@%h:%p`)
 /// or point it at a shorter directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ControlPathTooLong {
     /// The fully expanded path that was rejected.
     pub path: String,

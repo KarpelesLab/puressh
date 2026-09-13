@@ -17,6 +17,7 @@ use super::ConfigError;
 
 /// One parsed non-empty, non-comment line.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ParsedLine {
     /// 1-based source line number (for diagnostics).
     pub line_no: usize,

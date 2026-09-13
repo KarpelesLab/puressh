@@ -45,6 +45,7 @@ pub(crate) fn base64_decode(input: &[u8]) -> Result<Vec<u8>> {
 /// Only the options needed for certificate authentication are understood;
 /// anything else is a hard error (the strict "refuse unknown option" stance).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct AuthorizedKeyOptions {
     /// The `cert-authority` flag: this key is a CA whose certificates are
     /// trusted (rather than a directly-authorized user key).

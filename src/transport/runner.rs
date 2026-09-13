@@ -49,6 +49,7 @@ pub enum Role {
 
 /// Result of stepping the runner.
 #[derive(Debug, Default, Clone)]
+#[non_exhaustive]
 pub struct KexAdvance {
     /// Frames to send (decoded payloads — the codec frames them).
     pub outbound: Vec<Vec<u8>>,
@@ -68,6 +69,7 @@ pub struct KexAdvance {
 /// [`ZeroizeOnDrop`]. Not `Clone` — duplicating live keys is never needed and
 /// would multiply the copies that must be wiped.
 #[derive(ZeroizeOnDrop)]
+#[non_exhaustive]
 pub struct DirKeys {
     /// Negotiated cipher name (e.g. `aes256-ctr`).
     #[zeroize(skip)]
@@ -92,6 +94,7 @@ impl core::fmt::Debug for DirKeys {
 
 /// Both directions' worth of derived keys.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct InstalledKeys {
     /// Client to server direction.
     pub c2s: DirKeys,

@@ -52,6 +52,7 @@ pub struct KexInitOut {
 /// / `core::mem::take(&mut out.h)` instead, which leaves an empty
 /// `Vec` behind that the drop glue can safely wipe.
 #[derive(Clone, zeroize::ZeroizeOnDrop)]
+#[non_exhaustive]
 pub struct KexOutput {
     /// The shared secret `K` as an SSH `mpint` byte string (length-prefixed,
     /// two's-complement). This is what RFC 4253 §7.2 feeds into the KDF.

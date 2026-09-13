@@ -225,6 +225,7 @@ pub struct RemoteForwardSpec {
 /// "not set" from "set to default" and apply OpenSSH precedence (CLI > file >
 /// built-in default) via a `pick(cli, cfg, default)` helper.
 #[derive(Default, Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ClientOptions {
     /// `HostName`: real hostname to connect to (the `Host` block name is just a label).
     pub host_name: Option<String>,

@@ -79,6 +79,7 @@ impl PermitRootLogin {
 /// (Linux + the `pam` feature); without it the methods are never advertised
 /// (the binary warns).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServerOptions {
     /// `Port` — default 22 (OpenSSH default; puressh's CLI default differs).
     pub port: Option<u16>,
@@ -345,6 +346,7 @@ pub struct RekeyLimit {
 /// One `Match` block from an `sshd_config(5)` file: the parsed conditions
 /// plus the options that apply when every condition matches.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServerMatchBlock {
     /// All conditions must match (logical AND) for `opts` to apply.
     pub conditions: Vec<MatchCondition>,
@@ -358,6 +360,7 @@ pub struct ServerMatchBlock {
 /// [`SshServerConfig::resolve`] for a given [`MatchContext`] to flatten the
 /// global options with every matching block.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SshServerConfig {
     /// Pre-`Match` ("global") options, applied to every connection.
     pub global: ServerOptions,

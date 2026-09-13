@@ -478,6 +478,7 @@ impl Config {
 }
 
 /// Result of running `exec`.
+#[non_exhaustive]
 pub struct ExecOutput {
     /// Captured stdout bytes.
     pub stdout: Vec<u8>,
@@ -497,6 +498,7 @@ pub struct ExecOutput {
 /// (per a previous `tcpip-forward` global request); `orig_*` are the
 /// remote-side socket coordinates of the peer that just connected to it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ForwardedTcpipOrigin {
     /// Address the server is listening on (typically what the client passed
     /// to [`Client::request_tcpip_forward`]).
@@ -526,6 +528,7 @@ pub type ForwardedTcpipCallback =
 /// [`ClientHandlers::on_forwarded_streamlocal`] so the callback knows which
 /// bound socket the connection arrived on.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ForwardedStreamlocalOrigin {
     /// Path the server is listening on (typically what the client passed to
     /// [`Client::request_streamlocal_forward`]).

@@ -39,6 +39,7 @@ pub const SSH_MSG_NEWKEYS: u8 = 21;
 /// `KexAlgorithms` (the borrowed view in `kex.rs`) is the input the caller
 /// hands us; `KexInit` is the owned, wire-encodable form.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct KexInit {
     /// 16-byte random cookie.
     pub cookie: [u8; 16],
@@ -75,6 +76,7 @@ pub struct KexInit {
 /// This struct carries those owned lists straight into
 /// [`KexInit::from_algorithms_owned`] without an intermediate borrow.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct KexAlgorithmsOwned {
     /// Key-exchange algorithms.
     pub kex: Vec<String>,
@@ -253,6 +255,7 @@ fn read_name_list(r: &mut Reader<'_>) -> Result<Vec<String>> {
 
 /// Result of negotiation between two KEXINITs.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NegotiatedOwned {
     /// Chosen key-exchange method.
     pub kex: String,

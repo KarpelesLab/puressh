@@ -33,6 +33,7 @@ pub struct KexAlgorithms<'a> {
 /// Carries owned strings so the runner can keep it across the rest of the
 /// KEX round-trip and across re-keys.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Negotiated {
     /// Key-exchange method.
     pub kex: alloc::string::String,

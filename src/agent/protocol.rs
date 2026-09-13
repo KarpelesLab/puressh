@@ -62,6 +62,7 @@ pub fn encode_sign_request(key_blob: &[u8], data: &[u8], flags: u32) -> Vec<u8> 
 
 /// Decoded identity entry returned by `SSH_AGENT_IDENTITIES_ANSWER`.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct IdentityEntry {
     /// SSH wire-format public key blob (the same bytes that appear
     /// after the algorithm name in an `authorized_keys` line, decoded

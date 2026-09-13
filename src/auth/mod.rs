@@ -14,7 +14,12 @@
 //! SSH *payload* bytes (the message-type byte plus method-specific fields)
 //! and never touch sockets directly.
 
+/// Wire-format codecs for the userauth messages (plumbing).
+///
+/// Only the sans-IO state machines need these; they are re-exported for
+/// alternative frontends under [`crate::hazmat::auth::message`].
 #[cfg(feature = "alloc")]
+#[doc(hidden)]
 pub mod message;
 
 #[cfg(feature = "alloc")]
@@ -24,12 +29,22 @@ mod client;
 mod server;
 
 #[cfg(feature = "alloc")]
-pub use client::{ClientAuth, ClientCredential, ClientStep, KeyboardInteractiveResponder};
-
+pub use client::{ClientCredential, KeyboardInteractiveResponder};
 #[cfg(feature = "alloc")]
-pub use server::{
-    AuthAttempt, AuthCertCaps, AuthDecision, Authenticator, CertInfo, ServerAuth, ServerStep,
-};
+pub use message::SecretString;
+#[cfg(feature = "alloc")]
+pub use server::{AuthAttempt, AuthCertCaps, AuthDecision, Authenticator, CertInfo};
+
+// The sans-IO step machines are plumbing the drivers are built from. They
+// stay `pub` here because `client::Client::new_auth_driver` / `run_auth`
+// hand them across module boundaries, but their documented home is
+// `crate::hazmat::auth`.
+#[cfg(feature = "alloc")]
+#[doc(hidden)]
+pub use client::{ClientAuth, ClientStep};
+#[cfg(feature = "alloc")]
+#[doc(hidden)]
+pub use server::{ServerAuth, ServerStep};
 
 #[cfg(all(test, feature = "alloc"))]
 mod tests;

@@ -1214,6 +1214,10 @@ impl Client {
     /// hand to [`Self::run_auth`]. This is the one-driver-per-connection entry
     /// point for callers (e.g. the `ssh` binary) that need a re-promptable
     /// password or a keyboard-interactive responder.
+    ///
+    /// The returned [`ClientAuth`] is a [`crate::hazmat::auth`] type: it is
+    /// exposed so the credential list can be assembled incrementally, but it
+    /// carries no stability promise beyond the crate version.
     pub fn new_auth_driver(&self, user: &str) -> ClientAuth {
         let mut auth = ClientAuth::new(user, self.driver.session_id().to_vec());
         if let Some(accepted) = self.algo_overrides.pubkey_accepted_algorithms.clone() {

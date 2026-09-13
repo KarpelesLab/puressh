@@ -18,7 +18,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use puressh::auth::message::SecretString;
+use puressh::auth::SecretString;
 use puressh::auth::{ClientCredential, KeyboardInteractiveResponder};
 use puressh::client::{
     AlgoOverrides, ChannelStream, Client, ClientHandlers, Config, ForwardedTcpipCallback,

@@ -75,7 +75,10 @@ pam = ["dep:pam-client2"]
 # bounded custom DH-group validation (our `diffie-hellman-group-exchange`
 # path), and zeroized ChaCha20, ML-KEM and X25519 stack temporaries; 0.8.3
 # only touches DTLS/QUIC/Falcon but is the current tip of that line.
-purecrypto = { version = "0.8.3", default-features = false, features = [
+#
+# 0.9's breaking changes are confined to TLS, QUIC, X.509 and LMS/HSS, none of
+# which this crate enables; the MSRV stays at Rust 1.89.
+purecrypto = { version = "0.9", default-features = false, features = [
     "hash", "cipher", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem",
 ] }
 # 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting

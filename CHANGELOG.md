@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/KarpelesLab/puressh/compare/v0.1.7...v0.1.8) - 2026-09-17
+
+### Other
+
+- *(deps)* bump purecrypto to 0.9
+
 ## [0.1.7](https://github.com/KarpelesLab/puressh/compare/v0.1.6...v0.1.7) - 2026-09-13
 
 ### Fixed

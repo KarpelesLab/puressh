@@ -1,5 +1,5 @@
 //! Client connection multiplexing (`ControlMaster` / `ControlPath` /
-//! `ControlPersist`) over a Unix-domain control socket.
+//! `ControlPersist`) over a control carrier: a Unix-domain socket on Unix, a named pipe on Windows.
 //!
 //! A *master* connection performs the normal TCP / KEX / userauth dance once,
 //! then binds a `UnixListener` at the configured `ControlPath` and moves its
@@ -29,7 +29,7 @@
 //! [`Client`]: crate::client::Client
 //! [`SharedClient`]: crate::shared::SharedClient
 
-#![cfg(all(unix, feature = "client"))]
+#![cfg(all(any(unix, all(windows, feature = "win-ipc")), feature = "client"))]
 
 #[cfg(feature = "multichannel")]
 use std::io::{self, Read, Write};
@@ -46,14 +46,25 @@ pub use path::{
     ControlPathTooLong, connection_hash, expand_control_path, local_hostname, socket_path_for,
 };
 
+/// Carrier for the control connection: a Unix-domain socket or a named pipe.
+#[cfg(feature = "multichannel")]
+mod transport;
+
+#[cfg(all(windows, feature = "win-ipc"))]
+mod win;
+
 // The master / client *roles* drive a real connection and need
 // `SharedClient` (master side) / blocking socket I/O. They live behind the
 // `multichannel` feature; the codec + path helpers above stay available with
 // just `client` so the lib still compiles in `multichannel`-off builds.
 #[cfg(feature = "multichannel")]
 mod server;
+#[cfg(unix)]
+pub use server::PeerCheck;
 #[cfg(feature = "multichannel")]
-pub use server::{ForwardHook, MasterConfig, PeerCheck, Persist, run_master, run_master_daemon};
+pub use server::{
+    ForwardHook, MasterConfig, Persist, run_master, run_master_daemon, run_master_daemon_notify,
+};
 
 #[cfg(feature = "multichannel")]
 mod client;

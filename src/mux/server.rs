@@ -10,10 +10,11 @@
 //! whether the master's own foreground session has finished — see
 //! [`run_master`] for the exact policy.
 
-use std::fs;
 use std::io::{Read, Write};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+
+use super::transport::{self, Listener, Stream};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -59,9 +60,12 @@ pub struct MasterConfig {
     /// Lists the open channels for `ssh -O channels`.
     pub on_channels: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// Decides whether an accepted control-socket connection may be served
+    /// (Unix only: the peer's credentials are checked through a socket option
+    /// that Windows named pipes do not have).
     /// (OpenSSH lets in only its own user and root, by peer credentials).
     /// The library cannot read peer credentials itself; without a check,
     /// the owner-only socket is the access control.
+    #[cfg(unix)]
     pub peer_check: Option<PeerCheck>,
 }
 
@@ -69,6 +73,7 @@ pub struct MasterConfig {
 pub type ForwardHook = Arc<dyn Fn(u8, &str, bool) -> Result<u16, String> + Send + Sync>;
 
 /// See [`MasterConfig::peer_check`].
+#[cfg(unix)]
 pub type PeerCheck = Arc<dyn Fn(&UnixStream) -> bool + Send + Sync>;
 
 impl MasterConfig {
@@ -81,6 +86,7 @@ impl MasterConfig {
             on_forward: None,
             on_conninfo: None,
             on_channels: None,
+            #[cfg(unix)]
             peer_check: None,
         }
     }
@@ -115,6 +121,7 @@ impl MasterConfig {
 
     /// Serve only the control-socket connections `f` accepts (see
     /// [`MasterConfig::peer_check`]).
+    #[cfg(unix)]
     pub fn with_peer_check(
         mut self,
         f: impl Fn(&UnixStream) -> bool + Send + Sync + 'static,
@@ -145,13 +152,14 @@ struct MasterState {
     /// See [`MasterConfig::on_channels`].
     on_channels: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// See [`MasterConfig::peer_check`].
+    #[cfg(unix)]
     peer_check: Option<PeerCheck>,
 }
 
 /// Bind the control socket at `cfg.control_path`, taking care not to clobber a
 /// live master. Returns the bound listener, or an error if a live master is
 /// already answering (`ControlMaster yes` must refuse rather than steal it).
-fn bind_socket(path: &Path) -> Result<UnixListener, String> {
+fn bind_socket(path: &Path) -> Result<Listener, String> {
     match probe_master(path) {
         ProbeOutcome::Live => {
             return Err(format!(
@@ -161,7 +169,7 @@ fn bind_socket(path: &Path) -> Result<UnixListener, String> {
         }
         ProbeOutcome::Stale => {
             // A dead socket file is in the way — remove it before binding.
-            let _ = fs::remove_file(path);
+            transport::unlink(path);
         }
         ProbeOutcome::Absent => {}
     }
@@ -174,73 +182,16 @@ fn bind_socket(path: &Path) -> Result<UnixListener, String> {
             parent.display()
         ));
     }
-    match bind_private(path) {
-        Ok(l) => return Ok(l),
-        // The temporary name did not fit in a socket address (a very short
-        // ControlPath file name): bind in place below.
-        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(format!(
-                "ControlPath {} already has a live master; refusing to clobber it",
-                path.display()
-            ));
-        }
-        Err(e) => return Err(format!("bind control socket {}: {e}", path.display())),
+    match transport::bind(path) {
+        Ok(l) => Ok(l),
+        // Another process bound the carrier between the probe and the bind:
+        // treat it exactly like a live master rather than stealing the name.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(format!(
+            "ControlPath {} already has a live master; refusing to clobber it",
+            path.display()
+        )),
+        Err(e) => Err(format!("bind control socket {}: {e}", path.display())),
     }
-    let listener = UnixListener::bind(path)
-        .map_err(|e| format!("bind control socket {}: {e}", path.display()))?;
-    // 0600: only the owner may connect to the multiplexed connection.
-    if let Err(e) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
-        let _ = fs::remove_file(path);
-        return Err(format!("chmod 0600 {}: {e}", path.display()));
-    }
-    Ok(listener)
-}
-
-/// Bind a listener at `path` that nobody else can reach at any point.
-///
-/// A plain bind creates the socket `0777 & ~umask` and the chmod after it
-/// leaves a window where another user can connect. OpenSSH binds a
-/// temporary name under umask 0177 and link(2)s it into place; the library
-/// cannot change the umask (`forbid(unsafe_code)`), so it binds inside a
-/// fresh 0700 directory next to `path` instead, makes the socket 0600 there
-/// and then links it to `path` — which, unlike a rename, fails rather than
-/// replace a master that bound `path` in the meantime.
-fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
-    use std::os::unix::fs::DirBuilderExt;
-    let parent = match path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p,
-        _ => Path::new("."),
-    };
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.subsec_nanos())
-        ^ std::process::id().rotate_left(16);
-    let mut dir = None;
-    for i in 0..16u32 {
-        // Kept short: the socket inside must still fit in `sun_path`.
-        let d = parent.join(format!(".m{:06x}", seed.wrapping_add(i) & 0xff_ffff));
-        match fs::DirBuilder::new().mode(0o700).create(&d) {
-            Ok(()) => {
-                dir = Some(d);
-                break;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    let Some(dir) = dir else {
-        return Err(std::io::Error::other("no free temporary directory name"));
-    };
-    let tmp = dir.join("s");
-    let res = UnixListener::bind(&tmp).and_then(|l| {
-        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
-        fs::hard_link(&tmp, path)?;
-        Ok(l)
-    });
-    let _ = fs::remove_file(&tmp);
-    let _ = fs::remove_dir(&dir);
-    res
 }
 
 /// Become the master: bind the socket and serve clients until the
@@ -272,6 +223,7 @@ where
         on_forward: cfg.on_forward.clone(),
         on_conninfo: cfg.on_conninfo.clone(),
         on_channels: cfg.on_channels.clone(),
+        #[cfg(unix)]
         peer_check: cfg.peer_check.clone(),
     });
 
@@ -291,6 +243,15 @@ where
         reaper_loop(persist, reaper_state, &reaper_path);
     });
 
+    // Keep the connection read while the foreground session runs: the
+    // server's channel opens and keepalives arrive at any time.
+    let pump_shared = shared.clone();
+    let pump_state = state.clone();
+    let pump = thread::spawn(move || {
+        let _ = pump_shared.pump_while(|| !pump_state.shutdown.load(Ordering::SeqCst));
+        pump_state.shutdown.store(true, Ordering::SeqCst);
+    });
+
     // Run the foreground session.
     let status = foreground(&shared);
     state.foreground_done.store(true, Ordering::SeqCst);
@@ -299,9 +260,11 @@ where
         Persist::No => {
             // Tear down immediately: stop accepting, unlink, join.
             state.shutdown.store(true, Ordering::SeqCst);
-            let _ = fs::remove_file(&cfg.control_path);
+            wake_accept(&cfg.control_path);
+            transport::unlink(&cfg.control_path);
             let _ = accept.join();
             let _ = reaper.join();
+            let _ = pump.join();
             Ok(status)
         }
         Persist::Yes | Persist::Seconds(_) => {
@@ -313,6 +276,7 @@ where
             // daemonizing — documented limitation above.
             drop(accept);
             drop(reaper);
+            drop(pump);
             Ok(status)
         }
     }
@@ -333,7 +297,18 @@ where
 /// clients: the master lingers `n` seconds after the last client detaches,
 /// then unlinks the socket and returns. `Yes` blocks until `-O exit`.
 pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), String> {
+    run_master_daemon_notify(cfg, shared, || {})
+}
+
+/// Like run_master_daemon, but calls ready once the control socket is bound and
+/// before any client is served. When binding fails, ready is not called.
+pub fn run_master_daemon_notify<F: FnOnce()>(
+    cfg: MasterConfig,
+    shared: SharedClient,
+    ready: F,
+) -> Result<(), String> {
     let listener = bind_socket(&cfg.control_path)?;
+    ready();
 
     let state = Arc::new(MasterState {
         live_clients: AtomicU64::new(0),
@@ -348,6 +323,7 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         on_forward: cfg.on_forward.clone(),
         on_conninfo: cfg.on_conninfo.clone(),
         on_channels: cfg.on_channels.clone(),
+        #[cfg(unix)]
         peer_check: cfg.peer_check.clone(),
     });
 
@@ -365,8 +341,8 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
     });
 
     // Keep the connection read even while no client runs a session: the
-    // server's channel opens (`-R`, `-A`, `-X`) and keepalives arrive at any
-    // time. Its end (the server went away) ends the master too.
+    // server's channel opens (-R, -A, -X) and keepalives arrive at any time.
+    // Its end (the server went away) ends the master too.
     let pump_shared = shared.clone();
     let pump_state = state.clone();
     let pump = thread::spawn(move || {
@@ -374,46 +350,49 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         pump_state.shutdown.store(true, Ordering::SeqCst);
     });
 
-    // Block here until something flips `shutdown` — the reaper (Seconds linger),
-    // an `-O exit` handler, or the connection ending. Then make sure the
-    // socket is gone and join.
+    // Block here until something flips `shutdown` (the reaper, an -O exit
+    // handler, or the connection ending). Then wake a blocked accept, make
+    // sure the carrier is gone and join the pump.
     while !state.shutdown.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
     }
-    let _ = fs::remove_file(&cfg.control_path);
+    wake_accept(&cfg.control_path);
+    transport::unlink(&cfg.control_path);
     let _ = accept.join();
     let _ = reaper.join();
     let _ = pump.join();
     Ok(())
 }
 
-/// How often the accept loop looks at the shutdown flag between clients.
-const ACCEPT_POLL: Duration = Duration::from_millis(50);
+/// Wake a blocked `accept()` by making one throwaway connection to the
+/// carrier (a Unix socket or a named pipe), so a master that is shutting down
+/// does not stay parked in `accept`.
+fn wake_accept(path: &Path) {
+    transport::wake(path);
+}
 
-/// Accept incoming mux clients and spawn a session handler per connection,
-/// until `shutdown`. The listener is polled rather than blocked on, so
-/// shutdown never depends on reaching it through its path (which may be
-/// gone: `-O exit` callers and tmp cleaners remove it).
-fn accept_loop(listener: UnixListener, shared: SharedClient, state: Arc<MasterState>) {
-    if listener.set_nonblocking(true).is_err() {
-        return;
-    }
-    while !state.shutdown.load(Ordering::SeqCst) {
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(ACCEPT_POLL);
-                continue;
-            }
+/// Accept incoming mux clients and spawn a session handler per connection.
+fn accept_loop(listener: Listener, shared: SharedClient, state: Arc<MasterState>) {
+    loop {
+        let accepted = transport::accept(&listener);
+        // Check shutdown before the error path, so a broken listener cannot keep this
+        // thread alive after the master has been asked to stop.
+        if state.shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        let stream = match accepted {
+            Ok(s) => s,
             Err(_) => {
-                thread::sleep(ACCEPT_POLL);
+                thread::sleep(Duration::from_millis(10));
                 continue;
             }
         };
         // macOS hands accepted sockets the listener's O_NONBLOCK.
+        #[cfg(unix)]
         if stream.set_nonblocking(false).is_err() {
             continue;
         }
+        #[cfg(unix)]
         if let Some(check) = &state.peer_check
             && !check(&stream)
         {
@@ -435,8 +414,9 @@ fn reaper_loop(persist: Persist, state: Arc<MasterState>, path: &Path) {
             // Persist::No teardown, by `run_master_daemon`'s main loop, or by
             // an `-O exit` (`Frame::ExitRequest`) handler. Make the socket
             // teardown idempotent so an ExitRequest under in-process
-            // Persist::Yes still unlinks it.
-            let _ = fs::remove_file(path);
+            // Persist::Yes still unlinks and wakes the accept loop.
+            wake_accept(path);
+            transport::unlink(path);
             return;
         }
         thread::sleep(Duration::from_millis(200));
@@ -465,7 +445,8 @@ fn reaper_loop(persist: Persist, state: Arc<MasterState>, path: &Path) {
                 if since.elapsed() >= Duration::from_secs(n) {
                     drop(idle);
                     state.shutdown.store(true, Ordering::SeqCst);
-                    let _ = fs::remove_file(path);
+                    wake_accept(path);
+                    transport::unlink(path);
                     return;
                 }
             }
@@ -474,7 +455,7 @@ fn reaper_loop(persist: Persist, state: Arc<MasterState>, path: &Path) {
 }
 
 /// Serve one attached client: HELLO handshake, OPEN_SESSION, then splice.
-fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterState>) {
+fn handle_client(stream: Stream, shared: SharedClient, state: Arc<MasterState>) {
     let mut ctrl = stream;
 
     // HELLO exchange.
@@ -513,7 +494,7 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
             // `ssh -O exit`: ask the whole master to shut down.
             state.shutdown.store(true, Ordering::SeqCst);
             if let Some(f) = &state.on_exit {
-                let _ = fs::remove_file(&state.control_path);
+                transport::unlink(&state.control_path);
                 f();
             }
             return;
@@ -611,7 +592,7 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
 /// `StdoutData` back to it).
 #[allow(clippy::too_many_arguments)]
 fn handle_direct_tcpip(
-    mut ctrl: UnixStream,
+    mut ctrl: Stream,
     shared: SharedClient,
     state: Arc<MasterState>,
     dest_host: &str,
@@ -665,7 +646,7 @@ fn handle_direct_tcpip(
 /// Splice a mux control socket against a session channel:
 ///   socket STDIN_DATA → channel write; channel stdout → socket STDOUT_DATA;
 ///   channel stderr → socket STDERR_DATA; channel exit → socket EXIT_STATUS.
-fn splice(ctrl: UnixStream, chan: OwnedChannelStream, shared: &SharedClient) {
+fn splice(ctrl: Stream, chan: OwnedChannelStream, shared: &SharedClient) {
     let channel_id = chan.channel_id();
     // Keep the pump from parking forever in a quiescent read so the writer
     // (control→channel) thread can squeeze in (mirrors the interactive path).
@@ -769,9 +750,12 @@ fn splice(ctrl: UnixStream, chan: OwnedChannelStream, shared: &SharedClient) {
     drop(chan);
 }
 
-#[cfg(test)]
+/// The private-bind hardening is Unix-only: it is an answer to the socket
+/// file's umask and ownership rules.
+#[cfg(all(test, unix))]
 mod bind_tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn control_socket_is_bound_owner_only_and_never_clobbered() {
@@ -779,7 +763,7 @@ mod bind_tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("control-socket");
-        let l = bind_private(&sock).unwrap();
+        let l = transport::bind(&sock).unwrap();
         let mode = fs::symlink_metadata(&sock).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         // The temporary directory is gone; only the socket is left.
@@ -792,7 +776,7 @@ mod bind_tests {
         let _c = UnixStream::connect(&sock).unwrap();
         assert!(l.accept().is_ok());
         // A second master does not replace the first.
-        let e = bind_private(&sock).unwrap_err();
+        let e = transport::bind(&sock).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
         let _ = fs::remove_dir_all(&dir);

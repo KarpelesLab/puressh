@@ -20,8 +20,10 @@ autobins = false
 [features]
 # The defaults are what a client-library consumer needs. The server side
 # (`server`, `pam`) and the agent daemon (`agent`) are opt-in; the release
-# builds of the binaries enable all three.
-default = ["std", "client", "compress", "multichannel", "knock", "security-key", "pkcs11"]
+# builds of the binaries enable all three. `win-ipc` is on by default so a
+# Windows `cargo install` gets ControlMaster without extra flags; it is inert
+# on other targets.
+default = ["std", "client", "compress", "multichannel", "knock", "security-key", "pkcs11", "win-ipc"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -80,6 +82,10 @@ mio = ["client"]
 # without it there is no libpam runtime dep. The dep itself is also gated to
 # Linux, so other builds stay clean.
 pam = ["server", "dep:dlsym"]
+# Native Windows ControlMaster transport over named pipes, with current-user
+# ACLs and CryptProtectMemory-derived names. Only enables `unsafe` on Windows
+# targets; every other target keeps `forbid(unsafe_code)`.
+win-ipc = ["client", "multichannel"]
 
 [dependencies]
 # `libc` for the few low-level POSIX bits: constants the library passes to

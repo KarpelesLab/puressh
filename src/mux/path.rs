@@ -81,7 +81,7 @@ pub fn expand_tokens_with_hash(
             None => pre.push('%'),
         }
     }
-    crate::proc_transport::expand_tokens(&pre, host, port, user)
+    crate::expand::expand_tokens(&pre, host, port, user)
 }
 
 /// Best-effort local hostname for `%C` / `%l`. Tries `$HOSTNAME`, then the
@@ -157,7 +157,7 @@ pub fn expand_control_path(
 /// Apply the `sun_path` length check to an already-expanded path string.
 /// Returns the path unchanged when it fits, otherwise [`ControlPathTooLong`].
 pub fn socket_path_for(expanded: &str) -> Result<PathBuf, ControlPathTooLong> {
-    if expanded.len() <= SUN_PATH_MAX {
+    if cfg!(not(unix)) || expanded.len() <= SUN_PATH_MAX {
         Ok(PathBuf::from(expanded))
     } else {
         Err(ControlPathTooLong {
@@ -232,6 +232,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn overlong_path_is_rejected() {
         let long_name: String = "x".repeat(200);
         let full = format!("/tmp/{long_name}");
@@ -245,6 +246,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn overlong_parent_is_rejected_not_relocated() {
         // Regression: this used to land in `std::env::temp_dir()` under a
         // predictable name any local user could pre-create.
@@ -253,6 +255,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn expand_control_path_propagates_length_error() {
         let tilde = |s: &str| s.to_string();
         assert!(expand_control_path("/tmp/cm-%C", "lh", "h", 22, "u", tilde).is_ok());

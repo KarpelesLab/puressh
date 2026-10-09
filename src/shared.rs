@@ -1339,6 +1339,16 @@ impl SharedClient {
 /// needs next (still under the same lock).
 ///
 /// `what` is a short tag used in error messages.
+/// Read the next packet, retrying across read timeouts. The request and open
+/// helpers must not fail just because the pump interval elapsed, so they loop.
+fn read_packet_retrying(g: &mut Inner) -> Result<Vec<u8>> {
+    loop {
+        if let Some(payload) = g.client.read_one_packet_maybe_timeout()? {
+            return Ok(payload);
+        }
+    }
+}
+
 fn open_session_under_lock(g: &mut Inner, what: &'static str) -> Result<u32> {
     let (local_id, open_payload) = g.client.conn.open(ChannelOpen::Session)?;
     g.client.write_payload(&open_payload)?;
@@ -1350,7 +1360,7 @@ fn open_session_under_lock(g: &mut Inner, what: &'static str) -> Result<u32> {
         if iter_guard > MAX_OPEN_ITER {
             return Err(Error::Protocol(open_loop_msg(what)));
         }
-        let payload = g.client.read_one_packet()?;
+        let payload = read_packet_retrying(g)?;
         let ev = g.client.conn.on_packet(&payload)?;
         match ev {
             ChannelEvent::OpenConfirmed { channel } if channel == local_id => {
@@ -1437,7 +1447,7 @@ fn await_open_under_lock(g: &mut Inner, local_id: u32, what: &'static str) -> Re
         if iter_guard > MAX_OPEN_ITER {
             return Err(Error::Protocol(open_loop_msg(what)));
         }
-        let payload = g.client.read_one_packet()?;
+        let payload = read_packet_retrying(g)?;
         let ev = g.client.conn.on_packet(&payload)?;
         match ev {
             ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
@@ -1468,7 +1478,7 @@ fn send_request_and_await(
         if iter_guard > MAX_OPEN_ITER {
             return Err(Error::Protocol(reply_loop_msg(what)));
         }
-        let payload = g.client.read_one_packet()?;
+        let payload = read_packet_retrying(g)?;
         let ev = g.client.conn.on_packet(&payload)?;
         match ev {
             ChannelEvent::Success { channel } if channel == local_id => return Ok(()),

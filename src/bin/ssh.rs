@@ -767,8 +767,8 @@ fn parse_jump_hops(spec: &str) -> Result<Vec<JumpHop>, String> {
 
 /// Collect publickey credentials for a host: agent identities (unless
 /// `IdentitiesOnly`), then the `-i` CLI identities, then the matching
-/// ssh_config block's `IdentityFile`s, then the OpenSSH default identities
-/// under `~/.ssh/`. Mirrors OpenSSH's ordering. `cli_identities` is empty
+/// ssh_config block's `IdentityFile`s, then (only when neither names one)
+/// the OpenSSH default identities under `~/.ssh/`. Mirrors OpenSSH. `cli_identities` is empty
 /// for ProxyJump hops (the `-i` flag targets the final host only).
 fn collect_credentials(
     cfg_block: &puressh::config::ClientOptions,
@@ -828,7 +828,7 @@ fn collect_credentials(
             .map(|c| (expand_tilde(c), None))
             .collect();
         let mut implicit_keys = key_paths.clone();
-        if !identities_only {
+        if key_paths.is_empty() {
             implicit_keys.extend(
                 default_identity_paths()
                     .into_iter()
@@ -928,7 +928,9 @@ fn collect_credentials(
             Err(e) => warn!("warning: config identity {id_path}: {e}"),
         }
     }
-    if !identities_only {
+    // Like OpenSSH, the default identities are used only when no -i or
+    // IdentityFile names one (IdentitiesOnly restricts agent keys, not these).
+    if cli_identities.is_empty() && cfg_block.identity_files.is_empty() {
         for path in default_identity_paths() {
             match try_load_default_identity(&path) {
                 Ok(Some(pk)) => match pk.into_host_key() {

@@ -35,26 +35,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Linux binaries are built on Ubuntu 22.04 so they link against
+          # glibc 2.35 and run on 22.04 and anything newer (24.04, …).
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             archive: tar.gz
             asset_suffix: linux-x86_64
             # `pam-client2` (default-on for sshd on Linux) needs libpam.
             apt_packages: libpam0g-dev
+          # Native arm64 runner (free for public repos): no cross toolchain,
+          # and libpam0g-dev installs for the host architecture, so this
+          # build keeps every default feature, PAM included.
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04-arm
             archive: tar.gz
             asset_suffix: linux-aarch64
-            apt_packages: gcc-aarch64-linux-gnu
-            linker: aarch64-linux-gnu-gcc
-            # GitHub's `ubuntu-latest` runners only mirror amd64 packages
-            # for the security/updates suites; arm64 lives on
-            # ports.ubuntu.com and pulling `libpam0g-dev:arm64` through
-            # `dpkg --add-architecture` 404s on the default mirror. Easier
-            # to drop the `pam` feature for this one cross binary —
-            # everything else stays on by default. Downstream users who
-            # need PAM on aarch64 can rebuild from source.
-            cargo_features: --no-default-features --features "std,client,server,compress,multichannel"
+            apt_packages: libpam0g-dev
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
@@ -84,17 +80,9 @@ jobs:
 
       - name: Build CLI binaries and C library
         shell: bash
-        env:
-          # Only set the linker env var when the matrix entry asks for one.
-          # GitHub Actions silently drops empty `env:` values, so this is
-          # a no-op for the native targets.
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
         run: |
-          # `cargo_features` is empty for default-feature builds; matrix
-          # entries that need a different set (e.g. aarch64-linux dropping
-          # the `pam` feature, see the matrix comment above) populate it.
-          cargo build --release --bin ssh  ${{ matrix.cargo_features }} --target ${{ matrix.target }}
-          cargo build --release --bin sshd ${{ matrix.cargo_features }} --target ${{ matrix.target }}
+          cargo build --release --bin ssh  --target ${{ matrix.target }}
+          cargo build --release --bin sshd --target ${{ matrix.target }}
           cargo rustc --lib --release --features ffi --crate-type staticlib --target ${{ matrix.target }}
           cargo rustc --lib --release --features ffi --crate-type cdylib    --target ${{ matrix.target }}
 

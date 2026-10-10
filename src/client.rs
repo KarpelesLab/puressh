@@ -935,7 +935,7 @@ pub struct Client {
     /// issues `auth-agent-req@openssh.com` immediately after the open and
     /// before the matching shell/exec/subsystem request. Toggle with
     /// [`Self::set_request_auth_agent_forwarding`].
-    request_auth_agent: bool,
+    pub(crate) request_auth_agent: bool,
     /// When `Some`, every session-channel helper issues `x11-req`
     /// immediately after the open and before the matching
     /// shell/exec/subsystem request. Toggle with
@@ -977,14 +977,14 @@ pub struct Client {
     /// Callers that need exact per-binding correlation (as the shipped
     /// `ssh` binary does) should keep doing it in their
     /// `on_forwarded_tcpip` callback.
-    tcpip_forward_grants: Vec<(String, u16)>,
+    pub(crate) tcpip_forward_grants: Vec<(String, u16)>,
     /// Outstanding reverse streamlocal-forward grants: socket paths for which
     /// [`Self::request_streamlocal_forward`] succeeded and which have not been
     /// cancelled via [`Self::cancel_streamlocal_forward`]. Used as the same
     /// conservative defence-in-depth filter as [`Self::tcpip_forward_grants`]:
     /// a `forwarded-streamlocal@openssh.com` open is rejected only when there
     /// are **zero** outstanding grants.
-    streamlocal_forward_grants: Vec<String>,
+    pub(crate) streamlocal_forward_grants: Vec<String>,
     /// Set by the host-key verifier when a *changed* key was accepted via
     /// [`TofuAction::AcceptWithWarning`]. Shared with the verifier closure
     /// (which runs on every KEX, including re-keys). See
@@ -1122,6 +1122,11 @@ impl Client {
         me.driver.start(Instant::now())?;
         me.drive_handshake()?;
         Ok(me)
+    }
+
+    /// Whether X11 forwarding was requested ([`Self::set_request_x11_forwarding`]).
+    pub(crate) fn wants_x11(&self) -> bool {
+        self.request_x11.is_some()
     }
 
     /// `true` if this session was established over a host key that did

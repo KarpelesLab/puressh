@@ -15,14 +15,14 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread;
 
 use puressh::auth::SecretString;
 use puressh::auth::{ClientCredential, KeyboardInteractiveResponder};
 use puressh::client::{
     AlgoOverrides, ChannelStream, Client, ClientHandlers, Config, ForwardedTcpipCallback,
-    ForwardedTcpipOrigin, ServeContext,
+    ForwardedTcpipOrigin,
 };
 
 #[path = "common.rs"]
@@ -57,7 +57,7 @@ const USAGE: &str = "usage: ssh [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface] [
 /// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
 /// each accepted connection becomes a `direct-tcpip` channel to the server
 /// targeting `RHOST:RPORT`. Each forward gets a dedicated accept thread
-/// that drives [`ServeContext::open_direct_tcpip`] per connection.
+/// that opens a `direct-tcpip` channel on the shared connection per connection.
 #[derive(Clone, Debug)]
 struct LocalForward {
     /// Local port to bind on `127.0.0.1`.
@@ -1911,14 +1911,8 @@ fn run() -> Result<i32, String> {
         client.set_session_env(session_env);
     }
 
-    // ServerAliveInterval / ServerAliveCountMax drive the serve loop's
-    // keepalive. No-op on the one-shot exec path (which doesn't serve).
-    if let Some(interval) = cfg_block.server_alive_interval
-        && interval > 0
-    {
-        let count_max = cfg_block.server_alive_count_max.unwrap_or(3);
-        client.set_keepalive(interval, count_max);
-    }
+    // ServerAliveInterval: started once the connection is shared (below).
+    let server_alive = cfg_block.server_alive_interval.filter(|i| *i > 0);
 
     // `-f`: authenticated; continue in the background.
     #[cfg(unix)]
@@ -1932,43 +1926,66 @@ fn run() -> Result<i32, String> {
         return run_stdio_forward(client, &spec);
     }
 
-    // If any port-forwarding was requested, switch over to the multi-channel
-    // serve loop instead of the single-shot exec/shell path. Mixing exec with
-    // forwarding on the same client is a follow-up — it needs the serve loop
-    // to also drive a session channel concurrently.
-    //
-    // `-A` (agent forwarding) also routes through the serve loop: it needs a
-    // session channel open (for the `auth-agent-req@openssh.com` request)
-    // plus concurrent handling of incoming `auth-agent@openssh.com` channels,
-    // which is exactly the multi-channel shape.
-    let want_forwarding = cli.no_command
-        || !cli.remotes.is_empty()
-        || !cli.locals.is_empty()
-        || !dynamics.is_empty()
-        || cli.agent_forward
-        || cli.x11_forward.is_some();
-    if want_forwarding {
-        if cli.command.is_some() {
-            return Err(
-                "running a command alongside -A/-D/-L/-R/-N/-X/-Y is not yet supported; \
-                        invoke ssh twice or wire the forward without a command"
-                    .into(),
-            );
-        }
-        if cli.no_command
-            && cli.remotes.is_empty()
-            && cli.locals.is_empty()
-            && dynamics.is_empty()
-            && !cli.agent_forward
-            && cli.x11_forward.is_none()
+    // Forwarding, set up the way OpenSSH does it, alongside the session:
+    //   -R  remote listeners, requested now (the replies are synchronous);
+    //   -A  -X/-Y  requested on the session channel, the server's agent /
+    //       X11 channels accepted by the handlers below;
+    //   -L  -D  local listeners opening direct-tcpip channels.
+    let exit_on_forward_failure = cfg_block.exit_on_forward_failure == Some(true);
+    let gateway = cfg_block
+        .gateway_ports
+        .unwrap_or(puressh::config::GatewayPorts::No);
+    let mut handlers = ClientHandlers::new();
+    if let Some(cb) = request_remote_forwards(&mut client, &cli, exit_on_forward_failure)? {
+        handlers = handlers.with_forwarded_tcpip(cb);
+    }
+    if cli.agent_forward {
+        #[cfg(unix)]
         {
-            return Err("-N requires at least one of -A, -D, -L, -R, -X, -Y".into());
+            let cb =
+                puressh::forwarding::agent::splice_to_local_agent_callback().ok_or_else(|| {
+                    "-A: $SSH_AUTH_SOCK is unset, or names a socket that failed validation \
+                     (must exist, be a socket, not a symlink, owned by you, mode 0?00); \
+                     refusing to forward the agent"
+                        .to_string()
+                })?;
+            handlers = handlers.with_auth_agent(cb);
+            client.set_request_auth_agent_forwarding(true);
         }
-        let exit_on_forward_failure = cfg_block.exit_on_forward_failure == Some(true);
-        let gateway = cfg_block
-            .gateway_ports
-            .unwrap_or(puressh::config::GatewayPorts::No);
-        return run_forwarding(client, &cli, &dynamics, exit_on_forward_failure, gateway);
+        #[cfg(not(unix))]
+        warn!("Warning: agent forwarding is not supported on this platform; ignoring -A");
+    }
+    if let Some(mode) = cli.x11_forward {
+        #[cfg(unix)]
+        {
+            let cb =
+                puressh::forwarding::x11::splice_to_local_display_callback().ok_or_else(|| {
+                    "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial"
+                        .to_string()
+                })?;
+            // puressh has no SECURITY-extension cookie isolation yet: -X
+            // behaves like -Y. Say so rather than silently downgrading.
+            if mode == X11Forward::Untrusted {
+                warn!(
+                    "Warning: -X is currently equivalent to -Y in puressh (no \
+                     SECURITY-extension cookie); the remote can read X11 input from \
+                     your local display."
+                );
+            }
+            let cookie = mint_x11_cookie()?;
+            handlers = handlers.with_x11(cb);
+            client.set_request_x11_forwarding(Some((
+                false,
+                "MIT-MAGIC-COOKIE-1".to_string(),
+                cookie,
+                0,
+            )));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = mode;
+            warn!("Warning: X11 forwarding is not supported on this platform; ignoring -X/-Y");
+        }
     }
 
     // The session: a command (`-s`: a subsystem) or the login shell, all
@@ -1987,21 +2004,227 @@ fn run() -> Result<i32, String> {
         .unwrap_or_else(puressh::config::ObscureKeystrokeTiming::default_on);
     let command = cli.command.clone();
     let subsystem = cli.subsystem;
+    let no_command = cli.no_command;
     let shared: puressh::shared::SharedClient = client.into();
+    shared.set_channel_handlers(handlers);
+    start_local_forwards(&shared, &cli, &dynamics, gateway, exit_on_forward_failure)?;
+    if let Some(interval) = server_alive {
+        spawn_keepalive(&shared, interval);
+    }
+
+    // `-N`: no session; keep the connection (and its forwards) alive.
+    let run = move |s: &puressh::shared::SharedClient| -> i32 {
+        if no_command {
+            return match s.pump_until_closed() {
+                Ok(()) => 0,
+                Err(e) => {
+                    warn!("Connection closed: {e}");
+                    255
+                }
+            };
+        }
+        // With forwards or remote channels to serve, keep pumping the
+        // connection when the session is not reading.
+        let what = session_request(command.as_deref(), subsystem);
+        run_session(s, what, use_pty, okt, escape).unwrap_or_else(|e| {
+            eprintln!("ssh: {e}");
+            255
+        })
+    };
     // Master role: serve the control socket while running this session as
     // the foreground one.
     #[cfg(unix)]
     if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
-        return become_master(dec, &cli, &cfg_block, shared, move |s| {
-            let what = session_request(command.as_deref(), subsystem);
-            run_session(s, what, use_pty, okt, escape).unwrap_or_else(|e| {
-                eprintln!("ssh: {e}");
-                255
-            })
-        });
+        return become_master(dec, &cli, &cfg_block, shared, run);
     }
-    let what = session_request(command.as_deref(), subsystem);
-    run_session(&shared, what, use_pty, okt, escape)
+    Ok(run(&shared))
+}
+
+/// `ServerAliveInterval`: a keepalive on the connection every `interval`
+/// seconds, so NAT and firewall state stays up during quiet periods, and
+/// ssh exits (status 255) once the connection can no longer be written to.
+fn spawn_keepalive(shared: &puressh::shared::SharedClient, interval: u32) {
+    let s = shared.clone();
+    thread::spawn(move || {
+        loop {
+            thread::sleep(std::time::Duration::from_secs(interval as u64));
+            if let Err(e) = s.send_ping(b"keepalive") {
+                eprintln!("Timeout, server not responding: {e}");
+                std::process::exit(255);
+            }
+        }
+    });
+}
+
+/// `-R`: ask the server to listen for every remote forward (before the
+/// connection is shared: the replies are awaited synchronously) and return
+/// the callback that connects each forwarded connection to its local
+/// target. `None` when there are no remote forwards.
+fn request_remote_forwards(
+    client: &mut Client,
+    cli: &Cli,
+    exit_on_forward_failure: bool,
+) -> Result<Option<Arc<ForwardedTcpipCallback>>, String> {
+    if cli.remotes.is_empty() {
+        return Ok(None);
+    }
+    let mut routes: std::collections::BTreeMap<(String, u16), (String, u16)> =
+        std::collections::BTreeMap::new();
+    for r in &cli.remotes {
+        let bound_port = match client.request_tcpip_forward("127.0.0.1", r.remote_port) {
+            Ok(p) => p,
+            Err(e) => {
+                let msg = format!(
+                    "remote port forwarding failed for listen port {}: {e}",
+                    r.remote_port
+                );
+                if exit_on_forward_failure {
+                    return Err(msg);
+                }
+                warn!("Warning: {msg}");
+                continue;
+            }
+        };
+        vlog(
+            1,
+            &format!(
+                "-R 127.0.0.1:{}:{}:{} active",
+                bound_port, r.local_host, r.local_port
+            ),
+        );
+        // OpenSSH reports the port the server picked for `-R 0:…`.
+        if r.remote_port == 0 {
+            warn!(
+                "Allocated port {bound_port} for remote forward to {}:{}",
+                r.local_host, r.local_port
+            );
+        }
+        routes.insert(
+            ("127.0.0.1".to_string(), bound_port),
+            (r.local_host.clone(), r.local_port),
+        );
+    }
+    let routes = Arc::new(routes);
+    let cb: Arc<ForwardedTcpipCallback> =
+        Arc::new(move |origin: ForwardedTcpipOrigin, stream: ChannelStream| {
+            let Some((local_host, local_port)) = routes
+                .get(&(origin.bound_address.clone(), origin.bound_port))
+                .cloned()
+            else {
+                warn!(
+                    "Warning: forwarded connection for unknown listener {}:{}; dropping",
+                    origin.bound_address, origin.bound_port
+                );
+                return;
+            };
+            match TcpStream::connect((local_host.as_str(), local_port)) {
+                Ok(tcp) => spawn_splice_to_tcp(stream, tcp),
+                Err(e) => warn!(
+                    "connect to {local_host} port {local_port} failed: {e} (forwarded from {}:{})",
+                    origin.orig_address, origin.orig_port
+                ),
+            }
+        });
+    Ok(Some(cb))
+}
+
+/// `-L` and `-D`: bind the local listeners; each accepted connection opens
+/// a `direct-tcpip` channel on the shared connection. The bind address
+/// follows `GatewayPorts` (loopback by default).
+fn start_local_forwards(
+    shared: &puressh::shared::SharedClient,
+    cli: &Cli,
+    dynamics: &[DynamicForward],
+    gateway: puressh::config::GatewayPorts,
+    exit_on_forward_failure: bool,
+) -> Result<(), String> {
+    let bind_ip = resolve_bind_addr(gateway, None);
+    for l in &cli.locals {
+        match TcpListener::bind((bind_ip.as_str(), l.listen_port)) {
+            Ok(listener) => {
+                vlog(
+                    1,
+                    &format!(
+                        "-L {}:{}:{}:{} active",
+                        bind_ip, l.listen_port, l.remote_host, l.remote_port
+                    ),
+                );
+                spawn_local_forward_listener(listener, l.clone(), shared.clone());
+            }
+            Err(e) => {
+                let msg = format!("bind [{bind_ip}]:{}: {e}", l.listen_port);
+                if exit_on_forward_failure {
+                    return Err(msg);
+                }
+                warn!("{msg}");
+            }
+        }
+    }
+    for d in dynamics {
+        match TcpListener::bind((d.bind_addr.as_str(), d.listen_port)) {
+            Ok(listener) => {
+                vlog(
+                    1,
+                    &format!("-D {}:{} (SOCKS) active", d.bind_addr, d.listen_port),
+                );
+                spawn_dynamic_forward_listener(listener, d.listen_port, shared.clone());
+            }
+            Err(e) => {
+                let msg = format!("bind [{}]:{}: {e}", d.bind_addr, d.listen_port);
+                if exit_on_forward_failure {
+                    return Err(msg);
+                }
+                warn!("{msg}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Splice a `direct-tcpip` channel on the shared connection with a local TCP
+/// connection, both ways, until either side closes.
+fn splice_shared_with_tcp(
+    shared: puressh::shared::SharedClient,
+    mut stream: puressh::shared::OwnedChannelStream,
+    tcp: TcpStream,
+) {
+    let channel = stream.channel_id();
+    let Ok(mut tcp_in) = tcp.try_clone() else {
+        return;
+    };
+    let mut tcp_out = tcp;
+    // TCP → channel.
+    thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match tcp_in.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !send_all(&shared, channel, &buf[..n]) {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        let _ = shared.channel_send_eof(channel);
+    });
+    // Channel → TCP; dropping the stream closes the channel.
+    thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tcp_out.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = tcp_out.shutdown(std::net::Shutdown::Both);
+    });
 }
 
 /// The session channel request for `ssh [-s] host [command]`.
@@ -3391,269 +3614,14 @@ fn set_so_keepalive(_sock: &TcpStream, _on: bool) -> Result<(), String> {
     Err("TCPKeepAlive is only supported on Unix".into())
 }
 
-/// Drive the multi-channel forwarding loop: register every `-R` binding on the
-/// server, install an `on_forwarded_tcpip` callback that dials the user's
-/// local destination per accepted connection, then enter
-/// [`Client::serve`] until either the peer hangs up or the process is killed.
-///
-/// Returns an exit code matching OpenSSH's `-N -R` behaviour: 0 on a clean
-/// peer disconnect, 255 on protocol error.
-fn run_forwarding(
-    mut client: Client,
-    cli: &Cli,
-    dynamics: &[DynamicForward],
-    exit_on_forward_failure: bool,
-    gateway: puressh::config::GatewayPorts,
-) -> Result<i32, String> {
-    // `ExitOnForwardFailure yes` turns a failed bind / grant into a hard
-    // abort; otherwise we warn and carry on (OpenSSH's default).
-    macro_rules! forward_fail {
-        ($($arg:tt)*) => {{
-            let msg = format!($($arg)*);
-            if exit_on_forward_failure {
-                return Err(msg);
-            } else {
-                eprintln!("ssh: {msg}");
-            }
-        }};
-    }
-
-    // Map "(bound_address, bound_port) → (local_host, local_port)" so the
-    // callback can look up the right local destination for each incoming
-    // forward. The bound address echoed by the server is "127.0.0.1" since
-    // that's what we ask for below.
-    let mut routes: std::collections::BTreeMap<(String, u16), (String, u16)> =
-        std::collections::BTreeMap::new();
-    for r in &cli.remotes {
-        let bound_port = match client.request_tcpip_forward("127.0.0.1", r.remote_port) {
-            Ok(p) => p,
-            Err(e) => {
-                forward_fail!("tcpip-forward 127.0.0.1:{}: {e}", r.remote_port);
-                continue;
-            }
-        };
-        vlog(
-            1,
-            &format!(
-                "-R 127.0.0.1:{}:{}:{} active",
-                bound_port, r.local_host, r.local_port
-            ),
-        );
-        // OpenSSH reports the port the server picked for `-R 0:…`.
-        if r.remote_port == 0 {
-            warn!(
-                "Allocated port {bound_port} for remote forward to {}:{}",
-                r.local_host, r.local_port
-            );
-        }
-        routes.insert(
-            ("127.0.0.1".to_string(), bound_port),
-            (r.local_host.clone(), r.local_port),
-        );
-    }
-    let _ = gateway; // -R always binds loopback server-side in this release.
-
-    let routes = Arc::new(Mutex::new(routes));
-    let routes_for_cb = Arc::clone(&routes);
-    let cb: Arc<ForwardedTcpipCallback> =
-        Arc::new(move |origin: ForwardedTcpipOrigin, stream: ChannelStream| {
-            let target = {
-                let map = match routes_for_cb.lock() {
-                    Ok(g) => g,
-                    Err(_) => return,
-                };
-                map.get(&(origin.bound_address.clone(), origin.bound_port))
-                    .cloned()
-            };
-            let (local_host, local_port) = match target {
-                Some(t) => t,
-                None => {
-                    eprintln!(
-                        "ssh: forwarded-tcpip for unknown binding {}:{}; dropping",
-                        origin.bound_address, origin.bound_port
-                    );
-                    return;
-                }
-            };
-            match TcpStream::connect((local_host.as_str(), local_port)) {
-                Ok(tcp) => spawn_splice_to_tcp(stream, tcp),
-                Err(e) => eprintln!(
-                    "ssh: dial {}:{} for forwarded-tcpip from {}:{}: {e}",
-                    local_host, local_port, origin.orig_address, origin.orig_port
-                ),
-            }
-        });
-
-    let mut handlers = ClientHandlers::new().with_forwarded_tcpip(cb);
-
-    // -A: install an `on_auth_agent` that splices each incoming
-    // `auth-agent@openssh.com` channel against the local `$SSH_AUTH_SOCK`.
-    // Then open a session channel up front so `auth-agent-req@openssh.com`
-    // can ride on it; the channel stays open for the lifetime of the serve
-    // loop. We close it at the end so the server unlinks its
-    // `SSH_AUTH_SOCK`.
-    let agent_fwd_channel: Option<u32> = if cli.agent_forward {
-        // Agent forwarding routes through `$SSH_AUTH_SOCK`, a Unix-domain
-        // socket. The forwarding implementation lives behind `cfg(unix)`
-        // in `puressh::forwarding::agent`, so on Windows we hard-fail
-        // rather than silently ignoring `-A`.
-        #[cfg(unix)]
-        {
-            use puressh::forwarding::agent::splice_to_local_agent_callback;
-            let cb = splice_to_local_agent_callback().ok_or_else(|| {
-                "-A: $SSH_AUTH_SOCK is unset, or names a socket that failed validation \
-                 (must exist, be a socket, not a symlink, owned by you, mode 0?00); \
-                 refusing to forward the agent"
-                    .to_string()
-            })?;
-            handlers = handlers.with_auth_agent(cb);
-            let id = client
-                .open_session_for_agent_forward()
-                .map_err(|e| format!("agent-forward session: {e}"))?;
-            eprintln!("ssh: -A agent forwarding requested");
-            Some(id)
-        }
-        #[cfg(not(unix))]
-        {
-            return Err("-A agent forwarding is not supported on this platform".to_string());
-        }
-    } else {
-        None
-    };
-
-    // -X / -Y: install an `on_x11` callback that splices each incoming `x11`
-    // channel against the local `$DISPLAY`, then open a session channel up
-    // front so `x11-req` can ride on it. The channel stays open for the
-    // lifetime of the serve loop. We close it at the end so the server
-    // tears down its display listener.
-    //
-    // v0: `-X` and `-Y` are identical on the wire — both send
-    // `single_connection=false`, screen 0, MIT-MAGIC-COOKIE-1, and a fresh
-    // random cookie (we don't yet shell out to `xauth` for the real one).
-    // The server passes the cookie through to the on-server display socket
-    // verbatim; the local `on_x11` callback splices against `$DISPLAY`
-    // without rewriting the X-protocol auth record. Cookie substitution
-    // (untrusted-X11 isolation) is a follow-up.
-    let x11_fwd_channel: Option<u32> = if let Some(mode) = cli.x11_forward {
-        // X11 forwarding dials `$DISPLAY` — either a TCP `host:N` form or
-        // a `/tmp/.X11-unix/X<N>` Unix-domain socket. The forwarding
-        // implementation in `puressh::forwarding::x11` is `cfg(unix)` for
-        // the UDS case, so we gate the consumer here too.
-        #[cfg(not(unix))]
-        {
-            let _ = mode;
-            return Err("-X/-Y X11 forwarding is not supported on this platform".to_string());
-        }
-        #[cfg(unix)]
-        {
-            use puressh::forwarding::x11::splice_to_local_display_callback;
-            let cb = splice_to_local_display_callback().ok_or_else(|| {
-                "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial".to_string()
-            })?;
-            handlers = handlers.with_x11(cb);
-            // `-X` is documented as "untrusted X11 forwarding" but
-            // puressh has no SECURITY-extension cookie isolation yet:
-            // both `-X` and `-Y` mint and forward the same plain
-            // MIT-MAGIC-COOKIE-1, which means the remote can read X11
-            // input from the local display either way. Warn loudly
-            // (once, on session start) when the user asked for the
-            // safer `-X` mode so they aren't silently downgraded to
-            // `-Y`-equivalent behaviour. Don't refuse — that would
-            // break existing scripts that rely on `-X` working at all.
-            if mode == X11Forward::Untrusted {
-                eprintln!(
-                    "warning: -X is currently equivalent to -Y in puressh \
-                     (no SECURITY-extension cookie); the remote can read \
-                     X11 input from your local display."
-                );
-            }
-            let cookie = mint_x11_cookie()?;
-            let id = client
-                .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", &cookie, 0)
-                .map_err(|e| format!("x11-forward session: {e}"))?;
-            eprintln!(
-                "ssh: -{} X11 forwarding requested (cookie={} chars)",
-                if mode == X11Forward::Trusted {
-                    "Y"
-                } else {
-                    "X"
-                },
-                cookie.len(),
-            );
-            Some(id)
-        }
-    } else {
-        None
-    };
-
-    // -L / -D: bind every local-forward and SOCKS listener, handing each a
-    // clone of the ServeContext so its accept thread can open `direct-tcpip`
-    // through the running serve loop. Both forward kinds share one context.
-    // The bind address comes from GatewayPorts (loopback by default).
-    let bind_ip = resolve_bind_addr(gateway, None);
-    let ctx_opt: Option<ServeContext> = if cli.locals.is_empty() && dynamics.is_empty() {
-        None
-    } else {
-        let (h, ctx) = handlers.with_serve_context();
-        handlers = h;
-        for l in &cli.locals {
-            match TcpListener::bind((bind_ip.as_str(), l.listen_port)) {
-                Ok(listener) => {
-                    vlog(
-                        1,
-                        &format!(
-                            "-L {}:{}:{}:{} active",
-                            bind_ip, l.listen_port, l.remote_host, l.remote_port
-                        ),
-                    );
-                    spawn_local_forward_listener(listener, l.clone(), ctx.clone());
-                }
-                Err(e) => forward_fail!("-L bind {bind_ip}:{}: {e}", l.listen_port),
-            }
-        }
-        for d in dynamics {
-            match TcpListener::bind((d.bind_addr.as_str(), d.listen_port)) {
-                Ok(listener) => {
-                    vlog(
-                        1,
-                        &format!("-D {}:{} (SOCKS) active", d.bind_addr, d.listen_port),
-                    );
-                    spawn_dynamic_forward_listener(listener, d.listen_port, ctx.clone());
-                }
-                Err(e) => forward_fail!("-D bind {}:{}: {e}", d.bind_addr, d.listen_port),
-            }
-        }
-        Some(ctx)
-    };
-
-    let result = match client.serve(handlers) {
-        Ok(()) => Ok(0),
-        Err(e) => Err(format!("serve: {e}")),
-    };
-
-    // Tear down the agent-forwarding session channel if we opened one.
-    if let Some(id) = agent_fwd_channel {
-        let _ = client.close_session(id);
-    }
-    // Same for the X11-forwarding session channel.
-    if let Some(id) = x11_fwd_channel {
-        let _ = client.close_session(id);
-    }
-    // Hold the original ctx until serve returns so cmd_tx isn't dropped
-    // (the listener threads keep their clones, so this is belt-and-braces).
-    drop(ctx_opt);
-    result
-}
-
 /// Per-`-L` accept loop. Each accepted TCP connection becomes one
-/// `direct-tcpip` channel via the serve loop; we then splice the channel
-/// stream against the TCP socket in both directions until either side
-/// closes.
-///
-/// Mirrors [`spawn_splice_to_tcp`] but for the outbound side: there's no
-/// `forwarded-tcpip` channel; instead we wait for [`ServeContext::open_direct_tcpip`]
-/// to return the freshly-opened [`ChannelStream`] before splicing.
-fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: ServeContext) {
+/// `direct-tcpip` channel on the shared connection, spliced against the
+/// TCP socket in both directions until either side closes.
+fn spawn_local_forward_listener(
+    listener: TcpListener,
+    spec: LocalForward,
+    ctx: puressh::shared::SharedClient,
+) {
     thread::spawn(move || {
         for accept in listener.incoming() {
             let tcp = match accept {
@@ -3678,18 +3646,22 @@ fn spawn_local_forward_listener(listener: TcpListener, spec: LocalForward, ctx: 
                         continue;
                     }
                 };
-            spawn_splice_to_tcp(stream, tcp);
+            splice_shared_with_tcp(ctx.clone(), stream, tcp);
         }
     });
 }
 
 /// Per-`-D` SOCKS accept loop. Each accepted TCP connection runs the SOCKS
 /// handshake ([`puressh::forwarding::socks::handshake`]) to learn the CONNECT
-/// target, opens a `direct-tcpip` channel to it through the serve loop,
+/// target, opens a `direct-tcpip` channel to it on the shared connection,
 /// writes the SOCKS success/failure reply, then splices the channel against
 /// the socket. BIND / UDP / bad-auth requests are rejected in-handshake and
 /// the connection dropped.
-fn spawn_dynamic_forward_listener(listener: TcpListener, listen_port: u16, ctx: ServeContext) {
+fn spawn_dynamic_forward_listener(
+    listener: TcpListener,
+    listen_port: u16,
+    ctx: puressh::shared::SharedClient,
+) {
     use puressh::forwarding::socks;
     thread::spawn(move || {
         for accept in listener.incoming() {
@@ -3722,7 +3694,7 @@ fn spawn_dynamic_forward_listener(listener: TcpListener, listen_port: u16, ctx: 
                         if socks::write_reply(&mut tcp, target.version, true).is_err() {
                             return;
                         }
-                        spawn_splice_to_tcp(stream, tcp);
+                        splice_shared_with_tcp(ctx, stream, tcp);
                     }
                     Err(e) => {
                         eprintln!("ssh: -D direct-tcpip {}:{}: {e}", target.host, target.port);

@@ -186,6 +186,29 @@ struct Inner {
     /// Only one pumper at a time; everyone else either drains its
     /// mailbox (returns immediately) or waits on its channel notifier.
     pumping: bool,
+    /// Callbacks for channels the server opens (agent, X11, forwarded
+    /// TCP / Unix sockets). `None` ⇒ every such open is refused.
+    handlers: Option<IncomingHandlers>,
+    /// Back-reference used to hand accepted channels to their handler
+    /// threads from inside the pump (which only holds `&mut Inner`).
+    self_ref: Option<SelfRef>,
+}
+
+/// The parts of a [`SharedClient`] needed to rebuild one from inside the
+/// pump.
+struct SelfRef {
+    inner: std::sync::Weak<Mutex<Inner>>,
+    lock_waiters: Arc<core::sync::atomic::AtomicUsize>,
+}
+
+/// Server-opened channel callbacks installed with
+/// [`SharedClient::set_channel_handlers`].
+#[derive(Clone)]
+struct IncomingHandlers {
+    forwarded_tcpip: Option<Arc<crate::client::ForwardedTcpipCallback>>,
+    forwarded_streamlocal: Option<Arc<crate::client::ForwardedStreamlocalCallback>>,
+    auth_agent: Option<Arc<crate::client::AuthAgentCallback>>,
+    x11: Option<Arc<crate::client::X11Callback>>,
 }
 
 /// Owned, clonable handle to a connected [`Client`] that supports
@@ -217,14 +240,24 @@ pub struct SharedClient {
 
 impl From<Client> for SharedClient {
     fn from(client: Client) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(Inner {
+        let lock_waiters = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let waiters = lock_waiters.clone();
+        let inner = Arc::new_cyclic(|weak| {
+            Mutex::new(Inner {
                 client,
                 queues: BTreeMap::new(),
                 notifiers: BTreeMap::new(),
                 pumping: false,
-            })),
-            lock_waiters: Arc::new(core::sync::atomic::AtomicUsize::new(0)),
+                handlers: None,
+                self_ref: Some(SelfRef {
+                    inner: weak.clone(),
+                    lock_waiters: waiters,
+                }),
+            })
+        });
+        Self {
+            inner,
+            lock_waiters,
         }
     }
 }
@@ -468,6 +501,64 @@ impl SharedClient {
             channel: local_id,
             local_close_sent: false,
         })
+    }
+
+    /// Keep the connection serviced until it closes: read and dispatch
+    /// packets (channel data for any open stream, server-opened channels
+    /// for [`Self::set_channel_handlers`], keepalive replies) even when no
+    /// stream is being read — `ssh -N` with `-R` or `-A` needs exactly
+    /// that. Cooperates with stream readers: it only pumps while nobody
+    /// else does. Returns the error that ended the connection.
+    pub fn pump_until_closed(&self) -> Result<()> {
+        self.set_read_timeout(Some(Duration::from_millis(50)))?;
+        loop {
+            let pumped = {
+                let _ticket = LockTicket::new(&self.lock_waiters);
+                let mut g = lock_or_poison(&self.inner)?;
+                if g.pumping {
+                    false
+                } else {
+                    g.pumping = true;
+                    let res = OwnedChannelStream::pump_one_step(&mut g);
+                    g.pumping = false;
+                    for cv in g.notifiers.values() {
+                        cv.notify_one();
+                    }
+                    res.map_err(Error::from)?;
+                    true
+                }
+            };
+            // Let stream readers / writers in between steps (the mutex is
+            // not fair), and back off while another thread is pumping.
+            std::thread::sleep(if pumped {
+                Duration::from_micros(200)
+            } else {
+                Duration::from_millis(10)
+            });
+        }
+    }
+
+    /// Accept the channels the server opens toward the client — the
+    /// agent socket for `ssh -A`, X11 connections for `ssh -X`, and the
+    /// connections of `ssh -R` remote forwards (TCP and Unix socket) — and
+    /// hand each to the matching callback of `handlers` on its own thread,
+    /// with a [`crate::stream::ChannelStream`] bridged onto the shared
+    /// connection. The same callbacks as [`Client::serve`] are used.
+    ///
+    /// A channel is only accepted when the client asked for it: agent and
+    /// X11 channels require the agent / X11 forwarding request to have been
+    /// enabled on the [`Client`] before conversion, forwarded channels a
+    /// granted `tcpip-forward` / `streamlocal-forward`. Everything else is
+    /// refused, as without handlers.
+    pub fn set_channel_handlers(&self, handlers: crate::client::ClientHandlers) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.handlers = Some(IncomingHandlers {
+                forwarded_tcpip: handlers.on_forwarded_tcpip,
+                forwarded_streamlocal: handlers.on_forwarded_streamlocal,
+                auth_agent: handlers.on_auth_agent,
+                x11: handlers.on_x11,
+            });
+        }
     }
 
     /// Send a `window-change` request (RFC 4254 §6.7) on a previously
@@ -890,7 +981,161 @@ fn notifier_for(g: &mut Inner, channel: u32) -> Arc<Condvar> {
 /// waiter sleeping on the target channel's notifier. The pump path and
 /// the under-lock open helpers both go through this so the CV
 /// notification can't be forgotten on one path and not the other.
+/// What an accepted server-opened channel is for.
+enum IncomingKind {
+    ForwardedTcpip(
+        Arc<crate::client::ForwardedTcpipCallback>,
+        crate::client::ForwardedTcpipOrigin,
+    ),
+    ForwardedStreamlocal(
+        Arc<crate::client::ForwardedStreamlocalCallback>,
+        crate::client::ForwardedStreamlocalOrigin,
+    ),
+    AuthAgent(Arc<crate::client::AuthAgentCallback>),
+    X11(Arc<crate::client::X11Callback>),
+}
+
+/// Decide on a server-initiated channel open: `Some` ⇒ a handler wants it
+/// and the client asked for this kind of channel; `None` ⇒ refuse.
+fn incoming_handler(g: &Inner, kind: &ChannelOpen) -> Option<IncomingKind> {
+    let h = g.handlers.as_ref()?;
+    match kind {
+        ChannelOpen::ForwardedTcpip {
+            dest_host,
+            dest_port,
+            orig_host,
+            orig_port,
+        } if !g.client.tcpip_forward_grants.is_empty() => {
+            let (Ok(bound_port), Ok(orig_port)) =
+                (u16::try_from(*dest_port), u16::try_from(*orig_port))
+            else {
+                return None;
+            };
+            Some(IncomingKind::ForwardedTcpip(
+                h.forwarded_tcpip.clone()?,
+                crate::client::ForwardedTcpipOrigin {
+                    bound_address: dest_host.clone(),
+                    bound_port,
+                    orig_address: orig_host.clone(),
+                    orig_port,
+                },
+            ))
+        }
+        ChannelOpen::ForwardedStreamlocal { socket_path }
+            if !g.client.streamlocal_forward_grants.is_empty() =>
+        {
+            Some(IncomingKind::ForwardedStreamlocal(
+                h.forwarded_streamlocal.clone()?,
+                crate::client::ForwardedStreamlocalOrigin {
+                    socket_path: socket_path.clone(),
+                },
+            ))
+        }
+        // Never over a host key that did not match known_hosts (the
+        // requests are not even sent then; refuse a stray open too).
+        ChannelOpen::AuthAgent
+            if g.client.request_auth_agent && !g.client.host_key_mismatched() =>
+        {
+            Some(IncomingKind::AuthAgent(h.auth_agent.clone()?))
+        }
+        ChannelOpen::X11 { .. } if g.client.wants_x11() && !g.client.host_key_mismatched() => {
+            Some(IncomingKind::X11(h.x11.clone()?))
+        }
+        _ => None,
+    }
+}
+
+/// Accept a server-opened channel and start its handler: one thread feeds
+/// the channel's data into a [`crate::stream::ChannelStream`] for the
+/// callback, another ships what the callback writes back out.
+fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
+    let Some(self_ref) = g.self_ref.as_ref() else {
+        return;
+    };
+    let Some(arc) = self_ref.inner.upgrade() else {
+        return;
+    };
+    let shared = SharedClient {
+        inner: arc,
+        lock_waiters: self_ref.lock_waiters.clone(),
+    };
+    match g.client.conn.accept_open(channel) {
+        Ok(p) => {
+            if g.client.write_payload(&p).is_err() {
+                return;
+            }
+        }
+        Err(_) => return,
+    }
+    g.queues.entry(channel).or_default();
+    let mut stream = OwnedChannelStream {
+        shared: shared.clone(),
+        channel,
+        local_close_sent: false,
+    };
+    let (ingress_tx, ingress_rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+    let (egress_tx, egress_rx) =
+        std::sync::mpsc::sync_channel::<crate::stream::ChannelEgress>(INCOMING_EGRESS_BACKLOG);
+    let cs = crate::stream::ChannelStream::new(ingress_rx, egress_tx);
+    std::thread::spawn(move || match kind {
+        IncomingKind::ForwardedTcpip(cb, origin) => cb(origin, cs),
+        IncomingKind::ForwardedStreamlocal(cb, origin) => cb(origin, cs),
+        IncomingKind::AuthAgent(cb) => cb(cs),
+        IncomingKind::X11(cb) => cb(cs),
+    });
+    // Handler → channel.
+    let out = shared;
+    std::thread::spawn(move || {
+        use crate::stream::ChannelEgress;
+        while let Ok(msg) = egress_rx.recv() {
+            match msg {
+                ChannelEgress::Data(bytes) => {
+                    let mut off = 0;
+                    while off < bytes.len() {
+                        match out.channel_send_data(channel, &bytes[off..]) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => off += n,
+                        }
+                    }
+                }
+                ChannelEgress::Eof => {
+                    let _ = out.channel_send_eof(channel);
+                }
+                ChannelEgress::Close => break,
+                _ => {}
+            }
+        }
+        let _ = out.channel_send_eof(channel);
+    });
+    // Channel → handler; dropping the stream at the end closes the channel.
+    std::thread::spawn(move || {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if ingress_tx.send(Some(buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = ingress_tx.send(None);
+        drop(stream);
+    });
+}
+
+/// Queue depth between a server-opened channel's handler and the thread
+/// that sends its output.
+const INCOMING_EGRESS_BACKLOG: usize = 64;
+
 fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
+    if let ChannelEvent::OpenRequest { channel, kind } = &ev
+        && let Some(handler) = incoming_handler(g, kind)
+    {
+        accept_incoming(g, *channel, handler);
+        return;
+    }
     // Peer-initiated opens (we accept none on a SharedClient) and global
     // requests that want a reply (sshd keepalives) are answered here, on
     // the pump path, so no consumer thread has to know about them. Best

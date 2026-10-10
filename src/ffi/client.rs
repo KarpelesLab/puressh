@@ -404,7 +404,7 @@ pub unsafe extern "C" fn pcssh_client_auth_publickey(
             // SAFETY: caller guarantees at least `private_key_pem_len` readable
             // bytes; the length was bounded to `isize::MAX` above.
             let pem_bytes =
-                unsafe { slice::from_raw_parts(private_key_pem as *const u8, private_key_pem_len) };
+                unsafe { slice::from_raw_parts(private_key_pem.cast::<u8>(), private_key_pem_len) };
             let pem_str = match core::str::from_utf8(pem_bytes) {
                 Ok(s) => s,
                 Err(_) => return PCSSH_ERR_INVALID_ARGUMENT,

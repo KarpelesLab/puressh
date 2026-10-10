@@ -8,6 +8,11 @@
 //! ssh-keygen -R host [-f known_hosts_path]            (remove entries)
 //! ssh-keygen -F host [-f known_hosts_path]            (find / print entries)
 //! ssh-keygen -H [-f known_hosts_path]                 (hash all entries)
+//! ssh-keygen -Y sign -f key_file -n namespace [-U] [-O option] file ...
+//! ssh-keygen -Y verify -f allowed_signers -I principal -n namespace -s sig_file
+//! ssh-keygen -Y find-principals -f allowed_signers -s sig_file
+//! ssh-keygen -Y match-principals -f allowed_signers -I principal
+//! ssh-keygen -Y check-novalidate -n namespace -s sig_file
 //! ```
 
 use std::fs;
@@ -70,7 +75,13 @@ const USAGE: &str = "usage: ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C com
                      ssh-keygen -R host [-f known_hosts_path]                             (remove host entries)\n       \
                      ssh-keygen -F host [-f known_hosts_path]                             (find host entries)\n       \
                      ssh-keygen -H [-f known_hosts_path]                                  (hash all entries)\n       \
-                     ssh-keygen -A [-f prefix] [-q]                                       (create missing host keys)";
+                     ssh-keygen -A [-f prefix] [-q]                                       (create missing host keys)\n       \
+                     ssh-keygen -Y sign -f key_file -n namespace [-U] [-O option] file ...\n       \
+                     ssh-keygen -Y verify -f allowed_signers_file -I signer_identity\n                  \
+                     -n namespace -s signature_file [-O option]\n       \
+                     ssh-keygen -Y find-principals -f allowed_signers_file -s signature_file\n       \
+                     ssh-keygen -Y match-principals -f allowed_signers_file -I signer_identity\n       \
+                     ssh-keygen -Y check-novalidate -n namespace -s signature_file";
 
 #[derive(Default)]
 struct Args {
@@ -98,6 +109,20 @@ struct Args {
     host_keys: bool,
     /// `-q`: quiet.
     quiet: bool,
+    /// `-Y op`: SSH signature operation (`sign`, `verify`, …).
+    sig_op: Option<String>,
+    /// `-n`: signature namespace.
+    namespace: Option<String>,
+    /// `-I`: signer identity (principal).
+    identity: Option<String>,
+    /// `-s`: signature file.
+    sig_file: Option<String>,
+    /// `-O`: options (`hashalg=`, `verify-time=`, `print-pubkey`).
+    sig_options: Vec<String>,
+    /// `-U`: the key is in the agent.
+    use_agent: bool,
+    /// Positional arguments (files to sign).
+    rest: Vec<String>,
     /// `-p` (in known_hosts mode means port — but ssh-keygen historically
     /// uses `host` directly; we accept `[host]:port` syntax via the
     /// pattern matcher instead and don't reuse `-p`).
@@ -118,7 +143,37 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             return Err("argument loop overflow".into());
         }
         let a = &args[i];
+        // `-Ovalue` / `-nvalue` etc.: the value attached to the flag.
+        if a.len() > 2
+            && let Some(v) = a.strip_prefix("-O")
+        {
+            out.sig_options.push(v.to_string());
+            i += 1;
+            continue;
+        }
         match a.as_str() {
+            "-Y" => {
+                i += 1;
+                out.sig_op = Some(args.get(i).ok_or("-Y requires an operation")?.clone());
+            }
+            "-n" => {
+                i += 1;
+                out.namespace = Some(args.get(i).ok_or("-n requires a namespace")?.clone());
+            }
+            "-I" => {
+                i += 1;
+                out.identity = Some(args.get(i).ok_or("-I requires an identity")?.clone());
+            }
+            "-s" => {
+                i += 1;
+                out.sig_file = Some(args.get(i).ok_or("-s requires a file")?.clone());
+            }
+            "-O" => {
+                i += 1;
+                out.sig_options
+                    .push(args.get(i).ok_or("-O requires an option")?.clone());
+            }
+            "-U" => out.use_agent = true,
             "-t" => {
                 i += 1;
                 out.type_ = Some(args.get(i).ok_or("-t requires a value")?.clone());
@@ -167,8 +222,9 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "-H" => out.hash_all = true,
             "-A" => out.host_keys = true,
             "-q" => out.quiet = true,
+            "-" => out.rest.push(a.clone()),
             s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
-            _ => return Err(format!("unexpected argument: {a}")),
+            _ => out.rest.push(a.clone()),
         }
         i += 1;
     }
@@ -688,6 +744,20 @@ fn run() -> Result<i32, i32> {
             return Err(2);
         }
     };
+    if let Some(op) = &parsed.sig_op {
+        return match sig::run(op, &parsed) {
+            Ok(code) => Ok(code),
+            Err(msg) => {
+                eprintln!("{msg}");
+                Err(255)
+            }
+        };
+    }
+    if let Some(a) = parsed.rest.first() {
+        eprintln!("ssh-keygen: unexpected argument: {a}");
+        eprintln!("{USAGE}");
+        return Err(2);
+    }
 
     let mode_count = [
         parsed.fingerprint as u8,
@@ -740,6 +810,308 @@ fn run() -> Result<i32, i32> {
                 || lower.contains("decrypt")
                 || lower.contains("encode");
             Err(if crypto { 3 } else { 1 })
+        }
+    }
+}
+
+/// `-Y`: SSH signatures (OpenSSH `PROTOCOL.sshsig`), as used by git.
+mod sig {
+    use super::{Args, PrivateKey, PublicKey, algorithm_label, read_passphrase_interactive};
+    use puressh::sshsig::{AllowedSigner, HashAlg, Signature};
+    use std::io::{Read, Write};
+
+    pub(super) fn run(op: &str, args: &Args) -> Result<i32, String> {
+        let mut hash = HashAlg::Sha512;
+        let mut verify_time = None;
+        let mut print_pubkey = false;
+        for o in &args.sig_options {
+            let (name, value) = o.split_once('=').unwrap_or((o, ""));
+            match name.to_ascii_lowercase().as_str() {
+                "hashalg" => {
+                    hash = HashAlg::from_name(value)
+                        .ok_or_else(|| format!("Unsupported hash algorithm \"{value}\""))?
+                }
+                "verify-time" => {
+                    verify_time = Some(
+                        puressh::sshsig::parse_time(value, local_offset(now()))
+                            .ok_or_else(|| format!("Invalid \"verify-time\" option: {value}"))?,
+                    )
+                }
+                "print-pubkey" => print_pubkey = true,
+                _ => return Err(format!("Invalid option \"{o}\"")),
+            }
+        }
+        let now = verify_time.unwrap_or_else(now);
+        match op {
+            "sign" => sign(args, hash),
+            "verify" => verify(args, now, print_pubkey, true),
+            "check-novalidate" => verify(args, now, print_pubkey, false),
+            "find-principals" => find_principals(args, now),
+            "match-principals" => match_principals(args),
+            _ => Err(format!("Unsupported operation for -Y: \"{op}\"")),
+        }
+    }
+
+    fn now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// The local zone's offset east of UTC at `t`, in seconds.
+    #[cfg(unix)]
+    fn local_offset(t: i64) -> i64 {
+        let tt = t as libc::time_t;
+        // SAFETY: `tm` is plain data; localtime_r fills it or returns NULL.
+        let mut tm: libc::tm = unsafe { core::mem::zeroed() };
+        if unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
+            return 0;
+        }
+        tm.tm_gmtoff as i64
+    }
+
+    #[cfg(not(unix))]
+    fn local_offset(_t: i64) -> i64 {
+        0
+    }
+
+    fn require<'a>(v: &'a Option<String>, what: &str) -> Result<&'a str, String> {
+        v.as_deref().ok_or_else(|| format!("Missing {what}"))
+    }
+
+    fn read_signature(path: &str) -> Result<Signature, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Couldn't read signature file: {e}"))?;
+        Signature::from_armored(&text).map_err(|e| format!("Couldn't parse signature: {e}"))
+    }
+
+    fn read_allowed_signers(path: &str, at: i64) -> Result<Vec<AllowedSigner>, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("open {path}: {e}"))?;
+        let (signers, bad) = AllowedSigner::parse_file(&text, local_offset(at));
+        for (line, e) in bad {
+            eprintln!("{path}:{line}: {e}");
+        }
+        Ok(signers)
+    }
+
+    /// A signer: the private key from `-f`, or the agent holding it.
+    enum Signer {
+        Key(Box<dyn puressh::hostkey::HostKey + Send>),
+        #[cfg(unix)]
+        Agent(puressh::agent::Agent, u32),
+    }
+
+    fn load_signer(path: &str, use_agent: bool) -> Result<(Signer, PublicKey), String> {
+        let text =
+            std::fs::read_to_string(path).map_err(|e| format!("Couldn't load {path}: {e}"))?;
+        let public = PublicKey::parse_authorized_keys_line(text.trim()).ok();
+        if use_agent || public.is_some() {
+            #[cfg(not(unix))]
+            return Err("signing with an agent is not supported on this platform".into());
+            #[cfg(unix)]
+            {
+                let pk = match public {
+                    Some(pk) => pk,
+                    None => super::load_public(&format!("{path}.pub"))
+                        .or_else(|_| super::load_public(path))?,
+                };
+                let agent = puressh::agent::Agent::connect_env()
+                    .ok()
+                    .flatten()
+                    .ok_or("Couldn't get agent socket")?;
+                // SSH_AGENT_RSA_SHA2_512: OpenSSH signs with rsa-sha2-512.
+                let flags = if matches!(pk, PublicKey::Rsa { .. }) {
+                    4
+                } else {
+                    0
+                };
+                return Ok((Signer::Agent(agent, flags), pk));
+            }
+        }
+        let sk = match PrivateKey::parse_openssh_pem(&text, None) {
+            Ok(k) => k,
+            Err(_) => {
+                let pp =
+                    read_passphrase_interactive(&format!("Enter passphrase for \"{path}\": "))?;
+                PrivateKey::parse_openssh_pem(&text, Some(pp.as_bytes()))
+                    .map_err(|e| format!("Couldn't load key {path}: {e}"))?
+            }
+        };
+        let pk = sk.public_key();
+        let key = sk.into_host_key().map_err(|e| format!("{path}: {e}"))?;
+        Ok((Signer::Key(key), pk))
+    }
+
+    fn sign_digest(
+        signer: &mut Signer,
+        pk: &PublicKey,
+        namespace: &str,
+        hash: HashAlg,
+        digest: &[u8],
+    ) -> Result<String, String> {
+        let sig = Signature::create(
+            pk.wire_blob(),
+            namespace,
+            hash,
+            digest,
+            |data| match signer {
+                Signer::Key(k) => k.sign(data),
+                #[cfg(unix)]
+                Signer::Agent(a, flags) => a.sign(&pk.wire_blob(), data, *flags),
+            },
+        )
+        .map_err(|e| format!("Signing failed: {e}"))?;
+        Ok(sig.to_armored())
+    }
+
+    fn sign(args: &Args, hash: HashAlg) -> Result<i32, String> {
+        let key_path = require(&args.file, "key file (-f)")?;
+        let namespace = require(&args.namespace, "namespace (-n)")?;
+        let (mut signer, pk) = load_signer(key_path, args.use_agent)?;
+        let files: Vec<&str> = if args.rest.is_empty() {
+            vec!["-"]
+        } else {
+            args.rest.iter().map(String::as_str).collect()
+        };
+        for f in files {
+            if f == "-" {
+                let digest = hash
+                    .digest_reader(std::io::stdin().lock())
+                    .map_err(|e| format!("read stdin: {e}"))?;
+                let armored = sign_digest(&mut signer, &pk, namespace, hash, &digest)?;
+                std::io::stdout()
+                    .write_all(armored.as_bytes())
+                    .map_err(|e| format!("write: {e}"))?;
+                continue;
+            }
+            if !args.quiet {
+                eprintln!("Signing file {f}");
+            }
+            let file = std::fs::File::open(f).map_err(|e| format!("Cannot open {f}: {e}"))?;
+            let digest = hash
+                .digest_reader(std::io::BufReader::new(file))
+                .map_err(|e| format!("read {f}: {e}"))?;
+            let armored = sign_digest(&mut signer, &pk, namespace, hash, &digest)?;
+            let out = format!("{f}.sig");
+            if std::path::Path::new(&out).exists() && !confirm_overwrite(&out) {
+                return Err(format!("{out} exists, not overwriting"));
+            }
+            std::fs::write(&out, armored).map_err(|e| format!("Cannot write {out}: {e}"))?;
+            if !args.quiet {
+                eprintln!("Write signature to {out}");
+            }
+        }
+        Ok(0)
+    }
+
+    fn confirm_overwrite(path: &str) -> bool {
+        println!("{path} already exists.");
+        print!("Overwrite (y/n)? ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let mut byte = [0u8; 1];
+        while std::io::stdin()
+            .read(&mut byte)
+            .map(|n| n == 1)
+            .unwrap_or(false)
+            && byte[0] != b'\n'
+        {
+            line.push(byte[0] as char);
+        }
+        line.starts_with('y')
+    }
+
+    fn verify(args: &Args, now: i64, print_pubkey: bool, validate: bool) -> Result<i32, String> {
+        let namespace = require(&args.namespace, "namespace (-n)")?;
+        let sig = read_signature(require(&args.sig_file, "signature file (-s)")?)?;
+        let digest = sig
+            .hash
+            .digest_reader(std::io::stdin().lock())
+            .map_err(|e| format!("read stdin: {e}"))?;
+        let pk = PublicKey::parse_wire_blob(&sig.public_key);
+        let mut result = sig
+            .verify(namespace, &digest)
+            .map_err(|e| format!("Signature verification failed: {e}"));
+        let mut principal = None;
+        if validate && result.is_ok() {
+            let allowed =
+                read_allowed_signers(require(&args.file, "allowed signers file (-f)")?, now)?;
+            let id = require(&args.identity, "signer identity (-I)")?;
+            let found = allowed.iter().any(|s| {
+                s.is_key(&sig.public_key, now)
+                    && s.matches_principal(id)
+                    && s.allows_namespace(namespace)
+            });
+            result = if found {
+                principal = Some(id);
+                Ok(())
+            } else {
+                Err(format!(
+                    "Signature verification failed: no allowed signer \"{id}\" \
+                     for this key and namespace \"{namespace}\""
+                ))
+            };
+        }
+        match (result, pk) {
+            (Ok(()), Ok(pk)) => {
+                if !args.quiet {
+                    let fp = pk.sha256_fingerprint();
+                    let ty = algorithm_label(&pk);
+                    match principal {
+                        Some(p) => {
+                            println!("Good \"{namespace}\" signature for {p} with {ty} key {fp}")
+                        }
+                        None => println!("Good \"{namespace}\" signature with {ty} key {fp}"),
+                    }
+                }
+                if print_pubkey {
+                    println!("{}", pk.to_authorized_keys_line());
+                }
+                Ok(0)
+            }
+            (res, _) => {
+                if let Err(e) = res {
+                    eprintln!("{e}");
+                }
+                if !args.quiet {
+                    println!("Could not verify signature.");
+                }
+                Ok(255)
+            }
+        }
+    }
+
+    fn find_principals(args: &Args, now: i64) -> Result<i32, String> {
+        let sig = read_signature(require(&args.sig_file, "signature file (-s)")?)?;
+        let allowed = read_allowed_signers(require(&args.file, "allowed signers file (-f)")?, now)?;
+        let mut found = false;
+        for s in allowed.iter().filter(|s| s.is_key(&sig.public_key, now)) {
+            for p in s.principals.split(',') {
+                println!("{p}");
+            }
+            found = true;
+        }
+        if found {
+            Ok(0)
+        } else {
+            Err("No principal matched.".into())
+        }
+    }
+
+    fn match_principals(args: &Args) -> Result<i32, String> {
+        let id = require(&args.identity, "signer identity (-I)")?;
+        let allowed =
+            read_allowed_signers(require(&args.file, "allowed signers file (-f)")?, now())?;
+        let mut found = false;
+        for s in allowed.iter().filter(|s| s.matches_principal(id)) {
+            println!("{}", s.principals);
+            found = true;
+        }
+        if found {
+            Ok(0)
+        } else {
+            Err("No principal matched.".into())
         }
     }
 }

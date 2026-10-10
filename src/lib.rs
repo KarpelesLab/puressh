@@ -85,6 +85,9 @@ pub mod cert;
 pub mod krl;
 
 #[cfg(feature = "alloc")]
+pub mod sshsig;
+
+#[cfg(feature = "alloc")]
 pub mod config;
 
 #[cfg(feature = "std")]

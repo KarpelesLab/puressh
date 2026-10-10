@@ -417,6 +417,12 @@ pub struct Config {
     /// `KexAlgorithms`, `HostKeyAlgorithms`, `PubkeyAcceptedAlgorithms`).
     /// `None` everywhere ⇒ use the built-in defaults.
     pub algorithms: AlgoOverrides,
+    /// Host key the server must present, as an SSH wire blob, checked in
+    /// addition to `host_key_policy`. Set by a knock rendezvous
+    /// ([`KnockAccepted::pin`](crate::knock::KnockAccepted::pin)) so the
+    /// session runs over the key that signed the ACCEPT; it also narrows the
+    /// advertised host-key algorithms to that key's. `None` ⇒ no pin.
+    pub pinned_host_key: Option<Vec<u8>>,
 }
 
 /// Per-connection overrides for the advertised algorithm preference lists.
@@ -464,6 +470,7 @@ impl Config {
             host_key_policy,
             timeout: None,
             algorithms: AlgoOverrides::default(),
+            pinned_host_key: None,
         }
     }
 
@@ -488,6 +495,7 @@ impl Config {
             host_key_policy: HostKeyPolicy::AcceptAny,
             timeout: None,
             algorithms: AlgoOverrides::default(),
+            pinned_host_key: None,
         }
     }
 
@@ -501,6 +509,7 @@ impl Config {
             host_key_policy: HostKeyPolicy::KnownHosts(KnownHostsPolicy::strict(store)),
             timeout: None,
             algorithms: AlgoOverrides::default(),
+            pinned_host_key: None,
         }
     }
 }
@@ -1064,12 +1073,25 @@ impl Client {
         // known-hosts I/O / prompting. Called on each `SSH_MSG_KEX_ECDH_REPLY`
         // (initial and re-key).
         let host_key_policy = cfg.host_key_policy;
+        let mut algorithms = cfg.algorithms;
+        let pinned = cfg.pinned_host_key;
+        if let Some(pin) = &pinned {
+            algorithms.host_key_algorithms = Some(pinned_host_key_algorithms(
+                pin,
+                algorithms.host_key_algorithms.as_deref(),
+            )?);
+        }
         let target_host = host.to_string();
-        let ca_sig_algos = cfg.algorithms.ca_signature_algorithms.clone();
+        let ca_sig_algos = algorithms.ca_signature_algorithms.clone();
         let host_key_mismatched = Arc::new(AtomicBool::new(false));
         let mismatched_flag = host_key_mismatched.clone();
         let verifier_factory: crate::driver::client::VerifierFactory =
             Box::new(move |reply: &[u8], runner: &KexRunner| {
+                if let Some(pin) = &pinned
+                    && reply_host_key(reply)? != pin.as_slice()
+                {
+                    return Err(Error::HostKeyRejected);
+                }
                 build_verifier(
                     reply,
                     &host_key_policy,
@@ -1081,13 +1103,13 @@ impl Client {
                     &mismatched_flag,
                 )
             });
-        let driver = ClientDriver::new(cfg.algorithms.clone(), verifier_factory);
+        let driver = ClientDriver::new(algorithms.clone(), verifier_factory);
         let mut me = Self {
             stream,
             out_buf: VecDeque::new(),
             conn: ConnectionState::new(),
             driver,
-            algo_overrides: cfg.algorithms,
+            algo_overrides: algorithms,
             request_auth_agent: false,
             request_x11: None,
             session_env: Vec::new(),
@@ -3405,6 +3427,41 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// `K_S` (the host key blob) of an `SSH_MSG_KEX_ECDH_REPLY` payload.
+fn reply_host_key(reply_payload: &[u8]) -> Result<&[u8]> {
+    let mut r = crate::format::Reader::new(reply_payload);
+    r.read_u8()?;
+    r.read_string()
+}
+
+/// Host-key algorithms that can present `pin`, intersected with the
+/// caller's `HostKeyAlgorithms` override (if any), in that override's order.
+fn pinned_host_key_algorithms(pin: &[u8], over: Option<&[String]>) -> Result<Vec<String>> {
+    let key_alg = crate::format::Reader::new(pin).read_string()?;
+    let algs: &[&str] = match key_alg {
+        b"ssh-rsa" => &["rsa-sha2-512", "rsa-sha2-256"],
+        b"ssh-ed25519" => &["ssh-ed25519"],
+        b"ecdsa-sha2-nistp256" => &["ecdsa-sha2-nistp256"],
+        b"ecdsa-sha2-nistp384" => &["ecdsa-sha2-nistp384"],
+        b"ecdsa-sha2-nistp521" => &["ecdsa-sha2-nistp521"],
+        _ => return Err(Error::Unsupported("pinned host key type")),
+    };
+    let out: Vec<String> = match over {
+        Some(list) => list
+            .iter()
+            .filter(|a| algs.contains(&a.as_str()))
+            .cloned()
+            .collect(),
+        None => algs.iter().map(|a| a.to_string()).collect(),
+    };
+    if out.is_empty() {
+        return Err(Error::Config(
+            "HostKeyAlgorithms excludes the pinned host key's algorithm",
+        ));
+    }
+    Ok(out)
+}
+
 /// Build the exchange-hash verifier for the host key carried in
 /// `reply_payload`, making the trust decision per `policy` first.
 ///
@@ -4650,6 +4707,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::AcceptFingerprint([0xffu8; 32]),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
         let err = Client::connect(addr, cfg).err().expect("must fail");
         assert!(matches!(err, Error::HostKeyRejected));
@@ -4689,6 +4747,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
 
         let _client =
@@ -4734,6 +4793,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
 
         let err = Client::connect_to_host("127.0.0.1", addr.port(), cfg)
@@ -4791,6 +4851,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
 
         let _client =
@@ -4843,6 +4904,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
 
         let err = Client::connect_to_host("127.0.0.1", addr.port(), cfg)
@@ -4895,6 +4957,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
 
         let _client =
@@ -4941,6 +5004,7 @@ mod tests {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
             timeout: None,
             algorithms: Default::default(),
+            pinned_host_key: None,
         };
 
         let mut client =

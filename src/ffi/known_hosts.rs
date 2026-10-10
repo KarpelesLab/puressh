@@ -581,6 +581,7 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
                     host_key_policy: HostKeyPolicy::KnownHosts(policy),
                     timeout,
                     algorithms: Default::default(),
+                    pinned_host_key: None,
                 }
             };
 

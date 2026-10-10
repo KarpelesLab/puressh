@@ -134,6 +134,11 @@ pub mod mux;
 #[cfg(feature = "multichannel")]
 pub mod shared;
 
+// Stealth UDP rendezvous ("knock") in front of the TCP listener; a
+// puressh-only extension, see `docs/knock.md`.
+#[cfg(feature = "knock")]
+pub mod knock;
+
 #[cfg(feature = "server")]
 pub mod server;
 

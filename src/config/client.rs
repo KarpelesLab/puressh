@@ -71,6 +71,19 @@ pub enum AddressFamily {
     Inet6,
 }
 
+/// `KnockMode` value — when the client falls back to the puressh UDP knock
+/// (`docs/knock.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KnockSetting {
+    /// `no`: plain TCP only.
+    No,
+    /// `auto` (default): knock when the TCP connect is refused or slow.
+    Auto,
+    /// `always`: knock straight away, no plain TCP attempt.
+    Always,
+}
+
 /// `GatewayPorts` value — controls the bind address of client-side
 /// `-L` / `-D` listeners.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,6 +410,13 @@ pub struct ClientOptions {
     /// interactive sessions (`yes`/`no`/`interval:<spec>`). Unset ⇒ honoring
     /// site applies the OpenSSH default (`yes` at 20 ms).
     pub obscure_keystroke_timing: Option<ObscureKeystrokeTiming>,
+    /// `KnockMode` — puressh UDP knock fallback (no/auto/always).
+    pub knock_mode: Option<KnockSetting>,
+    /// `KnockFallbackDelay` — ms a TCP connect may stay pending before the
+    /// knock starts alongside it.
+    pub knock_fallback_delay: Option<u32>,
+    /// `KnockPort` — UDP port to knock on (default: the SSH port).
+    pub knock_port: Option<u16>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -888,6 +908,35 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "bindaddress" => {
             opts.bind_address = Some(one_arg(line)?);
         }
+        "knockmode" => {
+            let s = one_arg(line)?.to_ascii_lowercase();
+            opts.knock_mode = Some(match s.as_str() {
+                "no" | "never" | "false" | "off" => KnockSetting::No,
+                "auto" | "yes" | "true" | "on" => KnockSetting::Auto,
+                "always" => KnockSetting::Always,
+                other => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected no/auto/always, got {other:?}"),
+                    });
+                }
+            });
+        }
+        "knockfallbackdelay" => {
+            opts.knock_fallback_delay = Some(parse_u32(line)?);
+        }
+        "knockport" => {
+            let port = parse_u32(line)?;
+            if port == 0 || port > u16::MAX as u32 {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "KnockPort must be 1..=65535".into(),
+                });
+            }
+            opts.knock_port = Some(port as u16);
+        }
         "identityagent" => {
             let v = one_arg(line)?;
             opts.identity_agent = Some(if v.eq_ignore_ascii_case("none") {
@@ -1011,6 +1060,9 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(control_path);
     take_scalar!(control_persist);
     take_scalar!(obscure_keystroke_timing);
+    take_scalar!(knock_mode);
+    take_scalar!(knock_fallback_delay);
+    take_scalar!(knock_port);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.certificate_files
@@ -1798,6 +1850,22 @@ Host *.example.com !secret.example.com
         let eff = cfg.lookup("h");
         assert_eq!(eff.server_alive_interval, Some(15));
         assert_eq!(eff.server_alive_count_max, Some(4));
+    }
+
+    #[test]
+    fn knock_keywords_parse() {
+        let cfg = SshClientConfig::parse(
+            "Host a\n KnockMode always\n KnockFallbackDelay 250\n KnockPort 2222\n\
+             Host *\n KnockMode no\n",
+        )
+        .unwrap();
+        let a = cfg.lookup("a");
+        assert_eq!(a.knock_mode, Some(KnockSetting::Always));
+        assert_eq!(a.knock_fallback_delay, Some(250));
+        assert_eq!(a.knock_port, Some(2222));
+        assert_eq!(cfg.lookup("b").knock_mode, Some(KnockSetting::No));
+        assert!(SshClientConfig::parse("KnockMode maybe\n").is_err());
+        assert!(SshClientConfig::parse("KnockPort 0\n").is_err());
     }
 
     #[test]

@@ -4738,6 +4738,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -4829,6 +4830,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -4906,6 +4908,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -4996,6 +4999,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5079,6 +5083,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5334,6 +5339,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5423,6 +5429,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5590,6 +5597,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5765,6 +5773,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5858,6 +5867,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -5950,6 +5960,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -6100,6 +6111,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -6181,6 +6193,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -6291,6 +6304,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -6995,6 +7009,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("client connect");
@@ -7109,6 +7124,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("connect");
@@ -7224,6 +7240,7 @@ mod tests {
                 host_key_policy: HostKeyPolicy::AcceptAny,
                 timeout: Some(Duration::from_secs(10)),
                 algorithms: Default::default(),
+                pinned_host_key: None,
             },
         )
         .expect("connect");

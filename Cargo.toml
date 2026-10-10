@@ -18,7 +18,7 @@ categories = ["cryptography", "network-programming"]
 autobins = false
 
 [features]
-default = ["std", "client", "server", "compress", "pam", "multichannel"]
+default = ["std", "client", "server", "compress", "pam", "multichannel", "knock"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -33,6 +33,10 @@ compress = ["dep:compcol"]
 # drain). Default on; turning it off keeps the borrow-based Client API and
 # strips ~600 lines of code from `src/shared.rs`.
 multichannel = ["client"]
+# Stealth UDP rendezvous ("knock", `docs/knock.md`): a signed UDP datagram
+# opens a one-shot TCP listener in front of a regular SSH session. puressh
+# only; not understood by other SSH implementations. Default on.
+knock = ["std"]
 # C ABI surface. Requires `std`, the `client` module, and the multi-channel
 # layer (the FFI's PcSshSftp / PcSshAgent depend on `SharedClient`). Produces
 # additional `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).

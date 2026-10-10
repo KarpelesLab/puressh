@@ -267,6 +267,7 @@ pub unsafe extern "C" fn pcssh_client_connect_ex(
                 },
                 timeout,
                 algorithms: Default::default(),
+                pinned_host_key: None,
             };
             match connect_bounded(host_str, port, timeout, make_cfg) {
                 Ok(c) => {

@@ -13,6 +13,33 @@ ssh_wanted() {
 		[ -L /etc/systemd/system/sshd.service ]
 }
 
+# An OpenSSH listener can outlive openssh-server's removal: its prerm does
+# not stop it, and with KillMode=process it stays behind in ssh.service's
+# cgroup once that unit is ours, holding port 22. Its binary has been
+# replaced, so it shows up as "/usr/sbin/sshd (deleted)" with PID 1 as its
+# parent. Stop only such listeners: per-connection processes are their
+# children, so open sessions survive. PIDs are collected first so a child
+# orphaned by an earlier kill is never mistaken for a listener.
+stop_stale_listeners() {
+	pids=
+	for d in /proc/[0-9]*; do
+		[ "$(readlink "$d/exe" 2>/dev/null)" = "/usr/sbin/sshd (deleted)" ] || continue
+		[ "$(awk '/^PPid:/ { print $2 }' "$d/status" 2>/dev/null)" = 1 ] || continue
+		pids="$pids ${d#/proc/}"
+	done
+	[ -n "$pids" ] || return 0
+	# shellcheck disable=SC2086
+	kill -TERM $pids 2>/dev/null || true
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		alive=
+		for pid in $pids; do
+			[ -d "/proc/$pid" ] && alive=1
+		done
+		[ -n "$alive" ] || return 0
+		sleep 0.5
+	done
+}
+
 if [ "$1" = "configure" ]; then
 	/usr/lib/puressh/sshd-prepare
 
@@ -73,6 +100,8 @@ MSG
 			systemctl -q is-active ssh.service 2>/dev/null; then
 			# KillMode=process: only the old listener is replaced, open
 			# sessions survive.
+			systemctl stop ssh.service || true
+			stop_stale_listeners
 			systemctl restart ssh.service
 		fi
 	fi

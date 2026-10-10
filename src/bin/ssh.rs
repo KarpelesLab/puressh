@@ -819,8 +819,33 @@ fn collect_credentials(
         let mut key_paths: Vec<String> = cli_identities.to_vec();
         key_paths.extend(cfg_block.identity_files.iter().map(|p| expand_tilde(p)));
 
-        for cert_raw in &cfg_block.certificate_files {
-            let cert_path = expand_tilde(cert_raw);
+        // Explicit CertificateFile entries pair with any of those keys; like
+        // OpenSSH, `<identity>-cert.pub` next to an identity (including
+        // the default ones) is also offered, paired with that identity.
+        let mut candidates: Vec<(String, Option<String>)> = cfg_block
+            .certificate_files
+            .iter()
+            .map(|c| (expand_tilde(c), None))
+            .collect();
+        let mut implicit_keys = key_paths.clone();
+        if !identities_only {
+            implicit_keys.extend(
+                default_identity_paths()
+                    .into_iter()
+                    .filter(|p| p.exists())
+                    .map(|p| p.display().to_string()),
+            );
+        }
+        for kp in implicit_keys {
+            let cert_path = format!("{kp}-cert.pub");
+            if std::path::Path::new(&cert_path).exists()
+                && !candidates.iter().any(|(c, _)| *c == cert_path)
+            {
+                candidates.push((cert_path, Some(kp)));
+            }
+        }
+
+        for (cert_path, own_key) in candidates {
             let text = match std::fs::read_to_string(&cert_path) {
                 Ok(t) => t,
                 Err(e) => {
@@ -837,7 +862,11 @@ fn collect_credentials(
             };
             // Find the matching private key by embedded-key equality.
             let mut paired = false;
-            for kp in &key_paths {
+            let pair_with = match &own_key {
+                Some(k) => std::slice::from_ref(k),
+                None => &key_paths[..],
+            };
+            for kp in pair_with {
                 let Ok(pk) = load_identity(kp) else { continue };
                 let Ok(signer) = pk.into_host_key_sync() else {
                     continue;
@@ -845,13 +874,10 @@ fn collect_credentials(
                 if signer.public_blob() != cert.embedded_pubkey_blob {
                     continue;
                 }
-                let cert_name = puressh::cert::CERT_KEY_NAMES
-                    .iter()
-                    .copied()
-                    .find(|n| {
-                        puressh::cert::cert_name_to_plain(n) == Some(cert.embedded_algorithm())
-                    })
-                    .unwrap_or("ssh-ed25519-cert-v01@openssh.com");
+                let Some(cert_name) = puressh::cert::cert_name_for_key_type(signer.algorithm())
+                else {
+                    continue;
+                };
                 match CertHostKey::new(signer, &cert, cert_name) {
                     Ok(ch) => {
                         vlog(1, &format!("certificate {cert_path}: offered"));

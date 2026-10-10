@@ -1156,6 +1156,10 @@ pub fn load_client_config(
 ) -> Result<puressh::config::SshClientConfig, String> {
     use puressh::config::SshClientConfig;
     if let Some(path) = explicit {
+        // `-F none`: no configuration file at all.
+        if path == Path::new("none") {
+            return Ok(SshClientConfig::default());
+        }
         // File-based load so `Include` directives resolve (each anchored to
         // the including file's own directory). `-F` means this file only.
         return SshClientConfig::load(path).map_err(|e| format!("{}: {e}", path.display()));

@@ -246,9 +246,25 @@ impl KnownHosts {
 
         if host_matched {
             LookupResult::Mismatch { expected }
+        } else if port != 22 && self.plain_host_has_key(host, key_type, key_blob) {
+            LookupResult::Match
         } else {
             LookupResult::Unknown
         }
+    }
+
+    /// OpenSSH's fallback for a non-default port with no `[host]:port`
+    /// entry: a key recorded under the bare host name is accepted, though a
+    /// *different* key there is not a mismatch (verified against OpenSSH
+    /// 10.4).
+    fn plain_host_has_key(&self, host: &str, key_type: &str, key_blob: &[u8]) -> bool {
+        self.lines.iter().any(|slot| {
+            matches!(slot, Slot::Entry(e)
+                if e.marker.is_none()
+                    && e.key_type == key_type
+                    && e.key_blob == key_blob
+                    && host_field_matches(&e.host_spec, host, 22))
+        })
     }
 
     /// Decide whether a host *certificate* is trusted for `host[:port]`.
@@ -295,30 +311,23 @@ impl KnownHosts {
         cert.check_validity(now)?;
         cert.require_known_critical_options()?;
 
-        // Pass 2: find a matching @cert-authority entry.
-        let mut saw_ca = false;
-        for slot in &self.lines {
-            let Slot::Entry(e) = slot else { continue };
-            if e.marker != Some(Marker::CertAuthority) {
-                continue;
-            }
-            if !host_field_matches(&e.host_spec, host, port) {
-                continue;
-            }
-            saw_ca = true;
-            if e.key_blob == cert.signature_key_blob {
-                // This CA is trusted for this host. Verify the CA signature
-                // and the principal binding.
-                cert.verify_ca_signature(allowed_ca_algos)?;
-                cert.check_principal(host)?;
-                return Ok(());
-            }
+        // Pass 2: find a matching @cert-authority entry for `[host]:port`,
+        // then (like OpenSSH, for a non-default port) for the bare host.
+        let ca_trusted = |port: u16| {
+            self.lines.iter().any(|slot| {
+                matches!(slot, Slot::Entry(e)
+                    if e.marker == Some(Marker::CertAuthority)
+                        && e.key_blob == cert.signature_key_blob
+                        && host_field_matches(&e.host_spec, host, port))
+            })
+        };
+        if ca_trusted(port) || (port != 22 && ca_trusted(22)) {
+            // This CA is trusted for this host. Verify the CA signature and
+            // the principal binding.
+            cert.verify_ca_signature(allowed_ca_algos)?;
+            cert.check_principal(host)?;
+            return Ok(());
         }
-
-        // No trusted CA for this host. If we saw a @cert-authority line for the
-        // host but its key didn't match, that's a CA mismatch; otherwise the
-        // host is simply unknown to the cert system.
-        let _ = saw_ca;
         Err(Error::HostKeyRejected)
     }
 

@@ -1198,7 +1198,7 @@ mod imp {
             // skipped; only having no usable key at all is fatal.
             let loaded_key = (|| -> Result<Box<dyn HostKey + Send>, String> {
                 if strict_modes {
-                    check_mode_strict(path, 0o077, "host key", None)?;
+                    check_owner_mode(path, 0o077, "host key")?;
                 }
                 let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
                 let priv_key = PrivateKey::parse_openssh_pem(&pem, None)
@@ -1235,10 +1235,7 @@ mod imp {
             if !matches!(cert.cert_type, puressh::cert::CertType::Host) {
                 return Err(format!("{path}: not a host certificate"));
             }
-            let cert_name = puressh::cert::CERT_KEY_NAMES
-                .iter()
-                .copied()
-                .find(|n| puressh::cert::cert_name_to_plain(n) == Some(cert.embedded_algorithm()))
+            let cert_name = puressh::cert::cert_name_for_key_type(cert.embedded_algorithm())
                 .ok_or_else(|| format!("{path}: unsupported certificate family"))?;
             certs.push((cert, cert_name));
         }
@@ -1303,6 +1300,33 @@ mod imp {
     ///
     /// `kind` is just a human label for the error message ("host key",
     /// "authorized_keys file").
+    /// Checks on a server-wide file (host key, TrustedUserCAKeys): none of
+    /// the `forbidden_mask` mode bits, and owned by root or by the user sshd
+    /// runs as. Unlike [`check_mode_strict`], its directories are not
+    /// checked; OpenSSH checks host keys no further.
+    fn check_owner_mode(path: &str, forbidden_mask: u32, kind: &str) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
+        let md = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
+        let mode = md.mode() & 0o777;
+        if mode & forbidden_mask != 0 {
+            return Err(format!(
+                "{kind} {path}: insecure mode 0o{mode:o} (must not have any of \
+                 0o{forbidden_mask:o}); fix with `chmod 0{:o} {path}` or override with \
+                 --no-strict-modes",
+                mode & !forbidden_mask
+            ));
+        }
+        let euid = nix::unistd::geteuid().as_raw();
+        if md.uid() != 0 && md.uid() != euid {
+            return Err(format!(
+                "{kind} {path}: must be owned by root or uid {euid}, is uid {}; \
+                 override with --no-strict-modes",
+                md.uid()
+            ));
+        }
+        Ok(())
+    }
+
     fn check_mode_strict(
         path: &str,
         forbidden_mask: u32,
@@ -1802,7 +1826,7 @@ mod imp {
     /// returning their wire blobs. Used for `TrustedUserCAKeys`.
     fn load_ca_keys_file(path: &str, strict_modes: bool) -> Result<Vec<Vec<u8>>, String> {
         if strict_modes {
-            check_mode_strict(path, 0o022, "TrustedUserCAKeys file", None)?;
+            check_owner_mode(path, 0o022, "TrustedUserCAKeys file")?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
         let mut out = Vec::new();

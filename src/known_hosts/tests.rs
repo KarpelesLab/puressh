@@ -593,3 +593,27 @@ fn save_produces_mode_0600_file() {
         "known_hosts must be owner-only (0o600), got {mode:o}"
     );
 }
+
+#[test]
+fn non_default_port_falls_back_to_bare_host_key() {
+    // OpenSSH: with no `[host]:port` entry, the key recorded under the bare
+    // host name is accepted; a different key there is not a mismatch.
+    let mut kh = KnownHosts::new();
+    let key = ed25519_blob(5);
+    let other = ed25519_blob(6);
+    kh.add("example.com", 22, "ssh-ed25519", &key, false);
+    assert!(matches!(
+        kh.lookup("example.com", 2222, "ssh-ed25519", &key),
+        LookupResult::Match
+    ));
+    assert!(matches!(
+        kh.lookup("example.com", 2222, "ssh-ed25519", &other),
+        LookupResult::Unknown
+    ));
+    // A `[host]:port` entry takes precedence: its mismatch stands.
+    kh.add("example.com", 2222, "ssh-ed25519", &other, false);
+    assert!(matches!(
+        kh.lookup("example.com", 2222, "ssh-ed25519", &key),
+        LookupResult::Mismatch { .. }
+    ));
+}

@@ -121,12 +121,14 @@ tokio-util = { version = "0.7", default-features = false, features = ["compat"],
 #   ioctl   — TIOCSWINSZ
 #   user    — User::from_name, setuid/setgid/initgroups, geteuid/getegid
 #   poll    — poll(2) for the ProxyCommand non-blocking read-with-deadline
+#   socket, net — sshd listeners (IPV6_V6ONLY so `[::]` and `0.0.0.0` bind
+#             side by side, as OpenSSH does)
 #
 # 0.31's breaking changes (removal of `PartialEq` on `SigHandler` and of a
 # NetBSD `IFF_NOTRAILERS` flag; libc floor 0.2.181) touch nothing we use.
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = [
-    "process", "signal", "term", "fs", "ioctl", "user", "poll",
+    "process", "signal", "term", "fs", "ioctl", "user", "poll", "socket", "net",
 ] }
 # `libc` for the few low-level POSIX bits the binaries need (terminal
 # echo control in the password reader; geteuid + Unix-socket stat() for

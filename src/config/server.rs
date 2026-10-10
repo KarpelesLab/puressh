@@ -290,6 +290,9 @@ pub struct ServerOptions {
     /// `PerSourceMaxStartups` — cap on connections per source address.
     /// `Some(0)` stands for the literal `none`.
     pub per_source_max_startups: Option<u32>,
+    /// Every `Port` line, in order (OpenSSH listens on all of them; `port`
+    /// keeps only the first, as `Match LocalPort` and older callers expect).
+    pub ports: Vec<u16>,
     /// Non-fatal diagnostics from parsing this block: OpenSSH keywords that
     /// are accepted but not implemented, or arguments that are ignored. Never
     /// merged across blocks; see [`SshServerConfig::warnings`].
@@ -584,6 +587,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(knock_clock_skew);
     take_scalar!(knock_max_pending);
     dst.knock_listen.extend(src.knock_listen.iter().cloned());
+    dst.ports.extend(src.ports.iter().copied());
     dst.knock_users.extend(src.knock_users.iter().cloned());
     // `pid_file` is startup-only (rejected inside Match), so it can only ever
     // come from the global block; merge it first-match-wins anyway for
@@ -653,7 +657,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
     let kw = line.keyword.as_str();
     match kw {
         "port" => {
-            opts.port = Some(parse_u16(line)?);
+            let port = parse_u16(line)?;
+            opts.port = Some(port);
+            opts.ports.push(port);
         }
         "listenaddress" => {
             opts.listen_addresses.push(one_arg(line)?);

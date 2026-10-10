@@ -54,7 +54,7 @@ pub use host_port::{parse_host_port, parse_host_port_pattern};
 #[cfg(feature = "std")]
 pub use include::tokenize_file_with_includes;
 pub use match_block::{AddressKind, AddressPattern, ExecPolicy, MatchCondition, MatchContext};
-pub use parser::ParsedLine;
+pub use parser::{ParsedLine, tokenize};
 pub use server::{
     Compression, HostPort, PermitRootLogin, RekeyLimit, ServerMatchBlock, ServerOptions,
     SshServerConfig, TcpForwarding,

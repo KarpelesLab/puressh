@@ -103,6 +103,7 @@ fn ssh_reaches_sshd_only_through_knock() {
     let guard = ChildGuard::spawn(
         Command::new(env!("CARGO_BIN_EXE_sshd"))
             .arg("-d")
+            .args(["-b", "127.0.0.1"])
             .args(["-p", &tcp_port.to_string()])
             .arg("-h")
             .arg(dir.join("host"))

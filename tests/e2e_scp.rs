@@ -146,6 +146,9 @@ fn fixture() -> Option<(PathBuf, PathBuf, u16, String, SshdGuard)> {
     // The OpenSSH-based suites do the same thing with `StrictModes no`.
     let guard = SshdGuard::spawn(
         Command::new(&sshd_bin)
+            // Not the host's /etc/ssh/sshd_config.
+            .args(["-f", "/dev/null"])
+            .args(["-b", "127.0.0.1"])
             .args(["-p", &port.to_string()])
             .args(["-h", &host_key.display().to_string()])
             .args(["-A", &authorized.display().to_string()])

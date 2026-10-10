@@ -1,9 +1,19 @@
 //! `sshd` — puressh's SSH server daemon.
 //!
 //! ```text
-//! sshd [-d] [-p port] [-h host_key_file]... [-A authorized_keys_file]
-//!      [-u allowed_user]... [--x11-forward]
+//! sshd [-46DdeqTt] [-f config] [-p port]... [-h host_key_file]... [-o option]...
+//!      [-A authorized_keys_file] [-u allowed_user]... [--x11-forward] ...
 //! ```
+//!
+//! Defaults follow OpenSSH so the binary can replace it: the configuration
+//! is `/etc/ssh/sshd_config` (when present; `-f` overrides, `-o` options win
+//! over the file), the host keys are `/etc/ssh/ssh_host_{rsa,ecdsa,ed25519}_key`
+//! (whichever load), the daemon listens on port 22 of every address (one
+//! `IPV6_V6ONLY` socket per family), and any user may log in subject to
+//! `AllowUsers` / `DenyUsers` and authentication. It always stays in the
+//! foreground (`-D` / `-e` are accepted no-ops); `-t` checks the
+//! configuration and host keys and exits; SIGHUP re-executes the daemon to
+//! reload the configuration, unless the new configuration fails to load.
 //!
 //! Public keys are looked up **per user**, as OpenSSH does: `AuthorizedKeysFile`
 //! (default `.ssh/authorized_keys .ssh/authorized_keys2`) names one or more
@@ -101,8 +111,9 @@ mod imp {
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    const USAGE: &str = "usage: sshd [-d] [-f configfile] [-p port] [-b address]... \
-                         [-h host_key_file]... [-A authorized_keys_file] \
+    const USAGE: &str = "usage: sshd [-46DdeqTt] [-f configfile] [-p port]... [-b address]... \
+                         [-h host_key_file]... [-c host_cert_file]... [-o option]... \
+                         [-E log_file] [-g login_grace_time] [-A authorized_keys_file] \
                          [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
                          [--sftp-root PATH] [--no-scp] [--no-agent-forward] \
                          [--x11-forward] [--no-strict-modes] [--debug-commands] \
@@ -708,10 +719,20 @@ mod imp {
     }
 
     struct Cli {
-        /// `-f path`: read this `sshd_config` before processing CLI flags
-        /// (CLI still wins on scalars).
+        /// `-f path`: the `sshd_config` to read. `None` ⇒ the OpenSSH default
+        /// [`DEFAULT_CONFIG`] (CLI flags still win on scalars).
         config_file: Option<String>,
-        port: Option<u16>,
+        /// `-o KEYWORD=value` / `-o "KEYWORD value"`: config lines that take
+        /// precedence over the file (first value wins, as in OpenSSH).
+        config_options: Vec<String>,
+        /// `-p port`, repeatable. Empty ⇒ `Port` lines, else 22.
+        ports: Vec<u16>,
+        /// `-t`: check the configuration and host keys, then exit.
+        test_only: bool,
+        /// `-4` / `-6`.
+        address_family: Option<puressh::config::ServerAddressFamily>,
+        /// `-E file`: append diagnostics to `file` instead of stderr.
+        log_file: Option<String>,
         /// `-b ADDR`: bind to ADDR (host or `host:port`). Repeats are
         /// recognised; v1 uses only the first one and warns about extras
         /// until multi-address bind lands. Config `ListenAddress` lines
@@ -784,18 +805,168 @@ mod imp {
     /// user explicitly opts in via `-f`. Relative includes resolve against the
     /// directory of the file being parsed (and, for the system entry point at
     /// `/etc/ssh/...`, that is `/etc/ssh`).
-    fn load_server_config(
-        path: &std::path::Path,
-    ) -> Result<puressh::config::SshServerConfig, String> {
-        let lines = puressh::config::tokenize_file_with_includes(path, 0)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        puressh::config::SshServerConfig::from_lines(lines)
-            .map_err(|e| format!("{}: {e}", path.display()))
+    /// Resolve `-b` / `ListenAddress` specs into the addresses to listen on,
+    /// with OpenSSH's syntax: `host`, `host:port`, `[v6]`, `[v6]:port`, or a
+    /// bare IPv6 literal. A spec without a port listens on every port in
+    /// `ports`. No spec ⇒ the wildcard address of each allowed family.
+    fn listen_addrs(
+        specs: &[String],
+        ports: &[u16],
+        af: Option<puressh::config::ServerAddressFamily>,
+    ) -> Result<Vec<std::net::SocketAddr>, String> {
+        use puressh::config::ServerAddressFamily as Af;
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+        let family_ok = |a: &SocketAddr| match af {
+            Some(Af::Inet) => a.is_ipv4(),
+            Some(Af::Inet6) => a.is_ipv6(),
+            _ => true,
+        };
+        let mut out: Vec<SocketAddr> = Vec::new();
+        let mut push = |a: SocketAddr| {
+            if family_ok(&a) && !out.contains(&a) {
+                out.push(a);
+            }
+        };
+        if specs.is_empty() {
+            for &p in ports {
+                push(SocketAddr::from((Ipv6Addr::UNSPECIFIED, p)));
+                push(SocketAddr::from((Ipv4Addr::UNSPECIFIED, p)));
+            }
+        }
+        for spec in specs {
+            let mut words = spec.split_whitespace();
+            let addr = words.next().unwrap_or("");
+            if let Some(extra) = words.next() {
+                return Err(format!(
+                    "ListenAddress {spec:?}: {extra} (routing domains) is not supported"
+                ));
+            }
+            let bad_port = || format!("ListenAddress {spec:?}: bad port");
+            // (host, explicit port)
+            let (host, port): (&str, Option<u16>) = if let Some(rest) = addr.strip_prefix('[') {
+                let (h, tail) = rest
+                    .split_once(']')
+                    .ok_or_else(|| format!("ListenAddress {spec:?}: unterminated '['"))?;
+                let port = match tail.strip_prefix(':') {
+                    Some(p) => Some(p.parse().map_err(|_| bad_port())?),
+                    None if tail.is_empty() => None,
+                    None => return Err(format!("ListenAddress {spec:?}: junk after ']'")),
+                };
+                (h, port)
+            } else if addr.matches(':').count() == 1 {
+                let (h, p) = addr.split_once(':').unwrap_or((addr, ""));
+                (h, Some(p.parse().map_err(|_| bad_port())?))
+            } else {
+                (addr, None)
+            };
+            let want: Vec<u16> = match port {
+                Some(p) => vec![p],
+                None => ports.to_vec(),
+            };
+            for p in want {
+                let resolved = (host, p)
+                    .to_socket_addrs()
+                    .map_err(|e| format!("ListenAddress {spec:?}: {e}"))?;
+                for a in resolved {
+                    push(a);
+                }
+            }
+        }
+        if out.is_empty() {
+            return Err("no listen address left after AddressFamily filtering".into());
+        }
+        Ok(out)
+    }
+
+    /// Bind a listening TCP socket. IPv6 sockets are `IPV6_V6ONLY` (as in
+    /// OpenSSH) so `[::]` and `0.0.0.0` coexist and IPv4 peers keep their
+    /// IPv4 addresses for `AllowUsers` / `Match Address`.
+    fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+        use nix::sys::socket::{
+            AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, SockaddrIn6, bind, listen,
+            setsockopt, socket, sockopt,
+        };
+        let family = if addr.is_ipv6() {
+            AddressFamily::Inet6
+        } else {
+            AddressFamily::Inet
+        };
+        let fd = socket(family, SockType::Stream, SockFlag::empty(), None)?;
+        fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
+        setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+        match addr {
+            std::net::SocketAddr::V6(v6) => {
+                setsockopt(&fd, sockopt::Ipv6V6Only, &true)?;
+                bind(fd.as_raw_fd(), &SockaddrIn6::from(v6))?;
+            }
+            std::net::SocketAddr::V4(v4) => bind(fd.as_raw_fd(), &SockaddrIn::from(v4))?,
+        }
+        listen(&fd, Backlog::new(128).unwrap_or(Backlog::MAXCONN))?;
+        Ok(std::net::TcpListener::from(fd))
+    }
+
+    /// The `sshd_config` read when `-f` is not given (OpenSSH's default).
+    const DEFAULT_CONFIG: &str = "/etc/ssh/sshd_config";
+
+    /// Host keys tried when neither `-h` nor `HostKey` names any (OpenSSH's
+    /// defaults); missing files are skipped.
+    const DEFAULT_HOST_KEYS: &[&str] = &[
+        "/etc/ssh/ssh_host_rsa_key",
+        "/etc/ssh/ssh_host_ecdsa_key",
+        "/etc/ssh/ssh_host_ed25519_key",
+    ];
+
+    /// The effective configuration: `-o` options first (so they win, since
+    /// the first obtained value is used), then the file (`-f`, or
+    /// [`DEFAULT_CONFIG`] if it exists).
+    fn load_effective_config(cli: &Cli) -> Result<puressh::config::SshServerConfig, String> {
+        let mut lines = Vec::new();
+        for o in &cli.config_options {
+            let toks = puressh::config::tokenize(o).map_err(|e| format!("-o {o:?}: {e}"))?;
+            if toks.len() != 1 || toks[0].keyword == "match" || toks[0].keyword == "include" {
+                return Err(format!(
+                    "-o {o:?}: expected a single `Keyword value` option"
+                ));
+            }
+            lines.extend(toks);
+        }
+        let path = match cli.config_file.as_deref() {
+            Some(p) => Some(std::path::PathBuf::from(p)),
+            None => {
+                let p = std::path::PathBuf::from(DEFAULT_CONFIG);
+                p.exists().then_some(p)
+            }
+        };
+        if let Some(path) = &path {
+            lines.extend(
+                puressh::config::tokenize_file_with_includes(path, 0)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+            );
+        }
+        puressh::config::SshServerConfig::from_lines(lines).map_err(|e| match &path {
+            Some(p) => format!("{}: {e}", p.display()),
+            None => e.to_string(),
+        })
+    }
+
+    /// Fill unset global options with OpenSSH's defaults where this daemon's
+    /// built-in defaults differ (`Match` blocks can still override them).
+    fn apply_openssh_defaults(g: &mut puressh::config::ServerOptions) {
+        g.print_motd.get_or_insert(true);
+        if g.max_startups.is_none() {
+            // MaxStartups 10:30:100
+            g.max_startups = Some(100);
+            g.max_startups_early = Some((10, 30));
+        }
     }
 
     fn parse_args(args: &[String]) -> Result<Cli, String> {
         let mut config_file: Option<String> = None;
-        let mut port: Option<u16> = None;
+        let mut config_options: Vec<String> = Vec::new();
+        let mut ports: Vec<u16> = Vec::new();
+        let mut test_only = false;
+        let mut address_family: Option<puressh::config::ServerAddressFamily> = None;
+        let mut log_file: Option<String> = None;
         let mut listen_addresses: Vec<String> = Vec::new();
         let mut host_key_files: Vec<String> = Vec::new();
         let mut host_certificate_files: Vec<String> = Vec::new();
@@ -828,8 +999,44 @@ mod imp {
                 "-p" => {
                     i += 1;
                     let v = args.get(i).ok_or("-p requires a value")?;
-                    port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
+                    ports.push(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
                 }
+                "-o" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("-o requires a value")?.clone();
+                    config_options.push(v);
+                }
+                "-t" => test_only = true,
+                "-T" => {
+                    return Err("-T (dump the effective configuration) is not supported; \
+                                use -t to check it"
+                        .into());
+                }
+                "-4" => address_family = Some(puressh::config::ServerAddressFamily::Inet),
+                "-6" => address_family = Some(puressh::config::ServerAddressFamily::Inet6),
+                "-c" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("-c requires a value")?.clone();
+                    host_certificate_files.push(v);
+                }
+                "-E" => {
+                    i += 1;
+                    log_file = Some(args.get(i).ok_or("-E requires a value")?.clone());
+                }
+                "-g" => {
+                    i += 1;
+                    let v = args.get(i).ok_or("-g requires a value")?;
+                    login_grace_time = Some(
+                        v.trim_end_matches('s')
+                            .parse::<u32>()
+                            .map_err(|_| "invalid -g (seconds)".to_string())?,
+                    );
+                }
+                // OpenSSH compatibility no-ops: sshd always stays in the
+                // foreground and logs to stderr (`-D`, `-e`); `-q` quiet,
+                // `-r` no re-exec, `-k` obsolete key regeneration.
+                "-D" | "-e" | "-q" | "-r" => {}
+                "-k" => i += 1,
                 "-b" => {
                     i += 1;
                     let v = args.get(i).ok_or("-b requires a value")?.clone();
@@ -856,7 +1063,11 @@ mod imp {
                 "-u" => {
                     i += 1;
                     let v = args.get(i).ok_or("-u requires a value")?.clone();
-                    allowed_users.push(v);
+                    // OpenSSH's `-u len` (utmp host-name length) is numeric
+                    // and ignorable; anything else is puressh's allowed user.
+                    if v.parse::<u32>().is_err() {
+                        allowed_users.push(v);
+                    }
                 }
                 "-d" => debug = true,
                 "--no-sftp" => sftp = Some(false),
@@ -931,7 +1142,11 @@ mod imp {
         // that supplies `HostKey` is sufficient.
         Ok(Cli {
             config_file,
-            port,
+            config_options,
+            ports,
+            test_only,
+            address_family,
+            log_file,
             listen_addresses,
             host_key_files,
             host_certificate_files,
@@ -978,15 +1193,27 @@ mod imp {
         }
         let mut loaded: Vec<Loaded> = Vec::new();
         for path in key_paths {
-            if strict_modes {
-                check_mode_strict(path, 0o077, "host key", None)?;
-            }
-            let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-            let priv_key = PrivateKey::parse_openssh_pem(&pem, None)
-                .map_err(|e| format!("parse {path}: {e}"))?;
-            let hk = priv_key
-                .into_host_key()
-                .map_err(|e| format!("convert {path}: {e}"))?;
+            // As in OpenSSH, a host key that cannot be used (missing file,
+            // unsupported type such as DSA, bad permissions) is reported and
+            // skipped; only having no usable key at all is fatal.
+            let loaded_key = (|| -> Result<Box<dyn HostKey + Send>, String> {
+                if strict_modes {
+                    check_mode_strict(path, 0o077, "host key", None)?;
+                }
+                let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+                let priv_key = PrivateKey::parse_openssh_pem(&pem, None)
+                    .map_err(|e| format!("parse {path}: {e}"))?;
+                priv_key
+                    .into_host_key()
+                    .map_err(|e| format!("convert {path}: {e}"))
+            })();
+            let hk = match loaded_key {
+                Ok(hk) => hk,
+                Err(e) => {
+                    eprintln!("sshd: warning: unable to load host key: {e}");
+                    continue;
+                }
+            };
             // PrivateKey::into_host_key returns `Box<dyn HostKey + Send>` —
             // upgrade to `Send + Sync` by wrapping. Our concrete signers (Ed25519,
             // ECDSA, RSA) hold only `Sync`-safe types internally; we expose this
@@ -1038,6 +1265,9 @@ mod imp {
             return Err(format!(
                 "HostCertificate present but no matching HostKey for {name}"
             ));
+        }
+        if out.is_empty() {
+            return Err(format!("no usable host key among {key_paths:?}"));
         }
         Ok(out)
     }
@@ -1347,11 +1577,15 @@ mod imp {
             }
             let mut host_keys: Vec<KnockHostKey> = Vec::new();
             for path in host_key_files {
-                let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-                let key = PrivateKey::parse_openssh_pem(&pem, None)
-                    .and_then(|k| k.into_host_key_sync())
-                    .map_err(|e| format!("knock: host key {path}: {e}"))?;
-                host_keys.push(Arc::from(key));
+                // Unusable keys were already reported by the main loader.
+                let Ok(pem) = std::fs::read_to_string(path) else {
+                    continue;
+                };
+                if let Ok(key) =
+                    PrivateKey::parse_openssh_pem(&pem, None).and_then(|k| k.into_host_key_sync())
+                {
+                    host_keys.push(Arc::from(key));
+                }
             }
             let mut cfg = KnockServerConfig::default();
             if let Some(w) = g.knock_window {
@@ -1537,11 +1771,12 @@ mod imp {
     ) -> Vec<String> {
         let mut out: Vec<String> = cli.to_vec();
         out.extend(cfg.iter().cloned());
-        if out.is_empty() {
-            out.push(match default_user {
-                Some(u) => u.to_string(),
-                None => "!*".to_string(),
-            });
+        // Nothing configured ⇒ the default user if one is given, else no
+        // restriction at all (an empty list allows everyone).
+        if out.is_empty()
+            && let Some(u) = default_user
+        {
+            out.push(u.to_string());
         }
         out
     }
@@ -4675,6 +4910,43 @@ mod imp {
         SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
     }
 
+    /// Set by SIGHUP: re-read the configuration (by re-executing).
+    static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    /// SIGHUP handler. SAFETY: signal-context safe — one atomic store.
+    extern "C" fn reload_handler(_sig: libc::c_int) {
+        RELOAD_REQUESTED.store(true, Ordering::Relaxed);
+    }
+
+    /// SIGHUP: like OpenSSH, re-execute this binary with the original
+    /// arguments, so the new process reads the configuration (and host keys)
+    /// afresh. Live sessions are separate processes and are unaffected. The
+    /// new configuration is checked first: if it does not load, the daemon
+    /// keeps running with the old one rather than exiting. Returns only on
+    /// failure.
+    fn reload(cli: &Cli, args: &[String]) {
+        if let Err(e) = load_effective_config(cli) {
+            eprintln!("sshd: SIGHUP: new configuration rejected, keeping the old one: {e}");
+            return;
+        }
+        // argv[0] when absolute (systemd starts us by absolute path, and it
+        // still names the *new* binary after a package upgrade), else
+        // /proc/self/exe.
+        let exe = std::env::args_os()
+            .next()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| std::env::current_exe().ok());
+        let Some(exe) = exe else {
+            eprintln!("sshd: SIGHUP: cannot find our own executable; not reloading");
+            return;
+        };
+        eprintln!("sshd: SIGHUP: re-executing {}", exe.display());
+        // Listening sockets are close-on-exec; the new process binds afresh.
+        let err = Command::new(&exe).args(args).exec();
+        eprintln!("sshd: SIGHUP: exec {}: {err}", exe.display());
+    }
+
     /// Install SIGCHLD (wake the accept loop to reap) and SIGTERM/SIGINT
     /// (graceful shutdown).
     fn install_parent_signals() -> Result<(), String> {
@@ -4711,6 +4983,16 @@ mod imp {
             if libc::sigaction(libc::SIGINT, &sa, core::ptr::null_mut()) != 0 {
                 return Err(format!(
                     "sigaction(SIGINT): {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            let mut sa: libc::sigaction = core::mem::zeroed();
+            sa.sa_sigaction = reload_handler as *const () as usize;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            if libc::sigaction(libc::SIGHUP, &sa, core::ptr::null_mut()) != 0 {
+                return Err(format!(
+                    "sigaction(SIGHUP): {}",
                     std::io::Error::last_os_error()
                 ));
             }
@@ -4919,14 +5201,22 @@ mod imp {
 
         let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
 
-        // Load sshd_config if `-f` was supplied; otherwise an empty config
-        // so every `pick()` falls through to the CLI value or the built-in
-        // default. CLI flags always win over the config file (so adminstrators
-        // can override a baked-in config without editing it).
-        let sshd_cfg = Arc::new(match cli.config_file.as_deref() {
-            Some(p) => load_server_config(std::path::Path::new(p))?,
-            None => puressh::config::SshServerConfig::default(),
-        });
+        // `-E file`: append diagnostics to `file` from here on.
+        if let Some(path) = cli.log_file.as_deref() {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("-E {path}: {e}"))?;
+            nix::unistd::dup2_stderr(&f).map_err(|e| format!("-E {path}: {e}"))?;
+        }
+
+        // sshd_config: `-o` options, then `-f` (default /etc/ssh/sshd_config
+        // when present), with OpenSSH's defaults for anything left unset.
+        // CLI flags always win over the config file.
+        let mut sshd_cfg = load_effective_config(&cli)?;
+        apply_openssh_defaults(&mut sshd_cfg.global);
+        let sshd_cfg = Arc::new(sshd_cfg);
         // OpenSSH keywords we accept but do not implement, ignored arguments.
         for w in sshd_cfg.warnings() {
             eprintln!("sshd: warning: config {w}");
@@ -4944,7 +5234,17 @@ mod imp {
         };
 
         // Resolve effective values: CLI > config > built-in default.
-        let port = pick(cli.port, sshd_cfg.global.port, 2222u16);
+        // Ports: `-p` (repeatable), else every `Port` line, else 22.
+        let ports: Vec<u16> = if !cli.ports.is_empty() {
+            cli.ports.clone()
+        } else if !sshd_cfg.global.ports.is_empty() {
+            sshd_cfg.global.ports.clone()
+        } else {
+            vec![22]
+        };
+        // The first one names the daemon in diagnostics and is the knock's
+        // default UDP port.
+        let port = ports[0];
         let strict_modes = pick(cli.strict_modes, sshd_cfg.global.strict_modes, true);
         // SFTP is on when either the puressh `SftpEnabled` knob OR the standard
         // `Subsystem sftp internal-sftp` line enables it (CLI still wins).
@@ -4983,20 +5283,31 @@ mod imp {
             120u32,
         );
         let max_startups = pick(cli.max_startups, sshd_cfg.global.max_startups, 100u32);
-        // `--per-source-max` > `PerSourceMaxStartups` (`none` ⇒ 0, no cap) > 10.
+        // `--per-source-max` > `PerSourceMaxStartups` > no cap (OpenSSH's
+        // default; `none` is 0 as well).
         let per_source_max = pick(
             cli.per_source_max,
             sshd_cfg.global.per_source_max_startups,
-            10u32,
+            0u32,
         );
 
         // CLI host-keys, then any HostKey lines from config (cumulative).
         let mut host_key_files = cli.host_key_files.clone();
         host_key_files.extend(sshd_cfg.global.host_key_files.iter().cloned());
         if host_key_files.is_empty() {
-            return Err(
-                "at least one -h host_key_file (or HostKey in sshd_config) is required".into(),
-            );
+            // OpenSSH's defaults, skipping the ones that do not exist.
+            host_key_files = DEFAULT_HOST_KEYS
+                .iter()
+                .filter(|p| std::path::Path::new(p).exists())
+                .map(|p| p.to_string())
+                .collect();
+        }
+        if host_key_files.is_empty() {
+            return Err(format!(
+                "no host keys: none of {} exist (generate them with `ssh-keygen -A`), \
+                 and no -h / HostKey was given",
+                DEFAULT_HOST_KEYS.join(", ")
+            ));
         }
 
         // CLI `-u`, then `AllowUsers` from the global section. `AllowUsers`
@@ -5009,38 +5320,9 @@ mod imp {
         let mut accept_env = cli.accept_env.clone();
         accept_env.extend(sshd_cfg.global.accept_env.iter().cloned());
 
-        // Pick the bind address. We support a single listener for v1; warn
-        // if more than one ListenAddress / -b was supplied.
+        // Listen addresses: `-b` + `ListenAddress` (cumulative), on `ports`.
         let mut bind_specs = cli.listen_addresses.clone();
         bind_specs.extend(sshd_cfg.global.listen_addresses.iter().cloned());
-        if bind_specs.len() > 1 {
-            eprintln!(
-                "sshd: warning: {} ListenAddress entries supplied; binding only the first \
-                 (multi-address listen is a follow-up). Extras: {:?}",
-                bind_specs.len(),
-                &bind_specs[1..]
-            );
-        }
-        let bind_addr = match bind_specs.first() {
-            Some(s) => {
-                // Bare host → add the effective port. `host:port` passes through.
-                if s.contains(':') && !s.contains("::") {
-                    s.clone()
-                } else if s.starts_with('[') {
-                    // [v6]:port literal — already complete
-                    s.clone()
-                } else {
-                    // bare host or bare IPv6 → append :port
-                    if s.contains(':') {
-                        // bare IPv6 literal
-                        format!("[{s}]:{port}")
-                    } else {
-                        format!("{s}:{port}")
-                    }
-                }
-            }
-            None => format!("127.0.0.1:{port}"),
-        };
 
         let mut host_certificate_files = cli.host_certificate_files.clone();
         host_certificate_files.extend(sshd_cfg.global.host_certificate_files.iter().cloned());
@@ -5160,14 +5442,10 @@ mod imp {
             sshd_cfg.global.authorized_principals_file.clone();
 
         // AllowUsers is matched as OpenSSH `Host`-style globs (a literal name
-        // is just a glob with no metacharacters). Empty ⇒ the historical
-        // "current user only" default, seeded as a single literal pattern
-        // (required to resolve when nothing else is configured).
-        let default_allow_user: Option<String> = if allowed_user_list.is_empty() {
-            Some(current_user()?)
-        } else {
-            current_user().ok()
-        };
+        // is just a glob with no metacharacters). Empty ⇒ no restriction, as
+        // in OpenSSH (a daemon not running as root can only ever serve its
+        // own user anyway: it cannot switch to anyone else).
+        let default_allow_user: Option<String> = None;
         let allow_users = UserHostPattern::parse_all(&effective_allow_users(
             &cli.allowed_users,
             &sshd_cfg.global.allow_users,
@@ -5212,14 +5490,18 @@ mod imp {
             );
         }
 
-        let cfg_password = sshd_cfg.global.password_authentication == Some(true);
-        let cfg_kbdint = sshd_cfg.global.kbd_interactive_authentication == Some(true);
+        // OpenSSH defaults both to yes (Ubuntu's stock file turns
+        // keyboard-interactive off).
+        let cfg_password = sshd_cfg.global.password_authentication != Some(false);
+        let cfg_kbdint = sshd_cfg.global.kbd_interactive_authentication != Some(false);
         let pubkey_enabled = sshd_cfg.global.pubkey_authentication != Some(false);
         let password_enabled = cfg_password && pam_available;
         let kbd_interactive_enabled = cfg_kbdint && pam_available;
         let permit_empty_passwords = sshd_cfg.global.permit_empty_passwords == Some(true);
 
-        if (cfg_password || cfg_kbdint) && !pam_available {
+        let asked_password = sshd_cfg.global.password_authentication == Some(true)
+            || sshd_cfg.global.kbd_interactive_authentication == Some(true);
+        if asked_password && !pam_available {
             eprintln!(
                 "sshd: warning: PasswordAuthentication/KbdInteractiveAuthentication requested but \
                  no PAM backend is compiled in (need the `pam` feature on Linux); these methods \
@@ -5460,8 +5742,10 @@ mod imp {
         // Compression (startup-only): `no` strips zlib from the KEXINIT advert.
         config.compression = sshd_cfg.global.compression;
 
-        // AddressFamily (startup-only): restrict the listener family.
-        let address_family = sshd_cfg.global.address_family;
+        // AddressFamily (startup-only): `-4`/`-6` > config; restricts the
+        // listener family.
+        let address_family = cli.address_family.or(sshd_cfg.global.address_family);
+        let listen = listen_addrs(&bind_specs, &ports, address_family)?;
         // PidFile (startup-only): write our PID after bind unless `none`.
         let pid_file = if sshd_cfg.global.pid_file_set {
             sshd_cfg.global.pid_file.clone()
@@ -5479,28 +5763,40 @@ mod imp {
 
         let cfg = Arc::new(config);
 
+        // `-t`: everything above parsed and loaded; stop before binding.
+        if cli.test_only {
+            if cli.debug {
+                eprintln!("sshd: configuration OK; would listen on {listen:?}");
+            }
+            return Ok(0);
+        }
+
         install_parent_signals()?;
 
-        let addr = bind_addr;
-        // AddressFamily filter: refuse to bind an address of the wrong family
-        // rather than silently ignoring the directive.
-        if let Some(af) = address_family {
-            let parsed: Option<std::net::IpAddr> = addr
-                .rsplit_once(':')
-                .and_then(|(h, _)| h.trim_matches(['[', ']']).parse().ok());
-            let mismatch = match (af, parsed) {
-                (puressh::config::ServerAddressFamily::Inet, Some(ip)) => ip.is_ipv6(),
-                (puressh::config::ServerAddressFamily::Inet6, Some(ip)) => ip.is_ipv4(),
-                _ => false,
-            };
-            if mismatch {
-                return Err(format!(
-                    "bind {addr}: AddressFamily {af:?} excludes this listener address"
-                ));
+        // As in OpenSSH, an address that cannot be bound (e.g. `::` on a host
+        // without IPv6) is reported and skipped; only binding none is fatal.
+        let mut listeners = Vec::with_capacity(listen.len());
+        let mut bound = Vec::with_capacity(listen.len());
+        let mut bind_errors = Vec::new();
+        for a in &listen {
+            match bind_listener(*a) {
+                Ok(l) => {
+                    listeners.push(l);
+                    bound.push(*a);
+                }
+                Err(e) => {
+                    eprintln!("sshd: warning: bind {a}: {e}");
+                    bind_errors.push(format!("{a}: {e}"));
+                }
             }
         }
-        let listener =
-            std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+        if listeners.is_empty() {
+            return Err(format!(
+                "could not bind any address: {}",
+                bind_errors.join("; ")
+            ));
+        }
+        let listen = bound;
         let mut knock = KnockFrontend::bind(
             &sshd_cfg.global,
             port,
@@ -5516,10 +5812,9 @@ mod imp {
             eprintln!("sshd: warning: could not write PidFile {path}: {e}");
         }
 
-        eprintln!(
-            "puressh sshd listening on {addr} (pid {})",
-            std::process::id()
-        );
+        for a in &listen {
+            eprintln!("puressh sshd listening on {a} (pid {})", std::process::id());
+        }
 
         // Exponential backoff for `fork()` EAGAIN — under a fork-bomb a
         // tight `continue` loop just makes the kernel keep saying no.
@@ -5546,6 +5841,9 @@ mod imp {
                 eprintln!("sshd: shutdown requested, exiting accept loop");
                 break;
             }
+            if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) {
+                reload(&cli, &args);
+            }
             if SIGCHLD_PENDING.swap(false, Ordering::Relaxed) || children.len() > 0 {
                 children.reap(cli.debug);
             }
@@ -5563,8 +5861,11 @@ mod imp {
                 }
                 None => accept_tick,
             };
-            let listener_ready = {
-                let mut wait = vec![PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+            let ready_listeners: Vec<usize> = {
+                let mut wait: Vec<PollFd<'_>> = listeners
+                    .iter()
+                    .map(|l| PollFd::new(l.as_fd(), PollFlags::POLLIN))
+                    .collect();
                 wait.extend(
                     knock
                         .poll_fds()
@@ -5580,7 +5881,9 @@ mod imp {
                         continue;
                     }
                 }
-                wait[0].revents().is_some_and(|r| !r.is_empty())
+                (0..listeners.len())
+                    .filter(|&i| wait[i].revents().is_some_and(|r| !r.is_empty()))
+                    .collect()
             };
 
             // Connections to hand off this pass: knocked rendezvous
@@ -5593,8 +5896,8 @@ mod imp {
                 }
                 incoming.push((stream, peer, Some(user)));
             }
-            if listener_ready {
-                match listener.accept() {
+            for i in ready_listeners {
+                match listeners[i].accept() {
                     Ok((stream, peer)) => incoming.push((stream, peer, None)),
                     Err(e)
                         if matches!(
@@ -5688,7 +5991,7 @@ mod imp {
                         // long session loop. Without this, restarting the
                         // daemon on the same port keeps hitting EADDRINUSE
                         // because the kernel sees an open listener.
-                        drop(listener);
+                        drop(listeners);
                         // Likewise the knock sockets, and every other connection
                         // of this batch (each is the parent's / a sibling's).
                         #[allow(clippy::drop_non_drop)] // empty without `knock`
@@ -5702,11 +6005,12 @@ mod imp {
                         // SAFETY: same justification as the parent — we run
                         // in a single-threaded process here.
                         let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
-                        // Likewise restore default SIGTERM/SIGINT so the
-                        // child dies cleanly on signal rather than getting
-                        // the parent's "set the shutdown flag" handler.
+                        // Likewise restore default SIGTERM/SIGINT/SIGHUP so
+                        // the child dies cleanly on signal rather than getting
+                        // the parent's shutdown / reload handlers.
                         let _ = unsafe { signal(Signal::SIGTERM, SigHandler::SigDfl) };
                         let _ = unsafe { signal(Signal::SIGINT, SigHandler::SigDfl) };
+                        let _ = unsafe { signal(Signal::SIGHUP, SigHandler::SigDfl) };
 
                         // Stash the peer address on *this child's* PamGate
                         // copy — set_peer mutates state behind a Mutex but
@@ -6799,9 +7103,9 @@ mod imp {
                 effective_allow_users(&[], &[], Some("me")),
                 vec!["me".to_string()]
             );
-            // Nothing configured and no daemon user ⇒ nobody, never everybody.
-            let nobody = UserHostPattern::parse_all(&effective_allow_users(&[], &[], None));
-            assert!(!user_host_list_matches(&nobody, "anyone", None));
+            // Nothing configured and no default user ⇒ no AllowUsers
+            // restriction (OpenSSH semantics; authentication still decides).
+            assert!(effective_allow_users(&[], &[], None).is_empty());
         }
 
         // ---- S6: Match-block access policy per connection ------------------

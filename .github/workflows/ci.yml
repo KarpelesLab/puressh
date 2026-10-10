@@ -131,6 +131,13 @@ jobs:
           cargo test --test e2e_scp --test e2e_cert --
           --ignored --test-threads=1 --nocapture
 
+      # Knock rendezvous (puressh ssh ↔ puressh sshd): the TCP port is closed,
+      # so the session only comes up through the UDP knock (docs/knock.md).
+      - name: Run knock rendezvous end-to-end
+        run: >
+          cargo test --test e2e_knock --
+          --ignored --test-threads=1 --nocapture
+
   interop-mlkem:
     name: OpenSSH interop (ML-KEM + strict KEX, built sshd 10.4p1)
     runs-on: ubuntu-latest

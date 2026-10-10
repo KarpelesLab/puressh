@@ -1247,6 +1247,179 @@ mod imp {
         Ok(out)
     }
 
+    /// Where the knock key table comes from (`KnockUsers` × authorized keys),
+    /// kept so the table can be rebuilt when `authorized_keys` files change.
+    struct KnockKeySource {
+        users: Vec<String>,
+        global: Option<Arc<AuthorizedKeys>>,
+        files: Vec<String>,
+        strict_modes: bool,
+        debug: bool,
+    }
+
+    impl KnockKeySource {
+        /// Plain keys of every knock user. Certificate authorities are not
+        /// knock material: a knock names a concrete key.
+        fn table(&self) -> puressh::knock::KnockKeyTable {
+            let mut t = puressh::knock::KnockKeyTable::new();
+            for user in &self.users {
+                let keys = match &self.global {
+                    Some(g) => (**g).clone(),
+                    None => {
+                        load_user_authorized_keys(user, &self.files, self.strict_modes, self.debug)
+                    }
+                };
+                for blob in keys.blobs {
+                    t.insert(user, blob);
+                }
+            }
+            t
+        }
+    }
+
+    /// `KnockListen` value → `host:port`, defaulting the port to the SSH one.
+    fn knock_listen_addr(spec: &str, port: u16) -> String {
+        if spec.starts_with('[') {
+            if spec.contains("]:") {
+                spec.to_string()
+            } else {
+                format!("{spec}:{port}")
+            }
+        } else if spec.contains("::") || spec.matches(':').count() > 1 {
+            format!("[{spec}]:{port}")
+        } else if spec.contains(':') {
+            spec.to_string()
+        } else {
+            format!("{spec}:{port}")
+        }
+    }
+
+    /// Bind one knock server per `KnockListen` address, signing ACCEPTs with
+    /// the daemon's plain host keys.
+    fn bind_knock_servers(
+        g: &puressh::config::ServerOptions,
+        port: u16,
+        source: &KnockKeySource,
+        host_key_files: &[String],
+        debug: bool,
+    ) -> Result<Vec<puressh::knock::KnockServer>, String> {
+        use puressh::knock::{KnockHostKey, KnockServer, KnockServerConfig, KnockState, unix_ms};
+        if g.knock_listen.is_empty() {
+            return Ok(Vec::new());
+        }
+        if g.knock_users.is_empty() {
+            return Err("KnockListen requires KnockUsers (the users allowed to knock)".into());
+        }
+        let mut host_keys: Vec<KnockHostKey> = Vec::new();
+        for path in host_key_files {
+            let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+            let key = PrivateKey::parse_openssh_pem(&pem, None)
+                .and_then(|k| k.into_host_key_sync())
+                .map_err(|e| format!("knock: host key {path}: {e}"))?;
+            host_keys.push(Arc::from(key));
+        }
+        let mut cfg = KnockServerConfig::default();
+        if let Some(w) = g.knock_window {
+            cfg.window_secs = w as u16;
+        }
+        if let Some(s) = g.knock_clock_skew {
+            cfg.clock_skew_ms = s as u64 * 1000;
+        }
+        if let Some(n) = g.knock_max_pending {
+            cfg.max_pending = n;
+        }
+        let table = source.table();
+        eprintln!(
+            "sshd: knock: {} key(s) for {} user(s)",
+            table.len(),
+            source.users.len()
+        );
+        let mut out = Vec::new();
+        for spec in &g.knock_listen {
+            let addr = knock_listen_addr(spec, port);
+            let state = KnockState::new(cfg.clone(), table.clone(), host_keys.clone(), unix_ms());
+            let mut ks = KnockServer::bind(&addr, state)
+                .map_err(|e| format!("knock: bind udp {addr}: {e}"))?;
+            if let Some((lo, hi)) = g.knock_ports {
+                ks.set_port_range(lo, hi);
+            }
+            if debug {
+                ks.set_logger(|ev| eprintln!("sshd: knock: {ev:?}"));
+            }
+            eprintln!("sshd: knock listening on udp {addr}");
+            out.push(ks);
+        }
+        Ok(out)
+    }
+
+    /// Expand every `AuthorizedKeysFile` template for `user` and read the
+    /// files that exist, StrictModes-checked against `user`'s uid. Any
+    /// failure (unknown user, bad template, StrictModes refusal,
+    /// unreadable file) contributes no keys — never a wider set. A file
+    /// that simply does not exist is silently skipped, as in OpenSSH.
+    fn load_user_authorized_keys(
+        user: &str,
+        authorized_keys_files: &[String],
+        strict_modes: bool,
+        debug: bool,
+    ) -> AuthorizedKeys {
+        let mut out = AuthorizedKeys::default();
+        let info = match lookup_user(user) {
+            Ok(i) => i,
+            Err(e) => {
+                if debug {
+                    eprintln!("sshd: AuthorizedKeysFile: user lookup failed for {user}: {e}");
+                }
+                return out;
+            }
+        };
+        for template in authorized_keys_files {
+            let path = match expand_pct_tokens(template, &info) {
+                Ok(p) => p,
+                Err(e) => {
+                    if debug {
+                        eprintln!("sshd: AuthorizedKeysFile: bad path template {template:?}: {e}");
+                    }
+                    continue;
+                }
+            };
+            let path = if path.starts_with('/') {
+                path
+            } else {
+                let home = if info.home_str.is_empty() {
+                    "/"
+                } else {
+                    info.home_str.as_str()
+                };
+                format!("{}/{path}", home.trim_end_matches('/'))
+            };
+            if !std::path::Path::new(&path).exists() {
+                if debug {
+                    eprintln!("sshd: AuthorizedKeysFile {path}: not present");
+                }
+                continue;
+            }
+            match load_authorized_keys_and_cas(&path, strict_modes, Some(info.uid)) {
+                Ok(set) => {
+                    if debug {
+                        eprintln!(
+                            "sshd: AuthorizedKeysFile {path}: {} key(s), {} cert-authority line(s)",
+                            set.blobs.len(),
+                            set.cas.len()
+                        );
+                    }
+                    out.append(set);
+                }
+                Err(e) => {
+                    if debug {
+                        eprintln!("sshd: AuthorizedKeysFile {path}: {e}");
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Whether a `-u` / `AllowUsers` token names exactly one literal user (no
     /// glob metacharacters, no negation, no `@host` half).
     fn is_literal_user_token(token: &str) -> bool {
@@ -1691,6 +1864,10 @@ mod imp {
                     .any(|g| puressh::config::host_matches(pats, g))
             };
 
+            // 0. A knocked connection is bound to the knock's user.
+            if knock_user().is_some_and(|k| k != user) {
+                return false;
+            }
             // 1. DenyUsers wins outright.
             if !self.deny_users.is_empty() && user_host_list_matches(&self.deny_users, user, peer) {
                 return false;
@@ -1866,69 +2043,14 @@ mod imp {
             self.authorized_keys.as_ref().unwrap()
         }
 
-        /// Expand every `AuthorizedKeysFile` template for `user` and read the
-        /// files that exist, StrictModes-checked against `user`'s uid. Any
-        /// failure (unknown user, bad template, StrictModes refusal,
-        /// unreadable file) contributes no keys — never a wider set. A file
-        /// that simply does not exist is silently skipped, as in OpenSSH.
+        /// [`load_user_authorized_keys`] with this connection's settings.
         fn load_authorized_keys_for(&self, user: &str) -> AuthorizedKeys {
-            let mut out = AuthorizedKeys::default();
-            let info = match lookup_user(user) {
-                Ok(i) => i,
-                Err(e) => {
-                    if self.debug {
-                        eprintln!("sshd: AuthorizedKeysFile: user lookup failed for {user}: {e}");
-                    }
-                    return out;
-                }
-            };
-            for template in &self.authorized_keys_files {
-                let path = match expand_pct_tokens(template, &info) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        if self.debug {
-                            eprintln!(
-                                "sshd: AuthorizedKeysFile: bad path template {template:?}: {e}"
-                            );
-                        }
-                        continue;
-                    }
-                };
-                let path = if path.starts_with('/') {
-                    path
-                } else {
-                    let home = if info.home_str.is_empty() {
-                        "/"
-                    } else {
-                        info.home_str.as_str()
-                    };
-                    format!("{}/{path}", home.trim_end_matches('/'))
-                };
-                if !std::path::Path::new(&path).exists() {
-                    if self.debug {
-                        eprintln!("sshd: AuthorizedKeysFile {path}: not present");
-                    }
-                    continue;
-                }
-                match load_authorized_keys_and_cas(&path, self.strict_modes, Some(info.uid)) {
-                    Ok(set) => {
-                        if self.debug {
-                            eprintln!(
-                                "sshd: AuthorizedKeysFile {path}: {} key(s), {} cert-authority line(s)",
-                                set.blobs.len(),
-                                set.cas.len()
-                            );
-                        }
-                        out.append(set);
-                    }
-                    Err(e) => {
-                        if self.debug {
-                            eprintln!("sshd: AuthorizedKeysFile {path}: {e}");
-                        }
-                    }
-                }
-            }
-            out
+            load_user_authorized_keys(
+                user,
+                &self.authorized_keys_files,
+                self.strict_modes,
+                self.debug,
+            )
         }
 
         /// Re-derive the per-connection access policy from the `sshd_config`
@@ -2654,6 +2776,16 @@ mod imp {
     /// hook's peer lookup.
     static CONN_ADDRS: Mutex<Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)>> =
         Mutex::new(None);
+
+    /// Login name of the knock (`docs/knock.md`) that opened this
+    /// connection's rendezvous, recorded by the forked child; `None` for a
+    /// connection on the regular listener. A knocked connection may only log
+    /// in as that user.
+    static KNOCK_USER: Mutex<Option<String>> = Mutex::new(None);
+
+    fn knock_user() -> Option<String> {
+        KNOCK_USER.lock().ok().and_then(|g| g.clone())
+    }
 
     fn conn_addrs() -> Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)> {
         CONN_ADDRS.lock().ok().and_then(|g| *g)
@@ -4804,6 +4936,13 @@ mod imp {
             .authorized_keys_file
             .clone()
             .unwrap_or_else(default_authorized_keys_files);
+        let knock_source = KnockKeySource {
+            users: sshd_cfg.global.knock_users.clone(),
+            global: global_authorized_keys.clone(),
+            files: authorized_keys_files.clone(),
+            strict_modes,
+            debug: cli.debug,
+        };
         // A template with no per-user token is one shared file: every key in
         // it logs in as any allowed user. Legal (as in OpenSSH), but loud.
         for block in sshd_cfg.all_blocks() {
@@ -5193,6 +5332,16 @@ mod imp {
         }
         let listener =
             std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
+        let mut knock_servers = bind_knock_servers(
+            &sshd_cfg.global,
+            port,
+            &knock_source,
+            &host_key_files,
+            cli.debug,
+        )?;
+        let mut knock_refreshed = std::time::Instant::now();
+        // How often the knock key table is rebuilt from authorized_keys.
+        const KNOCK_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
         // PidFile: write our PID now that the listener is up.
         if let Some(path) = pid_file.as_deref()
@@ -5236,154 +5385,203 @@ mod imp {
             }
             children.poll_auth();
 
-            let mut wait = [PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
-            match poll(&mut wait, accept_tick) {
-                Ok(0) => continue, // tick: reconcile and wait again
-                Ok(_) => {}
-                Err(Errno::EINTR) => continue, // signal: flags checked above
-                Err(e) => {
-                    eprintln!("sshd: poll: {e}");
-                    std::thread::sleep(std::time::Duration::from_millis(FORK_BACKOFF_MIN_MS));
-                    continue;
+            if !knock_servers.is_empty() && knock_refreshed.elapsed() >= KNOCK_REFRESH {
+                knock_refreshed = std::time::Instant::now();
+                let table = knock_source.table();
+                for ks in &mut knock_servers {
+                    ks.state_mut().set_key_table(table.clone());
                 }
             }
-            let (stream, peer) = match listener.accept() {
-                Ok(p) => p,
-                Err(e)
-                    if matches!(
-                        e.kind(),
-                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                    ) =>
-                {
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("sshd: accept: {e}");
-                    continue;
-                }
-            };
 
-            // Enforce both connection caps *before* fork so a flood
-            // can't OOM us via per-process accounting. On refusal we
-            // simply drop the socket — RST tells the client to retry.
-            if let Err(reason) = children.admit(&peer, max_startups, cli.per_source_max) {
-                if cli.debug {
-                    eprintln!(
-                        "sshd: refused {peer}: {reason} (live={}, unauth={}, from-ip={})",
-                        children.len(),
-                        children.unauthenticated(),
-                        children.count_from_ip(peer.ip())
+            // Wait on the listener plus every knock socket / rendezvous
+            // listener, waking early for the knock's own deadlines.
+            let tick = match knock_servers.iter().filter_map(|k| k.next_wakeup()).min() {
+                Some(d) => {
+                    let ms = d
+                        .saturating_duration_since(std::time::Instant::now())
+                        .as_millis()
+                        .clamp(1, 1_000) as u16;
+                    PollTimeout::from(ms)
+                }
+                None => accept_tick,
+            };
+            let listener_ready = {
+                let mut wait = vec![PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
+                for ks in &knock_servers {
+                    wait.extend(
+                        ks.poll_fds()
+                            .into_iter()
+                            .map(|fd| PollFd::new(fd, PollFlags::POLLIN)),
                     );
                 }
-                drop(stream);
-                continue;
+                match poll(&mut wait, tick) {
+                    Ok(_) => {}
+                    Err(Errno::EINTR) => continue, // signal: flags checked above
+                    Err(e) => {
+                        eprintln!("sshd: poll: {e}");
+                        std::thread::sleep(std::time::Duration::from_millis(FORK_BACKOFF_MIN_MS));
+                        continue;
+                    }
+                }
+                wait[0].revents().is_some_and(|r| !r.is_empty())
+            };
+
+            // Connections to hand off this pass: knocked rendezvous
+            // connections (bound to the knock's user), then the listener.
+            let mut incoming: Vec<(std::net::TcpStream, std::net::SocketAddr, Option<String>)> =
+                Vec::new();
+            for ks in &mut knock_servers {
+                for c in ks.process() {
+                    if cli.debug {
+                        eprintln!("sshd: knock: rendezvous from {} for {}", c.peer, c.user);
+                    }
+                    incoming.push((c.stream, c.peer, Some(c.user)));
+                }
+            }
+            if listener_ready {
+                match listener.accept() {
+                    Ok((stream, peer)) => incoming.push((stream, peer, None)),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(e) => eprintln!("sshd: accept: {e}"),
+                }
             }
 
-            // Auth-notification pipe: the child writes one byte on userauth
-            // success so the parent moves it out of the `MaxStartups`
-            // count. Close-on-exec on both ends, so no program the child
-            // later spawns inherits either. If the pipe cannot be created
-            // the child is simply counted as unauthenticated for life
-            // (fail closed for the cap; the connection still works).
-            let (auth_rx, auth_tx) = match pipe_cloexec() {
-                Ok(p) => (Some(p.0), Some(p.1)),
-                Err(e) => {
-                    eprintln!("sshd: pipe for auth notification: {e}");
-                    (None, None)
-                }
-            };
-            AUTH_NOTIFY_FD.store(
-                auth_tx.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(-1),
-                Ordering::Relaxed,
-            );
-
-            // SAFETY: the daemon parent is single-threaded — no `thread::spawn`
-            // in this loop — so the `fork()` is followed by ordinary Rust
-            // code with no async-signal-safety concerns. The kernel
-            // duplicates fds across fork; the child inherits its own copy of
-            // `stream` and `listener`.
-            match unsafe { fork() } {
-                Ok(ForkResult::Parent { child }) => {
-                    fork_backoff_ms = FORK_BACKOFF_MIN_MS;
-                    // The write end now belongs to the child alone: close
-                    // ours so its EOF is observable, and forget the fd.
-                    AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
-                    drop(auth_tx);
-                    // Account the child (per-IP slot, unauthenticated) for as
-                    // long as it lives; `reap` releases it.
-                    children.insert(child, peer.ip(), auth_rx);
+            let mut incoming = incoming.into_iter();
+            #[allow(clippy::while_let_on_iterator)] // the child drops `incoming` mid-loop
+            while let Some((stream, peer, knock_user)) = incoming.next() {
+                // Enforce both connection caps *before* fork so a flood
+                // can't OOM us via per-process accounting. On refusal we
+                // simply drop the socket — RST tells the client to retry.
+                if let Err(reason) = children.admit(&peer, max_startups, cli.per_source_max) {
                     if cli.debug {
                         eprintln!(
-                            "sshd: forked connection {peer} -> pid {} (live={}, unauth={})",
-                            child.as_raw(),
+                            "sshd: refused {peer}: {reason} (live={}, unauth={}, from-ip={})",
                             children.len(),
                             children.unauthenticated(),
+                            children.count_from_ip(peer.ip())
                         );
                     }
-                    // Parent has no further use for this socket — its
-                    // refcount in the child keeps it alive.
                     drop(stream);
+                    continue;
                 }
-                Ok(ForkResult::Child) => {
-                    // The child owns nothing in the parent's table: close the
-                    // inherited read ends (this one's and every sibling's).
-                    // Its own write end is now owned by `AUTH_NOTIFY_FD`, so
-                    // the `OwnedFd` wrapper must not close it here.
-                    drop(children);
-                    drop(auth_rx);
-                    if let Some(tx) = auth_tx {
-                        core::mem::forget(tx);
-                    }
-                    // CRUCIAL: release the listener fd before we enter the
-                    // long session loop. Without this, restarting the
-                    // daemon on the same port keeps hitting EADDRINUSE
-                    // because the kernel sees an open listener.
-                    drop(listener);
-                    // Restore default SIGCHLD so the grandchild shell
-                    // can be reaped via waitpid(WNOHANG).
-                    // SAFETY: same justification as the parent — we run
-                    // in a single-threaded process here.
-                    let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
-                    // Likewise restore default SIGTERM/SIGINT so the
-                    // child dies cleanly on signal rather than getting
-                    // the parent's "set the shutdown flag" handler.
-                    let _ = unsafe { signal(Signal::SIGTERM, SigHandler::SigDfl) };
-                    let _ = unsafe { signal(Signal::SIGINT, SigHandler::SigDfl) };
 
-                    // Stash the peer address on *this child's* PamGate
-                    // copy — set_peer mutates state behind a Mutex but
-                    // post-fork COW means only this child sees it.
-                    pam_gate.set_peer(peer.to_string());
-                    // Likewise record this connection's socket addresses for
-                    // the `Match LocalAddress`/`LocalPort` context and the
-                    // session-open hook (COW-isolated per child).
-                    if let Ok(mut g) = CONN_ADDRS.lock() {
-                        *g = Some((peer, stream.local_addr().ok()));
+                // Auth-notification pipe: the child writes one byte on userauth
+                // success so the parent moves it out of the `MaxStartups`
+                // count. Close-on-exec on both ends, so no program the child
+                // later spawns inherits either. If the pipe cannot be created
+                // the child is simply counted as unauthenticated for life
+                // (fail closed for the cap; the connection still works).
+                let (auth_rx, auth_tx) = match pipe_cloexec() {
+                    Ok(p) => (Some(p.0), Some(p.1)),
+                    Err(e) => {
+                        eprintln!("sshd: pipe for auth notification: {e}");
+                        (None, None)
                     }
+                };
+                AUTH_NOTIFY_FD.store(
+                    auth_tx.as_ref().map(|fd| fd.as_raw_fd()).unwrap_or(-1),
+                    Ordering::Relaxed,
+                );
 
-                    let rc = match handle_session_with_peer(stream, peer, cfg.clone()) {
-                        Ok(()) => 0,
-                        Err(e) => {
-                            if cli.debug {
-                                eprintln!("sshd[child]: session error: {e}");
-                            }
-                            1
+                // SAFETY: the daemon parent is single-threaded — no `thread::spawn`
+                // in this loop — so the `fork()` is followed by ordinary Rust
+                // code with no async-signal-safety concerns. The kernel
+                // duplicates fds across fork; the child inherits its own copy of
+                // `stream` and `listener`.
+                match unsafe { fork() } {
+                    Ok(ForkResult::Parent { child }) => {
+                        fork_backoff_ms = FORK_BACKOFF_MIN_MS;
+                        // The write end now belongs to the child alone: close
+                        // ours so its EOF is observable, and forget the fd.
+                        AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
+                        drop(auth_tx);
+                        // Account the child (per-IP slot, unauthenticated) for as
+                        // long as it lives; `reap` releases it.
+                        children.insert(child, peer.ip(), auth_rx);
+                        if cli.debug {
+                            eprintln!(
+                                "sshd: forked connection {peer} -> pid {} (live={}, unauth={})",
+                                child.as_raw(),
+                                children.len(),
+                                children.unauthenticated(),
+                            );
                         }
-                    };
-                    // Skip atexit machinery — we've already cleanly
-                    // returned from handle_session.
-                    unsafe { libc::_exit(rc) };
-                }
-                Err(e) => {
-                    eprintln!("sshd: fork: {e} (backoff {fork_backoff_ms}ms)");
-                    AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
-                    drop(auth_tx);
-                    drop(auth_rx);
-                    drop(stream);
-                    // Bounded exponential backoff so a sustained EAGAIN
-                    // (rlimit, OOM-killer pressure) doesn't pin a core.
-                    std::thread::sleep(std::time::Duration::from_millis(fork_backoff_ms));
-                    fork_backoff_ms = (fork_backoff_ms * 2).min(FORK_BACKOFF_MAX_MS);
+                        // Parent has no further use for this socket — its
+                        // refcount in the child keeps it alive.
+                        drop(stream);
+                    }
+                    Ok(ForkResult::Child) => {
+                        // The child owns nothing in the parent's table: close the
+                        // inherited read ends (this one's and every sibling's).
+                        // Its own write end is now owned by `AUTH_NOTIFY_FD`, so
+                        // the `OwnedFd` wrapper must not close it here.
+                        drop(children);
+                        drop(auth_rx);
+                        if let Some(tx) = auth_tx {
+                            core::mem::forget(tx);
+                        }
+                        // CRUCIAL: release the listener fd before we enter the
+                        // long session loop. Without this, restarting the
+                        // daemon on the same port keeps hitting EADDRINUSE
+                        // because the kernel sees an open listener.
+                        drop(listener);
+                        // Likewise the knock sockets, and every other connection
+                        // of this batch (each is the parent's / a sibling's).
+                        drop(knock_servers);
+                        drop(incoming);
+                        if let Ok(mut g) = KNOCK_USER.lock() {
+                            *g = knock_user;
+                        }
+                        // Restore default SIGCHLD so the grandchild shell
+                        // can be reaped via waitpid(WNOHANG).
+                        // SAFETY: same justification as the parent — we run
+                        // in a single-threaded process here.
+                        let _ = unsafe { signal(Signal::SIGCHLD, SigHandler::SigDfl) };
+                        // Likewise restore default SIGTERM/SIGINT so the
+                        // child dies cleanly on signal rather than getting
+                        // the parent's "set the shutdown flag" handler.
+                        let _ = unsafe { signal(Signal::SIGTERM, SigHandler::SigDfl) };
+                        let _ = unsafe { signal(Signal::SIGINT, SigHandler::SigDfl) };
+
+                        // Stash the peer address on *this child's* PamGate
+                        // copy — set_peer mutates state behind a Mutex but
+                        // post-fork COW means only this child sees it.
+                        pam_gate.set_peer(peer.to_string());
+                        // Likewise record this connection's socket addresses for
+                        // the `Match LocalAddress`/`LocalPort` context and the
+                        // session-open hook (COW-isolated per child).
+                        if let Ok(mut g) = CONN_ADDRS.lock() {
+                            *g = Some((peer, stream.local_addr().ok()));
+                        }
+
+                        let rc = match handle_session_with_peer(stream, peer, cfg.clone()) {
+                            Ok(()) => 0,
+                            Err(e) => {
+                                if cli.debug {
+                                    eprintln!("sshd[child]: session error: {e}");
+                                }
+                                1
+                            }
+                        };
+                        // Skip atexit machinery — we've already cleanly
+                        // returned from handle_session.
+                        unsafe { libc::_exit(rc) };
+                    }
+                    Err(e) => {
+                        eprintln!("sshd: fork: {e} (backoff {fork_backoff_ms}ms)");
+                        AUTH_NOTIFY_FD.store(-1, Ordering::Relaxed);
+                        drop(auth_tx);
+                        drop(auth_rx);
+                        drop(stream);
+                        // Bounded exponential backoff so a sustained EAGAIN
+                        // (rlimit, OOM-killer pressure) doesn't pin a core.
+                        std::thread::sleep(std::time::Duration::from_millis(fork_backoff_ms));
+                        fork_backoff_ms = (fork_backoff_ms * 2).min(FORK_BACKOFF_MAX_MS);
+                    }
                 }
             }
         }

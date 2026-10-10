@@ -568,6 +568,9 @@ fn apply_extra_o(
         control_master,
         control_path,
         control_persist,
+        knock_mode,
+        knock_fallback_delay,
+        knock_port,
     );
     // Cumulative lists: append whatever the -o block contributed.
     cfg_block.identity_files.extend(o.identity_files);
@@ -1360,6 +1363,8 @@ fn run() -> Result<i32, String> {
         eprintln!("warning: both ProxyJump and ProxyCommand set; using ProxyJump");
     }
 
+    // Publickey credentials gathered before connecting (knock path only).
+    let mut early_credentials: Option<Vec<ClientCredential>> = None;
     let mut client = if let Some(spec) = proxy_jump {
         // ---- ProxyJump ----
         let hops = parse_jump_hops(&spec)?;
@@ -1423,8 +1428,25 @@ fn run() -> Result<i32, String> {
         // AddressFamily / TCPKeepAlive take real effect, then run the client
         // over the configured socket via connect_via (which still threads
         // connect_host through so KnownHosts looks the host up by name).
+        //
+        // Unless `KnockMode no`, a refused or slow connect falls back to the
+        // puressh UDP knock (docs/knock.md), which needs the publickey
+        // identities up front to sign the knock.
         vlog(1, &format!("connecting to {connect_host}:{port}"));
-        let sock = dial_tcp(&connect_host, port, &cfg_block)?;
+        let mut cfg = cfg;
+        let knock_mode = cfg_block
+            .knock_mode
+            .unwrap_or(puressh::config::KnockSetting::Auto);
+        let sock = if knock_mode == puressh::config::KnockSetting::No {
+            dial_tcp(&connect_host, port, &cfg_block)?
+        } else {
+            apply_identity_agent(cfg_block.identity_agent.as_ref(), identities_only);
+            let creds = collect_credentials(&cfg_block, &cli.identities, identities_only);
+            let sock =
+                knock_support::dial(&connect_host, port, &user, &cfg_block, &mut cfg, &creds)?;
+            early_credentials = Some(creds);
+            sock
+        };
         let client = Client::connect_via(Box::new(sock), connect_host.as_str(), port, cfg)
             .map_err(|e| format!("connect: {e}"))?;
         vlog(1, &format!("connected to {connect_host}:{port}"));
@@ -1436,9 +1458,13 @@ fn run() -> Result<i32, String> {
     // replaces $SSH_AUTH_SOCK for the agent-backed credential lookup and any
     // AddKeysToAgent push below. We do this by adjusting the process env so
     // the existing agent helpers (which read $SSH_AUTH_SOCK) pick it up.
-    apply_identity_agent(cfg_block.identity_agent.as_ref(), identities_only);
-
-    let credentials = collect_credentials(&cfg_block, &cli.identities, identities_only);
+    let credentials = match early_credentials {
+        Some(c) => c,
+        None => {
+            apply_identity_agent(cfg_block.identity_agent.as_ref(), identities_only);
+            collect_credentials(&cfg_block, &cli.identities, identities_only)
+        }
+    };
     authenticate_client(&mut client, &user, credentials, &cfg_block)?;
 
     // AddKeysToAgent yes: push the supplied identities into the local agent.
@@ -2644,12 +2670,42 @@ fn dial_tcp(
     port: u16,
     cfg_block: &puressh::config::ClientOptions,
 ) -> Result<TcpStream, String> {
+    let timeout = connect_timeout(cfg_block);
+
+    // Try each candidate address until one connects.
+    let mut last_err: Option<String> = None;
+    for addr in resolve_addrs(host, port, cfg_block)? {
+        let sock = match connect_one(addr, cfg_block.bind_address.as_deref(), timeout) {
+            Ok(s) => s,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        configure_socket(&sock, cfg_block)?;
+        return Ok(sock);
+    }
+    Err(last_err.unwrap_or_else(|| format!("could not connect to {host}:{port}")))
+}
+
+/// `ConnectTimeout` as a `Duration`.
+fn connect_timeout(cfg_block: &puressh::config::ClientOptions) -> Option<std::time::Duration> {
+    cfg_block
+        .connect_timeout
+        .map(|s| std::time::Duration::from_secs(s as u64))
+}
+
+/// Resolve `host:port`, keeping only the `AddressFamily` the config allows.
+fn resolve_addrs(
+    host: &str,
+    port: u16,
+    cfg_block: &puressh::config::ClientOptions,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     use puressh::config::AddressFamily;
     use std::net::ToSocketAddrs;
 
-    // Resolve and filter by AddressFamily.
     let family = cfg_block.address_family.unwrap_or(AddressFamily::Any);
-    let mut addrs: Vec<std::net::SocketAddr> = (host, port)
+    let addrs: Vec<std::net::SocketAddr> = (host, port)
         .to_socket_addrs()
         .map_err(|e| format!("resolve {host}:{port}: {e}"))?
         .filter(|a| match family {
@@ -2665,30 +2721,21 @@ fn dial_tcp(
             "no addresses for {host}:{port} in the requested address family"
         ));
     }
+    Ok(addrs)
+}
 
-    let timeout = cfg_block
-        .connect_timeout
-        .map(|s| std::time::Duration::from_secs(s as u64));
-
-    // Try each candidate address until one connects.
-    let mut last_err: Option<String> = None;
-    for addr in addrs.drain(..) {
-        let sock = match connect_one(addr, cfg_block.bind_address.as_deref(), timeout) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        };
-        // TCPKeepAlive: default yes (OpenSSH default). Only set SO_KEEPALIVE
-        // off when explicitly disabled.
-        if cfg_block.tcp_keep_alive != Some(false) {
-            set_so_keepalive(&sock, true)?;
-        }
-        let _ = sock.set_nodelay(true);
-        return Ok(sock);
+/// Socket options applied to every connected SSH socket.
+fn configure_socket(
+    sock: &TcpStream,
+    cfg_block: &puressh::config::ClientOptions,
+) -> Result<(), String> {
+    // TCPKeepAlive: default yes (OpenSSH default). Only set SO_KEEPALIVE
+    // off when explicitly disabled.
+    if cfg_block.tcp_keep_alive != Some(false) {
+        set_so_keepalive(sock, true)?;
     }
-    Err(last_err.unwrap_or_else(|| format!("could not connect to {host}:{port}")))
+    let _ = sock.set_nodelay(true);
+    Ok(())
 }
 
 /// Connect to a single resolved address, optionally binding a local source
@@ -3234,6 +3281,306 @@ fn main() -> ExitCode {
         Err(msg) => {
             eprintln!("ssh: {msg}");
             ExitCode::from(255)
+        }
+    }
+}
+
+/// Client side of the puressh UDP knock (`docs/knock.md` §6) for the direct
+/// TCP path: identity selection, the sig1 and knock-host caches under
+/// `~/.ssh/puressh/`, and pinning the session to the ACCEPT's host key.
+mod knock_support {
+    use super::*;
+    use puressh::client::HostKeyPolicy;
+    use puressh::config::KnockSetting;
+    use puressh::hostkey::HostKey;
+    use puressh::knock::{
+        Connected, KnockConnectOptions, KnockIdentity, KnockMode, KnockRequest, TcpDialer,
+        connect_or_knock_addrs, wire,
+    };
+    use std::collections::HashMap;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    /// Keys knocked with at once (`docs/knock.md` §6.2).
+    const MAX_IDENTITIES: usize = 4;
+    /// Knock-host cache entries unused for this long are forgotten.
+    const HOST_CACHE_TTL_SECS: u64 = 30 * 24 * 3600;
+
+    /// Connect to `host:port` like [`dial_tcp`], knocking when plain TCP is
+    /// refused or slow. On a knock, `cfg` is pinned to the ACCEPT's host key.
+    pub(super) fn dial(
+        host: &str,
+        port: u16,
+        user: &str,
+        cfg_block: &puressh::config::ClientOptions,
+        cfg: &mut Config,
+        creds: &[ClientCredential],
+    ) -> Result<TcpStream, String> {
+        let signers: Vec<&dyn HostKey> = creds
+            .iter()
+            .filter_map(|c| match c {
+                ClientCredential::PublicKey(k) => Some(&**k as &dyn HostKey),
+                _ => None,
+            })
+            .filter(|k| wire::max_sig_blob_len(&k.public_blob()).is_some())
+            .take(MAX_IDENTITIES)
+            .collect();
+        if signers.is_empty() || user.is_empty() || user.len() > wire::MAX_USER_LEN {
+            vlog(2, "knock: no usable identity or user name; plain TCP only");
+            return dial_tcp(host, port, cfg_block);
+        }
+
+        let addrs = resolve_addrs(host, port, cfg_block)?;
+        let timeout = connect_timeout(cfg_block);
+        let bind = cfg_block.bind_address.clone();
+        let dialer: TcpDialer = Arc::new(move |a| {
+            connect_one(a, bind.as_deref(), timeout).map_err(std::io::Error::other)
+        });
+
+        let mut sig1_cache = Sig1Cache::load();
+        let identities: Vec<KnockIdentity<'_>> = signers
+            .iter()
+            .map(|k| KnockIdentity {
+                signer: *k,
+                sig1: sig1_cache.get(user, &wire::key_fp(&k.public_blob())),
+            })
+            .collect();
+        let mut host_cache = HostCache::load();
+        let host_key = format!("{host}:{port}");
+
+        let mut opts = KnockConnectOptions::default();
+        opts.mode = match cfg_block.knock_mode {
+            Some(KnockSetting::Always) => KnockMode::Always,
+            _ => KnockMode::Auto,
+        };
+        opts.fallback_delay = if host_cache.contains(&host_key) {
+            // Answered a knock before: knock right away, alongside TCP.
+            Duration::ZERO
+        } else {
+            Duration::from_millis(cfg_block.knock_fallback_delay.unwrap_or(1500) as u64)
+        };
+        opts.connect_timeout = timeout;
+        opts.knock_port = cfg_block.knock_port;
+
+        let mut req = KnockRequest {
+            user,
+            identities,
+            known_host_keys: known_host_keys(cfg, host, port),
+        };
+        let res = connect_or_knock_addrs(&addrs, &mut req, &opts, dialer);
+        for (k, id) in signers.iter().zip(&req.identities) {
+            if let Some(s1) = &id.sig1 {
+                sig1_cache.put(user, wire::key_fp(&k.public_blob()), s1);
+            }
+        }
+        sig1_cache.save();
+
+        match res {
+            Ok(Connected::Direct(s)) => {
+                configure_socket(&s, cfg_block)?;
+                Ok(s)
+            }
+            Ok(Connected::Knocked { stream, accepted }) => {
+                vlog(
+                    1,
+                    &format!(
+                        "knock: accepted, rendezvous at {} ({} host key)",
+                        accepted.target,
+                        if accepted.host_key_known {
+                            "known"
+                        } else {
+                            "new"
+                        }
+                    ),
+                );
+                accepted.pin(cfg);
+                host_cache.touch(&host_key);
+                host_cache.save();
+                configure_socket(&stream, cfg_block)?;
+                Ok(stream)
+            }
+            Ok(_) => Err(format!("connect {host}:{port}: unsupported knock outcome")),
+            Err(e) => Err(format!("connect {host}:{port}: {e}")),
+        }
+    }
+
+    /// Plain host keys `known_hosts` holds for `host:port`, if the policy
+    /// reads `known_hosts` at all.
+    fn known_host_keys(cfg: &Config, host: &str, port: u16) -> Vec<Vec<u8>> {
+        let HostKeyPolicy::KnownHosts(kh) = &cfg.host_key_policy else {
+            return Vec::new();
+        };
+        let Ok(store) = kh.store.lock() else {
+            return Vec::new();
+        };
+        store
+            .find(host, port)
+            .into_iter()
+            .filter(|e| e.marker.is_none())
+            .map(|e| e.key_blob.clone())
+            .collect()
+    }
+
+    fn cache_path(name: &str) -> Option<PathBuf> {
+        let dir = expand_tilde("~/.ssh/puressh");
+        if dir.starts_with('~') {
+            return None;
+        }
+        Some(PathBuf::from(dir).join(name))
+    }
+
+    fn hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    fn unhex(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2) {
+            return None;
+        }
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+            .collect()
+    }
+
+    /// Write `content` to `path` (mode 0600, directory 0700) via a rename.
+    fn write_private(path: &std::path::Path, content: &str) {
+        let Some(dir) = path.parent() else { return };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            let _ = std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(dir);
+        }
+        #[cfg(not(unix))]
+        let _ = std::fs::create_dir_all(dir);
+        let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600);
+        }
+        let ok = o
+            .open(&tmp)
+            .and_then(|mut f| f.write_all(content.as_bytes()))
+            .is_ok();
+        if !ok || std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            vlog(1, &format!("knock: could not write {}", path.display()));
+        }
+    }
+
+    /// `knock_ids`: `user key_fp_hex sig1_hex` per line.
+    struct Sig1Cache {
+        entries: HashMap<(String, [u8; 32]), Vec<u8>>,
+        dirty: bool,
+    }
+
+    impl Sig1Cache {
+        fn load() -> Self {
+            let mut entries = HashMap::new();
+            let text = cache_path("knock_ids")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            for line in text.lines() {
+                let mut it = line.split_whitespace();
+                let (Some(u), Some(fp), Some(sig)) = (it.next(), it.next(), it.next()) else {
+                    continue;
+                };
+                let (Some(fp), Some(sig)) = (unhex(fp), unhex(sig)) else {
+                    continue;
+                };
+                let Ok(fp) = <[u8; 32]>::try_from(fp) else {
+                    continue;
+                };
+                entries.insert((u.to_string(), fp), sig);
+            }
+            Self {
+                entries,
+                dirty: false,
+            }
+        }
+
+        fn get(&self, user: &str, fp: &[u8; 32]) -> Option<Vec<u8>> {
+            self.entries.get(&(user.to_string(), *fp)).cloned()
+        }
+
+        fn put(&mut self, user: &str, fp: [u8; 32], sig1: &[u8]) {
+            let k = (user.to_string(), fp);
+            if self.entries.get(&k).map(Vec::as_slice) != Some(sig1) {
+                self.entries.insert(k, sig1.to_vec());
+                self.dirty = true;
+            }
+        }
+
+        fn save(&self) {
+            if !self.dirty
+                || self
+                    .entries
+                    .keys()
+                    .any(|(u, _)| u.contains(char::is_whitespace))
+            {
+                return;
+            }
+            let Some(path) = cache_path("knock_ids") else {
+                return;
+            };
+            let mut out = String::new();
+            for ((u, fp), sig) in &self.entries {
+                out.push_str(&format!("{u} {} {}\n", hex(fp), hex(sig)));
+            }
+            write_private(&path, &out);
+        }
+    }
+
+    /// `knock_hosts`: `host:port last_use_unix_secs` per line.
+    struct HostCache {
+        entries: HashMap<String, u64>,
+        now: u64,
+    }
+
+    impl HostCache {
+        fn load() -> Self {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let text = cache_path("knock_hosts")
+                .and_then(|p| std::fs::read_to_string(p).ok())
+                .unwrap_or_default();
+            let entries = text
+                .lines()
+                .filter_map(|l| {
+                    let (h, t) = l.split_once(' ')?;
+                    let t: u64 = t.trim().parse().ok()?;
+                    (now.saturating_sub(t) < HOST_CACHE_TTL_SECS).then(|| (h.to_string(), t))
+                })
+                .collect();
+            Self { entries, now }
+        }
+
+        fn contains(&self, host: &str) -> bool {
+            self.entries.contains_key(host)
+        }
+
+        fn touch(&mut self, host: &str) {
+            self.entries.insert(host.to_string(), self.now);
+        }
+
+        fn save(&self) {
+            let Some(path) = cache_path("knock_hosts") else {
+                return;
+            };
+            let mut out = String::new();
+            for (h, t) in &self.entries {
+                if !h.contains(char::is_whitespace) {
+                    out.push_str(&format!("{h} {t}\n"));
+                }
+            }
+            write_private(&path, &out);
         }
     }
 }

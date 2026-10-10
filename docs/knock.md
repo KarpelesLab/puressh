@@ -1,6 +1,7 @@
 # puressh knock: stealth SSH rendezvous over UDP
 
-Status: **draft v1**. Not compatible with SSH or any existing port-knocking
+Status: **v1, implemented** (`puressh::knock`, the `ssh` and `sshd`
+binaries; see §10). Not compatible with SSH or any existing port-knocking
 tool; it only works between puressh clients and puressh servers.
 
 ## 1. Goal and overview
@@ -278,22 +279,23 @@ on, following the normal address order.
 
 ### 6.3 Receiving ACCEPT
 
-Ignore any datagram that does not come from the knocked IP and port 22, does
+Ignore any datagram that does not come from the knocked IP and port, does
 not parse, has a `knock_hash` that matches none of the outstanding knocks, or
 has an invalid `sig_host`. Then:
 
 - **Known host:** the signing key must be the `host_fp` key. Otherwise ignore
   the datagram.
-- **Unknown host (`HOSTKEY_FULL`):** run the normal TOFU prompt, mentioning
-  that the key arrived through a knock. On acceptance, record it under the
-  **original host name and port** (not the rendezvous port). If the user takes
-  longer than `window`, knock again; this time the host key is known.
+- **Unknown host (`HOSTKEY_FULL`):** the key is new. Connect (§6.4) and let
+  the SSH key exchange run the normal TOFU decision, keyed by the **original
+  host name and port** (not the rendezvous port). The pin makes that decision
+  about the same key that signed the ACCEPT. Because the listener is consumed
+  by the connect, the prompt is not limited by `window`.
 
 ### 6.4 Connecting
 
-- Bind the TCP socket to the **same local IP** the UDP socket used
-  (`getsockname`). This matters on hosts with several addresses or IPv6
-  privacy addresses.
+- The TCP connection should leave from the **same local IP** as the knock.
+  Kernels choose the same source address for the same destination
+  (RFC 6724), so the implementation does not bind explicitly.
 - Connect to `knocked IP : port` and send `token` (32 bytes), then run normal
   SSH.
 - Restrict the host key algorithms to the one of the ACCEPT key. The host key
@@ -355,8 +357,63 @@ has an invalid `sig_host`. Then:
 - **Certificate users.** `key_fp` lookup needs a key table, and
   certificate-authenticated users or `AuthorizedKeysCommand` have no static
   list. Options: a separate knock-key list, or learning keys from successful
-  cert logins.
-- **Enabling users.** Which users are enabled for knock, and how the server
-  reads their `authorized_keys` without full privileges (scan at startup
-  versus an explicit `KnockUsers` list).
+  cert logins. v1 only knocks with plain keys.
 - **ProxyJump.** Whether a jump host should knock on behalf of the client.
+  v1 knocks only on the direct-TCP path; jump hops connect normally.
+
+## 10. Implementation notes (puressh)
+
+Library: `puressh::knock` (feature `knock`, on by default).
+`KnockState` is the sans-IO server filter of §5.2, `KnockServer` adds the
+sockets (poll-friendly: `poll_fds()`, `next_wakeup()`, `process()`), and
+`connect_or_knock` / `connect_or_knock_addrs` implement §6.1. On the client,
+`KnockAccepted::pin` sets `client::Config::pinned_host_key`, which both
+restricts the advertised host-key algorithms and makes KEX fail unless the
+server presents exactly that key.
+
+Differences from the text above:
+
+- `sk-*` keys are part of the protocol but puressh has no FIDO support yet,
+  so neither side can use them.
+- The rendezvous listener binds to the knock socket's own address (the
+  wildcard if the socket is bound to the wildcard), not to the specific
+  destination address of the knock (that would need `IP_PKTINFO`, which
+  `std` does not expose). The peer-IP check of §5.4 is unchanged.
+- The knock goes to the UDP port with the same number as the SSH TCP port
+  unless `KnockPort` says otherwise.
+
+### `sshd`
+
+Global-only `sshd_config` keywords (refused inside `Match`):
+
+| Keyword | Meaning |
+|---------|---------|
+| `KnockListen addr[:port]` | UDP address to listen on (repeatable). Port defaults to `Port`. Enables knock. |
+| `KnockUsers user…` | Users allowed to knock (repeatable). Required with `KnockListen`. |
+| `KnockPorts lo-hi` | Rendezvous TCP port range (default: kernel ephemeral). |
+| `KnockWindow secs` | Rendezvous listener lifetime (default 60). |
+| `KnockClockSkew secs` | Accepted client clock offset (default 30). |
+| `KnockMaxPending n` | Open listeners per (user, key) (default 2). |
+
+The key table is each knock user's plain keys from `AuthorizedKeysFile` (or
+the global `-A` file). It is read as root at startup and every 60 s
+afterwards. A knocked connection may only authenticate as the knock's user
+(`KnockBindUser` is always on). It goes through the same `MaxStartups` /
+per-source limits and the same forked-child path as any other connection.
+
+To actually hide the server, keep TCP `Port` off the public interface
+(`ListenAddress 127.0.0.1`, or a firewall that drops it), drop or ignore
+other UDP, and open `KnockPorts` in the firewall.
+
+### `ssh`
+
+| `ssh_config` keyword | Meaning |
+|----------------------|---------|
+| `KnockMode no\|auto\|always` | Default `auto` (§6.1). |
+| `KnockFallbackDelay ms` | Default 1500. |
+| `KnockPort port` | UDP port to knock (default: the SSH port). |
+
+Up to four plain publickey identities (agent and `IdentityFile`, in offer
+order) knock at once. The caches of §6.5 live in `~/.ssh/puressh/` (mode
+0600). A host in `knock_hosts` gets its knock sent immediately, alongside the
+TCP attempt. `-v` reports `knock: accepted, rendezvous at …`.

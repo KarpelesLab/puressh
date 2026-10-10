@@ -251,6 +251,21 @@ pub struct ServerOptions {
     /// (the standard `sshd_config` spelling; `SftpEnabled` remains a working
     /// alias). External-command subsystems are rejected at parse time.
     pub subsystem_sftp: Option<bool>,
+    /// `KnockListen` — UDP address(es) for the puressh knock rendezvous
+    /// (`docs/knock.md`): `addr`, `addr:port` or `[v6]:port`. A missing port
+    /// means the SSH `Port`. Cumulative; empty ⇒ knock disabled.
+    pub knock_listen: Vec<String>,
+    /// `KnockUsers` — login names allowed to knock (literal, cumulative).
+    pub knock_users: Vec<String>,
+    /// `KnockPorts` — `lo-hi` TCP port range for rendezvous listeners.
+    /// `None` ⇒ kernel-chosen ephemeral ports.
+    pub knock_ports: Option<(u16, u16)>,
+    /// `KnockWindow` — seconds a rendezvous listener stays open.
+    pub knock_window: Option<u32>,
+    /// `KnockClockSkew` — largest accepted client clock offset, seconds.
+    pub knock_clock_skew: Option<u32>,
+    /// `KnockMaxPending` — open rendezvous listeners per (user, key).
+    pub knock_max_pending: Option<u32>,
 }
 
 /// `AllowTcpForwarding` policy: which forwarding directions are permitted.
@@ -513,6 +528,12 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(rekey_limit);
     take_scalar!(address_family);
     take_scalar!(subsystem_sftp);
+    take_scalar!(knock_ports);
+    take_scalar!(knock_window);
+    take_scalar!(knock_clock_skew);
+    take_scalar!(knock_max_pending);
+    dst.knock_listen.extend(src.knock_listen.iter().cloned());
+    dst.knock_users.extend(src.knock_users.iter().cloned());
     // `pid_file` is startup-only (rejected inside Match), so it can only ever
     // come from the global block; merge it first-match-wins anyway for
     // robustness, carrying the "was it set" flag alongside.
@@ -560,6 +581,13 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         // applies the env allow-list once, connection-wide, from the global
         // section; a per-block list would be silently ignored, so refuse it.
         "acceptenv",
+        // The knock socket and its key table are built once at startup.
+        "knocklisten",
+        "knockusers",
+        "knockports",
+        "knockwindow",
+        "knockclockskew",
+        "knockmaxpending",
     ];
     if INVALID_IN_MATCH.contains(&line.keyword.as_str()) {
         return Err(ConfigError::Unsupported {
@@ -584,6 +612,57 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "hostcertificate" => {
             opts.host_certificate_files.push(one_arg(line)?);
+        }
+        "knocklisten" => {
+            opts.knock_listen.push(one_arg(line)?);
+        }
+        "knockusers" => {
+            if line.args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected at least one user name".into(),
+                });
+            }
+            opts.knock_users.extend(line.args.iter().cloned());
+        }
+        "knockports" => {
+            let s = one_arg(line)?;
+            let range = s
+                .split_once('-')
+                .and_then(|(lo, hi)| Some((lo.parse::<u16>().ok()?, hi.parse::<u16>().ok()?)))
+                .filter(|(lo, hi)| *lo > 0 && lo <= hi);
+            opts.knock_ports = Some(range.ok_or_else(|| ConfigError::BadValue {
+                line: line.line_no,
+                keyword: kw.to_string(),
+                msg: format!("expected lo-hi port range, got {s:?}"),
+            })?);
+        }
+        "knockwindow" | "knockclockskew" => {
+            let secs = parse_duration_seconds(line)?;
+            if secs == 0 || secs > u16::MAX as u32 {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected 1..=65535 seconds".into(),
+                });
+            }
+            if kw == "knockwindow" {
+                opts.knock_window = Some(secs);
+            } else {
+                opts.knock_clock_skew = Some(secs);
+            }
+        }
+        "knockmaxpending" => {
+            let n = parse_u16(line)?;
+            if n == 0 {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "must be at least 1".into(),
+                });
+            }
+            opts.knock_max_pending = Some(n as u32);
         }
         "trustedusercakeys" => {
             opts.trusted_user_ca_keys = Some(one_arg(line)?);
@@ -2038,6 +2117,32 @@ Subsystem sftp internal-sftp
             matches!(err, ConfigError::BadValue { line: 1, .. }),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn knock_keywords_parse() {
+        let cfg = SshServerConfig::parse(
+            "KnockListen 0.0.0.0\nKnockListen [::]:2222\nKnockUsers alice bob\n\
+             KnockPorts 40000-40100\nKnockWindow 30\nKnockClockSkew 1m\nKnockMaxPending 3\n",
+        )
+        .unwrap();
+        let g = &cfg.global;
+        assert_eq!(g.knock_listen, vec!["0.0.0.0", "[::]:2222"]);
+        assert_eq!(g.knock_users, vec!["alice", "bob"]);
+        assert_eq!(g.knock_ports, Some((40000, 40100)));
+        assert_eq!(g.knock_window, Some(30));
+        assert_eq!(g.knock_clock_skew, Some(60));
+        assert_eq!(g.knock_max_pending, Some(3));
+        for bad in [
+            "KnockPorts 5-1",
+            "KnockPorts x",
+            "KnockWindow 0",
+            "KnockMaxPending 0",
+        ] {
+            assert!(SshServerConfig::parse(bad).is_err(), "{bad}");
+        }
+        let err = SshServerConfig::parse("Match User a\n  KnockUsers a\n").unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { .. }));
     }
 
     #[test]

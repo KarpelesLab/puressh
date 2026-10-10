@@ -79,6 +79,7 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 | `compress`     | yes     | `zlib` compression via `compcol`                       |
 | `pam`          | yes     | PAM session integration for `sshd` (Linux only)        |
 | `multichannel` | yes     | Concurrent multi-channel client (`SharedClient`, `SftpSession`) |
+| `knock`        | yes     | Stealth UDP knock rendezvous in front of SSH (puressh-only, see [`docs/knock.md`](docs/knock.md)) |
 | `async`        | no      | Runtime-agnostic async frontends (`AsyncClient`, `AsyncServerConnection`) over `futures_io` |
 | `tokio`        | no      | Native tokio entry points (`connect_tokio` / `accept_tokio`) accepting `tokio::io` streams; builds on `async` |
 | `mio`          | no      | Native readiness frontend (`MioClient`) for a `mio`-style `Poll` loop; no `mio` dependency in the library |
@@ -161,6 +162,14 @@ cargo build --release
 All of them understand `ssh_config` (including `Match` blocks and `Include`),
 `known_hosts`, and bracketed-IPv6 host syntax (`[2001:db8::1]:22`).
 
+`ssh` and `sshd` also speak the puressh-only **knock** rendezvous
+([`docs/knock.md`](docs/knock.md)). With `KnockListen` / `KnockUsers` set,
+`sshd` keeps no TCP port visibly open: an authorized key sends one signed UDP
+datagram, and the server opens a one-shot TCP listener for that client only.
+The SSH session that follows is ordinary, including full user
+authentication. `ssh` knocks automatically when the TCP connect is refused or
+slow (`KnockMode auto`).
+
 ## Module layout
 
 ```
@@ -186,6 +195,7 @@ src/
 ├── agent/           ssh-agent client protocol
 ├── driver/          sans-I/O ClientDriver / ServerDriver state machines
 ├── shared.rs        SharedClient (multichannel layer)
+├── knock/           stealth UDP knock rendezvous (feature `knock`)
 ├── ffi/             C ABI surface (feature `ffi`)
 ├── client.rs        high-level blocking client API (feature `client`)
 ├── server.rs        high-level blocking server API (feature `server`)

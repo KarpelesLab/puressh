@@ -122,6 +122,22 @@ pub fn cert_name_to_plain(name: &str) -> Option<&'static str> {
     }
 }
 
+/// The certificate algorithm name to offer for a certificate whose embedded
+/// key is `key_type` (`ssh-ed25519`, `ssh-rsa`, …, as
+/// [`Certificate::embedded_algorithm`] reports it). RSA certificates are
+/// offered as `rsa-sha2-512-cert-v01@openssh.com`, matching signers that
+/// sign RSA with SHA-512.
+pub fn cert_name_for_key_type(key_type: &str) -> Option<&'static str> {
+    match key_type {
+        "ssh-rsa" | "rsa-sha2-512" => Some("rsa-sha2-512-cert-v01@openssh.com"),
+        "rsa-sha2-256" => Some("rsa-sha2-256-cert-v01@openssh.com"),
+        other => CERT_KEY_NAMES
+            .iter()
+            .copied()
+            .find(|n| cert_name_to_plain(n) == Some(other)),
+    }
+}
+
 /// Map the *certificate blob's own* type string (the first field of the blob)
 /// to the plain key-type used to reconstruct the embedded public key. This is
 /// the canonical-form name; for RSA it is always `ssh-rsa-cert-v01@openssh.com`
@@ -403,7 +419,15 @@ impl Certificate {
         let line = line.trim();
         let mut it = line.split_whitespace();
         let name = it.next().ok_or(Error::Format("cert: empty line"))?;
-        if !CERT_KEY_NAMES.contains(&name) {
+        // Files carry the blob's own type (`ssh-rsa-cert-v01@openssh.com`
+        // for every RSA cert); also accept the negotiated RSA names.
+        let name = match name {
+            "rsa-sha2-512-cert-v01@openssh.com" | "rsa-sha2-256-cert-v01@openssh.com" => {
+                "ssh-rsa-cert-v01@openssh.com"
+            }
+            n => n,
+        };
+        if blob_type_to_plain(name).is_none() {
             return Err(Error::Format("cert: line is not an OpenSSH certificate"));
         }
         let b64 = it
@@ -411,8 +435,8 @@ impl Certificate {
             .ok_or(Error::Format("cert: missing base64 blob"))?;
         let blob = crate::key::base64_decode(b64.as_bytes())?;
         let cert = Self::parse(&blob)?;
-        // The negotiated/file name must be consistent with the blob's own type.
-        if cert_name_to_plain(name) != blob_type_to_plain(&cert.key_type) {
+        // The file's name must be the blob's own type.
+        if name != cert.key_type {
             return Err(Error::Format("cert: line key-type disagrees with blob"));
         }
         Ok(cert)
@@ -605,6 +629,156 @@ impl Certificate {
     /// True if the named extension is present.
     pub fn has_extension(&self, name: &str) -> bool {
         self.extensions.iter().any(|(n, _)| n == name)
+    }
+}
+
+impl Certificate {
+    /// Decode a string-valued option payload (see
+    /// [`Self::critical_option_string`]).
+    pub fn option_string(data: &[u8]) -> Option<String> {
+        decode_option_string(data)
+    }
+
+    /// The single-line public form (`<key type> <base64> [comment]`) written
+    /// to `*-cert.pub` files.
+    pub fn to_openssh_line(&self, comment: &str) -> String {
+        let mut line = alloc::format!(
+            "{} {}",
+            self.key_type,
+            crate::key::base64::encode(&self.raw)
+        );
+        if !comment.is_empty() {
+            line.push(' ');
+            line.push_str(comment);
+        }
+        line
+    }
+}
+
+/// The extensions `ssh-keygen -s` grants a user certificate by default.
+pub const DEFAULT_USER_EXTENSIONS: &[&str] = &[
+    "permit-X11-forwarding",
+    "permit-agent-forwarding",
+    "permit-port-forwarding",
+    "permit-pty",
+    "permit-user-rc",
+];
+
+/// Builds and signs a certificate (what `ssh-keygen -s` does).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct CertificateBuilder {
+    /// Plain public-key blob of the key being certified.
+    pub public_key: Vec<u8>,
+    /// Random nonce (OpenSSH uses 32 bytes).
+    pub nonce: Vec<u8>,
+    /// Serial number.
+    pub serial: u64,
+    /// User or host.
+    pub cert_type: CertType,
+    /// Key identity, logged by servers.
+    pub key_id: String,
+    /// Principals; empty means any.
+    pub valid_principals: Vec<String>,
+    /// Start of validity (Unix seconds).
+    pub valid_after: u64,
+    /// End of validity (Unix seconds); `u64::MAX` is forever.
+    pub valid_before: u64,
+    /// Critical options, `(name, raw data)`; any order.
+    pub critical_options: Vec<(String, Vec<u8>)>,
+    /// Extensions, `(name, raw data)`; any order.
+    pub extensions: Vec<(String, Vec<u8>)>,
+}
+
+/// Encode a string-valued option payload (`force-command`, …).
+pub fn encode_option_string(value: &str) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.write_string(value.as_bytes());
+    w.into_vec()
+}
+
+fn write_pair_list(pairs: &[(String, Vec<u8>)]) -> Result<Vec<u8>> {
+    let mut sorted: Vec<&(String, Vec<u8>)> = pairs.iter().collect();
+    sorted.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut w = Writer::new();
+    for (i, (name, data)) in sorted.iter().map(|p| (&p.0, &p.1)).enumerate() {
+        if i > 0 && sorted[i - 1].0 == *name {
+            return Err(Error::Config("cert: duplicate option"));
+        }
+        w.write_string(name.as_bytes());
+        w.write_string(data);
+    }
+    Ok(w.into_vec())
+}
+
+impl CertificateBuilder {
+    /// A certificate for `public_key`, valid forever for any principal, with
+    /// no options or extensions.
+    pub fn new(public_key: Vec<u8>, cert_type: CertType, nonce: Vec<u8>) -> Self {
+        Self {
+            public_key,
+            nonce,
+            serial: 0,
+            cert_type,
+            key_id: String::new(),
+            valid_principals: Vec::new(),
+            valid_after: 0,
+            valid_before: u64::MAX,
+            critical_options: Vec::new(),
+            extensions: Vec::new(),
+        }
+    }
+
+    /// Sign with the CA whose plain public-key blob is `ca_public_key`;
+    /// `sign` returns an SSH signature blob over the bytes it is given (for
+    /// an RSA CA, OpenSSH uses `rsa-sha2-512`).
+    pub fn sign(
+        &self,
+        ca_public_key: &[u8],
+        sign: impl FnOnce(&[u8]) -> Result<Vec<u8>>,
+    ) -> Result<Certificate> {
+        let mut key = Reader::new(&self.public_key);
+        let plain = key.read_string()?;
+        let key_type = match plain {
+            b"ssh-ed25519" => "ssh-ed25519-cert-v01@openssh.com",
+            b"ecdsa-sha2-nistp256" => "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            b"ecdsa-sha2-nistp384" => "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+            b"ecdsa-sha2-nistp521" => "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+            b"ssh-rsa" => "ssh-rsa-cert-v01@openssh.com",
+            _ => return Err(Error::Unsupported("cert: key type")),
+        };
+        if self.valid_after > self.valid_before {
+            return Err(Error::Config("cert: valid_after after valid_before"));
+        }
+        let mut w = Writer::new();
+        w.write_string(key_type.as_bytes());
+        w.write_string(&self.nonce);
+        // The plain key's fields follow its type name in the same order.
+        w.write_raw(&self.public_key[self.public_key.len() - key.remaining()..]);
+        w.write_u64(self.serial);
+        w.write_u32(match self.cert_type {
+            CertType::User => 1,
+            CertType::Host => 2,
+        });
+        w.write_string(self.key_id.as_bytes());
+        let mut principals = Writer::new();
+        for p in &self.valid_principals {
+            principals.write_string(p.as_bytes());
+        }
+        w.write_string(principals.as_slice());
+        w.write_u64(self.valid_after);
+        w.write_u64(self.valid_before);
+        w.write_string(&write_pair_list(&self.critical_options)?);
+        w.write_string(&write_pair_list(&self.extensions)?);
+        w.write_string(b"");
+        w.write_string(ca_public_key);
+        let signature = sign(w.as_slice())?;
+        w.write_string(&signature);
+        let cert = Certificate::parse(&w.into_vec())?;
+        if cert.embedded_pubkey_blob != self.public_key {
+            return Err(Error::Format("cert: unexpected public key encoding"));
+        }
+        Ok(cert)
     }
 }
 

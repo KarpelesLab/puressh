@@ -123,14 +123,15 @@ jobs:
           cargo test --test e2e_server_compression --
           --ignored --test-threads=1 --nocapture
 
-      # SCP (puressh client ↔ puressh sshd) and OpenSSH certificate auth
-      # (puressh client ↔ real sshd). Neither suite ran in CI before, and both
+      # SCP (puressh client ↔ puressh sshd), OpenSSH certificate auth
+      # (puressh client ↔ real sshd), and ssh-keygen signatures/certificates
+      # against OpenSSH's ssh-keygen. Neither suite ran in CI before, and both
       # had rotted into permanent failure unnoticed: `e2e_scp` could not start
       # our own sshd at all, and `e2e_cert` could not authenticate with a user
       # certificate against any sshd that sends `server-sig-algs`.
       - name: Run SCP and certificate interop
         run: >
-          cargo test --test e2e_scp --test e2e_cert --
+          cargo test --test e2e_scp --test e2e_cert --test e2e_keygen --
           --ignored --test-threads=1 --nocapture
 
       # Knock rendezvous (puressh ssh ↔ puressh sshd): the TCP port is closed,

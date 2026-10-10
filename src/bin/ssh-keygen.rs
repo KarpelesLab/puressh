@@ -8,6 +8,8 @@
 //! ssh-keygen -R host [-f known_hosts_path]            (remove entries)
 //! ssh-keygen -F host [-f known_hosts_path]            (find / print entries)
 //! ssh-keygen -H [-f known_hosts_path]                 (hash all entries)
+//! ssh-keygen -s ca_key -I id [-h] [-U] [-n principals] [-O option] [-V interval] [-z serial] file ...
+//! ssh-keygen -L -f cert_file                           (print a certificate)
 //! ssh-keygen -Y sign -f key_file -n namespace [-U] [-O option] file ...
 //! ssh-keygen -Y verify -f allowed_signers -I principal -n namespace -s sig_file
 //! ssh-keygen -Y find-principals -f allowed_signers -s sig_file
@@ -76,6 +78,9 @@ const USAGE: &str = "usage: ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C com
                      ssh-keygen -F host [-f known_hosts_path]                             (find host entries)\n       \
                      ssh-keygen -H [-f known_hosts_path]                                  (hash all entries)\n       \
                      ssh-keygen -A [-f prefix] [-q]                                       (create missing host keys)\n       \
+                     ssh-keygen -s ca_key -I certificate_identity [-h] [-U] [-n principals]\n                  \
+                     [-O option] [-V validity_interval] [-z serial_number] file ...\n       \
+                     ssh-keygen -L [-f input_keyfile]\n       \
                      ssh-keygen -Y sign -f key_file -n namespace [-U] [-O option] file ...\n       \
                      ssh-keygen -Y verify -f allowed_signers_file -I signer_identity\n                  \
                      -n namespace -s signature_file [-O option]\n       \
@@ -123,6 +128,14 @@ struct Args {
     use_agent: bool,
     /// Positional arguments (files to sign).
     rest: Vec<String>,
+    /// `-h`: sign a host certificate.
+    host_cert: bool,
+    /// `-V`: certificate validity interval.
+    validity: Option<String>,
+    /// `-z`: certificate serial number.
+    serial: Option<String>,
+    /// `-L`: print certificate contents.
+    list_cert: bool,
     /// `-p` (in known_hosts mode means port — but ssh-keygen historically
     /// uses `host` directly; we accept `[host]:port` syntax via the
     /// pattern matcher instead and don't reuse `-p`).
@@ -174,6 +187,16 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                     .push(args.get(i).ok_or("-O requires an option")?.clone());
             }
             "-U" => out.use_agent = true,
+            "-h" => out.host_cert = true,
+            "-L" => out.list_cert = true,
+            "-V" => {
+                i += 1;
+                out.validity = Some(args.get(i).ok_or("-V requires an interval")?.clone());
+            }
+            "-z" => {
+                i += 1;
+                out.serial = Some(args.get(i).ok_or("-z requires a serial number")?.clone());
+            }
             "-t" => {
                 i += 1;
                 out.type_ = Some(args.get(i).ok_or("-t requires a value")?.clone());
@@ -726,12 +749,12 @@ fn run_known_hosts_hash(args: &Args) -> Result<i32, String> {
 
 fn run() -> Result<i32, i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    if args.iter().any(|a| a == "--help") || args == ["-h"] {
         println!("{USAGE}");
         println!("\nA pure-Rust ssh-keygen built on puressh {VERSION}.");
         return Ok(0);
     }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
+    if args.iter().any(|a| a == "--version") || args == ["-V"] {
         println!("puressh ssh-keygen {VERSION}");
         return Ok(0);
     }
@@ -753,7 +776,7 @@ fn run() -> Result<i32, i32> {
             }
         };
     }
-    if let Some(a) = parsed.rest.first() {
+    if let Some(a) = parsed.rest.first().filter(|_| parsed.sig_file.is_none()) {
         eprintln!("ssh-keygen: unexpected argument: {a}");
         eprintln!("{USAGE}");
         return Err(2);
@@ -768,6 +791,8 @@ fn run() -> Result<i32, i32> {
         parsed.find_host.is_some() as u8,
         parsed.hash_all as u8,
         parsed.host_keys as u8,
+        parsed.sig_file.is_some() as u8,
+        parsed.list_cert as u8,
     ]
     .iter()
     .sum::<u8>();
@@ -776,7 +801,9 @@ fn run() -> Result<i32, i32> {
         return Err(2);
     }
     if mode_count > 1 {
-        eprintln!("ssh-keygen: -t / -l / -y / -p / -R / -F / -H / -A are mutually exclusive");
+        eprintln!(
+            "ssh-keygen: -t / -l / -y / -p / -R / -F / -H / -A / -s / -L are mutually exclusive"
+        );
         return Err(2);
     }
 
@@ -794,6 +821,10 @@ fn run() -> Result<i32, i32> {
         run_known_hosts_hash(&parsed)
     } else if parsed.host_keys {
         run_host_keys(&parsed)
+    } else if parsed.sig_file.is_some() {
+        certs::sign(&parsed)
+    } else if parsed.list_cert {
+        certs::list(&parsed)
     } else {
         run_generate(&parsed)
     };
@@ -814,9 +845,60 @@ fn run() -> Result<i32, i32> {
     }
 }
 
+fn now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The local zone's offset east of UTC at `t`, in seconds.
+#[cfg(unix)]
+fn local_offset(t: i64) -> i64 {
+    let tt = t as libc::time_t;
+    // SAFETY: `tm` is plain data; localtime_r fills it or returns NULL.
+    let mut tm: libc::tm = unsafe { core::mem::zeroed() };
+    if unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
+        return 0;
+    }
+    tm.tm_gmtoff as i64
+}
+
+#[cfg(not(unix))]
+fn local_offset(_t: i64) -> i64 {
+    0
+}
+
+/// Format Unix time `t` as local `YYYY-MM-DDTHH:MM:SS`, like OpenSSH.
+fn format_local_time(t: u64) -> String {
+    let t = i64::try_from(t).unwrap_or(i64::MAX);
+    let local = t.saturating_add(local_offset(t));
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    // Howard Hinnant's civil_from_days.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}",
+        secs / 3600,
+        secs / 60 % 60,
+        secs % 60
+    )
+}
+
 /// `-Y`: SSH signatures (OpenSSH `PROTOCOL.sshsig`), as used by git.
 mod sig {
-    use super::{Args, PrivateKey, PublicKey, algorithm_label, read_passphrase_interactive};
+    use super::{
+        Args, PrivateKey, PublicKey, algorithm_label, local_offset, now,
+        read_passphrase_interactive,
+    };
     use puressh::sshsig::{AllowedSigner, HashAlg, Signature};
     use std::io::{Read, Write};
 
@@ -852,30 +934,6 @@ mod sig {
         }
     }
 
-    fn now() -> i64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
-    }
-
-    /// The local zone's offset east of UTC at `t`, in seconds.
-    #[cfg(unix)]
-    fn local_offset(t: i64) -> i64 {
-        let tt = t as libc::time_t;
-        // SAFETY: `tm` is plain data; localtime_r fills it or returns NULL.
-        let mut tm: libc::tm = unsafe { core::mem::zeroed() };
-        if unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
-            return 0;
-        }
-        tm.tm_gmtoff as i64
-    }
-
-    #[cfg(not(unix))]
-    fn local_offset(_t: i64) -> i64 {
-        0
-    }
-
     fn require<'a>(v: &'a Option<String>, what: &str) -> Result<&'a str, String> {
         v.as_deref().ok_or_else(|| format!("Missing {what}"))
     }
@@ -896,13 +954,26 @@ mod sig {
     }
 
     /// A signer: the private key from `-f`, or the agent holding it.
-    enum Signer {
+    pub(super) enum Signer {
         Key(Box<dyn puressh::hostkey::HostKey + Send>),
         #[cfg(unix)]
         Agent(puressh::agent::Agent, u32),
     }
 
-    fn load_signer(path: &str, use_agent: bool) -> Result<(Signer, PublicKey), String> {
+    impl Signer {
+        /// An SSH signature blob over `data` by the key `pk`.
+        pub(super) fn sign(&mut self, pk: &PublicKey, data: &[u8]) -> puressh::Result<Vec<u8>> {
+            #[cfg(not(unix))]
+            let _ = pk;
+            match self {
+                Signer::Key(k) => k.sign(data),
+                #[cfg(unix)]
+                Signer::Agent(a, flags) => a.sign(&pk.wire_blob(), data, *flags),
+            }
+        }
+    }
+
+    pub(super) fn load_signer(path: &str, use_agent: bool) -> Result<(Signer, PublicKey), String> {
         let text =
             std::fs::read_to_string(path).map_err(|e| format!("Couldn't load {path}: {e}"))?;
         let public = PublicKey::parse_authorized_keys_line(text.trim()).ok();
@@ -950,17 +1021,9 @@ mod sig {
         hash: HashAlg,
         digest: &[u8],
     ) -> Result<String, String> {
-        let sig = Signature::create(
-            pk.wire_blob(),
-            namespace,
-            hash,
-            digest,
-            |data| match signer {
-                Signer::Key(k) => k.sign(data),
-                #[cfg(unix)]
-                Signer::Agent(a, flags) => a.sign(&pk.wire_blob(), data, *flags),
-            },
-        )
+        let sig = Signature::create(pk.wire_blob(), namespace, hash, digest, |data| {
+            signer.sign(pk, data)
+        })
         .map_err(|e| format!("Signing failed: {e}"))?;
         Ok(sig.to_armored())
     }
@@ -1113,6 +1176,345 @@ mod sig {
         } else {
             Err("No principal matched.".into())
         }
+    }
+}
+
+/// `-s` / `-L`: OpenSSH certificates.
+mod certs {
+    use super::{Args, PublicKey, algorithm_label, format_local_time, local_offset, now};
+    use purecrypto::rng::{OsRng, RngCore};
+    use puressh::cert::{
+        CertType, Certificate, CertificateBuilder, DEFAULT_USER_EXTENSIONS, encode_option_string,
+    };
+
+    /// `[+-]1w2d3h4m5s` relative to `now`.
+    fn parse_relative(s: &str, now: u64) -> Option<u64> {
+        let (neg, body) = match s.as_bytes().first()? {
+            b'+' => (false, &s[1..]),
+            b'-' => (true, &s[1..]),
+            _ => return None,
+        };
+        if body.is_empty() {
+            return None;
+        }
+        let mut total = 0u64;
+        let mut num = String::new();
+        for c in body.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let n: u64 = num.parse().ok()?;
+            num.clear();
+            let unit = match c.to_ascii_lowercase() {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86_400,
+                'w' => 604_800,
+                _ => return None,
+            };
+            total = total.checked_add(n.checked_mul(unit)?)?;
+        }
+        if !num.is_empty() {
+            total = total.checked_add(num.parse().ok()?)?;
+        }
+        if neg {
+            Some(now.saturating_sub(total))
+        } else {
+            now.checked_add(total)
+        }
+    }
+
+    fn parse_absolute(s: &str) -> Option<u64> {
+        if let Some(hex) = s.strip_prefix("0x") {
+            return u64::from_str_radix(hex, 16).ok();
+        }
+        let t = puressh::sshsig::parse_time(s, local_offset(now()))?;
+        u64::try_from(t).ok()
+    }
+
+    /// `-V`: `from:to`, or a lone `+relative` end (starting a minute ago).
+    fn parse_validity(spec: &str, now: u64) -> Result<(u64, u64), String> {
+        let bad = || format!("Invalid certificate life specification {spec}");
+        let (from, to) = match spec.split_once(':') {
+            Some((f, t)) => {
+                let from = match f {
+                    "always" => 0,
+                    f if f.starts_with(['+', '-']) => parse_relative(f, now).ok_or_else(bad)?,
+                    f => parse_absolute(f).ok_or_else(bad)?,
+                };
+                let to = match t {
+                    "forever" => u64::MAX,
+                    t if t.starts_with(['+', '-']) => parse_relative(t, now).ok_or_else(bad)?,
+                    t => parse_absolute(t).ok_or_else(bad)?,
+                };
+                (from, to)
+            }
+            None if spec.starts_with('+') => (
+                (now / 60).saturating_sub(1) * 60,
+                parse_relative(spec, now).ok_or_else(bad)?,
+            ),
+            None => return Err(bad()),
+        };
+        if from >= to {
+            return Err("Empty certificate validity interval".into());
+        }
+        Ok((from, to))
+    }
+
+    fn validity_text(from: u64, to: u64) -> String {
+        match (from, to) {
+            (0, u64::MAX) => "forever".into(),
+            (0, to) => format!("before {}", format_local_time(to)),
+            (from, u64::MAX) => format!("after {}", format_local_time(from)),
+            (from, to) => format!(
+                "from {} to {}",
+                format_local_time(from),
+                format_local_time(to)
+            ),
+        }
+    }
+
+    fn set(list: &mut Vec<(String, Vec<u8>)>, name: &str, data: Vec<u8>) {
+        list.retain(|(n, _)| n != name);
+        list.push((name.to_string(), data));
+    }
+
+    /// Apply the `-O` options to a user certificate.
+    fn apply_options(b: &mut CertificateBuilder, options: &[String]) -> Result<(), String> {
+        for o in options {
+            let lower = o.to_ascii_lowercase();
+            // `permit-pty` / `no-pty`, …: toggle a standard extension.
+            let standard = DEFAULT_USER_EXTENSIONS.iter().find_map(|e| {
+                let short = e["permit-".len()..].to_ascii_lowercase();
+                if lower == e.to_ascii_lowercase() {
+                    Some((*e, true))
+                } else if lower == format!("no-{short}") {
+                    Some((*e, false))
+                } else {
+                    None
+                }
+            });
+            if lower == "clear" {
+                b.critical_options.clear();
+                b.extensions.clear();
+            } else if let Some((e, on)) = standard {
+                if on {
+                    set(&mut b.extensions, e, Vec::new());
+                } else {
+                    b.extensions.retain(|(n, _)| n != e);
+                }
+            } else if lower == "no-touch-required" {
+                set(&mut b.extensions, "no-touch-required", Vec::new());
+            } else if lower == "verify-required" {
+                set(&mut b.critical_options, "verify-required", Vec::new());
+            } else if let Some(v) = strip_ci(o, "force-command=") {
+                set(
+                    &mut b.critical_options,
+                    "force-command",
+                    encode_option_string(v),
+                );
+            } else if let Some(v) = strip_ci(o, "source-address=") {
+                set(
+                    &mut b.critical_options,
+                    "source-address",
+                    encode_option_string(v),
+                );
+            } else if let Some(v) = strip_ci(o, "critical:") {
+                let (name, data) = custom(v);
+                set(&mut b.critical_options, name, data);
+            } else if let Some(v) = strip_ci(o, "extension:") {
+                let (name, data) = custom(v);
+                set(&mut b.extensions, name, data);
+            } else {
+                return Err(format!("Unsupported certificate option \"{o}\""));
+            }
+        }
+        Ok(())
+    }
+
+    fn strip_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+        s.get(..prefix.len())
+            .filter(|p| p.eq_ignore_ascii_case(prefix))
+            .map(|_| &s[prefix.len()..])
+    }
+
+    /// `name[=value]`: a flag, or a string-valued option.
+    fn custom(v: &str) -> (&str, Vec<u8>) {
+        match v.split_once('=') {
+            Some((n, val)) => (n, encode_option_string(val)),
+            None => (v, Vec::new()),
+        }
+    }
+
+    fn cert_path(path: &str) -> String {
+        format!("{}-cert.pub", path.strip_suffix(".pub").unwrap_or(path))
+    }
+
+    pub(super) fn sign(args: &Args) -> Result<i32, String> {
+        let ca_path = args.sig_file.as_deref().unwrap_or_default();
+        let key_id = args
+            .identity
+            .as_deref()
+            .ok_or("Must specify key id (-I) when certifying")?;
+        if args.rest.is_empty() {
+            return Err("Too few arguments.".into());
+        }
+        let now = now() as u64;
+        let (valid_after, valid_before) = match &args.validity {
+            Some(spec) => parse_validity(spec, now)?,
+            None => (0, u64::MAX),
+        };
+        let (mut serial, auto_increment) = match args.serial.as_deref() {
+            None => (0, false),
+            Some(z) => {
+                let (digits, inc) = match z.strip_prefix('+') {
+                    Some(d) => (d, true),
+                    None => (z, false),
+                };
+                let n = digits
+                    .parse::<u64>()
+                    .map_err(|_| format!("Invalid serial number \"{z}\""))?;
+                (n, inc)
+            }
+        };
+        let principals: Vec<String> = args
+            .namespace
+            .as_deref()
+            .map(|n| n.split(',').map(str::to_string).collect())
+            .unwrap_or_default();
+        let (mut signer, ca_pk) = super::sig::load_signer(ca_path, args.use_agent)?;
+        let cert_type = if args.host_cert {
+            CertType::Host
+        } else {
+            CertType::User
+        };
+        for path in &args.rest {
+            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            let pk = PublicKey::parse_authorized_keys_line(text.trim())
+                .map_err(|e| format!("{path}: {e}"))?;
+            let mut nonce = vec![0u8; 32];
+            OsRng.fill_bytes(&mut nonce);
+            let mut b = CertificateBuilder::new(pk.wire_blob(), cert_type, nonce);
+            b.serial = serial;
+            b.key_id = key_id.to_string();
+            b.valid_principals = principals.clone();
+            b.valid_after = valid_after;
+            b.valid_before = valid_before;
+            // Host certificates carry no options, as with OpenSSH.
+            if cert_type == CertType::User {
+                b.extensions = DEFAULT_USER_EXTENSIONS
+                    .iter()
+                    .map(|e| (e.to_string(), Vec::new()))
+                    .collect();
+                apply_options(&mut b, &args.sig_options)?;
+            }
+            let cert = b
+                .sign(&ca_pk.wire_blob(), |data| signer.sign(&ca_pk, data))
+                .map_err(|e| format!("Couldn't certify key {path}: {e}"))?;
+            let out = cert_path(path);
+            std::fs::write(&out, cert.to_openssh_line(pk.comment()) + "\n")
+                .map_err(|e| format!("Could not write certified key to {out}: {e}"))?;
+            if !args.quiet {
+                if principals.is_empty() {
+                    eprintln!("Warning: certificate will contain no principals (-n)");
+                }
+                let kind = if args.host_cert { "host" } else { "user" };
+                let who = if principals.is_empty() {
+                    String::new()
+                } else {
+                    format!("for {} ", principals.join(","))
+                };
+                eprintln!(
+                    "Signed {kind} key {out}: id \"{key_id}\" serial {serial} {who}valid {}",
+                    validity_text(valid_after, valid_before)
+                );
+            }
+            if auto_increment {
+                serial = serial.wrapping_add(1);
+            }
+        }
+        Ok(0)
+    }
+
+    /// One critical option or extension, as `ssh-keygen -L` shows it.
+    fn describe(known_flags: &[&str], (name, data): &(String, Vec<u8>)) -> String {
+        if matches!(name.as_str(), "force-command" | "source-address")
+            && let Some(v) = Certificate::option_string(data)
+        {
+            format!("{name} {v}")
+        } else if data.is_empty() && known_flags.contains(&name.as_str()) {
+            name.clone()
+        } else if data.is_empty() {
+            format!("{name} UNKNOWN FLAG OPTION")
+        } else {
+            let hex: String = data.iter().map(|b| format!("{b:02x}")).collect();
+            format!("{name} UNKNOWN OPTION: {hex} (len {})", data.len())
+        }
+    }
+
+    fn print_list(title: &str, items: Vec<String>) {
+        if items.is_empty() {
+            println!("        {title}: (none)");
+        } else {
+            println!("        {title}: ");
+            for i in items {
+                println!("                {i}");
+            }
+        }
+    }
+
+    pub(super) fn list(args: &Args) -> Result<i32, String> {
+        let path = args.file.as_deref().ok_or("-f is required")?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let cert = Certificate::parse_openssh_line(text.trim())
+            .map_err(|e| format!("{path} is not a certificate: {e}"))?;
+        let key = PublicKey::parse_wire_blob(cert.embedded_pubkey_blob())
+            .map_err(|e| format!("{path}: {e}"))?;
+        let ca = PublicKey::parse_wire_blob(&cert.signature_key_blob)
+            .map_err(|e| format!("{path}: {e}"))?;
+        let kind = match cert.cert_type {
+            CertType::User => "user",
+            CertType::Host => "host",
+        };
+        println!("{path}:");
+        println!("        Type: {} {kind} certificate", cert.key_type);
+        println!(
+            "        Public key: {}-CERT {}",
+            algorithm_label(&key),
+            key.sha256_fingerprint()
+        );
+        println!(
+            "        Signing CA: {} {} (using {})",
+            algorithm_label(&ca),
+            ca.sha256_fingerprint(),
+            cert.ca_algorithm().unwrap_or("unknown")
+        );
+        println!("        Key ID: \"{}\"", cert.key_id);
+        println!("        Serial: {}", cert.serial);
+        println!(
+            "        Valid: {}",
+            validity_text(cert.valid_after, cert.valid_before)
+        );
+        print_list("Principals", cert.valid_principals.clone());
+        print_list(
+            "Critical Options",
+            cert.critical_options
+                .iter()
+                .map(|o| describe(&["verify-required"], o))
+                .collect(),
+        );
+        let mut known = DEFAULT_USER_EXTENSIONS.to_vec();
+        known.push("no-touch-required");
+        print_list(
+            "Extensions",
+            cert.extensions
+                .iter()
+                .map(|o| describe(&known, o))
+                .collect(),
+        );
+        Ok(0)
     }
 }
 

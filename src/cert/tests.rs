@@ -484,3 +484,103 @@ fn encode_str(s: &[u8]) -> Vec<u8> {
     w.write_string(s);
     w.into_vec()
 }
+
+#[test]
+fn openssh_rsa_cert_line_parses() {
+    let text = std::fs::read_to_string(concat_fixture("u_rsa-cert.pub")).unwrap();
+    assert!(text.starts_with("ssh-rsa-cert-v01@openssh.com "));
+    let cert = Certificate::parse_openssh_line(&text).unwrap();
+    assert_eq!(cert.key_type, "ssh-rsa-cert-v01@openssh.com");
+    // The negotiated name for the same blob is accepted too.
+    let renamed = text.replacen(
+        "ssh-rsa-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com",
+        1,
+    );
+    Certificate::parse_openssh_line(&renamed).unwrap();
+}
+
+/// Rebuilding an OpenSSH-made certificate from its fields (and its CA
+/// signature) gives back the identical blob.
+#[test]
+fn builder_reproduces_openssh_cert() {
+    for name in [
+        "u_ed25519-cert.pub",
+        "u_ed25519_crit-cert.pub",
+        "h_ed25519-cert.pub",
+        "u_rsa-cert.pub",
+        "u_ecdsa-cert.pub",
+    ] {
+        let orig = Certificate::parse(&load_cert_blob(name)).unwrap();
+        let mut b = CertificateBuilder::new(
+            orig.embedded_pubkey_blob.clone(),
+            orig.cert_type,
+            orig.nonce.clone(),
+        );
+        b.serial = orig.serial;
+        b.key_id = orig.key_id.clone();
+        b.valid_principals = orig.valid_principals.clone();
+        b.valid_after = orig.valid_after;
+        b.valid_before = orig.valid_before;
+        b.critical_options = orig.critical_options.clone();
+        // Order must not matter: the builder sorts.
+        b.extensions = orig.extensions.iter().rev().cloned().collect();
+        let rebuilt = b
+            .sign(&orig.signature_key_blob, |data| {
+                assert_eq!(data, &orig.raw[..orig.signed_len]);
+                Ok(orig.signature.clone())
+            })
+            .unwrap();
+        assert_eq!(rebuilt.raw, orig.raw, "{name}");
+    }
+}
+
+#[test]
+fn builder_signs_verifiable_cert() {
+    use crate::hostkey::{Ed25519HostKey, HostKey};
+    let ca = Ed25519HostKey::from_seed([7u8; 32]);
+    let user = Ed25519HostKey::from_seed([8u8; 32]);
+    let mut b = CertificateBuilder::new(user.public_blob(), CertType::User, alloc::vec![1u8; 32]);
+    b.key_id = "alice".into();
+    b.valid_principals = alloc::vec!["alice".into(), "root".into()];
+    b.critical_options = alloc::vec![("force-command".into(), encode_option_string("/bin/true"))];
+    b.extensions = DEFAULT_USER_EXTENSIONS
+        .iter()
+        .map(|e| (e.to_string(), Vec::new()))
+        .collect();
+    let cert = b.sign(&ca.public_blob(), |d| ca.sign(d)).unwrap();
+    cert.verify_ca_signature(CA_ALGOS).unwrap();
+    cert.check_principal("root").unwrap();
+    assert_eq!(
+        cert.critical_option_string("force-command").as_deref(),
+        Some("/bin/true")
+    );
+    assert!(cert.has_extension("permit-pty"));
+    let line = cert.to_openssh_line("alice@host");
+    let back = Certificate::parse_openssh_line(&line).unwrap();
+    assert_eq!(back.raw, cert.raw);
+    // Duplicate extensions are refused.
+    b.extensions.push(("permit-pty".into(), Vec::new()));
+    assert!(b.sign(&ca.public_blob(), |d| ca.sign(d)).is_err());
+}
+
+#[test]
+fn cert_names_for_key_types() {
+    assert_eq!(
+        cert_name_for_key_type("ssh-rsa"),
+        Some("rsa-sha2-512-cert-v01@openssh.com")
+    );
+    assert_eq!(
+        cert_name_for_key_type("rsa-sha2-256"),
+        Some("rsa-sha2-256-cert-v01@openssh.com")
+    );
+    assert_eq!(
+        cert_name_for_key_type("ssh-ed25519"),
+        Some("ssh-ed25519-cert-v01@openssh.com")
+    );
+    assert_eq!(
+        cert_name_for_key_type("ecdsa-sha2-nistp384"),
+        Some("ecdsa-sha2-nistp384-cert-v01@openssh.com")
+    );
+    assert_eq!(cert_name_for_key_type("ssh-dss"), None);
+}

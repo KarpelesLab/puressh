@@ -9,9 +9,12 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 use super::protocol::{
-    IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_FAILURE, SSH_AGENT_IDENTITIES_ANSWER,
-    SSH_AGENT_SIGN_RESPONSE, SSH_AGENT_SUCCESS, SSH_AGENTC_ADD_IDENTITY, decode_identities_answer,
-    decode_sign_response, encode_message, encode_request_identities, encode_sign_request,
+    IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_CONSTRAIN_LIFETIME, SSH_AGENT_FAILURE,
+    SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE, SSH_AGENT_SUCCESS,
+    SSH_AGENTC_ADD_ID_CONSTRAINED, SSH_AGENTC_ADD_IDENTITY, SSH_AGENTC_LOCK,
+    SSH_AGENTC_REMOVE_ALL_IDENTITIES, SSH_AGENTC_REMOVE_IDENTITY, SSH_AGENTC_UNLOCK,
+    decode_identities_answer, decode_sign_response, encode_message, encode_request_identities,
+    encode_sign_request,
 };
 
 /// Default per-call socket timeout. Agents are nearly always
@@ -171,6 +174,66 @@ impl Agent {
             SSH_AGENT_SUCCESS => Ok(()),
             SSH_AGENT_FAILURE => Err(Error::Protocol("agent: failure adding identity")),
             _ => Err(Error::Protocol("agent: unexpected reply to add-identity")),
+        }
+    }
+
+    /// Add a private identity that the agent forgets after `lifetime`
+    /// seconds (`SSH_AGENTC_ADD_ID_CONSTRAINED`, `ssh-add -t`).
+    pub fn add_identity_with_lifetime(
+        &mut self,
+        key: &crate::key::PrivateKey,
+        lifetime: u32,
+    ) -> Result<()> {
+        let mut body = zeroize::Zeroizing::new(key.to_agent_add_body());
+        body.push(SSH_AGENT_CONSTRAIN_LIFETIME);
+        body.extend_from_slice(&lifetime.to_be_bytes());
+        let frame = zeroize::Zeroizing::new(encode_message(SSH_AGENTC_ADD_ID_CONSTRAINED, &body));
+        self.simple_request(&frame, "add-identity")
+    }
+
+    /// Remove the identity whose public blob is `key_blob` (`ssh-add -d`).
+    pub fn remove_identity(&mut self, key_blob: &[u8]) -> Result<()> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(key_blob);
+        let frame = encode_message(SSH_AGENTC_REMOVE_IDENTITY, w.as_slice());
+        self.simple_request(&frame, "remove-identity")
+    }
+
+    /// Remove every identity (`ssh-add -D`).
+    pub fn remove_all_identities(&mut self) -> Result<()> {
+        let frame = encode_message(SSH_AGENTC_REMOVE_ALL_IDENTITIES, &[]);
+        self.simple_request(&frame, "remove-all-identities")
+    }
+
+    /// Lock the agent with `passphrase` (`ssh-add -x`): it lists and signs
+    /// nothing until unlocked.
+    pub fn lock(&mut self, passphrase: &[u8]) -> Result<()> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(passphrase);
+        let frame = zeroize::Zeroizing::new(encode_message(SSH_AGENTC_LOCK, w.as_slice()));
+        self.simple_request(&frame, "lock")
+    }
+
+    /// Unlock the agent (`ssh-add -X`).
+    pub fn unlock(&mut self, passphrase: &[u8]) -> Result<()> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(passphrase);
+        let frame = zeroize::Zeroizing::new(encode_message(SSH_AGENTC_UNLOCK, w.as_slice()));
+        self.simple_request(&frame, "unlock")
+    }
+
+    fn simple_request(&mut self, frame: &[u8], what: &'static str) -> Result<()> {
+        self.write_frame(frame)?;
+        let (msg_type, _) = self.read_frame()?;
+        match msg_type {
+            SSH_AGENT_SUCCESS => Ok(()),
+            SSH_AGENT_FAILURE => Err(Error::Protocol(match what {
+                "lock" => "agent: lock refused (already locked?)",
+                "unlock" => "agent: unlock refused (wrong passphrase?)",
+                "remove-identity" => "agent: no such identity",
+                _ => "agent: request refused",
+            })),
+            _ => Err(Error::Protocol("agent: unexpected reply")),
         }
     }
 

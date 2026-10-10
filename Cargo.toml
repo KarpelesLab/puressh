@@ -187,6 +187,21 @@ path = "src/bin/ssh-keygen.rs"
 required-features = ["std"]
 
 [[bin]]
+name = "ssh-add"
+path = "src/bin/ssh-add.rs"
+required-features = ["std", "client"]
+
+[[bin]]
+name = "ssh-agent"
+path = "src/bin/ssh-agent.rs"
+required-features = ["std"]
+
+[[bin]]
+name = "ssh-keyscan"
+path = "src/bin/ssh-keyscan.rs"
+required-features = ["std", "client"]
+
+[[bin]]
 name = "sftp"
 path = "src/bin/sftp.rs"
 required-features = ["std", "client"]

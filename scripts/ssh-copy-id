@@ -1,0 +1,112 @@
+#!/bin/sh
+# ssh-copy-id — install public keys in a remote account's authorized_keys.
+#
+# usage: ssh-copy-id [-f] [-n] [-i [identity_file]] [-p port] [-F ssh_config]
+#                    [-t target_path] [-o ssh_option] ... [user@]hostname
+#
+# puressh version of the OpenSSH helper: the keys are sent over ssh and the
+# remote side appends only those not already present, creating ~/.ssh
+# (0700) and authorized_keys (0600) as needed.
+set -u
+
+usage() {
+	cat >&2 <<USAGE
+Usage: $0 [-f] [-n] [-i [identity_file]] [-p port] [-F alternative ssh_config file] [-t target_path] [[-o <ssh -o options>] ...] [user@]hostname
+	-f: force mode -- copy keys without checking which are already installed
+	-n: dry run    -- no keys are actually copied
+	-h|-?: print this help
+USAGE
+	exit 1
+}
+
+ID_FILE=
+DRY_RUN=
+TARGET_PATH=.ssh/authorized_keys
+SSH=${SSH_COPY_ID_SSH:-ssh}
+set --  "$@" --end--
+OPTS=
+while [ "$1" != --end-- ]; do
+	case "$1" in
+	-i)
+		# -i without a file: the default identity.
+		case "${2:-}" in
+		-* | --end-- | '') ID_FILE=default ;;
+		*) ID_FILE=$2; shift ;;
+		esac
+		;;
+	-i*) ID_FILE=${1#-i} ;;
+	-p | -F | -o) OPTS="$OPTS $1 $(printf %s "$2" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
+	-p* | -F* | -o*) OPTS="$OPTS '$1'" ;;
+	-t) TARGET_PATH=$2; shift ;;
+	-f) ;; # remote de-duplication makes force mode the same as normal
+	-n) DRY_RUN=1 ;;
+	-s) ;; # always uses the shell path
+	-x) set -x ;;
+	-h | '-?') usage ;;
+	--) shift; break ;;
+	-*) echo "$0: unknown option $1" >&2; usage ;;
+	*) set -- "$@" "$1" ;;
+	esac
+	shift
+done
+# Remaining positional argument(s) after --end-- are the host.
+while [ "$1" != --end-- ]; do shift; done
+shift
+[ $# -eq 1 ] || usage
+HOST=$1
+
+if [ -z "$ID_FILE" ] && keys=$(ssh-add -L 2>/dev/null) && [ -n "$keys" ]; then
+	KEYS=$keys
+	FROM="the agent"
+else
+	if [ -z "$ID_FILE" ] || [ "$ID_FILE" = default ]; then
+		ID_FILE=$(ls -t "$HOME"/.ssh/id_*.pub 2>/dev/null | head -n 1)
+		[ -n "$ID_FILE" ] || { echo "$0: ERROR: No identities found" >&2; exit 1; }
+	fi
+	case "$ID_FILE" in *.pub) ;; *) [ -r "$ID_FILE.pub" ] && ID_FILE=$ID_FILE.pub ;; esac
+	[ -r "$ID_FILE" ] || { echo "$0: ERROR: failed to open ID file '$ID_FILE'" >&2; exit 1; }
+	KEYS=$(grep -v '^[[:space:]]*\(#\|$\)' "$ID_FILE")
+	FROM="\"$ID_FILE\""
+fi
+printf '%s\n' "$0: INFO: Source of key(s) to be installed: $FROM" >&2
+
+if [ -n "$DRY_RUN" ]; then
+	printf '%s\n' "$KEYS" | sed 's/^/would add: /' >&2
+	exit 0
+fi
+
+# Run with sh on the remote side whatever the login shell is.
+REMOTE=$(cat <<'REMOTE'
+umask 077
+t="$1"
+d=$(dirname "$t")
+mkdir -p "$d" && touch "$t" || exit 1
+n=0
+while IFS= read -r k; do
+	[ -n "$k" ] || continue
+	grep -qxF "$k" "$t" && continue
+	[ -z "$(tail -c1 "$t")" ] || echo >> "$t"
+	printf '%s\n' "$k" >> "$t" || exit 1
+	n=$((n + 1))
+done
+command -v restorecon >/dev/null 2>&1 && restorecon -F "$d" "$t" >/dev/null 2>&1
+echo "$n"
+REMOTE
+)
+quoted=$(printf %s "$REMOTE" | sed "s/'/'\\\\''/g")
+target_q=$(printf %s "$TARGET_PATH" | sed "s/'/'\\\\''/g")
+remote_cmd="exec sh -c '$quoted' sh '$target_q'"
+# Rebuild the collected ssh options as arguments (they were quoted for this).
+eval "set -- $OPTS"
+# $SSH may carry its own options: split it on purpose.
+# shellcheck disable=SC2086
+added=$(printf '%s\n' "$KEYS" | $SSH "$@" -- "$HOST" "$remote_cmd") || {
+	echo "$0: ERROR: failed to install the key(s)" >&2
+	exit 1
+}
+echo
+echo "Number of key(s) added: $added"
+echo
+echo "Now try logging into the machine, with: \"$SSH$OPTS '$HOST'\""
+echo "and check to make sure that only the key(s) you wanted were added."
+echo

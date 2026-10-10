@@ -26,7 +26,8 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
   as the blocking APIs: runtime-agnostic over `futures_io` (`async`), with native
   entry points for **tokio** (`tokio`) and a readiness/non-blocking **mio**-style
   client (`mio`).
-- **CLI suite** — drop-in `ssh`, `sftp`, `scp`, `sshd`, and `ssh-keygen` binaries
+- **CLI suite** — drop-in `ssh`, `sftp`, `scp`, `sshd`, `ssh-keygen`, `ssh-agent`,
+  `ssh-add` and `ssh-keyscan` binaries
   built on the library.
 - **`hazmat`** — the raw protocol layers the drivers are assembled from (wire
   format, packet codec, KEX, ciphers, MACs, channels). Public for people
@@ -158,6 +159,11 @@ cargo build --release
 | `scp`        | File copy over SSH                                         |
 | `sshd`       | SSH server daemon (PTY, PAM sessions on Linux)             |
 | `ssh-keygen` | Key generation and OpenSSH key-file management             |
+| `ssh-agent`  | Key agent (OpenSSH-compatible protocol and command line)    |
+| `ssh-add`    | Add / list / remove / lock agent keys                      |
+| `ssh-keyscan`| Collect host keys in `known_hosts` format                  |
+
+`scripts/ssh-copy-id` installs public keys in a remote `authorized_keys`.
 
 All of them understand `ssh_config` (including `Match` blocks and `Include`),
 `known_hosts`, and bracketed-IPv6 host syntax (`[2001:db8::1]:22`).

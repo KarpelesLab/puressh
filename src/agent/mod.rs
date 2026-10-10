@@ -20,9 +20,11 @@
 pub(crate) mod client;
 mod host_key;
 mod protocol;
+pub mod server;
 
 #[cfg(test)]
 mod tests;
 
 pub use client::{Agent, AgentIdentity};
 pub use host_key::{AgentHostKey, RsaHash};
+pub use server::AgentState;

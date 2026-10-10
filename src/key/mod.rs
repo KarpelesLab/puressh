@@ -779,6 +779,41 @@ fn check_rsa_private(n: &[u8], e: &[u8], d: &[u8], p: &[u8], q: &[u8]) -> Result
     Ok(())
 }
 
+impl PrivateKey {
+    /// A signer for an agent `SSH_AGENTC_SIGN_REQUEST` with `flags`: for
+    /// RSA, `SSH_AGENT_RSA_SHA2_512` (4) selects `rsa-sha2-512`,
+    /// `SSH_AGENT_RSA_SHA2_256` (2) `rsa-sha2-256`, and no flag the legacy
+    /// SHA-1 `ssh-rsa`; other key types ignore the flags.
+    #[cfg(all(feature = "std", unix))]
+    pub(crate) fn agent_signer(
+        &self,
+        flags: u32,
+    ) -> Result<Box<dyn crate::hostkey::HostKey + Send>> {
+        let PrivateKey::Rsa { n, e, d, p, q, .. } = self else {
+            return self.clone().into_host_key();
+        };
+        let num = |b: &[u8]| BoxedUint::from_be_bytes(trim_leading_zeros(b));
+        let primes = rsa_has_primes(p, q);
+        macro_rules! build {
+            ($ty:ty) => {
+                if primes {
+                    <$ty>::from_components_with_primes(num(n), num(e), num(d), num(p), num(q))
+                } else {
+                    <$ty>::from_components(num(n), num(e), num(d))
+                }
+                .map(|k| Box::new(k) as Box<dyn crate::hostkey::HostKey + Send>)
+            };
+        }
+        if flags & 4 != 0 {
+            build!(crate::hostkey::RsaSha2_512HostKey)
+        } else if flags & 2 != 0 {
+            build!(crate::hostkey::RsaSha2_256HostKey)
+        } else {
+            build!(crate::hostkey::RsaSha1HostKey)
+        }
+    }
+}
+
 /// Build the `rsa-sha2-512` signer for an RSA private key, keeping base
 /// blinding enabled by passing the prime factors through whenever the key
 /// carries them (openssh-key-v1, PKCS#1 and PKCS#8 all do). A key without
@@ -833,6 +868,21 @@ fn trim_leading_zeros(b: &[u8]) -> &[u8] {
         i += 1;
     }
     &b[i..]
+}
+
+impl PrivateKey {
+    /// Decode the key of an agent `SSH_AGENTC_ADD_IDENTITY` request (the
+    /// layout [`Self::to_agent_add_body`] produces: key type, private
+    /// fields, comment), consuming it from `r`. The key is checked for
+    /// internal consistency before it is returned.
+    #[cfg(all(feature = "std", unix))]
+    pub(crate) fn from_agent_add_body(r: &mut Reader<'_>) -> Result<Self> {
+        let pk = parse_private_fields(r)?;
+        let comment = String::from_utf8_lossy(r.read_string()?).into_owned();
+        let pk = attach_comment(pk, comment);
+        pk.check_consistency()?;
+        Ok(pk)
+    }
 }
 
 fn parse_private_fields(r: &mut Reader<'_>) -> Result<PrivateKey> {

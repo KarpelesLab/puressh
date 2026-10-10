@@ -32,6 +32,23 @@ pub const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 /// Request an RSA SHA-2-512 signature (`rsa-sha2-512`).
 pub const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 
+/// `SSH_AGENTC_REMOVE_IDENTITY`.
+pub const SSH_AGENTC_REMOVE_IDENTITY: u8 = 18;
+/// `SSH_AGENTC_REMOVE_ALL_IDENTITIES`.
+pub const SSH_AGENTC_REMOVE_ALL_IDENTITIES: u8 = 19;
+/// `SSH_AGENTC_LOCK`.
+pub const SSH_AGENTC_LOCK: u8 = 22;
+/// `SSH_AGENTC_UNLOCK`.
+pub const SSH_AGENTC_UNLOCK: u8 = 23;
+/// `SSH_AGENTC_ADD_ID_CONSTRAINED`.
+pub const SSH_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
+/// `SSH_AGENTC_EXTENSION`.
+pub const SSH_AGENTC_EXTENSION: u8 = 27;
+/// `SSH_AGENT_EXTENSION_FAILURE`.
+pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
+/// Key constraint: lifetime in seconds (`uint32`).
+pub const SSH_AGENT_CONSTRAIN_LIFETIME: u8 = 1;
+
 /// Cap on how large a single agent reply we'll buffer. The OpenSSH
 /// agent reports its own ~256 KiB ceiling — we go larger to tolerate
 /// pathological identity counts but still refuse a runaway peer.

@@ -291,6 +291,19 @@ pub fn read_kbdint_response(prompt: &str, echo: bool) -> std::io::Result<Zeroizi
     }
 }
 
+/// Ask for a secret (a key passphrase, an agent lock password) with
+/// `prompt`: on the controlling terminal with echo off, else through
+/// `$SSH_ASKPASS`; never from a redirected stdin.
+#[allow(dead_code)] // not every binary prompts for secrets
+pub fn read_secret(prompt: &str) -> std::io::Result<Zeroizing<String>> {
+    if let Some(mut tty) = open_prompt_tty() {
+        tty.output.write_all(prompt.as_bytes())?;
+        tty.output.flush()?;
+        return read_secret_line(&mut tty);
+    }
+    try_ssh_askpass(prompt)?.ok_or_else(no_tty_error)
+}
+
 /// The error returned when a secret is requested but there is no terminal
 /// to ask on and no askpass helper.
 fn no_tty_error() -> std::io::Error {

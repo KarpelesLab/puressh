@@ -1,7 +1,7 @@
 //! `sshd` — puressh's SSH server daemon.
 //!
 //! ```text
-//! sshd [-46DdeqTt] [-f config] [-p port]... [-h host_key_file]... [-o option]...
+//! sshd [-46DdeqTt] [-C connection_spec] [-f config] [-p port]... [-h host_key_file]... [-o option]...
 //!      [-A authorized_keys_file] [-u allowed_user]... [--x11-forward] ...
 //! ```
 //!
@@ -111,7 +111,8 @@ mod imp {
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    const USAGE: &str = "usage: sshd [-46DdeqTt] [-f configfile] [-p port]... [-b address]... \
+    const USAGE: &str = "usage: sshd [-46DdeqTt] [-C connection_spec] [-f configfile] [-p port]... \
+                         [-b address]... \
                          [-h host_key_file]... [-c host_cert_file]... [-o option]... \
                          [-E log_file] [-g login_grace_time] [-A authorized_keys_file] \
                          [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
@@ -727,6 +728,11 @@ mod imp {
         config_options: Vec<String>,
         /// `-p port`, repeatable. Empty ⇒ `Port` lines, else 22.
         ports: Vec<u16>,
+        /// `-T`: print the effective configuration and exit.
+        dump_config: bool,
+        /// `-C spec` (repeatable): connection parameters (`user=`, `addr=`,
+        /// …) whose `Match` blocks `-T` applies.
+        connection_spec: Vec<String>,
         /// `-t`: check the configuration and host keys, then exit.
         test_only: bool,
         /// `-4` / `-6`.
@@ -960,10 +966,341 @@ mod imp {
         }
     }
 
+    /// `-T [-C spec]`: print the effective configuration like OpenSSH's
+    /// `sshd -T`: lowercase keywords, every setting with its default, and
+    /// the `Match` blocks selected by `-C` applied.
+    fn dump_config(cli: &Cli, cfg: &puressh::config::SshServerConfig) -> Result<i32, String> {
+        use puressh::config::{
+            Compression, ExecPolicy, MatchContext, PermitRootLogin, ServerAddressFamily as Af,
+            ServerGatewayPorts as GatewayPorts, TcpForwarding,
+        };
+
+        // `-C user=…,addr=…` (any order, repeatable).
+        let (mut user, mut host, mut addr, mut laddr, mut lport) = (None, None, None, None, None);
+        for spec in &cli.connection_spec {
+            for kv in spec.split(',').filter(|kv| !kv.is_empty()) {
+                let (k, v) = kv
+                    .split_once('=')
+                    .ok_or_else(|| format!("Invalid test mode specification {kv}"))?;
+                match k.to_ascii_lowercase().as_str() {
+                    "user" => user = Some(v.to_string()),
+                    "host" => host = Some(v.to_string()),
+                    "addr" => addr = Some(v.to_string()),
+                    "laddr" => laddr = Some(v.to_string()),
+                    "lport" => {
+                        lport = Some(v.parse::<u16>().map_err(|_| format!("Invalid port {v}"))?)
+                    }
+                    "rdomain" => {}
+                    _ => return Err(format!("Invalid test mode specification {kv}")),
+                }
+            }
+        }
+        let opts = if cli.connection_spec.is_empty() {
+            cfg.global.clone()
+        } else {
+            let groups = user.as_deref().map(lookup_user_groups);
+            let mut ctx = MatchContext::default();
+            ctx.host = host.as_deref().unwrap_or("");
+            ctx.user = user.as_deref();
+            ctx.groups = groups.as_deref();
+            ctx.address = addr.as_deref();
+            ctx.local_address = laddr.as_deref();
+            ctx.local_port = lport;
+            cfg.resolve(&ctx, ExecPolicy::Deny)
+        };
+
+        let mut out = String::new();
+        let mut line = |k: &str, v: &str| {
+            out.push_str(k);
+            out.push(' ');
+            out.push_str(v);
+            out.push('\n');
+        };
+        let yn = |b: bool| if b { "yes" } else { "no" };
+        let fwd = |f: Option<TcpForwarding>| match f {
+            None | Some(TcpForwarding::All) => "yes",
+            Some(TcpForwarding::No) => "no",
+            Some(TcpForwarding::Local) => "local",
+            Some(TcpForwarding::Remote) => "remote",
+            Some(_) => "yes",
+        };
+        let list = |v: &Option<Vec<String>>, default: &[&str]| match v {
+            Some(v) => v.join(","),
+            None => default
+                .iter()
+                .filter(|a| !a.starts_with("kex-strict-"))
+                .copied()
+                .collect::<Vec<_>>()
+                .join(","),
+        };
+        let none_or = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
+
+        let ports: Vec<u16> = if !cli.ports.is_empty() {
+            cli.ports.clone()
+        } else if !opts.ports.is_empty() {
+            opts.ports.clone()
+        } else {
+            vec![22]
+        };
+        for p in &ports {
+            line("port", &p.to_string());
+        }
+        let af = cli.address_family.or(opts.address_family);
+        line(
+            "addressfamily",
+            match af {
+                Some(Af::Inet) => "inet",
+                Some(Af::Inet6) => "inet6",
+                _ => "any",
+            },
+        );
+        let mut specs = cli.listen_addresses.clone();
+        specs.extend(opts.listen_addresses.iter().cloned());
+        for a in listen_addrs(&specs, &ports, af)? {
+            line("listenaddress", &a.to_string());
+        }
+        let mut host_keys = cli.host_key_files.clone();
+        host_keys.extend(opts.host_key_files.iter().cloned());
+        if host_keys.is_empty() {
+            host_keys = DEFAULT_HOST_KEYS.iter().map(|s| s.to_string()).collect();
+        }
+        for k in &host_keys {
+            line("hostkey", k);
+        }
+        let mut certs = cli.host_certificate_files.clone();
+        certs.extend(opts.host_certificate_files.iter().cloned());
+        for c in &certs {
+            line("hostcertificate", c);
+        }
+        line(
+            "usepam",
+            yn(opts
+                .use_pam
+                .unwrap_or(cfg!(all(feature = "pam", target_os = "linux")))),
+        );
+        line(
+            "logingracetime",
+            &cli.login_grace_time
+                .or(opts.login_grace_time)
+                .unwrap_or(120)
+                .to_string(),
+        );
+        line(
+            "maxauthtries",
+            &opts
+                .max_auth_tries
+                .unwrap_or(puressh::server::DEFAULT_MAX_AUTH_TRIES)
+                .to_string(),
+        );
+        line("maxsessions", &opts.max_sessions.unwrap_or(10).to_string());
+        let full = opts.max_startups.unwrap_or(100);
+        match opts.max_startups_early {
+            Some((start, rate)) => line("maxstartups", &format!("{start}:{rate}:{full}")),
+            None => line("maxstartups", &format!("{full}:100:{full}")),
+        }
+        line(
+            "persourcemaxstartups",
+            &match opts.per_source_max_startups {
+                None | Some(0) => "none".to_string(),
+                Some(n) => n.to_string(),
+            },
+        );
+        line(
+            "clientaliveinterval",
+            &opts.client_alive_interval.unwrap_or(0).to_string(),
+        );
+        line(
+            "clientalivecountmax",
+            &opts.client_alive_count_max.unwrap_or(3).to_string(),
+        );
+        line(
+            "requiredrsasize",
+            &opts
+                .required_rsa_size
+                .unwrap_or(DEFAULT_REQUIRED_RSA_SIZE)
+                .to_string(),
+        );
+        line(
+            "permitrootlogin",
+            match cli.permit_root_login.or(opts.permit_root_login) {
+                Some(PermitRootLogin::Yes) => "yes",
+                Some(PermitRootLogin::No) => "no",
+                _ => "without-password",
+            },
+        );
+        line(
+            "pubkeyauthentication",
+            yn(opts.pubkey_authentication != Some(false)),
+        );
+        line(
+            "passwordauthentication",
+            yn(opts.password_authentication != Some(false)),
+        );
+        line(
+            "kbdinteractiveauthentication",
+            yn(opts.kbd_interactive_authentication != Some(false)),
+        );
+        line(
+            "permitemptypasswords",
+            yn(opts.permit_empty_passwords == Some(true)),
+        );
+        line(
+            "strictmodes",
+            yn(cli.strict_modes.or(opts.strict_modes).unwrap_or(true)),
+        );
+        line(
+            "x11forwarding",
+            yn(cli.x11_forward.or(opts.x11_forwarding).unwrap_or(false)),
+        );
+        line(
+            "allowagentforwarding",
+            yn(cli
+                .agent_forward
+                .or(opts.allow_agent_forwarding)
+                .unwrap_or(true)),
+        );
+        line("allowtcpforwarding", fwd(opts.allow_tcp_forwarding));
+        line(
+            "allowstreamlocalforwarding",
+            fwd(opts.allow_stream_local_forwarding),
+        );
+        line(
+            "gatewayports",
+            match opts.gateway_ports {
+                Some(GatewayPorts::Yes) => "yes",
+                Some(GatewayPorts::ClientSpecified) => "clientspecified",
+                _ => "no",
+            },
+        );
+        line(
+            "disableforwarding",
+            yn(opts.disable_forwarding == Some(true)),
+        );
+        line("permittty", yn(opts.permit_tty != Some(false)));
+        line("printmotd", yn(opts.print_motd.unwrap_or(true)));
+        line(
+            "compression",
+            yn(!matches!(opts.compression, Some(Compression::No))),
+        );
+        line(
+            "loglevel",
+            match opts.log_level.unwrap_or(0) {
+                0 => "INFO",
+                1 => "DEBUG1",
+                2 => "DEBUG2",
+                _ => "DEBUG3",
+            },
+        );
+        match &opts.authorized_keys_file {
+            Some(files) => line("authorizedkeysfile", &files.join(" ")),
+            None => line(
+                "authorizedkeysfile",
+                &default_authorized_keys_files().join(" "),
+            ),
+        }
+        line(
+            "authorizedprincipalsfile",
+            &none_or(&opts.authorized_principals_file),
+        );
+        line("trustedusercakeys", &none_or(&opts.trusted_user_ca_keys));
+        line("revokedkeys", &none_or(&opts.revoked_keys));
+        line("banner", &none_or(&opts.banner));
+        line("forcecommand", &none_or(&opts.force_command));
+        line("chrootdirectory", &none_or(&opts.chroot_directory));
+        line(
+            "pidfile",
+            &if opts.pid_file_set {
+                none_or(&opts.pid_file)
+            } else {
+                "/run/sshd.pid".to_string()
+            },
+        );
+        match &opts.authentication_methods {
+            Some(m) => line("authenticationmethods", &m.join(" ")),
+            None => line("authenticationmethods", "any"),
+        }
+        let hostport = |hp: &Option<Vec<puressh::config::HostPort>>| match hp {
+            None => "any".to_string(),
+            Some(v) if v.is_empty() => "none".to_string(),
+            Some(v) => v
+                .iter()
+                .map(|h| match h.port {
+                    Some(p) => format!("{}:{p}", h.host),
+                    None => format!("{}:*", h.host),
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        line("permitopen", &hostport(&opts.permit_open));
+        line("permitlisten", &hostport(&opts.permit_listen));
+        let (bytes, secs) = opts
+            .rekey_limit
+            .map(|rk| (rk.max_bytes.unwrap_or(0), rk.max_seconds.unwrap_or(0)))
+            .unwrap_or((0, 0));
+        line("rekeylimit", &format!("{bytes} {secs}"));
+        use puressh::hazmat::transport::kex::defaults;
+        line("ciphers", &list(&opts.ciphers, defaults::CIPHERS));
+        line("macs", &list(&opts.macs, defaults::MACS));
+        line("kexalgorithms", &list(&opts.kex_algorithms, defaults::KEX));
+        // Certificate algorithms first, as OpenSSH lists them.
+        let with_certs: Vec<&str> = puressh::cert::CERT_KEY_NAMES
+            .iter()
+            .chain(defaults::HOST_KEY)
+            .copied()
+            .collect();
+        line(
+            "hostkeyalgorithms",
+            &list(&opts.host_key_algorithms, &with_certs),
+        );
+        line(
+            "pubkeyacceptedalgorithms",
+            &list(&opts.pubkey_accepted_algorithms, &with_certs),
+        );
+        line(
+            "casignaturealgorithms",
+            &list(&opts.ca_signature_algorithms, defaults::HOST_KEY),
+        );
+        // Features this daemon does not have, shown with the value that
+        // describes its behaviour (the config parser only accepts these).
+        for (k, v) in [
+            ("hostbasedauthentication", "no"),
+            ("ignorerhosts", "yes"),
+            ("gssapiauthentication", "no"),
+            ("permituserenvironment", "no"),
+            ("permittunnel", "no"),
+            ("exposeauthinfo", "no"),
+            ("usedns", "no"),
+            ("authorizedkeyscommand", "none"),
+            ("authorizedprincipalscommand", "none"),
+            ("fingerprinthash", "SHA256"),
+            ("pamservicename", "sshd"),
+        ] {
+            line(k, v);
+        }
+        if opts.subsystem_sftp != Some(false) && opts.sftp_enabled != Some(false) {
+            line("subsystem", "sftp internal-sftp");
+        }
+        for (k, v) in [
+            ("allowusers", &opts.allow_users),
+            ("denyusers", &opts.deny_users),
+            ("allowgroups", &opts.allow_groups),
+            ("denygroups", &opts.deny_groups),
+            ("acceptenv", &opts.accept_env),
+        ] {
+            for item in v {
+                line(k, item);
+            }
+        }
+        print!("{out}");
+        Ok(0)
+    }
+
     fn parse_args(args: &[String]) -> Result<Cli, String> {
         let mut config_file: Option<String> = None;
         let mut config_options: Vec<String> = Vec::new();
         let mut ports: Vec<u16> = Vec::new();
+        let mut dump_config = false;
+        let mut connection_spec: Vec<String> = Vec::new();
         let mut test_only = false;
         let mut address_family: Option<puressh::config::ServerAddressFamily> = None;
         let mut log_file: Option<String> = None;
@@ -1007,10 +1344,10 @@ mod imp {
                     config_options.push(v);
                 }
                 "-t" => test_only = true,
-                "-T" => {
-                    return Err("-T (dump the effective configuration) is not supported; \
-                                use -t to check it"
-                        .into());
+                "-T" => dump_config = true,
+                "-C" => {
+                    i += 1;
+                    connection_spec.push(args.get(i).ok_or("-C requires a value")?.clone());
                 }
                 "-4" => address_family = Some(puressh::config::ServerAddressFamily::Inet),
                 "-6" => address_family = Some(puressh::config::ServerAddressFamily::Inet6),
@@ -1144,6 +1481,8 @@ mod imp {
             config_file,
             config_options,
             ports,
+            dump_config,
+            connection_spec,
             test_only,
             address_family,
             log_file,
@@ -5420,6 +5759,9 @@ mod imp {
         // OpenSSH keywords we accept but do not implement, ignored arguments.
         for w in sshd_cfg.warnings() {
             eprintln!("sshd: warning: config {w}");
+        }
+        if cli.dump_config {
+            return dump_config(&cli, &sshd_cfg);
         }
 
         // LogLevel (sshd_config): VERBOSE/DEBUG* (level >= 1) turns on the same

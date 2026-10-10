@@ -35,22 +35,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux binaries are built on Ubuntu 22.04 so they link against
-          # glibc 2.35 and run on 22.04 and anything newer (24.04, …).
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-22.04
-            archive: tar.gz
-            asset_suffix: linux-x86_64
-            # `pam-client2` (default-on for sshd on Linux) needs libpam.
-            apt_packages: libpam0g-dev
-          # Native arm64 runner (free for public repos): no cross toolchain,
-          # and libpam0g-dev installs for the host architecture, so this
-          # build keeps every default feature, PAM included.
-          - target: aarch64-unknown-linux-gnu
-            os: ubuntu-22.04-arm
-            archive: tar.gz
-            asset_suffix: linux-aarch64
-            apt_packages: libpam0g-dev
           - target: x86_64-pc-windows-msvc
             os: windows-latest
             archive: zip
@@ -62,12 +46,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
-
-      - name: Install Linux build deps
-        if: matrix.apt_packages
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ${{ matrix.apt_packages }}
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -129,6 +107,86 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${TAG}" "${{ steps.pack.outputs.asset }}" --clobber
+
+  # Linux: built inside ubuntu:20.04 (glibc 2.31) on native amd64 / arm64
+  # runners, so one binary runs on Ubuntu 20.04, 22.04, 24.04 and newer.
+  # The container has no gh CLI; `publish-linux` packs and uploads.
+  build-linux:
+    name: build linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    container: ubuntu:20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, arch: amd64, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-24.04-arm, arch: arm64, target: aarch64-unknown-linux-gnu }
+    steps:
+      - name: Install build tools
+        run: >
+          apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y
+          curl ca-certificates build-essential git libpam0g-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build CLI binaries and C library
+        run: |
+          for bin in ssh sshd ssh-keygen sftp scp; do
+            cargo build --release --bin "$bin"
+          done
+          cargo rustc --lib --release --features ffi --crate-type staticlib
+          cargo rustc --lib --release --features ffi --crate-type cdylib
+
+      - name: Stage
+        run: |
+          mkdir -p staging/bin staging/lib staging/include
+          for bin in ssh sshd ssh-keygen sftp scp; do
+            cp "target/release/$bin" staging/bin/
+          done
+          cp target/release/libpuressh.a target/release/libpuressh.so staging/lib/
+          cp include/puressh.h staging/include/
+          cp README.md staging/
+          [ -f LICENSE ] && cp LICENSE staging/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: staging/
+
+  publish-linux:
+    name: publish linux tarballs and Ubuntu packages
+    needs: build-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Pack tarballs and build .deb packages
+        run: |
+          version="${TAG#v}"
+          mkdir -p out
+          for arch in amd64 arm64; do
+            dir="artifacts/linux-$arch"
+            chmod 755 "$dir"/bin/*
+            case "$arch" in amd64) suffix=x86_64 ;; arm64) suffix=aarch64 ;; esac
+            tar -C "$dir" -czf "out/puressh-${TAG}-linux-${suffix}.tar.gz" .
+            for release in focal jammy noble; do
+              packaging/deb/build-deb.sh "$release" "$arch" "$version" "$dir/bin" out
+            done
+          done
+          ls -l out
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${TAG}" out/* --clobber
 
   build-macos-universal:
     name: build macos universal

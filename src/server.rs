@@ -270,6 +270,23 @@ pub trait ShellHandler: Send + Sync {
         env: &SessionEnv,
         pty: Option<PtySpec>,
     ) -> Result<Box<dyn ShellSession>>;
+
+    /// Run `command` (as `exec` would: through the user's shell, `-c`) on a
+    /// pseudo-terminal allocated from `pty` — what `ssh -t host command`
+    /// asks for. The returned session is driven exactly like a shell.
+    ///
+    /// The default returns [`Error::Unsupported`], in which case the
+    /// server runs the command without a terminal, as before.
+    fn spawn_command(
+        &self,
+        user: &str,
+        env: &SessionEnv,
+        pty: PtySpec,
+        command: &str,
+    ) -> Result<Box<dyn ShellSession>> {
+        let _ = (user, env, pty, command);
+        Err(crate::Error::Unsupported("exec on a pseudo-terminal"))
+    }
 }
 
 /// One running shell process. All methods are non-blocking; the server
@@ -3603,6 +3620,60 @@ fn handle_global_request(
     Ok(())
 }
 
+/// If a `pty-req` is pending on `channel` and the shell handler can run
+/// commands on a terminal, spawn `command` there. `None` ⇒ no terminal was
+/// requested or the handler does not support it (the caller runs the
+/// command the plain way); `Some(Ok)` ⇒ the session is installed on the
+/// channel's [`ShellRuntime`]; `Some(Err)` ⇒ spawning failed.
+fn spawn_command_on_pty(
+    cfg: &Config,
+    user: &str,
+    channel: u32,
+    command: &str,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
+    envs: &BTreeMap<u32, SessionEnv>,
+    empty_env: &SessionEnv,
+) -> Option<Result<()>> {
+    let handler = cfg.shell_handler.clone()?;
+    let rt = shells.get_mut(&channel)?;
+    let spec = rt.pending_pty.clone()?;
+    let env_ref = envs.get(&channel).unwrap_or(empty_env);
+    match handler.spawn_command(user, env_ref, spec, command) {
+        Ok(sess) => {
+            rt.pending_pty = None;
+            rt.session = Some(sess);
+            Some(Ok(()))
+        }
+        Err(Error::Unsupported(_)) => None,
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Answer the request that [`spawn_command_on_pty`] handled.
+fn reply_spawned(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    conn: &mut ConnectionState,
+    channel: u32,
+    want_reply: bool,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
+    spawned: Result<()>,
+) -> Result<()> {
+    let ok = spawned.is_ok();
+    if !ok {
+        shells.remove(&channel);
+    }
+    if want_reply {
+        let p = if ok {
+            conn.send_request_success(channel)?
+        } else {
+            conn.send_request_failure(channel)?
+        };
+        srv_send(stream, driver, &p)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_channel_request(
     stream: &mut TcpStream,
@@ -3643,6 +3714,13 @@ fn handle_channel_request(
             } else {
                 command
             };
+            // `pty-req` came first (`ssh -t host command`): run the command on
+            // that terminal, driven like a shell, when the handler can.
+            if let Some(handled) =
+                spawn_command_on_pty(cfg, user, channel, &command, shells, envs, &empty_env)
+            {
+                return reply_spawned(stream, driver, conn, channel, want_reply, shells, handled);
+            }
             return run_exec_command(
                 stream, driver, conn, cfg, user, channel, &command, want_reply, subsystems, envs,
             );
@@ -3693,6 +3771,14 @@ fn handle_channel_request(
                 if forced.eq_ignore_ascii_case("internal-sftp") {
                     return route_internal_sftp(
                         stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
+                    );
+                }
+                // With a terminal requested, the forced command gets it.
+                if let Some(handled) =
+                    spawn_command_on_pty(cfg, user, channel, forced, shells, envs, &empty_env)
+                {
+                    return reply_spawned(
+                        stream, driver, conn, channel, want_reply, shells, handled,
                     );
                 }
                 let env_ref = envs.get(&channel).unwrap_or(&empty_env);
@@ -4614,6 +4700,8 @@ mod tests {
         exit_now: Option<ShellExitStatus>,
         /// Latched user name from `ShellHandler::spawn`.
         user: String,
+        /// Command from `ShellHandler::spawn_command` (exec on a pty).
+        command: Option<String>,
     }
 
     #[derive(Clone)]
@@ -4633,6 +4721,7 @@ mod tests {
                     exit_on_stdin_close: None,
                     exit_now: None,
                     user: String::new(),
+                    command: None,
                 })),
             }
         }
@@ -4661,6 +4750,27 @@ mod tests {
                 let mut st = self.shell.inner.lock().unwrap();
                 st.pty = pty;
                 st.user = user.to_string();
+            }
+            Ok(Box::new(MemoryShellSession {
+                inner: self.shell.inner.clone(),
+            }))
+        }
+
+        fn spawn_command(
+            &self,
+            user: &str,
+            _env: &SessionEnv,
+            pty: PtySpec,
+            command: &str,
+        ) -> Result<Box<dyn ShellSession>> {
+            {
+                let mut st = self.shell.inner.lock().unwrap();
+                st.pty = Some(pty);
+                st.user = user.to_string();
+                st.command = Some(command.to_string());
+                st.stdout
+                    .extend_from_slice(format!("ran:{command}").as_bytes());
+                st.exit_now = Some(ShellExitStatus::Exited(5));
             }
             Ok(Box::new(MemoryShellSession {
                 inner: self.shell.inner.clone(),
@@ -4716,6 +4826,62 @@ mod tests {
             }
             None
         }
+    }
+
+    #[test]
+    fn loopback_exec_with_pty_runs_on_the_terminal() {
+        // `ssh -t host command`: pty-req then exec must reach
+        // ShellHandler::spawn_command, not the buffered command handler.
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let allowed_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+        let user = "pty-exec-user".to_string();
+        let u = user.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: u.clone(),
+                allowed_blob: allowed_blob.clone(),
+            })
+        });
+        let memshell = MemoryShell::new();
+        let cfg = Config::new(
+            vec![Box::new(Ed25519HostKey::from_seed(host_seed))],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler {
+                out: b"buffered-exec\n".to_vec(),
+            }),
+        )
+        .with_shell(Arc::new(MemoryShellHandler {
+            shell: memshell.clone(),
+        }));
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("local_addr");
+        let server_thread = thread::spawn(move || server.accept_one());
+
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+                pinned_host_key: None,
+            },
+        )
+        .expect("connect");
+        client
+            .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+            .expect("auth");
+        client.set_request_pty(Some(("xterm".into(), 80, 24, 0, 0, Vec::new())));
+        let out = client.exec("uptime").expect("exec");
+        assert_eq!(out.stdout, b"ran:uptime");
+        assert_eq!(out.exit_status, Some(5));
+        let st = memshell.inner.lock().unwrap();
+        assert_eq!(st.command.as_deref(), Some("uptime"));
+        assert_eq!(st.pty.as_ref().map(|p| p.term.as_str()), Some("xterm"));
+        drop(st);
+        drop(client);
+        let _ = server_thread.join();
     }
 
     #[test]

@@ -3889,10 +3889,37 @@ mod imp {
             match pty {
                 Some(spec) => {
                     let print_motd = self.print_motd.load(std::sync::atomic::Ordering::Relaxed);
-                    spawn_pty_shell(&self.pam, user, &env_pairs, &spec, self.debug, print_motd)
+                    spawn_pty_shell(
+                        &self.pam, user, &env_pairs, &spec, self.debug, print_motd, None,
+                    )
                 }
                 None => spawn_pipe_shell(&self.pam, user, &env_pairs, self.debug),
             }
+        }
+
+        /// `ssh -t host command`: the command, through the user's shell,
+        /// on a pseudo-terminal. No motd (OpenSSH prints it only for an
+        /// interactive login).
+        fn spawn_command(
+            &self,
+            user: &str,
+            env: &SessionEnv,
+            pty: PtySpec,
+            command: &str,
+        ) -> puressh::Result<Box<dyn ShellSession>> {
+            let env_pairs: Vec<(String, String)> = safe_session_env(env)
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            spawn_pty_shell(
+                &self.pam,
+                user,
+                &env_pairs,
+                &pty,
+                self.debug,
+                false,
+                Some(command),
+            )
         }
     }
 
@@ -4455,6 +4482,9 @@ mod imp {
         Ok((rx, tx))
     }
 
+    /// Spawn the user's login shell — or, with `command`, `shell -c command`
+    /// (non-login argv0, as OpenSSH runs `exec` requests) — on a new pty.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_pty_shell(
         pam: &Arc<pam_gate::PamGate>,
         user: &str,
@@ -4462,7 +4492,30 @@ mod imp {
         spec: &PtySpec,
         debug: bool,
         print_motd: bool,
+        command: Option<&str>,
     ) -> puressh::Result<Box<dyn ShellSession>> {
+        // argv for `shell -c command`, built pre-fork (allocation is not
+        // async-signal-safe after fork).
+        let command_argv: Option<[std::ffi::CString; 3]> = match command {
+            Some(cmd) => Some([
+                {
+                    let shell = lookup_user(user)?.shell_c;
+                    let base = shell
+                        .as_bytes()
+                        .rsplit(|b| *b == b'/')
+                        .next()
+                        .unwrap_or(b"sh");
+                    std::ffi::CString::new(base).map_err(|_| {
+                        puressh::Error::Io(std::io::Error::other("shell name has NUL"))
+                    })?
+                },
+                c"-c".to_owned(),
+                std::ffi::CString::new(cmd).map_err(|_| {
+                    puressh::Error::Io(std::io::Error::other("command contains NUL byte"))
+                })?,
+            ]),
+            None => None,
+        };
         // PrintMotd: read /etc/motd in the parent (we may already be inside the
         // ChrootDirectory and dropped to the user — the file is read from the
         // session's view of the filesystem). The bytes are written to the
@@ -4683,6 +4736,11 @@ mod imp {
                     }
                 }
 
+                // `exec` on a pty: `shell -c command`, plain argv0.
+                if let Some(argv) = &command_argv {
+                    let _ = execvp(&info.shell_c, argv);
+                    unsafe { libc::_exit(127) };
+                }
                 // execvp the user's actual login shell from passwd,
                 // with argv0 prefixed by "-" so bash/zsh/sh source
                 // their login profile files.

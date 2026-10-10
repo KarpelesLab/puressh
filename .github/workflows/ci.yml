@@ -180,9 +180,15 @@ jobs:
   # GitHub has no Ubuntu 20.04 VM runners any more: build and install inside
   # an ubuntu:20.04 container (glibc 2.31, dpkg 1.19), without systemd.
   deb-focal:
-    name: Ubuntu package (focal amd64, container)
-    runs-on: ubuntu-latest
+    name: Ubuntu package (focal ${{ matrix.arch }}, container)
+    runs-on: ${{ matrix.os }}
     container: ubuntu:20.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04, arch: amd64 }
+          - { os: ubuntu-24.04-arm, arch: arm64 }
     steps:
       - name: Install build tools
         run: >
@@ -200,7 +206,7 @@ jobs:
 
       - name: Build the package
         run: >
-          packaging/deb/build-deb.sh focal amd64
+          packaging/deb/build-deb.sh focal ${{ matrix.arch }}
           "$(cargo pkgid | sed 's/.*[#@]//')" target/release out
 
       - name: Install and log in

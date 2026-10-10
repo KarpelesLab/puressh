@@ -54,7 +54,11 @@ step "install puressh-server"
 apt-get install -y "$DEB"
 if installed openssh-server; then echo "openssh-server still installed"; exit 1; fi
 /usr/sbin/sshd -V | grep -q puressh
-systemctl is-active ssh.service
+if ! systemctl is-active ssh.service; then
+	systemctl status ssh.service --no-pager || true
+	journalctl -u ssh.service --no-pager -n 30 || true
+	exit 1
+fi
 if ! systemctl is-enabled ssh.service; then
 	ls -la /etc/systemd/system /etc/systemd/system/*.wants /etc/systemd/system/*.requires || true
 	ls -la /var/lib/systemd/deb-systemd-helper-enabled /var/lib/systemd/deb-systemd-helper-masked || true

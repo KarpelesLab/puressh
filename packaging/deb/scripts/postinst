@@ -50,6 +50,10 @@ MSG
 		systemctl stop ssh.socket >/dev/null 2>&1 || true
 		deb-systemd-helper purge ssh.socket >/dev/null 2>&1 || true
 		rm -f /etc/systemd/system/sockets.target.wants/ssh.socket
+		# 24.04's ssh.socket is RequiredBy=ssh.service: a leftover link
+		# would make our ssh.service require a unit that no longer exists.
+		rm -f /etc/systemd/system/ssh.service.requires/ssh.socket
+		rmdir /etc/systemd/system/ssh.service.requires 2>/dev/null || true
 		systemctl daemon-reload || true
 
 		if [ -n "$wanted" ]; then

@@ -20,6 +20,8 @@ use super::wire::MAX_DATAGRAM;
 const MAX_CONNS_PER_RENDEZVOUS: usize = 4;
 /// Wrong tokens tolerated before a listener is closed.
 const MAX_STRIKES: u8 = 3;
+/// Datagrams read per [`KnockServer::process`] call.
+const MAX_DATAGRAMS_PER_PROCESS: usize = 1024;
 /// Random ports tried in a configured range before giving up.
 const PORT_ATTEMPTS: u32 = 64;
 
@@ -242,13 +244,15 @@ impl KnockServer {
 
     fn drain_udp(&mut self) {
         let mut buf = [0u8; MAX_DATAGRAM + 1];
-        loop {
+        // Bounded so a flood (or an error that keeps recurring) cannot
+        // starve the rendezvous listeners; the rest waits for the next call.
+        for _ in 0..MAX_DATAGRAMS_PER_PROCESS {
             let (n, src) = match self.udp.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => return,
-                // ICMP errors from earlier sends (ECONNREFUSED on Linux)
-                // surface here; they say nothing about the next datagram.
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // ICMP errors from earlier sends (ECONNREFUSED on Linux,
+                // WSAECONNRESET on Windows) surface here; they say nothing
+                // about the next datagram.
                 Err(_) => continue,
             };
             if n > MAX_DATAGRAM {

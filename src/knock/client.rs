@@ -254,8 +254,16 @@ pub fn knock(
             {
                 continue;
             }
-            // ICMP port unreachable: nothing listens, stop early.
-            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => return Ok(None),
+            // ICMP port unreachable: nothing listens, stop early. Linux and
+            // macOS report it as ECONNREFUSED, Windows as WSAECONNRESET.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionRefused | io::ErrorKind::ConnectionReset
+                ) =>
+            {
+                return Ok(None);
+            }
             Err(e) => return Err(e.into()),
         };
         if n > MAX_DATAGRAM {

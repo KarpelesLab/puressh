@@ -140,6 +140,72 @@ jobs:
           cargo test --test e2e_knock --
           --ignored --test-threads=1 --nocapture
 
+  deb:
+    name: Ubuntu package (${{ matrix.release }} ${{ matrix.arch }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04, release: jammy, arch: amd64 }
+          - { os: ubuntu-24.04, release: noble, arch: amd64 }
+          - { os: ubuntu-24.04-arm, release: noble, arch: arm64 }
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: deb-${{ matrix.os }}
+
+      - name: Install libpam
+        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
+
+      - name: Build sshd and ssh-keygen
+        run: cargo build --release --bin sshd --bin ssh-keygen
+
+      - name: Build the package
+        run: >
+          packaging/deb/build-deb.sh ${{ matrix.release }} ${{ matrix.arch }}
+          "$(cargo pkgid | sed 's/.*[#@]//')" target/release out
+
+      # Real VM with systemd: stock OpenSSH -> puressh-server -> reload ->
+      # purge openssh-server (host keys restored) -> back to OpenSSH.
+      - name: Package lifecycle (replace OpenSSH and back)
+        run: sudo packaging/deb/test/lifecycle.sh out/*.deb
+
+  # GitHub has no Ubuntu 20.04 VM runners any more: build and install inside
+  # an ubuntu:20.04 container (glibc 2.31, dpkg 1.19), without systemd.
+  deb-focal:
+    name: Ubuntu package (focal amd64, container)
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    steps:
+      - name: Install build tools
+        run: >
+          apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y
+          curl ca-certificates build-essential git libpam0g-dev
+
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build sshd and ssh-keygen
+        run: cargo build --release --bin sshd --bin ssh-keygen
+
+      - name: Build the package
+        run: >
+          packaging/deb/build-deb.sh focal amd64
+          "$(cargo pkgid | sed 's/.*[#@]//')" target/release out
+
+      - name: Install and log in
+        run: packaging/deb/test/no-systemd.sh out/*.deb
+
   interop-mlkem:
     name: OpenSSH interop (ML-KEM + strict KEX, built sshd 10.4p1)
     runs-on: ubuntu-latest

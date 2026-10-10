@@ -69,7 +69,8 @@ const USAGE: &str = "usage: ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C com
                      ssh-keygen -p -f path [-P old_passphrase] -N new_passphrase          (change passphrase)\n       \
                      ssh-keygen -R host [-f known_hosts_path]                             (remove host entries)\n       \
                      ssh-keygen -F host [-f known_hosts_path]                             (find host entries)\n       \
-                     ssh-keygen -H [-f known_hosts_path]                                  (hash all entries)";
+                     ssh-keygen -H [-f known_hosts_path]                                  (hash all entries)\n       \
+                     ssh-keygen -A [-f prefix] [-q]                                       (create missing host keys)";
 
 #[derive(Default)]
 struct Args {
@@ -92,6 +93,11 @@ struct Args {
     find_host: Option<String>,
     /// `-H`: hash every plain entry in the file in place.
     hash_all: bool,
+    /// `-A`: create every missing default host key (`-f` is then a root
+    /// prefix, as in OpenSSH).
+    host_keys: bool,
+    /// `-q`: quiet.
+    quiet: bool,
     /// `-p` (in known_hosts mode means port — but ssh-keygen historically
     /// uses `host` directly; we accept `[host]:port` syntax via the
     /// pattern matcher instead and don't reuse `-p`).
@@ -159,6 +165,8 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 out.find_host = Some(args.get(i).ok_or("-F requires a host")?.clone());
             }
             "-H" => out.hash_all = true,
+            "-A" => out.host_keys = true,
+            "-q" => out.quiet = true,
             s if s.starts_with('-') => return Err(format!("unknown flag: {s}")),
             _ => return Err(format!("unexpected argument: {a}")),
         }
@@ -442,6 +450,65 @@ fn run_generate(args: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
+/// `ssh-keygen -A`: for each default host key type (RSA 3072, ECDSA P-256,
+/// Ed25519) whose private key does not exist under `<prefix>/etc/ssh`,
+/// generate one, unencrypted, commented `root@<hostname>`. Each key is
+/// written to a temporary name and renamed into place, so a crash never
+/// leaves a half-written key. Existing keys are never touched.
+fn run_host_keys(args: &Args) -> Result<i32, String> {
+    let prefix = args.file.clone().unwrap_or_default();
+    let dir = format!("{}/etc/ssh", prefix.trim_end_matches('/'));
+    let host = fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| fs::read_to_string("/etc/hostname"))
+        .map(|h| h.trim().to_string())
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "localhost".into());
+    let comment = format!("root@{host}");
+    // Like OpenSSH: the directory is created world-readable (0755 under
+    // the usual umask); only the private keys are 0600.
+    fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
+    let mut made = Vec::new();
+    for (ty, label) in [("rsa", "RSA"), ("ecdsa", "ECDSA"), ("ed25519", "ED25519")] {
+        let path = format!("{dir}/ssh_host_{ty}_key");
+        if Path::new(&path).exists() {
+            continue;
+        }
+        if made.is_empty() && !args.quiet {
+            print!("ssh-keygen: generating new host keys: ");
+        }
+        let mut rng = OsRng;
+        let sk = match ty {
+            "rsa" => PrivateKey::generate_rsa(&mut rng, 3072, comment.clone())
+                .map_err(|e| format!("rsa generation: {e}"))?,
+            "ecdsa" => PrivateKey::generate_ecdsa(&mut rng, EcdsaCurve::P256, comment.clone()),
+            _ => PrivateKey::generate_ed25519(&mut rng, comment.clone()),
+        };
+        let pem = sk
+            .to_openssh_pem(None)
+            .map_err(|e| format!("encode: {e}"))?;
+        let mut pub_line = sk.public_key().to_authorized_keys_line();
+        pub_line.push('\n');
+        let tmp = format!("{path}.{}.tmp", std::process::id());
+        let tmp_pub = format!("{tmp}.pub");
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&tmp_pub);
+        write_private(&tmp, &pem)?;
+        write_public(&tmp_pub, &pub_line)?;
+        fs::rename(&tmp_pub, format!("{path}.pub"))
+            .map_err(|e| format!("rename {tmp_pub}: {e}"))?;
+        fs::rename(&tmp, &path).map_err(|e| format!("rename {tmp}: {e}"))?;
+        if !args.quiet {
+            print!("{label} ");
+        }
+        made.push(label);
+    }
+    if !made.is_empty() && !args.quiet {
+        println!();
+    }
+    Ok(0)
+}
+
 fn run_fingerprint(args: &Args) -> Result<i32, String> {
     let file = ensure_file_in(&args.file)?;
     // Accept either a .pub line, an authorized_keys line, or a private key.
@@ -630,6 +697,7 @@ fn run() -> Result<i32, i32> {
         parsed.remove_host.is_some() as u8,
         parsed.find_host.is_some() as u8,
         parsed.hash_all as u8,
+        parsed.host_keys as u8,
     ]
     .iter()
     .sum::<u8>();
@@ -638,7 +706,7 @@ fn run() -> Result<i32, i32> {
         return Err(2);
     }
     if mode_count > 1 {
-        eprintln!("ssh-keygen: -t / -l / -y / -p / -R / -F / -H are mutually exclusive");
+        eprintln!("ssh-keygen: -t / -l / -y / -p / -R / -F / -H / -A are mutually exclusive");
         return Err(2);
     }
 
@@ -654,6 +722,8 @@ fn run() -> Result<i32, i32> {
         run_known_hosts_find(&parsed, host)
     } else if parsed.hash_all {
         run_known_hosts_hash(&parsed)
+    } else if parsed.host_keys {
+        run_host_keys(&parsed)
     } else {
         run_generate(&parsed)
     };

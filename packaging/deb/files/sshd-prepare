@@ -1,0 +1,67 @@
+#!/bin/sh
+# puressh: make sure sshd has a configuration and host keys before it starts.
+#
+# Run as ExecStartPre of ssh.service and from the package's postinst. Purging
+# the openssh-server package that puressh-server replaced deletes
+# /etc/ssh/sshd_config and /etc/ssh/ssh_host_*_key; this restores them from
+# the copy kept in /var/lib/puressh, so the host keys (and with them every
+# client's known_hosts entry) survive. Keys are only restored or generated
+# when *no* default host key exists, so a key an administrator removed on
+# purpose is not brought back.
+set -e
+
+BACKUP=/var/lib/puressh/etc-ssh
+TEMPLATE=/usr/share/puressh/sshd_config
+TYPES="rsa ecdsa ed25519"
+
+umask 022
+mkdir -p /etc/ssh /etc/ssh/sshd_config.d
+
+if [ ! -e /etc/ssh/sshd_config ]; then
+	if [ -e "$BACKUP/sshd_config" ]; then
+		cp -p "$BACKUP/sshd_config" /etc/ssh/sshd_config
+		echo "sshd-prepare: restored /etc/ssh/sshd_config from $BACKUP" >&2
+	else
+		cp "$TEMPLATE" /etc/ssh/sshd_config
+		echo "sshd-prepare: installed the default /etc/ssh/sshd_config" >&2
+	fi
+fi
+
+have_key=
+for t in $TYPES; do
+	[ -e "/etc/ssh/ssh_host_${t}_key" ] && have_key=1
+done
+if [ -z "$have_key" ]; then
+	for t in $TYPES; do
+		k="ssh_host_${t}_key"
+		if [ -e "$BACKUP/$k" ] && [ -e "$BACKUP/$k.pub" ]; then
+			cp -p "$BACKUP/$k" "$BACKUP/$k.pub" /etc/ssh/
+			echo "sshd-prepare: restored /etc/ssh/$k from $BACKUP" >&2
+		fi
+	done
+fi
+have_key=
+for t in $TYPES; do
+	[ -e "/etc/ssh/ssh_host_${t}_key" ] && have_key=1
+done
+if [ -z "$have_key" ]; then
+	/usr/lib/puressh/ssh-keygen -A >&2
+fi
+
+# Refresh the backup with what is in place now.
+umask 077
+mkdir -p "$BACKUP"
+chmod 0700 /var/lib/puressh "$BACKUP"
+tmp="$BACKUP.new"
+rm -rf "$tmp"
+mkdir "$tmp"
+cp -p /etc/ssh/sshd_config "$tmp/"
+for t in $TYPES; do
+	k="/etc/ssh/ssh_host_${t}_key"
+	if [ -e "$k" ] && [ -e "$k.pub" ]; then
+		cp -p "$k" "$k.pub" "$tmp/"
+	fi
+done
+rm -rf "$BACKUP"
+mv "$tmp" "$BACKUP"
+exit 0

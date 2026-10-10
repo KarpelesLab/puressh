@@ -1,0 +1,27 @@
+[Unit]
+Description=puressh Secure Shell server
+Documentation=https://github.com/KarpelesLab/puressh man:sshd(8)
+After=network.target auditd.service
+ConditionPathExists=!/etc/ssh/sshd_not_to_be_run
+
+[Service]
+EnvironmentFile=-/etc/default/ssh
+# Recreate /etc/ssh/sshd_config and the host keys if something (e.g. purging
+# the replaced openssh-server package) deleted them.
+ExecStartPre=/usr/lib/puressh/sshd-prepare
+ExecStartPre=/usr/sbin/sshd -t $SSHD_OPTS
+ExecStart=/usr/sbin/sshd -D $SSHD_OPTS
+ExecReload=/usr/sbin/sshd -t $SSHD_OPTS
+ExecReload=/bin/kill -HUP $MAINPID
+# Only the listener is stopped on restart/upgrade: open sessions are
+# separate processes and keep running.
+KillMode=process
+Restart=on-failure
+RestartPreventExitStatus=255
+Type=simple
+RuntimeDirectory=sshd
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
+Alias=sshd.service

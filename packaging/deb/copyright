@@ -1,0 +1,19 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: puressh
+Source: https://github.com/KarpelesLab/puressh
+
+Files: *
+Copyright: Mark Karpeles and the puressh contributors
+License: MIT or Apache-2.0
+ puressh is dual-licensed under the MIT license and the Apache License,
+ Version 2.0, at your option. On Debian systems the Apache License can be
+ found in /usr/share/common-licenses/Apache-2.0.
+
+Files: etc/pam.d/sshd etc/default/ssh etc/ufw/applications.d/openssh-server
+ usr/share/puressh/sshd_config
+Copyright: 1995 Tatu Ylonen, Espoo, Finland, and the OpenSSH and Debian
+ openssh package authors
+License: BSD-2-clause
+ These configuration files are copied unchanged from Ubuntu's openssh-server
+ package (20.04, 22.04 and 24.04) so the replacement keeps the same files.
+ See /usr/share/doc/openssh-client/copyright for the full OpenSSH licence.

@@ -1,0 +1,12 @@
+#!/bin/sh
+# puressh-server prerm.
+set -e
+
+# A plain removal stops the daemon. When we are removed in favour of another
+# package (e.g. openssh-server coming back) or upgraded, the daemon keeps
+# running until the incoming package restarts ssh.service.
+if [ "$1" = "remove" ] && [ -z "$2" ] && [ -d /run/systemd/system ]; then
+	systemctl stop ssh.service >/dev/null 2>&1 || true
+fi
+
+exit 0

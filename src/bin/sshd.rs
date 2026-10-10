@@ -762,8 +762,8 @@ mod imp {
         max_startups: Option<u32>,
         /// `--per-source-max N`: cap on simultaneous connections (for their
         /// whole lifetime, authenticated or not) from any single peer IP
-        /// (0 = unlimited).
-        per_source_max: u32,
+        /// (0 = unlimited). `None` ⇒ `PerSourceMaxStartups`, else 10.
+        per_source_max: Option<u32>,
         /// `--permit-root-login yes|no|prohibit-password`: whether the root
         /// account (uid 0) may authenticate. Default (config/built-in) is
         /// `prohibit-password`, which permits root by key since puressh has
@@ -813,7 +813,7 @@ mod imp {
         let mut accept_env: Vec<String> = Vec::new();
         let mut login_grace_time: Option<u32> = None;
         let mut max_startups: Option<u32> = None;
-        let mut per_source_max: u32 = 10;
+        let mut per_source_max: Option<u32> = None;
         let mut permit_root_login: Option<puressh::config::PermitRootLogin> = None;
 
         let mut i = 0;
@@ -896,9 +896,10 @@ mod imp {
                 "--per-source-max" => {
                     i += 1;
                     let v = args.get(i).ok_or("--per-source-max requires a value")?;
-                    per_source_max = v
-                        .parse::<u32>()
-                        .map_err(|_| "invalid --per-source-max".to_string())?;
+                    per_source_max = Some(
+                        v.parse::<u32>()
+                            .map_err(|_| "invalid --per-source-max".to_string())?,
+                    );
                 }
                 "--permit-root-login" => {
                     use puressh::config::PermitRootLogin;
@@ -1432,6 +1433,22 @@ mod imp {
         }
     }
 
+    /// OpenSSH's default `RequiredRSASize`.
+    const DEFAULT_REQUIRED_RSA_SIZE: u32 = 1024;
+
+    /// Bit length of the modulus of an `ssh-rsa` key blob; `None` for any
+    /// other key type (or a malformed blob, which never authenticates).
+    fn rsa_modulus_bits(blob: &[u8]) -> Option<usize> {
+        match PublicKey::parse_wire_blob(blob).ok()? {
+            PublicKey::Rsa { n, .. } => {
+                let n: Vec<u8> = n.into_iter().skip_while(|b| *b == 0).collect();
+                let lead = *n.first()?;
+                Some((n.len() - 1) * 8 + (8 - lead.leading_zeros() as usize))
+            }
+            _ => None,
+        }
+    }
+
     /// Expand every `AuthorizedKeysFile` template for `user` and read the
     /// files that exist, StrictModes-checked against `user`'s uid. Any
     /// failure (unknown user, bad template, StrictModes refusal,
@@ -1883,6 +1900,11 @@ mod imp {
         /// `PermitEmptyPasswords` — when false (the default), an empty password
         /// is rejected without ever consulting PAM.
         permit_empty_passwords: bool,
+        /// `PubkeyAcceptedAlgorithms`: signature algorithms accepted for
+        /// publickey auth. `None` ⇒ everything the auth layer verifies.
+        pubkey_accepted: Option<Vec<String>>,
+        /// `RequiredRSASize`: minimum RSA modulus bits for user keys.
+        required_rsa_size: u32,
         /// Multi-factor chain set, resolved per-user from
         /// `AuthenticationMethods` (each inner Vec is one comma-chain of
         /// required methods). Empty ⇒ single-factor (any one advertised method
@@ -2162,6 +2184,8 @@ mod imp {
                 .or(opts.permit_root_login)
                 .unwrap_or(puressh::config::PermitRootLogin::ProhibitPassword);
             self.permit_empty_passwords = opts.permit_empty_passwords == Some(true);
+            self.pubkey_accepted = opts.pubkey_accepted_algorithms.clone();
+            self.required_rsa_size = opts.required_rsa_size.unwrap_or(DEFAULT_REQUIRED_RSA_SIZE);
             self.authorized_principals_file = opts.authorized_principals_file;
             self.authorized_principals = None;
             if self.global_authorized_keys.is_none() {
@@ -2529,11 +2553,11 @@ mod imp {
                 }
                 AuthAttempt::PublicKey {
                     user,
+                    algorithm,
                     public_blob,
                     probe_only,
                     verified,
                     cert,
-                    ..
                 } => {
                     // An invalid username, or a username switched
                     // mid-userauth, is refused before anything else. Both
@@ -2587,7 +2611,31 @@ mod imp {
                     if blob_revoked && self.debug {
                         eprintln!("sshd: auth publickey: key/cert blob revoked by KRL for {user}");
                     }
+                    // PubkeyAcceptedAlgorithms / RequiredRSASize: a policy on
+                    // the key itself, folded into `blob_ok` (no early return,
+                    // so timing stays uniform).
+                    let alg_ok = self
+                        .pubkey_accepted
+                        .as_ref()
+                        .is_none_or(|l| l.iter().any(|a| a == &algorithm));
+                    let key_blob = cert.as_ref().map_or(public_blob.as_slice(), |ci| {
+                        ci.embedded_pubkey_blob.as_slice()
+                    });
+                    let size_ok = rsa_modulus_bits(key_blob)
+                        .is_none_or(|bits| bits >= self.required_rsa_size as usize);
+                    if self.debug && !(alg_ok && size_ok) {
+                        eprintln!(
+                            "sshd: auth publickey: {} for {user}",
+                            if alg_ok {
+                                "RSA key below RequiredRSASize"
+                            } else {
+                                "algorithm not in PubkeyAcceptedAlgorithms"
+                            }
+                        );
+                    }
                     let blob_ok = !blob_revoked
+                        && alg_ok
+                        && size_ok
                         && match &cert {
                             Some(ci) => self.cert_trusted(ci, &user),
                             None => self
@@ -2968,6 +3016,8 @@ mod imp {
                 kbd_conv: None,
                 pending_first_prompt: true,
                 permit_empty_passwords: self.permit_empty_passwords,
+                pubkey_accepted: None,
+                required_rsa_size: DEFAULT_REQUIRED_RSA_SIZE,
                 chains: Vec::new(),
                 satisfied: Vec::new(),
                 bound_user: None,
@@ -4823,10 +4873,29 @@ mod imp {
             &self,
             peer: &std::net::SocketAddr,
             max_startups: u32,
+            early: Option<(u32, u32)>,
             per_source_max: u32,
         ) -> Result<(), &'static str> {
-            if max_startups > 0 && self.unauthenticated() >= max_startups as usize {
+            let unauth = self.unauthenticated();
+            if max_startups > 0 && unauth >= max_startups as usize {
                 return Err("max-startups");
+            }
+            // `MaxStartups start:rate:full`: random early drop, `rate`% at
+            // `start` rising linearly to 100% at `full` (OpenSSH's formula).
+            if let Some((start, rate)) = early
+                && max_startups > 0
+                && unauth >= start as usize
+            {
+                let (start, full, unauth) = (start as u64, max_startups as u64, unauth as u64);
+                let p = if full > start {
+                    (100 - rate as u64) * (unauth - start) / (full - start) + rate as u64
+                } else {
+                    100
+                };
+                use purecrypto::rng::{OsRng, RngCore};
+                if (OsRng.next_u32() % 100) < p as u32 {
+                    return Err("max-startups (early drop)");
+                }
             }
             if per_source_max > 0 && self.count_from_ip(peer.ip()) >= per_source_max as usize {
                 return Err("per-source-max");
@@ -4858,6 +4927,10 @@ mod imp {
             Some(p) => load_server_config(std::path::Path::new(p))?,
             None => puressh::config::SshServerConfig::default(),
         });
+        // OpenSSH keywords we accept but do not implement, ignored arguments.
+        for w in sshd_cfg.warnings() {
+            eprintln!("sshd: warning: config {w}");
+        }
 
         // LogLevel (sshd_config): VERBOSE/DEBUG* (level >= 1) turns on the same
         // verbose diagnostics as `-d`, so the config keyword actually controls
@@ -4910,6 +4983,12 @@ mod imp {
             120u32,
         );
         let max_startups = pick(cli.max_startups, sshd_cfg.global.max_startups, 100u32);
+        // `--per-source-max` > `PerSourceMaxStartups` (`none` ⇒ 0, no cap) > 10.
+        let per_source_max = pick(
+            cli.per_source_max,
+            sshd_cfg.global.per_source_max_startups,
+            10u32,
+        );
 
         // CLI host-keys, then any HostKey lines from config (cumulative).
         let mut host_key_files = cli.host_key_files.clone();
@@ -5126,6 +5205,12 @@ mod imp {
         // we cannot satisfy. `pam_check_password` on a non-PAM build always
         // fails, so this is the authoritative gate.
         let pam_available = cfg!(all(feature = "pam", target_os = "linux"));
+        if pam_available && sshd_cfg.global.use_pam == Some(false) {
+            eprintln!(
+                "sshd: warning: UsePAM no: PAM account and session checks still run (this \
+                 build has no non-PAM account checks to fall back on)"
+            );
+        }
 
         let cfg_password = sshd_cfg.global.password_authentication == Some(true);
         let cfg_kbdint = sshd_cfg.global.kbd_interactive_authentication == Some(true);
@@ -5526,7 +5611,12 @@ mod imp {
                 // Enforce both connection caps *before* fork so a flood
                 // can't OOM us via per-process accounting. On refusal we
                 // simply drop the socket — RST tells the client to retry.
-                if let Err(reason) = children.admit(&peer, max_startups, cli.per_source_max) {
+                if let Err(reason) = children.admit(
+                    &peer,
+                    max_startups,
+                    sshd_cfg.global.max_startups_early,
+                    per_source_max,
+                ) {
                     if cli.debug {
                         eprintln!(
                             "sshd: refused {peer}: {reason} (live={}, unauth={}, from-ip={})",
@@ -5813,6 +5903,8 @@ mod imp {
                 kbd_conv: None,
                 pending_first_prompt: true,
                 permit_empty_passwords: false,
+                pubkey_accepted: None,
+                required_rsa_size: DEFAULT_REQUIRED_RSA_SIZE,
                 chains: Vec::new(),
                 satisfied: Vec::new(),
                 bound_user: None,
@@ -6360,6 +6452,76 @@ mod imp {
             assert!(matches!(decision, AuthDecision::Reject));
         }
 
+        fn verified_attempt(alg: &str, blob: &[u8]) -> AuthAttempt {
+            AuthAttempt::PublicKey {
+                user: "alice".into(),
+                algorithm: alg.into(),
+                public_blob: blob.to_vec(),
+                probe_only: false,
+                verified: true,
+                cert: None,
+            }
+        }
+
+        fn authorizing(blob: &[u8]) -> LocalAuthenticator {
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            a.authorized_keys = Some(AuthorizedKeys {
+                blobs: vec![blob.to_vec()],
+                cas: Vec::new(),
+            });
+            a
+        }
+
+        #[test]
+        fn pubkey_accepted_algorithms_gate_userauth() {
+            let blob = unhex(USERKEY_BLOB_HEX);
+            let mut a = authorizing(&blob);
+            assert!(matches!(
+                a.evaluate(verified_attempt("ssh-ed25519", &blob)),
+                AuthDecision::Accept
+            ));
+            let mut a = authorizing(&blob);
+            a.pubkey_accepted = Some(vec!["rsa-sha2-512".into()]);
+            assert!(matches!(
+                a.evaluate(verified_attempt("ssh-ed25519", &blob)),
+                AuthDecision::Reject
+            ));
+        }
+
+        #[test]
+        fn required_rsa_size_gates_userauth() {
+            let rsa = |bits: usize| {
+                let mut n = vec![0u8; bits / 8];
+                n[0] = 0x80;
+                PublicKey::Rsa {
+                    e: vec![1, 0, 1],
+                    n,
+                    comment: String::new(),
+                }
+                .wire_blob()
+            };
+            let small = rsa(1024);
+            assert_eq!(rsa_modulus_bits(&small), Some(1024));
+            assert_eq!(rsa_modulus_bits(&unhex(USERKEY_BLOB_HEX)), None);
+            let mut a = authorizing(&small);
+            assert!(!matches!(
+                a.evaluate(verified_attempt("rsa-sha2-512", &small)),
+                AuthDecision::Reject
+            ));
+            let mut a = authorizing(&small);
+            a.required_rsa_size = 2048;
+            assert!(matches!(
+                a.evaluate(verified_attempt("rsa-sha2-512", &small)),
+                AuthDecision::Reject
+            ));
+            let tiny = rsa(768);
+            let mut a = authorizing(&tiny);
+            assert!(matches!(
+                a.evaluate(verified_attempt("rsa-sha2-512", &tiny)),
+                AuthDecision::Reject
+            ));
+        }
+
         /// A `CertInfo` wrapping `USERKEY_BLOB_HEX` as its embedded key, signed
         /// by a (fake) CA blob, with `alice` as its sole principal. The CA
         /// signature was already verified by the auth layer by the time the
@@ -6805,11 +6967,11 @@ mod imp {
             assert_eq!(t.unauthenticated(), 2);
             assert_eq!(t.count_from_ip(ip4), 2);
             // MaxStartups over unauthenticated children.
-            assert_eq!(t.admit(&peer_b, 2, 0), Err("max-startups"));
-            assert_eq!(t.admit(&peer_b, 3, 0), Ok(()));
+            assert_eq!(t.admit(&peer_b, 2, None, 0), Err("max-startups"));
+            assert_eq!(t.admit(&peer_b, 3, None, 0), Ok(()));
             // Per-source cap over live children from that IP.
-            assert_eq!(t.admit(&peer_a, 0, 2), Err("per-source-max"));
-            assert_eq!(t.admit(&peer_b, 0, 2), Ok(()));
+            assert_eq!(t.admit(&peer_a, 0, None, 2), Err("per-source-max"));
+            assert_eq!(t.admit(&peer_b, 0, None, 2), Ok(()));
             // An authenticated child leaves the MaxStartups count but keeps
             // its per-IP slot for life.
             t.children
@@ -6817,10 +6979,15 @@ mod imp {
                 .unwrap()
                 .authenticated = true;
             assert_eq!(t.unauthenticated(), 1);
-            assert_eq!(t.admit(&peer_b, 2, 0), Ok(()));
-            assert_eq!(t.admit(&peer_a, 0, 2), Err("per-source-max"));
+            assert_eq!(t.admit(&peer_b, 2, None, 0), Ok(()));
+            assert_eq!(t.admit(&peer_a, 0, None, 2), Err("per-source-max"));
             // Caps of 0 are unlimited.
-            assert_eq!(t.admit(&peer_a, 0, 0), Ok(()));
+            assert_eq!(t.admit(&peer_a, 0, None, 0), Ok(()));
+            // MaxStartups start:rate:full: 1 unauthenticated child, start 1 at
+            // rate 100 ⇒ always dropped; start 2 ⇒ never.
+            assert!(t.admit(&peer_b, 10, Some((1, 100)), 0).is_err());
+            assert_eq!(t.admit(&peer_b, 10, Some((2, 100)), 0), Ok(()));
+            assert_eq!(t.admit(&peer_b, 10, Some((1, 0)), 0), Ok(()));
         }
 
         #[test]

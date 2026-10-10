@@ -1162,6 +1162,15 @@ pub struct EffectivePolicy {
     /// `PrintMotd` — print `/etc/motd` for interactive shells. `None` ⇒
     /// default (no).
     pub print_motd: Option<bool>,
+    /// `PermitTTY` — when `Some(false)`, `pty-req` is refused.
+    pub permit_tty: Option<bool>,
+    /// `DisableForwarding` — when `Some(true)`, every kind of forwarding (TCP,
+    /// StreamLocal, agent, X11) is refused regardless of the other gates.
+    pub disable_forwarding: Option<bool>,
+    /// `AllowStreamLocalForwarding` — Unix-socket forwarding directions. It
+    /// narrows, never widens, the `AllowTcpForwarding` ceiling that
+    /// StreamLocal forwarding has always shared here. `None` ⇒ no extra gate.
+    pub allow_stream_local_forwarding: Option<crate::config::TcpForwarding>,
     /// Capability gates from an authenticating **user certificate**. `Some`
     /// only when the connection authenticated with an OpenSSH user certificate;
     /// its extensions are *default-deny* — an absent `permit-*` extension
@@ -1188,6 +1197,9 @@ impl EffectivePolicy {
             client_alive_interval: None,
             client_alive_count_max: None,
             print_motd: None,
+            permit_tty: None,
+            disable_forwarding: None,
+            allow_stream_local_forwarding: None,
             cert_caps: None,
         }
     }
@@ -1196,14 +1208,38 @@ impl EffectivePolicy {
     /// permits a PTY (subject to a shell handler being attached); a user
     /// certificate must carry the `permit-pty` extension (default-deny).
     fn pty_allowed(&self) -> bool {
-        self.cert_caps.as_ref().is_none_or(|c| c.permit_pty)
+        self.permit_tty != Some(false) && self.cert_caps.as_ref().is_none_or(|c| c.permit_pty)
+    }
+
+    /// `DisableForwarding yes` in force.
+    fn forwarding_disabled(&self) -> bool {
+        self.disable_forwarding == Some(true)
+    }
+
+    /// True iff a `direct-streamlocal` open is permitted: the local TCP
+    /// forwarding gate AND `AllowStreamLocalForwarding`.
+    fn local_streamlocal_allowed(&self) -> bool {
+        self.local_forwarding_allowed()
+            && self
+                .allow_stream_local_forwarding
+                .is_none_or(|p| p.local_allowed())
+    }
+
+    /// True iff a `streamlocal-forward` bind is permitted: the remote TCP
+    /// forwarding gate AND `AllowStreamLocalForwarding`.
+    fn remote_streamlocal_allowed(&self) -> bool {
+        self.remote_forwarding_allowed()
+            && self
+                .allow_stream_local_forwarding
+                .is_none_or(|p| p.remote_allowed())
     }
 
     /// True iff agent forwarding is permitted: not refused by
     /// `AllowAgentForwarding no`, AND (for a user cert) the `permit-agent-
     /// forwarding` extension is present.
     fn agent_forwarding_allowed(&self) -> bool {
-        self.allow_agent_forwarding != Some(false)
+        !self.forwarding_disabled()
+            && self.allow_agent_forwarding != Some(false)
             && self
                 .cert_caps
                 .as_ref()
@@ -1213,7 +1249,8 @@ impl EffectivePolicy {
     /// True iff X11 forwarding is permitted: not refused by `X11Forwarding no`,
     /// AND (for a user cert) the `permit-X11-forwarding` extension is present.
     fn x11_forwarding_allowed(&self) -> bool {
-        self.x11_forwarding != Some(false)
+        !self.forwarding_disabled()
+            && self.x11_forwarding != Some(false)
             && self
                 .cert_caps
                 .as_ref()
@@ -1224,7 +1261,8 @@ impl EffectivePolicy {
     /// `AllowTcpForwarding`, AND (for a user cert) the `permit-port-forwarding`
     /// extension is present. Default-allow when unset.
     fn local_forwarding_allowed(&self) -> bool {
-        self.allow_tcp_forwarding.is_none_or(|p| p.local_allowed())
+        !self.forwarding_disabled()
+            && self.allow_tcp_forwarding.is_none_or(|p| p.local_allowed())
             && self
                 .cert_caps
                 .as_ref()
@@ -1235,7 +1273,8 @@ impl EffectivePolicy {
     /// `AllowTcpForwarding`, AND (for a user cert) the `permit-port-forwarding`
     /// extension is present. Default-allow when unset.
     fn remote_forwarding_allowed(&self) -> bool {
-        self.allow_tcp_forwarding.is_none_or(|p| p.remote_allowed())
+        !self.forwarding_disabled()
+            && self.allow_tcp_forwarding.is_none_or(|p| p.remote_allowed())
             && self
                 .cert_caps
                 .as_ref()
@@ -2028,6 +2067,9 @@ fn resolve_effective_policy(
         client_alive_interval: opts.client_alive_interval,
         client_alive_count_max: opts.client_alive_count_max,
         print_motd: opts.print_motd,
+        permit_tty: opts.permit_tty,
+        disable_forwarding: opts.disable_forwarding,
+        allow_stream_local_forwarding: opts.allow_stream_local_forwarding,
         // Certificate caps are not a `sshd_config` concept; they are folded in
         // post-auth by the caller from the authenticating user certificate.
         cert_caps: None,
@@ -3202,12 +3244,11 @@ fn dispatch_app_packet(
                 }
             }
             ChannelOpen::DirectStreamlocal { socket_path } => {
-                // AllowStreamLocalForwarding capability ceiling. We reuse the
-                // local-forwarding gate (the same `AllowTcpForwarding`-derived
-                // flag `direct-tcpip` uses); PermitOpen is host:port-based and
-                // does not apply to Unix-socket paths, so destination
-                // filtering is left to the handler's own policy.
-                let forwarding_ok = effective.local_forwarding_allowed();
+                // StreamLocal capability ceiling: the local TCP forwarding
+                // gate AND `AllowStreamLocalForwarding`. PermitOpen is
+                // host:port-based and does not apply to Unix-socket paths, so
+                // destination filtering is left to the handler's own policy.
+                let forwarding_ok = effective.local_streamlocal_allowed();
                 if !forwarding_ok {
                     let p = conn.reject_open(
                         channel,
@@ -3503,11 +3544,11 @@ fn handle_global_request(
             srv_send(stream, driver, &p)?;
         }
         GlobalRequest::StreamlocalForward { socket_path } => {
-            // AllowStreamLocalForwarding capability ceiling: reuse the
-            // remote-forwarding gate. PermitListen is host:port-based and does
-            // not apply to Unix-socket paths, so path filtering is left to the
-            // handler's own policy.
-            let bound = if !effective.remote_forwarding_allowed()
+            // StreamLocal capability ceiling: the remote TCP forwarding gate
+            // AND `AllowStreamLocalForwarding`. PermitListen is host:port-based
+            // and does not apply to Unix-socket paths, so path filtering is
+            // left to the handler's own policy.
+            let bound = if !effective.remote_streamlocal_allowed()
                 || !forward_bindings_below_cap(cfg, forward, streamlocal_forward)
             {
                 false
@@ -6822,6 +6863,34 @@ mod tests {
         assert!(eff.x11_forwarding_allowed());
         assert!(eff.local_forwarding_allowed());
         assert!(eff.remote_forwarding_allowed());
+    }
+
+    #[test]
+    fn permit_tty_disable_forwarding_and_streamlocal_gates() {
+        let mut eff = EffectivePolicy::unrestricted();
+        assert!(eff.local_streamlocal_allowed() && eff.remote_streamlocal_allowed());
+        eff.permit_tty = Some(false);
+        assert!(!eff.pty_allowed());
+        assert!(eff.agent_forwarding_allowed());
+
+        let mut eff = EffectivePolicy::unrestricted();
+        eff.disable_forwarding = Some(true);
+        assert!(eff.pty_allowed());
+        assert!(!eff.agent_forwarding_allowed());
+        assert!(!eff.x11_forwarding_allowed());
+        assert!(!eff.local_forwarding_allowed());
+        assert!(!eff.remote_forwarding_allowed());
+        assert!(!eff.local_streamlocal_allowed());
+        assert!(!eff.remote_streamlocal_allowed());
+
+        let mut eff = EffectivePolicy::unrestricted();
+        eff.allow_stream_local_forwarding = Some(crate::config::TcpForwarding::Local);
+        assert!(eff.local_streamlocal_allowed());
+        assert!(!eff.remote_streamlocal_allowed());
+        assert!(eff.remote_forwarding_allowed(), "TCP forwarding unaffected");
+        // StreamLocal never widens the TCP ceiling.
+        eff.allow_tcp_forwarding = Some(crate::config::TcpForwarding::No);
+        assert!(!eff.local_streamlocal_allowed());
     }
 
     #[test]

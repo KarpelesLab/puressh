@@ -123,6 +123,10 @@ pub struct ServerOptions {
     /// `MaxStartups` (first sub-field only — the OpenSSH `start:rate:full`
     /// triple is rejected as a bad value).
     pub max_startups: Option<u32>,
+    /// `MaxStartups start:rate:full` — the `(start, rate)` half: from `start`
+    /// unauthenticated connections on, refuse new ones with a probability
+    /// rising linearly from `rate`% to 100% at `full` (= `max_startups`).
+    pub max_startups_early: Option<(u32, u32)>,
     /// `AllowAgentForwarding` (yes/no).
     pub allow_agent_forwarding: Option<bool>,
     /// `X11Forwarding` (yes/no).
@@ -268,6 +272,28 @@ pub struct ServerOptions {
     pub knock_clock_skew: Option<u32>,
     /// `KnockMaxPending` — open rendezvous listeners per (user, key).
     pub knock_max_pending: Option<u32>,
+    /// `UsePAM` (yes/no). `None` ⇒ default (PAM used when compiled in).
+    pub use_pam: Option<bool>,
+    /// `PermitTTY` (yes/no) — whether `pty-req` may be honoured.
+    pub permit_tty: Option<bool>,
+    /// `DisableForwarding` (yes/no) — `yes` refuses every kind of forwarding
+    /// (TCP, StreamLocal, agent, X11), overriding the individual keywords.
+    pub disable_forwarding: Option<bool>,
+    /// `AllowStreamLocalForwarding` — which Unix-socket forwarding directions
+    /// are permitted (in addition to the `AllowTcpForwarding` ceiling).
+    pub allow_stream_local_forwarding: Option<TcpForwarding>,
+    /// `PubkeyAcceptedAlgorithms` (alias `PubkeyAcceptedKeyTypes`) — the
+    /// signature algorithms accepted for publickey authentication.
+    pub pubkey_accepted_algorithms: Option<Vec<String>>,
+    /// `RequiredRSASize` — minimum RSA modulus size, in bits, for user keys.
+    pub required_rsa_size: Option<u32>,
+    /// `PerSourceMaxStartups` — cap on connections per source address.
+    /// `Some(0)` stands for the literal `none`.
+    pub per_source_max_startups: Option<u32>,
+    /// Non-fatal diagnostics from parsing this block: OpenSSH keywords that
+    /// are accepted but not implemented, or arguments that are ignored. Never
+    /// merged across blocks; see [`SshServerConfig::warnings`].
+    pub warnings: Vec<String>,
 }
 
 /// `AllowTcpForwarding` policy: which forwarding directions are permitted.
@@ -443,7 +469,14 @@ impl SshServerConfig {
             if in_match {
                 reject_invalid_in_match(&line)?;
             }
-            apply_keyword(target, &line)?;
+            // sshd_config(5): "for each parameter, the first obtained value
+            // will be used" (list keywords accumulate). Applying each line to
+            // a scratch block and merging gives exactly that, so a later
+            // drop-in or line cannot override an earlier one.
+            let mut one = ServerOptions::default();
+            apply_keyword(&mut one, &line)?;
+            target.warnings.append(&mut one.warnings);
+            merge_server_options(target, &one);
         }
         Ok(SshServerConfig {
             global,
@@ -479,6 +512,14 @@ impl SshServerConfig {
     pub fn all_blocks(&self) -> impl Iterator<Item = &ServerOptions> {
         core::iter::once(&self.global).chain(self.match_blocks.iter().map(|b| &b.opts))
     }
+
+    /// Every non-fatal parse diagnostic, global section first: OpenSSH
+    /// keywords accepted for compatibility but not implemented, and ignored
+    /// arguments. A daemon should log these at startup (and for `-t`).
+    pub fn warnings(&self) -> impl Iterator<Item = &str> {
+        self.all_blocks()
+            .flat_map(|b| b.warnings.iter().map(String::as_str))
+    }
 }
 
 /// Merge `src` into `dst` with first-match-wins scalars (an already-set scalar
@@ -495,6 +536,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(authorized_keys_file);
     take_scalar!(login_grace_time);
     take_scalar!(max_startups);
+    take_scalar!(max_startups_early);
     take_scalar!(allow_agent_forwarding);
     take_scalar!(x11_forwarding);
     take_scalar!(strict_modes);
@@ -530,6 +572,13 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(rekey_limit);
     take_scalar!(address_family);
     take_scalar!(subsystem_sftp);
+    take_scalar!(use_pam);
+    take_scalar!(permit_tty);
+    take_scalar!(disable_forwarding);
+    take_scalar!(allow_stream_local_forwarding);
+    take_scalar!(pubkey_accepted_algorithms);
+    take_scalar!(required_rsa_size);
+    take_scalar!(per_source_max_startups);
     take_scalar!(knock_ports);
     take_scalar!(knock_window);
     take_scalar!(knock_clock_skew);
@@ -715,10 +764,27 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         "maxstartups" => {
             let s = one_arg(line)?;
             if s.contains(':') {
-                return Err(ConfigError::Unsupported {
+                let bad = || ConfigError::BadValue {
                     line: line.line_no,
-                    msg: "MaxStartups start:rate:full triple not yet supported".into(),
-                });
+                    keyword: kw.to_string(),
+                    msg: format!(
+                        "expected N or start:rate:full (start <= full, rate <= 100), got {s:?}"
+                    ),
+                };
+                let parts: Vec<u32> = s
+                    .split(':')
+                    .map(|p| p.parse::<u32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| bad())?;
+                let [start, rate, full] = parts[..] else {
+                    return Err(bad());
+                };
+                if start > full || rate > 100 || full == 0 {
+                    return Err(bad());
+                }
+                opts.max_startups = Some(full);
+                opts.max_startups_early = Some((start, rate));
+                return Ok(());
             }
             opts.max_startups = Some(s.parse::<u32>().map_err(|_| ConfigError::BadValue {
                 line: line.line_no,
@@ -984,9 +1050,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             }
         }
         "subsystem" => {
-            // Standard form: `Subsystem <name> <command>`. Only the in-process
-            // `sftp` → `internal-sftp` mapping is supported; an external
-            // command subsystem cannot be honoured.
+            // Standard form: `Subsystem <name> <command> [args…]`. Only SFTP
+            // is served, in-process; OpenSSH's external `sftp-server` is
+            // mapped onto it (Debian/Ubuntu ship that line by default).
             if line.args.len() < 2 {
                 return Err(ConfigError::BadValue {
                     line: line.line_no,
@@ -996,23 +1062,91 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             }
             let name = line.args[0].to_ascii_lowercase();
             let command = &line.args[1];
-            if name == "sftp" && command.eq_ignore_ascii_case("internal-sftp") {
+            let base = command.rsplit('/').next().unwrap_or(command);
+            if name == "sftp"
+                && (command.eq_ignore_ascii_case("internal-sftp") || base == "sftp-server")
+            {
                 opts.subsystem_sftp = Some(true);
+                apply_sftp_server_args(opts, line, &line.args[2..])?;
             } else {
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: format!(
-                        "Subsystem {name:?}: only `sftp internal-sftp` is supported \
-                         (external-command subsystems are not)"
-                    ),
-                });
+                // Fail closed: the subsystem is simply not offered.
+                opts.warnings.push(format!(
+                    "line {}: Subsystem {name}: external-command subsystems are not \
+                     supported; requests for it will be refused",
+                    line.line_no
+                ));
             }
         }
         "permittunnel" => {
-            return Err(ConfigError::Unsupported {
+            if !one_arg(line)?.eq_ignore_ascii_case("no") {
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: "PermitTunnel: tun/tap device forwarding is not supported; \
+                          only `PermitTunnel no` is accepted"
+                        .into(),
+                });
+            }
+        }
+        "usepam" => {
+            opts.use_pam = Some(parse_yes_no(line)?);
+        }
+        "permittty" => {
+            opts.permit_tty = Some(parse_yes_no(line)?);
+        }
+        "disableforwarding" => {
+            opts.disable_forwarding = Some(parse_yes_no(line)?);
+        }
+        "allowstreamlocalforwarding" => {
+            opts.allow_stream_local_forwarding = Some(parse_tcp_forwarding(line)?);
+        }
+        "pubkeyacceptedalgorithms" | "pubkeyacceptedkeytypes" => {
+            opts.pubkey_accepted_algorithms = Some(resolve_algo_list(
+                AlgoCategory::PubkeyAccepted,
+                &line.args,
+                line.line_no,
+                "PubkeyAcceptedAlgorithms",
+            )?);
+        }
+        "requiredrsasize" => {
+            let s = one_arg(line)?;
+            opts.required_rsa_size = Some(s.parse::<u32>().map_err(|_| ConfigError::BadValue {
                 line: line.line_no,
-                msg: "PermitTunnel: tun/tap device forwarding is not supported".into(),
+                keyword: kw.to_string(),
+                msg: format!("expected a number of bits, got {s:?}"),
+            })?);
+        }
+        "persourcemaxstartups" => {
+            let s = one_arg(line)?;
+            opts.per_source_max_startups = Some(if s.eq_ignore_ascii_case("none") {
+                0
+            } else {
+                s.parse::<u32>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: kw.to_string(),
+                        msg: format!("expected a positive number or `none`, got {s:?}"),
+                    })?
             });
+        }
+        kw if IGNORED_KEYWORDS
+            .iter()
+            .any(|(k, _, _)| k.eq_ignore_ascii_case(kw)) =>
+        {
+            let (name, quiet, note) = IGNORED_KEYWORDS
+                .iter()
+                .find(|(k, _, _)| k.eq_ignore_ascii_case(kw))
+                .expect("checked by the guard");
+            let value = line.args.join(" ");
+            let lower = value.to_ascii_lowercase();
+            if !(quiet.contains(&"*") || quiet.contains(&lower.as_str())) {
+                opts.warnings.push(format!(
+                    "line {}: {name} {value}: not implemented, ignored{}{note}",
+                    line.line_no,
+                    if note.is_empty() { "" } else { " — " },
+                ));
+            }
         }
         _ => {
             return Err(ConfigError::UnknownKeyword {
@@ -1020,6 +1154,157 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 keyword: kw.to_string(),
             });
         }
+    }
+    Ok(())
+}
+
+/// OpenSSH `sshd_config` keywords accepted for compatibility but not
+/// implemented: `(keyword as OpenSSH spells it, values that need no warning,
+/// note)`. `"*"` means
+/// the keyword is always quiet.
+///
+/// Every entry is safe to ignore: dropping it never grants more access than
+/// OpenSSH would. Either it is cosmetic / logging / tuning, or it enables a
+/// feature this server lacks (so ignoring it fails closed: e.g. GSSAPI or
+/// `AuthorizedKeysCommand` logins are simply unavailable). Keywords that
+/// *restrict* access are implemented or rejected, never listed here.
+const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
+    // Logging, DNS, network tuning, cosmetics.
+    ("UseDNS", &["*"], ""),
+    ("SyslogFacility", &["*"], ""),
+    ("LogVerbose", &["*"], ""),
+    ("PrintLastLog", &["*"], ""),
+    ("TCPKeepAlive", &["*"], ""),
+    ("IPQoS", &["*"], ""),
+    ("VersionAddendum", &["*"], ""),
+    ("DebianBanner", &["*"], ""),
+    ("FingerprintHash", &["*"], ""),
+    ("ModuliFile", &["*"], ""),
+    ("X11DisplayOffset", &["*"], ""),
+    ("X11UseLocalhost", &["*"], ""),
+    ("XAuthLocation", &["*"], ""),
+    ("StreamLocalBindMask", &["*"], ""),
+    ("StreamLocalBindUnlink", &["*"], ""),
+    ("PerSourceNetBlockSize", &["*"], ""),
+    ("PerSourcePenalties", &["*"], ""),
+    ("PerSourcePenaltyExemptList", &["*"], ""),
+    ("ChannelTimeout", &["none"], "channels are not timed out"),
+    (
+        "UnusedConnectionTimeout",
+        &["none"],
+        "idle connections are not timed out",
+    ),
+    // Features this server does not have: ignoring them fails closed.
+    ("SecurityKeyProvider", &["*"], ""),
+    ("PubkeyAuthOptions", &["*"], ""),
+    ("ExposeAuthInfo", &["no"], "SSH_USER_AUTH is not set"),
+    (
+        "HostKeyAgent",
+        &["none"],
+        "host keys held by an agent are not used",
+    ),
+    ("PermitUserRC", &["*"], ""),
+    (
+        "PermitUserEnvironment",
+        &["no"],
+        "~/.ssh/environment is never read",
+    ),
+    ("SetEnv", &[], "the variables are not set in sessions"),
+    (
+        "AuthorizedKeysCommand",
+        &["none"],
+        "keys it would return are not accepted",
+    ),
+    ("AuthorizedKeysCommandUser", &["*"], ""),
+    (
+        "AuthorizedPrincipalsCommand",
+        &["none"],
+        "principals it would return are not accepted",
+    ),
+    ("AuthorizedPrincipalsCommandUser", &["*"], ""),
+    (
+        "GSSAPIAuthentication",
+        &["no"],
+        "GSSAPI authentication is unavailable",
+    ),
+    (
+        "GSSAPIKeyExchange",
+        &["no"],
+        "GSSAPI key exchange is unavailable",
+    ),
+    ("GSSAPICleanupCredentials", &["*"], ""),
+    ("GSSAPIStrictAcceptorCheck", &["*"], ""),
+    ("GSSAPIStoreCredentialsOnRekey", &["*"], ""),
+    ("GSSAPIKexAlgorithms", &["*"], ""),
+    (
+        "KerberosAuthentication",
+        &["no"],
+        "Kerberos authentication is unavailable",
+    ),
+    ("KerberosOrLocalPasswd", &["*"], ""),
+    ("KerberosTicketCleanup", &["*"], ""),
+    ("KerberosGetAFSToken", &["*"], ""),
+    (
+        "HostbasedAuthentication",
+        &["no"],
+        "host-based authentication is unavailable",
+    ),
+    ("HostbasedAcceptedAlgorithms", &["*"], ""),
+    ("HostbasedAcceptedKeyTypes", &["*"], ""),
+    ("HostbasedUsesNameFromPacketOnly", &["*"], ""),
+    ("IgnoreRhosts", &["*"], ""),
+    ("IgnoreUserKnownHosts", &["*"], ""),
+    ("KbdInteractiveDevices", &["*"], ""),
+    // Deprecated / removed in OpenSSH itself (it ignores them too).
+    ("Protocol", &["*"], ""),
+    ("UsePrivilegeSeparation", &["*"], ""),
+    ("KeyRegenerationInterval", &["*"], ""),
+    ("ServerKeyBits", &["*"], ""),
+    ("RSAAuthentication", &["*"], ""),
+    ("RhostsRSAAuthentication", &["*"], ""),
+    ("DSAAuthentication", &["*"], ""),
+    ("UseLogin", &["*"], ""),
+    ("PAMAuthenticationViaKbdInt", &["*"], ""),
+    ("SkeyAuthentication", &["*"], ""),
+    ("KerberosTgtPassing", &["*"], ""),
+    ("AFSTokenPassing", &["*"], ""),
+    ("VerifyReverseMapping", &["*"], ""),
+    ("ReverseMappingCheck", &["*"], ""),
+];
+
+/// Arguments after the program in `Subsystem sftp …`, as accepted by
+/// OpenSSH's `sftp-server` / `internal-sftp`. `-R` (read-only) is honoured;
+/// logging and start-directory options are ignored; options that restrict
+/// what a client may do but are not implemented are rejected.
+fn apply_sftp_server_args(
+    opts: &mut ServerOptions,
+    line: &ParsedLine,
+    args: &[String],
+) -> Result<(), ConfigError> {
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-R" => opts.sftp_read_only = Some(true),
+            "-e" | "-h" => {}
+            "-f" | "-l" => i += 1,
+            "-d" => {
+                opts.warnings.push(format!(
+                    "line {}: Subsystem sftp -d: start directory ignored",
+                    line.line_no
+                ));
+                i += 1;
+            }
+            other => {
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: format!(
+                        "Subsystem sftp: option {other:?} is not supported (only -R, -d, \
+                         -e, -f, -l are)"
+                    ),
+                });
+            }
+        }
+        i += 1;
     }
     Ok(())
 }
@@ -2068,13 +2353,18 @@ Subsystem sftp internal-sftp
     }
 
     #[test]
-    fn external_subsystem_unsupported() {
-        let err =
-            SshServerConfig::parse("Subsystem sftp /usr/lib/openssh/sftp-server\n").unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Unsupported { line: 1, .. }),
-            "{err:?}"
-        );
+    fn first_obtained_value_wins_within_a_block() {
+        let cfg = SshServerConfig::parse(
+            "PasswordAuthentication yes\nPasswordAuthentication no\n\
+             ListenAddress a\nListenAddress b\nMaxStartups 10:30:100\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.global.password_authentication, Some(true));
+        assert_eq!(cfg.global.listen_addresses, vec!["a", "b"]);
+        assert_eq!(cfg.global.max_startups, Some(100));
+        assert_eq!(cfg.global.max_startups_early, Some((10, 30)));
+        assert!(SshServerConfig::parse("MaxStartups 10:101:100\n").is_err());
+        assert!(SshServerConfig::parse("MaxStartups 50:30:10\n").is_err());
     }
 
     #[test]
@@ -2145,6 +2435,191 @@ Subsystem sftp internal-sftp
         }
         let err = SshServerConfig::parse("Match User a\n  KnockUsers a\n").unwrap_err();
         assert!(matches!(err, ConfigError::Unsupported { .. }));
+    }
+
+    /// Active lines of the stock Ubuntu 22.04 / 24.04 `sshd_config`
+    /// (`/usr/share/openssh/sshd_config`, identical in both), minus the
+    /// `Include` that `parse` cannot resolve.
+    const UBUNTU_STOCK: &str = "\
+KbdInteractiveAuthentication no
+UsePAM yes
+X11Forwarding yes
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem\tsftp\t/usr/lib/openssh/sftp-server
+";
+
+    #[test]
+    fn ubuntu_stock_config_parses_without_warnings() {
+        let cfg = SshServerConfig::parse(UBUNTU_STOCK).unwrap();
+        let g = &cfg.global;
+        assert_eq!(g.use_pam, Some(true));
+        assert_eq!(g.subsystem_sftp, Some(true));
+        assert_eq!(g.x11_forwarding, Some(true));
+        assert_eq!(g.print_motd, Some(false));
+        assert_eq!(
+            cfg.warnings().count(),
+            0,
+            "{:?}",
+            cfg.warnings().collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn ubuntu_stock_config_with_include_and_cloud_dropins_loads() {
+        let dir = std::env::temp_dir().join(format!("puressh_stock_{}", std::process::id()));
+        let d = dir.join("sshd_config.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("50-cloud-init.conf"), "PasswordAuthentication yes\n").unwrap();
+        std::fs::write(
+            d.join("60-cloudimg-settings.conf"),
+            "PasswordAuthentication no\n",
+        )
+        .unwrap();
+        let main = dir.join("sshd_config");
+        std::fs::write(
+            &main,
+            format!("Include {}/*.conf\n{UBUNTU_STOCK}", d.display()),
+        )
+        .unwrap();
+        let cfg = SshServerConfig::load(&main).unwrap();
+        // First match wins, in glob order: 50-cloud-init.conf.
+        assert_eq!(cfg.global.password_authentication, Some(true));
+        assert_eq!(cfg.global.subsystem_sftp, Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Every keyword the stock file lists commented out, uncommented with a
+    /// typical value, parses.
+    #[test]
+    fn commonly_uncommented_keywords_parse() {
+        let src = "\
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ecdsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+RekeyLimit default none
+SyslogFacility AUTH
+LogLevel INFO
+LoginGraceTime 2m
+PermitRootLogin prohibit-password
+StrictModes yes
+MaxAuthTries 6
+MaxSessions 10
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys .ssh/authorized_keys2
+AuthorizedPrincipalsFile none
+AuthorizedKeysCommand none
+AuthorizedKeysCommandUser nobody
+HostbasedAuthentication no
+IgnoreUserKnownHosts no
+IgnoreRhosts yes
+PasswordAuthentication yes
+PermitEmptyPasswords no
+KerberosAuthentication no
+KerberosOrLocalPasswd yes
+KerberosTicketCleanup yes
+KerberosGetAFSToken no
+GSSAPIAuthentication no
+GSSAPICleanupCredentials yes
+GSSAPIStrictAcceptorCheck yes
+GSSAPIKeyExchange no
+AllowAgentForwarding yes
+AllowTcpForwarding yes
+GatewayPorts no
+X11DisplayOffset 10
+X11UseLocalhost yes
+PermitTTY yes
+PrintLastLog yes
+TCPKeepAlive yes
+PermitUserEnvironment no
+Compression delayed
+ClientAliveInterval 0
+ClientAliveCountMax 3
+UseDNS no
+PidFile /run/sshd.pid
+MaxStartups 10:30:100
+PermitTunnel no
+ChrootDirectory none
+VersionAddendum none
+Banner none
+ChallengeResponseAuthentication no
+UsePrivilegeSeparation sandbox
+";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        assert_eq!(cfg.global.permit_tty, Some(true));
+        assert_eq!(
+            cfg.warnings().count(),
+            0,
+            "{:?}",
+            cfg.warnings().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn unimplemented_keywords_warn_only_when_it_matters() {
+        let cfg = SshServerConfig::parse(
+            "GSSAPIAuthentication yes\nAuthorizedKeysCommand /usr/bin/ldap-keys\n\
+             SetEnv FOO=bar\nUseDNS yes\nPermitUserEnvironment yes\n",
+        )
+        .unwrap();
+        let w: Vec<_> = cfg.warnings().collect();
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert!(w[0].contains("GSSAPIAuthentication") && w[0].contains("line 1"));
+        assert!(w[1].contains("AuthorizedKeysCommand"));
+        assert!(w.iter().all(|x| !x.contains("UseDNS")));
+    }
+
+    #[test]
+    fn subsystem_sftp_server_mapping() {
+        let cfg =
+            SshServerConfig::parse("Subsystem sftp /usr/lib/sftp-server -f AUTHPRIV -l INFO\n")
+                .unwrap();
+        assert_eq!(cfg.global.subsystem_sftp, Some(true));
+        assert_eq!(cfg.global.sftp_read_only, None);
+        let cfg = SshServerConfig::parse("Subsystem sftp internal-sftp -R\n").unwrap();
+        assert_eq!(cfg.global.sftp_read_only, Some(true));
+        // Restrictions we cannot honour are fatal, never silently dropped.
+        assert!(SshServerConfig::parse("Subsystem sftp internal-sftp -P write\n").is_err());
+        assert!(SshServerConfig::parse("Subsystem sftp internal-sftp -u 077\n").is_err());
+        // Other external subsystems are refused at request time, with a warning.
+        let cfg = SshServerConfig::parse("Subsystem netconf /usr/bin/netconf\n").unwrap();
+        assert_eq!(cfg.global.subsystem_sftp, None);
+        assert_eq!(cfg.warnings().count(), 1);
+    }
+
+    #[test]
+    fn restrictive_keywords_parse_and_match_override() {
+        let cfg = SshServerConfig::parse(
+            "PermitTTY yes\nDisableForwarding no\nAllowStreamLocalForwarding local\n\
+             PubkeyAcceptedAlgorithms ssh-ed25519,rsa-sha2-512\nRequiredRSASize 3072\n\
+             PerSourceMaxStartups none\n\
+             Match User guest\n  PermitTTY no\n  DisableForwarding yes\n",
+        )
+        .unwrap();
+        let g = &cfg.global;
+        assert_eq!(g.allow_stream_local_forwarding, Some(TcpForwarding::Local));
+        assert_eq!(
+            g.pubkey_accepted_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string(), "rsa-sha2-512".to_string()][..])
+        );
+        assert_eq!(g.required_rsa_size, Some(3072));
+        assert_eq!(g.per_source_max_startups, Some(0));
+        let ctx = crate::config::MatchContext {
+            user: Some("guest"),
+            ..Default::default()
+        };
+        let r = cfg.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
+        assert_eq!(r.permit_tty, Some(false));
+        assert_eq!(r.disable_forwarding, Some(true));
+        // Keywords OpenSSH rejects unless they are no-ops stay strict.
+        assert!(SshServerConfig::parse("PermitTunnel yes\n").is_err());
+        assert!(SshServerConfig::parse("PermitTunnel no\n").is_ok());
+        assert!(SshServerConfig::parse("PubkeyAcceptedKeyTypes +ssh-dss\n").is_err());
     }
 
     #[test]

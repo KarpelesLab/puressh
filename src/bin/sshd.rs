@@ -3286,8 +3286,11 @@ mod imp {
         debug_commands: bool,
     }
 
-    impl CommandHandler for ShellCommandHandler {
-        fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
+    impl ShellCommandHandler {
+        /// Everything needed to run `command` for `user`, short of spawning:
+        /// logging, the passwd lookup, PAM session, environment and the
+        /// privilege drop (in `pre_exec`). `Err` is a message for stderr.
+        fn prepare(&self, user: &str, env: &SessionEnv, command: &str) -> Result<Command, String> {
             // Both the config `ForceCommand` directive and a user certificate's
             // `force-command` critical option are applied uniformly by the
             // server connection-phase dispatcher (it rewrites `command` to the
@@ -3316,32 +3319,17 @@ mod imp {
             // Resolve the target user in /etc/passwd first — every
             // subsequent step (PAM open, env layering, setuid) depends
             // on these values. A missing user is a hard fail.
-            let info = match lookup_user(user) {
-                Ok(i) => i,
-                Err(e) => {
-                    return ExecResult::new(
-                        Vec::new(),
-                        format!("sshd: user lookup failed: {e}\n").into_bytes(),
-                        255,
-                    );
-                }
-            };
+            let info = lookup_user(user).map_err(|e| format!("sshd: user lookup failed: {e}\n"))?;
 
             // Open the PAM session before spawning the child. `exec`
             // requests don't have a real tty, so we use "ssh" — matches
             // OpenSSH's behaviour for non-PTY channels. `ExecResult`
             // has no error channel, so PAM failure surfaces as exit
             // status 255 with the error message on stderr.
-            let mut envs = match self.pam.ensure(user, "ssh") {
-                Ok(e) => e,
-                Err(e) => {
-                    return ExecResult::new(
-                        Vec::new(),
-                        format!("sshd: PAM session open failed: {e}\n").into_bytes(),
-                        255,
-                    );
-                }
-            };
+            let mut envs = self
+                .pam
+                .ensure(user, "ssh")
+                .map_err(|e| format!("sshd: PAM session open failed: {e}\n"))?;
             apply_login_envs(&mut envs, &info);
 
             // Run the command via the user's login shell so that
@@ -3404,6 +3392,110 @@ mod imp {
                 // Same uid → still chdir for clean cwd semantics.
                 cmd.current_dir(&info.home_str);
             }
+            Ok(cmd)
+        }
+
+        /// Run `command` streaming: channel data feeds its stdin (EOF
+        /// closes it), its stdout and stderr go out as they are produced,
+        /// then its exit status. This is what `ssh host command` (git,
+        /// rsync, `tail -f`, `cat > file`) needs.
+        fn run_streaming(
+            &self,
+            user: &str,
+            env: &SessionEnv,
+            command: &str,
+            mut stream: ChannelStream,
+        ) -> puressh::Result<()> {
+            use puressh::server::ChannelEgress;
+            use std::io::{Read, Write};
+            let mut cmd = match self.prepare(user, env, command) {
+                Ok(c) => c,
+                Err(msg) => {
+                    let _ = stream.write_stderr(msg.as_bytes());
+                    let _ = stream.send_exit_status(255);
+                    return Ok(());
+                }
+            };
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            let mut child = match cmd.spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = stream.write_stderr(format!("sshd: failed to spawn: {e}\n").as_bytes());
+                    let _ = stream.send_exit_status(255);
+                    return Ok(());
+                }
+            };
+            let (rx, tx) = stream.into_raw();
+
+            // channel → stdin. Not joined: it ends when the client sends EOF
+            // or the channel goes away.
+            if let Some(mut child_in) = child.stdin.take() {
+                std::thread::spawn(move || {
+                    while let Ok(Some(bytes)) = rx.recv() {
+                        if child_in.write_all(&bytes).is_err() {
+                            break;
+                        }
+                    }
+                    // Dropping `child_in` closes the command's stdin.
+                });
+            }
+
+            fn pump<R: Read + Send + 'static>(
+                mut r: R,
+                tx: std::sync::mpsc::SyncSender<ChannelEgress>,
+                stderr: bool,
+            ) -> std::thread::JoinHandle<()> {
+                std::thread::spawn(move || {
+                    let mut buf = vec![0u8; 32 * 1024];
+                    loop {
+                        match r.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                let chunk = buf[..n].to_vec();
+                                let msg = if stderr {
+                                    ChannelEgress::Stderr(chunk)
+                                } else {
+                                    ChannelEgress::Data(chunk)
+                                };
+                                if tx.send(msg).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                            Err(_) => break,
+                        }
+                    }
+                })
+            }
+            let t_out = child.stdout.take().map(|o| pump(o, tx.clone(), false));
+            let t_err = child.stderr.take().map(|e| pump(e, tx.clone(), true));
+            if let Some(t) = t_out {
+                let _ = t.join();
+            }
+            if let Some(t) = t_err {
+                let _ = t.join();
+            }
+            if let Ok(status) = child.wait() {
+                // A command killed by a signal has no exit status; the
+                // client then reports 255, like OpenSSH.
+                if let Some(code) = status.code() {
+                    let _ = tx.send(ChannelEgress::ExitStatus(code as u32));
+                }
+            }
+            let _ = tx.send(ChannelEgress::Eof);
+            let _ = tx.send(ChannelEgress::Close);
+            Ok(())
+        }
+    }
+
+    impl CommandHandler for ShellCommandHandler {
+        fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
+            let mut cmd = match self.prepare(user, env, command) {
+                Ok(c) => c,
+                Err(msg) => return ExecResult::new(Vec::new(), msg.into_bytes(), 255),
+            };
 
             // Spawn + manually drain so we can cap total buffered
             // output. `cmd.output()` would grow each stream
@@ -3421,7 +3513,7 @@ mod imp {
                 Err(e) => {
                     return ExecResult::new(
                         Vec::new(),
-                        format!("sshd: failed to spawn {}: {e}\n", info.shell_str).into_bytes(),
+                        format!("sshd: failed to spawn: {e}\n").into_bytes(),
                         255,
                     );
                 }
@@ -4047,6 +4139,32 @@ mod imp {
 
     struct ScpExecHandler {
         debug: bool,
+    }
+
+    /// Every `exec` request: in-process `scp` when enabled and asked for,
+    /// otherwise the command through the user's shell, streamed.
+    struct ExecDispatch {
+        scp: Option<ScpExecHandler>,
+        shell: Arc<ShellCommandHandler>,
+    }
+
+    impl ExecStreamHandler for ExecDispatch {
+        fn claims(&self, _command: &str) -> bool {
+            true
+        }
+
+        fn run(
+            &self,
+            user: &str,
+            env: &SessionEnv,
+            command: &str,
+            stream: ChannelStream,
+        ) -> puressh::Result<()> {
+            match &self.scp {
+                Some(scp) if scp.claims(command) => scp.run(user, env, command, stream),
+                _ => self.shell.run_streaming(user, env, command, stream),
+            }
+        }
     }
 
     impl ExecStreamHandler for ScpExecHandler {
@@ -5627,22 +5745,18 @@ mod imp {
         // child sees the value the hook wrote for *this* connection.
         let print_motd_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let mut config = Config::new(
-            host_keys,
-            factory,
-            advertised,
-            Arc::new(ShellCommandHandler {
-                pam: pam_gate.clone(),
-                debug: cli.debug,
-                debug_commands: cli.debug_commands,
-            }),
-        )
-        .with_auth_methods(default_auth_methods)
-        .with_shell(Arc::new(NixShellHandler {
+        let shell_commands = Arc::new(ShellCommandHandler {
             pam: pam_gate.clone(),
             debug: cli.debug,
-            print_motd: print_motd_flag.clone(),
-        }));
+            debug_commands: cli.debug_commands,
+        });
+        let mut config = Config::new(host_keys, factory, advertised, shell_commands.clone())
+            .with_auth_methods(default_auth_methods)
+            .with_shell(Arc::new(NixShellHandler {
+                pam: pam_gate.clone(),
+                debug: cli.debug,
+                print_motd: print_motd_flag.clone(),
+            }));
 
         // Resolved CASignatureAlgorithms for user-certificate verification.
         if let Some(ca) = sshd_cfg.global.ca_signature_algorithms.clone() {
@@ -5658,10 +5772,32 @@ mod imp {
             config = config.with_subsystem(Arc::new(sftp));
         }
 
-        if scp_enabled {
-            let scp = ScpExecHandler { debug: cli.debug };
-            config = config.with_exec_stream_handler(Arc::new(scp));
-        }
+        // TCP and Unix-socket forwarding (`ssh -L/-R/-D/-W`), on by default
+        // as in OpenSSH. The handlers accept what reaches them: the server's
+        // per-user policy layer applies AllowTcpForwarding, PermitOpen,
+        // PermitListen, GatewayPorts (bind-address rewrite),
+        // AllowStreamLocalForwarding and DisableForwarding first, and the
+        // connection already runs as the logged-in user.
+        config = config
+            .with_direct_tcpip(Arc::new(
+                puressh::forwarding::direct::DefaultDirectTcpipHandler::permit_all(),
+            ))
+            .with_tcpip_forward(Arc::new(
+                puressh::forwarding::reverse::DefaultTcpipForwardHandler::permit_all_interfaces(),
+            ))
+            .with_direct_streamlocal(Arc::new(
+                puressh::forwarding::direct_streamlocal::DefaultDirectStreamlocalHandler::permit_all(),
+            ))
+            .with_streamlocal_forward(Arc::new(
+                puressh::forwarding::streamlocal::DefaultStreamlocalForwardHandler::permit_all(),
+            ));
+
+        // `exec` requests stream (stdin, stdout, stderr, exit status);
+        // `scp` is served in-process when enabled.
+        config = config.with_exec_stream_handler(Arc::new(ExecDispatch {
+            scp: scp_enabled.then_some(ScpExecHandler { debug: cli.debug }),
+            shell: shell_commands,
+        }));
 
         if agent_forward {
             use puressh::forwarding::agent::DefaultAgentForwardHandler;

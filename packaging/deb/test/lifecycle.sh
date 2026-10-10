@@ -36,6 +36,7 @@ apt-get install -y -qq openssh-server >/dev/null
 if grep -q VERSION_CODENAME=noble /etc/os-release; then
 	systemctl enable --now ssh.socket
 	systemctl restart ssh.socket
+	ls -la /etc/systemd/system/sockets.target.wants/ /etc/systemd/system/ssh.service.requires/ || true
 else
 	systemctl enable --now ssh.service
 	systemctl restart ssh.service
@@ -54,7 +55,11 @@ apt-get install -y "$DEB"
 if installed openssh-server; then echo "openssh-server still installed"; exit 1; fi
 /usr/sbin/sshd -V | grep -q puressh
 systemctl is-active ssh.service
-systemctl is-enabled ssh.service
+if ! systemctl is-enabled ssh.service; then
+	ls -la /etc/systemd/system /etc/systemd/system/*.wants /etc/systemd/system/*.requires || true
+	ls -la /var/lib/systemd/deb-systemd-helper-enabled /var/lib/systemd/deb-systemd-helper-masked || true
+	exit 1
+fi
 [ "$(fp)" = "$FP" ] || { echo "host key changed"; exit 1; }
 out=$(try_ssh tester@localhost 'echo puressh-ok; id -un')
 echo "$out" | grep -q puressh-ok

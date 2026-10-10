@@ -55,6 +55,8 @@ MSG
 		if [ -n "$wanted" ]; then
 			# SSH was enabled before: keep it enabled.
 			deb-systemd-helper enable ssh.service >/dev/null || true
+			systemctl -q is-enabled ssh.service 2>/dev/null ||
+				systemctl enable ssh.service
 		elif [ -z "$2" ] && ! deb-systemd-helper debian-installed ssh.service; then
 			# First install on a host that never had an SSH server
 			# package: enable it, as openssh-server would.

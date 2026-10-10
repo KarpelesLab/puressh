@@ -1433,17 +1433,23 @@ fn run() -> Result<i32, String> {
         // puressh UDP knock (docs/knock.md), which needs the publickey
         // identities up front to sign the knock.
         vlog(1, &format!("connecting to {connect_host}:{port}"));
+        #[cfg_attr(not(feature = "knock"), allow(unused_mut))]
         let mut cfg = cfg;
         let knock_mode = cfg_block
             .knock_mode
             .unwrap_or(puressh::config::KnockSetting::Auto);
-        let sock = if knock_mode == puressh::config::KnockSetting::No {
+        // Without the `knock` feature the keywords parse but do nothing.
+        let use_knock = cfg!(feature = "knock") && knock_mode != puressh::config::KnockSetting::No;
+        let sock = if !use_knock {
             dial_tcp(&connect_host, port, &cfg_block)?
         } else {
             apply_identity_agent(cfg_block.identity_agent.as_ref(), identities_only);
             let creds = collect_credentials(&cfg_block, &cli.identities, identities_only);
+            #[cfg(feature = "knock")]
             let sock =
                 knock_support::dial(&connect_host, port, &user, &cfg_block, &mut cfg, &creds)?;
+            #[cfg(not(feature = "knock"))]
+            let sock = dial_tcp(&connect_host, port, &cfg_block)?;
             early_credentials = Some(creds);
             sock
         };
@@ -3288,6 +3294,7 @@ fn main() -> ExitCode {
 /// Client side of the puressh UDP knock (`docs/knock.md` §6) for the direct
 /// TCP path: identity selection, the sig1 and knock-host caches under
 /// `~/.ssh/puressh/`, and pinning the session to the ACCEPT's host key.
+#[cfg(feature = "knock")]
 mod knock_support {
     use super::*;
     use puressh::client::HostKeyPolicy;

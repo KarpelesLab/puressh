@@ -1249,6 +1249,7 @@ mod imp {
 
     /// Where the knock key table comes from (`KnockUsers` × authorized keys),
     /// kept so the table can be rebuilt when `authorized_keys` files change.
+    #[cfg_attr(not(feature = "knock"), allow(dead_code))]
     struct KnockKeySource {
         users: Vec<String>,
         global: Option<Arc<AuthorizedKeys>>,
@@ -1257,6 +1258,7 @@ mod imp {
         debug: bool,
     }
 
+    #[cfg(feature = "knock")]
     impl KnockKeySource {
         /// Plain keys of every knock user. Certificate authorities are not
         /// knock material: a knock names a concrete key.
@@ -1278,6 +1280,7 @@ mod imp {
     }
 
     /// `KnockListen` value → `host:port`, defaulting the port to the SSH one.
+    #[cfg(feature = "knock")]
     fn knock_listen_addr(spec: &str, port: u16) -> String {
         if spec.starts_with('[') {
             if spec.contains("]:") {
@@ -1294,62 +1297,158 @@ mod imp {
         }
     }
 
-    /// Bind one knock server per `KnockListen` address, signing ACCEPTs with
-    /// the daemon's plain host keys.
-    fn bind_knock_servers(
-        g: &puressh::config::ServerOptions,
-        port: u16,
-        source: &KnockKeySource,
-        host_key_files: &[String],
-        debug: bool,
-    ) -> Result<Vec<puressh::knock::KnockServer>, String> {
-        use puressh::knock::{KnockHostKey, KnockServer, KnockServerConfig, KnockState, unix_ms};
-        if g.knock_listen.is_empty() {
-            return Ok(Vec::new());
+    /// The daemon's knock sockets (`docs/knock.md`): UDP knock servers whose
+    /// rendezvous connections join the accept loop. Empty when `KnockListen`
+    /// is unset; a no-op shell when built without the `knock` feature.
+    struct KnockFrontend {
+        #[cfg(feature = "knock")]
+        servers: Vec<puressh::knock::KnockServer>,
+        #[cfg(feature = "knock")]
+        source: KnockKeySource,
+        #[cfg(feature = "knock")]
+        refreshed: std::time::Instant,
+    }
+
+    #[cfg(feature = "knock")]
+    impl KnockFrontend {
+        /// How often the key table is rebuilt from authorized_keys.
+        const REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
+
+        /// Bind one knock server per `KnockListen` address, signing ACCEPTs
+        /// with the daemon's plain host keys.
+        fn bind(
+            g: &puressh::config::ServerOptions,
+            port: u16,
+            source: KnockKeySource,
+            host_key_files: &[String],
+            debug: bool,
+        ) -> Result<Self, String> {
+            let servers = Self::bind_servers(g, port, &source, host_key_files, debug)?;
+            Ok(Self {
+                servers,
+                source,
+                refreshed: std::time::Instant::now(),
+            })
         }
-        if g.knock_users.is_empty() {
-            return Err("KnockListen requires KnockUsers (the users allowed to knock)".into());
-        }
-        let mut host_keys: Vec<KnockHostKey> = Vec::new();
-        for path in host_key_files {
-            let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-            let key = PrivateKey::parse_openssh_pem(&pem, None)
-                .and_then(|k| k.into_host_key_sync())
-                .map_err(|e| format!("knock: host key {path}: {e}"))?;
-            host_keys.push(Arc::from(key));
-        }
-        let mut cfg = KnockServerConfig::default();
-        if let Some(w) = g.knock_window {
-            cfg.window_secs = w as u16;
-        }
-        if let Some(s) = g.knock_clock_skew {
-            cfg.clock_skew_ms = s as u64 * 1000;
-        }
-        if let Some(n) = g.knock_max_pending {
-            cfg.max_pending = n;
-        }
-        let table = source.table();
-        eprintln!(
-            "sshd: knock: {} key(s) for {} user(s)",
-            table.len(),
-            source.users.len()
-        );
-        let mut out = Vec::new();
-        for spec in &g.knock_listen {
-            let addr = knock_listen_addr(spec, port);
-            let state = KnockState::new(cfg.clone(), table.clone(), host_keys.clone(), unix_ms());
-            let mut ks = KnockServer::bind(&addr, state)
-                .map_err(|e| format!("knock: bind udp {addr}: {e}"))?;
-            if let Some((lo, hi)) = g.knock_ports {
-                ks.set_port_range(lo, hi);
+
+        fn bind_servers(
+            g: &puressh::config::ServerOptions,
+            port: u16,
+            source: &KnockKeySource,
+            host_key_files: &[String],
+            debug: bool,
+        ) -> Result<Vec<puressh::knock::KnockServer>, String> {
+            use puressh::knock::{
+                KnockHostKey, KnockServer, KnockServerConfig, KnockState, unix_ms,
+            };
+            if g.knock_listen.is_empty() {
+                return Ok(Vec::new());
             }
-            if debug {
-                ks.set_logger(|ev| eprintln!("sshd: knock: {ev:?}"));
+            if g.knock_users.is_empty() {
+                return Err("KnockListen requires KnockUsers (the users allowed to knock)".into());
             }
-            eprintln!("sshd: knock listening on udp {addr}");
-            out.push(ks);
+            let mut host_keys: Vec<KnockHostKey> = Vec::new();
+            for path in host_key_files {
+                let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+                let key = PrivateKey::parse_openssh_pem(&pem, None)
+                    .and_then(|k| k.into_host_key_sync())
+                    .map_err(|e| format!("knock: host key {path}: {e}"))?;
+                host_keys.push(Arc::from(key));
+            }
+            let mut cfg = KnockServerConfig::default();
+            if let Some(w) = g.knock_window {
+                cfg.window_secs = w as u16;
+            }
+            if let Some(s) = g.knock_clock_skew {
+                cfg.clock_skew_ms = s as u64 * 1000;
+            }
+            if let Some(n) = g.knock_max_pending {
+                cfg.max_pending = n;
+            }
+            let table = source.table();
+            eprintln!(
+                "sshd: knock: {} key(s) for {} user(s)",
+                table.len(),
+                source.users.len()
+            );
+            let mut out = Vec::new();
+            for spec in &g.knock_listen {
+                let addr = knock_listen_addr(spec, port);
+                let state =
+                    KnockState::new(cfg.clone(), table.clone(), host_keys.clone(), unix_ms());
+                let mut ks = KnockServer::bind(&addr, state)
+                    .map_err(|e| format!("knock: bind udp {addr}: {e}"))?;
+                if let Some((lo, hi)) = g.knock_ports {
+                    ks.set_port_range(lo, hi);
+                }
+                if debug {
+                    ks.set_logger(|ev| eprintln!("sshd: knock: {ev:?}"));
+                }
+                eprintln!("sshd: knock listening on udp {addr}");
+                out.push(ks);
+            }
+            Ok(out)
         }
-        Ok(out)
+
+        /// Rebuild the key table when it is due.
+        fn refresh(&mut self) {
+            if self.servers.is_empty() || self.refreshed.elapsed() < Self::REFRESH {
+                return;
+            }
+            self.refreshed = std::time::Instant::now();
+            let table = self.source.table();
+            for ks in &mut self.servers {
+                ks.state_mut().set_key_table(table.clone());
+            }
+        }
+
+        fn next_wakeup(&self) -> Option<std::time::Instant> {
+            self.servers.iter().filter_map(|k| k.next_wakeup()).min()
+        }
+
+        fn poll_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+            self.servers.iter().flat_map(|k| k.poll_fds()).collect()
+        }
+
+        /// Rendezvous connections that presented their token, with the
+        /// knock's user.
+        fn process(&mut self) -> Vec<(std::net::TcpStream, std::net::SocketAddr, String)> {
+            let mut out = Vec::new();
+            for ks in &mut self.servers {
+                out.extend(ks.process().into_iter().map(|c| (c.stream, c.peer, c.user)));
+            }
+            out
+        }
+    }
+
+    #[cfg(not(feature = "knock"))]
+    impl KnockFrontend {
+        fn bind(
+            g: &puressh::config::ServerOptions,
+            _port: u16,
+            _source: KnockKeySource,
+            _host_key_files: &[String],
+            _debug: bool,
+        ) -> Result<Self, String> {
+            if !g.knock_listen.is_empty() {
+                return Err("KnockListen: this sshd was built without the `knock` feature".into());
+            }
+            Ok(Self {})
+        }
+
+        fn refresh(&mut self) {}
+
+        fn next_wakeup(&self) -> Option<std::time::Instant> {
+            None
+        }
+
+        fn poll_fds(&self) -> Vec<std::os::fd::BorrowedFd<'_>> {
+            Vec::new()
+        }
+
+        fn process(&mut self) -> Vec<(std::net::TcpStream, std::net::SocketAddr, String)> {
+            Vec::new()
+        }
     }
 
     /// Expand every `AuthorizedKeysFile` template for `user` and read the
@@ -5332,16 +5431,13 @@ mod imp {
         }
         let listener =
             std::net::TcpListener::bind(&addr).map_err(|e| format!("bind {addr}: {e}"))?;
-        let mut knock_servers = bind_knock_servers(
+        let mut knock = KnockFrontend::bind(
             &sshd_cfg.global,
             port,
-            &knock_source,
+            knock_source,
             &host_key_files,
             cli.debug,
         )?;
-        let mut knock_refreshed = std::time::Instant::now();
-        // How often the knock key table is rebuilt from authorized_keys.
-        const KNOCK_REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
 
         // PidFile: write our PID now that the listener is up.
         if let Some(path) = pid_file.as_deref()
@@ -5385,17 +5481,11 @@ mod imp {
             }
             children.poll_auth();
 
-            if !knock_servers.is_empty() && knock_refreshed.elapsed() >= KNOCK_REFRESH {
-                knock_refreshed = std::time::Instant::now();
-                let table = knock_source.table();
-                for ks in &mut knock_servers {
-                    ks.state_mut().set_key_table(table.clone());
-                }
-            }
+            knock.refresh();
 
             // Wait on the listener plus every knock socket / rendezvous
             // listener, waking early for the knock's own deadlines.
-            let tick = match knock_servers.iter().filter_map(|k| k.next_wakeup()).min() {
+            let tick = match knock.next_wakeup() {
                 Some(d) => {
                     let ms = d
                         .saturating_duration_since(std::time::Instant::now())
@@ -5407,13 +5497,12 @@ mod imp {
             };
             let listener_ready = {
                 let mut wait = vec![PollFd::new(listener.as_fd(), PollFlags::POLLIN)];
-                for ks in &knock_servers {
-                    wait.extend(
-                        ks.poll_fds()
-                            .into_iter()
-                            .map(|fd| PollFd::new(fd, PollFlags::POLLIN)),
-                    );
-                }
+                wait.extend(
+                    knock
+                        .poll_fds()
+                        .into_iter()
+                        .map(|fd| PollFd::new(fd, PollFlags::POLLIN)),
+                );
                 match poll(&mut wait, tick) {
                     Ok(_) => {}
                     Err(Errno::EINTR) => continue, // signal: flags checked above
@@ -5430,13 +5519,11 @@ mod imp {
             // connections (bound to the knock's user), then the listener.
             let mut incoming: Vec<(std::net::TcpStream, std::net::SocketAddr, Option<String>)> =
                 Vec::new();
-            for ks in &mut knock_servers {
-                for c in ks.process() {
-                    if cli.debug {
-                        eprintln!("sshd: knock: rendezvous from {} for {}", c.peer, c.user);
-                    }
-                    incoming.push((c.stream, c.peer, Some(c.user)));
+            for (stream, peer, user) in knock.process() {
+                if cli.debug {
+                    eprintln!("sshd: knock: rendezvous from {peer} for {user}");
                 }
+                incoming.push((stream, peer, Some(user)));
             }
             if listener_ready {
                 match listener.accept() {
@@ -5531,7 +5618,8 @@ mod imp {
                         drop(listener);
                         // Likewise the knock sockets, and every other connection
                         // of this batch (each is the parent's / a sibling's).
-                        drop(knock_servers);
+                        #[allow(clippy::drop_non_drop)] // empty without `knock`
+                        drop(knock);
                         drop(incoming);
                         if let Ok(mut g) = KNOCK_USER.lock() {
                             *g = knock_user;

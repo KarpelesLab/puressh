@@ -255,7 +255,9 @@ pub struct ServerOptions {
     /// (`docs/knock.md`): `addr`, `addr:port` or `[v6]:port`. A missing port
     /// means the SSH `Port`. Cumulative; empty ⇒ knock disabled.
     pub knock_listen: Vec<String>,
-    /// `KnockUsers` — login names allowed to knock (literal, cumulative).
+    /// `KnockUsers` — optional narrowing of who may knock (literal names,
+    /// cumulative). Empty ⇒ any user; logins are still subject to the usual
+    /// access checks.
     pub knock_users: Vec<String>,
     /// `KnockPorts` — `lo-hi` TCP port range for rendezvous listeners.
     /// `None` ⇒ kernel-chosen ephemeral ports.

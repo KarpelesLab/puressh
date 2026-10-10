@@ -32,6 +32,6 @@ pub use client::{
 };
 pub use server::{KnockEvent, KnockServer, KnockedConnection, unix_ms};
 pub use state::{
-    CompletedAccept, DropReason, KnockHostKey, KnockKeyTable, KnockServerConfig, KnockState,
-    PendingAccept, Verdict,
+    CompletedAccept, DropReason, KnockHostKey, KnockKeySource, KnockKeyTable, KnockServerConfig,
+    KnockState, PendingAccept, Verdict,
 };

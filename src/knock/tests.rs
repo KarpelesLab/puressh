@@ -376,20 +376,170 @@ fn rsa_and_ecdsa_user_keys_can_knock() {
 }
 
 #[test]
-fn key_table_swap_keeps_and_drops_state() {
+fn key_source_swap_keeps_and_drops_state() {
     let mut f = setup();
     let d = f.knock(NOW);
     expect_accept(f.state.handle(NOW, ip(1), &d));
     let mut table = KnockKeyTable::new();
     table.insert(USER, f.user_key.public_blob());
-    f.state.set_key_table(table);
+    f.state.set_key_source(table);
     // Same key kept its last nonce.
     expect_drop(f.state.handle(NOW, ip(1), &d), DropReason::Replay);
-    f.state.set_key_table(KnockKeyTable::new());
+    f.state.set_key_source(KnockKeyTable::new());
     expect_drop(
         f.state.handle(NOW, ip(1), &f.knock(NOW + 1)),
         DropReason::UnknownKey,
     );
+}
+
+/// A key source that records every lookup.
+struct CountingSource {
+    keys: Vec<(String, Vec<u8>)>,
+    calls: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl KnockKeySource for CountingSource {
+    fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>> {
+        self.calls.lock().unwrap().push(user.to_string());
+        self.keys
+            .iter()
+            .filter(|(u, _)| u == user)
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+}
+
+fn counting_setup() -> (Fixture, Arc<std::sync::Mutex<Vec<String>>>) {
+    let user_key: Box<dyn HostKey + Send + Sync> = Box::new(ed25519());
+    let host: KnockHostKey = Arc::new(ed25519());
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let source = CountingSource {
+        keys: vec![(USER.to_string(), user_key.public_blob())],
+        calls: calls.clone(),
+    };
+    let host_blob = host.public_blob();
+    let f = Fixture {
+        state: KnockState::new(
+            KnockServerConfig::default(),
+            source,
+            vec![host],
+            NOW - 60_000,
+        ),
+        user_key,
+        host_blob,
+    };
+    (f, calls)
+}
+
+#[test]
+fn keys_are_loaded_lazily_and_cached() {
+    let (mut f, calls) = counting_setup();
+    // Building the state reads nothing.
+    assert!(calls.lock().unwrap().is_empty());
+    // Garbage and out-of-window knocks read nothing either.
+    expect_drop(f.state.handle(NOW, ip(1), b"junk"), DropReason::Malformed);
+    expect_drop(
+        f.state.handle(NOW, ip(1), &f.knock(NOW - 31_000)),
+        DropReason::Clock,
+    );
+    assert!(calls.lock().unwrap().is_empty());
+
+    // First valid knock loads the user once; later knocks reuse the cache.
+    for t in [NOW, NOW + 10] {
+        let p = expect_accept(f.state.handle(t, ip(1), &f.knock(t)));
+        f.state.release_pending(&p.user, &p.key_fp);
+    }
+    assert_eq!(*calls.lock().unwrap(), vec![USER.to_string()]);
+
+    // After the TTL the next knock reloads.
+    let later = NOW + 61_000;
+    let p = expect_accept(f.state.handle(later, ip(2), &f.knock(later)));
+    f.state.release_pending(&p.user, &p.key_fp);
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    // State survived the reload: the old nonce is still refused.
+    expect_drop(
+        f.state.handle(later, ip(2), &f.knock(later - 1)),
+        DropReason::Replay,
+    );
+
+    // invalidate_keys forces a reload on the next knock.
+    f.state.invalidate_keys(Some(USER));
+    let p = expect_accept(f.state.handle(later + 1, ip(2), &f.knock(later + 1)));
+    f.state.release_pending(&p.user, &p.key_fp);
+    assert_eq!(calls.lock().unwrap().len(), 3);
+}
+
+#[test]
+fn unknown_users_are_negatively_cached() {
+    let (mut f, calls) = counting_setup();
+    let fp = wire::key_fp(&f.host_blob);
+    for i in 0..5 {
+        let (d, _) = make_knock(f.user_key.as_ref(), "mallory", NOW + i, Some(fp), 0);
+        expect_drop(f.state.handle(NOW, ip(1), &d), DropReason::UnknownKey);
+    }
+    assert_eq!(*calls.lock().unwrap(), vec!["mallory".to_string()]);
+}
+
+#[test]
+fn key_cache_is_bounded() {
+    let (mut f, calls) = counting_setup();
+    let cfg = KnockServerConfig {
+        key_cache_users: 2,
+        ..Default::default()
+    };
+    let source = CountingSource {
+        keys: Vec::new(),
+        calls: calls.clone(),
+    };
+    f.state = KnockState::new(cfg, source, Vec::new(), NOW - 60_000);
+    let fp = wire::key_fp(&f.host_blob);
+    for (i, user) in ["u1", "u2", "u3", "u1"].into_iter().enumerate() {
+        let t = NOW + i as u64;
+        let (d, _) = make_knock(f.user_key.as_ref(), user, t, Some(fp), 0);
+        f.state.handle(t, ip(1), &d);
+    }
+    // u1 was evicted by u3, so it is asked for again.
+    assert_eq!(calls.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn key_lookups_are_rate_limited_and_real_users_survive_eviction() {
+    let (mut f, calls) = counting_setup();
+    let cfg = KnockServerConfig {
+        key_cache_users: 3,
+        key_lookups_per_sec: 4,
+        ..Default::default()
+    };
+    let source = CountingSource {
+        keys: vec![(USER.to_string(), f.user_key.public_blob())],
+        calls: calls.clone(),
+    };
+    let host: KnockHostKey = Arc::new(ed25519());
+    f.host_blob = host.public_blob();
+    f.state = KnockState::new(cfg, source, vec![host], NOW - 60_000);
+    let fp = wire::key_fp(&f.host_blob);
+
+    // The real user gets cached first.
+    let p = expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+    f.state.release_pending(&p.user, &p.key_fp);
+    // A flood of made-up names: 3 more lookups fit the burst, then drops.
+    for i in 0..10u64 {
+        let user = format!("fake{i}");
+        let (d, _) = make_knock(f.user_key.as_ref(), &user, NOW + i, Some(fp), 0);
+        let v = f.state.handle(NOW + 1, ip(9), &d);
+        let want = if i < 3 {
+            DropReason::UnknownKey
+        } else {
+            DropReason::RateLimited
+        };
+        expect_drop(v, want);
+    }
+    assert_eq!(calls.lock().unwrap().len(), 4);
+    // The cache (3 users) evicted fake entries, not the real user: its next
+    // knock needs no lookup even though the lookup bucket is empty.
+    let p = expect_accept(f.state.handle(NOW + 2, ip(1), &f.knock(NOW + 2)));
+    f.state.release_pending(&p.user, &p.key_fp);
+    assert_eq!(calls.lock().unwrap().len(), 4);
 }
 
 /// Full loopback: UDP knock → ACCEPT → rendezvous connect → token check.

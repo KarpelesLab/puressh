@@ -46,6 +46,18 @@ pub struct KnockServerConfig {
     pub max_prefixes_per_key: usize,
     /// Accepted sig1 values cached per (user, key).
     pub sig1_cache_size: usize,
+    /// How long a user's keys from the [`KnockKeySource`] are reused before
+    /// the next knock for that user asks again, in ms. Covers users with no
+    /// keys too.
+    pub key_cache_ttl_ms: u64,
+    /// Users whose keys are cached at once. When full, users without keys
+    /// are evicted first (oldest first), then the oldest user with keys.
+    pub key_cache_users: usize,
+    /// Key-source lookups per second, globally (also the burst). A knock
+    /// that needs a lookup beyond it is dropped, or served from an expired
+    /// cache entry if there is one. Bounds the disk / passwd work a flood of
+    /// made-up user names can cause.
+    pub key_lookups_per_sec: u32,
 }
 
 impl Default for KnockServerConfig {
@@ -62,11 +74,29 @@ impl Default for KnockServerConfig {
             verify_per_sec: 1000,
             max_prefixes_per_key: 64,
             sig1_cache_size: 4,
+            key_cache_ttl_ms: 60_000,
+            key_cache_users: 4096,
+            key_lookups_per_sec: 50,
         }
     }
 }
 
+/// Where [`KnockState`] gets the public keys a user may knock with.
+///
+/// Queried lazily: only when a well-formed, in-time KNOCK names `user`, and
+/// at most once per user per [`KnockServerConfig::key_cache_ttl_ms`]
+/// (an empty answer is cached the same way). An implementation reading
+/// `authorized_keys` files should refuse users it does not serve without
+/// touching the disk, since the user name comes from an unauthenticated
+/// datagram.
+pub trait KnockKeySource: Send {
+    /// SSH wire blobs of the plain public keys `user` may knock with.
+    /// Unsupported key types and certificates are ignored.
+    fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>>;
+}
+
 /// The users and public keys allowed to knock: `user → {key_fp → key blob}`.
+/// A static [`KnockKeySource`].
 #[derive(Debug, Clone, Default)]
 pub struct KnockKeyTable {
     users: HashMap<String, HashMap<[u8; 32], Vec<u8>>>,
@@ -104,10 +134,21 @@ impl KnockKeyTable {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+}
 
-    fn get(&self, user: &str, fp: &[u8; 32]) -> Option<&Vec<u8>> {
-        self.users.get(user)?.get(fp)
+impl KnockKeySource for KnockKeyTable {
+    fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>> {
+        self.users
+            .get(user)
+            .map(|k| k.values().cloned().collect())
+            .unwrap_or_default()
     }
+}
+
+/// One user's keys as last returned by the [`KnockKeySource`].
+struct CachedKeys {
+    loaded_ms: u64,
+    keys: HashMap<[u8; 32], Vec<u8>>,
 }
 
 /// Token bucket with integer millisecond refill.
@@ -249,14 +290,16 @@ impl core::fmt::Debug for CompletedAccept {
 /// A host key usable to sign ACCEPTs.
 pub type KnockHostKey = Arc<dyn HostKey + Send + Sync>;
 
-/// Server knock state: key table, per-key replay / rate-limit state, host
-/// keys.
+/// Server knock state: key source and cache, per-key replay / rate-limit
+/// state, host keys.
 pub struct KnockState {
     cfg: KnockServerConfig,
-    table: KnockKeyTable,
+    source: Box<dyn KnockKeySource>,
+    key_cache: HashMap<String, CachedKeys>,
     entries: HashMap<(String, [u8; 32]), Entry>,
     host_keys: Vec<(KnockHostKey, Vec<u8>, [u8; 32])>,
     verify: Bucket,
+    lookups: Bucket,
     nonce_floor: u64,
 }
 
@@ -274,7 +317,7 @@ impl KnockState {
     /// knock captured before a restart cannot be replayed after it.
     pub fn new(
         cfg: KnockServerConfig,
-        table: KnockKeyTable,
+        source: impl KnockKeySource + 'static,
         host_keys: Vec<KnockHostKey>,
         now_ms: u64,
     ) -> Self {
@@ -293,12 +336,19 @@ impl KnockState {
             (1000 / cfg.verify_per_sec.max(1) as u64).max(1),
             now_ms,
         );
+        let lookups = Bucket::new(
+            cfg.key_lookups_per_sec.max(1),
+            (1000 / cfg.key_lookups_per_sec.max(1) as u64).max(1),
+            now_ms,
+        );
         Self {
             cfg,
-            table,
+            source: Box::new(source),
+            key_cache: HashMap::new(),
             entries: HashMap::new(),
             host_keys: hk,
             verify,
+            lookups,
             nonce_floor: now_ms,
         }
     }
@@ -308,12 +358,69 @@ impl KnockState {
         &self.cfg
     }
 
-    /// Replace the key table (e.g. after `authorized_keys` changed). State
-    /// of keys that remain is kept; state of removed keys is dropped.
-    pub fn set_key_table(&mut self, table: KnockKeyTable) {
+    /// Replace the key source. Cached keys are forgotten, so the next knock
+    /// for each user asks the new source; replay and rate-limit state of
+    /// keys the new source still returns is kept.
+    pub fn set_key_source(&mut self, source: impl KnockKeySource + 'static) {
+        self.source = Box::new(source);
+        self.key_cache.clear();
+    }
+
+    /// Forget the cached keys of `user` (all users if `None`), so the next
+    /// knock asks the source again.
+    pub fn invalidate_keys(&mut self, user: Option<&str>) {
+        match user {
+            Some(u) => {
+                self.key_cache.remove(u);
+            }
+            None => self.key_cache.clear(),
+        }
+    }
+
+    /// Make sure `user`'s keys are cached and fresh, asking the source if
+    /// not. Drops per-key state of keys the source no longer returns.
+    /// Returns `false` when a lookup was needed but the lookup rate limit
+    /// refused it and no expired entry is left to fall back on.
+    fn load_user_keys(&mut self, user: &str, now_ms: u64) -> bool {
+        let ttl = self.cfg.key_cache_ttl_ms;
+        let cached = self.key_cache.get(user);
+        if let Some(c) = cached
+            && now_ms >= c.loaded_ms
+            && now_ms - c.loaded_ms < ttl
+        {
+            return true;
+        }
+        if !self.lookups.take(now_ms) {
+            return cached.is_some();
+        }
+        if cached.is_none() && self.key_cache.len() >= self.cfg.key_cache_users.max(1) {
+            // Made-up names cost an entry each; evict those before real users.
+            let victim = self
+                .key_cache
+                .iter()
+                .min_by_key(|(_, c)| (!c.keys.is_empty(), c.loaded_ms))
+                .map(|(u, _)| u.clone());
+            if let Some(v) = victim {
+                self.key_cache.remove(&v);
+            }
+        }
+        let keys: HashMap<[u8; 32], Vec<u8>> = self
+            .source
+            .keys_for(user)
+            .into_iter()
+            .filter(|b| wire::max_sig_blob_len(b).is_some())
+            .map(|b| (wire::key_fp(&b), b))
+            .collect();
         self.entries
-            .retain(|(user, fp), _| table.get(user, fp).is_some());
-        self.table = table;
+            .retain(|(u, fp), _| u != user || keys.contains_key(fp));
+        self.key_cache.insert(
+            user.to_string(),
+            CachedKeys {
+                loaded_ms: now_ms,
+                keys,
+            },
+        );
+        true
     }
 
     /// A rendezvous listener of (user, key) closed, by use or expiry — or a
@@ -330,14 +437,21 @@ impl KnockState {
         let Ok(k) = Knock::parse(datagram) else {
             return Verdict::Drop(DropReason::Malformed);
         };
-        // 2. key table
-        let Some(key_blob) = self.table.get(k.user, &k.key_fp) else {
-            return Verdict::Drop(DropReason::UnknownKey);
-        };
-        // 3. clock window
+        // 2. clock window (before the key lookup, which may touch the disk)
         if k.nonce.abs_diff(now_ms) > self.cfg.clock_skew_ms {
             return Verdict::Drop(DropReason::Clock);
         }
+        // 3. user's keys, loaded lazily and cached
+        if !self.load_user_keys(k.user, now_ms) {
+            return Verdict::Drop(DropReason::RateLimited);
+        }
+        let Some(key_blob) = self
+            .key_cache
+            .get(k.user)
+            .and_then(|c| c.keys.get(&k.key_fp))
+        else {
+            return Verdict::Drop(DropReason::UnknownKey);
+        };
         let cfg = &self.cfg;
         let entry = self
             .entries
@@ -520,7 +634,7 @@ impl KnockState {
 impl core::fmt::Debug for KnockState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("KnockState")
-            .field("keys", &self.table.len())
+            .field("cached_users", &self.key_cache.len())
             .field("host_keys", &self.host_keys.len())
             .finish_non_exhaustive()
     }

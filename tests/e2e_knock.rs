@@ -1,5 +1,5 @@
 //! End-to-end knock test with the real binaries: our `sshd` with
-//! `KnockListen` / `KnockUsers`, and our `ssh` connecting to a port that has
+//! `KnockListen`, and our `ssh` connecting to a port that has
 //! no TCP listener, so the connection only works through the UDP knock
 //! (`docs/knock.md`).
 //!
@@ -96,7 +96,7 @@ fn ssh_reaches_sshd_only_through_knock() {
     let knock_port = pick_free_port();
     std::fs::write(
         dir.join("sshd_config"),
-        format!("KnockListen 127.0.0.1:{knock_port}\nKnockUsers {user}\n"),
+        format!("KnockListen 127.0.0.1:{knock_port}\n"),
     )
     .unwrap();
 
@@ -158,7 +158,7 @@ fn ssh_reaches_sshd_only_through_knock() {
         show(&o)
     );
 
-    // A user outside KnockUsers is not answered either.
+    // Nor is a valid key knocking for a user it is not authorized for.
     let o = env.ssh("client", "root", "yes", &[], "echo nope");
     assert!(!o.status.success(), "{}", show(&o));
 

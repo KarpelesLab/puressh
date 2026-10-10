@@ -1247,35 +1247,46 @@ mod imp {
         Ok(out)
     }
 
-    /// Where the knock key table comes from (`KnockUsers` × authorized keys),
-    /// kept so the table can be rebuilt when `authorized_keys` files change.
+    /// Knock keys (a user's authorized keys), read on demand: the knock state
+    /// asks for a user's keys only when a well-formed knock names that user,
+    /// and caches the answer for 60 s. Any user may knock unless `KnockUsers`
+    /// narrows it; users outside it are refused without touching the disk.
+    /// Who may actually log in is still decided by the usual access checks
+    /// and authentication on the rendezvous connection.
+    #[derive(Clone)]
     #[cfg_attr(not(feature = "knock"), allow(dead_code))]
-    struct KnockKeySource {
-        users: Vec<String>,
-        global: Option<Arc<AuthorizedKeys>>,
+    struct KnockKeys {
+        /// `KnockUsers`, or `None` for any user.
+        users: Option<Vec<String>>,
+        /// `-A` mode: the one user the global file authorizes, and its keys.
+        global: Option<(String, Arc<AuthorizedKeys>)>,
         files: Vec<String>,
         strict_modes: bool,
         debug: bool,
     }
 
+    /// Plain keys only: certificate authorities are not knock material, a
+    /// knock names a concrete key.
     #[cfg(feature = "knock")]
-    impl KnockKeySource {
-        /// Plain keys of every knock user. Certificate authorities are not
-        /// knock material: a knock names a concrete key.
-        fn table(&self) -> puressh::knock::KnockKeyTable {
-            let mut t = puressh::knock::KnockKeyTable::new();
-            for user in &self.users {
-                let keys = match &self.global {
-                    Some(g) => (**g).clone(),
-                    None => {
-                        load_user_authorized_keys(user, &self.files, self.strict_modes, self.debug)
-                    }
-                };
-                for blob in keys.blobs {
-                    t.insert(user, blob);
-                }
+    impl puressh::knock::KnockKeySource for KnockKeys {
+        fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>> {
+            if let Some(users) = &self.users
+                && !users.iter().any(|u| u == user)
+            {
+                return Vec::new();
             }
-            t
+            let keys = match &self.global {
+                Some((only, g)) if only == user => g.blobs.clone(),
+                Some(_) => Vec::new(),
+                None => {
+                    load_user_authorized_keys(user, &self.files, self.strict_modes, self.debug)
+                        .blobs
+                }
+            };
+            if self.debug {
+                eprintln!("sshd: knock: loaded {} key(s) for {user}", keys.len());
+            }
+            keys
         }
     }
 
@@ -1303,38 +1314,27 @@ mod imp {
     struct KnockFrontend {
         #[cfg(feature = "knock")]
         servers: Vec<puressh::knock::KnockServer>,
-        #[cfg(feature = "knock")]
-        source: KnockKeySource,
-        #[cfg(feature = "knock")]
-        refreshed: std::time::Instant,
     }
 
     #[cfg(feature = "knock")]
     impl KnockFrontend {
-        /// How often the key table is rebuilt from authorized_keys.
-        const REFRESH: std::time::Duration = std::time::Duration::from_secs(60);
-
         /// Bind one knock server per `KnockListen` address, signing ACCEPTs
         /// with the daemon's plain host keys.
         fn bind(
             g: &puressh::config::ServerOptions,
             port: u16,
-            source: KnockKeySource,
+            keys: KnockKeys,
             host_key_files: &[String],
             debug: bool,
         ) -> Result<Self, String> {
-            let servers = Self::bind_servers(g, port, &source, host_key_files, debug)?;
-            Ok(Self {
-                servers,
-                source,
-                refreshed: std::time::Instant::now(),
-            })
+            let servers = Self::bind_servers(g, port, &keys, host_key_files, debug)?;
+            Ok(Self { servers })
         }
 
         fn bind_servers(
             g: &puressh::config::ServerOptions,
             port: u16,
-            source: &KnockKeySource,
+            keys: &KnockKeys,
             host_key_files: &[String],
             debug: bool,
         ) -> Result<Vec<puressh::knock::KnockServer>, String> {
@@ -1343,9 +1343,6 @@ mod imp {
             };
             if g.knock_listen.is_empty() {
                 return Ok(Vec::new());
-            }
-            if g.knock_users.is_empty() {
-                return Err("KnockListen requires KnockUsers (the users allowed to knock)".into());
             }
             let mut host_keys: Vec<KnockHostKey> = Vec::new();
             for path in host_key_files {
@@ -1365,17 +1362,15 @@ mod imp {
             if let Some(n) = g.knock_max_pending {
                 cfg.max_pending = n;
             }
-            let table = source.table();
-            eprintln!(
-                "sshd: knock: {} key(s) for {} user(s)",
-                table.len(),
-                source.users.len()
-            );
+            match &keys.users {
+                Some(u) => eprintln!("sshd: knock: users {u:?} may knock; keys read on demand"),
+                None => eprintln!("sshd: knock: any user may knock; keys read on demand"),
+            }
             let mut out = Vec::new();
             for spec in &g.knock_listen {
                 let addr = knock_listen_addr(spec, port);
                 let state =
-                    KnockState::new(cfg.clone(), table.clone(), host_keys.clone(), unix_ms());
+                    KnockState::new(cfg.clone(), keys.clone(), host_keys.clone(), unix_ms());
                 let mut ks = KnockServer::bind(&addr, state)
                     .map_err(|e| format!("knock: bind udp {addr}: {e}"))?;
                 if let Some((lo, hi)) = g.knock_ports {
@@ -1388,18 +1383,6 @@ mod imp {
                 out.push(ks);
             }
             Ok(out)
-        }
-
-        /// Rebuild the key table when it is due.
-        fn refresh(&mut self) {
-            if self.servers.is_empty() || self.refreshed.elapsed() < Self::REFRESH {
-                return;
-            }
-            self.refreshed = std::time::Instant::now();
-            let table = self.source.table();
-            for ks in &mut self.servers {
-                ks.state_mut().set_key_table(table.clone());
-            }
         }
 
         fn next_wakeup(&self) -> Option<std::time::Instant> {
@@ -1426,7 +1409,7 @@ mod imp {
         fn bind(
             g: &puressh::config::ServerOptions,
             _port: u16,
-            _source: KnockKeySource,
+            _keys: KnockKeys,
             _host_key_files: &[String],
             _debug: bool,
         ) -> Result<Self, String> {
@@ -1435,8 +1418,6 @@ mod imp {
             }
             Ok(Self {})
         }
-
-        fn refresh(&mut self) {}
 
         fn next_wakeup(&self) -> Option<std::time::Instant> {
             None
@@ -4998,6 +4979,8 @@ mod imp {
         //    root-owned StrictModes rule. Because the file cannot say *which*
         //    user a key belongs to, it is refused unless exactly one literal
         //    user is allowed anywhere in the configuration.
+        // The single user a `-A` file authorizes, for the knock key source.
+        let mut global_keys_user: Option<String> = None;
         let global_authorized_keys: Option<Arc<AuthorizedKeys>> = match &cli.authorized_keys_file {
             Some(path) => {
                 let mut all_allowed: Vec<String> = allowed_user_list.clone();
@@ -5026,6 +5009,7 @@ mod imp {
                     set.blobs.len(),
                     set.cas.len()
                 );
+                global_keys_user = Some(single);
                 Some(Arc::new(set))
             }
             None => None,
@@ -5035,9 +5019,10 @@ mod imp {
             .authorized_keys_file
             .clone()
             .unwrap_or_else(default_authorized_keys_files);
-        let knock_source = KnockKeySource {
-            users: sshd_cfg.global.knock_users.clone(),
-            global: global_authorized_keys.clone(),
+        let knock_keys = KnockKeys {
+            users: (!sshd_cfg.global.knock_users.is_empty())
+                .then(|| sshd_cfg.global.knock_users.clone()),
+            global: global_keys_user.clone().zip(global_authorized_keys.clone()),
             files: authorized_keys_files.clone(),
             strict_modes,
             debug: cli.debug,
@@ -5434,7 +5419,7 @@ mod imp {
         let mut knock = KnockFrontend::bind(
             &sshd_cfg.global,
             port,
-            knock_source,
+            knock_keys,
             &host_key_files,
             cli.debug,
         )?;
@@ -5480,8 +5465,6 @@ mod imp {
                 children.reap(cli.debug);
             }
             children.poll_auth();
-
-            knock.refresh();
 
             // Wait on the listener plus every knock socket / rendezvous
             // listener, waking early for the knock's own deadlines.

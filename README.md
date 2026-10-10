@@ -163,8 +163,7 @@ All of them understand `ssh_config` (including `Match` blocks and `Include`),
 `known_hosts`, and bracketed-IPv6 host syntax (`[2001:db8::1]:22`).
 
 `ssh` and `sshd` also speak the puressh-only **knock** rendezvous
-([`docs/knock.md`](docs/knock.md)). With `KnockListen` / `KnockUsers` set,
-`sshd` keeps no TCP port visibly open: an authorized key sends one signed UDP
+([`docs/knock.md`](docs/knock.md)). With `KnockListen` set, `sshd` keeps no TCP port visibly open: an authorized key sends one signed UDP
 datagram, and the server opens a one-shot TCP listener for that client only.
 The SSH session that follows is ordinary, including full user
 authentication. `ssh` knocks automatically when the TCP connect is refused or

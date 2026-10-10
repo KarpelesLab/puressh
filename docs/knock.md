@@ -163,9 +163,15 @@ host key).
 
 ### 5.1 State
 
-The *key table* maps `user → { key_fp → entry }`. It is built from the
-authorized keys of users enabled for knock, reloaded when those files change.
-Unknown users and keys never allocate state.
+The *key table* maps `user → { key_fp → entry }`. It is filled **lazily**: a
+user's authorized keys are read only when a well-formed, in-time KNOCK names
+that user, then cached for 60 s (an empty answer too, so a user without keys
+costs one lookup per minute at most). Nothing is read at startup. Lookups
+are rate limited globally (default 50/s), so a flood of made-up user names
+cannot turn into unbounded disk or passwd work. The cache holds a bounded
+number of users, and when it is full, users without keys are evicted before
+real ones. Users excluded by configuration are refused without reading
+anything, and unknown users and keys never allocate state.
 
 Per entry (user, key):
 
@@ -188,8 +194,9 @@ Every *drop* is silent. Every step is cheaper than the next one.
 
 1. Datagram length is between the minimum and 1232 bytes, version and type
    match, and the strict parse succeeds. Otherwise drop.
-2. Look up `user`, then `key_fp`, in the key table. If either is missing, drop.
-3. If `|nonce − now| > ClockSkew`, drop.
+2. If `|nonce − now| > ClockSkew`, drop.
+3. Look up `user` (loading its keys if not cached), then `key_fp`. If either
+   is missing, drop.
 4. **sig1:** if it is byte-equal to an entry in `sig1_cache`, continue.
    Otherwise take one token from `newsig1_bucket` and one from
    `verify_bucket` (drop if either is empty), verify sig1, add it to the
@@ -389,15 +396,23 @@ Global-only `sshd_config` keywords (refused inside `Match`):
 | Keyword | Meaning |
 |---------|---------|
 | `KnockListen addr[:port]` | UDP address to listen on (repeatable). Port defaults to `Port`. Enables knock. |
-| `KnockUsers user…` | Users allowed to knock (repeatable). Required with `KnockListen`. |
+| `KnockUsers user…` | Optional: only these users may knock (repeatable). Default: any user. |
 | `KnockPorts lo-hi` | Rendezvous TCP port range (default: kernel ephemeral). |
 | `KnockWindow secs` | Rendezvous listener lifetime (default 60). |
 | `KnockClockSkew secs` | Accepted client clock offset (default 30). |
 | `KnockMaxPending n` | Open listeners per (user, key) (default 2). |
 
-The key table is each knock user's plain keys from `AuthorizedKeysFile` (or
-the global `-A` file). It is read as root at startup and every 60 s
-afterwards. A knocked connection may only authenticate as the knock's user
+With TCP hidden, the knock is the only way in, so by default any user may
+knock. Who may log in is still decided by `AllowUsers` / `DenyUsers` /
+`PermitRootLogin` and authentication on the rendezvous connection;
+`KnockUsers` only narrows who may open one. A user's plain keys come from
+`AuthorizedKeysFile` (or, in `-A` mode, the global file for its single user).
+They are read on demand, as in §5.1: nothing at startup, a user's files only
+when a valid-looking knock for that user arrives, cached 60 s, and never for
+users outside `KnockUsers` when it is set. The read happens in the daemon
+parent (as root), so a slow passwd lookup (NSS/LDAP) can delay the accept
+loop. That happens at most once per user per minute, and within the global
+lookup rate. A knocked connection may only authenticate as the knock's user
 (`KnockBindUser` is always on). It goes through the same `MaxStartups` /
 per-source limits and the same forked-child path as any other connection.
 

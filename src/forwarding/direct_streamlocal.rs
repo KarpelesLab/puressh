@@ -288,6 +288,7 @@ mod tests {
             match egress_rx.recv_timeout(Duration::from_millis(500)) {
                 Ok(ChannelEgress::Data(d)) => got.extend_from_slice(&d),
                 Ok(ChannelEgress::Eof) | Ok(ChannelEgress::Close) => break,
+                Ok(_) => continue,
                 Err(_) => break,
             }
         }

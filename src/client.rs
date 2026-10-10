@@ -3427,6 +3427,22 @@ pub(crate) fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Persist an accepted host key. Like OpenSSH, failing to write the file
+/// only warns: the key was accepted for this connection either way, and a
+/// `UserKnownHostsFile` of `/dev/null` (the usual "don't remember" idiom) is
+/// not written at all.
+fn save_known_hosts(store: &KnownHosts, path: &std::path::Path) {
+    if path == std::path::Path::new("/dev/null") {
+        return;
+    }
+    if let Err(e) = store.save(path) {
+        eprintln!(
+            "Warning: failed to add the host to the list of known hosts ({}): {e}",
+            path.display()
+        );
+    }
+}
+
 /// `K_S` (the host key blob) of an `SSH_MSG_KEX_ECDH_REPLY` payload.
 fn reply_host_key(reply_payload: &[u8]) -> Result<&[u8]> {
     let mut r = crate::format::Reader::new(reply_payload);
@@ -3685,7 +3701,7 @@ pub(crate) fn build_verifier(
                         let _ = store.remove_exact(target_host, target_port);
                         store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
                         if let Some(path) = &kh.save_path {
-                            store.save(path).map_err(Error::from)?;
+                            save_known_hosts(&store, path);
                         }
                     }
                 }
@@ -3725,7 +3741,7 @@ pub(crate) fn build_verifier(
                     }
                     store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
                     if let Some(path) = &kh.save_path {
-                        store.save(path).map_err(Error::from)?;
+                        save_known_hosts(&store, path);
                     }
                 }
             }
@@ -3883,6 +3899,9 @@ fn serve_drain_runtimes(
                 Ok(ChannelEgress::Data(bytes)) => {
                     emit_serve_data(client, ch, &bytes, rt)?;
                 }
+                // Session-only egress (stderr, exit status) has no meaning
+                // on the forwarded channels a client serves.
+                Ok(ChannelEgress::Stderr(_) | ChannelEgress::ExitStatus(_)) => {}
                 Ok(ChannelEgress::Eof) => {
                     rt.pending_eof = true;
                     break;

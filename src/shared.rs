@@ -417,6 +417,59 @@ impl SharedClient {
         })
     }
 
+    /// Open a session channel running `what`, with a pseudo-terminal when
+    /// `pty` is given (`pty-req` is sent first), and return an owned stream
+    /// over its stdin/stdout. Covers every `ssh` session shape: an
+    /// interactive shell, `ssh host command` (with `-t`, on a terminal),
+    /// and `ssh -s host subsystem`. Stderr arrives through
+    /// [`Self::channel_recv_stderr`]; the exit status through
+    /// [`OwnedChannelStream::exit_status`] once stdout reaches EOF.
+    pub fn session_stream(
+        &self,
+        what: SessionRequest<'_>,
+        pty: Option<PtyRequest>,
+    ) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = lock_or_poison(&self.inner)?;
+            let id = open_session_under_lock(&mut g, "session")?;
+            if let Some(p) = pty {
+                send_request_and_await(
+                    &mut g,
+                    id,
+                    ChannelRequest::PtyReq {
+                        term: p.term,
+                        cols: p.cols,
+                        rows: p.rows,
+                        px_w: p.px_w,
+                        px_h: p.px_h,
+                        modes: p.modes,
+                    },
+                    "session: pty-req",
+                )?;
+            }
+            let (req, what_msg) = match what {
+                SessionRequest::Shell => (ChannelRequest::Shell, "session: shell"),
+                SessionRequest::Exec(command) => (
+                    ChannelRequest::Exec {
+                        command: command.into(),
+                    },
+                    "session: exec",
+                ),
+                SessionRequest::Subsystem(name) => (
+                    ChannelRequest::Subsystem { name: name.into() },
+                    "session: subsystem",
+                ),
+            };
+            send_request_and_await(&mut g, id, req, what_msg)?;
+            id
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+        })
+    }
+
     /// Send a `window-change` request (RFC 4254 §6.7) on a previously
     /// opened session channel. `want_reply` is always false per the
     /// RFC, so this call returns as soon as the packet is on the wire.
@@ -939,6 +992,52 @@ fn replenish_under_lock(g: &mut Inner, channel: u32, n: u32) -> std::io::Result<
         g.client.write_payload(&adj).map_err(io_err)?;
     }
     Ok(())
+}
+
+/// What a session channel runs (see [`SharedClient::session_stream`]).
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum SessionRequest<'a> {
+    /// The user's login shell.
+    Shell,
+    /// A command, run by the server (through the user's shell).
+    Exec(&'a str),
+    /// A named subsystem, e.g. `sftp`.
+    Subsystem(&'a str),
+}
+
+/// Pseudo-terminal parameters for [`SharedClient::session_stream`]
+/// (RFC 4254 §6.2).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct PtyRequest {
+    /// `TERM` value, e.g. `xterm-256color`.
+    pub term: String,
+    /// Width in characters.
+    pub cols: u32,
+    /// Height in rows.
+    pub rows: u32,
+    /// Width in pixels (0 if unknown).
+    pub px_w: u32,
+    /// Height in pixels (0 if unknown).
+    pub px_h: u32,
+    /// Encoded terminal modes (RFC 4254 §8); see
+    /// [`crate::client::encode_termios_modes`]. Empty ⇒ server defaults.
+    pub modes: Vec<u8>,
+}
+
+impl PtyRequest {
+    /// Build a request; pixel sizes default to 0 and modes to empty.
+    pub fn new(term: impl Into<String>, cols: u32, rows: u32) -> Self {
+        Self {
+            term: term.into(),
+            cols,
+            rows,
+            px_w: 0,
+            px_h: 0,
+            modes: Vec::new(),
+        }
+    }
 }
 
 /// Read+Write adapter wrapping a single open channel on a

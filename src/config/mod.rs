@@ -44,6 +44,9 @@ pub(crate) mod match_block;
 pub(crate) mod parser;
 pub mod server;
 
+pub use algos::{
+    AlgoCategory, default_list as default_algorithms, known_names as supported_algorithms,
+};
 pub use client::{
     AddressFamily, ClientOptions, ControlMaster, ControlPersist, DynamicForwardSpec, GatewayPorts,
     IdentityAgent, KnockSetting, LocalForwardSpec, ObscureKeystrokeTiming, RemoteForwardSpec,

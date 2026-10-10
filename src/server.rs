@@ -333,6 +333,10 @@ struct SubsystemRuntime {
     eof_sent: bool,
     /// Whether we've already sent `CHANNEL_CLOSE` on the wire.
     close_sent: bool,
+    /// Stderr bytes (`CHANNEL_EXTENDED_DATA`) waiting for window space.
+    pending_stderr: Vec<u8>,
+    /// Exit status from the handler, sent once all output has shipped.
+    pending_exit: Option<u32>,
 }
 
 /// Per-connection context handed to the [`Config::on_session_open`] hook.
@@ -2943,16 +2947,29 @@ fn drain_subsystems(
                 continue;
             }
         }
+        if !rt.pending_stderr.is_empty() {
+            let leftover = core::mem::take(&mut rt.pending_stderr);
+            emit_subsystem_stderr(stream, driver, conn, ch, &leftover, rt)?;
+            if !rt.pending_stderr.is_empty() {
+                continue;
+            }
+        }
 
         // 2) Pull as many egress messages as we can without blocking. Stop
         // as soon as a write window-blocks (pending_data populated again).
         loop {
-            if !rt.pending_data.is_empty() {
+            if !rt.pending_data.is_empty() || !rt.pending_stderr.is_empty() {
                 break;
             }
             match rt.egress_rx.try_recv() {
                 Ok(ChannelEgress::Data(bytes)) => {
                     emit_subsystem_data(stream, driver, conn, ch, &bytes, rt)?;
+                }
+                Ok(ChannelEgress::Stderr(bytes)) => {
+                    emit_subsystem_stderr(stream, driver, conn, ch, &bytes, rt)?;
+                }
+                Ok(ChannelEgress::ExitStatus(code)) => {
+                    rt.pending_exit = Some(code);
                 }
                 Ok(ChannelEgress::Eof) => {
                     rt.pending_eof = true;
@@ -2972,8 +2989,12 @@ fn drain_subsystems(
             }
         }
 
-        // 3) Emit EOF / Close if we have them pending and all data shipped.
-        if rt.pending_data.is_empty() {
+        // 3) Emit EOF / exit-status / Close once all output has shipped.
+        if rt.pending_data.is_empty() && rt.pending_stderr.is_empty() {
+            if let Some(code) = rt.pending_exit.take() {
+                let p = conn.send_request(ch, ChannelRequest::ExitStatus { code }, false)?;
+                srv_send(stream, driver, &p)?;
+            }
             if rt.pending_eof && !rt.eof_sent {
                 let p = conn.send_eof(ch)?;
                 srv_send(stream, driver, &p)?;
@@ -3009,6 +3030,29 @@ fn emit_subsystem_data(
         let (payload, taken) = conn.send_data(channel, &bytes[off..])?;
         if taken == 0 {
             rt.pending_data.extend_from_slice(&bytes[off..]);
+            return Ok(());
+        }
+        srv_send(stream, driver, &payload)?;
+        off += taken;
+    }
+    Ok(())
+}
+
+/// Like [`emit_subsystem_data`], for stderr (`CHANNEL_EXTENDED_DATA`).
+fn emit_subsystem_stderr(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    conn: &mut ConnectionState,
+    channel: u32,
+    bytes: &[u8],
+    rt: &mut SubsystemRuntime,
+) -> Result<()> {
+    let mut off = 0usize;
+    while off < bytes.len() {
+        let (payload, taken) =
+            conn.send_extended_data(channel, SSH_EXTENDED_DATA_STDERR, &bytes[off..])?;
+        if taken == 0 {
+            rt.pending_stderr.extend_from_slice(&bytes[off..]);
             return Ok(());
         }
         srv_send(stream, driver, &payload)?;
@@ -3059,6 +3103,8 @@ fn dispatch_app_packet(
                         pending_data: Vec::new(),
                         pending_eof: false,
                         pending_close: false,
+                        pending_stderr: Vec::new(),
+                        pending_exit: None,
                         eof_sent: false,
                         close_sent: false,
                     },
@@ -3085,6 +3131,8 @@ fn dispatch_app_packet(
                         pending_data: Vec::new(),
                         pending_eof: false,
                         pending_close: false,
+                        pending_stderr: Vec::new(),
+                        pending_exit: None,
                         eof_sent: false,
                         close_sent: false,
                     },
@@ -3104,6 +3152,8 @@ fn dispatch_app_packet(
                         pending_data: Vec::new(),
                         pending_eof: false,
                         pending_close: false,
+                        pending_stderr: Vec::new(),
+                        pending_exit: None,
                         eof_sent: false,
                         close_sent: false,
                     },
@@ -3124,6 +3174,8 @@ fn dispatch_app_packet(
                         pending_data: Vec::new(),
                         pending_eof: false,
                         pending_close: false,
+                        pending_stderr: Vec::new(),
+                        pending_exit: None,
                         eof_sent: false,
                         close_sent: false,
                     },
@@ -3246,6 +3298,8 @@ fn dispatch_app_packet(
                             pending_data: Vec::new(),
                             pending_eof: false,
                             pending_close: false,
+                            pending_stderr: Vec::new(),
+                            pending_exit: None,
                             eof_sent: false,
                             close_sent: false,
                         },
@@ -3297,6 +3351,8 @@ fn dispatch_app_packet(
                             pending_data: Vec::new(),
                             pending_eof: false,
                             pending_close: false,
+                            pending_stderr: Vec::new(),
+                            pending_exit: None,
                             eof_sent: false,
                             close_sent: false,
                         },
@@ -3953,6 +4009,8 @@ fn handle_channel_request(
                         pending_data: Vec::new(),
                         pending_eof: false,
                         pending_close: false,
+                        pending_stderr: Vec::new(),
+                        pending_exit: None,
                         eof_sent: false,
                         close_sent: false,
                     },
@@ -4110,6 +4168,8 @@ fn run_exec_command(
                 pending_data: Vec::new(),
                 pending_eof: false,
                 pending_close: false,
+                pending_stderr: Vec::new(),
+                pending_exit: None,
                 eof_sent: false,
                 close_sent: false,
             },
@@ -4185,6 +4245,8 @@ fn route_internal_sftp(
                 pending_data: Vec::new(),
                 pending_eof: false,
                 pending_close: false,
+                pending_stderr: Vec::new(),
+                pending_exit: None,
                 eof_sent: false,
                 close_sent: false,
             },

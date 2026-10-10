@@ -36,6 +36,12 @@ pub enum ChannelEgress {
     Eof,
     /// `CHANNEL_CLOSE`.
     Close,
+    /// Bytes destined for `CHANNEL_EXTENDED_DATA` (stderr). Honoured by the
+    /// server dispatcher for session channels.
+    Stderr(Vec<u8>),
+    /// An `exit-status` request, sent after the queued output and before
+    /// EOF / close. Honoured by the server dispatcher for session channels.
+    ExitStatus(u32),
 }
 
 /// Bidirectional view of an SSH channel.
@@ -66,6 +72,30 @@ impl ChannelStream {
             tx: Some(tx),
             buf: Vec::new(),
             rx_eof: false,
+        }
+    }
+
+    /// Queue `data` as stderr (`CHANNEL_EXTENDED_DATA`). Only session
+    /// channels on the server side carry it.
+    pub fn write_stderr(&mut self, data: &[u8]) -> std::io::Result<()> {
+        self.send_egress(ChannelEgress::Stderr(data.to_vec()))
+    }
+
+    /// Queue an `exit-status` for the peer; it is sent after the output
+    /// already queued and before EOF / close.
+    pub fn send_exit_status(&mut self, code: u32) -> std::io::Result<()> {
+        self.send_egress(ChannelEgress::ExitStatus(code))
+    }
+
+    fn send_egress(&mut self, msg: ChannelEgress) -> std::io::Result<()> {
+        match &self.tx {
+            Some(tx) => tx
+                .send(msg)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "channel closed")),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "channel stream already split",
+            )),
         }
     }
 

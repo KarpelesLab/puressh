@@ -27,6 +27,15 @@ use puressh::client::{
 
 #[path = "common.rs"]
 mod common;
+
+/// A warning: printed unless `-q`.
+macro_rules! warn {
+    ($($t:tt)*) => {
+        if !common::is_quiet() {
+            eprintln!($($t)*);
+        }
+    };
+}
 #[cfg(unix)]
 use common::{KeystrokeObfuscator, TickAction};
 use common::{
@@ -37,16 +46,13 @@ use common::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: ssh [-v[v[v]]] [-F configfile] [-p port] [-i identity_file] [-l user] \
-                     [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
-                     [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
-                     [-o IdentitiesOnly={yes,no}] \
-                     [-L LPORT:RHOST:RPORT] [-R RPORT:LHOST:LPORT] [-D [bind:]port] \
-                     [-J [user@]host[:port][,...]] \
-                     [-O check|exit|stop] \
-                     [-C] [-t] [-T] [-N] [-A] [-X] [-Y] \
-                     [-o ssh_config_keyword=value] \
-                     [user@]host [command...]";
+const USAGE: &str = "usage: ssh [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface] [-b bind_address]\n           \
+                     [-c cipher_spec] [-D [bind_address:]port] [-E log_file]\n           \
+                     [-e escape_char] [-F configfile] [-I pkcs11] [-i identity_file]\n           \
+                     [-J destination] [-L address] [-l login_name] [-m mac_spec]\n           \
+                     [-O ctl_cmd] [-o option] [-P tag] [-p port] [-Q query_option]\n           \
+                     [-R address] [-S ctl_path] [-W host:port] [-w local_tun[:remote_tun]]\n           \
+                     destination [command [argument ...]]";
 
 /// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
 /// each accepted connection becomes a `direct-tcpip` channel to the server
@@ -152,6 +158,30 @@ struct Cli {
     /// unix-gated); requires a resolved `ControlPath`.
     #[cfg_attr(not(unix), allow(dead_code))]
     control_cmd: Option<String>,
+    /// `-n`: stdin from /dev/null (also implied by `-f`).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    stdin_null: bool,
+    /// `-f`: go to the background after authentication.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fork_after_auth: bool,
+    /// `-q`: quiet; no warnings or diagnostics.
+    quiet: bool,
+    /// `-W host:port`: forward stdin/stdout to `host:port` over the server.
+    stdio_forward: Option<String>,
+    /// `-s`: the command names a subsystem.
+    subsystem: bool,
+    /// `-G`: print the resolved configuration and exit.
+    print_config: bool,
+    /// `-e char`: escape character for the interactive session (`None` in the
+    /// outer option = default `~`; `Some(None)` = `-e none`).
+    escape_char: Option<Option<u8>>,
+    /// `-E file`: append diagnostics to `file` instead of stderr.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    log_file: Option<String>,
+    /// `-Q query`: print the supported algorithms of a kind and exit.
+    query: Option<String>,
+    /// `-V`: print the version and exit.
+    version: bool,
     host: String,
     user_in_host: Option<String>,
     command: Option<String>,
@@ -268,6 +298,34 @@ fn split_forward_triple(s: &str, flag: &str) -> Result<(u16, String, u16), Strin
     Ok((port1, host, port2))
 }
 
+/// Options of OpenSSH's `ssh` that take a value (its getopt string is
+/// `1246ab:c:e:fgi:kl:m:no:p:qstvxAB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy`).
+const SSH_VALUE_OPTS: &str = "bceilmopBDEFIJLOPQRSwW";
+/// Options of OpenSSH's `ssh` that are plain flags.
+const SSH_FLAG_OPTS: &str = "1246afgknqstvxACGKMNTVXYy";
+
+/// Parse `-e` values: a single character, `^X` for a control character, or
+/// `none`.
+fn parse_escape_char(v: &str) -> Result<Option<u8>, String> {
+    let b = v.as_bytes();
+    match b {
+        _ if v.eq_ignore_ascii_case("none") => Ok(None),
+        [c] => Ok(Some(*c)),
+        [b'^', c]
+            if c.is_ascii_alphabetic() || matches!(c, b'@' | b'[' | b'\\' | b']' | b'^' | b'_') =>
+        {
+            Ok(Some(c.to_ascii_uppercase() & 0x1f))
+        }
+        _ => Err(format!("-e: bad escape character {v:?}")),
+    }
+}
+
+/// Parse the command line the way OpenSSH's `ssh` does: getopt-style short
+/// options (bundled flags like `-tt` / `-NfL 8080:h:80`, values attached
+/// like `-p22` or separate), options are also accepted after the
+/// destination, and the first argument after the destination that is not an
+/// option starts the remote command — everything from there on, options
+/// included, belongs to the command (`ssh host ls -la`).
 fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut config_file: Option<PathBuf> = None;
     let mut port: Option<u16> = None;
@@ -289,182 +347,201 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut proxy_jump: Option<String> = None;
     let mut control_cmd: Option<String> = None;
     let mut verbose: u8 = 0;
-    let mut positional: Vec<String> = Vec::new();
+    let mut stdin_null = false;
+    let mut fork_after_auth = false;
+    let mut quiet = false;
+    let mut stdio_forward: Option<String> = None;
+    let mut subsystem = false;
+    let mut print_config = false;
+    let mut escape_char: Option<Option<u8>> = None;
+    let mut log_file: Option<String> = None;
+    let mut query: Option<String> = None;
+    let mut version = false;
+    let mut tty_count = 0u8;
+    let mut host_arg: Option<String> = None;
+    let mut command_args: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a == "--" {
-            positional.extend_from_slice(&args[i + 1..]);
+            // End of options: next is the destination (if not seen yet),
+            // then the command.
+            let mut rest = args[i + 1..].iter().cloned();
+            if host_arg.is_none() {
+                host_arg = rest.next();
+            }
+            command_args.extend(rest);
             break;
         }
-        match a.as_str() {
-            "-p" => {
+        if !a.starts_with('-') || a == "-" {
+            if host_arg.is_none() {
+                host_arg = Some(a.clone());
                 i += 1;
-                let v = args.get(i).ok_or("-p requires a value")?;
-                port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
+                continue;
             }
-            "-F" => {
-                i += 1;
-                let v = args.get(i).ok_or("-F requires a value")?.clone();
-                config_file = Some(PathBuf::from(v));
-            }
-            "-i" => {
-                i += 1;
-                let v = args.get(i).ok_or("-i requires a value")?.clone();
-                identities.push(v);
-            }
-            "-l" => {
-                i += 1;
-                let v = args.get(i).ok_or("-l requires a value")?.clone();
-                cli_user = Some(v);
-            }
-            "-L" => {
-                i += 1;
-                let v = args.get(i).ok_or("-L requires a value")?;
-                locals.push(parse_local_forward(v)?);
-            }
-            "-R" => {
-                i += 1;
-                let v = args.get(i).ok_or("-R requires a value")?;
-                remotes.push(parse_remote_forward(v)?);
-            }
-            "-D" => {
-                i += 1;
-                let v = args.get(i).ok_or("-D requires a value")?;
-                dynamics_raw.push(parse_dynamic_forward(v)?);
-            }
-            // `-C` enables compression (OpenSSH's flag form of
-            // `Compression yes`). There is no flag to turn it off.
-            "-C" => {
-                compression = Some(true);
-            }
-            // `-t` forces PTY allocation; `-T` disables it. These map onto
-            // RequestTTY Force / No and win over the config keyword.
-            "-t" => {
-                request_tty = Some(puressh::config::RequestTty::Force);
-            }
-            "-T" => {
-                request_tty = Some(puressh::config::RequestTty::No);
-            }
-            "-N" => {
-                no_command = true;
-            }
-            "-J" => {
-                i += 1;
-                let v = args.get(i).ok_or("-J requires a value")?.clone();
-                proxy_jump = Some(v);
-            }
-            // `-O <cmd>`: control a running ControlMaster. We accept the
-            // multiplexing control commands puressh's mux master honors:
-            // `check` (is the master alive?), `exit`/`stop` (tear it down).
-            "-O" => {
-                i += 1;
-                let v = args.get(i).ok_or("-O requires a command")?.clone();
-                match v.as_str() {
-                    "check" | "exit" | "stop" => control_cmd = Some(v),
-                    other => {
-                        return Err(format!(
-                            "-O: unsupported control command {other:?} \
-                             (supported: check, exit, stop)"
-                        ));
+            // First non-option after the destination: the command.
+            command_args.extend_from_slice(&args[i..]);
+            break;
+        }
+        let cluster: Vec<char> = a[1..].chars().collect();
+        let mut j = 0;
+        while j < cluster.len() {
+            let c = cluster[j];
+            if SSH_VALUE_OPTS.contains(c) {
+                let attached: String = cluster[j + 1..].iter().collect();
+                let v = if !attached.is_empty() {
+                    attached
+                } else {
+                    i += 1;
+                    args.get(i)
+                        .ok_or_else(|| format!("option requires an argument -- {c}"))?
+                        .clone()
+                };
+                match c {
+                    'b' => extra_o.push(format!("BindAddress {v}")),
+                    'c' => extra_o.push(format!("Ciphers {v}")),
+                    'e' => escape_char = Some(parse_escape_char(&v)?),
+                    'i' => identities.push(v),
+                    'l' => cli_user = Some(v),
+                    'm' => extra_o.push(format!("MACs {v}")),
+                    'o' => apply_dash_o(
+                        &v,
+                        &mut strict,
+                        &mut known_hosts_path,
+                        &mut hash_known_hosts,
+                        &mut identities_only,
+                        &mut compression,
+                        &mut request_tty,
+                        &mut extra_o,
+                    )?,
+                    'p' => port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?),
+                    'B' => {
+                        return Err("-B (BindInterface) is not supported; use -b ADDRESS".into());
                     }
+                    'D' => dynamics_raw.push(parse_dynamic_forward(&v)?),
+                    'E' => log_file = Some(v),
+                    'F' => config_file = Some(PathBuf::from(v)),
+                    'I' => return Err("-I: PKCS#11 tokens are not supported".into()),
+                    'J' => proxy_jump = Some(v),
+                    'L' => locals.push(parse_local_forward(&v)?),
+                    // `-O <cmd>`: control a running ControlMaster. We accept
+                    // the multiplexing control commands puressh's mux master
+                    // honors: `check` (is the master alive?), `exit`/`stop`.
+                    'O' => match v.as_str() {
+                        "check" | "exit" | "stop" => control_cmd = Some(v),
+                        other => {
+                            return Err(format!(
+                                "-O: unsupported control command {other:?} \
+                                 (supported: check, exit, stop)"
+                            ));
+                        }
+                    },
+                    // `-P tag` (the `Tag` keyword) only selects config
+                    // blocks via `Match tagged`; not supported, ignored.
+                    'P' => {}
+                    'Q' => query = Some(v),
+                    'R' => remotes.push(parse_remote_forward(&v)?),
+                    'S' => extra_o.push(format!("ControlPath {v}")),
+                    'w' => return Err("-w: tun device forwarding is not supported".into()),
+                    'W' => stdio_forward = Some(v),
+                    _ => unreachable!(),
                 }
+                // The value consumed the rest of the cluster.
+                break;
             }
-            "-A" => {
-                agent_forward = true;
+            if !SSH_FLAG_OPTS.contains(c) {
+                return Err(format!("unknown option -- {c}"));
             }
-            "-X" => {
-                x11_forward = Some(X11Forward::Untrusted);
-            }
-            "-Y" => {
-                x11_forward = Some(X11Forward::Trusted);
-            }
-            // OpenSSH-style verbosity. Accept the stacked forms `-vv` /
-            // `-vvv` as single tokens (the common way users type them),
-            // plus repeated `-v` which also accumulates.
-            "-v" => {
-                verbose = verbose.saturating_add(1).min(3);
-            }
-            "-vv" => {
-                verbose = verbose.max(2);
-            }
-            "-vvv" => {
-                verbose = 3;
-            }
-            "-o" => {
-                i += 1;
-                let v = args.get(i).ok_or("-o requires a value")?;
-                let (k, val) = v
-                    .split_once('=')
-                    .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
-                // The unrecognised-keyword path below joins every `-o` with
-                // `\n` into a synthetic config that the real parser reads;
-                // a value carrying a line break would smuggle in extra
-                // directives. Refuse up front for every keyword.
-                if v.contains(['\n', '\r']) {
-                    return Err(format!(
-                        "-o value for {k} must not contain a newline or carriage return"
-                    ));
+            match c {
+                '1' => return Err("SSH protocol v.1 is no longer supported".into()),
+                '2' | 'k' | 'y' => {}
+                '4' => extra_o.push("AddressFamily inet".into()),
+                '6' => extra_o.push("AddressFamily inet6".into()),
+                'a' => {
+                    agent_forward = false;
+                    extra_o.push("ForwardAgent no".into());
                 }
-                match k.to_ascii_lowercase().as_str() {
-                    "stricthostkeychecking" => {
-                        strict = Some(match val.to_ascii_lowercase().as_str() {
-                            "yes" => StrictMode::Yes,
-                            "no" | "off" => StrictMode::No,
-                            "accept-new" => StrictMode::AcceptNew,
-                            "ask" => StrictMode::Ask,
-                            other => return Err(format!("unknown StrictHostKeyChecking={other}")),
-                        });
-                    }
-                    "userknownhostsfile" => {
-                        known_hosts_path = Some(PathBuf::from(val));
-                    }
-                    "hashknownhosts" => {
-                        hash_known_hosts =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
-                    }
-                    "identitiesonly" => {
-                        identities_only =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
-                    }
-                    "compression" => {
-                        compression = Some(match val.to_ascii_lowercase().as_str() {
-                            "yes" | "on" | "true" => true,
-                            "no" | "off" | "false" => false,
-                            other => return Err(format!("unknown Compression={other}")),
-                        });
-                    }
-                    "requesttty" => {
-                        request_tty = Some(match val.to_ascii_lowercase().as_str() {
-                            "no" => puressh::config::RequestTty::No,
-                            "yes" => puressh::config::RequestTty::Yes,
-                            "force" => puressh::config::RequestTty::Force,
-                            "auto" => puressh::config::RequestTty::Auto,
-                            other => return Err(format!("unknown RequestTTY={other}")),
-                        });
-                    }
-                    // Every other recognised ssh_config keyword is routed
-                    // through the real config parser (as a highest-priority
-                    // synthetic block) so `-o KEY=VAL` honours the same strict
-                    // validation as the file. Collected here; applied in run().
-                    _ => {
-                        extra_o.push(format!("{k} {val}"));
-                    }
+                'A' => agent_forward = true,
+                'C' => compression = Some(true),
+                'f' => {
+                    fork_after_auth = true;
+                    stdin_null = true;
                 }
+                'g' => extra_o.push("GatewayPorts yes".into()),
+                'G' => print_config = true,
+                'K' => {
+                    return Err("-K: GSSAPI authentication is not supported".into());
+                }
+                'M' => extra_o.push("ControlMaster yes".into()),
+                'n' => stdin_null = true,
+                'N' => no_command = true,
+                'q' => quiet = true,
+                's' => subsystem = true,
+                't' => tty_count = tty_count.saturating_add(1),
+                'T' => request_tty = Some(puressh::config::RequestTty::No),
+                // OpenSSH-style verbosity; `-vvv` stacks.
+                'v' => verbose = verbose.saturating_add(1).min(3),
+                'V' => version = true,
+                'x' => {
+                    x11_forward = None;
+                    extra_o.push("ForwardX11 no".into());
+                }
+                'X' => x11_forward = Some(X11Forward::Untrusted),
+                'Y' => x11_forward = Some(X11Forward::Trusted),
+                _ => unreachable!(),
             }
-            s if s.starts_with('-') => {
-                return Err(format!("unknown flag: {s}"));
-            }
-            _ => positional.push(a.clone()),
+            j += 1;
         }
         i += 1;
     }
-
-    if positional.is_empty() {
-        return Err("missing host argument".into());
+    // `-t` asks for a terminal when stdin is one; `-tt` always.
+    match tty_count {
+        0 => {}
+        1 => request_tty = Some(puressh::config::RequestTty::Yes),
+        _ => request_tty = Some(puressh::config::RequestTty::Force),
     }
-    let target = positional.remove(0);
+
+    // `-V` and `-Q` need no destination.
+    if version || query.is_some() {
+        return Ok(Cli {
+            config_file,
+            port,
+            identities,
+            cli_user,
+            strict,
+            known_hosts_path,
+            hash_known_hosts,
+            identities_only,
+            extra_o,
+            locals,
+            remotes,
+            dynamics_raw,
+            compression,
+            request_tty,
+            no_command,
+            agent_forward,
+            x11_forward,
+            proxy_jump,
+            control_cmd,
+            stdin_null,
+            fork_after_auth,
+            quiet,
+            stdio_forward,
+            subsystem,
+            print_config,
+            escape_char,
+            log_file,
+            query,
+            version,
+            verbose,
+            host: String::new(),
+            user_in_host: None,
+            command: None,
+        });
+    }
+
+    let target = host_arg.ok_or("missing host argument")?;
     // parse_target accepts `[user@]host[:port]` and handles bare /
     // bracketed IPv6 literals (`2001:db8::1`, `[2001:db8::1]:22`).
     // The returned port is `Some(p)` only when the target carried an
@@ -475,10 +552,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     if port.is_none() {
         port = target_port;
     }
-    let command = if positional.is_empty() {
+    let command = if command_args.is_empty() {
         None
     } else {
-        Some(positional.join(" "))
+        Some(command_args.join(" "))
     };
 
     Ok(Cli {
@@ -501,11 +578,90 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         x11_forward,
         proxy_jump,
         control_cmd,
+        stdin_null,
+        fork_after_auth,
+        quiet,
+        stdio_forward,
+        subsystem,
+        print_config,
+        escape_char,
+        log_file,
+        query,
+        version,
         verbose,
         host,
         user_in_host,
         command,
     })
+}
+
+/// One `-o KEY=VALUE` (or `-o "KEY VALUE"`): the handful of keywords with a
+/// dedicated `Cli` field are set directly; every other keyword is queued in
+/// `extra_o` for the real config parser.
+#[allow(clippy::too_many_arguments)]
+fn apply_dash_o(
+    v: &str,
+    strict: &mut Option<StrictMode>,
+    known_hosts_path: &mut Option<PathBuf>,
+    hash_known_hosts: &mut Option<bool>,
+    identities_only: &mut Option<bool>,
+    compression: &mut Option<bool>,
+    request_tty: &mut Option<puressh::config::RequestTty>,
+    extra_o: &mut Vec<String>,
+) -> Result<(), String> {
+    // The unrecognised-keyword path below joins every `-o` with `\n` into a
+    // synthetic config that the real parser reads; a value carrying a line
+    // break would smuggle in extra directives. Refuse up front.
+    if v.contains(['\n', '\r']) {
+        return Err(format!(
+            "-o value must not contain a newline or carriage return: {v:?}"
+        ));
+    }
+    // OpenSSH accepts both `Key=Value` and `Key Value`.
+    let (k, val) = match v.split_once('=') {
+        Some((k, val)) if !k.trim().contains(char::is_whitespace) => (k.trim(), val.trim()),
+        _ => v
+            .trim()
+            .split_once(char::is_whitespace)
+            .map(|(k, val)| (k, val.trim()))
+            .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?,
+    };
+    match k.to_ascii_lowercase().as_str() {
+        "stricthostkeychecking" => {
+            *strict = Some(match val.to_ascii_lowercase().as_str() {
+                "yes" => StrictMode::Yes,
+                "no" | "off" => StrictMode::No,
+                "accept-new" => StrictMode::AcceptNew,
+                "ask" => StrictMode::Ask,
+                other => return Err(format!("unknown StrictHostKeyChecking={other}")),
+            });
+        }
+        "userknownhostsfile" => *known_hosts_path = Some(PathBuf::from(val)),
+        "hashknownhosts" => {
+            *hash_known_hosts = Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+        }
+        "identitiesonly" => {
+            *identities_only = Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+        }
+        "compression" => {
+            *compression = Some(match val.to_ascii_lowercase().as_str() {
+                "yes" | "on" | "true" => true,
+                "no" | "off" | "false" => false,
+                other => return Err(format!("unknown Compression={other}")),
+            });
+        }
+        "requesttty" => {
+            *request_tty = Some(match val.to_ascii_lowercase().as_str() {
+                "no" => puressh::config::RequestTty::No,
+                "yes" => puressh::config::RequestTty::Yes,
+                "force" => puressh::config::RequestTty::Force,
+                "auto" => puressh::config::RequestTty::Auto,
+                other => return Err(format!("unknown RequestTTY={other}")),
+            });
+        }
+        _ => extra_o.push(format!("{k} {val}")),
+    }
+    Ok(())
 }
 
 /// Merge the `-o KEY=VALUE` options collected in [`Cli::extra_o`] into the
@@ -647,7 +803,7 @@ fn collect_credentials(
                 }
                 credentials.append(&mut from_agent);
             }
-            Err(e) => eprintln!("warning: agent: {e}"),
+            Err(e) => warn!("warning: agent: {e}"),
         }
     }
     // User certificates (`CertificateFile`). Each cert is paired with the
@@ -668,14 +824,14 @@ fn collect_credentials(
             let text = match std::fs::read_to_string(&cert_path) {
                 Ok(t) => t,
                 Err(e) => {
-                    eprintln!("warning: CertificateFile {cert_path}: {e}");
+                    warn!("warning: CertificateFile {cert_path}: {e}");
                     continue;
                 }
             };
             let cert = match Certificate::parse_openssh_line(&text) {
                 Ok(c) => c,
                 Err(e) => {
-                    eprintln!("warning: CertificateFile {cert_path}: {e}");
+                    warn!("warning: CertificateFile {cert_path}: {e}");
                     continue;
                 }
             };
@@ -703,7 +859,7 @@ fn collect_credentials(
                         paired = true;
                         break;
                     }
-                    Err(e) => eprintln!("warning: CertificateFile {cert_path}: {e}"),
+                    Err(e) => warn!("warning: CertificateFile {cert_path}: {e}"),
                 }
             }
             if !paired {
@@ -717,7 +873,7 @@ fn collect_credentials(
         let pk = match load_identity(id_path) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: {e}");
+                warn!("warning: {e}");
                 continue;
             }
         };
@@ -726,7 +882,7 @@ fn collect_credentials(
                 vlog(1, &format!("identity {id_path}: loaded"));
                 credentials.push(ClientCredential::PublicKey(hk));
             }
-            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
+            Err(e) => warn!("warning: identity {id_path}: {e}"),
         }
     }
     for id_path_raw in &cfg_block.identity_files {
@@ -734,7 +890,7 @@ fn collect_credentials(
         let pk = match load_identity(&id_path) {
             Ok(p) => p,
             Err(e) => {
-                eprintln!("warning: {e}");
+                warn!("warning: {e}");
                 continue;
             }
         };
@@ -743,7 +899,7 @@ fn collect_credentials(
                 vlog(1, &format!("config identity {id_path}: loaded"));
                 credentials.push(ClientCredential::PublicKey(hk));
             }
-            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
+            Err(e) => warn!("warning: config identity {id_path}: {e}"),
         }
     }
     if !identities_only {
@@ -755,13 +911,13 @@ fn collect_credentials(
                         credentials.push(ClientCredential::PublicKey(hk));
                     }
                     Err(e) => {
-                        eprintln!("warning: default identity {}: {e}", path.display());
+                        warn!("warning: default identity {}: {e}", path.display());
                     }
                 },
                 Ok(None) => {
                     vlog(2, &format!("default identity {}: skipped", path.display()));
                 }
-                Err(msg) => eprintln!("warning: {msg}"),
+                Err(msg) => warn!("warning: {msg}"),
             }
         }
     }
@@ -1073,11 +1229,11 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
     let mut agent = match Agent::connect_env() {
         Ok(Some(a)) => a,
         Ok(None) => {
-            eprintln!("warning: AddKeysToAgent: no agent at $SSH_AUTH_SOCK; skipping");
+            warn!("warning: AddKeysToAgent: no agent at $SSH_AUTH_SOCK; skipping");
             return;
         }
         Err(e) => {
-            eprintln!("warning: AddKeysToAgent: agent connect: {e}");
+            warn!("warning: AddKeysToAgent: agent connect: {e}");
             return;
         }
     };
@@ -1096,7 +1252,7 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
         if let Ok(pk) = load_identity(&path) {
             match agent.add_identity(&pk) {
                 Ok(()) => vlog(1, &format!("AddKeysToAgent: added {path}")),
-                Err(e) => eprintln!("warning: AddKeysToAgent: add {path}: {e}"),
+                Err(e) => warn!("warning: AddKeysToAgent: add {path}: {e}"),
             }
         }
     }
@@ -1105,19 +1261,29 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
 #[cfg(not(unix))]
 fn maybe_add_keys_to_agent(_cfg_block: &puressh::config::ClientOptions, _cli: &Cli) {}
 
-/// Decide whether the one-shot `exec` path should allocate a PTY, honouring
-/// `RequestTTY` (CLI `-t`/`-T`/`-o RequestTTY` over the config keyword):
-///   - Force / Yes ⇒ always (even for a remote command);
-///   - No ⇒ never;
-///   - Auto / unset ⇒ only when local stdin is a tty.
-#[cfg(unix)]
-fn want_exec_pty(cli: &Cli, cfg_block: &puressh::config::ClientOptions) -> bool {
+/// Whether to request a PTY, with OpenSSH's rules (CLI `-t`/`-T`/`-o
+/// RequestTTY` over the config keyword): always for `-tt` (`force`); when
+/// stdin is a terminal for `-t` (`yes`); by default (`auto`) only for an
+/// interactive shell on a terminal; never for `-T` (`no`) or a subsystem
+/// unless forced.
+fn want_pty(
+    cli: &Cli,
+    cfg_block: &puressh::config::ClientOptions,
+    has_command: bool,
+    subsystem: bool,
+) -> bool {
     use puressh::config::RequestTty::*;
+    let tty = stdin_is_tty();
     match cli.request_tty.or(cfg_block.request_tty) {
-        Some(Force) | Some(Yes) => true,
+        Some(Force) => true,
         Some(No) => false,
-        // Auto, unset, or a keyword value this binary predates.
-        _ => stdin_is_tty(),
+        Some(Yes) if !subsystem => {
+            if !tty {
+                warn!("Pseudo-terminal will not be allocated because stdin is not a terminal.");
+            }
+            tty
+        }
+        _ => !has_command && !subsystem && tty,
     }
 }
 
@@ -1156,21 +1322,273 @@ fn apply_identity_agent(setting: Option<&puressh::config::IdentityAgent>, _ident
     }
 }
 
+/// `ssh -G`: the resolved configuration as `keyword value` lines (lower-case
+/// keywords, OpenSSH's format), with OpenSSH's defaults for unset values.
+/// Scripts typically read `hostname`, `user`, `port`, `identityfile`,
+/// `proxyjump` / `proxycommand` and `controlpath` from it.
+fn print_config(
+    cli: &Cli,
+    c: &puressh::config::ClientOptions,
+    hostname: &str,
+    user: &str,
+    port: u16,
+) {
+    use puressh::config::{AddressFamily, ControlMaster, RequestTty, StrictMode};
+    let yn = |b: Option<bool>, default: bool| if b.unwrap_or(default) { "yes" } else { "no" };
+    let list = |l: &Option<Vec<String>>, cat| match l {
+        Some(v) => v.join(","),
+        None => puressh::config::default_algorithms(cat).join(","),
+    };
+    let mut out = vec![
+        format!("host {}", cli.host),
+        format!("user {user}"),
+        format!("hostname {hostname}"),
+        format!("port {port}"),
+        format!(
+            "addressfamily {}",
+            match c.address_family {
+                Some(AddressFamily::Inet) => "inet",
+                Some(AddressFamily::Inet6) => "inet6",
+                _ => "any",
+            }
+        ),
+        format!("batchmode {}", yn(c.batch_mode, false)),
+        format!(
+            "compression {}",
+            yn(cli.compression.or(c.compression), false)
+        ),
+        format!(
+            "forwardagent {}",
+            yn(c.forward_agent.or(Some(cli.agent_forward)), false)
+        ),
+        format!("forwardx11 {}", yn(c.forward_x11, false)),
+        format!("forwardx11trusted {}", yn(c.forward_x11_trusted, false)),
+        format!(
+            "identitiesonly {}",
+            yn(cli.identities_only.or(c.identities_only), false)
+        ),
+        format!(
+            "hashknownhosts {}",
+            yn(cli.hash_known_hosts.or(c.hash_known_hosts), false)
+        ),
+        format!("tcpkeepalive {}", yn(c.tcp_keep_alive, true)),
+        format!("clearallforwardings {}", yn(c.clear_all_forwardings, false)),
+        format!(
+            "exitonforwardfailure {}",
+            yn(c.exit_on_forward_failure, false)
+        ),
+        format!(
+            "stricthostkeychecking {}",
+            match cli.strict.or(c.strict_host_key) {
+                Some(StrictMode::Yes) => "true",
+                Some(StrictMode::No) => "false",
+                Some(StrictMode::AcceptNew) => "accept-new",
+                _ => "ask",
+            }
+        ),
+        format!(
+            "requesttty {}",
+            match cli.request_tty.or(c.request_tty) {
+                Some(RequestTty::No) => "false",
+                Some(RequestTty::Yes) => "true",
+                Some(RequestTty::Force) => "force",
+                _ => "auto",
+            }
+        ),
+        format!(
+            "controlmaster {}",
+            match c.control_master {
+                Some(ControlMaster::Yes) => "true",
+                Some(ControlMaster::Auto) => "auto",
+                _ => "false",
+            }
+        ),
+        format!(
+            "ciphers {}",
+            list(&c.ciphers, puressh::config::AlgoCategory::Cipher)
+        ),
+        format!("macs {}", list(&c.macs, puressh::config::AlgoCategory::Mac)),
+        format!(
+            "kexalgorithms {}",
+            list(&c.kex_algorithms, puressh::config::AlgoCategory::Kex)
+        ),
+        format!(
+            "hostkeyalgorithms {}",
+            list(
+                &c.host_key_algorithms,
+                puressh::config::AlgoCategory::HostKey
+            )
+        ),
+        format!(
+            "pubkeyacceptedalgorithms {}",
+            list(
+                &c.pubkey_accepted_algorithms,
+                puressh::config::AlgoCategory::PubkeyAccepted
+            )
+        ),
+        format!(
+            "connecttimeout {}",
+            c.connect_timeout.map_or("none".into(), |t| t.to_string())
+        ),
+        format!(
+            "serveraliveinterval {}",
+            c.server_alive_interval.unwrap_or(0)
+        ),
+        format!(
+            "serveralivecountmax {}",
+            c.server_alive_count_max.unwrap_or(3)
+        ),
+        format!(
+            "numberofpasswordprompts {}",
+            c.number_of_password_prompts.unwrap_or(3)
+        ),
+    ];
+    let identities: Vec<String> = if !cli.identities.is_empty() || !c.identity_files.is_empty() {
+        cli.identities
+            .iter()
+            .cloned()
+            .chain(c.identity_files.iter().map(|p| expand_tilde(p)))
+            .collect()
+    } else {
+        default_identity_paths()
+            .into_iter()
+            .map(|p| p.display().to_string())
+            .collect()
+    };
+    out.extend(identities.into_iter().map(|p| format!("identityfile {p}")));
+    out.extend(
+        c.certificate_files
+            .iter()
+            .map(|p| format!("certificatefile {}", expand_tilde(p))),
+    );
+    let known_hosts = cli
+        .known_hosts_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| c.user_known_hosts.clone())
+        .unwrap_or_else(|| expand_tilde("~/.ssh/known_hosts"));
+    out.push(format!("userknownhostsfile {known_hosts}"));
+    if let Some(p) = cli.proxy_jump.as_ref().or(c.proxy_jump.as_ref()) {
+        out.push(format!("proxyjump {p}"));
+    }
+    if let Some(p) = &c.proxy_command {
+        out.push(format!("proxycommand {p}"));
+    }
+    if let Some(p) = &c.control_path {
+        out.push(format!("controlpath {p}"));
+    }
+    if let Some(b) = &c.bind_address {
+        out.push(format!("bindaddress {b}"));
+    }
+    if let Some(p) = &c.preferred_authentications {
+        out.push(format!("preferredauthentications {}", p.join(",")));
+    }
+    out.extend(c.send_env.iter().map(|e| format!("sendenv {e}")));
+    out.extend(c.set_env.iter().map(|(k, v)| format!("setenv {k}={v}")));
+    for f in &c.local_forwards {
+        out.push(format!(
+            "localforward {}:{} {}:{}",
+            f.bind_addr.as_deref().unwrap_or("[localhost]"),
+            f.listen_port,
+            f.remote_host,
+            f.remote_port
+        ));
+    }
+    for f in &c.remote_forwards {
+        out.push(format!(
+            "remoteforward {}:{} {}:{}",
+            f.bind_addr.as_deref().unwrap_or("[localhost]"),
+            f.remote_port,
+            f.local_host,
+            f.local_port
+        ));
+    }
+    for f in &c.dynamic_forwards {
+        out.push(format!(
+            "dynamicforward {}:{}",
+            f.bind_addr.as_deref().unwrap_or("[localhost]"),
+            f.listen_port
+        ));
+    }
+    for line in out {
+        println!("{line}");
+    }
+}
+
+/// `ssh -Q KIND`: list the algorithms this build supports, one per line.
+fn run_query(kind: &str) -> Result<i32, String> {
+    use puressh::config::{AlgoCategory, supported_algorithms};
+    let list: Vec<&str> = match kind {
+        "cipher" | "cipher-auth" => supported_algorithms(AlgoCategory::Cipher),
+        "mac" => supported_algorithms(AlgoCategory::Mac),
+        "kex" => supported_algorithms(AlgoCategory::Kex),
+        "key" | "key-plain" | "key-sig" | "HostKeyAlgorithms" | "PubkeyAcceptedAlgorithms" => {
+            supported_algorithms(AlgoCategory::HostKey)
+        }
+        "key-cert" => puressh::hostkey::HOST_KEY_CERT_VERIFY_NAMES.to_vec(),
+        "sig" => supported_algorithms(AlgoCategory::PubkeyAccepted),
+        "compression" => vec!["none", "zlib@openssh.com"],
+        "protocol-version" => vec!["2"],
+        "help" => vec![
+            "cipher",
+            "cipher-auth",
+            "compression",
+            "kex",
+            "key",
+            "key-cert",
+            "key-plain",
+            "key-sig",
+            "mac",
+            "protocol-version",
+            "sig",
+        ],
+        other => return Err(format!("Unsupported query \"{other}\"")),
+    };
+    for name in list {
+        println!("{name}");
+    }
+    Ok(0)
+}
+
 fn run() -> Result<i32, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
+    // Only a leading `-h`/`--help` asks for help: anywhere else it may be
+    // part of the remote command (`ssh host df -h`).
+    if matches!(args.first().map(String::as_str), Some("-h" | "--help")) {
         println!("{USAGE}");
         println!();
         println!("A pure-Rust SSH client built on puressh {VERSION}.");
         return Ok(0);
     }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("puressh ssh {VERSION}");
-        return Ok(0);
-    }
 
     let mut cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     set_verbose(cli.verbose);
+    common::set_quiet(cli.quiet);
+
+    // `-V`: like OpenSSH, the version goes to stderr.
+    if cli.version {
+        eprintln!("puressh_{VERSION} (pure-Rust SSH, OpenSSH-compatible)");
+        return Ok(0);
+    }
+    if let Some(q) = cli.query.as_deref() {
+        return run_query(q);
+    }
+    // `-E file`: diagnostics go to `file` from here on.
+    #[cfg(unix)]
+    if let Some(path) = cli.log_file.as_deref() {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map_err(|e| format!("-E {path}: {e}"))?;
+        nix::unistd::dup2_stderr(&f).map_err(|e| format!("-E {path}: {e}"))?;
+    }
+    // `-n` (and `-f`): stdin from /dev/null.
+    #[cfg(unix)]
+    if cli.stdin_null {
+        let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+        nix::unistd::dup2_stdin(&null).map_err(|e| format!("-n: {e}"))?;
+    }
 
     // Resolve the ssh_config block matching the user-typed host name. CLI
     // values then take precedence over the block; the block over built-in
@@ -1266,6 +1684,12 @@ fn run() -> Result<i32, String> {
         .clone()
         .unwrap_or_else(|| cli.host.clone());
 
+    // `-G`: print the resolved configuration and stop.
+    if cli.print_config {
+        print_config(&cli, &cfg_block, &connect_host, &user, port);
+        return Ok(0);
+    }
+
     let cfg = config_for_host(&cfg_block, &cli)?;
 
     // ---- Connection multiplexing (ControlMaster/ControlPath/ControlPersist) ----
@@ -1360,7 +1784,7 @@ fn run() -> Result<i32, String> {
         .or_else(|| cfg_block.proxy_jump.clone());
     let proxy_command = cfg_block.proxy_command.clone();
     if proxy_jump.is_some() && proxy_command.is_some() {
-        eprintln!("warning: both ProxyJump and ProxyCommand set; using ProxyJump");
+        warn!("warning: both ProxyJump and ProxyCommand set; using ProxyJump");
     }
 
     // Publickey credentials gathered before connecting (knock path only).
@@ -1496,6 +1920,18 @@ fn run() -> Result<i32, String> {
         client.set_keepalive(interval, count_max);
     }
 
+    // `-f`: authenticated; continue in the background.
+    #[cfg(unix)]
+    if cli.fork_after_auth {
+        fork_to_background()?;
+    }
+
+    // `-W host:port`: stdin/stdout become a tunnel to host:port (the usual
+    // `ProxyCommand ssh -W %h:%p jump` form); no session.
+    if let Some(spec) = cli.stdio_forward.clone() {
+        return run_stdio_forward(client, &spec);
+    }
+
     // If any port-forwarding was requested, switch over to the multi-channel
     // serve loop instead of the single-shot exec/shell path. Mixing exec with
     // forwarding on the same client is a follow-up — it needs the serve loop
@@ -1535,87 +1971,123 @@ fn run() -> Result<i32, String> {
         return run_forwarding(client, &cli, &dynamics, exit_on_forward_failure, gateway);
     }
 
-    if let Some(command) = cli.command.clone() {
-        // RequestTTY Force/Yes allocates a PTY even for a remote command.
-        #[cfg(unix)]
-        {
-            if want_exec_pty(&cli, &cfg_block) {
-                let (cols, rows, px_w, px_h) = query_window_size();
-                let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
-                client.set_request_pty(Some((term, cols, rows, px_w, px_h, Vec::new())));
+    // The session: a command (`-s`: a subsystem) or the login shell, all
+    // streamed both ways like OpenSSH.
+    if cli.subsystem && cli.command.is_none() {
+        return Err("-s requires a subsystem name".into());
+    }
+    let has_command = cli.command.is_some();
+    let use_pty = want_pty(&cli, &cfg_block, has_command, cli.subsystem);
+    // EscapeChar: `-e`, else `~`.
+    let escape: Option<u8> = cli.escape_char.unwrap_or(Some(b'~'));
+    // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms); only used
+    // for interactive terminal sessions.
+    let okt = cfg_block
+        .obscure_keystroke_timing
+        .unwrap_or_else(puressh::config::ObscureKeystrokeTiming::default_on);
+    let command = cli.command.clone();
+    let subsystem = cli.subsystem;
+    let shared: puressh::shared::SharedClient = client.into();
+    // Master role: serve the control socket while running this session as
+    // the foreground one.
+    #[cfg(unix)]
+    if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
+        return become_master(dec, &cli, &cfg_block, shared, move |s| {
+            let what = session_request(command.as_deref(), subsystem);
+            run_session(s, what, use_pty, okt, escape).unwrap_or_else(|e| {
+                eprintln!("ssh: {e}");
+                255
+            })
+        });
+    }
+    let what = session_request(command.as_deref(), subsystem);
+    run_session(&shared, what, use_pty, okt, escape)
+}
+
+/// The session channel request for `ssh [-s] host [command]`.
+fn session_request(command: Option<&str>, subsystem: bool) -> puressh::shared::SessionRequest<'_> {
+    use puressh::shared::SessionRequest;
+    match command {
+        Some(c) if subsystem => SessionRequest::Subsystem(c),
+        Some(c) => SessionRequest::Exec(c),
+        None => SessionRequest::Shell,
+    }
+}
+
+/// `ssh -f`: after authentication, keep going in a child process that
+/// leaves the terminal's session, and let the parent exit 0 — so
+/// `ssh -fN -L …` returns to the shell with the tunnel up.
+#[cfg(unix)]
+fn fork_to_background() -> Result<(), String> {
+    // SAFETY: called while single-threaded (no session or forwarding threads
+    // have been started); the child continues with ordinary Rust code.
+    match unsafe { nix::libc::fork() } {
+        -1 => Err(format!("fork: {}", std::io::Error::last_os_error())),
+        0 => {
+            // SAFETY: setsid() in the child; failure is harmless.
+            unsafe { nix::libc::setsid() };
+            Ok(())
+        }
+        _ => std::process::exit(0),
+    }
+}
+
+/// `ssh -W host:port`: splice stdin/stdout with a `direct-tcpip` channel to
+/// `host:port`. Exits 0 when the connection ends.
+fn run_stdio_forward(client: Client, spec: &str) -> Result<i32, String> {
+    // host:port, [v6]:port, or host/port style is not accepted by OpenSSH.
+    let (host, port) = if let Some(rest) = spec.strip_prefix('[') {
+        let (h, p) = rest
+            .split_once("]:")
+            .ok_or_else(|| format!("-W: bad forwarding specification {spec:?}"))?;
+        (h.to_string(), p)
+    } else {
+        let (h, p) = spec
+            .rsplit_once(':')
+            .ok_or_else(|| format!("-W: bad forwarding specification {spec:?}"))?;
+        (h.to_string(), p)
+    };
+    let port: u16 = port
+        .parse()
+        .map_err(|_| format!("-W: bad port in {spec:?}"))?;
+    let shared: puressh::shared::SharedClient = client.into();
+    let mut stream = shared
+        .open_direct_tcpip(&host, port, "127.0.0.1", 0)
+        .map_err(|e| format!("stdio forwarding failed: {e}"))?;
+    let channel_id = stream.channel_id();
+    let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
+    let w = shared.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 32 * 1024];
+        let mut stdin = std::io::stdin();
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !send_all(&w, channel_id, &buf[..n]) {
+                        return;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(_) => break,
             }
         }
-        // Master role: if we should become a ControlMaster, move into a
-        // SharedClient and serve the socket while running this exec as the
-        // foreground session. Otherwise the cheap borrow-based exec path.
-        #[cfg(unix)]
-        if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
-            let shared: puressh::shared::SharedClient = client.into();
-            let cmd = command.clone();
-            return become_master(dec, &cli, &cfg_block, shared, move |s| {
-                run_exec_shared(s, &cmd)
-            });
-        }
-        let out = client.exec(&command).map_err(|e| format!("exec: {e}"))?;
-        let _ = std::io::stdout().write_all(&out.stdout);
-        let _ = std::io::stderr().write_all(&out.stderr);
-        return Ok(out.exit_status.map(|s| s as i32).unwrap_or(255));
-    }
-
-    // No command on the CLI → interactive shell. Hand the connection
-    // off to the SharedClient-driven runner so the SIGWINCH thread can
-    // call back into the same SSH connection without contending with
-    // the I/O threads.
-    let shared: puressh::shared::SharedClient = client.into();
-    #[cfg(unix)]
-    {
-        // RequestTTY decides PTY allocation for the interactive shell:
-        //   Force/Yes ⇒ PTY even when stdin isn't a tty;
-        //   No        ⇒ no PTY (line-buffered pipe shell);
-        //   Auto/unset⇒ PTY iff stdin is a tty (the historical default).
-        use puressh::config::RequestTty::*;
-        let use_pty = match cli.request_tty.or(cfg_block.request_tty) {
-            Some(Force) | Some(Yes) => true,
-            Some(No) => false,
-            // Auto, unset, or a keyword value this binary predates.
-            _ => stdin_is_tty(),
-        };
-        // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms). Only
-        // meaningful for the PTY (interactive) path; the pipe path ignores it.
-        let okt = cfg_block
-            .obscure_keystroke_timing
-            .unwrap_or_else(puressh::config::ObscureKeystrokeTiming::default_on);
-        // Master role: serve the control socket while running this shell as
-        // the foreground session.
-        if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
-            return become_master(dec, &cli, &cfg_block, shared, move |s| {
-                if use_pty {
-                    run_interactive_pty_shell_on(s, okt)
-                } else {
-                    run_interactive_pipe_shell_on(s)
+        let _ = w.channel_send_eof(channel_id);
+    });
+    let mut buf = [0u8; 32 * 1024];
+    let mut stdout = std::io::stdout();
+    loop {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if stdout.write_all(&buf[..n]).is_err() {
+                    break;
                 }
-                .unwrap_or(255)
-            });
-        }
-        if use_pty {
-            run_interactive_pty_shell(shared, okt)
-        } else {
-            run_interactive_pipe_shell(shared)
+                let _ = stdout.flush();
+            }
         }
     }
-    #[cfg(not(unix))]
-    {
-        // Windows: no PTY plumbing yet. The pipe path is portable —
-        // splice stdin/stdout/stderr against a no-PTY shell. The
-        // remote login shell will run line-buffered; not great for
-        // interactive use but useful for scripts.
-        let _ = shared;
-        Err(
-            "interactive shell on non-Unix needs the pipe fallback path, which has \
-             not been wired up for Windows in this version"
-                .into(),
-        )
-    }
+    Ok(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -1740,9 +2212,12 @@ fn run_mux_forwarding(
         let bind_ip = "127.0.0.1";
         let listener = TcpListener::bind((bind_ip, l.listen_port))
             .map_err(|e| format!("-L bind {bind_ip}:{}: {e}", l.listen_port))?;
-        eprintln!(
-            "ssh: -L {}:{}:{} active (via ControlMaster)",
-            l.listen_port, l.remote_host, l.remote_port
+        vlog(
+            1,
+            &format!(
+                "-L {}:{}:{} active (via ControlMaster)",
+                l.listen_port, l.remote_host, l.remote_port
+            ),
         );
         bound_any = true;
         let spec = l.clone();
@@ -1861,30 +2336,13 @@ fn run_mux_client(
     cfg_block: &puressh::config::ClientOptions,
     path: &std::path::Path,
 ) -> Result<i32, String> {
-    use puressh::config::RequestTty::*;
     let env = build_session_env(cfg_block);
-    let (want_pty, term, cols, rows) = if cli.command.is_some() {
-        // Exec: PTY only if RequestTTY Force/Yes (mirrors want_exec_pty).
-        if want_exec_pty(cli, cfg_block) {
-            let (c, r, _, _) = query_window_size();
-            (true, term_env(), c, r)
-        } else {
-            (false, String::new(), 0, 0)
-        }
+    // Same PTY rules as a direct connection.
+    let (want_pty, term, cols, rows) = if want_pty(cli, cfg_block, cli.command.is_some(), false) {
+        let (c, r, _, _) = query_window_size();
+        (true, term_env(), c, r)
     } else {
-        // Interactive: PTY iff RequestTTY says so / stdin is a tty.
-        let use_pty = match cli.request_tty.or(cfg_block.request_tty) {
-            Some(Force) | Some(Yes) => true,
-            Some(No) => false,
-            // Auto, unset, or a keyword value this binary predates.
-            _ => stdin_is_tty(),
-        };
-        if use_pty {
-            let (c, r, _, _) = query_window_size();
-            (true, term_env(), c, r)
-        } else {
-            (false, String::new(), 0, 0)
-        }
+        (false, String::new(), 0, 0)
     };
     let mut req = puressh::mux::SessionRequest::default();
     req.want_pty = want_pty;
@@ -2069,68 +2527,12 @@ fn detach_stdio() {
     }
 }
 
-/// Run a one-shot `command` over a `SharedClient`, splicing the channel's
-/// stdout/stderr to the local stdout/stderr. Used by the ControlMaster
-/// foreground exec path (the borrow-based `Client::exec` is consumed by the
-/// SharedClient conversion).
-#[cfg(unix)]
-fn run_exec_shared(shared: &puressh::shared::SharedClient, command: &str) -> i32 {
-    let mut stream = match shared.exec_stream(command) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("exec: {e}");
-            return 255;
-        }
-    };
-    let channel_id = stream.channel_id();
-    let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-
-    // stderr drainer thread.
-    let err_shared = shared.clone();
-    let t_err = thread::spawn(move || {
-        let mut buf = [0u8; 32 * 1024];
-        let mut stderr = std::io::stderr();
-        loop {
-            match err_shared.channel_recv_stderr(channel_id, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stderr.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = stderr.flush();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let mut buf = [0u8; 32 * 1024];
-    let mut stdout = std::io::stdout();
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => {
-                if stdout.write_all(&buf[..n]).is_err() {
-                    break;
-                }
-                let _ = stdout.flush();
-            }
-            Err(_) => break,
-        }
-    }
-    let _ = t_err.join();
-    stream.exit_status().unwrap_or(255)
-}
-
-/// `isatty(0)` — true if stdin is connected to a terminal. We only
-/// allocate a PTY when this is the case (matching OpenSSH `ssh host`
-/// behaviour when stdin is redirected from a file or a pipe).
-#[cfg(unix)]
+/// True if stdin is a terminal. A PTY is only allocated automatically in
+/// that case (matching OpenSSH when stdin is redirected from a file or a
+/// pipe).
 fn stdin_is_tty() -> bool {
-    // nix's IsAtty helper is feature-gated and not in our nix flags;
-    // call libc directly under the bin's own unsafe (binaries are
-    // outside the lib's `forbid(unsafe_code)`).
-    unsafe { nix::libc::isatty(0) == 1 }
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
 }
 
 /// `ObscureKeystrokeTiming` chaff tail: how long the cadence keeps emitting
@@ -2279,113 +2681,291 @@ fn spawn_obfuscated_stdin(
     vec![t_reader, t_cadence]
 }
 
-/// Run an interactive shell with a real PTY:
-///   1. capture local terminal size + termios
-///   2. switch local TTY into raw mode (restored on Drop)
-///   3. open the remote shell with our `term`/dimensions/modes
-///   4. spawn three I/O threads (stdin→remote, remote-stdout→1,
-///      remote-stderr→2) and a SIGWINCH watcher that sends
-///      window-change requests on local resize
-///   5. wait for the I/O threads to finish, then read exit-status
-#[cfg(unix)]
-fn run_interactive_pty_shell(
-    shared: puressh::shared::SharedClient,
-    okt: puressh::config::ObscureKeystrokeTiming,
-) -> Result<i32, String> {
-    run_interactive_pty_shell_on(&shared, okt)
+/// OpenSSH escape sequences (`EscapeChar`, `~` by default) on the
+/// interactive stdin stream: recognised only right after a newline.
+struct EscapeFilter {
+    ch: u8,
+    at_line_start: bool,
+    pending: bool,
 }
 
-/// `&`-taking variant of [`run_interactive_pty_shell`] so the ControlMaster
-/// foreground closure (which only borrows the `SharedClient`) can run the same
-/// interactive session while the accept loop holds its own clone.
+/// What an escape sequence asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscapeAction {
+    /// `~.`: disconnect.
+    Disconnect,
+    /// `~?`: list the escapes.
+    Help,
+    /// `~^Z`: suspend ssh.
+    Suspend,
+    /// `~#`: list forwarded connections.
+    ListForwards,
+    /// `~V` / `~v`: more / less verbose.
+    MoreVerbose,
+    LessVerbose,
+}
+
+impl EscapeFilter {
+    fn new(ch: u8) -> Self {
+        Self {
+            ch,
+            at_line_start: true,
+            pending: false,
+        }
+    }
+
+    /// Filter `input`: bytes to forward go to `out`; recognised escapes are
+    /// returned in order (with the position in `out` where each occurred,
+    /// so the caller can flush what precedes it first).
+    fn feed(&mut self, input: &[u8], out: &mut Vec<u8>) -> Vec<(usize, EscapeAction)> {
+        let mut actions = Vec::new();
+        for &b in input {
+            if self.pending {
+                self.pending = false;
+                let action = match b {
+                    b'.' => Some(EscapeAction::Disconnect),
+                    b'?' => Some(EscapeAction::Help),
+                    0x1a => Some(EscapeAction::Suspend),
+                    b'#' => Some(EscapeAction::ListForwards),
+                    b'V' => Some(EscapeAction::MoreVerbose),
+                    b'v' => Some(EscapeAction::LessVerbose),
+                    _ => None,
+                };
+                match action {
+                    Some(a) => {
+                        actions.push((out.len(), a));
+                        // OpenSSH keeps treating the next byte as a line
+                        // start after an escape.
+                        self.at_line_start = true;
+                        continue;
+                    }
+                    None if b == self.ch => {
+                        // `~~` sends one escape character.
+                        out.push(b);
+                        self.at_line_start = false;
+                        continue;
+                    }
+                    None => {
+                        // Not an escape: send both bytes.
+                        out.push(self.ch);
+                    }
+                }
+            } else if self.at_line_start && b == self.ch {
+                self.pending = true;
+                continue;
+            }
+            out.push(b);
+            self.at_line_start = b == b'\r' || b == b'\n';
+        }
+        actions
+    }
+}
+
+/// The local terminal settings to restore when ssh exits or suspends from
+/// an escape sequence (set while a raw-mode session runs).
 #[cfg(unix)]
-fn run_interactive_pty_shell_on(
+static ORIGINAL_TERMIOS: std::sync::Mutex<Option<nix::libc::termios>> = std::sync::Mutex::new(None);
+
+/// Carry out an escape action on behalf of the stdin thread.
+fn run_escape(action: EscapeAction, ch: u8) {
+    let show = |c: u8| -> String {
+        if c < 0x20 {
+            format!("^{}", (c + b'@') as char)
+        } else {
+            (c as char).to_string()
+        }
+    };
+    let e = show(ch);
+    match action {
+        EscapeAction::Disconnect => {
+            #[cfg(unix)]
+            if let Ok(g) = ORIGINAL_TERMIOS.lock()
+                && let Some(t) = g.as_ref()
+            {
+                // SAFETY: restoring a termios captured from fd 0.
+                unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, t) };
+            }
+            eprintln!("{e}.");
+            std::process::exit(255);
+        }
+        EscapeAction::Help => {
+            let lines = [
+                "Supported escape sequences:".to_string(),
+                format!(" {e}.   - terminate connection"),
+                format!(" {e}^Z  - suspend ssh"),
+                format!(" {e}#   - list forwarded connections"),
+                format!(" {e}V/v - increase/decrease verbosity"),
+                format!(" {e}?   - this message"),
+                format!(" {e}{e}   - send the escape character by typing it twice"),
+                "(Note that escapes are only recognized immediately after newline.)".to_string(),
+            ];
+            for l in lines {
+                eprint!("{l}\r\n");
+            }
+        }
+        EscapeAction::ListForwards => {
+            eprint!("The following connections are open:\r\n  #0 session\r\n");
+        }
+        EscapeAction::MoreVerbose => {
+            set_verbose(common::verbose_level().saturating_add(1));
+            eprint!("[verbosity {}]\r\n", common::verbose_level());
+        }
+        EscapeAction::LessVerbose => {
+            set_verbose(common::verbose_level().saturating_sub(1));
+            eprint!("[verbosity {}]\r\n", common::verbose_level());
+        }
+        EscapeAction::Suspend => {
+            #[cfg(unix)]
+            {
+                let original = ORIGINAL_TERMIOS.lock().ok().and_then(|g| *g);
+                // SAFETY: plain termios calls on fd 0 and a raise() of a
+                // stop signal; the raw settings are read back first so they
+                // can be re-applied on resume.
+                unsafe {
+                    let mut raw: nix::libc::termios = core::mem::zeroed();
+                    let have_raw = nix::libc::tcgetattr(0, &mut raw) == 0;
+                    if let Some(t) = original {
+                        nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &t);
+                    }
+                    eprintln!("{e}^Z [suspend ssh]");
+                    nix::libc::raise(nix::libc::SIGTSTP);
+                    if have_raw {
+                        nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &raw);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Send `data` on the session channel, retrying partial writes. `false` once
+/// the channel is gone.
+fn send_all(shared: &puressh::shared::SharedClient, channel: u32, data: &[u8]) -> bool {
+    let mut off = 0;
+    while off < data.len() {
+        match shared.channel_send_data(channel, &data[off..]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => off += n,
+        }
+    }
+    true
+}
+
+/// Run one session channel the way OpenSSH's `ssh` does, streaming in both
+/// directions: stdin → channel (EOF forwarded), channel stdout → stdout,
+/// channel stderr → stderr, until the remote side closes. With `want_pty`
+/// a pseudo-terminal is requested (with the local terminal's size and
+/// modes); if stdin is a terminal it is put in raw mode, window resizes
+/// are forwarded, and `escape` (normally `~`) sequences are honoured.
+/// Returns the remote exit status (255 when there is none, e.g. the
+/// command was killed by a signal).
+fn run_session(
     shared: &puressh::shared::SharedClient,
+    what: puressh::shared::SessionRequest<'_>,
+    want_pty: bool,
     okt: puressh::config::ObscureKeystrokeTiming,
+    escape: Option<u8>,
 ) -> Result<i32, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // 1. Geometry.
-    let (cols, rows, px_w, px_h) = query_window_size();
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
+    let stdin_tty = stdin_is_tty();
+    let interactive = want_pty && stdin_tty;
 
-    // 2. Termios capture + raw mode.
-    let mut original_termios: nix::libc::termios = unsafe { core::mem::zeroed() };
-    let tcget_ok = unsafe { nix::libc::tcgetattr(0, &mut original_termios) } == 0;
-    let modes = if tcget_ok {
-        puressh::client::encode_termios_modes(&original_termios)
-    } else {
-        Vec::new()
+    // Terminal: size, modes, raw mode (only when stdin is a terminal).
+    #[cfg(unix)]
+    let (pty, _raw_guard) = {
+        if want_pty {
+            let (cols, rows, px_w, px_h) = query_window_size();
+            let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
+            // SAFETY: zero-initialised termios filled by tcgetattr on fd 0.
+            let mut original: nix::libc::termios = unsafe { core::mem::zeroed() };
+            let have = stdin_tty && unsafe { nix::libc::tcgetattr(0, &mut original) } == 0;
+            let mut req = puressh::shared::PtyRequest::new(term, cols, rows);
+            req.px_w = px_w;
+            req.px_h = px_h;
+            if have {
+                req.modes = puressh::client::encode_termios_modes(&original);
+                if let Ok(mut g) = ORIGINAL_TERMIOS.lock() {
+                    *g = Some(original);
+                }
+            }
+            let guard = have.then(|| common::TermiosRawGuard::install(&original));
+            (Some(req), guard)
+        } else {
+            (None, None)
+        }
     };
-    let _raw_guard = if tcget_ok {
-        Some(common::TermiosRawGuard::install(&original_termios))
-    } else {
-        None
-    };
+    #[cfg(not(unix))]
+    let pty = want_pty.then(|| puressh::shared::PtyRequest::new("xterm", 80, 24));
 
-    // 3. Open the remote shell.
     let stream = shared
-        .shell_stream(&term, cols, rows, px_w, px_h, modes)
-        .map_err(|e| format!("shell: {e}"))?;
+        .session_stream(what, pty)
+        .map_err(|e| e.to_string())?;
     let channel_id = stream.channel_id();
-
-    // Short read timeout so the channel-reader pump releases the
-    // SharedClient mutex periodically. The stdin → channel writer thread
-    // and the SIGWINCH watcher both need to acquire that mutex, and
-    // without the timeout the reader would park indefinitely in the
-    // socket read while there's nothing to read — wedging the writer.
+    // A short read timeout makes the stdout pump release the SharedClient
+    // lock regularly, so the stdin writer and resize threads get through.
     let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
 
-    // 4. Three I/O threads. We do NOT wrap the OwnedChannelStream in a
-    //    mutex — that would serialise the read pump and the write path
-    //    on the outer lock and deadlock interactive sessions. Instead
-    //    the reader thread owns the stream; the writer thread issues
-    //    sends via `SharedClient::channel_send_data` / `channel_send_eof`
-    //    keyed by `channel_id`, which goes through the inner mutex
-    //    independently and yields between pump iterations.
-    let stdout_done = Arc::new(AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
+    let escape = if interactive { escape } else { None };
 
-    // stdin → channel. Two modes:
-    //   * ObscureKeystrokeTiming on: a reader thread enqueues stdin bytes
-    //     into a shared KeystrokeObfuscator while a cadence thread releases
-    //     them (or emits chaff PINGs) on a fixed interval — see
-    //     `spawn_obfuscated_stdin`.
-    //   * off: the historical immediate-write thread.
-    let stdin_stop = stdout_done.clone();
-    let t_in: Vec<thread::JoinHandle<()>> = if okt.is_on() {
-        spawn_obfuscated_stdin(shared, channel_id, okt, stdin_stop)
+    // stdin → channel.
+    #[cfg(unix)]
+    let use_okt = interactive && okt.is_on() && escape.is_none();
+    #[cfg(not(unix))]
+    let use_okt = false;
+    let _t_in: Vec<thread::JoinHandle<()>> = if use_okt {
+        #[cfg(unix)]
+        {
+            spawn_obfuscated_stdin(shared, channel_id, okt, done.clone())
+        }
+        #[cfg(not(unix))]
+        unreachable!()
     } else {
-        let writer_shared = shared.clone();
+        let _ = okt;
+        let w = shared.clone();
         vec![thread::spawn(move || {
-            let mut buf = [0u8; 8 * 1024];
+            let mut filter = escape.map(EscapeFilter::new);
+            let mut buf = [0u8; 16 * 1024];
+            let mut out = Vec::with_capacity(16 * 1024);
             let mut stdin = std::io::stdin();
             loop {
                 match stdin.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => {
-                        let mut off = 0;
-                        while off < n {
-                            match writer_shared.channel_send_data(channel_id, &buf[off..n]) {
-                                Ok(0) => return,
-                                Err(_) => return,
-                                Ok(taken) => off += taken,
+                    Ok(n) => match filter.as_mut() {
+                        None => {
+                            if !send_all(&w, channel_id, &buf[..n]) {
+                                return;
                             }
                         }
-                    }
+                        Some(f) => {
+                            out.clear();
+                            let actions = f.feed(&buf[..n], &mut out);
+                            let mut sent = 0;
+                            for (at, action) in actions {
+                                if !send_all(&w, channel_id, &out[sent..at]) {
+                                    return;
+                                }
+                                sent = at;
+                                run_escape(action, f.ch);
+                            }
+                            if !send_all(&w, channel_id, &out[sent..]) {
+                                return;
+                            }
+                        }
+                    },
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
             }
-            // Half-close the write side so the remote shell sees EOF on
-            // its stdin. We don't close the channel — the remote stdout
-            // is probably still draining.
-            let _ = writer_shared.channel_send_eof(channel_id);
+            // Half-close: the remote command sees EOF on its stdin.
+            let _ = w.channel_send_eof(channel_id);
         })]
     };
 
-    // channel → stdout. Owns the stream — no outer mutex.
-    let stdout_flag = stdout_done.clone();
+    // channel → stdout (owns the stream).
     let (stream_tx, stream_rx) = std::sync::mpsc::channel::<puressh::shared::OwnedChannelStream>();
+    let out_done = done.clone();
     let t_out = thread::spawn(move || {
         let mut stream = stream;
         let mut buf = [0u8; 32 * 1024];
@@ -2402,14 +2982,11 @@ fn run_interactive_pty_shell_on(
                 Err(_) => break,
             }
         }
-        stdout_flag.store(true, Ordering::Relaxed);
-        // Hand the stream out so the main thread can pull exit-status
-        // and run Drop (which sends CHANNEL_CLOSE).
+        out_done.store(true, Ordering::Relaxed);
         let _ = stream_tx.send(stream);
     });
 
-    // channel.stderr → stderr. Reads via the SharedClient directly so
-    // it doesn't need to share the OwnedChannelStream with t_out.
+    // channel stderr → stderr.
     let err_shared = shared.clone();
     let t_err = thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
@@ -2428,145 +3005,42 @@ fn run_interactive_pty_shell_on(
         }
     });
 
-    // 5. SIGWINCH watcher.
-    static RESIZED: AtomicBool = AtomicBool::new(false);
-    extern "C" fn on_winch(_sig: nix::libc::c_int) {
-        RESIZED.store(true, Ordering::Relaxed);
-    }
-    // SAFETY: signal handler is async-signal-safe — it only stores
-    // into an AtomicBool. Replacing SIGWINCH is the standard idiom
-    // for terminal resize handling.
-    unsafe {
-        nix::libc::signal(
-            nix::libc::SIGWINCH,
-            on_winch as *const () as nix::libc::sighandler_t,
-        );
-    }
-    let winch_shared = shared.clone();
-    let winch_stop = stdout_done.clone();
-    let t_winch = thread::spawn(move || {
-        while !winch_stop.load(Ordering::Relaxed) {
-            thread::sleep(std::time::Duration::from_millis(100));
-            if RESIZED.swap(false, Ordering::Relaxed) {
-                let (cols, rows, px_w, px_h) = query_window_size();
-                let _ = winch_shared.send_window_change(channel_id, cols, rows, px_w, px_h);
-            }
+    // Window resizes.
+    #[cfg(unix)]
+    let _t_winch = interactive.then(|| {
+        static RESIZED: AtomicBool = AtomicBool::new(false);
+        extern "C" fn on_winch(_sig: nix::libc::c_int) {
+            RESIZED.store(true, Ordering::Relaxed);
         }
+        // SAFETY: the handler only stores into an AtomicBool.
+        unsafe {
+            nix::libc::signal(
+                nix::libc::SIGWINCH,
+                on_winch as *const () as nix::libc::sighandler_t,
+            );
+        }
+        let s = shared.clone();
+        let stop = done.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(100));
+                if RESIZED.swap(false, Ordering::Relaxed) {
+                    let (cols, rows, px_w, px_h) = query_window_size();
+                    let _ = s.send_window_change(channel_id, cols, rows, px_w, px_h);
+                }
+            }
+        })
     });
 
-    // Wait for the channel reader to wind down — that's the canonical
-    // "remote shell exited" signal. The stdin thread may still be
-    // parked in read(0); we don't try to join it (read(0) is
-    // uninterruptible without closing the fd, which would mangle the
-    // user's terminal). The kernel cleans it up on process exit.
+    // The remote side closing stdout ends the session. The stdin thread
+    // may still be blocked reading a terminal; it is not joined (the
+    // process exits right after).
     let _ = t_out.join();
     let _ = t_err.join();
-    drop(t_in);
-    drop(t_winch);
-
-    // Recover the stream so we can read exit-status and run Drop
-    // (which sends CHANNEL_CLOSE).
     let stream = stream_rx
         .recv_timeout(std::time::Duration::from_secs(1))
         .ok();
-    Ok(stream.and_then(|s| s.exit_status()).unwrap_or(0))
-}
-
-/// Non-PTY shell: stdin is a pipe / file, not a terminal. Same
-/// three-way splice, no termios fiddling, no SIGWINCH. The remote
-/// shell runs in non-canonical line-buffered mode but still works for
-/// `echo cmd | ssh host`-style usage.
-#[cfg(unix)]
-fn run_interactive_pipe_shell(shared: puressh::shared::SharedClient) -> Result<i32, String> {
-    run_interactive_pipe_shell_on(&shared)
-}
-
-/// `&`-taking variant of [`run_interactive_pipe_shell`] (see
-/// [`run_interactive_pty_shell_on`]).
-#[cfg(unix)]
-fn run_interactive_pipe_shell_on(shared: &puressh::shared::SharedClient) -> Result<i32, String> {
-    let stream = shared
-        .shell_stream_no_pty()
-        .map_err(|e| format!("shell: {e}"))?;
-    let channel_id = stream.channel_id();
-
-    // See run_interactive_pty_shell: a short read timeout lets the
-    // stdin → channel writer thread acquire the SharedClient mutex
-    // while the channel → stdout reader thread is otherwise pumping.
-    let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
-
-    // stdin → channel.
-    let writer_shared = shared.clone();
-    let t_in = thread::spawn(move || {
-        let mut buf = [0u8; 8 * 1024];
-        let mut stdin = std::io::stdin();
-        loop {
-            match stdin.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut off = 0;
-                    while off < n {
-                        match writer_shared.channel_send_data(channel_id, &buf[off..n]) {
-                            Ok(0) | Err(_) => return,
-                            Ok(taken) => off += taken,
-                        }
-                    }
-                }
-                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-        let _ = writer_shared.channel_send_eof(channel_id);
-    });
-
-    // channel → stdout. Owns the stream — no outer mutex.
-    let (stream_tx, stream_rx) = std::sync::mpsc::channel::<puressh::shared::OwnedChannelStream>();
-    let t_out = thread::spawn(move || {
-        let mut stream = stream;
-        let mut buf = [0u8; 32 * 1024];
-        let mut stdout = std::io::stdout();
-        loop {
-            match stream.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stdout.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = stdout.flush();
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = stream_tx.send(stream);
-    });
-
-    // channel.stderr → stderr.
-    let err_shared = shared.clone();
-    let t_err = thread::spawn(move || {
-        let mut buf = [0u8; 32 * 1024];
-        let mut stderr = std::io::stderr();
-        loop {
-            match err_shared.channel_recv_stderr(channel_id, &mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if stderr.write_all(&buf[..n]).is_err() {
-                        break;
-                    }
-                    let _ = stderr.flush();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let _ = t_out.join();
-    let _ = t_err.join();
-    drop(t_in);
-
-    let stream = stream_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .ok();
-    Ok(stream.and_then(|s| s.exit_status()).unwrap_or(0))
+    Ok(stream.and_then(|s| s.exit_status()).unwrap_or(255))
 }
 
 /// Query the local terminal's size via `TIOCGWINSZ` on fd 0. Returns
@@ -2958,10 +3432,20 @@ fn run_forwarding(
                 continue;
             }
         };
-        eprintln!(
-            "ssh: -R 127.0.0.1:{}:{}:{} active",
-            bound_port, r.local_host, r.local_port,
+        vlog(
+            1,
+            &format!(
+                "-R 127.0.0.1:{}:{}:{} active",
+                bound_port, r.local_host, r.local_port
+            ),
         );
+        // OpenSSH reports the port the server picked for `-R 0:…`.
+        if r.remote_port == 0 {
+            warn!(
+                "Allocated port {bound_port} for remote forward to {}:{}",
+                r.local_host, r.local_port
+            );
+        }
         routes.insert(
             ("127.0.0.1".to_string(), bound_port),
             (r.local_host.clone(), r.local_port),
@@ -3115,9 +3599,12 @@ fn run_forwarding(
         for l in &cli.locals {
             match TcpListener::bind((bind_ip.as_str(), l.listen_port)) {
                 Ok(listener) => {
-                    eprintln!(
-                        "ssh: -L {}:{}:{}:{} active",
-                        bind_ip, l.listen_port, l.remote_host, l.remote_port,
+                    vlog(
+                        1,
+                        &format!(
+                            "-L {}:{}:{}:{} active",
+                            bind_ip, l.listen_port, l.remote_host, l.remote_port
+                        ),
                     );
                     spawn_local_forward_listener(listener, l.clone(), ctx.clone());
                 }
@@ -3127,7 +3614,10 @@ fn run_forwarding(
         for d in dynamics {
             match TcpListener::bind((d.bind_addr.as_str(), d.listen_port)) {
                 Ok(listener) => {
-                    eprintln!("ssh: -D {}:{} (SOCKS) active", d.bind_addr, d.listen_port);
+                    vlog(
+                        1,
+                        &format!("-D {}:{} (SOCKS) active", d.bind_addr, d.listen_port),
+                    );
                     spawn_dynamic_forward_listener(listener, d.listen_port, ctx.clone());
                 }
                 Err(e) => forward_fail!("-D bind {}:{}: {e}", d.bind_addr, d.listen_port),
@@ -3598,6 +4088,88 @@ mod extra_o_tests {
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn options_stop_at_the_command() {
+        // `ssh host ls -la`: `-la` belongs to the remote command.
+        let c = parse_args(&args(&["host", "ls", "-la", "/tmp"])).unwrap();
+        assert_eq!(c.host, "host");
+        assert_eq!(c.command.as_deref(), Some("ls -la /tmp"));
+        // Options are still parsed after the destination, before a command.
+        let c = parse_args(&args(&["host", "-p", "2222", "-q", "uptime", "-p"])).unwrap();
+        assert_eq!(c.port, Some(2222));
+        assert!(c.quiet);
+        assert_eq!(c.command.as_deref(), Some("uptime -p"));
+        // `--` ends options.
+        let c = parse_args(&args(&["--", "host", "-x"])).unwrap();
+        assert_eq!(c.command.as_deref(), Some("-x"));
+    }
+
+    #[test]
+    fn bundled_and_attached_options() {
+        let c = parse_args(&args(&["-p22", "-NfL", "8080:example:80", "-vv", "host"])).unwrap();
+        assert_eq!(c.port, Some(22));
+        assert!(c.no_command && c.fork_after_auth && c.stdin_null);
+        assert_eq!(c.locals.len(), 1);
+        assert_eq!(c.verbose, 2);
+        let c = parse_args(&args(&["-tt", "host"])).unwrap();
+        assert_eq!(c.request_tty, Some(puressh::config::RequestTty::Force));
+        let c = parse_args(&args(&["-t", "host"])).unwrap();
+        assert_eq!(c.request_tty, Some(puressh::config::RequestTty::Yes));
+        let c = parse_args(&args(&["-4", "-c", "aes128-ctr", "-S", "/tmp/s", "host"])).unwrap();
+        assert!(c.extra_o.contains(&"AddressFamily inet".to_string()));
+        assert!(c.extra_o.contains(&"Ciphers aes128-ctr".to_string()));
+        assert!(c.extra_o.contains(&"ControlPath /tmp/s".to_string()));
+        let c = parse_args(&args(&["-o", "Port 2200", "-oUser=bob", "host"])).unwrap();
+        assert!(c.extra_o.contains(&"Port 2200".to_string()));
+        assert!(c.extra_o.contains(&"User bob".to_string()));
+        assert!(parse_args(&args(&["-Z", "host"])).is_err());
+        assert!(parse_args(&args(&["host", "-p"])).is_err());
+    }
+
+    #[test]
+    fn version_query_and_escape_parse() {
+        assert!(parse_args(&args(&["-V"])).unwrap().version);
+        assert_eq!(
+            parse_args(&args(&["-Q", "mac"])).unwrap().query.as_deref(),
+            Some("mac")
+        );
+        assert_eq!(
+            parse_args(&args(&["-e", "none", "h"])).unwrap().escape_char,
+            Some(None)
+        );
+        assert_eq!(
+            parse_args(&args(&["-e", "^]", "h"])).unwrap().escape_char,
+            Some(Some(0x1d))
+        );
+        assert!(parse_args(&args(&["-e", "ab", "h"])).is_err());
+    }
+
+    #[test]
+    fn escape_filter() {
+        let mut f = EscapeFilter::new(b'~');
+        let mut out = Vec::new();
+        assert_eq!(f.feed(b"~.", &mut out), vec![(0, EscapeAction::Disconnect)]);
+        assert!(out.is_empty());
+        // Not at a line start: plain data.
+        let mut f = EscapeFilter::new(b'~');
+        let mut out = Vec::new();
+        assert!(f.feed(b"a~.", &mut out).is_empty());
+        assert_eq!(out, b"a~.");
+        // After a newline it is an escape again; `~~` sends one `~`; an
+        // unknown escape sends both bytes.
+        let mut out = Vec::new();
+        assert_eq!(
+            f.feed(b"\r~?x\n~~\n~z", &mut out),
+            vec![(1, EscapeAction::Help)]
+        );
+        assert_eq!(out, b"\rx\n~\n~z");
+        // Split across reads.
+        let mut f = EscapeFilter::new(b'~');
+        let mut out = Vec::new();
+        assert!(f.feed(b"~", &mut out).is_empty());
+        assert_eq!(f.feed(b".", &mut out), vec![(0, EscapeAction::Disconnect)]);
     }
 
     #[test]

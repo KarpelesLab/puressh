@@ -1018,6 +1018,22 @@ pub fn build_host_key_policy(
 /// debug aid).
 static VERBOSE: AtomicU8 = AtomicU8::new(0);
 
+/// `-q`: suppress warnings and diagnostics (not errors, not security
+/// banners such as a changed host key).
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Turn quiet mode on (`-q`).
+#[allow(dead_code)] // not every binary has `-q`
+pub fn set_quiet(on: bool) {
+    QUIET.store(on, Ordering::Relaxed);
+}
+
+/// Whether `-q` is in force.
+#[allow(dead_code)]
+pub fn is_quiet() -> bool {
+    QUIET.load(Ordering::Relaxed)
+}
+
 /// Bump the binary-local verbosity to `level`, clamped to `0..=3`.
 /// Idempotent; call once after `parse_args` returns.
 pub fn set_verbose(level: u8) {

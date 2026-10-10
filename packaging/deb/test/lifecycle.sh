@@ -31,7 +31,15 @@ try_ssh() {
 step "baseline: stock openssh-server"
 apt-get update -qq
 apt-get install -y -qq openssh-server >/dev/null
-systemctl restart ssh.socket >/dev/null 2>&1 || systemctl restart ssh.service
+# Enabled at boot the way a stock install is (CI images ship it disabled):
+# through ssh.socket on 24.04, ssh.service before.
+if grep -q VERSION_CODENAME=noble /etc/os-release; then
+	systemctl enable --now ssh.socket
+	systemctl restart ssh.socket
+else
+	systemctl enable --now ssh.service
+	systemctl restart ssh.service
+fi
 id tester >/dev/null 2>&1 || useradd -m -s /bin/bash tester
 rm -f /root/tester_key /root/tester_key.pub
 ssh-keygen -q -t ed25519 -N '' -f /root/tester_key

@@ -11,6 +11,17 @@ DEB=$(readlink -f "$1")
 export DEBIAN_FRONTEND=noninteractive
 
 step() { printf '\n==> %s\n' "$*"; }
+# On any failure, show what systemd and the SSH daemons were doing.
+diagnose() {
+	status=$?
+	[ "$status" -eq 0 ] && return 0
+	printf '\n==> FAILED (exit %s): diagnostics\n' "$status"
+	timeout 20 systemctl status ssh.service ssh.socket --no-pager || true
+	timeout 20 journalctl --no-pager -n 100 || true
+	ps -eo pid,ppid,stat,etime,wchan:20,args --forest | grep -v ' \[' | tail -80 || true
+	return "$status"
+}
+trap diagnose EXIT
 fp() { ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub | awk '{print $2}'; }
 installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install ok installed'; }
 try_ssh() {

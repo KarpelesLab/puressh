@@ -629,9 +629,30 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
         opts: ClientOptions::default(),
     }];
     let mut ignore_unknown: Option<String> = None;
+    // The block count at each enclosing `Include`: when its file ends, the
+    // block open before it is open again (OpenSSH), as a fresh block after
+    // the included ones.
+    let mut at_include: Vec<usize> = Vec::new();
     for line in lines {
         let mut apply = || -> Result<(), ConfigError> {
             match line.keyword.as_str() {
+                super::parser::INCLUDE_BEGIN => at_include.push(blocks.len()),
+                super::parser::INCLUDE_END => {
+                    let saved = at_include.pop().unwrap_or(blocks.len());
+                    if saved != blocks.len() {
+                        let reopened = match &blocks[saved - 1] {
+                            Block::Host { patterns, .. } => Block::Host {
+                                patterns: patterns.clone(),
+                                opts: ClientOptions::default(),
+                            },
+                            Block::Match { conditions, .. } => Block::Match {
+                                conditions: conditions.clone(),
+                                opts: ClientOptions::default(),
+                            },
+                        };
+                        blocks.push(reopened);
+                    }
+                }
                 "host" => {
                     if line.args.is_empty() {
                         return Err(ConfigError::BadValue {
@@ -2812,6 +2833,23 @@ Match host gw
             let src = "Include inner.cfg\n";
             let cfg = SshClientConfig::load_with_base(src, &dir.path).unwrap();
             assert_eq!(cfg.lookup("gw").port, Some(9999));
+        }
+
+        #[test]
+        fn host_block_in_included_file_ends_with_it() {
+            // OpenSSH: the block open at the Include is open again after
+            // the included file, even when that file opened its own.
+            let dir = TempDir::new("blockend");
+            dir.write("hosts.cfg", "Host db\n  Port 5432\n");
+            let root = dir.write(
+                "root.cfg",
+                "Include hosts.cfg\nUser everyone\nHost gw\n  Include hosts.cfg\n  Port 2222\n",
+            );
+            let cfg = SshClientConfig::load(&root).unwrap();
+            assert_eq!(cfg.lookup("gw").port, Some(2222));
+            assert_eq!(cfg.lookup("other").user.as_deref(), Some("everyone"));
+            assert_eq!(cfg.lookup("db").user.as_deref(), Some("everyone"));
+            assert_eq!(cfg.lookup("db").port, Some(5432));
         }
 
         #[test]

@@ -36,6 +36,7 @@ use crate::known_hosts::{KnownHosts, LookupResult};
 use crate::sftp::SftpClient;
 pub use crate::stream::{ChannelEgress, ChannelStream};
 use crate::transport::kex::{defaults, is_strict_kex_marker};
+#[cfg(any(test, feature = "multichannel"))]
 use crate::transport::ping::encode_ping;
 use crate::transport::{KexAlgorithmsOwned, KexInit, KexRunner};
 
@@ -1151,6 +1152,7 @@ impl Client {
     }
 
     /// Whether X11 forwarding was requested ([`Self::set_request_x11_forwarding`]).
+    #[cfg(feature = "multichannel")]
     pub(crate) fn wants_x11(&self) -> bool {
         self.request_x11.is_some()
     }
@@ -2706,17 +2708,19 @@ impl Client {
     /// between reads so siblings can write.
     /// Whether a packet is already decoded and waiting (so there is no need
     /// to wait for the transport).
+    #[cfg(feature = "multichannel")]
     pub(crate) fn has_buffered_input(&self) -> bool {
         self.driver.has_pending_events()
     }
 
     /// See [`Transport::poll_fd`].
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "multichannel"))]
     pub(crate) fn transport_poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
         self.stream.poll_fd()
     }
 
     /// Advance re-key / keepalive timers while the wire is idle.
+    #[cfg(feature = "multichannel")]
     pub(crate) fn tick_idle(&mut self) -> Result<()> {
         self.driver.handle_timeout(Instant::now())?;
         self.pump_out()
@@ -2888,6 +2892,7 @@ impl Client {
     /// which the read loop drops. Used as constant-rate "chaff" by the
     /// `ObscureKeystrokeTiming` sender in the `ssh` binary. Must not be
     /// called while a KEX is in flight.
+    #[cfg(any(test, feature = "multichannel"))]
     pub(crate) fn send_transport_ping(&mut self, data: &[u8]) -> Result<()> {
         let ping = encode_ping(data);
         self.write_payload(&ping)

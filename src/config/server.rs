@@ -462,9 +462,30 @@ impl SshServerConfig {
     pub fn from_lines(lines: Vec<ParsedLine>) -> Result<Self, ConfigError> {
         let mut global = ServerOptions::default();
         let mut match_blocks: Vec<ServerMatchBlock> = Vec::new();
+        // The open block (`None`: global), and the ones open at each
+        // enclosing `Include`, restored when its file ends (OpenSSH).
+        let mut current: Option<usize> = None;
+        let mut at_include: Vec<Option<usize>> = Vec::new();
         for line in lines {
-            Self::apply_line(&mut global, &mut match_blocks, &line)
-                .map_err(|e| e.in_file(line.file.as_deref()))?;
+            match line.keyword.as_str() {
+                super::parser::INCLUDE_BEGIN => at_include.push(current),
+                super::parser::INCLUDE_END => {
+                    let saved = at_include.pop().flatten();
+                    if saved != current {
+                        // Lines after the Include belong to the block open
+                        // before it, coming after the included ones.
+                        current = saved.map(|i| {
+                            match_blocks.push(ServerMatchBlock {
+                                conditions: match_blocks[i].conditions.clone(),
+                                opts: ServerOptions::default(),
+                            });
+                            match_blocks.len() - 1
+                        });
+                    }
+                }
+                _ => Self::apply_line(&mut global, &mut match_blocks, &mut current, &line)
+                    .map_err(|e| e.in_file(line.file.as_deref()))?,
+            }
         }
         Ok(SshServerConfig {
             global,
@@ -476,6 +497,7 @@ impl SshServerConfig {
     fn apply_line(
         global: &mut ServerOptions,
         match_blocks: &mut Vec<ServerMatchBlock>,
+        current: &mut Option<usize>,
         line: &ParsedLine,
     ) -> Result<(), ConfigError> {
         if line.keyword == "include" {
@@ -496,13 +518,13 @@ impl SshServerConfig {
                 conditions,
                 opts: ServerOptions::default(),
             });
+            *current = Some(match_blocks.len() - 1);
             return Ok(());
         }
-        // Route the directive to the current block (the last Match block,
-        // or global if none has opened yet).
-        let in_match = !match_blocks.is_empty();
-        let target = match match_blocks.last_mut() {
-            Some(b) => &mut b.opts,
+        // Route the directive to the open block: a Match block, or global.
+        let in_match = current.is_some();
+        let target = match *current {
+            Some(i) => &mut match_blocks[i].opts,
             None => global,
         };
         if in_match {
@@ -2779,6 +2801,54 @@ Match User alice
             }
             _ => panic!("wrong err: {err:?}"),
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn match_in_included_file_ends_with_it() {
+        // A drop-in ending in a Match block (an SFTP jail): the main file's
+        // lines after the Include are global again, as with OpenSSH.
+        let dir = std::env::temp_dir().join(format!("puressh_incmatch_{}", std::process::id()));
+        let d = dir.join("sshd_config.d");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("50-jail.conf"),
+            "Match User jailed\n\tChrootDirectory /srv/jail/%u\n\tForceCommand internal-sftp\n",
+        )
+        .unwrap();
+        let main = dir.join("sshd_config");
+        std::fs::write(
+            &main,
+            format!(
+                "Include {}/*.conf\nAcceptEnv LANG\nX11Forwarding yes\n\
+                 Match User x\n\tPermitTTY no\n\tInclude {}/*.conf\n\tX11Forwarding no\n",
+                d.display(),
+                d.display()
+            ),
+        )
+        .unwrap();
+        let cfg = SshServerConfig::load(&main).expect("AcceptEnv after the drop-in is global");
+        let _ = std::fs::remove_dir_all(&dir);
+        let user = |u| {
+            cfg.resolve(
+                &MatchContext {
+                    user: Some(u),
+                    ..MatchContext::default()
+                },
+                ExecPolicy::Deny,
+            )
+        };
+        assert_eq!(cfg.global.accept_env, vec!["LANG".to_string()]);
+        assert_eq!(cfg.global.x11_forwarding, Some(true));
+        // Inside a Match block, the lines after the Include are that
+        // block's again.
+        assert_eq!(user("x").x11_forwarding, Some(false));
+        assert_eq!(user("x").permit_tty, Some(false));
+        assert_eq!(
+            user("jailed").force_command.as_deref(),
+            Some("internal-sftp")
+        );
+        assert_eq!(user("other").force_command, None);
     }
 
     #[cfg(feature = "std")]

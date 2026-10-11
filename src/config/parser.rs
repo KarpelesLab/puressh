@@ -41,6 +41,15 @@ impl ParsedLine {
     }
 }
 
+/// Keyword of the marker line [`expand_includes`](super::include) puts
+/// before an included file's lines. The tokenizer cuts keywords at `=`, so
+/// no config line can produce it.
+pub(crate) const INCLUDE_BEGIN: &str = "=include-begin";
+/// Keyword of the marker line after an included file's lines: the block
+/// (`Host` / `Match` / global) open at the `Include` is open again, as in
+/// OpenSSH, so a `Match` ending a drop-in does not swallow what follows.
+pub(crate) const INCLUDE_END: &str = "=include-end";
+
 /// Tokenize `src` into a vector of [`ParsedLine`] events.
 ///
 /// Skips blank lines and `#` comments. Quoted (`"..."`) substrings preserve

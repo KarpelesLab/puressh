@@ -33,7 +33,7 @@ use std::path::{Path, PathBuf};
 
 use super::ConfigError;
 use super::glob::HostPattern;
-use super::parser::{ParsedLine, tokenize};
+use super::parser::{INCLUDE_BEGIN, INCLUDE_END, ParsedLine, tokenize};
 
 /// Maximum number of nested `Include` files. OpenSSH uses the same value.
 pub const MAX_INCLUDE_DEPTH: usize = 16;
@@ -41,7 +41,10 @@ pub const MAX_INCLUDE_DEPTH: usize = 16;
 /// Read `path`, tokenise it, and inline any `Include` directives it
 /// references. The returned `ParsedLine` stream is what the block-parser
 /// consumes — by the time it sees the stream, Include lines have been
-/// replaced by the tokens of their targets (in source order).
+/// replaced by the tokens of their targets (in source order), each target
+/// between two marker lines (keywords starting with `=`, which no config
+/// line can produce) so the block open at the Include can be restored after
+/// it, as OpenSSH does.
 ///
 /// `depth` is the recursion depth of the current file (top-level is 0).
 /// Exceeding `MAX_INCLUDE_DEPTH` returns a hard error.
@@ -103,7 +106,8 @@ fn tokenize_included_file(path: &Path, depth: usize) -> Result<Vec<ParsedLine>, 
 }
 
 /// Walk a token stream and replace every `include` line in-place with the
-/// tokens of the file(s) it names.
+/// tokens of the file(s) it names, each file's lines between an
+/// `INCLUDE_BEGIN` and an `INCLUDE_END` marker line.
 ///
 /// Glob expansion happens here; one Include line can fan out to many files.
 /// Missing files are silently skipped (per ssh_config(5)); unreadable files
@@ -142,7 +146,15 @@ pub fn expand_includes(
                     });
                 }
                 let child_lines = tokenize_included_file(&matched, depth + 1)?;
+                let marker = |keyword: &str| ParsedLine {
+                    line_no: line.line_no,
+                    keyword: keyword.to_string(),
+                    args: Vec::new(),
+                    file: line.file.clone(),
+                };
+                out.push(marker(INCLUDE_BEGIN));
                 out.extend(child_lines);
+                out.push(marker(INCLUDE_END));
             }
         }
     }

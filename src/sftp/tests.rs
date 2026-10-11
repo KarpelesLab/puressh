@@ -1065,3 +1065,49 @@ fn unknown_extended_request_returns_op_unsupported() {
     drop(b);
     h.join().unwrap();
 }
+
+#[test]
+fn pipelined_write_from_and_read_to() {
+    let tmp = TempDir::new("pipelined");
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+
+    // Not a multiple of the chunk size, so the last request is short.
+    let data: Vec<u8> = (0..1_000_003u32).map(|i| (i * 7 + i / 251) as u8).collect();
+    let handle = client
+        .open(
+            b"big.bin",
+            FXF_WRITE | FXF_CREAT | FXF_TRUNC,
+            Attrs::default(),
+        )
+        .unwrap();
+    let mut last = 0;
+    let n = client
+        .write_from(&handle, 0, 4096, 8, &mut &data[..], |p| last = p)
+        .unwrap();
+    client.close(&handle).unwrap();
+    assert_eq!(n, data.len() as u64);
+    assert_eq!(last, data.len() as u64);
+    assert_eq!(fs::read(tmp.path().join("big.bin")).unwrap(), data);
+
+    let handle = client.open(b"big.bin", FXF_READ, Attrs::default()).unwrap();
+    let mut back = Vec::new();
+    let n = client
+        .read_to(&handle, 0, 4096, 8, &mut back, |_| {})
+        .unwrap();
+    assert_eq!(n, data.len() as u64);
+    assert_eq!(back, data);
+    // Resume from an offset (reget).
+    let mut tail = Vec::new();
+    client
+        .read_to(&handle, 999_000, 4096, 8, &mut tail, |_| {})
+        .unwrap();
+    assert_eq!(tail, data[999_000..]);
+    client.close(&handle).unwrap();
+
+    // The session is still usable afterwards.
+    assert!(client.stat(b"big.bin").is_ok());
+    drop(client);
+    h.join().unwrap();
+}

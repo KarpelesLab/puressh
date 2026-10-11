@@ -1552,15 +1552,15 @@ fn print_config(
     }
     if let Some(b) = &c.bind_address {
         out.push(format!("bindaddress {b}"));
-        if let Some(a) = &c.host_key_alias {
-            out.push(format!("hostkeyalias {a}"));
-        }
-        if let Some(r) = &c.revoked_host_keys {
-            out.push(format!("revokedhostkeys {r}"));
-        }
-        if let Some(r) = &c.remote_command {
-            out.push(format!("remotecommand {r}"));
-        }
+    }
+    if let Some(a) = &c.host_key_alias {
+        out.push(format!("hostkeyalias {a}"));
+    }
+    if let Some(r) = &c.revoked_host_keys {
+        out.push(format!("revokedhostkeys {r}"));
+    }
+    if let Some(r) = &c.remote_command {
+        out.push(format!("remotecommand {r}"));
     }
     if let Some(p) = &c.preferred_authentications {
         out.push(format!("preferredauthentications {}", p.join(",")));

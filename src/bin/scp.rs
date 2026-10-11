@@ -1,494 +1,629 @@
-//! `scp` — puressh's SCP client driver.
+//! `scp` — copy files between hosts, a drop-in for OpenSSH's.
 //!
 //! ```text
-//! scp [-r] [-p] [-P port] [-i identity_file] [-l user]
-//!     [-o StrictHostKeyChecking={yes,no,accept-new,ask}]
-//!     [-o UserKnownHostsFile=PATH]
-//!     [-o HashKnownHosts={yes,no}]
-//!     [-o IdentitiesOnly={yes,no}]
-//!     SOURCE [SOURCE...] TARGET
+//! scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
+//!     [-i identity_file] [-J destination] [-l limit] [-o ssh_option]
+//!     [-P port] [-S program] [-X sftp_option] source ... target
 //! ```
 //!
-//! Exactly one of `TARGET` or `SOURCE` may be of the form
-//! `[user@]host:path`; the others must be plain local paths.
-//! Three-corner copies (`scp host1:foo host2:bar`) are explicitly out of
-//! scope — the client connects to a single peer.
-//!
-//! Authentication and host-key policy mirror the `ssh` binary: the agent
-//! (`$SSH_AUTH_SOCK`) is tried first unless `IdentitiesOnly=yes`, then any
-//! `-i` keys, then a stdin password prompt.
-//!
-//! Note: OpenSSH 9.0+ deprecated SCP in favour of SFTP. For new scripts
-//! the puressh `sftp` binary (or the `puressh::client::Client::sftp`
-//! library API) is a better choice.
+//! As with OpenSSH's, the remote side is reached by running `ssh` (`-S`
+//! overrides which), so every ssh option and ssh_config setting applies.
+//! Transfers use the SFTP protocol by default; `-O` selects the legacy SCP
+//! protocol (`scp -t` / `scp -f` on the remote host). Copies between two
+//! remote hosts go through this host (`-3`, the default) or, with `-R`, are
+//! run by scp on the source host. Local-to-local copies use `cp`.
 
-use std::path::PathBuf;
+use std::io::{self, IsTerminal};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use puressh::auth::ClientCredential;
-use puressh::client::{AlgoOverrides, Client, Config};
-use puressh::scp::{ScpRecvOptions, ScpSendOptions};
+use puressh::scp::{Receiver, ScpRecvOptions, ScpSendOptions, Sender};
+use puressh::sftp::SftpClient;
 
-#[path = "common.rs"]
-mod common;
-use common::{
-    StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
-    expand_tilde, load_identity, parse_userhost_path, read_password_from_stdin, resolve_user,
-    set_verbose, try_load_default_identity, vlog,
-};
+#[path = "transfer.rs"]
+mod transfer;
+use transfer::{Remote, SshOptions, SshPipe, XferOpts};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-const USAGE: &str = "usage: scp [-v[v[v]]] [-r] [-p] [-B] [-F configfile] [-P port] [-i identity_file] [-l user] \
-                     [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
-                     [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
-                     [-o IdentitiesOnly={yes,no}] [-o BatchMode={yes,no}] \
-                     SOURCE [SOURCE...] TARGET";
+const USAGE: &str = "usage: scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
+           [-i identity_file] [-J destination] [-l limit] [-o ssh_option]
+           [-P port] [-S program] [-X sftp_option] source ... target";
 
 struct Cli {
-    /// Recursive (`-r`).
-    recursive: bool,
-    /// Preserve mtime/atime/mode (`-p`).
-    preserve_times: bool,
-    /// `-F path`: load this `ssh_config` instead of the defaults.
-    config_file: Option<PathBuf>,
+    ssh: SshOptions,
     port: Option<u16>,
-    identities: Vec<String>,
-    cli_user: Option<String>,
-    strict: Option<StrictMode>,
-    known_hosts_path: Option<PathBuf>,
-    hash_known_hosts: Option<bool>,
-    identities_only: Option<bool>,
-    /// `-B` / `-o BatchMode=yes`: never prompt (no password, no host-key
-    /// question). `None` ⇒ the ssh_config `BatchMode` decides.
-    batch_mode: Option<bool>,
-    /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
-    /// See [`common::set_verbose`].
-    verbose: u8,
-    /// All positional args, last is TARGET, the rest are SOURCEs.
-    positional: Vec<String>,
+    through_local: bool,
+    remote_to_remote_direct: bool,
+    legacy: bool,
+    sftp_direct: Option<String>,
+    quiet: bool,
+    verbose: bool,
+    xfer: XferOpts,
+    /// Flags to repeat for a remote scp (`-R`) or `scp -t/-f` (`-O`).
+    passthrough: Vec<String>,
+    /// `-t` / `-f`: the remote end of the legacy protocol (`-d`: the
+    /// target must be a directory).
+    sink: bool,
+    source: bool,
+    target_dir: bool,
+    operands: Vec<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
-    let mut recursive = false;
-    let mut preserve_times = false;
-    let mut config_file: Option<PathBuf> = None;
-    let mut port: Option<u16> = None;
-    let mut identities: Vec<String> = Vec::new();
-    let mut cli_user: Option<String> = None;
-    let mut strict: Option<StrictMode> = None;
-    let mut known_hosts_path: Option<PathBuf> = None;
-    let mut hash_known_hosts: Option<bool> = None;
-    let mut identities_only: Option<bool> = None;
-    let mut batch_mode: Option<bool> = None;
-    let mut verbose: u8 = 0;
-    let mut positional: Vec<String> = Vec::new();
-
+    const WITH_ARG: &str = "cDFiJloPSX";
+    let mut c = Cli {
+        ssh: SshOptions::default(),
+        port: None,
+        through_local: true,
+        remote_to_remote_direct: false,
+        legacy: false,
+        sftp_direct: None,
+        quiet: false,
+        verbose: false,
+        xfer: XferOpts::default(),
+        passthrough: Vec::new(),
+        sink: false,
+        source: false,
+        target_dir: false,
+        operands: Vec::new(),
+    };
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a == "--" {
-            positional.extend_from_slice(&args[i + 1..]);
+            c.operands.extend(args[i + 1..].iter().cloned());
             break;
         }
-        match a.as_str() {
-            "-r" => recursive = true,
-            "-p" => preserve_times = true,
-            "-P" => {
-                i += 1;
-                let v = args.get(i).ok_or("-P requires a value")?;
-                port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
-            }
-            "-F" => {
-                i += 1;
-                let v = args.get(i).ok_or("-F requires a value")?.clone();
-                config_file = Some(PathBuf::from(v));
-            }
-            "-i" => {
-                i += 1;
-                let v = args.get(i).ok_or("-i requires a value")?.clone();
-                identities.push(v);
-            }
-            "-l" => {
-                i += 1;
-                let v = args.get(i).ok_or("-l requires a value")?.clone();
-                cli_user = Some(v);
-            }
-            "-o" => {
-                i += 1;
-                let v = args.get(i).ok_or("-o requires a value")?;
-                let (k, val) = v
-                    .split_once('=')
-                    .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
-                match k.to_ascii_lowercase().as_str() {
-                    "stricthostkeychecking" => {
-                        strict = Some(match val.to_ascii_lowercase().as_str() {
-                            "yes" => StrictMode::Yes,
-                            "no" | "off" => StrictMode::No,
-                            "accept-new" => StrictMode::AcceptNew,
-                            "ask" => StrictMode::Ask,
-                            other => return Err(format!("unknown StrictHostKeyChecking={other}")),
-                        });
+        if !a.starts_with('-') || a == "-" {
+            c.operands.push(a.clone());
+            i += 1;
+            continue;
+        }
+        let flags: Vec<char> = a[1..].chars().collect();
+        let mut j = 0;
+        while j < flags.len() {
+            let f = flags[j];
+            if WITH_ARG.contains(f) {
+                let rest: String = flags[j + 1..].iter().collect();
+                let v = if !rest.is_empty() {
+                    rest
+                } else {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| format!("option requires an argument -- {f}"))?
+                };
+                match f {
+                    'c' => c.ssh.push("-c", Some(&v)),
+                    'D' => c.sftp_direct = Some(v),
+                    'F' => {
+                        c.ssh.push("-F", Some(&v));
+                        c.passthrough.extend(["-F".into(), v]);
                     }
-                    "userknownhostsfile" => {
-                        known_hosts_path = Some(PathBuf::from(val));
+                    'i' => {
+                        c.ssh.push("-i", Some(&v));
+                        c.passthrough.extend(["-i".into(), v]);
                     }
-                    "hashknownhosts" => {
-                        hash_known_hosts =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+                    'J' => c.ssh.push("-J", Some(&v)),
+                    'l' => {
+                        let kbit: u64 = v
+                            .parse()
+                            .ok()
+                            .filter(|n| *n > 0)
+                            .ok_or_else(|| format!("bad limit {v}"))?;
+                        c.xfer.limit = Some(kbit * 1024 / 8);
+                        c.passthrough.extend(["-l".into(), v]);
                     }
-                    "identitiesonly" => {
-                        identities_only =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+                    'o' => {
+                        c.ssh.push("-o", Some(&v));
+                        c.passthrough.extend(["-o".into(), v]);
                     }
-                    "batchmode" => {
-                        batch_mode =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+                    'P' => {
+                        c.port = Some(v.parse().map_err(|_| format!("bad port \"{v}\""))?);
                     }
-                    other => {
-                        return Err(format!("unsupported -o option: {other}={val}"));
-                    }
+                    'S' => c.ssh.program = Some(v),
+                    'X' => match v.split_once('=') {
+                        Some(("buffer", n)) => {
+                            c.xfer.chunk = n
+                                .parse()
+                                .ok()
+                                .filter(|n| (1..=256 * 1024).contains(n))
+                                .ok_or_else(|| format!("Invalid buffer size \"{n}\""))?;
+                        }
+                        Some(("nrequests", n)) => {
+                            c.xfer.depth = n
+                                .parse()
+                                .ok()
+                                .filter(|n| *n >= 1)
+                                .ok_or_else(|| format!("Invalid number of requests \"{n}\""))?;
+                        }
+                        _ => return Err(format!("Invalid -X option \"{v}\"")),
+                    },
+                    _ => unreachable!(),
                 }
+                break;
             }
-            "-v" => {
-                verbose = verbose.saturating_add(1).min(3);
+            match f {
+                '3' => c.through_local = true,
+                'R' => {
+                    c.through_local = false;
+                    c.remote_to_remote_direct = true;
+                }
+                '4' | '6' | 'C' => {
+                    c.ssh.push(&format!("-{f}"), None);
+                    c.passthrough.push(format!("-{f}"));
+                }
+                'A' => c.ssh.forward_agent = true,
+                'B' => {
+                    c.ssh.push("-oBatchMode=yes", None);
+                    c.passthrough.push("-B".into());
+                }
+                'O' => c.legacy = true,
+                's' => c.legacy = false,
+                'p' => {
+                    c.xfer.preserve = true;
+                    c.passthrough.push("-p".into());
+                }
+                'q' => {
+                    c.quiet = true;
+                    c.ssh.push("-q", None);
+                    c.passthrough.push("-q".into());
+                }
+                'r' => {
+                    c.xfer.recursive = true;
+                    c.passthrough.push("-r".into());
+                }
+                'T' => {}
+                'v' => {
+                    c.verbose = true;
+                    c.ssh.push("-v", None);
+                    c.passthrough.push("-v".into());
+                }
+                't' => c.sink = true,
+                'f' => c.source = true,
+                'd' => c.target_dir = true,
+                _ => return Err(format!("unknown option -- {f}")),
             }
-            "-vv" => {
-                verbose = verbose.max(2);
-            }
-            "-vvv" => {
-                verbose = 3;
-            }
-            // scp(1) `-B`: batch mode — never prompt for passwords or
-            // host-key confirmation.
-            "-B" => batch_mode = Some(true),
-            // Ignore harmless flags scp(1) users sometimes set.
-            "-q" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
-            s if s.starts_with('-') => {
-                return Err(format!("unknown flag: {s}"));
-            }
-            _ => positional.push(a.clone()),
+            j += 1;
         }
         i += 1;
     }
-
-    if positional.len() < 2 {
-        return Err(format!(
-            "expected at least one SOURCE and one TARGET, got {} args",
-            positional.len()
-        ));
+    if c.sink || c.source {
+        if c.operands.is_empty() {
+            return Err(USAGE.into());
+        }
+        return Ok(c);
     }
-    // No bare `-` (stdin/stdout) anywhere — we don't speak that.
-    if positional.iter().any(|p| p == "-") {
-        return Err("`-` (stdin/stdout) not supported".into());
+    if c.operands.len() < 2 {
+        return Err(USAGE.into());
     }
-
-    Ok(Cli {
-        recursive,
-        preserve_times,
-        config_file,
-        port,
-        identities,
-        cli_user,
-        strict,
-        known_hosts_path,
-        hash_known_hosts,
-        identities_only,
-        batch_mode,
-        verbose,
-        positional,
-    })
+    c.xfer.progress = !c.quiet && io::stdout().is_terminal();
+    Ok(c)
 }
 
-/// One side of a copy: local file path, or a `[user@]host:path` remote ref.
-#[derive(Debug)]
-enum Endpoint {
-    Local(PathBuf),
-    Remote {
-        user: Option<String>,
-        host: String,
-        path: String,
-    },
+fn remote(arg: &str) -> Option<Remote> {
+    transfer::parse_remote(arg, &["scp"])
 }
 
-fn classify(arg: &str) -> Endpoint {
-    match parse_userhost_path(arg) {
-        Some((user, host, path)) => Endpoint::Remote { user, host, path },
-        None => Endpoint::Local(PathBuf::from(arg)),
-    }
-}
-
-/// Connect to a remote, authenticate (agent → identity files → password),
-/// and return the resulting [`Client`] ready to drive SCP.
-///
-/// Factored out so it can be called once per `scp` invocation regardless of
-/// whether the remote is the source or the target.
-fn open_authenticated(
-    host: &str,
-    user_in_endpoint: Option<&str>,
-    cli: &Cli,
-    ssh_cfg: &puressh::config::SshClientConfig,
-) -> Result<Client, String> {
-    let cfg_block = ssh_cfg.lookup(host);
-
-    let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
-    let user = resolve_user(cli_user.as_deref(), user_in_endpoint)?;
-    let batch = common::pick(cli.batch_mode, cfg_block.batch_mode, false);
-    let mut strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
-    // BatchMode never prompts: OpenSSH promotes `ask` to `yes` (refuse
-    // unknown hosts) rather than blocking on a question nobody can answer.
-    if batch && strict == StrictMode::Ask {
-        strict = StrictMode::Yes;
-    }
-    let known_hosts_path = cli
-        .known_hosts_path
-        .clone()
-        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
-    let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
-    let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
-    let port = common::pick(cli.port, cfg_block.port, 22);
-    let connect_host = cfg_block
-        .host_name
-        .clone()
-        .unwrap_or_else(|| host.to_string());
-
-    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
-    let mut algorithms = AlgoOverrides::default();
-    algorithms.ciphers = cfg_block.ciphers.clone();
-    algorithms.macs = cfg_block.macs.clone();
-    algorithms.kex_algorithms = cfg_block.kex_algorithms.clone();
-    algorithms.host_key_algorithms = cfg_block.host_key_algorithms.clone();
-    algorithms.pubkey_accepted_algorithms = cfg_block.pubkey_accepted_algorithms.clone();
-    algorithms.ca_signature_algorithms = cfg_block.ca_signature_algorithms.clone();
-    algorithms.compression = cfg_block.compression;
-    let cfg = Config::new(policy).with_algorithms(algorithms);
-    vlog(1, &format!("connecting to {connect_host}:{port}"));
-    let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)
-        .map_err(|e| format!("connect: {e}"))?;
-    vlog(1, &format!("connected to {connect_host}:{port}"));
-
-    // Collect publickey credentials (agent first, unless IdentitiesOnly=yes).
-    let mut credentials: Vec<ClientCredential> = Vec::new();
-    if !identities_only {
-        match connect_agent_credentials() {
-            Ok(mut from_agent) => {
-                vlog(
-                    1,
-                    &format!("agent: offered {} identities", from_agent.len()),
-                );
-                credentials.append(&mut from_agent);
-            }
-            Err(e) => eprintln!("warning: agent: {e}"),
-        }
-    }
-    for id_path in &cli.identities {
-        let pk = match load_identity(id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
-        }
-    }
-    // Identities listed in the matching ssh_config block.
-    for id_path_raw in &cfg_block.identity_files {
-        let id_path = expand_tilde(id_path_raw);
-        let pk = match load_identity(&id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("config identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
-        }
-    }
-    // OpenSSH-style default identities: tried after agent + explicit -i,
-    // suppressed entirely by IdentitiesOnly=yes (which also disables the
-    // agent above).
-    if !identities_only {
-        for path in default_identity_paths() {
-            match try_load_default_identity(&path) {
-                Ok(Some(pk)) => match pk.into_host_key() {
-                    Ok(hk) => {
-                        vlog(1, &format!("default identity {}: loaded", path.display()));
-                        credentials.push(ClientCredential::PublicKey(hk));
-                    }
-                    Err(e) => {
-                        eprintln!("warning: default identity {}: {e}", path.display());
-                    }
-                },
-                Ok(None) => {
-                    vlog(2, &format!("default identity {}: skipped", path.display()));
-                }
-                Err(msg) => eprintln!("warning: {msg}"),
-            }
-        }
-    }
-
-    let authed = if !credentials.is_empty() {
-        vlog(
-            1,
-            &format!(
-                "trying publickey auth as {} ({} credentials)",
-                user,
-                credentials.len()
-            ),
-        );
-        let ok = client.authenticate(&user, credentials).is_ok();
-        if ok {
-            vlog(1, &format!("authenticated as {user} via publickey"));
-        }
-        ok
+/// A remote path for SFTP: `~` / `~/x` are relative to the login
+/// directory; empty means the login directory.
+fn sftp_path(path: &str) -> Vec<u8> {
+    let p = path
+        .strip_prefix("~/")
+        .or_else(|| (path == "~").then_some(""))
+        .unwrap_or(path);
+    if p.is_empty() {
+        b".".to_vec()
     } else {
-        false
+        p.as_bytes().to_vec()
+    }
+}
+
+struct Session {
+    sftp: SftpClient<SshPipe>,
+}
+
+fn open_sftp(cli: &Cli, r: &Remote) -> Result<Session, String> {
+    let pipe = match &cli.sftp_direct {
+        Some(server) => SshPipe::spawn_program(server, &[]),
+        None => SshPipe::spawn(
+            &cli.ssh,
+            r.user.as_deref(),
+            &r.host,
+            r.port.or(cli.port),
+            true,
+            &["sftp".to_string()],
+        ),
+    }
+    .map_err(|e| e.to_string())?;
+    let sftp = SftpClient::new(pipe).map_err(|e| format!("Connection closed ({e})"))?;
+    Ok(Session { sftp })
+}
+
+/// Where `name` lands under a target that may be a directory.
+fn remote_target(
+    sess: &mut Session,
+    target: &[u8],
+    name: &[u8],
+    many: bool,
+) -> Result<Vec<u8>, String> {
+    let is_dir = sess.sftp.stat(target).is_ok_and(|a| transfer::is_dir(&a));
+    if is_dir {
+        Ok(transfer::remote_join(target, name))
+    } else if many {
+        Err(format!(
+            "{}: Not a directory",
+            String::from_utf8_lossy(target)
+        ))
+    } else {
+        Ok(target.to_vec())
+    }
+}
+
+fn local_target(target: &Path, name: &str, many: bool) -> Result<PathBuf, String> {
+    if target.is_dir() {
+        Ok(target.join(name))
+    } else if many {
+        Err(format!("{}: Not a directory", target.display()))
+    } else {
+        Ok(target.to_path_buf())
+    }
+}
+
+/// Report an error OpenSSH-style and remember that one happened.
+fn fail(errs: &mut u32, msg: impl std::fmt::Display) {
+    eprintln!("scp: {msg}");
+    *errs += 1;
+}
+
+fn upload_sftp(cli: &Cli, sources: &[String], to: &Remote, errs: &mut u32) {
+    let mut sess = match open_sftp(cli, to) {
+        Ok(s) => s,
+        Err(e) => return fail(errs, e),
     };
-    if !authed {
-        // Password auth needs somewhere safe to ask. Under BatchMode, or
-        // with no controlling terminal and no $SSH_ASKPASS, fail closed like
-        // OpenSSH instead of reading the password off a redirected stdin.
-        if batch {
-            return Err(
-                "Permission denied (publickey); BatchMode is on, not prompting for a \
-                        password"
-                    .into(),
-            );
+    let target = sftp_path(&to.path);
+    let many = sources.len() > 1;
+    for src in sources {
+        let path = Path::new(src);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| src.clone());
+        if path.is_dir() && !cli.xfer.recursive {
+            fail(errs, format!("{src}: not a regular file"));
+            continue;
         }
-        if !common::secret_prompt_available() {
-            return Err(
-                "Permission denied (publickey); no controlling terminal to prompt for a \
-                        password and $SSH_ASKPASS is unset"
-                    .into(),
-            );
+        let dest = match remote_target(&mut sess, &target, name.as_bytes(), many) {
+            Ok(d) => d,
+            Err(e) => {
+                fail(errs, e);
+                continue;
+            }
+        };
+        if let Err(e) = transfer::upload(&mut sess.sftp, path, &dest, &cli.xfer) {
+            fail(errs, e);
         }
-        vlog(1, &format!("trying password auth as {user}"));
-        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
-        client
-            .authenticate_password(&user, &password)
-            .map_err(|e| format!("Auth failed: {e}"))?;
-        vlog(1, &format!("authenticated as {user} via password"));
     }
-    Ok(client)
 }
 
-fn run() -> Result<i32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        println!();
-        println!("A pure-Rust SCP client built on puressh {VERSION}.");
-        println!("Note: for new scripts, prefer sftp (puressh's `sftp` binary, or");
-        println!("`puressh::client::Client::sftp` from code). OpenSSH 9.0+ has");
-        println!("deprecated the SCP protocol.");
-        return Ok(0);
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("puressh scp {VERSION}");
-        return Ok(0);
-    }
-
-    let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
-    set_verbose(cli.verbose);
-
-    // Resolve config once; each remote host re-walks the same blocks via
-    // `open_authenticated`.
-    let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
-
-    // Split into sources (all but last) and target (last).
-    let mut endpoints: Vec<Endpoint> = cli.positional.iter().map(|s| classify(s)).collect();
-    let target = endpoints.pop().expect("at least 2 positionals");
-    let sources = endpoints;
-
-    let n_remote_sources = sources
-        .iter()
-        .filter(|e| matches!(e, Endpoint::Remote { .. }))
-        .count();
-    let target_is_remote = matches!(target, Endpoint::Remote { .. });
-
-    if target_is_remote && n_remote_sources > 0 {
-        return Err("at most one side may be remote; three-corner copy not supported".into());
-    }
-    if !target_is_remote && n_remote_sources == 0 {
-        return Err("at least one of SOURCE/TARGET must be a remote (user@host:path)".into());
-    }
-    if !target_is_remote && n_remote_sources > 1 {
-        return Err("multiple remote sources not supported".into());
-    }
-
-    if target_is_remote {
-        // Local → Remote.
-        let (user, host, remote_path) = match target {
-            Endpoint::Remote { user, host, path } => (user, host, path),
-            Endpoint::Local(_) => unreachable!(),
+fn download_sftp(cli: &Cli, from: &Remote, target: &Path, many: bool, errs: &mut u32) {
+    let mut sess = match open_sftp(cli, from) {
+        Ok(s) => s,
+        Err(e) => return fail(errs, e),
+    };
+    let pattern = sftp_path(&from.path);
+    let matches = match transfer::remote_glob(&mut sess.sftp, b"", &pattern) {
+        Ok(m) => m,
+        Err(e) => return fail(errs, e),
+    };
+    let many = many || matches.len() > 1;
+    for m in matches {
+        let name = String::from_utf8_lossy(transfer::remote_basename(&m)).into_owned();
+        if !transfer::safe_name(name.as_bytes()) && name != "." {
+            fail(errs, format!("{name}: invalid file name"));
+            continue;
+        }
+        let dest = match local_target(target, &name, many) {
+            Ok(d) => d,
+            Err(e) => {
+                fail(errs, e);
+                continue;
+            }
         };
-        let local_paths: Vec<PathBuf> = sources
-            .into_iter()
-            .map(|e| match e {
-                Endpoint::Local(p) => Ok(p),
-                Endpoint::Remote { .. } => {
-                    Err("mixing local and remote sources is not supported".to_string())
-                }
-            })
-            .collect::<Result<_, _>>()?;
-        let path_refs: Vec<&std::path::Path> = local_paths.iter().map(|p| p.as_path()).collect();
+        if let Err(e) = transfer::download(&mut sess.sftp, &m, &dest, &cli.xfer) {
+            fail(errs, e);
+        }
+    }
+}
 
-        let mut client = open_authenticated(&host, user.as_deref(), &cli, &ssh_cfg)?;
-        let mut opts = ScpSendOptions::default();
-        opts.recursive = cli.recursive;
-        opts.preserve_times = cli.preserve_times;
-        client
-            .scp_send_to(&path_refs, &remote_path, opts)
-            .map_err(|e| format!("upload: {e}"))?;
+/// Remote to remote through this host, SFTP: each file goes through a
+/// local temporary copy.
+fn crossload_sftp(cli: &Cli, from: &Remote, to: &Remote, errs: &mut u32) {
+    let tmp = std::env::temp_dir().join(format!("puressh-scp-{}", std::process::id()));
+    if let Err(e) = std::fs::create_dir(&tmp) {
+        return fail(errs, format!("{}: {e}", tmp.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700));
+    }
+    let before = *errs;
+    download_sftp(cli, from, &tmp, true, errs);
+    if *errs == before {
+        let mut staged: Vec<String> = std::fs::read_dir(&tmp)
+            .map(|rd| {
+                rd.filter_map(|e| e.ok())
+                    .map(|e| e.path().display().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        staged.sort();
+        upload_sftp(cli, &staged, to, errs);
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The remote command for the legacy protocol.
+fn legacy_cmd(cli: &Cli, mode: &str, path: &str) -> Vec<String> {
+    let mut cmd = vec!["scp".to_string()];
+    if cli.verbose {
+        cmd.push("-v".into());
+    }
+    if cli.xfer.recursive {
+        cmd.push("-r".into());
+    }
+    if cli.xfer.preserve {
+        cmd.push("-p".into());
+    }
+    cmd.push(mode.into());
+    cmd.push("--".into());
+    cmd.push(if path.is_empty() {
+        ".".into()
     } else {
-        // Remote → Local.
-        let local_target = match target {
-            Endpoint::Local(p) => p,
-            Endpoint::Remote { .. } => unreachable!(),
-        };
-        // We've already established n_remote_sources == 1.
-        let (user, host, remote_path) = sources
-            .into_iter()
-            .find_map(|e| match e {
-                Endpoint::Remote { user, host, path } => Some((user, host, path)),
-                Endpoint::Local(_) => None,
-            })
-            .expect("one remote source");
+        path.into()
+    });
+    cmd
+}
 
-        let mut client = open_authenticated(&host, user.as_deref(), &cli, &ssh_cfg)?;
-        let mut opts = ScpRecvOptions::default();
-        opts.recursive = cli.recursive;
-        opts.preserve_times = cli.preserve_times;
-        // Let scp_recv_from auto-detect based on the local target.
-        opts.target_is_file = false;
-        client
-            .scp_recv_from(&remote_path, &local_target, opts)
-            .map_err(|e| format!("download: {e}"))?;
+fn legacy_pipe(cli: &Cli, r: &Remote, mode: &str) -> Result<SshPipe, String> {
+    SshPipe::spawn(
+        &cli.ssh,
+        r.user.as_deref(),
+        &r.host,
+        r.port.or(cli.port),
+        false,
+        &legacy_cmd(cli, mode, &r.path),
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn upload_legacy(cli: &Cli, sources: &[String], to: &Remote, errs: &mut u32) {
+    let mode = if sources.len() > 1 { "-dt" } else { "-t" };
+    let pipe = match legacy_pipe(cli, to, mode) {
+        Ok(p) => p,
+        Err(e) => return fail(errs, e),
+    };
+    let mut sender = match Sender::new(pipe) {
+        Ok(s) => s,
+        Err(e) => return fail(errs, e),
+    };
+    let mut opts = ScpSendOptions::default();
+    opts.recursive = cli.xfer.recursive;
+    opts.preserve_times = cli.xfer.preserve;
+    for src in sources {
+        if let Err(e) = sender.send_path(Path::new(src), &opts) {
+            fail(errs, format!("{src}: {e}"));
+        }
     }
+}
 
-    Ok(0)
+fn download_legacy(cli: &Cli, from: &Remote, target: &Path, errs: &mut u32) {
+    let pipe = match legacy_pipe(cli, from, "-f") {
+        Ok(p) => p,
+        Err(e) => return fail(errs, e),
+    };
+    let mut opts = ScpRecvOptions::default();
+    opts.recursive = cli.xfer.recursive;
+    opts.preserve_times = cli.xfer.preserve;
+    opts.target_is_file = !target.is_dir();
+    let res = Receiver::new(pipe, target, opts).and_then(|mut r| r.run());
+    if let Err(e) = res {
+        fail(errs, e);
+    }
+}
+
+/// Remote to remote through this host, legacy protocol: `scp -f` on the
+/// source piped into `scp -t` on the target.
+fn crossload_legacy(cli: &Cli, from: &Remote, to: &Remote, errs: &mut u32) {
+    let (src, dst) = match (legacy_pipe(cli, from, "-f"), legacy_pipe(cli, to, "-t")) {
+        (Ok(s), Ok(d)) => (s, d),
+        (Err(e), _) | (_, Err(e)) => return fail(errs, e),
+    };
+    let (mut src_r, mut src_w, src_child) = src.split();
+    let (mut dst_r, mut dst_w, dst_child) = dst.split();
+    // Each side's output is the other's input; a side closing ends the
+    // copy into the other.
+    let up = std::thread::spawn(move || io::copy(&mut src_r, &mut dst_w).map(|_| ()));
+    let down = std::thread::spawn(move || io::copy(&mut dst_r, &mut src_w).map(|_| ()));
+    let _ = up.join();
+    let _ = down.join();
+    drop((src_child, dst_child));
+}
+
+/// `-R`: run scp on the source host to copy straight to the target.
+fn remote_to_remote_direct(cli: &Cli, from: &Remote, target: &str, errs: &mut u32) {
+    let mut cmd = vec!["scp".to_string()];
+    cmd.extend(cli.passthrough.iter().cloned());
+    if let Some(p) = cli.port {
+        cmd.extend(["-P".into(), p.to_string()]);
+    }
+    cmd.push("--".into());
+    cmd.push(if from.path.is_empty() {
+        ".".into()
+    } else {
+        from.path.clone()
+    });
+    cmd.push(target.to_string());
+    match SshPipe::spawn(
+        &cli.ssh,
+        from.user.as_deref(),
+        &from.host,
+        from.port.or(cli.port),
+        false,
+        &cmd,
+    ) {
+        Ok(p) => {
+            if p.finish() != 0 {
+                *errs += 1;
+            }
+        }
+        Err(e) => fail(errs, e),
+    }
+}
+
+fn local_copy(cli: &Cli, sources: &[String], target: &str, errs: &mut u32) {
+    let mut cmd = std::process::Command::new("cp");
+    if cli.xfer.recursive {
+        cmd.arg("-r");
+    }
+    if cli.xfer.preserve {
+        cmd.arg("-p");
+    }
+    cmd.arg("--").args(sources).arg(target);
+    match cmd.status() {
+        Ok(s) if s.success() => {}
+        Ok(_) => *errs += 1,
+        Err(e) => fail(errs, format!("cp: {e}")),
+    }
+}
+
+/// Our stdin/stdout as one stream (the remote end of the legacy protocol).
+struct Stdio;
+
+impl io::Read for Stdio {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        io::stdin().read(buf)
+    }
+}
+
+impl io::Write for Stdio {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        io::stdout().write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+/// `scp -t target` / `scp -f source…`: run by the other side's scp in
+/// legacy (`-O`) mode.
+fn remote_end(cli: &Cli) -> u32 {
+    if cli.sink {
+        let target = Path::new(&cli.operands[0]);
+        if cli.target_dir && !target.is_dir() {
+            let _ = puressh::scp::protocol::write_fatal(
+                &mut Stdio,
+                &format!("scp: {}: Not a directory", target.display()),
+            );
+            return 1;
+        }
+        let mut opts = ScpRecvOptions::default();
+        opts.recursive = cli.xfer.recursive;
+        opts.preserve_times = cli.xfer.preserve;
+        opts.target_is_file = !target.is_dir();
+        match Receiver::new(Stdio, target, opts).and_then(|mut r| r.run()) {
+            Ok(()) => 0,
+            Err(_) => 1,
+        }
+    } else {
+        let mut opts = ScpSendOptions::default();
+        opts.recursive = cli.xfer.recursive;
+        opts.preserve_times = cli.xfer.preserve;
+        let mut sender = match Sender::new(Stdio) {
+            Ok(s) => s,
+            Err(_) => return 1,
+        };
+        let mut errs = 0;
+        for src in &cli.operands {
+            if sender.send_path(Path::new(src), &opts).is_err() {
+                errs += 1;
+            }
+        }
+        errs
+    }
+}
+
+fn run() -> Result<u32, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_args(&args)?;
+    if cli.sink || cli.source {
+        return Ok(remote_end(&cli));
+    }
+    let (target_arg, sources) = cli.operands.split_last().expect("checked");
+    let target_remote = remote(target_arg);
+    let mut errs = 0u32;
+
+    match &target_remote {
+        Some(to) => {
+            // Local sources go in one session; each remote source separately.
+            let locals: Vec<String> = sources
+                .iter()
+                .filter(|s| remote(s).is_none())
+                .cloned()
+                .collect();
+            if !locals.is_empty() {
+                if cli.legacy {
+                    upload_legacy(&cli, &locals, to, &mut errs);
+                } else {
+                    upload_sftp(&cli, &locals, to, &mut errs);
+                }
+            }
+            for s in sources {
+                let Some(from) = remote(s) else { continue };
+                if cli.remote_to_remote_direct {
+                    remote_to_remote_direct(&cli, &from, target_arg, &mut errs);
+                } else if cli.legacy {
+                    crossload_legacy(&cli, &from, to, &mut errs);
+                } else {
+                    crossload_sftp(&cli, &from, to, &mut errs);
+                }
+            }
+        }
+        None => {
+            let target = Path::new(target_arg);
+            let many = sources.len() > 1;
+            if many && !target.is_dir() {
+                return Err(format!("{target_arg}: Not a directory"));
+            }
+            let locals: Vec<String> = sources
+                .iter()
+                .filter(|s| remote(s).is_none())
+                .cloned()
+                .collect();
+            if !locals.is_empty() {
+                local_copy(&cli, &locals, target_arg, &mut errs);
+            }
+            for s in sources {
+                let Some(from) = remote(s) else { continue };
+                if cli.legacy {
+                    download_legacy(&cli, &from, target, &mut errs);
+                } else {
+                    download_sftp(&cli, &from, target, many, &mut errs);
+                }
+            }
+        }
+    }
+    let _ = cli.through_local;
+    Ok(errs)
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(code) => {
-            let clamped = code.clamp(0, 255) as u8;
-            ExitCode::from(clamped)
-        }
+        Ok(0) => ExitCode::SUCCESS,
+        Ok(_) => ExitCode::from(1),
         Err(msg) => {
-            eprintln!("scp: {msg}");
-            ExitCode::from(255)
+            eprintln!("{msg}");
+            ExitCode::from(1)
         }
     }
 }

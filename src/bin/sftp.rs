@@ -1,741 +1,1183 @@
-//! `sftp` — puressh's SFTP client driver.
+//! `sftp` — interactive and batch file transfer, a drop-in for OpenSSH's.
 //!
 //! ```text
-//! sftp [-P port] [-i identity_file] [-l user]
-//!      [-o StrictHostKeyChecking={yes,no,accept-new,ask}]
-//!      [-o UserKnownHostsFile=PATH]
-//!      [-o HashKnownHosts={yes,no}]
-//!      [-o IdentitiesOnly={yes,no}]
-//!      [user@]host
+//! sftp [-46AaCfNpqrv] [-B buffer_size] [-b batchfile] [-c cipher]
+//!      [-D sftp_server_command] [-F ssh_config] [-i identity_file]
+//!      [-J destination] [-l limit] [-o ssh_option] [-P port]
+//!      [-R num_requests] [-S program] [-s subsystem | sftp_server]
+//!      [-X sftp_option] destination
 //! ```
 //!
-//! Drops into an interactive REPL after authentication. Supports the
-//! common subset of OpenSSH `sftp(1)` commands:
-//! `ls`, `cd`, `lcd`, `pwd`, `lpwd`, `get`, `put`, `mkdir`, `rmdir`,
-//! `rm`, `mv`, `chmod`, `quit` / `exit` / `bye`.
-//!
-//! Path resolution is dumb on purpose — relative remote paths are joined
-//! with the SFTP session's virtual cwd via `realpath`; relative local
-//! paths are joined with the process cwd. Glob patterns are not expanded.
-//!
-//! Host-key policy mirrors the `ssh` and `scp` binaries — default is
-//! `StrictHostKeyChecking=ask`. Earlier versions of this binary hard-
-//! coded `HostKeyPolicy::AcceptAny`, which trusted anything on the wire;
-//! that's no longer the default.
+//! The session runs over `ssh -s host sftp` (`-S` picks the ssh), so every
+//! ssh option and ssh_config setting applies. `destination` is
+//! `[user@]host[:path]` or `sftp://[user@]host[:port][/path]`: a directory
+//! path starts the session there, a file path (or glob) is fetched and sftp
+//! exits. Commands follow OpenSSH's (`help` lists them); in batch mode
+//! (`-b`) each is echoed and the first failure aborts with status 1 unless
+//! the command is prefixed with `-` (`@` suppresses the echo).
 
-use std::io::{BufRead, Read, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use puressh::auth::ClientCredential;
-use puressh::client::{AlgoOverrides, Client, Config};
-use puressh::sftp::{
-    Attrs, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE, FxpStatus, SftpClient, SftpError,
-};
+use puressh::sftp::{Attrs, FxpStatus, SftpClient, SftpError};
 
-#[path = "common.rs"]
-mod common;
-use common::{
-    StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
-    expand_tilde, load_identity, parse_target, read_password_from_stdin, resolve_user, set_verbose,
-    try_load_default_identity, vlog,
-};
+#[path = "transfer.rs"]
+mod transfer;
+use transfer::{SshOptions, SshPipe, XferOpts, remote_basename};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const USAGE: &str = "usage: sftp [-46AaCfNpqrv] [-B buffer_size] [-b batchfile] [-c cipher]
+          [-D sftp_server_command] [-F ssh_config] [-i identity_file]
+          [-J destination] [-l limit] [-o ssh_option] [-P port]
+          [-R num_requests] [-S program] [-s subsystem | sftp_server]
+          [-X sftp_option] destination";
 
-/// Scrub bytes that are unsafe to emit to an interactive terminal.
-///
-/// SFTP `longname`/`filename`/`realpath` fields arrive as opaque,
-/// unvalidated bytes from the server. A malicious server can embed ANSI
-/// or OSC control sequences (e.g. `ESC[...m`, `ESC]0;...BEL`) that, when
-/// written verbatim to a TTY, rewrite the screen, retitle the window, or
-/// otherwise hijack the operator's terminal. Following OpenSSH sftp's
-/// `strnvis`/`ctrl` handling, replace every control byte — anything below
-/// `0x20` (including ESC `0x1b`, TAB `0x09`, CR/LF) and DEL `0x7f` — with
-/// a `?` placeholder. The `ls -l` long format uses spaces, not tabs, for
-/// column alignment, so scrubbing TAB does not disturb the layout.
-fn sanitize_terminal_bytes(src: &[u8]) -> Vec<u8> {
-    src.iter()
-        .map(|&b| if b < 0x20 || b == 0x7f { b'?' } else { b })
-        .collect()
-}
-
-const USAGE: &str = "usage: sftp [-v[v[v]]] [-F configfile] [-P port] [-i identity_file] [-l user] \
-                     [-o StrictHostKeyChecking={yes,no,accept-new,ask}] \
-                     [-o UserKnownHostsFile=PATH] [-o HashKnownHosts={yes,no}] \
-                     [-o IdentitiesOnly={yes,no}] [-o BatchMode={yes,no}] [user@]host";
+const HELP: &str = "Available commands:
+bye                                Quit sftp
+cd path                            Change remote directory to 'path'
+chgrp [-h] grp path                Change group of file 'path' to 'grp'
+chmod [-h] mode path               Change permissions of file 'path' to 'mode'
+chown [-h] own path                Change owner of file 'path' to 'own'
+df [-hi] [path]                    Display statistics for current directory or
+                                   filesystem containing 'path'
+exit                               Quit sftp
+get [-afpR] remote [local]         Download file
+help                               Display this help text
+lcd path                           Change local directory to 'path'
+lls [ls-options [path]]            Display local directory listing
+lmkdir path                        Create local directory
+ln [-s] oldpath newpath            Link remote file (-s for symlink)
+lpwd                               Print local working directory
+ls [-1afhlnrSt] [path]             Display remote directory listing
+lumask umask                       Set local umask to 'umask'
+mkdir path                         Create remote directory
+progress                           Toggle display of progress meter
+put [-afpR] local [remote]         Upload file
+pwd                                Display remote working directory
+quit                               Quit sftp
+reget [-fpR] remote [local]        Resume download file
+rename oldpath newpath             Rename remote file
+reput [-fpR] local [remote]        Resume upload file
+rm path                            Delete remote file
+rmdir path                         Remove remote directory
+symlink oldpath newpath            Symlink remote file
+version                            Show SFTP version
+!command                           Execute 'command' in local shell
+!                                  Escape to local shell
+?                                  Synonym for help";
 
 struct Cli {
-    /// `-F path`: load this `ssh_config` instead of the defaults.
-    config_file: Option<PathBuf>,
-    /// `None` ⇒ ssh_config `Port` wins (else built-in default 22).
+    ssh: SshOptions,
     port: Option<u16>,
-    identities: Vec<String>,
-    cli_user: Option<String>,
-    strict: Option<StrictMode>,
-    known_hosts_path: Option<PathBuf>,
-    hash_known_hosts: Option<bool>,
-    identities_only: Option<bool>,
-    /// `-o BatchMode=yes`: never prompt (no password, no host-key
-    /// question). `None` ⇒ the ssh_config `BatchMode` decides.
-    batch_mode: Option<bool>,
-    /// OpenSSH-style verbose level: `-v` → 1, `-vv` → 2, `-vvv` → 3.
-    /// See [`common::set_verbose`].
-    verbose: u8,
-    host: String,
-    user_in_host: Option<String>,
+    batch: Option<String>,
+    quiet: bool,
+    xfer: XferOpts,
+    fsync: bool,
+    subsystem: Option<String>,
+    sftp_direct: Option<String>,
+    destination: String,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
-    let mut config_file: Option<PathBuf> = None;
-    let mut port: Option<u16> = None;
-    let mut identities: Vec<String> = Vec::new();
-    let mut cli_user: Option<String> = None;
-    let mut strict: Option<StrictMode> = None;
-    let mut known_hosts_path: Option<PathBuf> = None;
-    let mut hash_known_hosts: Option<bool> = None;
-    let mut identities_only: Option<bool> = None;
-    let mut batch_mode: Option<bool> = None;
-    let mut verbose: u8 = 0;
-    let mut positional: Vec<String> = Vec::new();
-
+    const WITH_ARG: &str = "BbcDFiJloPRSsX";
+    let mut c = Cli {
+        ssh: SshOptions::default(),
+        port: None,
+        batch: None,
+        quiet: false,
+        xfer: XferOpts::default(),
+        fsync: false,
+        subsystem: None,
+        sftp_direct: None,
+        destination: String::new(),
+    };
+    let mut operands = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
         if a == "--" {
-            positional.extend_from_slice(&args[i + 1..]);
+            operands.extend(args[i + 1..].iter().cloned());
             break;
         }
-        match a.as_str() {
-            "-P" => {
-                i += 1;
-                let v = args.get(i).ok_or("-P requires a value")?;
-                port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?);
-            }
-            "-F" => {
-                i += 1;
-                let v = args.get(i).ok_or("-F requires a value")?.clone();
-                config_file = Some(PathBuf::from(v));
-            }
-            "-i" => {
-                i += 1;
-                let v = args.get(i).ok_or("-i requires a value")?.clone();
-                identities.push(v);
-            }
-            "-l" => {
-                i += 1;
-                let v = args.get(i).ok_or("-l requires a value")?.clone();
-                cli_user = Some(v);
-            }
-            "-o" => {
-                i += 1;
-                let v = args.get(i).ok_or("-o requires a value")?;
-                let (k, val) = v
-                    .split_once('=')
-                    .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?;
-                match k.to_ascii_lowercase().as_str() {
-                    "stricthostkeychecking" => {
-                        strict = Some(match val.to_ascii_lowercase().as_str() {
-                            "yes" => StrictMode::Yes,
-                            "no" | "off" => StrictMode::No,
-                            "accept-new" => StrictMode::AcceptNew,
-                            "ask" => StrictMode::Ask,
-                            other => return Err(format!("unknown StrictHostKeyChecking={other}")),
-                        });
+        if !a.starts_with('-') || a == "-" {
+            operands.push(a.clone());
+            i += 1;
+            continue;
+        }
+        let flags: Vec<char> = a[1..].chars().collect();
+        let mut j = 0;
+        while j < flags.len() {
+            let f = flags[j];
+            if WITH_ARG.contains(f) {
+                let rest: String = flags[j + 1..].iter().collect();
+                let v = if !rest.is_empty() {
+                    rest
+                } else {
+                    i += 1;
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| format!("option requires an argument -- {f}"))?
+                };
+                let num = |what: &str, v: &str| -> Result<u64, String> {
+                    v.parse::<u64>()
+                        .ok()
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| format!("Invalid {what}: {v}"))
+                };
+                match f {
+                    'B' => {
+                        c.xfer.chunk = u32::try_from(num("buffer size", &v)?)
+                            .ok()
+                            .filter(|n| *n <= 256 * 1024)
+                            .ok_or_else(|| format!("Invalid buffer size \"{v}\""))?
                     }
-                    "userknownhostsfile" => {
-                        known_hosts_path = Some(PathBuf::from(val));
+                    'b' => {
+                        c.batch = Some(v);
+                        c.quiet = true;
+                        c.ssh.push("-oBatchMode=yes", None);
                     }
-                    "hashknownhosts" => {
-                        hash_known_hosts =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
-                    }
-                    "identitiesonly" => {
-                        identities_only =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
-                    }
-                    "batchmode" => {
-                        batch_mode =
-                            Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
-                    }
-                    other => {
-                        return Err(format!("unsupported -o option: {other}={val}"));
-                    }
+                    'c' => c.ssh.push("-c", Some(&v)),
+                    'D' => c.sftp_direct = Some(v),
+                    'F' => c.ssh.push("-F", Some(&v)),
+                    'i' => c.ssh.push("-i", Some(&v)),
+                    'J' => c.ssh.push("-J", Some(&v)),
+                    'l' => c.xfer.limit = Some(num("limit", &v)? * 1024 / 8),
+                    'o' => c.ssh.push("-o", Some(&v)),
+                    'P' => c.port = Some(v.parse().map_err(|_| format!("Bad port \"{v}\""))?),
+                    'R' => c.xfer.depth = num("number of requests", &v)? as usize,
+                    'S' => c.ssh.program = Some(v),
+                    's' => c.subsystem = Some(v),
+                    'X' => match v.split_once('=') {
+                        Some(("buffer", n)) => {
+                            c.xfer.chunk = n
+                                .parse()
+                                .ok()
+                                .filter(|n| (1..=256 * 1024).contains(n))
+                                .ok_or_else(|| format!("Invalid buffer size \"{n}\""))?
+                        }
+                        Some(("nrequests", n)) => {
+                            c.xfer.depth = num("number of requests", n)? as usize
+                        }
+                        _ => return Err(format!("Invalid -X option \"{v}\"")),
+                    },
+                    _ => unreachable!(),
                 }
+                break;
             }
-            "-v" => {
-                verbose = verbose.saturating_add(1).min(3);
+            match f {
+                '4' | '6' | 'C' | 'v' => c.ssh.push(&format!("-{f}"), None),
+                'A' => c.ssh.forward_agent = true,
+                'a' => c.xfer.resume = true,
+                'f' => c.fsync = true,
+                'N' => {}
+                'p' => c.xfer.preserve = true,
+                'q' => {
+                    c.quiet = true;
+                    c.ssh.push("-q", None);
+                }
+                'r' => c.xfer.recursive = true,
+                _ => return Err(format!("unknown option -- {f}\n{USAGE}")),
             }
-            "-vv" => {
-                verbose = verbose.max(2);
-            }
-            "-vvv" => {
-                verbose = 3;
-            }
-            s if s.starts_with('-') => {
-                return Err(format!("unknown flag: {s}"));
-            }
-            _ => positional.push(a.clone()),
+            j += 1;
         }
         i += 1;
     }
-
-    if positional.is_empty() {
-        return Err("missing host argument".into());
+    match operands.as_slice() {
+        [d] => c.destination = d.clone(),
+        _ => return Err(USAGE.into()),
     }
-    let target = positional.remove(0);
-    // parse_target accepts `[user@]host[:port]` with bare /
-    // bracketed IPv6 (`2001:db8::1`, `[2001:db8::1]:22`). When the
-    // target carries an explicit `:port`, `-P` still wins if given
-    // (mirroring how `-p` works for ssh).
-    let (user_in_host, host, target_port) = parse_target(&target)?;
-    if port.is_none() {
-        port = target_port;
-    }
-
-    Ok(Cli {
-        config_file,
-        port,
-        identities,
-        cli_user,
-        strict,
-        known_hosts_path,
-        hash_known_hosts,
-        identities_only,
-        batch_mode,
-        verbose,
-        host,
-        user_in_host,
-    })
+    Ok(c)
 }
 
-/// Resolve a remote path token against the session's virtual cwd.
-fn remote_join(cwd: &[u8], rel: &str) -> Vec<u8> {
-    if rel.starts_with('/') {
-        rel.as_bytes().to_vec()
-    } else {
-        let mut out = cwd.to_vec();
-        if !out.ends_with(b"/") {
-            out.push(b'/');
-        }
-        out.extend_from_slice(rel.as_bytes());
-        out
-    }
-}
-
-/// Render an [`SftpError`] for the terminal. The `message` of a `Status`
-/// reply is server-supplied free text that lands on the user's terminal
-/// via `eprintln!`; scrub control bytes so a hostile server cannot inject
-/// escape sequences through an error message (same treatment as directory
-/// listings and the remote cwd).
-fn sftp_err_to_string(e: SftpError) -> String {
+/// OpenSSH's wording for a failed request (its `fx2txt`).
+fn fx(e: &SftpError) -> String {
     match e {
-        SftpError::Status { code, message } => {
-            if message.is_empty() {
-                format!("{code:?}")
-            } else {
-                format!("{code:?}: {}", common::sanitize_terminal_str(&message))
+        SftpError::Status { code, .. } => match code {
+            FxpStatus::Ok => "Success",
+            FxpStatus::Eof => "End of file",
+            FxpStatus::NoSuchFile => "No such file or directory",
+            FxpStatus::PermissionDenied => "Permission denied",
+            FxpStatus::Failure => "Failure",
+            FxpStatus::BadMessage => "Bad message",
+            FxpStatus::NoConnection => "No connection",
+            FxpStatus::ConnectionLost => "Connection lost",
+            FxpStatus::OpUnsupported => "Operation unsupported",
+            _ => "Unknown status",
+        }
+        .into(),
+        other => other.to_string(),
+    }
+}
+
+fn lossy(b: &[u8]) -> String {
+    String::from_utf8_lossy(b).into_owned()
+}
+
+/// Scrub control bytes (terminal escapes) from server-supplied names before
+/// they reach the terminal, as OpenSSH does.
+fn safe_display(b: &[u8]) -> String {
+    let scrubbed: Vec<u8> = b
+        .iter()
+        .map(|c| if *c < 0x20 || *c == 0x7f { b'?' } else { *c })
+        .collect();
+    lossy(&scrubbed)
+}
+
+/// Split a command line like OpenSSH's sftp: whitespace separates words,
+/// `'…'` and `"…"` quote, `\` escapes the next character.
+fn split_line(line: &str) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_word = false;
+    let mut quote: Option<char> = None;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some('"'), '\\') | (None, '\\') => match chars.next() {
+                Some(n) => {
+                    cur.push(n);
+                    in_word = true;
+                }
+                None => return Err("Invalid escape at end of line".into()),
+            },
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_word = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_word {
+                    out.push(std::mem::take(&mut cur));
+                    in_word = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                in_word = true;
             }
         }
-        other => format!("{other:?}"),
     }
+    if quote.is_some() {
+        return Err("Unterminated quote".into());
+    }
+    if in_word {
+        out.push(cur);
+    }
+    Ok(out)
 }
 
-/// REPL state. `remote_cwd` is the SFTP virtual cwd reported by `realpath
-/// "."` on first interaction and kept in sync by `cd`.
-struct Repl<T: Read + Write> {
-    sftp: SftpClient<T>,
-    remote_cwd: Vec<u8>,
-    local_cwd: PathBuf,
-}
-
-impl<T: Read + Write> Repl<T> {
-    fn new(mut sftp: SftpClient<T>) -> Result<Self, String> {
-        let remote_cwd = sftp.realpath(b".").map_err(sftp_err_to_string)?;
-        let local_cwd = std::env::current_dir().map_err(|e| format!("getcwd: {e}"))?;
-        Ok(Self {
-            sftp,
-            remote_cwd,
-            local_cwd,
-        })
-    }
-
-    fn run(&mut self) -> Result<(), String> {
-        let stdin = std::io::stdin();
-        let mut stdin = stdin.lock();
-        let mut line = String::new();
-        loop {
-            eprint!("sftp> ");
-            std::io::stderr().flush().ok();
-            line.clear();
-            let n = match stdin.read_line(&mut line) {
-                Ok(n) => n,
-                Err(e) => return Err(format!("stdin: {e}")),
-            };
-            if n == 0 {
-                eprintln!();
-                return Ok(());
+/// Split leading `-xyz` flags off a command's arguments.
+fn take_flags(args: &[String], allowed: &str, cmd: &str) -> Result<(String, Vec<String>), String> {
+    let mut flags = String::new();
+    let mut i = 0;
+    while i < args.len() && args[i].starts_with('-') && args[i].len() > 1 {
+        if args[i] == "--" {
+            i += 1;
+            break;
+        }
+        for f in args[i][1..].chars() {
+            if !allowed.contains(f) {
+                return Err(format!("{cmd}: Invalid flag -{f}"));
             }
-            let cmd: Vec<&str> = line.split_whitespace().collect();
-            if cmd.is_empty() {
+            flags.push(f);
+        }
+        i += 1;
+    }
+    Ok((flags, args[i..].to_vec()))
+}
+
+fn human_size(n: u64) -> String {
+    const UNITS: [&str; 7] = ["", "K", "M", "G", "T", "P", "E"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n}B")
+    } else if v < 10.0 {
+        format!("{v:.1}{}", UNITS[u])
+    } else {
+        format!("{v:.0}{}", UNITS[u])
+    }
+}
+
+/// `ls -l` line formatted from attributes (`-n`, `-h`, or a single file).
+fn long_line(name: &str, a: &Attrs, human: bool, owners: Option<(&str, &str)>) -> String {
+    let mode = a.permissions.unwrap_or(0);
+    let kind = match mode & 0o170000 {
+        0o040000 => 'd',
+        0o120000 => 'l',
+        0o020000 => 'c',
+        0o060000 => 'b',
+        0o010000 => 'p',
+        0o140000 => 's',
+        _ => '-',
+    };
+    let bit = |m: u32, c: char| if mode & m != 0 { c } else { '-' };
+    let mut perms = String::with_capacity(10);
+    perms.push(kind);
+    for (r, w, x, special, sc) in [
+        (0o400, 0o200, 0o100, 0o4000, 's'),
+        (0o040, 0o020, 0o010, 0o2000, 's'),
+        (0o004, 0o002, 0o001, 0o1000, 't'),
+    ] {
+        perms.push(bit(r, 'r'));
+        perms.push(bit(w, 'w'));
+        perms.push(match (mode & x != 0, mode & special != 0) {
+            (true, true) => sc,
+            (false, true) => sc.to_ascii_uppercase(),
+            (true, false) => 'x',
+            (false, false) => '-',
+        });
+    }
+    let (uid, gid) = a.uid_gid.unwrap_or((0, 0));
+    let (user, group) = match owners {
+        Some((u, g)) if !u.is_empty() && !g.is_empty() => (u.to_string(), g.to_string()),
+        _ => (uid.to_string(), gid.to_string()),
+    };
+    let size = a.size.unwrap_or(0);
+    let size = if human {
+        human_size(size)
+    } else {
+        size.to_string()
+    };
+    let mtime = a.atime_mtime.map(|(_, m)| m).unwrap_or(0);
+    format!(
+        "{perms}    ? {user:<8} {group:<8} {size:>8} {} {name}",
+        format_mtime(mtime)
+    )
+}
+
+fn format_mtime(t: u32) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let local = i64::from(t) + transfer::local_offset(i64::from(t));
+    let days = local.div_euclid(86_400);
+    let secs = local.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // Like ls: the time for the last six months, else the year.
+    if (now - i64::from(t)).abs() < 183 * 86_400 {
+        format!(
+            "{} {d:>2} {:02}:{:02}",
+            MONTHS[(m - 1) as usize],
+            secs / 3600,
+            secs / 60 % 60
+        )
+    } else {
+        format!("{} {d:>2}  {y}", MONTHS[(m - 1) as usize])
+    }
+}
+
+struct Session {
+    sftp: SftpClient<SshPipe>,
+    pwd: Vec<u8>,
+    home: Vec<u8>,
+    xfer: XferOpts,
+    quiet: bool,
+    progress: bool,
+    fsync: bool,
+}
+
+enum Flow {
+    Continue,
+    Quit,
+}
+
+impl Session {
+    /// A remote path: `~` / `~/x` from the login directory, else relative
+    /// to the working directory.
+    fn resolve(&self, p: &str) -> Vec<u8> {
+        if p == "~" {
+            return self.home.clone();
+        }
+        if let Some(rest) = p.strip_prefix("~/") {
+            return transfer::remote_join(&self.home, rest.as_bytes());
+        }
+        transfer::remote_join(&self.pwd, p.as_bytes())
+    }
+
+    fn glob(&mut self, p: &str) -> Result<Vec<Vec<u8>>, String> {
+        let full = self.resolve(p);
+        transfer::remote_glob(&mut self.sftp, b"", &full)
+    }
+
+    fn opts(&self, flags: &str, resume: bool) -> XferOpts {
+        let mut o = self.xfer.clone();
+        o.preserve |= flags.contains('p') || flags.contains('P');
+        o.recursive |= flags.contains('r') || flags.contains('R');
+        o.resume |= resume || flags.contains('a');
+        o.progress = self.progress && !self.quiet;
+        o.announce_dirs = true;
+        o
+    }
+
+    fn run(&mut self, args: &[String]) -> Result<Flow, String> {
+        let Some((cmd, rest)) = args.split_first() else {
+            return Ok(Flow::Continue);
+        };
+        match cmd.as_str() {
+            "bye" | "exit" | "quit" => return Ok(Flow::Quit),
+            "help" | "?" => println!("{HELP}"),
+            "version" => println!("SFTP protocol version {}", self.sftp.server_version()),
+            "pwd" => println!("Remote working directory: {}", safe_display(&self.pwd)),
+            "lpwd" => println!(
+                "Local working directory: {}",
+                std::env::current_dir()
+                    .map(|d| d.display().to_string())
+                    .unwrap_or_default()
+            ),
+            "progress" => {
+                self.progress = !self.progress;
+                println!(
+                    "Progress meter {}",
+                    if self.progress { "enabled" } else { "disabled" }
+                );
+            }
+            "cd" => self.cd(rest.first().map(String::as_str))?,
+            "lcd" => {
+                let target = match rest.first() {
+                    Some(p) => PathBuf::from(p),
+                    None => std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .unwrap_or_default(),
+                };
+                std::env::set_current_dir(&target).map_err(|e| {
+                    format!(
+                        "Couldn't change local directory to \"{}\": {}",
+                        target.display(),
+                        io_text(&e)
+                    )
+                })?;
+            }
+            "lmkdir" => {
+                let p = rest
+                    .first()
+                    .ok_or("You must specify a path after a lmkdir command.")?;
+                std::fs::create_dir(p).map_err(|e| {
+                    format!("Couldn't create local directory \"{p}\": {}", io_text(&e))
+                })?;
+            }
+            "lls" => {
+                let st = std::process::Command::new("ls").args(rest).status();
+                if !st.is_ok_and(|s| s.success()) {
+                    return Err("Couldn't execute \"ls\"".into());
+                }
+            }
+            "lumask" => {
+                let v = rest
+                    .first()
+                    .ok_or("You must supply a numeric argument to the lumask command.")?;
+                let mask = u32::from_str_radix(v, 8)
+                    .ok()
+                    .filter(|m| *m <= 0o777)
+                    .ok_or("You must supply a numeric argument to the lumask command.")?;
+                set_umask(mask);
+                println!("Local umask: {mask:03o}");
+            }
+            "ls" | "dir" => self.ls(rest)?,
+            "get" | "reget" => self.get(rest, cmd == "reget")?,
+            "put" | "reput" => self.put(rest, cmd == "reput")?,
+            "mkdir" => {
+                let p = rest
+                    .first()
+                    .ok_or("You must specify a path after a mkdir command.")?;
+                let abs = self.resolve(p);
+                let mut a = Attrs::default();
+                a.permissions = Some(0o777);
+                self.sftp
+                    .mkdir(&abs, a)
+                    .map_err(|e| format!("remote mkdir \"{}\": {}", lossy(&abs), fx(&e)))?;
+            }
+            "rmdir" => {
+                let p = rest
+                    .first()
+                    .ok_or("You must specify a path after a rmdir command.")?;
+                let abs = self.resolve(p);
+                self.sftp
+                    .rmdir(&abs)
+                    .map_err(|e| format!("remote rmdir \"{}\": {}", lossy(&abs), fx(&e)))?;
+            }
+            "rm" => {
+                let p = rest
+                    .first()
+                    .ok_or("You must specify a path after a rm command.")?;
+                let mut err = None;
+                for f in self.glob(p)? {
+                    if !self.quiet {
+                        println!("Removing {}", safe_display(&f));
+                    }
+                    if let Err(e) = self.sftp.remove(&f) {
+                        let msg = format!("remote delete {}: {}", lossy(&f), fx(&e));
+                        eprintln!("{msg}");
+                        err = Some(msg);
+                    }
+                }
+                if err.is_some() {
+                    return Err(String::new());
+                }
+            }
+            "rename" => {
+                let [old, new] = rest else {
+                    return Err("You must specify two paths after a rename command.".into());
+                };
+                let (o, n) = (self.resolve(old), self.resolve(new));
+                let res = if self.sftp.has_extension("posix-rename@openssh.com") {
+                    self.sftp.posix_rename(&o, &n)
+                } else {
+                    self.sftp.rename(&o, &n)
+                };
+                res.map_err(|e| {
+                    format!(
+                        "Couldn't rename file \"{}\" to \"{}\": {}",
+                        lossy(&o),
+                        lossy(&n),
+                        fx(&e)
+                    )
+                })?;
+            }
+            "ln" | "symlink" => {
+                let (flags, paths) = take_flags(rest, "s", cmd)?;
+                let [old, new] = paths.as_slice() else {
+                    return Err(format!("You must specify two paths after a {cmd} command."));
+                };
+                let link = self.resolve(new);
+                if cmd == "symlink" || flags.contains('s') {
+                    // The target is stored as given (relative stays relative).
+                    self.sftp.symlink(old.as_bytes(), &link).map_err(|e| {
+                        format!(
+                            "Couldn't symlink file \"{old}\" to \"{}\": {}",
+                            lossy(&link),
+                            fx(&e)
+                        )
+                    })?;
+                } else {
+                    if !self.sftp.has_extension("hardlink@openssh.com") {
+                        return Err("Server does not support hardlink@openssh.com extension".into());
+                    }
+                    let target = self.resolve(old);
+                    self.sftp.hardlink(&target, &link).map_err(|e| {
+                        format!(
+                            "Couldn't link file \"{}\" to \"{}\": {}",
+                            lossy(&target),
+                            lossy(&link),
+                            fx(&e)
+                        )
+                    })?;
+                }
+            }
+            "chmod" | "chown" | "chgrp" => self.chattr(cmd, rest)?,
+            "df" => self.df(rest)?,
+            "copy" | "cp" => {
+                return Err("Server does not support copy-data extension".into());
+            }
+            other => return Err(format!("Invalid command \"{other}\".")),
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn cd(&mut self, p: Option<&str>) -> Result<(), String> {
+        let abs = match p {
+            Some(p) => self.resolve(p),
+            None => self.home.clone(),
+        };
+        let a = self
+            .sftp
+            .stat(&abs)
+            .map_err(|e| format!("stat remote: {}", fx(&e)))?;
+        if !transfer::is_dir(&a) {
+            return Err(format!(
+                "Can't change directory: \"{}\" is not a directory",
+                lossy(&abs)
+            ));
+        }
+        self.pwd = self.sftp.realpath(&abs).map_err(|e| fx(&e))?;
+        Ok(())
+    }
+
+    fn ls(&mut self, args: &[String]) -> Result<(), String> {
+        let (flags, paths) = take_flags(args, "1afhlnrSt", "ls")?;
+        let long = flags.contains('l') || flags.contains('n');
+        let all = flags.contains('a');
+        let targets: Vec<String> = if paths.is_empty() {
+            vec![lossy(&self.pwd)]
+        } else {
+            paths
+        };
+        for t in targets {
+            let abs = self.resolve(&t);
+            let matches = if transfer::has_glob(&abs) {
+                self.glob(&t)
+                    .map_err(|_| format!("Can't ls: \"{}\" not found", lossy(&abs)))?
+            } else {
+                vec![abs.clone()]
+            };
+            let mut entries: Vec<(Vec<u8>, Vec<u8>, Attrs)> = Vec::new();
+            for m in matches {
+                let a = self
+                    .sftp
+                    .stat(&m)
+                    .map_err(|_| format!("Can't ls: \"{}\" not found", lossy(&m)))?;
+                if transfer::is_dir(&a) && !transfer::has_glob(&abs) {
+                    let h = self
+                        .sftp
+                        .opendir(&m)
+                        .map_err(|e| format!("Couldn't read directory: {}", fx(&e)))?;
+                    while let Some(batch) = self.sftp.readdir(&h).map_err(|e| fx(&e))? {
+                        for e in batch {
+                            if !all && e.filename.first() == Some(&b'.') {
+                                continue;
+                            }
+                            entries.push((e.filename, e.longname, e.attrs));
+                        }
+                    }
+                    let _ = self.sftp.close(&h);
+                } else {
+                    let name = if paths_given(&t) {
+                        m.clone()
+                    } else {
+                        remote_basename(&m).to_vec()
+                    };
+                    entries.push((name, Vec::new(), a));
+                }
+            }
+            if !flags.contains('f') {
+                if flags.contains('S') {
+                    entries.sort_by(|a, b| b.2.size.cmp(&a.2.size).then(a.0.cmp(&b.0)));
+                } else if flags.contains('t') {
+                    let mt = |a: &Attrs| a.atime_mtime.map(|t| t.1).unwrap_or(0);
+                    entries.sort_by(|a, b| mt(&b.2).cmp(&mt(&a.2)).then(a.0.cmp(&b.0)));
+                } else {
+                    entries.sort_by(|a, b| a.0.cmp(&b.0));
+                }
+                if flags.contains('r') {
+                    entries.reverse();
+                }
+            }
+            let out = io::stdout();
+            let mut out = out.lock();
+            if long {
+                let numeric = flags.contains('n');
+                let human = flags.contains('h');
+                // Names for the lines formatted here (the server's own
+                // `longname` already has them), as OpenSSH asks the server.
+                let ids: Vec<(u32, u32)> = entries
+                    .iter()
+                    .filter(|e| e.1.is_empty() || human)
+                    .filter_map(|e| e.2.uid_gid)
+                    .collect();
+                let names = if !numeric
+                    && !ids.is_empty()
+                    && self.sftp.has_extension("users-groups-by-id@openssh.com")
+                {
+                    let uids: Vec<u32> = ids.iter().map(|i| i.0).collect();
+                    let gids: Vec<u32> = ids.iter().map(|i| i.1).collect();
+                    self.sftp
+                        .users_groups_by_id(&uids, &gids)
+                        .ok()
+                        .map(|(u, g)| {
+                            ids.iter()
+                                .zip(u.iter().zip(g.iter()))
+                                .map(|(id, (u, g))| (*id, (lossy(u), lossy(g))))
+                                .collect::<std::collections::BTreeMap<_, _>>()
+                        })
+                } else {
+                    None
+                };
+                for (name, longname, a) in &entries {
+                    let line = if !longname.is_empty() && !numeric && !human {
+                        safe_display(longname)
+                    } else {
+                        let owners = a
+                            .uid_gid
+                            .and_then(|id| names.as_ref()?.get(&id))
+                            .map(|(u, g)| (u.as_str(), g.as_str()));
+                        long_line(&safe_display(name), a, human, owners)
+                    };
+                    let _ = writeln!(out, "{line}");
+                }
+            } else if flags.contains('1') {
+                for (name, _, _) in &entries {
+                    let _ = writeln!(out, "{}", safe_display(name));
+                }
+            } else {
+                let names: Vec<String> = entries.iter().map(|e| safe_display(&e.0)).collect();
+                let width = names.iter().map(|n| n.chars().count()).max().unwrap_or(0) + 2;
+                let cols = (terminal_width() / width.max(1)).max(1);
+                for (i, n) in names.iter().enumerate() {
+                    let _ = write!(out, "{n:<width$}");
+                    if (i + 1) % cols == 0 || i + 1 == names.len() {
+                        let _ = writeln!(out);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn get(&mut self, args: &[String], resume: bool) -> Result<(), String> {
+        let (flags, paths) = take_flags(args, "afpPrR", "get")?;
+        let (src, dst) = match paths.as_slice() {
+            [s] => (s, None),
+            [s, d] => (s, Some(d.as_str())),
+            _ => return Err("You must specify at least one path after a get command.".into()),
+        };
+        let abs = self.resolve(src);
+        let matches = if transfer::has_glob(&abs) {
+            self.glob(src)
+                .map_err(|_| format!("File \"{}\" not found.", lossy(&abs)))?
+        } else {
+            vec![abs.clone()]
+        };
+        let local_dir = dst
+            .map(Path::new)
+            .filter(|d| d.is_dir())
+            .map(Path::to_path_buf);
+        if matches.len() > 1 && dst.is_some() && local_dir.is_none() {
+            return Err(
+                "Multiple source paths, but destination \"{}\" is not a directory"
+                    .replace("{}", dst.unwrap_or_default()),
+            );
+        }
+        let opts = self.opts(&flags, resume);
+        let mut failed = false;
+        for m in matches {
+            let name = lossy(remote_basename(&m));
+            if self.sftp.stat(&m).is_err() {
+                eprintln!("File \"{}\" not found.", lossy(&m));
+                failed = true;
                 continue;
             }
-            match cmd[0] {
-                "quit" | "exit" | "bye" => return Ok(()),
-                "pwd" => {
-                    // `remote_cwd` is the server's `realpath` reply — opaque
-                    // peer-supplied bytes. Scrub control bytes before echoing
-                    // to the TTY (terminal escape injection).
-                    let safe = sanitize_terminal_bytes(&self.remote_cwd);
-                    println!(
-                        "Remote working directory: {}",
-                        String::from_utf8_lossy(&safe)
-                    );
-                }
-                "lpwd" => println!("Local working directory: {}", self.local_cwd.display()),
-                "cd" => {
-                    if let Err(e) = self.cmd_cd(cmd.get(1).copied().unwrap_or("")) {
-                        eprintln!("cd: {e}");
-                    }
-                }
-                "lcd" => {
-                    if let Err(e) = self.cmd_lcd(cmd.get(1).copied().unwrap_or("")) {
-                        eprintln!("lcd: {e}");
-                    }
-                }
-                "ls" => {
-                    if let Err(e) = self.cmd_ls(cmd.get(1).copied()) {
-                        eprintln!("ls: {e}");
-                    }
-                }
-                "get" => {
-                    if cmd.len() < 2 {
-                        eprintln!("usage: get remote-path [local-path]");
-                        continue;
-                    }
-                    let local = cmd.get(2).copied();
-                    if let Err(e) = self.cmd_get(cmd[1], local) {
-                        eprintln!("get: {e}");
-                    }
-                }
-                "put" => {
-                    if cmd.len() < 2 {
-                        eprintln!("usage: put local-path [remote-path]");
-                        continue;
-                    }
-                    let remote = cmd.get(2).copied();
-                    if let Err(e) = self.cmd_put(cmd[1], remote) {
-                        eprintln!("put: {e}");
-                    }
-                }
-                "mkdir" => {
-                    if cmd.len() < 2 {
-                        eprintln!("usage: mkdir remote-path");
-                        continue;
-                    }
-                    let abs = remote_join(&self.remote_cwd, cmd[1]);
-                    if let Err(e) = self.sftp.mkdir(&abs, Attrs::default()) {
-                        eprintln!("mkdir: {}", sftp_err_to_string(e));
-                    }
-                }
-                "rmdir" => {
-                    if cmd.len() < 2 {
-                        eprintln!("usage: rmdir remote-path");
-                        continue;
-                    }
-                    let abs = remote_join(&self.remote_cwd, cmd[1]);
-                    if let Err(e) = self.sftp.rmdir(&abs) {
-                        eprintln!("rmdir: {}", sftp_err_to_string(e));
-                    }
-                }
-                "rm" => {
-                    if cmd.len() < 2 {
-                        eprintln!("usage: rm remote-path");
-                        continue;
-                    }
-                    let abs = remote_join(&self.remote_cwd, cmd[1]);
-                    if let Err(e) = self.sftp.remove(&abs) {
-                        eprintln!("rm: {}", sftp_err_to_string(e));
-                    }
-                }
-                "mv" | "rename" => {
-                    if cmd.len() < 3 {
-                        eprintln!("usage: mv oldpath newpath");
-                        continue;
-                    }
-                    let from = remote_join(&self.remote_cwd, cmd[1]);
-                    let to = remote_join(&self.remote_cwd, cmd[2]);
-                    if let Err(e) = self.sftp.rename(&from, &to) {
-                        eprintln!("mv: {}", sftp_err_to_string(e));
-                    }
-                }
+            let local = match (&local_dir, dst) {
+                (Some(d), _) => d.join(&name),
+                (None, Some(d)) => PathBuf::from(d),
+                (None, None) => PathBuf::from(&name),
+            };
+            if !self.quiet {
+                let slash = if self.sftp.stat(&m).is_ok_and(|a| transfer::is_dir(&a))
+                    && m.last() != Some(&b'/')
+                {
+                    "/"
+                } else {
+                    ""
+                };
+                println!(
+                    "Fetching {}{slash} to {}",
+                    safe_display(&m),
+                    local.display()
+                );
+            }
+            if let Err(e) = transfer::download(&mut self.sftp, &m, &local, &opts) {
+                eprintln!("{e}");
+                failed = true;
+            } else if (self.fsync || flags.contains('f'))
+                && let Ok(f) = std::fs::File::open(&local)
+            {
+                let _ = f.sync_all();
+            }
+        }
+        if failed { Err(String::new()) } else { Ok(()) }
+    }
+
+    fn put(&mut self, args: &[String], resume: bool) -> Result<(), String> {
+        let (flags, paths) = take_flags(args, "afpPrR", "put")?;
+        let (src, dst) = match paths.as_slice() {
+            [s] => (s, None),
+            [s, d] => (s, Some(d.as_str())),
+            _ => return Err("You must specify at least one path after a put command.".into()),
+        };
+        let locals = transfer::local_glob(src).map_err(|_| format!("File \"{src}\" not found."))?;
+        let target = dst.map(|d| self.resolve(d));
+        let target_is_dir = match &target {
+            Some(t) => self.sftp.stat(t).is_ok_and(|a| transfer::is_dir(&a)),
+            None => true,
+        };
+        if locals.len() > 1 && !target_is_dir {
+            return Err(format!(
+                "Multiple paths match, but destination \"{}\" is not a directory",
+                lossy(target.as_deref().unwrap_or_default())
+            ));
+        }
+        let opts = self.opts(&flags, resume);
+        let mut failed = false;
+        for l in locals {
+            let name = l
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let remote = match &target {
+                Some(t) if target_is_dir => transfer::remote_join(t, name.as_bytes()),
+                Some(t) => t.clone(),
+                None => transfer::remote_join(&self.pwd, name.as_bytes()),
+            };
+            if !l.exists() {
+                eprintln!("File \"{}\" not found.", l.display());
+                failed = true;
+                continue;
+            }
+            if !self.quiet {
+                let slash = if l.is_dir() && !l.to_string_lossy().ends_with('/') {
+                    "/"
+                } else {
+                    ""
+                };
+                println!(
+                    "Uploading {}{slash} to {}",
+                    l.display(),
+                    safe_display(&remote)
+                );
+            }
+            if let Err(e) = transfer::upload(&mut self.sftp, &l, &remote, &opts) {
+                eprintln!("{e}");
+                failed = true;
+            } else if (self.fsync || flags.contains('f'))
+                && self.sftp.has_extension("fsync@openssh.com")
+                && let Ok(h) = self
+                    .sftp
+                    .open(&remote, puressh::sftp::FXF_WRITE, Attrs::default())
+            {
+                let _ = self.sftp.fsync(&h);
+                let _ = self.sftp.close(&h);
+            }
+        }
+        if failed { Err(String::new()) } else { Ok(()) }
+    }
+
+    fn chattr(&mut self, cmd: &str, args: &[String]) -> Result<(), String> {
+        let (_flags, rest) = take_flags(args, "h", cmd)?;
+        let [value, path] = rest.as_slice() else {
+            return Err(format!(
+                "You must specify a value and a path after a {cmd} command."
+            ));
+        };
+        let mut failed = false;
+        for f in self.glob(path)? {
+            let mut a = Attrs::default();
+            match cmd {
                 "chmod" => {
-                    if cmd.len() < 3 {
-                        eprintln!("usage: chmod mode remote-path");
-                        continue;
+                    let mode = u32::from_str_radix(value, 8)
+                        .ok()
+                        .filter(|m| *m <= 0o7777)
+                        .ok_or("You must supply a numeric argument to the chmod command.")?;
+                    a.permissions = Some(mode);
+                    if !self.quiet {
+                        println!("Changing mode on {}", safe_display(&f));
                     }
-                    let mode = match u32::from_str_radix(cmd[1], 8) {
-                        Ok(m) => m,
-                        Err(_) => {
-                            eprintln!("chmod: invalid mode (octal expected): {}", cmd[1]);
+                }
+                _ => {
+                    let id: u32 = value.parse().map_err(|_| {
+                        format!("You must supply a numeric argument to the {cmd} command.")
+                    })?;
+                    let cur = match self.sftp.stat(&f) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            eprintln!(
+                                "Can't get current ownership of remote file \"{}\": {}",
+                                lossy(&f),
+                                fx(&e)
+                            );
+                            failed = true;
                             continue;
                         }
                     };
-                    let abs = remote_join(&self.remote_cwd, cmd[2]);
-                    let mut attrs = Attrs::default();
-                    attrs.permissions = Some(mode);
-                    if let Err(e) = self.sftp.setstat(&abs, attrs) {
-                        eprintln!("chmod: {}", sftp_err_to_string(e));
+                    let (uid, gid) = cur.uid_gid.unwrap_or((0, 0));
+                    a.uid_gid = Some(if cmd == "chown" { (id, gid) } else { (uid, id) });
+                    if !self.quiet {
+                        println!(
+                            "Changing {} on {}",
+                            if cmd == "chown" { "owner" } else { "group" },
+                            safe_display(&f)
+                        );
                     }
                 }
-                "help" | "?" => {
-                    eprintln!("commands: ls cd lcd pwd lpwd get put mkdir rmdir rm mv chmod quit");
-                }
-                other => eprintln!("unknown command: {other} (try 'help')"),
+            }
+            if let Err(e) = self.sftp.setstat(&f, a) {
+                eprintln!("Couldn't setstat on \"{}\": {}", lossy(&f), fx(&e));
+                failed = true;
             }
         }
+        if failed { Err(String::new()) } else { Ok(()) }
     }
 
-    fn cmd_cd(&mut self, arg: &str) -> Result<(), String> {
-        let target = if arg.is_empty() { "." } else { arg };
-        let abs = remote_join(&self.remote_cwd, target);
-        // Verify the path is a directory by opendir/close.
-        let h = self.sftp.opendir(&abs).map_err(sftp_err_to_string)?;
-        let _ = self.sftp.close(&h);
-        let canon = self.sftp.realpath(&abs).map_err(sftp_err_to_string)?;
-        self.remote_cwd = canon;
-        Ok(())
-    }
-
-    fn cmd_lcd(&mut self, arg: &str) -> Result<(), String> {
-        let target = if arg.is_empty() {
-            std::env::var_os("HOME")
-                .map(PathBuf::from)
-                .ok_or_else(|| "$HOME not set".to_string())?
+    fn df(&mut self, args: &[String]) -> Result<(), String> {
+        let (flags, rest) = take_flags(args, "hi", "df")?;
+        let path = match rest.first() {
+            Some(p) => self.resolve(p),
+            None => self.pwd.clone(),
+        };
+        if !self.sftp.has_extension("statvfs@openssh.com") {
+            return Err("Server does not support statvfs@openssh.com extension".into());
+        }
+        let v = self
+            .sftp
+            .statvfs(&path)
+            .map_err(|e| format!("Couldn't statvfs: {}", fx(&e)))?;
+        let (frsize, blocks, bfree, bavail, files, ffree, favail) =
+            (v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+        let pct = |used: u64, total: u64| (used * 100).checked_div(total).unwrap_or(0);
+        if flags.contains('i') {
+            println!("      Inodes        Used       Avail      (root)    %Capacity");
+            println!(
+                "{:>12} {:>11} {:>11} {:>11}         {:>3}%",
+                files,
+                files - ffree,
+                favail,
+                ffree,
+                pct(files - ffree, files)
+            );
+        } else if flags.contains('h') {
+            let h = |b: u64| {
+                let s = human_size(b * frsize);
+                // OpenSSH prints these with a trailing "B".
+                if s.ends_with('B') { s } else { format!("{s}B") }
+            };
+            println!("    Size     Used    Avail   (root)    %Capacity");
+            println!(
+                "{:>8} {:>8} {:>8} {:>8}         {:>3}%",
+                h(blocks),
+                h(blocks - bfree),
+                h(bavail),
+                h(bfree),
+                pct(blocks - bfree, blocks)
+            );
         } else {
-            let p = Path::new(arg);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                self.local_cwd.join(p)
-            }
-        };
-        let meta = std::fs::metadata(&target).map_err(|e| format!("{}: {e}", target.display()))?;
-        if !meta.is_dir() {
-            return Err(format!("{}: not a directory", target.display()));
+            let k = |b: u64| b * frsize / 1024;
+            println!("        Size         Used        Avail       (root)    %Capacity");
+            println!(
+                "{:>12} {:>12} {:>12} {:>12}         {:>3}%",
+                k(blocks),
+                k(blocks - bfree),
+                k(bavail),
+                k(bfree),
+                pct(blocks - bfree, blocks)
+            );
         }
-        self.local_cwd = target;
-        Ok(())
-    }
-
-    fn cmd_ls(&mut self, arg: Option<&str>) -> Result<(), String> {
-        let target = match arg {
-            Some(s) => remote_join(&self.remote_cwd, s),
-            None => self.remote_cwd.clone(),
-        };
-        let h = self.sftp.opendir(&target).map_err(sftp_err_to_string)?;
-        let stdout = std::io::stdout();
-        let mut out = stdout.lock();
-        while let Some(batch) = self.sftp.readdir(&h).map_err(sftp_err_to_string)? {
-            for e in batch {
-                // `longname` is server-formatted (typically ls -l) and
-                // arrives as opaque, unvalidated bytes from the peer. A
-                // hostile server can embed ANSI/OSC escape sequences to
-                // hijack the operator's terminal, so scrub control bytes
-                // before writing them to the TTY (CVE-class: terminal
-                // escape injection; mirrors OpenSSH sftp's strnvis).
-                let _ = out.write_all(&sanitize_terminal_bytes(&e.longname));
-                let _ = out.write_all(b"\n");
-            }
-        }
-        let _ = self.sftp.close(&h);
-        Ok(())
-    }
-
-    fn cmd_get(&mut self, remote: &str, local: Option<&str>) -> Result<(), String> {
-        let abs = remote_join(&self.remote_cwd, remote);
-        let local_path = match local {
-            Some(s) => {
-                let p = Path::new(s);
-                if p.is_absolute() {
-                    p.to_path_buf()
-                } else {
-                    self.local_cwd.join(p)
-                }
-            }
-            None => {
-                // Take the basename of the remote path.
-                let base = remote.rsplit('/').next().unwrap_or("file");
-                self.local_cwd.join(base)
-            }
-        };
-
-        let h = self
-            .sftp
-            .open(&abs, FXF_READ, Attrs::default())
-            .map_err(sftp_err_to_string)?;
-        let mut f = std::fs::File::create(&local_path)
-            .map_err(|e| format!("{}: {e}", local_path.display()))?;
-        let mut offset: u64 = 0;
-        let chunk: u32 = 32 * 1024;
-        loop {
-            let data = self
-                .sftp
-                .read(&h, offset, chunk)
-                .map_err(sftp_err_to_string)?;
-            if data.is_empty() {
-                break;
-            }
-            offset += data.len() as u64;
-            f.write_all(&data).map_err(|e| format!("write: {e}"))?;
-        }
-        let _ = self.sftp.close(&h);
-        Ok(())
-    }
-
-    fn cmd_put(&mut self, local: &str, remote: Option<&str>) -> Result<(), String> {
-        let local_path = {
-            let p = Path::new(local);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                self.local_cwd.join(p)
-            }
-        };
-        let remote_path = match remote {
-            Some(s) => remote_join(&self.remote_cwd, s),
-            None => {
-                let base = local.rsplit('/').next().unwrap_or("file");
-                remote_join(&self.remote_cwd, base)
-            }
-        };
-
-        let data =
-            std::fs::read(&local_path).map_err(|e| format!("{}: {e}", local_path.display()))?;
-        let h = self
-            .sftp
-            .open(
-                &remote_path,
-                FXF_WRITE | FXF_CREAT | FXF_TRUNC,
-                Attrs::default(),
-            )
-            .map_err(sftp_err_to_string)?;
-        let mut offset: u64 = 0;
-        let chunk: usize = 32 * 1024;
-        while offset < data.len() as u64 {
-            let end = std::cmp::min(offset as usize + chunk, data.len());
-            self.sftp
-                .write(&h, offset, &data[offset as usize..end])
-                .map_err(sftp_err_to_string)?;
-            offset = end as u64;
-        }
-        let _ = self.sftp.close(&h);
-        // suppress unused-var warning when FxpStatus isn't matched explicitly
-        let _ = FxpStatus::Ok;
         Ok(())
     }
 }
 
-fn run() -> Result<i32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.iter().any(|a| a == "-h" || a == "--help") {
-        println!("{USAGE}");
-        println!();
-        println!("A pure-Rust SFTP client built on puressh {VERSION}.");
-        return Ok(0);
-    }
-    if args.iter().any(|a| a == "-V" || a == "--version") {
-        println!("puressh sftp {VERSION}");
-        return Ok(0);
-    }
+fn paths_given(t: &str) -> bool {
+    t.contains('/')
+}
 
-    let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
-    set_verbose(cli.verbose);
+fn io_text(e: &io::Error) -> String {
+    match e.kind() {
+        io::ErrorKind::NotFound => "No such file or directory".into(),
+        io::ErrorKind::PermissionDenied => "Permission denied".into(),
+        io::ErrorKind::AlreadyExists => "File exists".into(),
+        _ => e.to_string(),
+    }
+}
 
-    let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
-    let cfg_block = ssh_cfg.lookup(&cli.host);
-    if cli.verbose == 0
-        && let Some(level) = cfg_block.log_level
+fn terminal_width() -> usize {
+    #[cfg(unix)]
     {
-        set_verbose(level);
+        // SAFETY: TIOCGWINSZ fills a plain struct; failure leaves it zeroed.
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+            return ws.ws_col as usize;
+        }
     }
-    let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
-    let user = resolve_user(cli_user.as_deref(), cli.user_in_host.as_deref())?;
-    let batch = common::pick(cli.batch_mode, cfg_block.batch_mode, false);
-    let mut strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
-    // BatchMode never prompts: OpenSSH promotes `ask` to `yes` (refuse
-    // unknown hosts) rather than blocking on a question nobody can answer.
-    if batch && strict == StrictMode::Ask {
-        strict = StrictMode::Yes;
-    }
-    let known_hosts_path = cli
-        .known_hosts_path
-        .clone()
-        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
-    let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
-    let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
-    let port = common::pick(cli.port, cfg_block.port, 22);
-    let connect_host = cfg_block
-        .host_name
-        .clone()
-        .unwrap_or_else(|| cli.host.clone());
+    80
+}
 
-    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
-    let mut algorithms = AlgoOverrides::default();
-    algorithms.ciphers = cfg_block.ciphers.clone();
-    algorithms.macs = cfg_block.macs.clone();
-    algorithms.kex_algorithms = cfg_block.kex_algorithms.clone();
-    algorithms.host_key_algorithms = cfg_block.host_key_algorithms.clone();
-    algorithms.pubkey_accepted_algorithms = cfg_block.pubkey_accepted_algorithms.clone();
-    algorithms.ca_signature_algorithms = cfg_block.ca_signature_algorithms.clone();
-    algorithms.compression = cfg_block.compression;
-    let cfg = Config::new(policy).with_algorithms(algorithms);
-    vlog(1, &format!("connecting to {connect_host}:{port}"));
-    // Use connect_to_host so KnownHosts can look the host up by its
-    // user-supplied name (HostKeyPolicy::KnownHosts now fails hard if
-    // the host name is missing, since silently degrading to AcceptAny
-    // would defeat the whole point of the check).
-    let mut client = Client::connect_to_host(connect_host.as_str(), port, cfg)
-        .map_err(|e| format!("connect: {e}"))?;
-    vlog(1, &format!("connected to {connect_host}:{port}"));
+fn set_umask(mask: u32) {
+    #[cfg(unix)]
+    // SAFETY: umask only swaps the process file-creation mask.
+    unsafe {
+        libc::umask(mask as libc::mode_t);
+    }
+    #[cfg(not(unix))]
+    let _ = mask;
+}
 
-    // Collect publickey credentials (agent first unless IdentitiesOnly=yes).
-    let mut credentials: Vec<ClientCredential> = Vec::new();
-    if !identities_only {
-        match connect_agent_credentials() {
-            Ok(mut from_agent) => {
-                vlog(
-                    1,
-                    &format!("agent: offered {} identities", from_agent.len()),
-                );
-                credentials.append(&mut from_agent);
-            }
-            Err(e) => eprintln!("warning: agent: {e}"),
-        }
+/// `!command` / `!`: run it with the user's shell.
+fn local_shell(cmd: &str) {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let mut c = std::process::Command::new(&shell);
+    if !cmd.trim().is_empty() {
+        c.arg("-c").arg(cmd);
     }
-    for id_path in &cli.identities {
-        let pk = match load_identity(id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
+    match c.status() {
+        Ok(s) if !s.success() => {
+            if let Some(code) = s.code() {
+                eprintln!("Shell exited with status {code}");
             }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => eprintln!("warning: identity {id_path}: {e}"),
         }
+        Ok(_) => {}
+        Err(e) => eprintln!("Couldn't execute \"{shell}\": {e}"),
     }
-    // Identities listed in the matching ssh_config block.
-    for id_path_raw in &cfg_block.identity_files {
-        let id_path = expand_tilde(id_path_raw);
-        let pk = match load_identity(&id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("config identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => eprintln!("warning: config identity {id_path}: {e}"),
+}
+
+/// Run commands from `input` until EOF or `quit`. Batch mode aborts on the
+/// first failing command (unless prefixed with `-`); the result is the exit
+/// status.
+fn command_loop(sess: &mut Session, input: &mut dyn BufRead, batch: bool) -> u8 {
+    let tty = io::stdin().is_terminal() && !batch;
+    let mut line = String::new();
+    loop {
+        if !batch {
+            print!("sftp> ");
+            let _ = io::stdout().flush();
         }
-    }
-    // OpenSSH-style default identities: tried after agent + explicit -i,
-    // suppressed entirely by IdentitiesOnly=yes (which also disables the
-    // agent above).
-    if !identities_only {
-        for path in default_identity_paths() {
-            match try_load_default_identity(&path) {
-                Ok(Some(pk)) => match pk.into_host_key() {
-                    Ok(hk) => {
-                        vlog(1, &format!("default identity {}: loaded", path.display()));
-                        credentials.push(ClientCredential::PublicKey(hk));
-                    }
-                    Err(e) => {
-                        eprintln!("warning: default identity {}: {e}", path.display());
-                    }
-                },
-                Ok(None) => {
-                    vlog(2, &format!("default identity {}: skipped", path.display()));
+        line.clear();
+        match input.read_line(&mut line) {
+            Ok(0) | Err(_) => {
+                if tty {
+                    println!();
                 }
-                Err(msg) => eprintln!("warning: {msg}"),
+                return 0;
+            }
+            Ok(_) => {}
+        }
+        let raw = line.trim_end_matches(['\n', '\r']);
+        let mut cmd = raw.trim_start();
+        // Interactive input from a pipe is echoed; batch input too unless
+        // prefixed with `@`.
+        let mut echo = !tty;
+        if let Some(rest) = cmd.strip_prefix('@') {
+            cmd = rest;
+            echo = false;
+        }
+        if echo {
+            if batch {
+                println!("sftp> {raw}");
+            } else {
+                println!("{raw}");
+            }
+        }
+        let ignore_err = cmd.starts_with('-');
+        if ignore_err {
+            cmd = &cmd[1..];
+        }
+        if cmd.trim().is_empty() || cmd.trim_start().starts_with('#') {
+            continue;
+        }
+        if let Some(shell_cmd) = cmd.strip_prefix('!') {
+            local_shell(shell_cmd);
+            continue;
+        }
+        let result = split_line(cmd).and_then(|argv| sess.run(&argv));
+        match result {
+            Ok(Flow::Quit) => return 0,
+            Ok(Flow::Continue) => {}
+            Err(msg) => {
+                if !msg.is_empty() {
+                    eprintln!("{msg}");
+                }
+                if batch && !ignore_err {
+                    return 1;
+                }
             }
         }
     }
+}
 
-    let authed = if !credentials.is_empty() {
-        vlog(
-            1,
-            &format!(
-                "trying publickey auth as {} ({} credentials)",
-                user,
-                credentials.len()
-            ),
-        );
-        match client.authenticate(&user, credentials) {
-            Ok(()) => {
-                vlog(1, &format!("authenticated as {user} via publickey"));
-                true
-            }
-            Err(e) => {
-                eprintln!("publickey auth: {e}");
-                false
-            }
-        }
-    } else {
-        false
+fn run() -> Result<u8, String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = parse_args(&args)?;
+    let remote = transfer::parse_remote(&cli.destination, &["sftp"]).unwrap_or(transfer::Remote {
+        user: None,
+        host: cli.destination.clone(),
+        port: None,
+        path: String::new(),
+    });
+    // A `user@host` destination without a path.
+    let (user, host) = match (&remote.user, remote.host.rsplit_once('@')) {
+        (None, Some((u, h))) if remote.path.is_empty() => (Some(u.to_string()), h.to_string()),
+        _ => (remote.user.clone(), remote.host.clone()),
     };
-    if !authed {
-        // Password auth needs somewhere safe to ask. Under BatchMode, or
-        // with no controlling terminal and no $SSH_ASKPASS, fail closed like
-        // OpenSSH instead of reading the password off a redirected stdin.
-        if batch {
-            return Err(
-                "Permission denied (publickey); BatchMode is on, not prompting for a \
-                        password"
-                    .into(),
-            );
+    let pipe = match (&cli.sftp_direct, &cli.subsystem) {
+        (Some(server), _) => {
+            let mut words = server.split_whitespace().map(str::to_string);
+            let prog = words.next().ok_or("empty -D command")?;
+            SshPipe::spawn_program(&prog, &words.collect::<Vec<_>>())
         }
-        if !common::secret_prompt_available() {
-            return Err(
-                "Permission denied (publickey); no controlling terminal to prompt for a \
-                        password and $SSH_ASKPASS is unset"
-                    .into(),
-            );
+        // `-s /path/sftp-server`: run it as a command instead of a subsystem.
+        (None, Some(s)) if s.contains('/') => SshPipe::spawn(
+            &cli.ssh,
+            user.as_deref(),
+            &host,
+            remote.port.or(cli.port),
+            false,
+            std::slice::from_ref(s),
+        ),
+        (None, sub) => SshPipe::spawn(
+            &cli.ssh,
+            user.as_deref(),
+            &host,
+            remote.port.or(cli.port),
+            true,
+            &[sub.clone().unwrap_or_else(|| "sftp".into())],
+        ),
+    }
+    .map_err(|e| e.to_string())?;
+    let mut sftp = SftpClient::new(pipe).map_err(|_| "Connection closed".to_string())?;
+    let home = sftp
+        .realpath(b".")
+        .map_err(|e| format!("Couldn't canonicalize: {}", fx(&e)))?;
+    if !cli.quiet {
+        eprintln!("Connected to {host}.");
+    }
+    let mut sess = Session {
+        sftp,
+        pwd: home.clone(),
+        home,
+        progress: io::stdout().is_terminal(),
+        xfer: cli.xfer.clone(),
+        quiet: cli.quiet,
+        fsync: cli.fsync,
+    };
+
+    // `host:path`: a directory to start in, or files to fetch.
+    if !remote.path.is_empty() {
+        let abs = sess.resolve(&remote.path);
+        let is_dir =
+            !transfer::has_glob(&abs) && sess.sftp.stat(&abs).is_ok_and(|a| transfer::is_dir(&a));
+        if is_dir {
+            sess.cd(Some(&remote.path))?;
+        } else {
+            let res = sess.get(std::slice::from_ref(&remote.path), cli.xfer.resume);
+            if let Err(e) = &res
+                && !e.is_empty()
+            {
+                eprintln!("{e}");
+            }
+            return Ok(if res.is_ok() { 0 } else { 1 });
         }
-        vlog(1, &format!("trying password auth as {user}"));
-        let password = read_password_from_stdin().map_err(|e| format!("read password: {e}"))?;
-        client
-            .authenticate_password(&user, &password)
-            .map_err(|e| format!("Auth failed: {e}"))?;
-        vlog(1, &format!("authenticated as {user} via password"));
     }
 
-    // The interactive sftp shell is single-channel by design; the
-    // borrow-based `Client::sftp` fits, even though it's now deprecated
-    // for new multi-channel callers (use `SharedClient::sftp`).
-    #[allow(deprecated)]
-    let sftp = client.sftp().map_err(|e| format!("sftp: {e}"))?;
-    let mut repl = Repl::new(sftp)?;
-    repl.run()?;
-    Ok(0)
+    let code = match &cli.batch {
+        Some(path) if path != "-" => {
+            let f = std::fs::File::open(path).map_err(|e| format!("{path} ({e})"))?;
+            command_loop(&mut sess, &mut io::BufReader::new(f), true)
+        }
+        Some(_) => command_loop(&mut sess, &mut io::stdin().lock(), true),
+        None => command_loop(&mut sess, &mut io::stdin().lock(), false),
+    };
+    Ok(code)
 }
 
 fn main() -> ExitCode {
     match run() {
-        Ok(code) => {
-            let clamped = code.clamp(0, 255) as u8;
-            ExitCode::from(clamped)
-        }
+        Ok(code) => ExitCode::from(code),
         Err(msg) => {
-            eprintln!("sftp: {msg}");
+            eprintln!("{msg}");
             ExitCode::from(255)
         }
     }
@@ -743,19 +1185,44 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_terminal_bytes;
+    use super::*;
 
     #[test]
-    fn strips_ansi_and_control_bytes() {
-        // ESC-based ANSI/OSC sequences and other control bytes are scrubbed.
-        let evil = b"\x1b[31mred\x1b]0;pwned\x07 file\x7f\nname\tcol\r";
-        let got = sanitize_terminal_bytes(evil);
-        assert_eq!(&got, b"?[31mred?]0;pwned? file??name?col?");
+    fn splits_like_openssh() {
+        assert_eq!(split_line("get a b").unwrap(), ["get", "a", "b"]);
+        assert_eq!(
+            split_line("put 'my file' \"other file\"").unwrap(),
+            ["put", "my file", "other file"]
+        );
+        assert_eq!(split_line("rm a\\ b").unwrap(), ["rm", "a b"]);
+        assert!(split_line("rm 'x").is_err());
     }
 
     #[test]
-    fn preserves_printable_ascii() {
-        let s = b"-rw-r--r-- 1 user group 1024 Jan  1 00:00 hello.txt";
-        assert_eq!(sanitize_terminal_bytes(s), s.to_vec());
+    fn flags() {
+        let args: Vec<String> = ["-pR", "a", "b"].iter().map(|s| s.to_string()).collect();
+        let (f, rest) = take_flags(&args, "afpPrR", "get").unwrap();
+        assert_eq!(f, "pR");
+        assert_eq!(rest, ["a", "b"]);
+        assert!(take_flags(&args, "a", "get").is_err());
+    }
+
+    #[test]
+    fn scrubs_control_bytes() {
+        assert_eq!(safe_display(b"a\x1b[31mb\n"), "a?[31mb?");
+    }
+
+    #[test]
+    fn long_listing() {
+        let mut a = Attrs::default();
+        a.permissions = Some(0o100644);
+        a.size = Some(5);
+        a.uid_gid = Some((1000, 1000));
+        a.atime_mtime = Some((0, 0));
+        let l = long_line("f", &a, false, None);
+        assert!(
+            l.starts_with("-rw-r--r--    ? 1000     1000            5 Jan  1  1970 f"),
+            "{l}"
+        );
     }
 }

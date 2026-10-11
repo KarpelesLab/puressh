@@ -93,7 +93,7 @@ fn auth_log_lines_match_openssh() {
 
     std::fs::write(p("askpass"), "#!/bin/sh\necho wrong\n").unwrap();
     std::fs::set_permissions(p("askpass"), std::fs::Permissions::from_mode(0o755)).unwrap();
-    let ssh = |key: &str, who: &str, extra: &[&str]| {
+    let ssh_cmd = |key: &str, who: &str, extra: &[&str], cmd: &str| {
         Command::new("ssh")
             .args(["-F", "/dev/null", "-o", "StrictHostKeyChecking=no"])
             .args([
@@ -106,17 +106,34 @@ fn auth_log_lines_match_openssh() {
             .arg(p(key))
             .args(extra)
             .arg(format!("{who}@127.0.0.1"))
-            .arg("true")
+            .arg(cmd)
             .env("SSH_ASKPASS", p("askpass"))
             .env("SSH_ASKPASS_REQUIRE", "force")
             .stdin(Stdio::null())
             .output()
             .unwrap()
     };
-    assert!(
-        ssh("user", &user, &["-o", "BatchMode=yes"])
-            .status
-            .success()
+    let ssh = |key: &str, who: &str, extra: &[&str]| ssh_cmd(key, who, extra, "true");
+    // The session knows where it comes from, as under OpenSSH.
+    let out = ssh_cmd(
+        "user",
+        &user,
+        &["-o", "BatchMode=yes"],
+        "printf '%s|%s' \"$SSH_CLIENT\" \"$SSH_CONNECTION\"",
+    );
+    assert!(out.status.success());
+    let env = String::from_utf8_lossy(&out.stdout).into_owned();
+    let (client, connection) = env.split_once('|').unwrap();
+    let c: Vec<&str> = client.split(' ').collect();
+    assert_eq!(
+        (c[0], c[2]),
+        ("127.0.0.1", port.to_string().as_str()),
+        "{env}"
+    );
+    assert_eq!(
+        connection,
+        format!("127.0.0.1 {} 127.0.0.1 {port}", c[1]),
+        "{env}"
     );
     ssh("user", "nosuchuser", &["-o", "BatchMode=yes"]);
     ssh("user", "nobody", &["-o", "BatchMode=yes"]);

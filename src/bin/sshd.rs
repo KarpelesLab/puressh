@@ -4483,6 +4483,9 @@ mod imp {
             for (k, v) in safe_session_env(env) {
                 cmd.env(k, v);
             }
+            for (k, v) in connection_env(None) {
+                cmd.env(k, v);
+            }
 
             // Drop to the user inside the spawned child via pre_exec.
             // We can't use Command::uid()/.gid()/.current_dir() because
@@ -5073,6 +5076,29 @@ mod imp {
                 envs.push((key, v.clone()));
             }
         }
+    }
+
+    /// The variables OpenSSH gives every session: `SSH_CLIENT` (client
+    /// address and port, server port), `SSH_CONNECTION` (client address and
+    /// port, server address and port) and, on a pty, `SSH_TTY`. Set after
+    /// the client's `env` requests, which cannot replace them.
+    fn connection_env(tty: Option<&str>) -> Vec<(&'static str, String)> {
+        let mut out = Vec::new();
+        if let Some((peer, local)) = conn_addrs() {
+            let (lip, lport) = local.map_or((String::new(), 0), |l| {
+                (sshd_log::addr_str(l.ip()), l.port())
+            });
+            let pip = sshd_log::addr_str(peer.ip());
+            out.push(("SSH_CLIENT", format!("{pip} {} {lport}", peer.port())));
+            out.push((
+                "SSH_CONNECTION",
+                format!("{pip} {} {lip} {lport}", peer.port()),
+            ));
+        }
+        if let Some(t) = tty {
+            out.push(("SSH_TTY", t.to_string()));
+        }
+        out
     }
 
     /// True iff we're already running as `info`'s uid/gid — in which
@@ -5890,6 +5916,11 @@ mod imp {
                 puressh::Error::Io(std::io::Error::other("channel env value contains NUL byte"))
             })?;
             channel_envs.push((kc, vc));
+        }
+        for (k, v) in connection_env(Some(&slave_path)) {
+            if let (Ok(k), Ok(v)) = (std::ffi::CString::new(k), std::ffi::CString::new(v)) {
+                channel_envs.push((k, v));
+            }
         }
 
         // SAFETY: fork() in single-threaded code is safe; the child

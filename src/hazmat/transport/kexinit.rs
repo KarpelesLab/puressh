@@ -288,6 +288,12 @@ pub struct NegotiatedOwned {
     /// the server's). RFC 8308 §2.1. When set, this side may send
     /// `SSH_MSG_EXT_INFO` immediately after its `NEWKEYS`.
     pub ext_info_enabled: bool,
+    /// The client advertised `ext-info-c`: the server may send it an
+    /// `SSH_MSG_EXT_INFO` (RFC 8308 §2.1), whatever the server advertised.
+    pub client_ext_info: bool,
+    /// The server advertised `ext-info-s`: the client may send it an
+    /// `SSH_MSG_EXT_INFO`. OpenSSH before 9.6 never does.
+    pub server_ext_info: bool,
 }
 
 /// Walk the **client's** list in order; the first name that also appears in
@@ -386,6 +392,8 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
         .iter()
         .any(|s| s == super::ext_info::EXT_INFO_SERVER_MARKER);
     let ext_info_enabled = client_ext && server_ext;
+    let client_ext_info = client_ext;
+    let server_ext_info = server_ext;
 
     Ok(NegotiatedOwned {
         kex: kex.to_string(),
@@ -399,6 +407,8 @@ pub fn negotiate(client: &KexInit, server: &KexInit) -> Result<NegotiatedOwned> 
         first_kex_packet_follows_wrong_guess: wrong,
         strict_kex_enabled,
         ext_info_enabled,
+        client_ext_info,
+        server_ext_info,
     })
 }
 

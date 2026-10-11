@@ -257,6 +257,11 @@ pub struct KexRunner {
     /// strict-kex it is NOT carried across rekeys: ext-info only fires on
     /// the first KEX.
     ext_info_enabled: bool,
+    /// Whether we may send our `SSH_MSG_EXT_INFO` after NEWKEYS: the peer
+    /// advertised the marker for *our* direction (`ext-info-s` for a
+    /// client, `ext-info-c` for a server). Independent of
+    /// [`Self::ext_info_enabled`], which governs what the peer may send us.
+    ext_info_send: bool,
     /// Outbound `SSH_MSG_EXT_INFO` payload the caller would like us to
     /// send. The runner emits it as part of the outbound batch produced by
     /// `handle_peer_newkeys` on the first KEX iff [`ext_info_enabled`] is
@@ -303,6 +308,7 @@ impl KexRunner {
             pending_wrong_guess_discard: false,
             first_kex: true,
             ext_info_enabled: false,
+            ext_info_send: false,
             outbound_ext_info: None,
             peer_ext_info: None,
             accept_ext_info_now: false,
@@ -367,6 +373,7 @@ impl KexRunner {
         // what the peer's rekey advert claims (RFC 8308 §2.1).
         self.first_kex = false;
         self.ext_info_enabled = false;
+        self.ext_info_send = false;
         self.outbound_ext_info = None;
         self.accept_ext_info_now = false;
         self.phase = Phase::SentKexInit;
@@ -663,7 +670,15 @@ impl KexRunner {
         }
         // RFC 8308 §2.1: ext-info MUST be ignored on rekeys. Even if a
         // misbehaving peer advertised the marker again, we refuse.
-        self.ext_info_enabled = self.first_kex && neg.ext_info_enabled;
+        // The two directions are independent (RFC 8308 §2.1): the server
+        // may send EXT_INFO to a client that advertised `ext-info-c`, the
+        // client to a server that advertised `ext-info-s`.
+        let (recv, send) = match self.role {
+            Role::Client => (neg.client_ext_info, neg.server_ext_info),
+            Role::Server => (neg.server_ext_info, neg.client_ext_info),
+        };
+        self.ext_info_enabled = self.first_kex && recv;
+        self.ext_info_send = self.first_kex && send;
         // Per RFC 4253 §7.1: if the peer prefixed a guess to its KEXINIT
         // and our negotiation says that guess was wrong, the next KEX
         // algorithm-specific packet from the peer must be silently dropped.
@@ -1108,13 +1123,15 @@ impl KexRunner {
         let mut adv = KexAdvance::default();
         if self.first_kex && self.ext_info_enabled {
             self.accept_ext_info_now = true;
-
-            // Emit our own ext-info if the caller supplied one. New keys
-            // are now installed (maybe_install fired above), so the codec
-            // will frame this packet under the post-NEWKEYS cipher.
-            if let Some(ext) = self.outbound_ext_info.take() {
-                adv.outbound.push(ext.encode());
-            }
+        }
+        // Emit our own ext-info if the caller supplied one and the peer
+        // asked for it. New keys are now installed (maybe_install fired
+        // above), so the codec frames it under the post-NEWKEYS cipher.
+        if self.first_kex
+            && self.ext_info_send
+            && let Some(ext) = self.outbound_ext_info.take()
+        {
+            adv.outbound.push(ext.encode());
         }
         // First-kex bookkeeping: clear the flag now that the first KEX has
         // completed end-to-end. Subsequent rekeys are gated by `first_kex
@@ -2180,13 +2197,15 @@ mod tests {
             v_s,
         );
 
-        assert!(!server.ext_info_enabled());
+        // The client did not advertise `ext-info-c`: the server must not
+        // send it EXT_INFO (it may still receive one, having advertised
+        // `ext-info-s` — the two directions are independent).
+        assert!(server.ext_info_enabled());
         assert!(!client.ext_info_enabled());
         // No EXT_INFO payloads should be in flight on either direction.
         assert!(from_client.is_empty());
         assert!(from_server.is_empty());
         assert!(!client.may_accept_ext_info());
-        assert!(!server.may_accept_ext_info());
     }
 
     #[test]

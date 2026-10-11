@@ -108,6 +108,17 @@ pub struct ServerOptions {
     /// authenticate as. When unset, the login user must itself appear in the
     /// certificate's principals list.
     pub authorized_principals_file: Option<String>,
+    /// `AuthorizedKeysCommand` — a program (absolute path) and its
+    /// arguments, `%` tokens unexpanded, whose output is read as further
+    /// `authorized_keys` lines. `none` ⇒ `Some(vec![])`.
+    pub authorized_keys_command: Option<Vec<String>>,
+    /// `AuthorizedKeysCommandUser` — the account the command runs as.
+    pub authorized_keys_command_user: Option<String>,
+    /// `AuthorizedPrincipalsCommand` — like `AuthorizedKeysCommand`, but
+    /// its output is read as `AuthorizedPrincipalsFile` lines.
+    pub authorized_principals_command: Option<Vec<String>>,
+    /// `AuthorizedPrincipalsCommandUser`.
+    pub authorized_principals_command_user: Option<String>,
     /// `AuthorizedKeysFile` — one or more path *templates* (space-separated
     /// on the config line), each resolved per login user: `%u` (username),
     /// `%h` (home directory) and `%%` are expanded, and a relative path is
@@ -609,6 +620,10 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(trusted_user_ca_keys);
     take_scalar!(revoked_keys);
     take_scalar!(authorized_principals_file);
+    take_scalar!(authorized_keys_command);
+    take_scalar!(authorized_keys_command_user);
+    take_scalar!(authorized_principals_command);
+    take_scalar!(authorized_principals_command_user);
     dst.allow_users.extend(src.allow_users.iter().cloned());
     dst.accept_env.extend(src.accept_env.iter().cloned());
     dst.deny_users.extend(src.deny_users.iter().cloned());
@@ -733,6 +748,20 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "authorizedprincipalsfile" => {
             opts.authorized_principals_file = Some(one_arg(line)?);
+        }
+        "authorizedkeyscommand" | "authorizedprincipalscommand" => {
+            let cmd = command_args(line)?;
+            if kw == "authorizedkeyscommand" {
+                opts.authorized_keys_command = Some(cmd);
+            } else {
+                opts.authorized_principals_command = Some(cmd);
+            }
+        }
+        "authorizedkeyscommanduser" => {
+            opts.authorized_keys_command_user = Some(one_arg(line)?);
+        }
+        "authorizedprincipalscommanduser" => {
+            opts.authorized_principals_command_user = Some(one_arg(line)?);
         }
         "authorizedkeysfile" => {
             if line.args.is_empty() {
@@ -1224,18 +1253,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ),
     ("SetEnv", &[], "the variables are not set in sessions"),
     (
-        "AuthorizedKeysCommand",
-        &["none"],
-        "keys it would return are not accepted",
-    ),
-    ("AuthorizedKeysCommandUser", &["*"], ""),
-    (
-        "AuthorizedPrincipalsCommand",
-        &["none"],
-        "principals it would return are not accepted",
-    ),
-    ("AuthorizedPrincipalsCommandUser", &["*"], ""),
-    (
         "GSSAPIAuthentication",
         &["no"],
         "GSSAPI authentication is unavailable",
@@ -1527,6 +1544,20 @@ fn validate_user_at_host(token: &str, keyword: &str, line_no: usize) -> Result<(
         });
     }
     Ok(())
+}
+
+/// `AuthorizedKeysCommand` / `AuthorizedPrincipalsCommand`: `none`, or an
+/// absolute program path followed by its arguments.
+fn command_args(line: &ParsedLine) -> Result<Vec<String>, ConfigError> {
+    match line.args.first() {
+        Some(a) if line.args.len() == 1 && a.eq_ignore_ascii_case("none") => Ok(Vec::new()),
+        Some(a) if a.starts_with('/') => Ok(line.args.clone()),
+        _ => Err(ConfigError::BadValue {
+            line: line.line_no,
+            keyword: line.keyword.clone(),
+            msg: "expected none, or an absolute path to a program".into(),
+        }),
+    }
 }
 
 fn one_arg(line: &ParsedLine) -> Result<String, ConfigError> {
@@ -2576,14 +2607,14 @@ UsePrivilegeSeparation sandbox
     #[test]
     fn unimplemented_keywords_warn_only_when_it_matters() {
         let cfg = SshServerConfig::parse(
-            "GSSAPIAuthentication yes\nAuthorizedKeysCommand /usr/bin/ldap-keys\n\
+            "GSSAPIAuthentication yes\nKerberosAuthentication yes\n\
              SetEnv FOO=bar\nUseDNS yes\nPermitUserEnvironment yes\n",
         )
         .unwrap();
         let w: Vec<_> = cfg.warnings().collect();
         assert_eq!(w.len(), 4, "{w:?}");
         assert!(w[0].contains("GSSAPIAuthentication") && w[0].contains("line 1"));
-        assert!(w[1].contains("AuthorizedKeysCommand"));
+        assert!(w[1].contains("KerberosAuthentication"));
         assert!(w.iter().all(|x| !x.contains("UseDNS")));
     }
 

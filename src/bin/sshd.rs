@@ -1238,6 +1238,26 @@ mod imp {
             "authorizedprincipalsfile",
             &none_or(&opts.authorized_principals_file),
         );
+        let command = |c: &Option<Vec<String>>| match c {
+            Some(c) if !c.is_empty() => c.join(" "),
+            _ => "none".to_string(),
+        };
+        line(
+            "authorizedkeyscommand",
+            &command(&opts.authorized_keys_command),
+        );
+        line(
+            "authorizedkeyscommanduser",
+            &none_or(&opts.authorized_keys_command_user),
+        );
+        line(
+            "authorizedprincipalscommand",
+            &command(&opts.authorized_principals_command),
+        );
+        line(
+            "authorizedprincipalscommanduser",
+            &none_or(&opts.authorized_principals_command_user),
+        );
         line("trustedusercakeys", &none_or(&opts.trusted_user_ca_keys));
         line("revokedkeys", &none_or(&opts.revoked_keys));
         line("banner", &none_or(&opts.banner));
@@ -1306,8 +1326,6 @@ mod imp {
             ("permittunnel", "no"),
             ("exposeauthinfo", "no"),
             ("usedns", "no"),
-            ("authorizedkeyscommand", "none"),
-            ("authorizedprincipalscommand", "none"),
             ("fingerprinthash", "SHA256"),
             ("pamservicename", "sshd"),
         ] {
@@ -1930,6 +1948,12 @@ mod imp {
             check_mode_strict(path, 0o022, "authorized_keys file", owner_uid)?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+        Ok(parse_authorized_keys(&body, path))
+    }
+
+    /// Parse `authorized_keys` lines (a file's or an `AuthorizedKeysCommand`'s
+    /// output); `source` names them in warnings about skipped lines.
+    fn parse_authorized_keys(body: &str, source: &str) -> AuthorizedKeys {
         let mut out = AuthorizedKeys::default();
         for (idx, line) in body.lines().enumerate() {
             let trimmed = line.trim();
@@ -1954,11 +1978,11 @@ mod imp {
                     }
                 }
                 Err(e) => {
-                    eprintln!("sshd: skipping {path} line {}: {e}", idx + 1);
+                    eprintln!("sshd: skipping {source} line {}: {e}", idx + 1);
                 }
             }
         }
-        Ok(out)
+        out
     }
 
     /// Knock keys (a user's authorized keys), read on demand: the knock state
@@ -2234,6 +2258,245 @@ mod imp {
         out
     }
 
+    /// The longest an `AuthorizedKeysCommand` / `AuthorizedPrincipalsCommand`
+    /// may run (OpenSSH bounds it only by LoginGraceTime).
+    const AUTH_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+    /// The most output read from such a command.
+    const AUTH_COMMAND_OUTPUT_MAX: usize = 4 << 20;
+
+    /// Expand the `%` tokens of one command argument; `%%` is a literal `%`.
+    /// A token the command kind does not define refuses the command, as
+    /// OpenSSH refuses the configuration.
+    fn expand_command_arg(arg: &str, tokens: &[(char, String)]) -> Result<String, String> {
+        let mut out = String::with_capacity(arg.len());
+        let mut chars = arg.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some(t) => match tokens.iter().find(|(k, _)| *k == t) {
+                    Some((_, v)) => out.push_str(v),
+                    None => return Err(format!("unknown token %{t}")),
+                },
+                None => return Err("trailing %".into()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// A key or certificate blob as command tokens: its SHA256 fingerprint,
+    /// base64 encoding and type name.
+    fn blob_tokens(blob: &[u8]) -> (String, String, String) {
+        use purecrypto::hash::{Digest, Sha256};
+        let b64 = purecrypto::der::base64_encode(&Sha256::digest(blob));
+        let fp = format!("SHA256:{}", b64.trim_end_matches('='));
+        let kind = blob
+            .get(..4)
+            .map(|l| u32::from_be_bytes([l[0], l[1], l[2], l[3]]) as usize)
+            .and_then(|n| blob.get(4..4 + n))
+            .and_then(|t| std::str::from_utf8(t).ok())
+            .unwrap_or("")
+            .to_string();
+        (fp, purecrypto::der::base64_encode(blob), kind)
+    }
+
+    /// The tokens every authorization command knows: `%C` (client address
+    /// and port, server address and port), `%D` (routing domain, none here),
+    /// `%h`, `%U` and `%u` (the login user's home, uid and name).
+    fn connection_tokens(info: &UserInfo) -> Vec<(char, String)> {
+        let endpoints = conn_addrs()
+            .map(|(peer, local)| {
+                let (lip, lport) =
+                    local.map_or((String::new(), 0), |l| (l.ip().to_string(), l.port()));
+                format!("{} {} {lip} {lport}", peer.ip(), peer.port())
+            })
+            .unwrap_or_default();
+        vec![
+            ('C', endpoints),
+            ('D', String::new()),
+            ('h', info.home_str.clone()),
+            ('U', info.uid.as_raw().to_string()),
+            ('u', info.name.clone()),
+        ]
+    }
+
+    /// Run an `AuthorizedKeysCommand` / `AuthorizedPrincipalsCommand` as
+    /// OpenSSH does. `argv[0]` must be an absolute path to a regular file
+    /// that, with every directory above it, is owned by root (or by this
+    /// daemon's own user when it is not root) and writable by nobody else;
+    /// StrictModes off skips that check. The command runs as `run_as`
+    /// (`*CommandUser`, required) with the minimal environment OpenSSH gives
+    /// it, stdin from `/dev/null` and stderr discarded unless debugging. Its
+    /// output counts only when it exits with status 0 within
+    /// [`AUTH_COMMAND_TIMEOUT`].
+    fn run_auth_command(
+        kind: &str,
+        argv: &[String],
+        run_as: Option<&str>,
+        strict_modes: bool,
+        debug: bool,
+    ) -> Option<String> {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        let fail = |msg: String| {
+            eprintln!("sshd: {kind}: {msg}");
+            None
+        };
+        let program = argv.first()?;
+        let Some(run_as) = run_as else {
+            return fail(format!("no {kind}User specified, skipping"));
+        };
+        let info = match lookup_user(run_as) {
+            Ok(i) => i,
+            Err(e) => return fail(format!("{kind}User {run_as}: {e}")),
+        };
+        if strict_modes
+            && let Err(e) = check_mode_strict(program, 0o022, kind, Some(nix::unistd::geteuid()))
+        {
+            return fail(e);
+        }
+        let switch = !already_matches(&info);
+        if switch && !nix::unistd::geteuid().is_root() {
+            return fail(format!("cannot run as {run_as} without root privileges"));
+        }
+        if debug {
+            eprintln!("sshd: {kind}: running {argv:?} as {run_as}");
+        }
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&argv[1..])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("USER", &info.name)
+            .env("LOGNAME", &info.name)
+            .env("HOME", &info.home_str)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(if debug {
+                std::process::Stdio::inherit()
+            } else {
+                std::process::Stdio::null()
+            });
+        if let Ok(lang) = std::env::var("LANG") {
+            cmd.env("LANG", lang);
+        }
+        if switch {
+            let (uid, gid, name_c) = (info.uid, info.gid, info.name_c.clone());
+            // SAFETY: runs in the forked child before exec, calling only the
+            // same set*id/initgroups sequence as the session drop below.
+            unsafe {
+                cmd.pre_exec(move || {
+                    setgroups_clear().map_err(to_io)?;
+                    nix::unistd::setgid(gid).map_err(to_io)?;
+                    initgroups_libc(&name_c, gid).map_err(to_io)?;
+                    nix::unistd::setuid(uid).map_err(to_io)?;
+                    verify_post_setuid(uid, gid).map_err(to_io)?;
+                    Ok(())
+                });
+            }
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return fail(format!("{program}: {e}")),
+        };
+        let mut stdout = child.stdout.take()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let r = (&mut stdout)
+                .take(AUTH_COMMAND_OUTPUT_MAX as u64 + 1)
+                .read_to_end(&mut buf);
+            let _ = tx.send(r.map(|_| buf));
+        });
+        let out = match rx.recv_timeout(AUTH_COMMAND_TIMEOUT) {
+            Ok(Ok(buf)) if buf.len() <= AUTH_COMMAND_OUTPUT_MAX => Some(buf),
+            Ok(Ok(_)) => {
+                eprintln!("sshd: {kind}: {program}: output too long");
+                None
+            }
+            Ok(Err(e)) => {
+                eprintln!("sshd: {kind}: {program}: read: {e}");
+                None
+            }
+            Err(_) => {
+                eprintln!("sshd: {kind}: {program}: timed out");
+                None
+            }
+        };
+        if out.is_none() {
+            let _ = child.kill();
+        }
+        let status = child.wait();
+        let out = out?;
+        match status {
+            Ok(st) if st.success() => Some(String::from_utf8_lossy(&out).into_owned()),
+            Ok(st) => fail(format!("{program} returned {st}")),
+            Err(e) => fail(format!("{program}: wait: {e}")),
+        }
+    }
+
+    /// Parse `AuthorizedPrincipalsFile` / `AuthorizedPrincipalsCommand` lines:
+    /// a principal name, optionally preceded by `authorized_keys` options
+    /// (OpenSSH takes the last field as the name). Lines whose options do not
+    /// parse are skipped.
+    fn parse_principals(body: &str, source: &str) -> Vec<AuthorizedPrincipal> {
+        let mut out = Vec::new();
+        for (idx, line) in body.lines().enumerate() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (opts, name) = match line.rfind([' ', '\t']) {
+                None => (Default::default(), line),
+                Some(i) => match puressh::key::AuthorizedKeyOptions::parse(line[..i].trim()) {
+                    Ok(o) => (o, line[i + 1..].trim()),
+                    Err(e) => {
+                        eprintln!("sshd: skipping {source} line {}: {e}", idx + 1);
+                        continue;
+                    }
+                },
+            };
+            out.push(AuthorizedPrincipal {
+                name: name.to_string(),
+                options: Arc::new(opts),
+            });
+        }
+        out
+    }
+
+    /// `AuthorizedKeysCommand` / `AuthorizedPrincipalsCommand` and the users
+    /// they run as; an empty command is none.
+    #[derive(Clone, Debug, Default)]
+    struct AuthCommands {
+        keys: Vec<String>,
+        keys_user: Option<String>,
+        principals: Vec<String>,
+        principals_user: Option<String>,
+    }
+
+    impl AuthCommands {
+        fn from_options(opts: &puressh::config::ServerOptions) -> Self {
+            AuthCommands {
+                keys: opts.authorized_keys_command.clone().unwrap_or_default(),
+                keys_user: opts.authorized_keys_command_user.clone(),
+                principals: opts
+                    .authorized_principals_command
+                    .clone()
+                    .unwrap_or_default(),
+                principals_user: opts.authorized_principals_command_user.clone(),
+            }
+        }
+    }
+
+    /// One line of an `AuthorizedPrincipalsFile` (or command output).
+    #[derive(Clone, Debug)]
+    struct AuthorizedPrincipal {
+        name: String,
+        options: Arc<puressh::key::AuthorizedKeyOptions>,
+    }
+
     /// Whether a `-u` / `AllowUsers` token names exactly one literal user (no
     /// glob metacharacters, no negation, no `@host` half).
     fn is_literal_user_token(token: &str) -> bool {
@@ -2302,25 +2565,17 @@ mod imp {
         Ok(out)
     }
 
-    /// Load an `AuthorizedPrincipalsFile`: one principal name per line
-    /// (comments / blanks skipped). No `%u`/`%h` token expansion in this build.
+    /// Load an `AuthorizedPrincipalsFile` (see [`parse_principals`]).
     fn load_principals_file(
         path: &str,
         strict_modes: bool,
         owner_uid: Option<nix::unistd::Uid>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<Vec<AuthorizedPrincipal>, String> {
         if strict_modes {
             check_mode_strict(path, 0o022, "AuthorizedPrincipalsFile", owner_uid)?;
         }
         let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
-        Ok(body
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| !l.is_empty() && !l.starts_with('#'))
-            // Each line may carry trailing option tokens in OpenSSH; we take the
-            // first whitespace-delimited token as the principal name.
-            .filter_map(|l| l.split_whitespace().next().map(|s| s.to_string()))
-            .collect())
+        Ok(parse_principals(&body, path))
     }
 
     /// Longest peer-controlled string echoed into a log line.
@@ -2593,8 +2848,12 @@ mod imp {
         /// Lazily-resolved `AuthorizedPrincipalsFile` contents for the bound
         /// user: `None` until first resolved; the inner `Option` is `None` when
         /// no file is configured (login user must itself be a cert principal,
-        /// the OpenSSH default) or `Some(list)` of the file's principal names.
-        authorized_principals: Option<Option<Vec<String>>>,
+        /// the OpenSSH default) or `Some(list)` of the file's lines.
+        authorized_principals: Option<Option<Vec<AuthorizedPrincipal>>>,
+        /// `AuthorizedKeysCommand` / `AuthorizedPrincipalsCommand` in force.
+        auth_commands: AuthCommands,
+        /// Their outputs on this connection, by expanded command line.
+        command_cache: std::collections::BTreeMap<Vec<String>, Option<String>>,
         permit_root_login: puressh::config::PermitRootLogin,
         /// Shared PAM gate (per-connection, COW-isolated by `fork`). Used to
         /// verify passwords via `pam_check_password`. On a non-PAM build the
@@ -2731,7 +2990,12 @@ mod imp {
         /// The CA signature, cert type, validity and critical-option
         /// understanding were already enforced by the auth layer before this is
         /// reached; this is purely the trust + authorization gate.
-        fn cert_trusted(&mut self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
+        fn cert_trusted(
+            &mut self,
+            ci: &puressh::auth::CertInfo,
+            user: &str,
+            cert_blob: &[u8],
+        ) -> bool {
             // 0. KRL revocation wins outright: a cert whose (CA, serial) or
             //    (CA, key-id) the KRL covers — or whose CA key itself is
             //    revoked as a plain key — is refused before any trust check.
@@ -2758,48 +3022,43 @@ mod imp {
             //        which suffices (OpenSSH tries authorized_keys first, then
             //        TrustedUserCAKeys):
             //
-            //   a. a `cert-authority` line in the *user's own* authorized_keys
-            //      names this CA. With a `principals="..."` option the cert
-            //      must carry a principal matching that list (and the login
-            //      user need not be one); without it, rule (b)'s principal
-            //      check applies.
-            //   b. the CA is in `TrustedUserCAKeys`, and the login user is an
-            //      authorized principal: with an AuthorizedPrincipalsFile the
-            //      login user must map to a principal the cert also lists;
-            //      without one the login user must itself be a cert principal
-            //      (an empty cert principal list authorizes any).
+            //   a. a `cert-authority` line of the user's authorized_keys (or
+            //      AuthorizedKeysCommand output) names this CA. With a
+            //      `principals="..."` option the cert must carry a listed
+            //      principal; without one, the login name, unless the cert
+            //      lists no principals at all.
+            //   b. the CA is in `TrustedUserCAKeys` and the cert lists
+            //      principals: one of them must be in AuthorizedPrincipalsFile
+            //      / AuthorizedPrincipalsCommand output when either is
+            //      configured, otherwise the login name must be.
             //
             // Both routes are evaluated unconditionally so the cost does not
             // depend on which one decides.
-            let standard_ok = self.login_user_is_principal(ci, user);
             let peer = self.peer.clone();
             let debug = self.debug;
-            let (ca_line, ca_opts): (Option<Option<Vec<String>>>, _) = {
-                let set = self.resolved_authorized_keys(user);
-                match set.cas.iter().enumerate().find(|(i, (blob, _))| {
-                    *blob == ci.ca_key_blob
-                        && set
-                            .ca_options
-                            .get(*i)
-                            .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
-                }) {
-                    Some((i, (_, principals))) => {
-                        (Some(principals.clone()), set.ca_options.get(i).cloned())
+            let mut set = self.resolved_authorized_keys(user).clone();
+            if let Some(more) = self.command_keys(user, cert_blob) {
+                set.append(more);
+            }
+            let ca_line = set.cas.iter().enumerate().find(|(i, (blob, principals))| {
+                *blob == ci.ca_key_blob
+                    && set
+                        .ca_options
+                        .get(*i)
+                        .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
+                    && match principals {
+                        Some(list) => principals_match_option(list, &ci.valid_principals),
+                        None => {
+                            ci.valid_principals.is_empty()
+                                || ci.valid_principals.iter().any(|p| p == user)
+                        }
                     }
-                    None => (None, None),
-                }
-            };
-            self.accepted_options = ca_opts;
-            let line_ok = match &ca_line {
-                None => false,
-                Some(Some(list)) => principals_match_option(list, &ci.valid_principals),
-                Some(None) => standard_ok,
-            };
-            let global_ok = self.trusted_user_ca_blobs.contains(&ci.ca_key_blob) && standard_ok;
-            if ca_line.is_none()
-                && !global_ok
-                && !self.trusted_user_ca_blobs.contains(&ci.ca_key_blob)
-            {
+            });
+            let ca_opts = ca_line.map(|(i, _)| set.ca_options.get(i).cloned().unwrap_or_default());
+            let global_trusted = self.trusted_user_ca_blobs.contains(&ci.ca_key_blob);
+            let principal = self.cert_principal_line(ci, user, cert_blob);
+            let global_ok = global_trusted && principal.is_some();
+            if ca_opts.is_none() && !global_trusted {
                 if self.debug {
                     eprintln!(
                         "sshd: cert auth: signing CA is not trusted for {user} (key-id {:?})",
@@ -2808,12 +3067,15 @@ mod imp {
                 }
                 return false;
             }
-            if !(line_ok || global_ok) {
+            if ca_opts.is_none() && !global_ok {
                 if self.debug {
                     eprintln!("sshd: cert auth: user {user} not an authorized principal");
                 }
                 return false;
             }
+            // The options in force: the cert-authority line's, else those of
+            // the principals line that matched.
+            self.accepted_options = ca_opts.or_else(|| principal.flatten());
 
             // 3. source-address critical option (if present) must admit the peer.
             if let Some(data) = ci.critical_option("source-address") {
@@ -2838,29 +3100,139 @@ mod imp {
             true
         }
 
-        /// The `TrustedUserCAKeys` principal rule: with an
-        /// `AuthorizedPrincipalsFile`, the login user must map to a principal
-        /// the certificate also lists; without one, the login user must itself
-        /// be a cert principal (an empty cert principal list authorizes any).
-        /// The file path is `%u`/`%h`-expanded and loaded lazily for this user
-        /// the first time it is needed.
-        fn login_user_is_principal(&mut self, ci: &puressh::auth::CertInfo, user: &str) -> bool {
-            match self.resolved_principals(user) {
-                Some(allowed) => {
-                    // The user is authorized iff some name they're allowed to
-                    // use (from the file) is also present in the cert, and the
-                    // login user is one of the file's mapped principals too
-                    // (the file maps login → allowed principals).
-                    !ci.valid_principals.is_empty()
-                        && allowed
-                            .iter()
-                            .any(|p| ci.valid_principals.iter().any(|vp| vp == p))
-                        && allowed.iter().any(|p| p == user)
+        /// The `TrustedUserCAKeys` principal rule. A certificate without
+        /// principals is refused. With an AuthorizedPrincipalsFile or
+        /// AuthorizedPrincipalsCommand, a line that applies to this
+        /// connection must name one of the certificate's principals: returns
+        /// `Some(Some(options))` of that line. Without either, the login name
+        /// must be a principal: `Some(None)`.
+        fn cert_principal_line(
+            &mut self,
+            ci: &puressh::auth::CertInfo,
+            user: &str,
+            cert_blob: &[u8],
+        ) -> Option<Option<Arc<puressh::key::AuthorizedKeyOptions>>> {
+            if ci.valid_principals.is_empty() {
+                if self.debug {
+                    eprintln!("sshd: cert auth: certificate lacks principal list");
                 }
-                None => {
-                    ci.valid_principals.is_empty() || ci.valid_principals.iter().any(|p| p == user)
+                return None;
+            }
+            let peer = self.peer.clone();
+            let debug = self.debug;
+            let mut lines = self.resolved_principals(user).clone();
+            if let Some(more) = self.command_principals(user, ci, cert_blob) {
+                lines.get_or_insert_with(Vec::new).extend(more);
+            }
+            match lines {
+                None => ci
+                    .valid_principals
+                    .iter()
+                    .any(|p| p == user)
+                    .then_some(None),
+                Some(lines) => lines
+                    .into_iter()
+                    .find(|l| {
+                        ci.valid_principals.contains(&l.name)
+                            && key_line_applies(&l.options, peer.as_deref(), debug)
+                    })
+                    .map(|l| Some(l.options)),
+            }
+        }
+
+        /// `AuthorizedKeysCommand` output for `user` and the offered key or
+        /// certificate `blob`, parsed; `None` when no command is configured
+        /// or it fails. Runs are cached per expanded command line, so the
+        /// probe and the signed attempt run it once.
+        fn command_keys(&mut self, user: &str, blob: &[u8]) -> Option<AuthorizedKeys> {
+            let template = self.auth_commands.keys.clone();
+            if template.is_empty() {
+                return None;
+            }
+            let info = lookup_user(user).ok()?;
+            let (fp, b64, kind) = blob_tokens(blob);
+            let mut tokens = connection_tokens(&info);
+            tokens.extend([('f', fp), ('k', b64), ('t', kind)]);
+            let mut argv = self.expand_command("AuthorizedKeysCommand", &template, &tokens)?;
+            // No arguments: the user name, as OpenSSH has always passed it.
+            if argv.len() == 1 {
+                argv.push(info.name.clone());
+            }
+            let user_opt = self.auth_commands.keys_user.clone();
+            let out = self.run_cached("AuthorizedKeysCommand", argv, user_opt)?;
+            Some(parse_authorized_keys(&out, "AuthorizedKeysCommand output"))
+        }
+
+        /// `AuthorizedPrincipalsCommand` output for a certificate, parsed.
+        fn command_principals(
+            &mut self,
+            user: &str,
+            ci: &puressh::auth::CertInfo,
+            cert_blob: &[u8],
+        ) -> Option<Vec<AuthorizedPrincipal>> {
+            let template = self.auth_commands.principals.clone();
+            if template.is_empty() {
+                return None;
+            }
+            let info = lookup_user(user).ok()?;
+            let (fp, b64, kind) = blob_tokens(cert_blob);
+            let (ca_fp, ca_b64, ca_kind) = blob_tokens(&ci.ca_key_blob);
+            let mut tokens = connection_tokens(&info);
+            tokens.extend([
+                ('f', fp),
+                ('k', b64),
+                ('t', kind),
+                ('F', ca_fp),
+                ('K', ca_b64),
+                ('T', ca_kind),
+                ('i', ci.key_id.clone()),
+                ('s', ci.serial.to_string()),
+            ]);
+            let argv = self.expand_command("AuthorizedPrincipalsCommand", &template, &tokens)?;
+            let user_opt = self.auth_commands.principals_user.clone();
+            let out = self.run_cached("AuthorizedPrincipalsCommand", argv, user_opt)?;
+            Some(parse_principals(&out, "AuthorizedPrincipalsCommand output"))
+        }
+
+        /// Expand a command's arguments (not the program path).
+        fn expand_command(
+            &self,
+            kind: &str,
+            template: &[String],
+            tokens: &[(char, String)],
+        ) -> Option<Vec<String>> {
+            let mut argv = vec![template[0].clone()];
+            for arg in &template[1..] {
+                match expand_command_arg(arg, tokens) {
+                    Ok(a) => argv.push(a),
+                    Err(e) => {
+                        eprintln!("sshd: {kind}: {arg:?}: {e}");
+                        return None;
+                    }
                 }
             }
+            Some(argv)
+        }
+
+        /// [`run_auth_command`], once per connection for a given command line.
+        fn run_cached(
+            &mut self,
+            kind: &str,
+            argv: Vec<String>,
+            run_as: Option<String>,
+        ) -> Option<String> {
+            if let Some(out) = self.command_cache.get(&argv) {
+                return out.clone();
+            }
+            let out = run_auth_command(
+                kind,
+                &argv,
+                run_as.as_deref(),
+                self.strict_modes,
+                self.debug,
+            );
+            self.command_cache.insert(argv, out.clone());
+            out
         }
 
         /// The bound user's authorized keys, loaded on first use: the global
@@ -2884,15 +3256,26 @@ mod imp {
         fn key_authorized(&mut self, user: &str, blob: &[u8]) -> bool {
             let peer = self.peer.clone();
             let debug = self.debug;
-            let set = self.resolved_authorized_keys(user);
-            let found = set.blobs.iter().enumerate().find(|(i, b)| {
-                b.as_slice() == blob
-                    && set
-                        .options
-                        .get(*i)
-                        .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
-            });
-            let opts = found.map(|(i, _)| set.options.get(i).cloned().unwrap_or_default());
+            let find = |set: &AuthorizedKeys| {
+                set.blobs
+                    .iter()
+                    .enumerate()
+                    .find(|(i, b)| {
+                        b.as_slice() == blob
+                            && set
+                                .options
+                                .get(*i)
+                                .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
+                    })
+                    .map(|(i, _)| set.options.get(i).cloned().unwrap_or_default())
+            };
+            // The files first, then AuthorizedKeysCommand, as OpenSSH.
+            let mut opts = find(self.resolved_authorized_keys(user));
+            if opts.is_none()
+                && let Some(set) = self.command_keys(user, blob)
+            {
+                opts = find(&set);
+            }
             let ok = opts.is_some();
             self.accepted_options = opts;
             ok
@@ -2939,6 +3322,8 @@ mod imp {
             self.permit_empty_passwords = opts.permit_empty_passwords == Some(true);
             self.pubkey_accepted = opts.pubkey_accepted_algorithms.clone();
             self.required_rsa_size = opts.required_rsa_size.unwrap_or(DEFAULT_REQUIRED_RSA_SIZE);
+            self.auth_commands = AuthCommands::from_options(&opts);
+            self.command_cache.clear();
             self.authorized_principals_file = opts.authorized_principals_file;
             self.authorized_principals = None;
             if self.global_authorized_keys.is_none() {
@@ -2982,9 +3367,12 @@ mod imp {
         /// configured but unreadable / fails StrictModes / has an unexpandable
         /// path resolves to `Some(vec![])` (no principals), which fails the
         /// authorization closed rather than silently widening it.
-        fn resolved_principals(&mut self, user: &str) -> &Option<Vec<String>> {
+        fn resolved_principals(&mut self, user: &str) -> &Option<Vec<AuthorizedPrincipal>> {
             if self.authorized_principals.is_none() {
-                let template = self.authorized_principals_file.clone();
+                let template = self
+                    .authorized_principals_file
+                    .clone()
+                    .filter(|t| !t.eq_ignore_ascii_case("none"));
                 let resolved = template.map(|t| self.load_principals_for(&t, user));
                 self.authorized_principals = Some(resolved);
             }
@@ -2993,8 +3381,8 @@ mod imp {
         }
 
         /// Expand a principals-file path template for `user` and load it,
-        /// returning the principal names (empty on any failure — fail closed).
-        fn load_principals_for(&self, template: &str, user: &str) -> Vec<String> {
+        /// returning its lines (empty on any failure — fail closed).
+        fn load_principals_for(&self, template: &str, user: &str) -> Vec<AuthorizedPrincipal> {
             let info = match lookup_user(user) {
                 Ok(i) => i,
                 Err(e) => {
@@ -3401,7 +3789,7 @@ mod imp {
                         && alg_ok
                         && size_ok
                         && match &cert {
-                            Some(ci) => self.cert_trusted(ci, &user),
+                            Some(ci) => self.cert_trusted(ci, &user, &public_blob),
                             None => self.key_authorized(&user, &public_blob),
                         };
                     // PermitRootLogin gate: if the requested user resolves to
@@ -3771,6 +4159,8 @@ mod imp {
                 authorized_principals_file: self.authorized_principals_file.clone(),
                 strict_modes: self.strict_modes,
                 authorized_principals: None,
+                auth_commands: AuthCommands::default(),
+                command_cache: Default::default(),
                 permit_root_login: self.permit_root_login,
                 pam: self.pam.clone(),
                 password_enabled: self.password_enabled,
@@ -6950,6 +7340,8 @@ mod imp {
                 authorized_principals_file: None,
                 strict_modes: false,
                 authorized_principals: None,
+                auth_commands: AuthCommands::default(),
+                command_cache: Default::default(),
                 permit_root_login: puressh::config::PermitRootLogin::ProhibitPassword,
                 pam: pam_gate::PamGate::new(false),
                 password_enabled: false,
@@ -7282,7 +7674,10 @@ mod imp {
             a.authorized_principals_file = Some(template);
             a.strict_modes = false; // temp file isn't root-owned
 
-            let resolved = a.resolved_principals(&user).clone();
+            let resolved = a
+                .resolved_principals(&user)
+                .clone()
+                .map(|l| l.into_iter().map(|p| p.name).collect::<Vec<_>>());
             std::fs::remove_file(&expanded).ok();
             std::fs::remove_dir(&dir).ok();
 
@@ -7310,7 +7705,11 @@ mod imp {
             let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
             a.authorized_principals_file = Some("/nonexistent/puressh/%u.principals".to_string());
             a.strict_modes = false;
-            assert_eq!(a.resolved_principals(&info.name).clone(), Some(Vec::new()));
+            assert!(
+                a.resolved_principals(&info.name)
+                    .as_ref()
+                    .is_some_and(Vec::is_empty)
+            );
         }
 
         /// Resolve a real user for token-expansion tests: prefer $USER, fall

@@ -146,8 +146,12 @@ pub struct ServerOptions {
     pub accept_env: Vec<String>,
     /// `StrictModes` (yes/no).
     pub strict_modes: Option<bool>,
-    /// `LogLevel`: 0 = QUIET/INFO, 1 = VERBOSE/DEBUG1, 2 = DEBUG2, 3 = DEBUG3.
+    /// `LogLevel`, numbered as OpenSSH orders them: 0 QUIET, 1 FATAL,
+    /// 2 ERROR, 3 INFO (the default), 4 VERBOSE, 5 DEBUG1, 6 DEBUG2,
+    /// 7 DEBUG3. See [`LOG_LEVELS`].
     pub log_level: Option<u8>,
+    /// `SyslogFacility` (`AUTH` by default), upper-cased.
+    pub syslog_facility: Option<String>,
     /// puressh-specific: `SftpEnabled` (yes/no). `sshd_config(5)` expresses
     /// this via `Subsystem sftp ...`; we expose a direct toggle instead.
     pub sftp_enabled: Option<bool>,
@@ -569,6 +573,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(x11_forwarding);
     take_scalar!(strict_modes);
     take_scalar!(log_level);
+    take_scalar!(syslog_facility);
     take_scalar!(sftp_enabled);
     take_scalar!(sftp_read_only);
     take_scalar!(sftp_root);
@@ -756,6 +761,21 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "revokedkeys" => {
             opts.revoked_keys = Some(one_arg(line)?);
+        }
+        "syslogfacility" => {
+            let f = one_arg(line)?.to_ascii_uppercase();
+            const FACILITIES: &[&str] = &[
+                "DAEMON", "USER", "AUTH", "AUTHPRIV", "LOCAL0", "LOCAL1", "LOCAL2", "LOCAL3",
+                "LOCAL4", "LOCAL5", "LOCAL6", "LOCAL7",
+            ];
+            if !FACILITIES.contains(&f.as_str()) {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: format!("unsupported log facility {f:?}"),
+                });
+            }
+            opts.syslog_facility = Some(f);
         }
         "authorizedprincipalsfile" => {
             opts.authorized_principals_file = Some(one_arg(line)?);
@@ -1229,7 +1249,6 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
 const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     // Logging, DNS, network tuning, cosmetics.
     ("UseDNS", &["*"], ""),
-    ("SyslogFacility", &["*"], ""),
     ("LogVerbose", &["*"], ""),
     ("PrintLastLog", &["*"], ""),
     ("TCPKeepAlive", &["*"], ""),
@@ -1624,19 +1643,27 @@ fn parse_permit_root_login(line: &ParsedLine) -> Result<PermitRootLogin, ConfigE
     }
 }
 
+/// `LogLevel` names, indexed by [`ServerOptions::log_level`].
+pub const LOG_LEVELS: [&str; 8] = [
+    "QUIET", "FATAL", "ERROR", "INFO", "VERBOSE", "DEBUG1", "DEBUG2", "DEBUG3",
+];
+
 fn parse_log_level(line: &ParsedLine) -> Result<u8, ConfigError> {
     let s = one_arg(line)?.to_ascii_uppercase();
-    match s.as_str() {
-        "QUIET" | "FATAL" | "ERROR" | "INFO" => Ok(0),
-        "VERBOSE" | "DEBUG" | "DEBUG1" => Ok(1),
-        "DEBUG2" => Ok(2),
-        "DEBUG3" => Ok(3),
-        _ => Err(ConfigError::BadValue {
+    let s = if s == "DEBUG" {
+        "DEBUG1".to_string()
+    } else {
+        s
+    };
+    LOG_LEVELS
+        .iter()
+        .position(|l| *l == s)
+        .map(|i| i as u8)
+        .ok_or_else(|| ConfigError::BadValue {
             line: line.line_no,
             keyword: line.keyword.clone(),
             msg: format!("expected QUIET..DEBUG3, got {s:?}"),
-        }),
-    }
+        })
 }
 
 /// Parse an OpenSSH time-format duration like `30s`, `5m`, `2h`, or a bare

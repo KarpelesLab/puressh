@@ -77,7 +77,12 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(unix)]
+#[path = "sshd_log.rs"]
+mod sshd_log;
+
+#[cfg(unix)]
 mod imp {
+    use crate::sshd_log;
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::net::IpAddr;
@@ -739,6 +744,10 @@ mod imp {
         address_family: Option<puressh::config::ServerAddressFamily>,
         /// `-E file`: append diagnostics to `file` instead of stderr.
         log_file: Option<String>,
+        /// `-e`: log to stderr instead of syslog.
+        log_stderr: bool,
+        /// `-q`: log nothing.
+        quiet: bool,
         /// `-b ADDR`: bind to ADDR (host or `host:port`). Repeats are
         /// recognised; v1 uses only the first one and warns about extras
         /// until multi-address bind lands. Config `ListenAddress` lines
@@ -1220,12 +1229,11 @@ mod imp {
         );
         line(
             "loglevel",
-            match opts.log_level.unwrap_or(0) {
-                0 => "INFO",
-                1 => "DEBUG1",
-                2 => "DEBUG2",
-                _ => "DEBUG3",
-            },
+            puressh::config::server::LOG_LEVELS[usize::from(opts.log_level.unwrap_or(3).min(7))],
+        );
+        line(
+            "syslogfacility",
+            opts.syslog_facility.as_deref().unwrap_or("AUTH"),
         );
         match &opts.authorized_keys_file {
             Some(files) => line("authorizedkeysfile", &files.join(" ")),
@@ -1356,6 +1364,8 @@ mod imp {
         let mut dump_config = false;
         let mut connection_spec: Vec<String> = Vec::new();
         let mut test_only = false;
+        let mut log_stderr = false;
+        let mut quiet = false;
         let mut address_family: Option<puressh::config::ServerAddressFamily> = None;
         let mut log_file: Option<String> = None;
         let mut listen_addresses: Vec<String> = Vec::new();
@@ -1423,10 +1433,13 @@ mod imp {
                             .map_err(|_| "invalid -g (seconds)".to_string())?,
                     );
                 }
+                // `-e`: log to stderr rather than syslog; `-q`: log nothing.
+                "-e" => log_stderr = true,
+                "-q" => quiet = true,
                 // OpenSSH compatibility no-ops: sshd always stays in the
-                // foreground and logs to stderr (`-D`, `-e`); `-q` quiet,
-                // `-r` no re-exec, `-k` obsolete key regeneration.
-                "-D" | "-e" | "-q" | "-r" => {}
+                // foreground (`-D`); `-r` no re-exec, `-k` obsolete key
+                // regeneration.
+                "-D" | "-r" => {}
                 "-k" => i += 1,
                 "-b" => {
                     i += 1;
@@ -1540,6 +1553,8 @@ mod imp {
             test_only,
             address_family,
             log_file,
+            log_stderr,
+            quiet,
             listen_addresses,
             host_key_files,
             host_certificate_files,
@@ -2950,25 +2965,49 @@ mod imp {
             if knock_user().is_some_and(|k| k != user) {
                 return false;
             }
+            // OpenSSH says why an existing user is refused, once.
+            let refuse = |why: &str| {
+                sshd_log::with_conn(|c| {
+                    if c.invalid_prefix().is_empty() && c.first("not allowed") {
+                        let ip = peer.and_then(parse_peer_ip).map(sshd_log::addr_str);
+                        sshd_log::info(&format!(
+                            "User {user} from {} not allowed because {why}",
+                            ip.unwrap_or_default()
+                        ));
+                    }
+                });
+                false
+            };
             // 1. DenyUsers wins outright.
             if !self.deny_users.is_empty() && user_host_list_matches(&self.deny_users, user, peer) {
-                return false;
+                return refuse("listed in DenyUsers");
             }
             // 2. AllowUsers: if set, the user must match one.
             if !self.allow_users.is_empty()
                 && !user_host_list_matches(&self.allow_users, user, peer)
             {
-                return false;
+                return refuse("not listed in AllowUsers");
             }
             // 3. DenyGroups: a matching group refuses.
             if !self.deny_groups.is_empty() && in_group(&self.deny_groups) {
-                return false;
+                return refuse("a group is listed in DenyGroups");
             }
             // 4. AllowGroups: if set, the user must be in a matching group.
             if !self.allow_groups.is_empty() && !in_group(&self.allow_groups) {
-                return false;
+                return refuse("none of user's groups are listed in AllowGroups");
             }
             true
+        }
+
+        /// `ROOT LOGIN REFUSED FROM …`, once, when PermitRootLogin refuses.
+        fn log_root_refused(&self, denied: bool) {
+            if denied {
+                sshd_log::with_conn(|c| {
+                    if c.first("root refused") {
+                        sshd_log::info(&format!("ROOT LOGIN REFUSED FROM {}", c.peer()));
+                    }
+                });
+            }
         }
 
         /// Memoized `resolves_to_root(user)` for this connection.
@@ -3496,6 +3535,7 @@ mod imp {
             let user_ok = self.access_allowed(user);
             let is_root = self.is_root(user);
             let root_denied = is_root && !self.permit_root_login.permits_password();
+            self.log_root_refused(root_denied);
 
             let rhost = self.peer.clone();
             let pam_ok = self
@@ -3564,6 +3604,7 @@ mod imp {
                     let user_ok = self.access_allowed(user);
                     let is_root = self.is_root(user);
                     let root_denied = is_root && !self.permit_root_login.permits_password();
+                    self.log_root_refused(root_denied);
                     if user_ok && !root_denied {
                         if self.debug {
                             eprintln!("sshd: auth keyboard-interactive: accepted user {user}");
@@ -3678,6 +3719,130 @@ mod imp {
                 still_required: next,
             }
         }
+
+        /// Log an attempt's outcome as OpenSSH does: `Accepted …` (and the
+        /// connection is authenticated), `Partial …`, `Failed …` — at INFO
+        /// for an invalid user or a password, VERBOSE otherwise. A probe
+        /// that a key is acceptable is not an outcome.
+        fn log_decision(&mut self, note: &AttemptNote, decision: &AuthDecision) {
+            let _ = self;
+            sshd_log::with_conn(|c| {
+                let peer = c.peer();
+                let (user, key) = (&note.user, &note.key);
+                match decision {
+                    AuthDecision::Accept if !note.probe => {
+                        sshd_log::info(&format!(
+                            "Accepted {} for {user} from {peer} ssh2{key}",
+                            note.method
+                        ));
+                    }
+                    AuthDecision::PartialAccept { .. } if !note.probe => {
+                        sshd_log::verbose(&format!(
+                            "Partial {} for {user} from {peer} ssh2{key}",
+                            note.method
+                        ));
+                    }
+                    AuthDecision::Reject => {
+                        let invalid = c.invalid_prefix();
+                        let level = if sshd_log::failure_is_loud(c, note.method) {
+                            sshd_log::Level::Info
+                        } else {
+                            sshd_log::Level::Verbose
+                        };
+                        if note.method != "none" {
+                            c.failures += 1;
+                        }
+                        sshd_log::log(
+                            level,
+                            &format!(
+                                "Failed {} for {invalid}{user} from {peer} ssh2{key}",
+                                note.method
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            });
+            if matches!(decision, AuthDecision::Accept) && !note.probe {
+                sshd_log::conn_authenticated();
+            }
+        }
+    }
+
+    /// What an auth attempt's log line names.
+    struct AttemptNote {
+        /// `none`, `password`, `publickey`, `keyboard-interactive/pam`.
+        method: &'static str,
+        user: String,
+        /// A publickey query without a signature.
+        probe: bool,
+        /// `: ED25519 SHA256:…` for a key, empty otherwise.
+        key: String,
+    }
+
+    impl AttemptNote {
+        fn of(attempt: &AuthAttempt) -> Self {
+            let (method, user, probe, key) = match attempt {
+                AuthAttempt::None { user } => ("none", user, false, String::new()),
+                AuthAttempt::Password { user, .. } => ("password", user, false, String::new()),
+                AuthAttempt::KeyboardInteractive { user } => {
+                    ("keyboard-interactive/pam", user, false, String::new())
+                }
+                AuthAttempt::PublicKey {
+                    user,
+                    public_blob,
+                    probe_only,
+                    cert,
+                    ..
+                } => (
+                    "publickey",
+                    user,
+                    *probe_only,
+                    key_description(public_blob, cert.as_ref()),
+                ),
+                _ => ("unknown", &String::new(), false, String::new()),
+            };
+            AttemptNote {
+                method,
+                user: user.clone(),
+                probe,
+                key,
+            }
+        }
+    }
+
+    /// A key as OpenSSH's auth log names it: `: ED25519 SHA256:…`, or for a
+    /// certificate `: ED25519-CERT SHA256:… ID id (serial n) CA ED25519
+    /// SHA256:…`.
+    fn key_description(blob: &[u8], cert: Option<&puressh::auth::CertInfo>) -> String {
+        fn label(kind: &str) -> &'static str {
+            let plain = kind.split("-cert-v01@").next().unwrap_or(kind);
+            match plain {
+                "ssh-ed25519" => "ED25519",
+                "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => "RSA",
+                k if k.starts_with("ecdsa-sha2-") => "ECDSA",
+                k if k.starts_with("sk-ssh-ed25519") => "ED25519-SK",
+                k if k.starts_with("sk-ecdsa") => "ECDSA-SK",
+                _ => "UNKNOWN",
+            }
+        }
+        match cert {
+            None => {
+                let (fp, _, kind) = blob_tokens(blob);
+                format!(": {} {fp}", label(&kind))
+            }
+            Some(ci) => {
+                let (fp, _, kind) = blob_tokens(&ci.embedded_pubkey_blob);
+                let (ca_fp, _, ca_kind) = blob_tokens(&ci.ca_key_blob);
+                format!(
+                    ": {}-CERT {fp} ID {} (serial {}) CA {} {ca_fp}",
+                    label(&kind),
+                    ci.key_id,
+                    ci.serial,
+                    label(&ca_kind)
+                )
+            }
+        }
     }
 
     impl Authenticator for LocalAuthenticator {
@@ -3709,280 +3874,307 @@ mod imp {
         }
 
         fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
-            if self.policy_broken {
-                return AuthDecision::Reject;
-            }
-            match attempt {
-                AuthAttempt::None { user } => {
-                    if self.debug {
-                        eprintln!("sshd: auth none rejected for user {}", sanitize_log(&user));
-                    }
-                    AuthDecision::Reject
+            let note = AttemptNote::of(&attempt);
+            let decision = (|| {
+                if self.policy_broken {
+                    return AuthDecision::Reject;
                 }
-                AuthAttempt::PublicKey {
-                    user,
-                    algorithm,
-                    public_blob,
-                    probe_only,
-                    verified,
-                    cert,
-                } => {
-                    // An invalid username, or a username switched
-                    // mid-userauth, is refused before anything else. Both
-                    // verdicts depend only on the client's own input (never on
-                    // whether an account exists), so the early return leaks
-                    // nothing. Every `{user}` logged below has passed this
-                    // check and is therefore free of control characters.
-                    if !self.check_user_binding(&user) {
+                match attempt {
+                    AuthAttempt::None { user } => {
                         if self.debug {
+                            eprintln!("sshd: auth none rejected for user {}", sanitize_log(&user));
+                        }
+                        AuthDecision::Reject
+                    }
+                    AuthAttempt::PublicKey {
+                        user,
+                        algorithm,
+                        public_blob,
+                        probe_only,
+                        verified,
+                        cert,
+                    } => {
+                        // An invalid username, or a username switched
+                        // mid-userauth, is refused before anything else. Both
+                        // verdicts depend only on the client's own input (never on
+                        // whether an account exists), so the early return leaks
+                        // nothing. Every `{user}` logged below has passed this
+                        // check and is therefore free of control characters.
+                        if !self.check_user_binding(&user) {
+                            if self.debug {
+                                eprintln!(
+                                    "sshd: auth publickey: username rejected or changed mid-userauth"
+                                );
+                            }
+                            return AuthDecision::Reject;
+                        }
+                        // Always run *both* remaining checks unconditionally so an
+                        // attacker can't distinguish "unknown user" from
+                        // "known user / wrong key" via wall-clock timing.
+                        // The access check (DenyUsers/AllowUsers/DenyGroups/
+                        // AllowGroups, with a memoized group lookup) and the
+                        // scan over the user's authorized keys (loaded once per
+                        // connection) both run for every attempt so the paths
+                        // stay uniform.
+                        let user_ok = self.access_allowed(&user);
+                        // For a certificate, "blob_ok" becomes: the CA is trusted,
+                        // the login user is an authorized principal, and any
+                        // source-address critical option admits this peer. (The
+                        // auth layer already verified the CA signature, the cert
+                        // type/validity, and that all critical options are
+                        // understood, before producing a `verified` cert attempt.)
+                        // KRL revocation applies uniformly to plain keys and to a
+                        // certificate's full wire blob (OpenSSH's explicit-key /
+                        // fingerprint sections can name a cert blob directly). For
+                        // a certificate the key *embedded* in it is checked as
+                        // well: revoking a plain key must also refuse every
+                        // certificate wrapping that key (OpenSSH checks the
+                        // embedded key, not just the cert). A revoked blob forces
+                        // `blob_ok` false regardless of the authorized-keys /
+                        // cert-trust verdict.
+                        let blob_revoked = self
+                            .revoked_keys
+                            .as_ref()
+                            .as_ref()
+                            .map(|krl| {
+                                krl.is_revoked_key(&public_blob)
+                                    || cert.as_ref().is_some_and(|ci| {
+                                        krl.is_revoked_key(&ci.embedded_pubkey_blob)
+                                    })
+                            })
+                            .unwrap_or(false);
+                        if blob_revoked && self.debug {
                             eprintln!(
-                                "sshd: auth publickey: username rejected or changed mid-userauth"
+                                "sshd: auth publickey: key/cert blob revoked by KRL for {user}"
                             );
                         }
-                        return AuthDecision::Reject;
-                    }
-                    // Always run *both* remaining checks unconditionally so an
-                    // attacker can't distinguish "unknown user" from
-                    // "known user / wrong key" via wall-clock timing.
-                    // The access check (DenyUsers/AllowUsers/DenyGroups/
-                    // AllowGroups, with a memoized group lookup) and the
-                    // scan over the user's authorized keys (loaded once per
-                    // connection) both run for every attempt so the paths
-                    // stay uniform.
-                    let user_ok = self.access_allowed(&user);
-                    // For a certificate, "blob_ok" becomes: the CA is trusted,
-                    // the login user is an authorized principal, and any
-                    // source-address critical option admits this peer. (The
-                    // auth layer already verified the CA signature, the cert
-                    // type/validity, and that all critical options are
-                    // understood, before producing a `verified` cert attempt.)
-                    // KRL revocation applies uniformly to plain keys and to a
-                    // certificate's full wire blob (OpenSSH's explicit-key /
-                    // fingerprint sections can name a cert blob directly). For
-                    // a certificate the key *embedded* in it is checked as
-                    // well: revoking a plain key must also refuse every
-                    // certificate wrapping that key (OpenSSH checks the
-                    // embedded key, not just the cert). A revoked blob forces
-                    // `blob_ok` false regardless of the authorized-keys /
-                    // cert-trust verdict.
-                    let blob_revoked = self
-                        .revoked_keys
-                        .as_ref()
-                        .as_ref()
-                        .map(|krl| {
-                            krl.is_revoked_key(&public_blob)
-                                || cert
-                                    .as_ref()
-                                    .is_some_and(|ci| krl.is_revoked_key(&ci.embedded_pubkey_blob))
-                        })
-                        .unwrap_or(false);
-                    if blob_revoked && self.debug {
-                        eprintln!("sshd: auth publickey: key/cert blob revoked by KRL for {user}");
-                    }
-                    // PubkeyAcceptedAlgorithms / RequiredRSASize: a policy on
-                    // the key itself, folded into `blob_ok` (no early return,
-                    // so timing stays uniform).
-                    let alg_ok = self
-                        .pubkey_accepted
-                        .as_ref()
-                        .is_none_or(|l| l.iter().any(|a| a == &algorithm));
-                    let key_blob = cert.as_ref().map_or(public_blob.as_slice(), |ci| {
-                        ci.embedded_pubkey_blob.as_slice()
-                    });
-                    let size_ok = rsa_modulus_bits(key_blob)
-                        .is_none_or(|bits| bits >= self.required_rsa_size as usize);
-                    if self.debug && !(alg_ok && size_ok) {
-                        eprintln!(
-                            "sshd: auth publickey: {} for {user}",
-                            if alg_ok {
-                                "RSA key below RequiredRSASize"
-                            } else {
-                                "algorithm not in PubkeyAcceptedAlgorithms"
-                            }
-                        );
-                    }
-                    let blob_ok = !blob_revoked
-                        && alg_ok
-                        && size_ok
-                        && match &cert {
-                            Some(ci) => self.cert_trusted(ci, &user, &public_blob),
-                            None => self.key_authorized(&user, &public_blob),
-                        };
-                    // PermitRootLogin gate: if the requested user resolves to
-                    // the root account (uid 0) and policy forbids it, deny
-                    // regardless of key match. The username is resolved at
-                    // login time (memoized per connection) rather than from a
-                    // daemon-startup snapshot, so a uid-0 alias added after
-                    // startup is still caught. Resolved for every requested
-                    // user (not only allowed ones) so the lookup doesn't add a
-                    // user-enumeration timing signal.
-                    let is_root = self.is_root(&user);
-                    let root_denied = is_root && !self.permit_root_login.permits_publickey();
-                    let allow = user_ok && blob_ok && !root_denied;
+                        // PubkeyAcceptedAlgorithms / RequiredRSASize: a policy on
+                        // the key itself, folded into `blob_ok` (no early return,
+                        // so timing stays uniform).
+                        let alg_ok = self
+                            .pubkey_accepted
+                            .as_ref()
+                            .is_none_or(|l| l.iter().any(|a| a == &algorithm));
+                        let key_blob = cert.as_ref().map_or(public_blob.as_slice(), |ci| {
+                            ci.embedded_pubkey_blob.as_slice()
+                        });
+                        let size_ok = rsa_modulus_bits(key_blob)
+                            .is_none_or(|bits| bits >= self.required_rsa_size as usize);
+                        if self.debug && !(alg_ok && size_ok) {
+                            eprintln!(
+                                "sshd: auth publickey: {} for {user}",
+                                if alg_ok {
+                                    "RSA key below RequiredRSASize"
+                                } else {
+                                    "algorithm not in PubkeyAcceptedAlgorithms"
+                                }
+                            );
+                        }
+                        let blob_ok = !blob_revoked
+                            && alg_ok
+                            && size_ok
+                            && match &cert {
+                                Some(ci) => self.cert_trusted(ci, &user, &public_blob),
+                                None => self.key_authorized(&user, &public_blob),
+                            };
+                        // PermitRootLogin gate: if the requested user resolves to
+                        // the root account (uid 0) and policy forbids it, deny
+                        // regardless of key match. The username is resolved at
+                        // login time (memoized per connection) rather than from a
+                        // daemon-startup snapshot, so a uid-0 alias added after
+                        // startup is still caught. Resolved for every requested
+                        // user (not only allowed ones) so the lookup doesn't add a
+                        // user-enumeration timing signal.
+                        let is_root = self.is_root(&user);
+                        let root_denied = is_root && !self.permit_root_login.permits_publickey();
+                        self.log_root_refused(root_denied);
+                        let allow = user_ok && blob_ok && !root_denied;
 
-                    // probe_only attempts (no signature) only need
-                    // user+blob to be acceptable so the client knows it
-                    // can move on to the signed step.
-                    if probe_only {
-                        return if allow {
-                            AuthDecision::Accept
-                        } else {
+                        // probe_only attempts (no signature) only need
+                        // user+blob to be acceptable so the client knows it
+                        // can move on to the signed step.
+                        if probe_only {
+                            return if allow {
+                                AuthDecision::Accept
+                            } else {
+                                if self.debug {
+                                    if root_denied {
+                                        eprintln!(
+                                            "sshd: auth publickey probe: root login denied by PermitRootLogin for {user}"
+                                        );
+                                    } else if !user_ok {
+                                        eprintln!(
+                                            "sshd: auth publickey probe: user {user} not in allowed set"
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "sshd: auth publickey probe: key not in authorized_keys for {user}"
+                                        );
+                                    }
+                                }
+                                AuthDecision::Reject
+                            };
+                        }
+
+                        if !(allow && verified) {
                             if self.debug {
                                 if root_denied {
                                     eprintln!(
-                                        "sshd: auth publickey probe: root login denied by PermitRootLogin for {user}"
+                                        "sshd: auth publickey: root login denied by PermitRootLogin for {user}"
                                     );
                                 } else if !user_ok {
                                     eprintln!(
-                                        "sshd: auth publickey probe: user {user} not in allowed set"
+                                        "sshd: auth publickey: user {user} not in allowed set"
+                                    );
+                                } else if !blob_ok {
+                                    eprintln!(
+                                        "sshd: auth publickey: key not in authorized_keys for {user}"
                                     );
                                 } else {
                                     eprintln!(
-                                        "sshd: auth publickey probe: key not in authorized_keys for {user}"
+                                        "sshd: auth publickey: signature missing or unverified for {user}"
                                     );
                                 }
                             }
-                            AuthDecision::Reject
-                        };
-                    }
-
-                    if !(allow && verified) {
+                            return AuthDecision::Reject;
+                        }
                         if self.debug {
-                            if root_denied {
+                            eprintln!("sshd: auth publickey: verified user {user}");
+                        }
+                        // A verified user certificate's `force-command` critical
+                        // option (and its default-deny extensions) are captured by
+                        // the auth layer into `AuthCertCaps`, folded into the
+                        // per-connection `EffectivePolicy`, and enforced by the
+                        // server connection-phase dispatcher uniformly with the
+                        // config `ForceCommand` / forwarding gates. Nothing to
+                        // record here.
+                        //
+                        // A verified signature satisfies the `publickey` factor. In
+                        // single-factor mode this Accepts; under a multi-factor
+                        // chain it may PartialAccept and ask for the next factor.
+                        self.record_and_decide("publickey")
+                    }
+                    AuthAttempt::Password { user, password } => {
+                        if !self.password_enabled {
+                            if self.debug {
                                 eprintln!(
-                                    "sshd: auth publickey: root login denied by PermitRootLogin for {user}"
-                                );
-                            } else if !user_ok {
-                                eprintln!("sshd: auth publickey: user {user} not in allowed set");
-                            } else if !blob_ok {
-                                eprintln!(
-                                    "sshd: auth publickey: key not in authorized_keys for {user}"
-                                );
-                            } else {
-                                eprintln!(
-                                    "sshd: auth publickey: signature missing or unverified for {user}"
+                                    "sshd: auth password rejected (disabled) for user {user}"
                                 );
                             }
+                            return AuthDecision::Reject;
                         }
-                        return AuthDecision::Reject;
+                        // Copy the secret bytes into a zeroize-on-drop buffer; the
+                        // source `SecretString` is itself zeroizing and drops at the
+                        // end of this arm.
+                        let pw = zeroize::Zeroizing::new(password.as_bytes().to_vec());
+                        self.verify_password(&user, "password", pw)
                     }
-                    if self.debug {
-                        eprintln!("sshd: auth publickey: verified user {user}");
+                    AuthAttempt::KeyboardInteractive { user } => {
+                        if !self.kbd_interactive_enabled {
+                            if self.debug {
+                                eprintln!(
+                                    "sshd: auth keyboard-interactive rejected (disabled) for user {user}"
+                                );
+                            }
+                            return AuthDecision::Reject;
+                        }
+                        // Bind the username now (so a later switch is caught).
+                        if !self.check_user_binding(&user) {
+                            if self.debug {
+                                eprintln!(
+                                    "sshd: auth keyboard-interactive: username changed mid-userauth"
+                                );
+                            }
+                            return AuthDecision::Reject;
+                        }
+                        // Start a fresh PAM conversation on a worker thread. Any
+                        // previous (abandoned) conversation is dropped here, tearing
+                        // down its worker. The first `next()` blocks until PAM
+                        // either asks a prompt (→ InteractiveRequest) or finishes
+                        // immediately (e.g. pam_permit with no prompts → decide).
+                        let rhost = self.peer.clone();
+                        let conv = self.pam.start_kbd_interactive(&user, rhost.as_deref());
+                        self.kbd_conv = Some(conv);
+                        self.pending_first_prompt = true;
+                        let user = user.clone();
+                        self.kbd_pump(&user)
                     }
-                    // A verified user certificate's `force-command` critical
-                    // option (and its default-deny extensions) are captured by
-                    // the auth layer into `AuthCertCaps`, folded into the
-                    // per-connection `EffectivePolicy`, and enforced by the
-                    // server connection-phase dispatcher uniformly with the
-                    // config `ForceCommand` / forwarding gates. Nothing to
-                    // record here.
-                    //
-                    // A verified signature satisfies the `publickey` factor. In
-                    // single-factor mode this Accepts; under a multi-factor
-                    // chain it may PartialAccept and ask for the next factor.
-                    self.record_and_decide("publickey")
+                    // An auth method this binary predates: never accept it.
+                    _ => AuthDecision::Reject,
                 }
-                AuthAttempt::Password { user, password } => {
-                    if !self.password_enabled {
-                        if self.debug {
-                            eprintln!("sshd: auth password rejected (disabled) for user {user}");
-                        }
-                        return AuthDecision::Reject;
-                    }
-                    // Copy the secret bytes into a zeroize-on-drop buffer; the
-                    // source `SecretString` is itself zeroizing and drops at the
-                    // end of this arm.
-                    let pw = zeroize::Zeroizing::new(password.as_bytes().to_vec());
-                    self.verify_password(&user, "password", pw)
-                }
-                AuthAttempt::KeyboardInteractive { user } => {
-                    if !self.kbd_interactive_enabled {
-                        if self.debug {
-                            eprintln!(
-                                "sshd: auth keyboard-interactive rejected (disabled) for user {user}"
-                            );
-                        }
-                        return AuthDecision::Reject;
-                    }
-                    // Bind the username now (so a later switch is caught).
-                    if !self.check_user_binding(&user) {
-                        if self.debug {
-                            eprintln!(
-                                "sshd: auth keyboard-interactive: username changed mid-userauth"
-                            );
-                        }
-                        return AuthDecision::Reject;
-                    }
-                    // Start a fresh PAM conversation on a worker thread. Any
-                    // previous (abandoned) conversation is dropped here, tearing
-                    // down its worker. The first `next()` blocks until PAM
-                    // either asks a prompt (→ InteractiveRequest) or finishes
-                    // immediately (e.g. pam_permit with no prompts → decide).
-                    let rhost = self.peer.clone();
-                    let conv = self.pam.start_kbd_interactive(&user, rhost.as_deref());
-                    self.kbd_conv = Some(conv);
-                    self.pending_first_prompt = true;
-                    let user = user.clone();
-                    self.kbd_pump(&user)
-                }
-                // An auth method this binary predates: never accept it.
-                _ => AuthDecision::Reject,
-            }
+            })();
+            self.log_decision(&note, &decision);
+            decision
         }
 
         fn evaluate_interactive(&mut self, user: &str, responses: Vec<String>) -> AuthDecision {
-            if !self.kbd_interactive_enabled || self.policy_broken {
-                return AuthDecision::Reject;
-            }
-            // Username must not change mid-conversation.
-            if !self.check_user_binding(user) {
-                if self.debug {
-                    eprintln!("sshd: auth keyboard-interactive: username changed mid-userauth");
-                }
-                self.kbd_conv = None;
-                return AuthDecision::Reject;
-            }
-            // Feed the answer (we issue one prompt per round, so exactly one
-            // response is expected) into the running conversation, then pump
-            // for the next step. The response strings come from
-            // `UserauthInfoResponse`, whose Drop zeroizes its buffer; we copy
-            // the answer into a zeroizing buffer first.
-            let answer = responses
-                .first()
-                .map(|s| zeroize::Zeroizing::new(s.as_bytes().to_vec()))
-                .unwrap_or_default();
-
-            // Empty-password policy: refuse an empty answer to the first prompt
-            // unless PermitEmptyPasswords, mirroring the password path. This is
-            // input-dependent (not user-dependent), so it leaks no user-
-            // existence oracle. `pending_first_prompt` tracks whether this is
-            // the opening answer.
-            if self.pending_first_prompt && answer.is_empty() && !self.permit_empty_passwords {
-                if self.debug {
-                    eprintln!("sshd: auth keyboard-interactive: empty password refused for {user}");
-                }
-                self.kbd_conv = None;
-                return AuthDecision::Reject;
-            }
-            self.pending_first_prompt = false;
-
-            let conv = match self.kbd_conv.as_mut() {
-                Some(c) => c,
-                None => return AuthDecision::Reject,
+            let note = AttemptNote {
+                method: "keyboard-interactive/pam",
+                user: user.to_string(),
+                probe: false,
+                key: String::new(),
             };
-            if !conv.answer(answer) {
-                // Worker already gone (e.g. PAM aborted) ⇒ reject.
-                self.kbd_conv = None;
-                return AuthDecision::Reject;
-            }
-            let user = user.to_string();
-            self.kbd_pump(&user)
+            let decision = (|| {
+                if !self.kbd_interactive_enabled || self.policy_broken {
+                    return AuthDecision::Reject;
+                }
+                // Username must not change mid-conversation.
+                if !self.check_user_binding(user) {
+                    if self.debug {
+                        eprintln!("sshd: auth keyboard-interactive: username changed mid-userauth");
+                    }
+                    self.kbd_conv = None;
+                    return AuthDecision::Reject;
+                }
+                // Feed the answer (we issue one prompt per round, so exactly one
+                // response is expected) into the running conversation, then pump
+                // for the next step. The response strings come from
+                // `UserauthInfoResponse`, whose Drop zeroizes its buffer; we copy
+                // the answer into a zeroizing buffer first.
+                let answer = responses
+                    .first()
+                    .map(|s| zeroize::Zeroizing::new(s.as_bytes().to_vec()))
+                    .unwrap_or_default();
+
+                // Empty-password policy: refuse an empty answer to the first prompt
+                // unless PermitEmptyPasswords, mirroring the password path. This is
+                // input-dependent (not user-dependent), so it leaks no user-
+                // existence oracle. `pending_first_prompt` tracks whether this is
+                // the opening answer.
+                if self.pending_first_prompt && answer.is_empty() && !self.permit_empty_passwords {
+                    if self.debug {
+                        eprintln!(
+                            "sshd: auth keyboard-interactive: empty password refused for {user}"
+                        );
+                    }
+                    self.kbd_conv = None;
+                    return AuthDecision::Reject;
+                }
+                self.pending_first_prompt = false;
+
+                let conv = match self.kbd_conv.as_mut() {
+                    Some(c) => c,
+                    None => return AuthDecision::Reject,
+                };
+                if !conv.answer(answer) {
+                    // Worker already gone (e.g. PAM aborted) ⇒ reject.
+                    self.kbd_conv = None;
+                    return AuthDecision::Reject;
+                }
+                let user = user.to_string();
+                self.kbd_pump(&user)
+            })();
+            self.log_decision(&note, &decision);
+            decision
         }
 
         fn on_user_resolved(&mut self, user: &str, methods: &[String]) {
             // Bind the username on first sight (the publickey/password arms also
             // bind, but this fires first via the server's re-resolve hook).
             let bound = self.check_user_binding(user);
+            if bound {
+                sshd_log::conn_user(user, lookup_user(user).is_ok());
+            }
             // Match-block access policy for this (user, peer, local socket):
             // AllowUsers/DenyUsers/AllowGroups/DenyGroups, PermitRootLogin,
             // PermitEmptyPasswords, AuthorizedKeysFile,
@@ -6349,10 +6541,36 @@ mod imp {
         // verbose diagnostics as `-d`, so the config keyword actually controls
         // output. `-d` always wins (it can't be turned back off). Rebind `cli`
         // so every downstream `cli.debug` reflects the effective level.
-        let log_level = sshd_cfg.global.log_level.unwrap_or(0);
+        let log_level = sshd_cfg.global.log_level.unwrap_or(3);
+        // OpenSSH's logging: syslog (SyslogFacility) at LogLevel, or stderr
+        // with -d / -e / -E; -d raises the level to DEBUG1, -q silences it.
+        {
+            let configured = puressh::config::server::LOG_LEVELS[usize::from(log_level.min(7))];
+            let mut level = sshd_log::Level::parse(configured).unwrap_or(sshd_log::Level::Info);
+            if cli.debug {
+                level = level.max(sshd_log::Level::Debug1);
+            }
+            if cli.quiet {
+                level = sshd_log::Level::Quiet;
+            }
+            let facility = sshd_cfg
+                .global
+                .syslog_facility
+                .as_deref()
+                .and_then(sshd_log::facility)
+                .unwrap_or(libc::LOG_AUTH);
+            let to_stderr = cli.debug || cli.log_stderr || cli.log_file.is_some() || cli.test_only;
+            sshd_log::init(level, facility, to_stderr);
+            sshd_log::set_max_auth_tries(
+                sshd_cfg
+                    .global
+                    .max_auth_tries
+                    .unwrap_or(puressh::server::DEFAULT_MAX_AUTH_TRIES),
+            );
+        }
         let cli = {
             let mut c = cli;
-            c.debug = c.debug || log_level >= 1;
+            c.debug = c.debug || log_level >= 5;
             c
         };
 
@@ -6968,7 +7186,11 @@ mod imp {
         }
 
         for a in &listen {
-            eprintln!("puressh sshd listening on {a} (pid {})", std::process::id());
+            sshd_log::info(&format!(
+                "Server listening on {} port {}.",
+                sshd_log::addr_str(a.ip()),
+                a.port()
+            ));
         }
         notify_ready();
 
@@ -6994,7 +7216,10 @@ mod imp {
 
         loop {
             if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
-                eprintln!("sshd: shutdown requested, exiting accept loop");
+                sshd_log::info("Received signal 15; terminating.");
+                if cli.debug {
+                    eprintln!("sshd: shutdown requested, exiting accept loop");
+                }
                 break;
             }
             if RELOAD_REQUESTED.swap(false, Ordering::Relaxed) {
@@ -7178,8 +7403,42 @@ mod imp {
                         if let Ok(mut g) = CONN_ADDRS.lock() {
                             *g = Some((peer, stream.local_addr().ok()));
                         }
+                        sshd_log::conn_begin(peer, stream.local_addr().ok());
 
-                        let rc = match handle_session_with_peer(stream, peer, cfg.clone()) {
+                        let result = handle_session_with_peer(stream, peer, cfg.clone());
+                        sshd_log::conn_end(match &result {
+                            Ok(()) => sshd_log::End::Closed,
+                            Err(puressh::Error::Disconnected {
+                                reason,
+                                description,
+                            }) => sshd_log::End::PeerDisconnect {
+                                reason: *reason,
+                                description,
+                            },
+                            Err(puressh::Error::AuthFailed) => sshd_log::End::AuthFailed,
+                            Err(puressh::Error::Io(e))
+                                if e.kind() == std::io::ErrorKind::TimedOut =>
+                            {
+                                sshd_log::End::GraceTimeout
+                            }
+                            // The client going away is a close, not an error.
+                            Err(puressh::Error::Protocol("connection closed")) => {
+                                sshd_log::End::Closed
+                            }
+                            Err(puressh::Error::Io(e))
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::ConnectionReset
+                                        | std::io::ErrorKind::BrokenPipe
+                                        | std::io::ErrorKind::UnexpectedEof
+                                        | std::io::ErrorKind::ConnectionAborted
+                                ) =>
+                            {
+                                sshd_log::End::Closed
+                            }
+                            Err(e) => sshd_log::End::Error(e.to_string()),
+                        });
+                        let rc = match result {
                             Ok(()) => 0,
                             Err(e) => {
                                 if cli.debug {

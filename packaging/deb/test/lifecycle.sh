@@ -62,6 +62,8 @@ FP=$(fp)
 try_ssh tester@localhost 'echo openssh-ok'
 
 step "install puressh-server"
+INSTALLED=$(date '+%Y-%m-%d %H:%M:%S')
+sleep 1
 apt-get install -y "$DEB"
 if installed openssh-server; then echo "openssh-server still installed"; exit 1; fi
 /usr/sbin/sshd -V | grep -q puressh
@@ -82,6 +84,12 @@ echo "$out" | grep -qx tester
 # A PTY session goes through PAM sessions and the privilege drop.
 try_ssh -tt tester@localhost 'tty' | grep -q /dev/pts/
 ss -ltnp | grep -q ':22 '
+# Logins are logged as OpenSSH logs them (syslog, facility AUTH), where
+# fail2ban and auth.log readers look.
+sleep 1
+ours_log() { journalctl --no-pager -o cat --since "$INSTALLED" SYSLOG_FACILITY=4 SYSLOG_IDENTIFIER=sshd; }
+ours_log | grep -q '^Server listening on '
+ours_log | grep -q '^Accepted publickey for tester from .* port [0-9]* ssh2: ED25519 SHA256:'
 
 step "reload (SIGHUP) keeps serving"
 systemctl reload ssh.service

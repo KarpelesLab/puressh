@@ -6366,6 +6366,15 @@ mod imp {
             return Ok(0);
         }
 
+        // As OpenSSH does for its session processes: no ptrace attach and no
+        // core dumps (host keys, session keys). Forked connection handlers
+        // inherit it; the users' programs (exec) get the default back.
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: PR_SET_DUMPABLE takes plain integer arguments.
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+
         install_parent_signals()?;
 
         // As in OpenSSH, an address that cannot be bound (e.g. `::` on a host

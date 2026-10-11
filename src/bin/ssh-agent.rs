@@ -340,11 +340,30 @@ mod imp {
         }
     }
 
+    fn disable_tracing() {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        // SAFETY: PR_SET_DUMPABLE takes plain integer arguments.
+        unsafe {
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        }
+        #[cfg(target_os = "macos")]
+        // SAFETY: PT_DENY_ATTACH takes no address or data.
+        unsafe {
+            libc::ptrace(libc::PT_DENY_ATTACH, 0, std::ptr::null_mut(), 0);
+        }
+    }
+
     pub fn run() -> Result<i32, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let o = parse_args(&args)?;
         if o.kill {
             return kill_agent(&o);
+        }
+        // Like OpenSSH: keep other processes of the same user from attaching
+        // to the agent (ptrace, /proc/<pid>/mem) and from getting a core
+        // dump with the keys in it. Not in debug mode, as with OpenSSH.
+        if !o.debug {
+            disable_tracing();
         }
 
         let (sock, dir) = match &o.bind {

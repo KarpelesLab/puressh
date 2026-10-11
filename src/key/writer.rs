@@ -176,6 +176,31 @@ impl PrivateKey {
         rng: &mut R,
         passphrase: Option<&[u8]>,
     ) -> Result<String> {
+        self.to_openssh_pem_with_rng_rounds(rng, passphrase, BCRYPT_ROUNDS)
+    }
+
+    /// [`Self::to_openssh_pem`] with `rounds` bcrypt KDF rounds instead of
+    /// the default 16 (`ssh-keygen -a`); only used when encrypting.
+    #[cfg(feature = "std")]
+    pub fn to_openssh_pem_with_rounds(
+        &self,
+        passphrase: Option<&[u8]>,
+        rounds: u32,
+    ) -> Result<String> {
+        let mut rng = OsRng;
+        self.to_openssh_pem_with_rng_rounds(&mut rng, passphrase, rounds)
+    }
+
+    /// [`Self::to_openssh_pem_with_rng`] with an explicit bcrypt round count.
+    pub fn to_openssh_pem_with_rng_rounds<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        passphrase: Option<&[u8]>,
+        rounds: u32,
+    ) -> Result<String> {
+        if rounds == 0 {
+            return Err(Error::Config("bcrypt rounds must be > 0"));
+        }
         // `non_empty_pass` is the single source of truth for "encrypt?": both
         // the `block` choice and the encryption branch read from it, so the
         // branches can't disagree (which was the latent risk behind the prior
@@ -196,7 +221,7 @@ impl PrivateKey {
                 // memory at scope exit — without this it would linger in the
                 // heap until the allocator reused the slot.
                 let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
-                    bcrypt_pbkdf(pass, &salt, BCRYPT_ROUNDS, KEY_LEN + IV_LEN)
+                    bcrypt_pbkdf(pass, &salt, rounds, KEY_LEN + IV_LEN)
                         .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
                 );
                 // `key` and `iv` are derived material too; wrap so the stack
@@ -212,7 +237,7 @@ impl PrivateKey {
                 ctr.apply_keystream(&mut buf);
                 let mut opts = Writer::new();
                 opts.write_string(&salt);
-                opts.write_u32(BCRYPT_ROUNDS);
+                opts.write_u32(rounds);
                 ("aes256-ctr", "bcrypt", opts.into_vec(), buf)
             } else {
                 ("none", "none", Vec::new(), inner)

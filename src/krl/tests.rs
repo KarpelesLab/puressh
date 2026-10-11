@@ -291,3 +291,28 @@ fn empty_krl_revokes_nothing() {
     assert!(!krl.is_revoked_cert(CA_BLOB, 1, "x"));
     assert!(!krl.is_revoked_key(USERKEY_BLOB));
 }
+
+#[test]
+fn builder_round_trips() {
+    let mut k = Krl::new();
+    k.set_version(7);
+    k.set_comment("revoked");
+    k.revoke_key(b"key-a");
+    k.revoke_sha256([3u8; 32]);
+    k.revoke_sha1([4u8; 20]);
+    k.revoke_cert_serials(b"ca", 5, 5);
+    k.revoke_cert_serials(b"ca", 100, 200);
+    k.revoke_cert_key_id(b"ca", "alice");
+    k.revoke_cert_serials(b"", 9, 9);
+    let back = Krl::parse(&k.to_bytes(1_700_000_000)).unwrap();
+    assert_eq!(back.version(), 7);
+    assert_eq!(back.comment(), "revoked");
+    assert!(back.is_revoked_key(b"key-a"));
+    assert!(!back.is_revoked_key(b"key-b"));
+    assert!(back.is_revoked_cert(b"ca", 5, ""));
+    assert!(back.is_revoked_cert(b"ca", 150, ""));
+    assert!(!back.is_revoked_cert(b"ca", 201, ""));
+    assert!(back.is_revoked_cert(b"ca", 1, "alice"));
+    assert!(back.is_revoked_cert(b"other-ca", 9, ""));
+    assert!(!back.is_revoked_cert(b"other-ca", 5, ""));
+}

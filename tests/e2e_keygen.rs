@@ -154,3 +154,87 @@ fn certificate_interop() {
         }
     }
 }
+
+/// Fingerprint forms, randomart, conversions, SSHFP and KRLs agree with
+/// OpenSSH's ssh-keygen.
+#[test]
+#[ignore]
+fn formats_fingerprints_krl_interop() {
+    let dir = tempdir("fmt");
+    for kind in ["rsa", "ecdsa", "ed25519"] {
+        keygen(&dir, kind, kind);
+        let pubf = format!("{kind}.pub");
+        for flags in [
+            &["-l", "-f"][..],
+            &["-l", "-v", "-f"],
+            &["-l", "-E", "md5", "-f"],
+            &["-B", "-f"],
+            &["-e", "-m", "PKCS8", "-f"],
+            &["-r", "host.example", "-f"],
+            &["-r", "host.example", "-g", "-f"],
+        ] {
+            let mut args = flags.to_vec();
+            args.push(&pubf);
+            // OpenSSH has no PKCS8 export for Ed25519 keys.
+            if kind == "ed25519" && flags.contains(&"PKCS8") {
+                continue;
+            }
+            let theirs = ok(&dir, "ssh-keygen", &args, b"");
+            let ours = ok(&dir, OURS, &args, b"");
+            assert_eq!(ours, theirs, "{kind} {flags:?}");
+        }
+        // Each side imports the other's exports.
+        let exported = ok(&dir, "ssh-keygen", &["-e", "-f", &pubf], b"");
+        std::fs::write(dir.join("exp"), exported).unwrap();
+        let imported = ok(&dir, OURS, &["-i", "-f", "exp"], b"");
+        assert_eq!(
+            imported.split_whitespace().nth(1),
+            pub_line(&dir, kind).split_whitespace().nth(1)
+        );
+        // PEM / PKCS8 private keys we write load in OpenSSH.
+        for m in ["PEM", "PKCS8"] {
+            if kind == "ed25519" && m == "PEM" {
+                continue;
+            }
+            let name = format!("{kind}_{m}");
+            ok(
+                &dir,
+                OURS,
+                &["-q", "-t", kind, "-m", m, "-N", "", "-f", &name],
+                b"",
+            );
+            let derived = ok(&dir, "ssh-keygen", &["-y", "-f", &name], b"");
+            assert_eq!(
+                derived.split_whitespace().nth(1),
+                pub_line(&dir, &name).split_whitespace().nth(1)
+            );
+        }
+    }
+
+    // A KRL built by either tool reads the same in both.
+    keygen(&dir, "ed25519", "ca");
+    keygen(&dir, "ed25519", "u");
+    ok(
+        &dir,
+        "ssh-keygen",
+        &["-q", "-s", "ca", "-I", "alice", "-z", "150", "u.pub"],
+        b"",
+    );
+    let spec = format!("serial: 100-200\nkey: {}\n", pub_line(&dir, "rsa"));
+    std::fs::write(dir.join("spec"), spec).unwrap();
+    let files = ["u-cert.pub", "u.pub", "rsa.pub", "ecdsa.pub"];
+    for (builder, krl) in [(OURS, "ours.krl"), ("ssh-keygen", "theirs.krl")] {
+        ok(
+            &dir,
+            builder,
+            &["-k", "-f", krl, "-s", "ca.pub", "spec"],
+            b"",
+        );
+        let mut q = vec!["-Q", "-f", krl];
+        q.extend_from_slice(&files);
+        let theirs = run(&dir, "ssh-keygen", &q, b"");
+        let ours = run(&dir, OURS, &q, b"");
+        assert_eq!(ours.stdout, theirs.stdout, "{krl}");
+        assert_eq!(ours.status.code(), theirs.status.code(), "{krl}");
+    }
+}

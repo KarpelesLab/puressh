@@ -542,7 +542,7 @@ fn bcrypt_rounds_cap_rejects_oversize_kdfoptions() {
 
     let mut opts = Writer::new();
     opts.write_string(&[0u8; 16]); // salt
-    opts.write_u32(65); // > MAX_BCRYPT_ROUNDS (64)
+    opts.write_u32(10_001); // > MAX_BCRYPT_ROUNDS (10000)
     let kdfopts = opts.into_vec();
 
     let mut pubw = Writer::new();

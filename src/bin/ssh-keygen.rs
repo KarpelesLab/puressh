@@ -1,8 +1,12 @@
 //! `ssh-keygen` — puressh's key-generation and key-inspection tool.
 //!
 //! ```text
-//! ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C comment] -f path
-//! ssh-keygen -l -f path[.pub]
+//! ssh-keygen [-q] [-a rounds] [-b bits] [-C comment] [-f path] [-m format] [-N pass] [-t type]
+//! ssh-keygen -l [-v] [-E sha256|md5] -f path[.pub]     (also -B: bubblebabble)
+//! ssh-keygen -e|-i [-m RFC4716|PKCS8|PEM] -f path      (export / import)
+//! ssh-keygen -r hostname [-g] [-f path]                (SSHFP records)
+//! ssh-keygen -k -f krl [-u] [-s ca.pub] [-z version] file ...
+//! ssh-keygen -Q [-l] -f krl file ...
 //! ssh-keygen -y -f path [-N passphrase]
 //! ssh-keygen -p -f path [-P old] -N new
 //! ssh-keygen -R host [-f known_hosts_path]            (remove entries)
@@ -70,8 +74,15 @@ fn unique_tmp_path(path: &str) -> String {
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: ssh-keygen -t TYPE [-b BITS] [-N passphrase] [-C comment] -f path  (generate)\n       \
-                     ssh-keygen -l -f path[.pub]                                          (fingerprint)\n       \
+const USAGE: &str = "usage: ssh-keygen [-q] [-a rounds] [-b bits] [-C comment] [-f output_keyfile]\n                  \
+                     [-m format] [-N new_passphrase] [-t ecdsa | ed25519 | rsa]\n       \
+                     ssh-keygen -l [-v] [-E fingerprint_hash] [-f input_keyfile]\n       \
+                     ssh-keygen -B [-f input_keyfile]\n       \
+                     ssh-keygen -e [-f input_keyfile] [-m key_format]\n       \
+                     ssh-keygen -i [-f input_keyfile] [-m key_format]\n       \
+                     ssh-keygen -r hostname [-g] [-f input_keyfile]\n       \
+                     ssh-keygen -k -f krl_file [-u] [-s ca_public] [-z version_number] file ...\n       \
+                     ssh-keygen -Q [-l] -f krl_file file ...\n       \
                      ssh-keygen -y -f path [-N passphrase]                                (extract public)\n       \
                      ssh-keygen -p -f path [-P old_passphrase] -N new_passphrase          (change passphrase)\n       \
                      ssh-keygen -R host [-f known_hosts_path]                             (remove host entries)\n       \
@@ -136,6 +147,26 @@ struct Args {
     serial: Option<String>,
     /// `-L`: print certificate contents.
     list_cert: bool,
+    /// `-m`: key format (`RFC4716`, `PKCS8`, `PEM`).
+    format: Option<String>,
+    /// `-e`: export a key in `-m` format; `-i`: import one.
+    export: bool,
+    import: bool,
+    /// `-E`: fingerprint hash (`sha256`, `md5`).
+    fp_hash: Option<String>,
+    /// `-B`: bubblebabble digest; `-v`: with `-l`, the randomart image.
+    bubble: bool,
+    visual: bool,
+    /// `-a`: bcrypt KDF rounds for new or re-encrypted keys.
+    rounds: Option<u32>,
+    /// `-k`: build a KRL (`-u`: update an existing one); `-Q`: test keys
+    /// against one.
+    krl: bool,
+    krl_update: bool,
+    krl_query: bool,
+    /// `-r host`: print SSHFP records (`-g`: generic format).
+    sshfp: Option<String>,
+    sshfp_generic: bool,
     /// `-p` (in known_hosts mode means port — but ssh-keygen historically
     /// uses `host` directly; we accept `[host]:port` syntax via the
     /// pattern matcher instead and don't reuse `-p`).
@@ -232,6 +263,44 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 out.file = Some(args.get(i).ok_or("-f requires a value")?.clone());
             }
             "-l" => out.fingerprint = true,
+            "-e" => out.export = true,
+            "-k" => out.krl = true,
+            "-u" => out.krl_update = true,
+            "-Q" => out.krl_query = true,
+            "-g" => out.sshfp_generic = true,
+            "-r" => {
+                i += 1;
+                out.sshfp = Some(args.get(i).ok_or("-r requires a host name")?.clone());
+            }
+            "-i" => out.import = true,
+            "-B" => out.bubble = true,
+            "-v" | "-vv" | "-vvv" => out.visual = true,
+            "-lv" | "-vl" => {
+                out.fingerprint = true;
+                out.visual = true;
+            }
+            "-m" => {
+                i += 1;
+                out.format = Some(args.get(i).ok_or("-m requires a format")?.clone());
+            }
+            "-E" => {
+                i += 1;
+                out.fp_hash = Some(
+                    args.get(i)
+                        .ok_or("-E requires a hash")?
+                        .to_ascii_lowercase(),
+                );
+            }
+            "-a" => {
+                i += 1;
+                let v = args.get(i).ok_or("-a requires a number")?;
+                out.rounds = Some(
+                    v.parse::<u32>()
+                        .ok()
+                        .filter(|r| (1..=10_000).contains(r))
+                        .ok_or_else(|| format!("Invalid number: {v}"))?,
+                );
+            }
             "-y" => out.derive_pub = true,
             "-p" => out.change_pass = true,
             "-R" => {
@@ -439,7 +508,7 @@ fn load_public(path: &str) -> Result<PublicKey, String> {
         return Ok(p);
     }
     // Fall back: maybe a private key was passed.
-    let pk = PrivateKey::parse_openssh_pem(&text, None).map_err(|e| {
+    let pk = PrivateKey::parse_pem(&text, None).map_err(|e| {
         format!("{path}: not a public key line and not an unencrypted private key ({e})")
     })?;
     Ok(pk.public_key())
@@ -449,22 +518,60 @@ fn ensure_file_in(file: &Option<String>) -> Result<String, String> {
     file.clone().ok_or_else(|| "-f is required".into())
 }
 
-fn run_generate(args: &Args) -> Result<i32, String> {
-    let file = ensure_file_in(&args.file)?;
-    let pub_path = format!("{file}.pub");
-    let ty = args
-        .type_
-        .as_deref()
-        .ok_or("-t TYPE is required for generation")?
-        .to_lowercase();
+/// Ask a question on the terminal (stdout prompt, stdin answer), like
+/// OpenSSH's file / overwrite prompts. `None` at end of input.
+fn ask(prompt: &str) -> Option<String> {
+    print!("{prompt}");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line.trim_end_matches(['\n', '\r']).to_string()),
+    }
+}
 
-    let comment = args
-        .comment
-        .clone()
-        .unwrap_or_else(|| match std::env::var("USER") {
-            Ok(u) => format!("{u}@puressh"),
-            Err(_) => "puressh".into(),
-        });
+fn run_generate(args: &Args) -> Result<i32, String> {
+    // OpenSSH's default type is Ed25519.
+    let ty = args.type_.as_deref().unwrap_or("ed25519").to_lowercase();
+    if !args.quiet {
+        println!("Generating public/private {ty} key pair.");
+    }
+    let file = match &args.file {
+        Some(f) => f.clone(),
+        None => {
+            let home = std::env::var("HOME").map_err(|_| "$HOME is not set")?;
+            let default = format!("{home}/.ssh/id_{ty}");
+            let answer = ask(&format!(
+                "Enter file in which to save the key ({default}): "
+            ))
+            .ok_or("no file name given")?;
+            let file = if answer.is_empty() { default } else { answer };
+            if let Some(dir) = Path::new(&file).parent()
+                && !dir.as_os_str().is_empty()
+                && !dir.exists()
+            {
+                fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+                }
+                println!("Created directory '{}'.", dir.display());
+            }
+            file
+        }
+    };
+    if Path::new(&file).exists() {
+        let answer = ask(&format!("{file} already exists.\nOverwrite (y/n)? ")).unwrap_or_default();
+        if !answer.starts_with(['y', 'Y']) {
+            return Ok(1);
+        }
+        let _ = fs::remove_file(&file);
+        let _ = fs::remove_file(format!("{file}.pub"));
+    }
+    let pub_path = format!("{file}.pub");
+
+    let comment = args.comment.clone().unwrap_or_else(user_at_host);
 
     let mut rng = OsRng;
     let sk = match ty.as_str() {
@@ -506,13 +613,8 @@ fn run_generate(args: &Args) -> Result<i32, String> {
     } else {
         read_new_passphrase_confirmed("Enter passphrase (empty for no passphrase): ")?
     };
-    let pem = sk
-        .to_openssh_pem(if passphrase.is_empty() {
-            None
-        } else {
-            Some(passphrase.as_bytes())
-        })
-        .map_err(|e| format!("encode: {e}"))?;
+    let pem = encode_private(&sk, args, &passphrase)
+        .map_err(|e| format!("Saving key \"{file}\" failed: {e}"))?;
 
     let pub_line = sk.public_key().to_authorized_keys_line();
     let mut pub_full = pub_line;
@@ -521,11 +623,15 @@ fn run_generate(args: &Args) -> Result<i32, String> {
     write_private(&file, &pem)?;
     write_public(&pub_path, &pub_full)?;
 
-    let fp = sk.public_key().sha256_fingerprint();
-    println!("Your identification has been saved in {file}");
-    println!("Your public key has been saved in {pub_path}");
-    println!("The key fingerprint is:");
-    println!("{fp} {}", sk.public_key().comment());
+    if !args.quiet {
+        let pk = sk.public_key();
+        println!("Your identification has been saved in {file}");
+        println!("Your public key has been saved in {pub_path}");
+        println!("The key fingerprint is:");
+        println!("{} {}", pk.sha256_fingerprint(), pk.comment());
+        println!("The key's randomart image is:");
+        println!("{}", randomart(&pk, &sha256(&pk.wire_blob()), "SHA256"));
+    }
     Ok(0)
 }
 
@@ -588,21 +694,244 @@ fn run_host_keys(args: &Args) -> Result<i32, String> {
     Ok(0)
 }
 
+/// The fingerprint of `pk` as `ssh-keygen -l` prints it (`-E`, `-B`).
+fn fingerprint_text(pk: &PublicKey, args: &Args) -> Result<String, String> {
+    if args.bubble {
+        return Ok(bubblebabble(&sha1(&pk.wire_blob())));
+    }
+    match args.fp_hash.as_deref().unwrap_or("sha256") {
+        "sha256" => Ok(pk.sha256_fingerprint()),
+        "md5" => Ok(format!(
+            "MD5:{}",
+            md5(&pk.wire_blob())
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":")
+        )),
+        other => Err(format!("Invalid hash algorithm \"{other}\"")),
+    }
+}
+
+fn sha1(data: &[u8]) -> Vec<u8> {
+    use purecrypto::hash::{Digest, Sha1};
+    Sha1::digest(data).as_ref().to_vec()
+}
+
+fn md5(data: &[u8]) -> Vec<u8> {
+    use purecrypto::hash::{Digest, Md5};
+    Md5::digest(data).as_ref().to_vec()
+}
+
+fn sha256(data: &[u8]) -> Vec<u8> {
+    use purecrypto::hash::{Digest, Sha256};
+    Sha256::digest(data).as_ref().to_vec()
+}
+
+/// OpenSSH's bubblebabble encoding of a digest (`ssh-keygen -B`).
+fn bubblebabble(d: &[u8]) -> String {
+    const VOWELS: &[u8] = b"aeiouy";
+    const CONSONANTS: &[u8] = b"bcdfghklmnprstvzx";
+    let rounds = d.len() / 2 + 1;
+    let mut seed = 1usize;
+    let mut out = String::from("x");
+    for i in 0..rounds {
+        if i + 1 < rounds || !d.len().is_multiple_of(2) {
+            let b = d[2 * i] as usize;
+            out.push(VOWELS[(((b >> 6) & 3) + seed) % 6] as char);
+            out.push(CONSONANTS[(b >> 2) & 15] as char);
+            out.push(VOWELS[((b & 3) + seed / 6) % 6] as char);
+            if i + 1 < rounds {
+                let c = d[2 * i + 1] as usize;
+                out.push(CONSONANTS[(c >> 4) & 15] as char);
+                out.push('-');
+                out.push(CONSONANTS[c & 15] as char);
+                seed = (seed * 5 + b * 7 + c) % 36;
+            }
+        } else {
+            out.push(VOWELS[seed % 6] as char);
+            out.push(CONSONANTS[16] as char);
+            out.push(VOWELS[seed / 6] as char);
+        }
+    }
+    out.push('x');
+    out
+}
+
+/// OpenSSH's "drunken bishop" randomart for a key's digest.
+fn randomart(pk: &PublicKey, digest: &[u8], hash_name: &str) -> String {
+    const AUG: &[u8] = b" .o+=*BOX@%&#/^SE";
+    const W: usize = 17;
+    const H: usize = 9;
+    // As in OpenSSH: the last two symbols mark the start and end.
+    let len = AUG.len() - 1;
+    let mut field = [[0usize; H]; W];
+    let (mut x, mut y) = (W as isize / 2, H as isize / 2);
+    for byte in digest {
+        let mut input = *byte;
+        for _ in 0..4 {
+            x += if input & 1 != 0 { 1 } else { -1 };
+            y += if input & 2 != 0 { 1 } else { -1 };
+            x = x.clamp(0, W as isize - 1);
+            y = y.clamp(0, H as isize - 1);
+            let cell = &mut field[x as usize][y as usize];
+            if *cell < len - 2 {
+                *cell += 1;
+            }
+            input >>= 2;
+        }
+    }
+    field[W / 2][H / 2] = len - 1;
+    field[x as usize][y as usize] = len;
+    let border = |label: &str| {
+        let mut line = String::from("+");
+        let pad = W.saturating_sub(label.len()) / 2;
+        line.push_str(&"-".repeat(pad));
+        line.push_str(label);
+        line.push_str(&"-".repeat(W.saturating_sub(pad + label.len())));
+        line.push('+');
+        line
+    };
+    let mut out = border(&format!("[{} {}]", algorithm_label(pk), pk.bit_length()));
+    out.push('\n');
+    for row in 0..H {
+        out.push('|');
+        for col in field.iter() {
+            out.push(AUG[col[row].min(len)] as char);
+        }
+        out.push_str("|\n");
+    }
+    out.push_str(&border(&format!("[{hash_name}]")));
+    out
+}
+
 fn run_fingerprint(args: &Args) -> Result<i32, String> {
     let file = ensure_file_in(&args.file)?;
-    // Accept either a .pub line, an authorized_keys line, or a private key.
-    let pk = load_public(&file)?;
-    let fp = pk.sha256_fingerprint();
-    let bits = pk.bit_length();
-    let comment = pk.comment();
-    let comment = if comment.is_empty() {
-        "no comment"
-    } else {
-        comment
+    // A key file, or every key line of an authorized_keys / known_hosts
+    // style file.
+    let keys: Vec<PublicKey> = match load_public(&file) {
+        Ok(pk) => vec![pk],
+        Err(e) => {
+            let text = read_to_string(&file)?;
+            let keys: Vec<PublicKey> = text
+                .lines()
+                .filter_map(|l| {
+                    let l = l.trim();
+                    if l.is_empty() || l.starts_with('#') {
+                        return None;
+                    }
+                    PublicKey::parse_authorized_keys_line(l).ok().or_else(|| {
+                        // known_hosts: `hosts keytype base64`.
+                        l.split_once(char::is_whitespace).and_then(|(_, rest)| {
+                            PublicKey::parse_authorized_keys_line(rest.trim()).ok()
+                        })
+                    })
+                })
+                .collect();
+            if keys.is_empty() {
+                return Err(e);
+            }
+            keys
+        }
     };
-    let label = algorithm_label(&pk);
-    println!("{bits} {fp} {comment} ({label})");
+    for pk in keys {
+        let fp = fingerprint_text(&pk, args)?;
+        let comment = if pk.comment().is_empty() {
+            "no comment"
+        } else {
+            pk.comment()
+        };
+        println!(
+            "{} {fp} {comment} ({})",
+            pk.bit_length(),
+            algorithm_label(&pk)
+        );
+        if args.visual && !args.bubble {
+            let (digest, name) = match args.fp_hash.as_deref() {
+                Some("md5") => (md5(&pk.wire_blob()), "MD5"),
+                _ => (sha256(&pk.wire_blob()), "SHA256"),
+            };
+            println!("{}", randomart(&pk, &digest, name));
+        }
+    }
     Ok(0)
+}
+
+/// `user@host`, the default key comment and RFC 4716 "converted by".
+fn user_at_host() -> String {
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "user".into());
+    let host = fs::read_to_string("/proc/sys/kernel/hostname")
+        .or_else(|_| fs::read_to_string("/etc/hostname"))
+        .map(|h| h.trim().to_string())
+        .ok()
+        .filter(|h| !h.is_empty())
+        .or_else(|| std::env::var("HOSTNAME").ok())
+        .unwrap_or_else(|| "localhost".into());
+    format!("{user}@{host}")
+}
+
+/// `-e`: print a key (public, or a private key's public half) in the `-m`
+/// format: RFC 4716 (default), PKCS8 (SubjectPublicKeyInfo) or PEM.
+fn run_export(args: &Args) -> Result<i32, String> {
+    let file = ensure_file_in(&args.file)?;
+    let pk = load_public(&file)?;
+    let out = match args
+        .format
+        .as_deref()
+        .unwrap_or("RFC4716")
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "RFC4716" => pk.to_rfc4716(&user_at_host()),
+        "PKCS8" => pk.to_spki_pem(),
+        "PEM" => pk.to_pem(),
+        other => return Err(format!("Unsupported conversion format \"{other}\"")),
+    };
+    print!("{out}");
+    Ok(0)
+}
+
+/// `-i`: read an RFC 4716, PKCS8 or PEM public key and print it in
+/// OpenSSH format.
+fn run_import(args: &Args) -> Result<i32, String> {
+    let file = ensure_file_in(&args.file)?;
+    let text = read_to_string(&file)?;
+    let pk = PublicKey::parse_foreign(&text).map_err(|e| format!("{file}: {e}"))?;
+    println!("{}", pk.to_authorized_keys_line());
+    Ok(0)
+}
+
+/// A private key serialised in the `-m` format: the OpenSSH container
+/// (default, or `RFC4716`), or unencrypted `PEM` / `PKCS8`.
+fn encode_private(sk: &PrivateKey, args: &Args, passphrase: &str) -> Result<String, String> {
+    let format = args
+        .format
+        .as_deref()
+        .unwrap_or("RFC4716")
+        .to_ascii_uppercase();
+    match format.as_str() {
+        "RFC4716" | "OPENSSH" => match args.rounds {
+            Some(r) => sk.to_openssh_pem_with_rounds(
+                (!passphrase.is_empty()).then_some(passphrase.as_bytes()),
+                r,
+            ),
+            None => sk.to_openssh_pem((!passphrase.is_empty()).then_some(passphrase.as_bytes())),
+        }
+        .map_err(|e| format!("encode: {e}")),
+        "PEM" | "PKCS8" if !passphrase.is_empty() => Err(format!(
+            "passphrase-protected {format} keys are not supported; use the default \
+             OpenSSH format or an empty passphrase"
+        )),
+        "PEM" => sk
+            .to_traditional_pem()
+            .map_err(|e| format!("invalid format: {e}")),
+        "PKCS8" => sk
+            .to_pkcs8_pem()
+            .map_err(|e| format!("invalid format: {e}")),
+        other => Err(format!("Unsupported key format \"{other}\"")),
+    }
 }
 
 fn run_extract_public(args: &Args) -> Result<i32, String> {
@@ -613,11 +942,11 @@ fn run_extract_public(args: &Args) -> Result<i32, String> {
         .as_deref()
         .map(String::as_str)
         .filter(|p| !p.is_empty());
-    let sk = match PrivateKey::parse_openssh_pem(&text, pem_pass.map(str::as_bytes)) {
+    let sk = match PrivateKey::parse_pem(&text, pem_pass.map(str::as_bytes)) {
         Ok(sk) => sk,
         Err(_) if pem_pass.is_none() => {
             let pp = read_passphrase_interactive("Enter passphrase: ")?;
-            PrivateKey::parse_openssh_pem(
+            PrivateKey::parse_pem(
                 &text,
                 if pp.is_empty() {
                     None
@@ -642,11 +971,11 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
         .as_deref()
         .map(String::as_str)
         .filter(|p| !p.is_empty());
-    let sk = match PrivateKey::parse_openssh_pem(&text, old_pass.map(str::as_bytes)) {
+    let sk = match PrivateKey::parse_pem(&text, old_pass.map(str::as_bytes)) {
         Ok(sk) => sk,
         Err(_) if old_pass.is_none() => {
             let pp = read_passphrase_interactive("Enter old passphrase: ")?;
-            PrivateKey::parse_openssh_pem(
+            PrivateKey::parse_pem(
                 &text,
                 if pp.is_empty() {
                     None
@@ -665,13 +994,7 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
         read_new_passphrase_confirmed("Enter new passphrase (empty for no passphrase): ")?
     };
 
-    let pem = sk
-        .to_openssh_pem(if new_pass.is_empty() {
-            None
-        } else {
-            Some(new_pass.as_bytes())
-        })
-        .map_err(|e| format!("encode: {e}"))?;
+    let pem = encode_private(&sk, args, &new_pass)?;
 
     // Per-call unique tmp name + O_EXCL so two concurrent rotations
     // cannot race on the same temporary path, and an attacker with
@@ -776,14 +1099,41 @@ fn run() -> Result<i32, i32> {
             }
         };
     }
-    if let Some(a) = parsed.rest.first().filter(|_| parsed.sig_file.is_none()) {
+    if let Some(a) = parsed
+        .rest
+        .first()
+        .filter(|_| parsed.sig_file.is_none() && !parsed.krl && !parsed.krl_query)
+    {
         eprintln!("ssh-keygen: unexpected argument: {a}");
         eprintln!("{USAGE}");
         return Err(2);
     }
 
+    let mut parsed = parsed;
+    // KRL and SSHFP modes reuse -s / -z / -l / -f; handle them first.
+    let early = if parsed.krl {
+        Some(krl::build(&parsed))
+    } else if parsed.krl_query {
+        Some(krl::query(&parsed))
+    } else {
+        parsed.sshfp.as_ref().map(|host| run_sshfp(&parsed, host))
+    };
+    if let Some(res) = early {
+        return match res {
+            Ok(code) => Ok(code),
+            Err(msg) => {
+                eprintln!("ssh-keygen: {msg}");
+                Err(1)
+            }
+        };
+    }
+    if parsed.bubble {
+        parsed.fingerprint = true;
+    }
     let mode_count = [
         parsed.fingerprint as u8,
+        parsed.export as u8,
+        parsed.import as u8,
         parsed.derive_pub as u8,
         parsed.change_pass as u8,
         parsed.type_.is_some() as u8,
@@ -796,10 +1146,7 @@ fn run() -> Result<i32, i32> {
     ]
     .iter()
     .sum::<u8>();
-    if mode_count == 0 {
-        eprintln!("{USAGE}");
-        return Err(2);
-    }
+    // No mode: generate a key, as with OpenSSH (Ed25519 by default).
     if mode_count > 1 {
         eprintln!(
             "ssh-keygen: -t / -l / -y / -p / -R / -F / -H / -A / -s / -L are mutually exclusive"
@@ -809,6 +1156,10 @@ fn run() -> Result<i32, i32> {
 
     let res = if parsed.fingerprint {
         run_fingerprint(&parsed)
+    } else if parsed.export {
+        run_export(&parsed)
+    } else if parsed.import {
+        run_import(&parsed)
     } else if parsed.derive_pub {
         run_extract_public(&parsed)
     } else if parsed.change_pass {
@@ -1000,12 +1351,12 @@ mod sig {
                 return Ok((Signer::Agent(agent, flags), pk));
             }
         }
-        let sk = match PrivateKey::parse_openssh_pem(&text, None) {
+        let sk = match PrivateKey::parse_pem(&text, None) {
             Ok(k) => k,
             Err(_) => {
                 let pp =
                     read_passphrase_interactive(&format!("Enter passphrase for \"{path}\": "))?;
-                PrivateKey::parse_openssh_pem(&text, Some(pp.as_bytes()))
+                PrivateKey::parse_pem(&text, Some(pp.as_bytes()))
                     .map_err(|e| format!("Couldn't load key {path}: {e}"))?
             }
         };
@@ -1176,6 +1527,214 @@ mod sig {
         } else {
             Err("No principal matched.".into())
         }
+    }
+}
+
+/// `-r host`: DNS SSHFP records for a key (`-f`) or every host key.
+fn run_sshfp(args: &Args, host: &str) -> Result<i32, String> {
+    let files: Vec<String> = match &args.file {
+        Some(f) => vec![f.clone()],
+        None => ["rsa", "ecdsa", "ed25519"]
+            .iter()
+            .map(|t| format!("/etc/ssh/ssh_host_{t}_key.pub"))
+            .filter(|p| Path::new(p).exists())
+            .collect(),
+    };
+    for f in files {
+        let pk = load_public(&f)?;
+        let alg = match pk {
+            PublicKey::Rsa { .. } => 1,
+            PublicKey::Ed25519 { .. } => 4,
+            _ => 3,
+        };
+        for (fptype, digest) in [(1u8, sha1(&pk.wire_blob())), (2, sha256(&pk.wire_blob()))] {
+            let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+            if args.sshfp_generic {
+                println!(
+                    "{host} IN TYPE44 \\# {} {alg:02x} {fptype:02x} {hex}",
+                    2 + digest.len()
+                );
+            } else {
+                println!("{host} IN SSHFP {alg} {fptype} {hex}");
+            }
+        }
+    }
+    Ok(0)
+}
+
+/// `-k` / `-Q`: key revocation lists.
+mod krl {
+    use super::{Args, PublicKey, load_public, read_to_string};
+    use puressh::cert::Certificate;
+    use puressh::krl::Krl;
+
+    fn decode_fp(v: &str) -> Option<(bool, Vec<u8>)> {
+        let (sha256, b64) = if let Some(b) = v.strip_prefix("SHA256:") {
+            (true, b)
+        } else {
+            (false, v.strip_prefix("SHA1:")?)
+        };
+        let mut padded = b64.to_string();
+        while padded.len() % 4 != 0 {
+            padded.push('=');
+        }
+        let raw = purecrypto::der::base64_decode(&padded).ok()?;
+        let want = if sha256 { 32 } else { 20 };
+        (raw.len() == want).then_some((sha256, raw))
+    }
+
+    fn revoke_line_key(krl: &mut Krl, line: &str) -> Result<(), String> {
+        if let Ok(cert) = Certificate::parse_openssh_line(line) {
+            if cert.serial != 0 || cert.key_id.is_empty() {
+                krl.revoke_cert_serials(&cert.signature_key_blob, cert.serial, cert.serial);
+            } else {
+                krl.revoke_cert_key_id(&cert.signature_key_blob, &cert.key_id);
+            }
+            return Ok(());
+        }
+        let pk = PublicKey::parse_authorized_keys_line(line).map_err(|e| e.to_string())?;
+        krl.revoke_key(&pk.wire_blob());
+        Ok(())
+    }
+
+    fn parse_serial(v: &str) -> Option<u64> {
+        match v.strip_prefix("0x") {
+            Some(h) => u64::from_str_radix(h, 16).ok(),
+            None => v.parse().ok(),
+        }
+    }
+
+    fn update_from(krl: &mut Krl, ca: Option<&[u8]>, path: &str) -> Result<(), String> {
+        let text = if path == "-" {
+            let mut s = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut s)
+                .map_err(|e| format!("stdin: {e}"))?;
+            s
+        } else {
+            read_to_string(path)?
+        };
+        for (n, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let at = |e: String| format!("{path}:{}: {e}", n + 1);
+            let need_ca = || ca.ok_or_else(|| at("missing CA key (-s)".into()));
+            let (kw, val) = match line.split_once(':') {
+                Some((k, v)) if !k.contains(' ') => (k.to_ascii_lowercase(), v.trim()),
+                _ => (String::new(), line),
+            };
+            match kw.as_str() {
+                "serial" => {
+                    let ca = need_ca()?;
+                    let (lo, hi) = match val.split_once('-') {
+                        Some((a, b)) => (parse_serial(a.trim()), parse_serial(b.trim())),
+                        None => (parse_serial(val), parse_serial(val)),
+                    };
+                    let (Some(lo), Some(hi)) = (lo, hi) else {
+                        return Err(at(format!("invalid serial \"{val}\"")));
+                    };
+                    if lo > hi {
+                        return Err(at(format!("invalid serial range \"{val}\"")));
+                    }
+                    krl.revoke_cert_serials(ca, lo, hi);
+                }
+                "id" => krl.revoke_cert_key_id(need_ca()?, val),
+                "key" => revoke_line_key(krl, val).map_err(at)?,
+                "sha1" | "sha256" => {
+                    let blob = PublicKey::parse_authorized_keys_line(val)
+                        .map(|k| k.wire_blob())
+                        .map_err(|e| at(e.to_string()))?;
+                    if kw == "sha1" {
+                        krl.revoke_sha1(super::sha1(&blob).try_into().expect("20 bytes"));
+                    } else {
+                        krl.revoke_sha256(super::sha256(&blob).try_into().expect("32 bytes"));
+                    }
+                }
+                "hash" => match decode_fp(val) {
+                    Some((true, raw)) => krl.revoke_sha256(raw.try_into().expect("32 bytes")),
+                    Some((false, raw)) => krl.revoke_sha1(raw.try_into().expect("20 bytes")),
+                    None => return Err(at(format!("invalid fingerprint \"{val}\""))),
+                },
+                // A plain public key or certificate line (its key type
+                // contains no ':').
+                _ => revoke_line_key(krl, line).map_err(at)?,
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn build(args: &Args) -> Result<i32, String> {
+        let path = args.file.as_deref().ok_or("-f krl_file is required")?;
+        let mut krl = if args.krl_update {
+            let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            Krl::parse(&data).map_err(|e| format!("{path}: {e}"))?
+        } else {
+            Krl::new()
+        };
+        let ca = match &args.sig_file {
+            Some(f) => Some(load_public(f)?.wire_blob()),
+            None => None,
+        };
+        if let Some(z) = &args.serial {
+            krl.set_version(
+                z.parse()
+                    .map_err(|_| format!("Invalid KRL version \"{z}\""))?,
+            );
+        }
+        for f in &args.rest {
+            update_from(&mut krl, ca.as_deref(), f)?;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        std::fs::write(path, krl.to_bytes(now)).map_err(|e| format!("{path}: {e}"))?;
+        Ok(0)
+    }
+
+    pub(super) fn query(args: &Args) -> Result<i32, String> {
+        let path = args.file.as_deref().ok_or("-f krl_file is required")?;
+        let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let krl = Krl::parse(&data).map_err(|e| format!("{path}: {e}"))?;
+        if args.fingerprint {
+            println!("# KRL version {}", krl.version());
+            if !krl.comment().is_empty() {
+                println!("# Comment: {}", krl.comment());
+            }
+        }
+        let mut revoked_any = false;
+        for f in &args.rest {
+            let text = read_to_string(f)?;
+            for line in text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            {
+                let (revoked, comment) = if let Ok(cert) = Certificate::parse_openssh_line(line) {
+                    let r =
+                        krl.is_revoked_cert(&cert.signature_key_blob, cert.serial, &cert.key_id)
+                            || krl.is_revoked_key(cert.embedded_pubkey_blob())
+                            || krl.is_revoked_key(&cert.signature_key_blob);
+                    (r, line.split_whitespace().nth(2).unwrap_or("").to_string())
+                } else {
+                    let pk = PublicKey::parse_authorized_keys_line(line)
+                        .map_err(|e| format!("{f}: {e}"))?;
+                    (
+                        krl.is_revoked_key(&pk.wire_blob()),
+                        pk.comment().to_string(),
+                    )
+                };
+                let label = if comment.is_empty() {
+                    f.clone()
+                } else {
+                    format!("{f} ({comment})")
+                };
+                println!("{label}: {}", if revoked { "REVOKED" } else { "ok" });
+                revoked_any |= revoked;
+            }
+        }
+        Ok(if revoked_any { 1 } else { 0 })
     }
 }
 

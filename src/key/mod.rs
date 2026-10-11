@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
 
 pub(crate) mod base64;
+mod export;
 mod pkcs;
 mod writer;
 
@@ -1030,16 +1031,16 @@ fn decrypt_payload(
     // Cap rounds. bcrypt_pbkdf's cost is linear in the rounds count, and
     // a malicious key file could otherwise pin a victim's thread on the
     // KDF for an unbounded amount of time before they ever learn the
-    // passphrase is wrong. OpenSSH's `-a` flag defaults to 16; 64 is a
-    // comfortable ceiling that still lets legitimate hardening through
-    // while keeping per-attempt cost bounded.
-    const MAX_BCRYPT_ROUNDS: u32 = 64;
+    // passphrase is wrong. OpenSSH's `-a` defaults to 16 and `-a 100` is
+    // common hardening advice (about 0.5 s); 10000 rounds still loads
+    // (about 50 s) while bounding the worst case.
+    const MAX_BCRYPT_ROUNDS: u32 = 10_000;
     if rounds == 0 {
         return Err(Error::Format("openssh key: bcrypt rounds must be > 0"));
     }
     if rounds > MAX_BCRYPT_ROUNDS {
         return Err(Error::Format(
-            "openssh key: bcrypt rounds exceeds 64 (DoS guard)",
+            "openssh key: bcrypt rounds exceeds 10000 (DoS guard)",
         ));
     }
 

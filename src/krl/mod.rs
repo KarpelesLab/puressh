@@ -58,7 +58,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::error::{Error, Result};
-use crate::format::{Reader, read_mpint};
+use crate::format::{Reader, Writer, read_mpint};
 use purecrypto::hash::{Digest, Sha1, Sha256};
 
 /// KRL magic: `"SSHKRL\n\0"`.
@@ -134,8 +134,15 @@ impl CaRevocation {
     }
 }
 
-/// A parsed key-revocation list.
+/// A key-revocation list: parsed with [`Krl::parse`], or built with
+/// [`Krl::new`] and the `revoke_*` methods and written with
+/// [`Krl::to_bytes`] (`ssh-keygen -k`).
+#[derive(Default)]
 pub struct Krl {
+    /// `krl_version` (`ssh-keygen -z`).
+    version: u64,
+    /// Free-form comment.
+    comment: String,
     /// Per-CA certificate revocations.
     cert_revocations: Vec<CaRevocation>,
     /// Wire blobs of explicitly-revoked plain public keys (section 2).
@@ -174,13 +181,15 @@ impl Krl {
         if r.read_u32()? != KRL_FORMAT_VERSION {
             return Err(Error::Format("krl: unsupported format version"));
         }
-        let _krl_version = r.read_u64()?;
+        let version = r.read_u64()?;
         let _generated_date = r.read_u64()?;
         let _flags = r.read_u64()?;
         let _reserved = r.read_string()?;
-        let _comment = r.read_string()?;
+        let comment = String::from_utf8_lossy(r.read_string()?).into_owned();
 
         let mut krl = Krl {
+            version,
+            comment,
             cert_revocations: Vec::new(),
             explicit_keys: Vec::new(),
             fp_sha1: Vec::new(),
@@ -317,6 +326,171 @@ impl Krl {
             && self.explicit_keys.is_empty()
             && self.fp_sha1.is_empty()
             && self.fp_sha256.is_empty()
+    }
+
+    /// An empty list.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The `krl_version` field.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    /// Set the `krl_version` field (`ssh-keygen -z`).
+    pub fn set_version(&mut self, v: u64) {
+        self.version = v;
+    }
+
+    /// The comment field.
+    pub fn comment(&self) -> &str {
+        &self.comment
+    }
+
+    /// Set the comment field.
+    pub fn set_comment(&mut self, c: &str) {
+        self.comment = c.into();
+    }
+
+    /// Revoke a plain public key by its wire blob.
+    pub fn revoke_key(&mut self, blob: &[u8]) {
+        if !self.explicit_keys.iter().any(|k| k == blob) {
+            self.explicit_keys.push(blob.to_vec());
+        }
+    }
+
+    /// Revoke keys by SHA-1 hash of their wire blob.
+    pub fn revoke_sha1(&mut self, hash: [u8; 20]) {
+        if !self.fp_sha1.contains(&hash) {
+            self.fp_sha1.push(hash);
+        }
+    }
+
+    /// Revoke keys by SHA-256 hash of their wire blob.
+    pub fn revoke_sha256(&mut self, hash: [u8; 32]) {
+        if !self.fp_sha256.contains(&hash) {
+            self.fp_sha256.push(hash);
+        }
+    }
+
+    fn ca_entry(&mut self, ca_key_blob: &[u8]) -> &mut CaRevocation {
+        let pos = match self
+            .cert_revocations
+            .iter()
+            .position(|c| c.ca_key_blob == ca_key_blob)
+        {
+            Some(p) => p,
+            None => {
+                self.cert_revocations.push(CaRevocation {
+                    ca_key_blob: ca_key_blob.to_vec(),
+                    serials: Vec::new(),
+                    serial_ranges: Vec::new(),
+                    serial_bitmaps: Vec::new(),
+                    key_ids: Vec::new(),
+                });
+                self.cert_revocations.len() - 1
+            }
+        };
+        &mut self.cert_revocations[pos]
+    }
+
+    /// Revoke certificates from `ca_key_blob` (empty: any CA) with serials
+    /// `lo..=hi`.
+    pub fn revoke_cert_serials(&mut self, ca_key_blob: &[u8], lo: u64, hi: u64) {
+        let ca = self.ca_entry(ca_key_blob);
+        if lo == hi {
+            if !ca.serials.contains(&lo) {
+                ca.serials.push(lo);
+            }
+        } else if !ca.serial_ranges.contains(&(lo, hi)) {
+            ca.serial_ranges.push((lo.min(hi), lo.max(hi)));
+        }
+    }
+
+    /// Revoke certificates from `ca_key_blob` (empty: any CA) with key id
+    /// `key_id`.
+    pub fn revoke_cert_key_id(&mut self, ca_key_blob: &[u8], key_id: &str) {
+        let ca = self.ca_entry(ca_key_blob);
+        if !ca.key_ids.iter().any(|k| k == key_id) {
+            ca.key_ids.push(key_id.into());
+        }
+    }
+
+    /// Serialise in OpenSSH's KRL format, stamped `generated_date`.
+    pub fn to_bytes(&self, generated_date: u64) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_u64(KRL_MAGIC);
+        w.write_u32(KRL_FORMAT_VERSION);
+        w.write_u64(self.version);
+        w.write_u64(generated_date);
+        w.write_u64(0); // flags
+        w.write_string(b""); // reserved
+        w.write_string(self.comment.as_bytes());
+        for ca in &self.cert_revocations {
+            let mut body = Writer::new();
+            body.write_string(&ca.ca_key_blob);
+            body.write_string(b"");
+            let mut serials = ca.serials.clone();
+            serials.sort_unstable();
+            if !serials.is_empty() {
+                let mut sub = Writer::new();
+                for s in serials {
+                    sub.write_u64(s);
+                }
+                body.write_u8(CERT_SERIAL_LIST);
+                body.write_string(sub.as_slice());
+            }
+            let mut ranges = ca.serial_ranges.clone();
+            ranges.sort_unstable();
+            for (lo, hi) in ranges {
+                let mut sub = Writer::new();
+                sub.write_u64(lo);
+                sub.write_u64(hi);
+                body.write_u8(CERT_SERIAL_RANGE);
+                body.write_string(sub.as_slice());
+            }
+            for (offset, bits) in &ca.serial_bitmaps {
+                let mut sub = Writer::new();
+                sub.write_u64(*offset);
+                crate::format::write_mpint(&mut sub, bits);
+                body.write_u8(CERT_SERIAL_BITMAP);
+                body.write_string(sub.as_slice());
+            }
+            if !ca.key_ids.is_empty() {
+                let mut ids = ca.key_ids.clone();
+                ids.sort();
+                let mut sub = Writer::new();
+                for id in ids {
+                    sub.write_string(id.as_bytes());
+                }
+                body.write_u8(CERT_KEY_ID);
+                body.write_string(sub.as_slice());
+            }
+            w.write_u8(SECTION_CERTIFICATES);
+            w.write_string(body.as_slice());
+        }
+        let mut write_blobs = |section: u8, blobs: Vec<&[u8]>| {
+            if blobs.is_empty() {
+                return;
+            }
+            let mut body = Writer::new();
+            for b in blobs {
+                body.write_string(b);
+            }
+            w.write_u8(section);
+            w.write_string(body.as_slice());
+        };
+        let mut keys: Vec<&[u8]> = self.explicit_keys.iter().map(Vec::as_slice).collect();
+        keys.sort_unstable();
+        write_blobs(SECTION_EXPLICIT_KEY, keys);
+        let mut sha1: Vec<&[u8]> = self.fp_sha1.iter().map(|h| &h[..]).collect();
+        sha1.sort_unstable();
+        write_blobs(SECTION_FINGERPRINT_SHA1, sha1);
+        let mut sha256: Vec<&[u8]> = self.fp_sha256.iter().map(|h| &h[..]).collect();
+        sha256.sort_unstable();
+        write_blobs(SECTION_FINGERPRINT_SHA256, sha256);
+        w.into_vec()
     }
 }
 

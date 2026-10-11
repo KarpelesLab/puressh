@@ -242,6 +242,16 @@ pub trait Authenticator: Send {
         None
     }
 
+    /// The methods a USERAUTH_FAILURE lists as able to continue. `offered`
+    /// is every method the server accepts; the default lists them all. A
+    /// policy with ordered requirements (OpenSSH's `AuthenticationMethods`)
+    /// lists only those that can still lead to success, as OpenSSH does,
+    /// so clients do not prompt for credentials that cannot help.
+    #[cfg(feature = "alloc")]
+    fn continuable_methods(&self, offered: &[&'static str]) -> Vec<String> {
+        offered.iter().map(|m| (*m).into()).collect()
+    }
+
     /// Evaluate the responses to a previously-issued `InteractiveRequest`.
     fn evaluate_interactive(&mut self, user: &str, responses: Vec<String>) -> AuthDecision {
         let _ = (user, responses);
@@ -976,7 +986,7 @@ impl ServerAuth {
             self.state = State::Done;
             return Ok(ServerStep::Disconnect("Too many authentication failures"));
         }
-        let cont: Vec<String> = self.accepted_methods.iter().map(|s| (*s).into()).collect();
+        let cont = self.auth.continuable_methods(&self.accepted_methods);
         let failure = UserauthFailure {
             continuations: cont,
             partial_success: false,

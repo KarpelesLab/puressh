@@ -3681,6 +3681,22 @@ mod imp {
     }
 
     impl Authenticator for LocalAuthenticator {
+        fn continuable_methods(&self, offered: &[&'static str]) -> Vec<String> {
+            if self.chains.is_empty() {
+                return offered.iter().map(|m| (*m).into()).collect();
+            }
+            // The next method of each chain still consistent with what has
+            // been satisfied, if the server offers it (OpenSSH's
+            // authmethods_get with AuthenticationMethods).
+            match self.partial_or_reject_for_current() {
+                AuthDecision::PartialAccept { still_required } => still_required
+                    .into_iter()
+                    .filter(|m| offered.contains(&m.as_str()))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        }
+
         fn key_restrictions(
             &mut self,
             _user: &str,
@@ -7404,6 +7420,30 @@ mod imp {
             assert_eq!(
                 chains3,
                 vec![vec!["publickey", "password"], vec!["keyboard-interactive"]]
+            );
+        }
+
+        #[test]
+        fn failure_lists_only_methods_that_can_continue() {
+            let offered = ["publickey", "password", "keyboard-interactive"];
+            let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
+            // Single-factor: everything offered.
+            assert_eq!(a.continuable_methods(&offered), offered);
+            // `AuthenticationMethods publickey,password publickey,keyboard-interactive`.
+            a.chains = vec![
+                vec!["publickey", "password"],
+                vec!["publickey", "keyboard-interactive"],
+            ];
+            assert_eq!(a.continuable_methods(&offered), ["publickey"]);
+            a.satisfied = vec!["publickey"];
+            assert_eq!(
+                a.continuable_methods(&offered),
+                ["password", "keyboard-interactive"]
+            );
+            // A method the server does not offer is never listed.
+            assert_eq!(
+                a.continuable_methods(&["publickey", "password"]),
+                ["password"]
             );
         }
 

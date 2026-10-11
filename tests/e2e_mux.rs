@@ -201,5 +201,26 @@ fn control_master_shares_one_connection() {
     }
 
     ok("-O exit", run(&mut ssh(&["-O", "exit", &target])));
+    // The master must go even though its socket is removed at once (it used
+    // to wait for a wake-up through that path forever): sshd then sees every
+    // connection end.
+    for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().len() == 40 {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+    let start = Instant::now();
+    loop {
+        let l = log();
+        if l.matches("reaped connection").count() == l.matches("forked connection").count() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "the master did not exit after -O exit\n{l}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

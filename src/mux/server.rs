@@ -155,7 +155,6 @@ where
         Persist::No => {
             // Tear down immediately: stop accepting, unlink, join.
             state.shutdown.store(true, Ordering::SeqCst);
-            wake_accept(&cfg.control_path);
             let _ = fs::remove_file(&cfg.control_path);
             let _ = accept.join();
             let _ = reaper.join();
@@ -220,28 +219,39 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
     while !state.shutdown.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
     }
-    wake_accept(&cfg.control_path);
     let _ = fs::remove_file(&cfg.control_path);
     let _ = accept.join();
     let _ = reaper.join();
     Ok(())
 }
 
-/// Wake a blocked `accept()` by making one throwaway connection to the socket.
-fn wake_accept(path: &Path) {
-    let _ = UnixStream::connect(path);
-}
+/// How often the accept loop looks at the shutdown flag between clients.
+const ACCEPT_POLL: Duration = Duration::from_millis(50);
 
-/// Accept incoming mux clients and spawn a session handler per connection.
+/// Accept incoming mux clients and spawn a session handler per connection,
+/// until `shutdown`. The listener is polled rather than blocked on, so
+/// shutdown never depends on reaching it through its path (which may be
+/// gone: `-O exit` callers and tmp cleaners remove it).
 fn accept_loop(listener: UnixListener, shared: SharedClient, state: Arc<MasterState>) {
-    for conn in listener.incoming() {
-        if state.shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-        let stream = match conn {
-            Ok(s) => s,
-            Err(_) => continue,
+    if listener.set_nonblocking(true).is_err() {
+        return;
+    }
+    while !state.shutdown.load(Ordering::SeqCst) {
+        let stream = match listener.accept() {
+            Ok((s, _)) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL);
+                continue;
+            }
+            Err(_) => {
+                thread::sleep(ACCEPT_POLL);
+                continue;
+            }
         };
+        // macOS hands accepted sockets the listener's O_NONBLOCK.
+        if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
         let s = shared.clone();
         let st = state.clone();
         thread::spawn(move || {
@@ -258,8 +268,7 @@ fn reaper_loop(persist: Persist, state: Arc<MasterState>, path: &Path) {
             // Persist::No teardown, by `run_master_daemon`'s main loop, or by
             // an `-O exit` (`Frame::ExitRequest`) handler. Make the socket
             // teardown idempotent so an ExitRequest under in-process
-            // Persist::Yes still unlinks and wakes the accept loop.
-            wake_accept(path);
+            // Persist::Yes still unlinks it.
             let _ = fs::remove_file(path);
             return;
         }
@@ -289,7 +298,6 @@ fn reaper_loop(persist: Persist, state: Arc<MasterState>, path: &Path) {
                 if since.elapsed() >= Duration::from_secs(n) {
                     drop(idle);
                     state.shutdown.store(true, Ordering::SeqCst);
-                    wake_accept(path);
                     let _ = fs::remove_file(path);
                     return;
                 }

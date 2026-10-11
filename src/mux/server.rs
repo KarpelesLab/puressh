@@ -324,7 +324,7 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
         Ok(Some(f)) => f,
         _ => return,
     };
-    let (want_pty, term, cols, rows, env, command) = match open {
+    let (want_pty, term, cols, rows, env, command, subsystem) = match open {
         Frame::OpenSession {
             want_pty,
             term,
@@ -332,7 +332,8 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
             rows,
             env,
             command,
-        } => (want_pty, term, cols, rows, env, command),
+            subsystem,
+        } => (want_pty, term, cols, rows, env, command, subsystem),
         Frame::ExitRequest => {
             // `ssh -O exit`: ask the whole master to shut down.
             state.shutdown.store(true, Ordering::SeqCst);
@@ -365,13 +366,15 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
     }
 
     // Open the channel on the shared connection.
-    let stream_res = if let Some(cmd) = command.as_deref() {
-        shared.exec_stream(cmd)
-    } else if want_pty {
-        shared.shell_stream(&term, cols, rows, 0, 0, Vec::new())
-    } else {
-        shared.shell_stream_no_pty()
+    // A command or subsystem keeps its pty when one was asked for (`ssh -t
+    // host top`), as a shell does.
+    let what = match command.as_deref() {
+        Some(name) if subsystem => crate::shared::SessionRequest::Subsystem(name),
+        Some(cmd) => crate::shared::SessionRequest::Exec(cmd),
+        None => crate::shared::SessionRequest::Shell,
     };
+    let pty = want_pty.then(|| crate::shared::PtyRequest::new(term.as_str(), cols, rows));
+    let stream_res = shared.session_stream(what, pty);
     let chan = match stream_res {
         Ok(c) => c,
         Err(e) => {

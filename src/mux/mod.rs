@@ -42,7 +42,9 @@ pub use codec::MuxError;
 pub(crate) use codec::{Frame, MAX_FRAME_LEN};
 
 mod path;
-pub use path::{ControlPathTooLong, expand_control_path, local_hostname};
+pub use path::{
+    ControlPathTooLong, connection_hash, expand_control_path, local_hostname, socket_path_for,
+};
 
 // The master / client *roles* drive a real connection and need
 // `SharedClient` (master side) / blocking socket I/O. They live behind the
@@ -112,6 +114,7 @@ mod tests {
                 rows: 24,
                 env: vec![("LANG".into(), "C.UTF-8".into())],
                 command: None,
+                subsystem: false,
             },
             Frame::StdinData(b"echo hi\n".to_vec()),
             Frame::StdoutData(b"hi\n".to_vec()),

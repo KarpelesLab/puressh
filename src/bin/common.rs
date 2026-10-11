@@ -1262,7 +1262,8 @@ pub fn default_identity_paths() -> Vec<PathBuf> {
         return Vec::new();
     };
     let dot_ssh = PathBuf::from(home).join(".ssh");
-    ["id_ed25519", "id_ecdsa", "id_rsa"]
+    // OpenSSH's order (it also lists the FIDO `_sk` keys, which we lack).
+    ["id_rsa", "id_ecdsa", "id_ed25519"]
         .iter()
         .map(|name| dot_ssh.join(name))
         .collect()

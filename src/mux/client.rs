@@ -108,6 +108,8 @@ pub struct SessionRequest {
     pub env: Vec<(String, String)>,
     /// Remote command, or `None` for an interactive shell.
     pub command: Option<String>,
+    /// `command` names a subsystem (`ssh -s`).
+    pub subsystem: bool,
 }
 
 /// Open a `direct-tcpip` forward through a running master and return the
@@ -409,6 +411,7 @@ pub fn run_client(
             rows: req.rows,
             env: req.env.clone(),
             command: req.command.clone(),
+            subsystem: req.subsystem,
         },
     )?;
 

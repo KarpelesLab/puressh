@@ -679,62 +679,11 @@ fn apply_extra_o(
     }
     let src = extra_o.join("\n");
     let parsed = puressh::config::SshClientConfig::parse(&src).map_err(|e| format!("-o: {e}"))?;
-    let o = parsed.lookup("*");
-    // Scalars: a `Some` in the synthetic block wins.
-    macro_rules! overlay {
-        ($($f:ident),* $(,)?) => { $( if o.$f.is_some() { cfg_block.$f = o.$f.clone(); } )* };
-    }
-    overlay!(
-        host_name,
-        port,
-        user,
-        identities_only,
-        strict_host_key,
-        user_known_hosts,
-        hash_known_hosts,
-        forward_agent,
-        forward_x11,
-        forward_x11_trusted,
-        request_tty,
-        log_level,
-        ciphers,
-        macs,
-        kex_algorithms,
-        host_key_algorithms,
-        pubkey_accepted_algorithms,
-        proxy_command,
-        proxy_jump,
-        compression,
-        connect_timeout,
-        server_alive_interval,
-        server_alive_count_max,
-        tcp_keep_alive,
-        add_keys_to_agent,
-        preferred_authentications,
-        pubkey_authentication,
-        number_of_password_prompts,
-        batch_mode,
-        exit_on_forward_failure,
-        clear_all_forwardings,
-        gateway_ports,
-        address_family,
-        bind_address,
-        identity_agent,
-        obscure_keystroke_timing,
-        control_master,
-        control_path,
-        control_persist,
-        knock_mode,
-        knock_fallback_delay,
-        knock_port,
-    );
-    // Cumulative lists: append whatever the -o block contributed.
-    cfg_block.identity_files.extend(o.identity_files);
-    cfg_block.local_forwards.extend(o.local_forwards);
-    cfg_block.remote_forwards.extend(o.remote_forwards);
-    cfg_block.dynamic_forwards.extend(o.dynamic_forwards);
-    cfg_block.set_env.extend(o.set_env);
-    cfg_block.send_env.extend(o.send_env);
+    // `-o` options are obtained before the files: theirs win, and their
+    // list entries (IdentityFile, forwards, …) come first.
+    let mut o = parsed.lookup("*");
+    o.merge_lower(cfg_block);
+    *cfg_block = o;
     Ok(())
 }
 
@@ -1492,23 +1441,30 @@ fn print_config(
             yn(c.fork_after_authentication, false)
         ),
     ];
+    // As written (OpenSSH expands them only when loading).
     let identities: Vec<String> = if !cli.identities.is_empty() || !c.identity_files.is_empty() {
         cli.identities
             .iter()
+            .chain(c.identity_files.iter())
             .cloned()
-            .chain(c.identity_files.iter().map(|p| expand_tilde(p)))
             .collect()
     } else {
-        default_identity_paths()
-            .into_iter()
-            .map(|p| p.display().to_string())
-            .collect()
+        [
+            "id_rsa",
+            "id_ecdsa",
+            "id_ecdsa_sk",
+            "id_ed25519",
+            "id_ed25519_sk",
+        ]
+        .iter()
+        .map(|n| format!("~/.ssh/{n}"))
+        .collect()
     };
     out.extend(identities.into_iter().map(|p| format!("identityfile {p}")));
     out.extend(
         c.certificate_files
             .iter()
-            .map(|p| format!("certificatefile {}", expand_tilde(p))),
+            .map(|p| format!("certificatefile {p}")),
     );
     let known_hosts = cli
         .known_hosts_path
@@ -1663,13 +1619,13 @@ fn run() -> Result<i32, String> {
         Some(puressh::config::SessionType::Subsystem) => cli.subsystem = true,
         _ => {}
     }
-    if cli.command.is_none()
+    // RemoteCommand is taken once its tokens are expanded (below).
+    let command_from_config = cli.command.is_none()
         && !cli.no_command
-        && let Some(cmd) = cfg_block.remote_command.as_deref()
-        && !cmd.eq_ignore_ascii_case("none")
-    {
-        cli.command = Some(cmd.to_string());
-    }
+        && cfg_block
+            .remote_command
+            .as_deref()
+            .is_some_and(|c| !c.eq_ignore_ascii_case("none"));
     if cli.escape_char.is_none() {
         cli.escape_char = cfg_block.escape_char;
     }
@@ -1744,6 +1700,12 @@ fn run() -> Result<i32, String> {
     if !cli.agent_forward && cfg_block.forward_agent == Some(true) {
         cli.agent_forward = true;
     }
+    // `-X` is trusted when ForwardX11Trusted says so (Ubuntu's ssh_config
+    // does); `-Y` always is.
+    if cli.x11_forward == Some(X11Forward::Untrusted) && cfg_block.forward_x11_trusted == Some(true)
+    {
+        cli.x11_forward = Some(X11Forward::Trusted);
+    }
     if cli.x11_forward.is_none() && cfg_block.forward_x11 == Some(true) {
         cli.x11_forward = Some(if cfg_block.forward_x11_trusted == Some(true) {
             X11Forward::Trusted
@@ -1765,10 +1727,28 @@ fn run() -> Result<i32, String> {
     let port = common::pick(cli.port, cfg_block.port, 22);
     // `HostName` rewrites the connect target; the original `cli.host` is
     // what we *displayed* and what the config block matched on.
+    // `HostName` takes `%h` (the name given) and `%%`.
     let connect_host = cfg_block
         .host_name
-        .clone()
+        .as_deref()
+        .map(|h| {
+            h.replace("%%", "\0")
+                .replace("%h", &cli.host)
+                .replace('\0', "%")
+        })
         .unwrap_or_else(|| cli.host.clone());
+
+    // ssh_config(5) TOKENS in the directives that take them (before -G
+    // prints them, except IdentityFile / CertificateFile, which OpenSSH
+    // prints as written).
+    let tokens = Tokens::new(&cli.host, &connect_host, port, &user, &cfg_block, &cli);
+    tokens.expand_options(&mut cfg_block);
+    if let Some(p) = &cli.known_hosts_path {
+        cli.known_hosts_path = Some(PathBuf::from(tokens.expand_path(&p.to_string_lossy())));
+    }
+    if command_from_config {
+        cli.command = cfg_block.remote_command.clone();
+    }
 
     // `-G`: print the resolved configuration and stop.
     if cli.print_config {
@@ -1776,13 +1756,19 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
 
+    tokens.expand_paths(&mut cfg_block);
+    cli.identities = cli
+        .identities
+        .iter()
+        .map(|p| tokens.expand_path(p))
+        .collect();
     let cfg = config_for_host(&cfg_block, &cli)?;
 
     // ---- Connection multiplexing (ControlMaster/ControlPath/ControlPersist) ----
     // Resolve the control settings once. The honoring is Unix-only; the
     // resolved values just sit unused on other platforms.
     #[cfg(unix)]
-    let mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user)?;
+    let mut mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user)?;
 
     // `-O check|exit|stop`: a control command, not a session. Resolve the
     // ControlPath, talk to the master, and return — never connect/auth.
@@ -1815,36 +1801,34 @@ fn run() -> Result<i32, String> {
                     // `-L` / `-D` ride the mux carrier: each accepted local
                     // connection opens its own OPEN_DIRECT_TCPIP control
                     // connection to the master, which dials the destination
-                    // over its SSH connection. `-R` (needs master-side
-                    // listener management) and `-A`/`-X`/`-Y` (need
-                    // master-side session callbacks) stay unsupported over a
-                    // mux client.
-                    if !cli.remotes.is_empty() {
-                        return Err("-R remote forwarding is not supported over a multiplexed \
-                             (ControlMaster) connection; the master owns listener \
-                             management. Run -R without ControlMaster."
-                            .into());
-                    }
-                    if cli.agent_forward || cli.x11_forward.is_some() {
-                        return Err("-A/-X/-Y forwarding is not supported over a multiplexed \
-                             (ControlMaster) connection; these need a master-side \
-                             session channel. Run without ControlMaster."
-                            .into());
-                    }
-                    vlog(1, &format!("mux: reusing master at {}", dec.path.display()));
-                    if !cli.locals.is_empty() || !dynamics.is_empty() {
-                        // `-N` alongside `-L`/`-D` over mux is fine: we just
-                        // serve the listeners and never open a session.
-                        return run_mux_forwarding(&cli, &dynamics, &dec.path);
-                    }
-                    if cli.no_command {
-                        return Err(
-                            "-N over a multiplexed (ControlMaster) connection requires at \
-                             least one of -L or -D (the only forwards a mux client can carry)"
-                                .into(),
+                    // over its SSH connection. `-R`, `-A` and `-X`/`-Y` need
+                    // the master's own session machinery, which this mux
+                    // protocol does not carry: such a session gets its own
+                    // connection instead (and leaves the master alone).
+                    if !cli.remotes.is_empty() || cli.agent_forward || cli.x11_forward.is_some() {
+                        vlog(
+                            1,
+                            "mux: -R/-A/-X need their own connection; not using the master",
                         );
+                        if let Some(d) = mux_decision.as_mut() {
+                            d.become_master = false;
+                        }
+                    } else {
+                        vlog(1, &format!("mux: reusing master at {}", dec.path.display()));
+                        if !cli.locals.is_empty() || !dynamics.is_empty() {
+                            // `-N` alongside `-L`/`-D` over mux is fine: we just
+                            // serve the listeners and never open a session.
+                            return run_mux_forwarding(&cli, &dynamics, &dec.path);
+                        }
+                        if cli.no_command {
+                            return Err(
+                                "-N over a multiplexed (ControlMaster) connection requires at \
+                             least one of -L or -D (the only forwards a mux client can carry)"
+                                    .into(),
+                            );
+                        }
+                        return run_mux_client(&cli, &cfg_block, &dec.path);
                     }
-                    return run_mux_client(&cli, &cfg_block, &dec.path);
                 }
                 puressh::mux::ProbeOutcome::Stale | puressh::mux::ProbeOutcome::Absent => {
                     // No live master: fall through to a normal connection.
@@ -2028,15 +2012,19 @@ fn run() -> Result<i32, String> {
     if cli.agent_forward {
         #[cfg(unix)]
         {
-            let cb =
-                puressh::forwarding::agent::splice_to_local_agent_callback().ok_or_else(|| {
-                    "-A: $SSH_AUTH_SOCK is unset, or names a socket that failed validation \
-                     (must exist, be a socket, not a symlink, owned by you, mode 0?00); \
-                     refusing to forward the agent"
-                        .to_string()
-                })?;
-            handlers = handlers.with_auth_agent(cb);
-            client.set_request_auth_agent_forwarding(true);
+            // No usable agent: no forwarding, as with OpenSSH (which only
+            // finds out when the server first asks for it).
+            match puressh::forwarding::agent::splice_to_local_agent_callback() {
+                Some(cb) => {
+                    handlers = handlers.with_auth_agent(cb);
+                    client.set_request_auth_agent_forwarding(true);
+                }
+                None => vlog(
+                    1,
+                    "-A: no usable agent ($SSH_AUTH_SOCK unset, or not a socket of \
+                     yours); not forwarding it",
+                ),
+            }
         }
         #[cfg(not(unix))]
         warn!("Warning: agent forwarding is not supported on this platform; ignoring -A");
@@ -2044,28 +2032,33 @@ fn run() -> Result<i32, String> {
     if let Some(mode) = cli.x11_forward {
         #[cfg(unix)]
         {
-            let cb =
-                puressh::forwarding::x11::splice_to_local_display_callback().ok_or_else(|| {
-                    "-X/-Y: $DISPLAY is unset or names a display we don't know how to dial"
-                        .to_string()
-                })?;
+            // No display: no forwarding (OpenSSH: "DISPLAY not set").
+            let cb = puressh::forwarding::x11::splice_to_local_display_callback();
+            if cb.is_none() {
+                vlog(
+                    1,
+                    "-X/-Y: $DISPLAY is unset or not a display we can reach; not forwarding X11",
+                );
+            }
             // puressh has no SECURITY-extension cookie isolation yet: -X
             // behaves like -Y. Say so rather than silently downgrading.
-            if mode == X11Forward::Untrusted {
+            if mode == X11Forward::Untrusted && cb.is_some() {
                 warn!(
                     "Warning: -X is currently equivalent to -Y in puressh (no \
                      SECURITY-extension cookie); the remote can read X11 input from \
                      your local display."
                 );
             }
-            let cookie = mint_x11_cookie()?;
-            handlers = handlers.with_x11(cb);
-            client.set_request_x11_forwarding(Some((
-                false,
-                "MIT-MAGIC-COOKIE-1".to_string(),
-                cookie,
-                0,
-            )));
+            if let Some(cb) = cb {
+                let cookie = mint_x11_cookie()?;
+                handlers = handlers.with_x11(cb);
+                client.set_request_x11_forwarding(Some((
+                    false,
+                    "MIT-MAGIC-COOKIE-1".to_string(),
+                    cookie,
+                    0,
+                )));
+            }
         }
         #[cfg(not(unix))]
         {
@@ -2462,6 +2455,188 @@ struct MuxDecision {
     persist: puressh::mux::Persist,
 }
 
+/// The `%` tokens of ssh_config(5) for this connection.
+struct Tokens {
+    /// `%n`: the host name as given.
+    original: String,
+    /// `%h`: the host connected to (after `HostName`).
+    host: String,
+    port: u16,
+    /// `%r`: the remote user.
+    remote_user: String,
+    /// `%u`, `%i`, `%d`: the local user, uid and home directory.
+    local_user: String,
+    uid: String,
+    home: String,
+    /// `%l` / `%L`: the local host name, in full and up to the first dot.
+    local_host: String,
+    /// `%j`: the ProxyJump hops, or empty.
+    jump: String,
+    /// `%k`: HostKeyAlias, else the host name as given.
+    key_alias: String,
+}
+
+impl Tokens {
+    fn new(
+        original: &str,
+        host: &str,
+        port: u16,
+        remote_user: &str,
+        cfg: &puressh::config::ClientOptions,
+        cli: &Cli,
+    ) -> Self {
+        #[cfg(unix)]
+        let (uid, pw_home) = {
+            let uid = nix::unistd::getuid();
+            let home = nix::unistd::User::from_uid(uid)
+                .ok()
+                .flatten()
+                .map(|u| u.dir.to_string_lossy().into_owned());
+            (uid.as_raw().to_string(), home)
+        };
+        #[cfg(not(unix))]
+        let (uid, pw_home) = (String::new(), None::<String>);
+        let home = pw_home
+            .or_else(|| std::env::var("HOME").ok())
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .unwrap_or_default();
+        Tokens {
+            original: original.to_string(),
+            host: host.to_string(),
+            port,
+            remote_user: remote_user.to_string(),
+            local_user: common::local_user_name().unwrap_or_default(),
+            uid,
+            home,
+            #[cfg(unix)]
+            local_host: puressh::mux::local_hostname(),
+            #[cfg(not(unix))]
+            local_host: std::env::var("COMPUTERNAME").unwrap_or_default(),
+            jump: cli
+                .proxy_jump
+                .clone()
+                .or_else(|| cfg.proxy_jump.clone())
+                .filter(|j| !j.eq_ignore_ascii_case("none"))
+                .unwrap_or_default(),
+            key_alias: cfg
+                .host_key_alias
+                .clone()
+                .unwrap_or_else(|| original.to_string()),
+        }
+    }
+
+    /// `%C`: SHA-1 of `%l%h%p%r%j`, in hex (as `puressh::mux` computes it,
+    /// which Windows builds lack).
+    fn connection_hash(&self) -> String {
+        use purecrypto::hash::{Digest, Sha1};
+        let material = format!(
+            "{}{}{}{}{}",
+            self.local_host, self.host, self.port, self.remote_user, self.jump
+        );
+        Sha1::digest(material.as_bytes())
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
+    /// Expand `%C %d %h %i %j %k %L %l %n %p %r %u %%`; any other `%x` is
+    /// left as written.
+    fn expand(&self, s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                out.push(c);
+                continue;
+            }
+            match chars.next() {
+                Some('%') => out.push('%'),
+                Some('C') => out.push_str(&self.connection_hash()),
+                Some('d') => out.push_str(&self.home),
+                Some('h') => out.push_str(&self.host),
+                Some('i') => out.push_str(&self.uid),
+                Some('j') => out.push_str(&self.jump),
+                Some('k') => out.push_str(&self.key_alias),
+                Some('L') => out.push_str(self.local_host.split('.').next().unwrap_or("")),
+                Some('l') => out.push_str(&self.local_host),
+                Some('n') => out.push_str(&self.original),
+                Some('p') => out.push_str(&self.port.to_string()),
+                Some('r') => out.push_str(&self.remote_user),
+                Some('u') => out.push_str(&self.local_user),
+                Some(other) => {
+                    out.push('%');
+                    out.push(other);
+                }
+                None => out.push('%'),
+            }
+        }
+        out
+    }
+
+    /// A file name as OpenSSH takes it: `~`, then `${VAR}`, then tokens.
+    fn expand_path(&self, s: &str) -> String {
+        self.expand(&expand_env(&expand_tilde(s)))
+    }
+
+    /// The directives `-G` prints expanded: UserKnownHostsFile, ControlPath,
+    /// IdentityAgent, RevokedHostKeys, RemoteCommand.
+    fn expand_options(&self, cfg: &mut puressh::config::ClientOptions) {
+        if let Some(files) = &cfg.user_known_hosts {
+            let expanded: Vec<String> = files
+                .split_whitespace()
+                .map(|f| self.expand_path(f))
+                .collect();
+            cfg.user_known_hosts = Some(expanded.join(" "));
+        }
+        for p in [&mut cfg.control_path, &mut cfg.revoked_host_keys]
+            .into_iter()
+            .flatten()
+        {
+            if !p.eq_ignore_ascii_case("none") {
+                *p = self.expand_path(p);
+            }
+        }
+        if let Some(puressh::config::IdentityAgent::Path(p)) = &mut cfg.identity_agent
+            && p != "SSH_AUTH_SOCK"
+            && !p.starts_with('$')
+        {
+            *p = self.expand_path(p);
+        }
+        if let Some(c) = &mut cfg.remote_command {
+            *c = self.expand(c);
+        }
+    }
+
+    /// IdentityFile and CertificateFile, which `-G` prints as written.
+    fn expand_paths(&self, cfg: &mut puressh::config::ClientOptions) {
+        for p in cfg
+            .identity_files
+            .iter_mut()
+            .chain(cfg.certificate_files.iter_mut())
+        {
+            *p = self.expand_path(p);
+        }
+    }
+}
+
+/// `${NAME}` environment references (OpenSSH expands them in file names);
+/// an unset variable expands to nothing.
+fn expand_env(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        let Some(end) = rest[i + 2..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str(&std::env::var(&rest[i + 2..i + 2 + end]).unwrap_or_default());
+        rest = &rest[i + 3 + end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Resolve ControlMaster/ControlPath/ControlPersist into a [`MuxDecision`].
 /// Returns `Ok(None)` when multiplexing is disabled (no `ControlPath`, or
 /// `ControlMaster no` with no path — i.e. nothing to do), and `Err` when the
@@ -2481,16 +2656,9 @@ fn resolve_mux(
     let master = cfg_block.control_master.unwrap_or(ControlMaster::No);
     // ControlMaster no + a path still permits *attaching* as a client; only
     // skip entirely when there is no path. (Handled by the `?` above.)
-    let localhost = puressh::mux::local_hostname();
-    let path = puressh::mux::expand_control_path(
-        template,
-        &localhost,
-        connect_host,
-        port,
-        user,
-        expand_tilde,
-    )
-    .map_err(|e| format!("ControlPath: {e}"))?;
+    // Already expanded by `Tokens::expand_options`.
+    let _ = (connect_host, port, user);
+    let path = puressh::mux::socket_path_for(template).map_err(|e| format!("ControlPath: {e}"))?;
     let persist = match cfg_block.control_persist {
         Some(ControlPersist::No) | None => puressh::mux::Persist::No,
         Some(ControlPersist::Yes) => puressh::mux::Persist::Yes,
@@ -2705,6 +2873,7 @@ fn run_mux_client(
     req.rows = rows;
     req.env = env;
     req.command = cli.command.clone();
+    req.subsystem = cli.subsystem;
 
     // Put the local terminal in raw mode for an interactive PTY session so
     // keystrokes reach the remote unprocessed (mirrors the direct path).

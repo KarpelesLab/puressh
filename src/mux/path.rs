@@ -1,11 +1,10 @@
 //! `ControlPath` `%`-token expansion and `sun_path` length management.
 //!
 //! OpenSSH's `ControlPath` accepts the same `%`-token vocabulary as
-//! `ProxyCommand` plus `%C` — a hash of the connection 4-tuple
-//! (`localhost:host:port:user`). We reuse the shared
+//! `ProxyCommand` plus `%C` — OpenSSH's hash of the local host name, host,
+//! port, user and ProxyJump. We reuse the shared
 //! [`expand_tokens`](crate::proc_transport::expand_tokens) for `%h`/`%p`/`%r`
-//! and add `%C` here, since `%C` needs SHA-256 (already in the dep tree) and
-//! the local hostname.
+//! and add `%C` here.
 //!
 //! A Unix-domain socket address is bounded by `sun_path` (~108 bytes including
 //! the NUL terminator on Linux). An expanded `ControlPath` longer than that
@@ -18,7 +17,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use purecrypto::hash::sha256;
+use purecrypto::hash::{Digest, Sha1};
 
 /// Conservative usable length for a `sockaddr_un.sun_path`. The real limit is
 /// 108 on Linux / 104 on macOS *including* the trailing NUL; we keep a margin
@@ -35,14 +34,12 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// The `%C` connection hash: lowercase hex SHA-256 of
-/// `localhost:host:port:user`, truncated to 16 hex chars (8 bytes) to match
-/// OpenSSH's compact form. `localhost` is the local hostname (best-effort;
-/// empty string if unavailable, which still yields a stable per-target hash).
-pub fn connection_hash(localhost: &str, host: &str, port: u16, user: &str) -> String {
-    let material = format!("{localhost}:{host}:{port}:{user}");
-    let digest = sha256(material.as_bytes());
-    hex(&digest[..8])
+/// The `%C` connection hash, as OpenSSH computes it so both share masters:
+/// lowercase hex SHA-1 of the local host name, host, port, remote user and
+/// ProxyJump string (`%l%h%p%r%j`), concatenated.
+pub fn connection_hash(localhost: &str, host: &str, port: u16, user: &str, jump: &str) -> String {
+    let material = format!("{localhost}{host}{port}{user}{jump}");
+    hex(&Sha1::digest(material.as_bytes()))
 }
 
 /// Expand a `ControlPath` template's `%`-tokens — `%h`/`%p`/`%r`/`%%` via the
@@ -68,7 +65,7 @@ pub fn expand_tokens_with_hash(
         match chars.peek() {
             Some('C') => {
                 chars.next();
-                pre.push_str(&connection_hash(localhost, host, port, user));
+                pre.push_str(&connection_hash(localhost, host, port, user, ""));
             }
             Some('l') => {
                 chars.next();
@@ -176,15 +173,31 @@ mod tests {
 
     #[test]
     fn connection_hash_is_stable_and_distinct() {
-        let a = connection_hash("box", "example.com", 22, "alice");
-        let b = connection_hash("box", "example.com", 22, "alice");
+        let a = connection_hash("box", "example.com", 22, "alice", "");
+        let b = connection_hash("box", "example.com", 22, "alice", "");
         assert_eq!(a, b, "same tuple ⇒ same hash");
-        assert_eq!(a.len(), 16);
+        assert_eq!(a.len(), 40);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
-        let c = connection_hash("box", "example.com", 2222, "alice");
+        let c = connection_hash("box", "example.com", 2222, "alice", "");
         assert_ne!(a, c, "different port ⇒ different hash");
-        let d = connection_hash("box", "example.com", 22, "bob");
+        let d = connection_hash("box", "example.com", 22, "bob", "");
         assert_ne!(a, d, "different user ⇒ different hash");
+        let e = connection_hash("box", "example.com", 22, "alice", "jump");
+        assert_ne!(a, e, "different ProxyJump ⇒ different hash");
+    }
+
+    #[test]
+    fn connection_hash_matches_openssh() {
+        // `ssh -G -o ControlPath=%C -p 2222 -l bob example.com` on host
+        // "mizuki" (OpenSSH 10), then again with `-J jh`.
+        assert_eq!(
+            connection_hash("mizuki", "example.com", 2222, "bob", ""),
+            "0147fb14dc3e622c0202e8e9612af8dd607e19d6"
+        );
+        assert_eq!(
+            connection_hash("mizuki", "example.com", 2222, "bob", "jh"),
+            "d5a1ae91ed600dd3d267c31f11148c8a8eab2592"
+        );
     }
 
     #[test]
@@ -195,7 +208,7 @@ mod tests {
 
     #[test]
     fn expand_percent_c_and_l() {
-        let h = connection_hash("myhost", "srv", 22, "u");
+        let h = connection_hash("myhost", "srv", 22, "u", "");
         let out = expand_tokens_with_hash("/tmp/%l-%C", "myhost", "srv", 22, "u");
         assert_eq!(out, format!("/tmp/myhost-{h}"));
     }

@@ -1242,6 +1242,15 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("UseRsh", &["*"], ""),
 ];
 
+impl ClientOptions {
+    /// Fill every option `self` leaves unset from `lower` and append its
+    /// list options after `self`'s: the first-obtained-value rule, with
+    /// `self` obtained first (as `ssh -o` options are, ahead of the files).
+    pub fn merge_lower(&mut self, lower: &ClientOptions) {
+        merge_into(self, lower);
+    }
+}
+
 /// First-match-wins merge of `src` over `dst`. Scalars only overwrite if
 /// `dst` had `None`; list fields concatenate.
 fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {

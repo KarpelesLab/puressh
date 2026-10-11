@@ -9,7 +9,7 @@ use std::fmt;
 
 /// Protocol version carried in [`Frame::Hello`]. Bumped on any incompatible
 /// wire change; a master refuses a client whose `HELLO` version differs.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// Upper bound on a single frame's body length (type byte + payload). Guards
 /// the reader against a hostile/garbled length prefix demanding an unbounded
@@ -57,6 +57,8 @@ pub enum Frame {
         env: Vec<(String, String)>,
         /// Remote command to exec; `None` requests an interactive shell.
         command: Option<String>,
+        /// `command` is a subsystem name (`ssh -s`), not a command.
+        subsystem: bool,
     },
     /// Client → master: bytes for the session's stdin.
     StdinData(Vec<u8>),
@@ -141,6 +143,7 @@ impl Frame {
                 rows,
                 env,
                 command,
+                subsystem,
             } => {
                 out.push(T_OPEN_SESSION);
                 out.push(*want_pty as u8);
@@ -160,6 +163,7 @@ impl Frame {
                     }
                     None => out.push(0),
                 }
+                out.push(*subsystem as u8);
             }
             Frame::StdinData(d) => {
                 out.push(T_STDIN_DATA);
@@ -250,6 +254,11 @@ impl Frame {
                     1 => Some(r.str()?),
                     _ => return Err(MuxError::Malformed("OPEN_SESSION: bad command flag")),
                 };
+                let subsystem = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(MuxError::Malformed("OPEN_SESSION: bad subsystem flag")),
+                };
                 Frame::OpenSession {
                     want_pty,
                     term,
@@ -257,6 +266,7 @@ impl Frame {
                     rows,
                     env,
                     command,
+                    subsystem,
                 }
             }
             T_STDIN_DATA => Frame::StdinData(r.rest().to_vec()),
@@ -437,6 +447,7 @@ mod tests {
                 ("LONGKEY".into(), "a value with spaces".into()),
             ],
             command: Some("ls -la /tmp".into()),
+            subsystem: false,
         });
         round_trip(Frame::OpenSession {
             want_pty: false,
@@ -445,6 +456,16 @@ mod tests {
             rows: 0,
             env: vec![],
             command: None,
+            subsystem: false,
+        });
+        round_trip(Frame::OpenSession {
+            want_pty: false,
+            term: String::new(),
+            cols: 0,
+            rows: 0,
+            env: vec![],
+            command: Some("sftp".into()),
+            subsystem: true,
         });
         round_trip(Frame::StdinData(vec![]));
         round_trip(Frame::StdinData(b"some bytes \x00\xff".to_vec()));
@@ -487,6 +508,7 @@ mod tests {
             rows: 1,
             env: vec![],
             command: Some("écho café".into()),
+            subsystem: false,
         });
     }
 

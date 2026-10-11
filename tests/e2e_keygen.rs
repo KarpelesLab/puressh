@@ -193,7 +193,21 @@ fn formats_fingerprints_krl_interop() {
         );
         // PEM / PKCS8 private keys we write load in OpenSSH.
         for m in ["PEM", "PKCS8"] {
-            if kind == "ed25519" && m == "PEM" {
+            // No PEM form for Ed25519; and OpenSSH before 10 cannot load
+            // Ed25519 PKCS8 keys (test only if it can write one itself).
+            if kind == "ed25519"
+                && (m == "PEM"
+                    || !run(
+                        &dir,
+                        "ssh-keygen",
+                        &[
+                            "-q", "-t", "ed25519", "-m", "PKCS8", "-N", "", "-f", "probe",
+                        ],
+                        b"",
+                    )
+                    .status
+                    .success())
+            {
                 continue;
             }
             let name = format!("{kind}_{m}");

@@ -99,7 +99,8 @@ last -w tester | grep -q '^tester  *pts/'
 (sleep 5; printf 'exit\n') | timeout 60 ssh -tt -F /dev/null -i /root/tester_key -o BatchMode=yes \
 	-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts tester@localhost \
 	>/tmp/login.out 2>&1 && rc=0 || rc=$?
-if [ "$rc" != 0 ] || ! tr -d '\r' </tmp/login.out | grep -q '^Last login: .* from '; then
+# (Ubuntu's ~/.bash_logout ends with a failing clear_console: exit 1.)
+if [ "$rc" = 124 ] || ! tr -d '\r' </tmp/login.out | grep -q '^Last login: .* from '; then
 	echo "interactive login: exit $rc"; cat -A /tmp/login.out; exit 1
 fi
 ss -ltnp | grep -q ':22 '

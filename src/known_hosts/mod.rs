@@ -32,10 +32,12 @@
 
 pub(crate) mod format;
 mod hash;
+mod revoked;
 mod store;
 
 #[cfg(test)]
 mod tests;
 
 pub use format::{Entry, HostSpec, Marker, format_entry};
+pub use revoked::RevokedHostKeys;
 pub use store::{KnownHosts, LookupResult};

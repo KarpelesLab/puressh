@@ -50,7 +50,7 @@ pub use algos::{
 pub use client::{
     AddressFamily, ClientOptions, ControlMaster, ControlPersist, DynamicForwardSpec, GatewayPorts,
     IdentityAgent, KnockSetting, LocalForwardSpec, ObscureKeystrokeTiming, RemoteForwardSpec,
-    RequestTty, SshClientConfig, StrictMode,
+    RequestTty, SessionType, SshClientConfig, StrictMode, parse_escape_char,
 };
 pub use glob::{HostPattern, host_matches};
 pub use host_port::{parse_host_port, parse_host_port_pattern};

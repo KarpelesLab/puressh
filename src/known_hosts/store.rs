@@ -292,17 +292,8 @@ impl KnownHosts {
     ) -> crate::Result<()> {
         use crate::error::Error;
 
-        // Pass 1: @revoked — refuse if a revoke line matches the CA key OR the
-        // certificate's embedded key (revoking either kills the cert).
-        for slot in &self.lines {
-            if let Slot::Entry(e) = slot
-                && e.marker == Some(Marker::Revoked)
-                && host_field_matches(&e.host_spec, host, port)
-                && (e.key_blob == cert.signature_key_blob
-                    || e.key_blob == cert.embedded_pubkey_blob)
-            {
-                return Err(Error::HostKeyRejected);
-            }
+        if self.revokes_cert(host, port, cert) {
+            return Err(Error::HostKeyRejected);
         }
 
         // Validate the certificate itself before consulting the CA list, so a
@@ -329,6 +320,18 @@ impl KnownHosts {
             return Ok(());
         }
         Err(Error::HostKeyRejected)
+    }
+
+    /// Whether an `@revoked` line for `host[:port]` names the certificate's
+    /// CA key or its embedded key (revoking either kills the cert).
+    pub fn revokes_cert(&self, host: &str, port: u16, cert: &crate::cert::Certificate) -> bool {
+        self.lines.iter().any(|slot| {
+            matches!(slot, Slot::Entry(e)
+                if e.marker == Some(Marker::Revoked)
+                    && host_field_matches(&e.host_spec, host, port)
+                    && (e.key_blob == cert.signature_key_blob
+                        || e.key_blob == cert.embedded_pubkey_blob))
+        })
     }
 
     /// Append a new entry. The host is formatted as `host` for the

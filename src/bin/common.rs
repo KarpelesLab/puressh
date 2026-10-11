@@ -1020,6 +1020,47 @@ pub fn build_host_key_policy(
     Ok(HostKeyPolicy::KnownHosts(policy))
 }
 
+/// Apply the known_hosts-related ssh_config options to a host-key policy:
+/// `GlobalKnownHostsFile` (default `/etc/ssh/ssh_known_hosts{,2}`; missing
+/// files are skipped), `HostKeyAlias`, and `RevokedHostKeys`, whose file
+/// must be readable, as with OpenSSH: checking against a list that cannot
+/// be read would silently accept a revoked key.
+pub fn apply_known_hosts_options(
+    policy: &mut HostKeyPolicy,
+    cfg: &puressh::config::ClientOptions,
+) -> Result<(), String> {
+    let HostKeyPolicy::KnownHosts(kh) = policy else {
+        return Ok(());
+    };
+    let globals: Vec<String> = match &cfg.global_known_hosts_files {
+        Some(files) if files.iter().any(|f| f.eq_ignore_ascii_case("none")) => Vec::new(),
+        Some(files) => files.iter().map(|f| expand_tilde(f)).collect(),
+        None => vec![
+            "/etc/ssh/ssh_known_hosts".into(),
+            "/etc/ssh/ssh_known_hosts2".into(),
+        ],
+    };
+    for path in globals {
+        match KnownHosts::load(&path) {
+            Ok(store) => kh.global.push(Arc::new(store)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => vlog(1, &format!("global known_hosts {path}: {e}")),
+        }
+    }
+    kh.host_key_alias = cfg.host_key_alias.clone();
+    if let Some(path) = cfg
+        .revoked_host_keys
+        .as_deref()
+        .filter(|p| !p.eq_ignore_ascii_case("none"))
+    {
+        let path = expand_tilde(path);
+        let revoked = puressh::known_hosts::RevokedHostKeys::load(&path)
+            .map_err(|e| format!("RevokedHostKeys {path}: {e}"))?;
+        kh.revoked = Some(Arc::new(revoked));
+    }
+    Ok(())
+}
+
 /// Binary-local verbosity level (`-v` / `-vv` / `-vvv`). One copy per
 /// binary because `common.rs` is `#[path]`-included rather than shared
 /// as a crate — that's fine, since each binary's process only ever sees

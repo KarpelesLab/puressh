@@ -576,6 +576,9 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
                     // taking an on_mismatch action; the default here matches
                     // OpenSSH's `StrictHostKeyChecking=yes` for mismatches.
                     on_mismatch: TofuAction::Reject,
+                    global: Vec::new(),
+                    host_key_alias: None,
+                    revoked: None,
                 };
                 Config {
                     host_key_policy: HostKeyPolicy::KnownHosts(policy),

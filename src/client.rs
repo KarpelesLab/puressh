@@ -262,6 +262,16 @@ pub struct KnownHostsPolicy {
     /// [`TofuAction::AcceptWithWarning`] to keep insecure-but-loud
     /// parity with OpenSSH.
     pub on_mismatch: TofuAction,
+    /// Read-only system files (`GlobalKnownHostsFile`, by default
+    /// `/etc/ssh/ssh_known_hosts{,2}`), evaluated together with `store`
+    /// as OpenSSH does: a key listed in any file is accepted, a host listed
+    /// with other keys in any file is a mismatch. Never written.
+    pub global: Vec<Arc<KnownHosts>>,
+    /// `HostKeyAlias`: look the host key up (and record it) under this name,
+    /// on the default port, instead of the connection's host and port.
+    pub host_key_alias: Option<String>,
+    /// `RevokedHostKeys`: host keys (and certificates) refused outright.
+    pub revoked: Option<Arc<crate::known_hosts::RevokedHostKeys>>,
 }
 
 impl KnownHostsPolicy {
@@ -274,6 +284,9 @@ impl KnownHostsPolicy {
             hash_new: false,
             on_unknown: TofuAction::Reject,
             on_mismatch: TofuAction::Reject,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         }
     }
 }
@@ -3560,10 +3573,38 @@ pub(crate) fn build_verifier(
                 cert.check_validity(now)?;
                 cert.require_known_critical_options()?;
             }
-            // Trust via known_hosts `@cert-authority` (and `@revoked`).
+            // Trust via known_hosts `@cert-authority` (and `@revoked`), in
+            // the user file or a global one.
             HostKeyPolicy::KnownHosts(kh) => {
+                let (host, port) = match &kh.host_key_alias {
+                    Some(alias) => (alias.as_str(), 22),
+                    None => (target_host, target_port),
+                };
+                if kh
+                    .revoked
+                    .as_ref()
+                    .is_some_and(|r| r.is_revoked_cert(&cert))
+                {
+                    print_revoked_banner(&neg.host_key, host, port);
+                    return Err(Error::HostKeyRejected);
+                }
                 let store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
-                store.verify_host_cert(target_host, target_port, &cert, &ca_algos, now)?;
+                if store.revokes_cert(host, port, &cert)
+                    || kh.global.iter().any(|g| g.revokes_cert(host, port, &cert))
+                {
+                    return Err(Error::HostKeyRejected);
+                }
+                let user = store.verify_host_cert(host, port, &cert, &ca_algos, now);
+                if user.is_err()
+                    && kh.global.iter().any(|g| {
+                        g.verify_host_cert(host, port, &cert, &ca_algos, now)
+                            .is_ok()
+                    })
+                {
+                    // Trusted by a system file.
+                } else {
+                    user?;
+                }
             }
         }
         // Build the exchange-hash verifier from the cert's embedded key, keyed
@@ -3582,9 +3623,23 @@ pub(crate) fn build_verifier(
         HostKeyPolicy::KnownHosts(kh) => {
             // Host-empty / port-zero already rejected above. Past this
             // point we have a real (host, port) pair, so the lookup can
-            // proceed.
+            // proceed. `HostKeyAlias` replaces both for the lookup.
+            let (target_host, target_port) = match &kh.host_key_alias {
+                Some(alias) => (alias.as_str(), 22),
+                None => (target_host, target_port),
+            };
+            if kh.revoked.as_ref().is_some_and(|r| r.is_revoked_key(k_s)) {
+                print_revoked_banner(&neg.host_key, target_host, target_port);
+                return Err(Error::HostKeyRejected);
+            }
             let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
-            let lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
+            let mut lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
+            for g in &kh.global {
+                lookup = combine_lookups(
+                    lookup,
+                    g.lookup(target_host, target_port, &neg.host_key, k_s),
+                );
+            }
             match lookup {
                 LookupResult::Match => {}
                 LookupResult::Revoked => {
@@ -3592,21 +3647,7 @@ pub(crate) fn build_verifier(
                     // `on_mismatch` — no `StrictHostKeyChecking=no` accept,
                     // no prompt, no rotation of the store. OpenSSH aborts
                     // the connection here too.
-                    eprintln!(
-                        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-                         @       WARNING: REVOKED HOST KEY DETECTED!               @\n\
-                         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
-                         The {} host key for {} is revoked.\n\
-                         This could mean that a stolen key is being used to \
-                         impersonate this host.\n\
-                         Host key verification failed: host key is revoked.",
-                        neg.host_key,
-                        if target_port == 22 {
-                            target_host.to_string()
-                        } else {
-                            format!("[{target_host}]:{target_port}")
-                        },
-                    );
+                    print_revoked_banner(&neg.host_key, target_host, target_port);
                     return Err(Error::HostKeyRejected);
                 }
                 LookupResult::Mismatch { expected } => {
@@ -3754,6 +3795,40 @@ pub(crate) fn build_verifier(
     }
 
     host_key_verify_by_name(&neg.host_key, k_s)
+}
+
+/// OpenSSH's banner for a revoked host key.
+fn print_revoked_banner(key_type: &str, host: &str, port: u16) {
+    eprintln!(
+        "@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+         @       WARNING: REVOKED HOST KEY DETECTED!               @\n\
+         @@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n\
+         The {key_type} host key for {} is revoked.\n\
+         This could mean that a stolen key is being used to \
+         impersonate this host.\n\
+         Host key verification failed: host key is revoked.",
+        if port == 22 {
+            host.to_string()
+        } else {
+            format!("[{host}]:{port}")
+        },
+    );
+}
+
+/// Combine the lookups of the user and a global known_hosts file the way
+/// OpenSSH evaluates them together: a revocation anywhere wins, then a
+/// match anywhere, then a mismatch anywhere (listing every expected key).
+fn combine_lookups(a: LookupResult, b: LookupResult) -> LookupResult {
+    match (a, b) {
+        (LookupResult::Revoked, _) | (_, LookupResult::Revoked) => LookupResult::Revoked,
+        (LookupResult::Match, _) | (_, LookupResult::Match) => LookupResult::Match,
+        (LookupResult::Mismatch { mut expected }, LookupResult::Mismatch { expected: more }) => {
+            expected.extend(more);
+            LookupResult::Mismatch { expected }
+        }
+        (m @ LookupResult::Mismatch { .. }, _) | (_, m @ LookupResult::Mismatch { .. }) => m,
+        _ => LookupResult::Unknown,
+    }
 }
 
 /// Pull every queued [`ServeCommand`] from `cmd_rx` (non-blocking) and
@@ -4766,6 +4841,9 @@ mod tests {
             hash_new: false,
             on_unknown: TofuAction::PromptDetailed(cb),
             on_mismatch: TofuAction::Reject,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -4812,6 +4890,9 @@ mod tests {
             hash_new: false,
             on_unknown: TofuAction::PromptDetailed(cb),
             on_mismatch: TofuAction::Reject,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -4870,6 +4951,9 @@ mod tests {
             hash_new: false,
             on_unknown: TofuAction::Reject,
             on_mismatch: TofuAction::PromptDetailed(cb),
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -4923,6 +5007,9 @@ mod tests {
             hash_new: false,
             on_unknown: TofuAction::Accept,
             on_mismatch: TofuAction::AcceptWithWarning,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -4976,6 +5063,9 @@ mod tests {
             hash_new: false,
             on_unknown: TofuAction::Reject,
             on_mismatch: TofuAction::Accept,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5023,6 +5113,9 @@ mod tests {
             hash_new: false,
             on_unknown: TofuAction::Reject,
             on_mismatch: TofuAction::AcceptWithWarning,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),

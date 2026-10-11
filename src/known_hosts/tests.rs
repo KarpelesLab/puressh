@@ -617,3 +617,21 @@ fn non_default_port_falls_back_to_bare_host_key() {
         LookupResult::Mismatch { .. }
     ));
 }
+
+#[test]
+fn revoked_host_keys_list_and_krl() {
+    use crate::known_hosts::RevokedHostKeys;
+    let a = ed25519_blob(7);
+    let b = ed25519_blob(8);
+    let text = format!(
+        "# revoked\n\nssh-ed25519 {} old host\n",
+        crate::key::base64::encode(&a)
+    );
+    let r = RevokedHostKeys::parse(text.as_bytes()).unwrap();
+    assert!(r.is_revoked_key(&a));
+    assert!(!r.is_revoked_key(&b));
+    // A malformed line fails the file instead of being skipped.
+    assert!(RevokedHostKeys::parse(b"garbage\n").is_err());
+    // An empty file revokes nothing.
+    assert!(!RevokedHostKeys::parse(b"").unwrap().is_revoked_key(&a));
+}

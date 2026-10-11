@@ -58,6 +58,18 @@ pub enum RequestTty {
     Auto,
 }
 
+/// `SessionType` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionType {
+    /// `none`: no session at all (like `-N`).
+    None,
+    /// `subsystem`: the command names a subsystem (like `-s`).
+    Subsystem,
+    /// `default`: a shell or command.
+    Default,
+}
+
 /// `AddressFamily` value — filters the addresses a hostname resolves to
 /// before we attempt a connection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -417,6 +429,28 @@ pub struct ClientOptions {
     pub knock_fallback_delay: Option<u32>,
     /// `KnockPort` — UDP port to knock on (default: the SSH port).
     pub knock_port: Option<u16>,
+    /// `EscapeChar`: `Some(None)` for `none`.
+    pub escape_char: Option<Option<u8>>,
+    /// `RemoteCommand` (raw; `none` means no command).
+    pub remote_command: Option<String>,
+    /// `SessionType`.
+    pub session_type: Option<SessionType>,
+    /// `StdinNull` (like `-n`).
+    pub stdin_null: Option<bool>,
+    /// `ForkAfterAuthentication` (like `-f`).
+    pub fork_after_authentication: Option<bool>,
+    /// `PasswordAuthentication`.
+    pub password_authentication: Option<bool>,
+    /// `KbdInteractiveAuthentication` (alias `ChallengeResponseAuthentication`).
+    pub kbd_interactive_authentication: Option<bool>,
+    /// `HostKeyAlias`: name the host key is looked up and recorded under.
+    pub host_key_alias: Option<String>,
+    /// `RevokedHostKeys` (raw; `none` disables).
+    pub revoked_host_keys: Option<String>,
+    /// `GlobalKnownHostsFile` (raw list; `none` disables).
+    pub global_known_hosts_files: Option<Vec<String>>,
+    /// `ConnectionAttempts`.
+    pub connection_attempts: Option<u32>,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -594,6 +628,7 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
         patterns: vec![HostPattern::Any],
         opts: ClientOptions::default(),
     }];
+    let mut ignore_unknown: Option<String> = None;
     for line in lines {
         match line.keyword.as_str() {
             "host" => {
@@ -628,9 +663,26 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
                         .into(),
                 });
             }
+            "ignoreunknown" => {
+                if ignore_unknown.is_none() {
+                    ignore_unknown = Some(line.args.join(","));
+                }
+            }
             _ => {
                 let current = blocks.last_mut().expect("global block always present");
-                apply_keyword(current.opts_mut(), &line)?;
+                match apply_keyword(current.opts_mut(), &line) {
+                    // `IgnoreUnknown`: unknown keywords matching its
+                    // patterns (seen earlier in the file) are skipped.
+                    Err(ConfigError::UnknownKeyword { .. })
+                        if ignore_unknown.as_deref().is_some_and(|pats| {
+                            let pats: Vec<HostPattern> = pats
+                                .split(',')
+                                .map(|p| HostPattern::parse(&p.to_ascii_lowercase()))
+                                .collect();
+                            host_matches(&pats, &line.keyword)
+                        }) => {}
+                    r => r?,
+                }
             }
         }
     }
@@ -640,7 +692,12 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
 /// Apply one parsed line to the in-progress [`ClientOptions`] of the current
 /// block.
 fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), ConfigError> {
-    let kw = line.keyword.as_str();
+    // OpenSSH's older names for current keywords.
+    let kw = match line.keyword.as_str() {
+        "challengeresponseauthentication" => "kbdinteractiveauthentication",
+        "dsaauthentication" => "pubkeyauthentication",
+        kw => kw,
+    };
     let args = &line.args;
     match kw {
         "hostname" => {
@@ -996,7 +1053,82 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                 &line.keyword,
             )?);
         }
+        "escapechar" => {
+            let v = one_arg(line)?;
+            opts.escape_char =
+                Some(parse_escape_char(&v).ok_or_else(|| ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: format!("expected a character, ^X or none, got {v:?}"),
+                })?);
+        }
+        "remotecommand" => {
+            // The rest of the line, verbatim.
+            if opts.remote_command.is_none() {
+                opts.remote_command = Some(line.args.join(" "));
+            }
+        }
+        "sessiontype" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            opts.session_type = Some(match v.as_str() {
+                "none" => SessionType::None,
+                "subsystem" => SessionType::Subsystem,
+                "default" => SessionType::Default,
+                _ => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected none/subsystem/default, got {v:?}"),
+                    });
+                }
+            });
+        }
+        "stdinnull" => opts.stdin_null = Some(parse_yes_no(line)?),
+        "forkafterauthentication" => opts.fork_after_authentication = Some(parse_yes_no(line)?),
+        "passwordauthentication" => opts.password_authentication = Some(parse_yes_no(line)?),
+        "kbdinteractiveauthentication" => {
+            opts.kbd_interactive_authentication = Some(parse_yes_no(line)?)
+        }
+        "hostkeyalias" => opts.host_key_alias = Some(one_arg(line)?),
+        "revokedhostkeys" => opts.revoked_host_keys = Some(one_arg(line)?),
+        "globalknownhostsfile" => {
+            if line.args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "expected one or more files".into(),
+                });
+            }
+            opts.global_known_hosts_files = Some(line.args.clone());
+        }
+        "connectionattempts" => {
+            let v = one_arg(line)?;
+            opts.connection_attempts =
+                Some(v.parse::<u32>().ok().filter(|n| *n > 0).ok_or_else(|| {
+                    ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected a positive number, got {v:?}"),
+                    }
+                })?);
+        }
         _ => {
+            if let Some((_, allowed, why)) = IGNORED_KEYWORDS
+                .iter()
+                .find(|(k, _, _)| k.eq_ignore_ascii_case(kw))
+            {
+                let value = line.args.join(" ");
+                if allowed.is_empty()
+                    || allowed.contains(&"*")
+                    || allowed.iter().any(|a| a.eq_ignore_ascii_case(&value))
+                {
+                    return Ok(());
+                }
+                return Err(ConfigError::Unsupported {
+                    line: line.line_no,
+                    msg: format!("{} {value}: {why}", line.keyword),
+                });
+            }
             return Err(ConfigError::UnknownKeyword {
                 line: line.line_no,
                 keyword: kw.to_string(),
@@ -1006,6 +1138,105 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
     let _ = args;
     Ok(())
 }
+
+/// `EscapeChar`: a single character, `^X` for a control character, or
+/// `none`.
+pub fn parse_escape_char(v: &str) -> Option<Option<u8>> {
+    if v.eq_ignore_ascii_case("none") {
+        return Some(None);
+    }
+    match v.as_bytes() {
+        [c] => Some(Some(*c)),
+        [b'^', c] => Some(Some(c.to_ascii_uppercase() & 0x1f)),
+        _ => None,
+    }
+}
+
+/// OpenSSH `ssh_config` keywords this client accepts without implementing:
+/// `(keyword, values accepted, why other values are refused)`. `"*"`
+/// accepts any value: ignoring the keyword can only make the client
+/// stricter or lose a convenience. A value whose loss would silently weaken
+/// security or break the connection is refused instead.
+const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
+    ("BindInterface", &["*"], ""),
+    ("CanonicalDomains", &["*"], ""),
+    ("CanonicalizeFallbackLocal", &["*"], ""),
+    ("CanonicalizeHostname", &["*"], ""),
+    ("CanonicalizeMaxDots", &["*"], ""),
+    ("CanonicalizePermittedCNAMEs", &["*"], ""),
+    ("ChannelTimeout", &["*"], ""),
+    ("CheckHostIP", &["*"], ""),
+    ("EnableEscapeCommandline", &["*"], ""),
+    (
+        "EnableSSHKeysign",
+        &["no"],
+        "host-based authentication is not supported",
+    ),
+    ("FingerprintHash", &["*"], ""),
+    ("ForwardX11Timeout", &["*"], ""),
+    ("GSSAPIAuthentication", &["*"], ""),
+    ("GSSAPIDelegateCredentials", &["*"], ""),
+    ("GSSAPIKeyExchange", &["*"], ""),
+    ("GSSAPIClientIdentity", &["*"], ""),
+    ("GSSAPIServerIdentity", &["*"], ""),
+    ("GSSAPIRenewalForcesRekey", &["*"], ""),
+    ("GSSAPITrustDns", &["*"], ""),
+    ("GSSAPIKexAlgorithms", &["*"], ""),
+    ("HostbasedAcceptedAlgorithms", &["*"], ""),
+    ("HostbasedKeyTypes", &["*"], ""),
+    ("HostbasedAuthentication", &["*"], ""),
+    ("IPQoS", &["*"], ""),
+    ("KbdInteractiveDevices", &["*"], ""),
+    ("KnownHostsCommand", &["*"], ""),
+    ("LocalCommand", &["*"], ""),
+    ("LogVerbose", &["*"], ""),
+    ("NoHostAuthenticationForLocalhost", &["*"], ""),
+    ("PermitLocalCommand", &["*"], ""),
+    (
+        "PermitRemoteOpen",
+        &["any"],
+        "restricting remote dynamic forwarding destinations is not supported",
+    ),
+    (
+        "PKCS11Provider",
+        &["none"],
+        "PKCS#11 tokens are not supported",
+    ),
+    (
+        "ProxyUseFdpass",
+        &["no"],
+        "a ProxyCommand that passes a file descriptor is not supported",
+    ),
+    ("RekeyLimit", &["*"], ""),
+    (
+        "RequiredRSASize",
+        &["1024", "2048"],
+        "RSA keys under 2048 bits are always refused; a higher floor is not supported",
+    ),
+    ("SecurityKeyProvider", &["*"], ""),
+    ("StreamLocalBindMask", &["*"], ""),
+    ("StreamLocalBindUnlink", &["*"], ""),
+    ("SyslogFacility", &["*"], ""),
+    ("Tag", &["*"], ""),
+    ("Tunnel", &["no"], "tun/tap forwarding is not supported"),
+    ("TunnelDevice", &["*"], ""),
+    ("UpdateHostKeys", &["*"], ""),
+    ("UseKeychain", &["*"], ""),
+    ("VerifyHostKeyDNS", &["*"], ""),
+    ("VisualHostKey", &["*"], ""),
+    ("WarnWeakCrypto", &["*"], ""),
+    ("XAuthLocation", &["*"], ""),
+    // Removed from OpenSSH; it ignores them with a warning.
+    ("Protocol", &["*"], ""),
+    ("Cipher", &["*"], ""),
+    ("CompressionLevel", &["*"], ""),
+    ("UseRoaming", &["*"], ""),
+    ("RSAAuthentication", &["*"], ""),
+    ("RhostsRSAAuthentication", &["*"], ""),
+    ("UsePrivilegedPort", &["*"], ""),
+    ("FallBackToRsh", &["*"], ""),
+    ("UseRsh", &["*"], ""),
+];
 
 /// First-match-wins merge of `src` over `dst`. Scalars only overwrite if
 /// `dst` had `None`; list fields concatenate.
@@ -1063,6 +1294,17 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(knock_mode);
     take_scalar!(knock_fallback_delay);
     take_scalar!(knock_port);
+    take_scalar!(escape_char);
+    take_scalar!(remote_command);
+    take_scalar!(session_type);
+    take_scalar!(stdin_null);
+    take_scalar!(fork_after_authentication);
+    take_scalar!(password_authentication);
+    take_scalar!(kbd_interactive_authentication);
+    take_scalar!(host_key_alias);
+    take_scalar!(revoked_host_keys);
+    take_scalar!(global_known_hosts_files);
+    take_scalar!(connection_attempts);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.certificate_files
@@ -1739,15 +1981,87 @@ Host *.example.com !secret.example.com
 
     #[test]
     fn unknown_keyword_errors() {
-        let src = "Host gw\n  CompressionLevel 9\n";
+        let src = "Host gw\n  NoSuchOption 9\n";
         let err = SshClientConfig::parse(src).unwrap_err();
         match err {
             ConfigError::UnknownKeyword { keyword, line } => {
-                assert_eq!(keyword, "compressionlevel");
+                assert_eq!(keyword, "nosuchoption");
                 assert_eq!(line, 2);
             }
             _ => panic!("wrong error: {err:?}"),
         }
+    }
+
+    /// Ubuntu's stock `ssh_config` and other common OpenSSH keywords parse.
+    #[test]
+    fn openssh_keywords_accepted() {
+        let src = "Host *\n\
+            \x20   SendEnv LANG LC_*\n\
+            \x20   HashKnownHosts yes\n\
+            \x20   GSSAPIAuthentication yes\n\
+            \x20   CheckHostIP no\n\
+            \x20   VisualHostKey yes\n\
+            \x20   UpdateHostKeys yes\n\
+            \x20   Tunnel no\n\
+            \x20   ChallengeResponseAuthentication no\n\
+            \x20   RevokedHostKeys /etc/ssh/ssh_revoked_hosts\n\
+            \x20   HostKeyAlias gateway\n\
+            \x20   EscapeChar ^]\n\
+            \x20   PasswordAuthentication no\n\
+            \x20   SessionType none\n\
+            \x20   GlobalKnownHostsFile /etc/a /etc/b\n\
+            \x20   ConnectionAttempts 3\n";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let o = cfg.lookup("example.com");
+        assert_eq!(o.kbd_interactive_authentication, Some(false));
+        assert_eq!(o.password_authentication, Some(false));
+        assert_eq!(
+            o.revoked_host_keys.as_deref(),
+            Some("/etc/ssh/ssh_revoked_hosts")
+        );
+        assert_eq!(o.host_key_alias.as_deref(), Some("gateway"));
+        assert_eq!(o.escape_char, Some(Some(0x1d)));
+        assert_eq!(o.session_type, Some(SessionType::None));
+        assert_eq!(
+            o.global_known_hosts_files,
+            Some(vec!["/etc/a".to_string(), "/etc/b".to_string()])
+        );
+        assert_eq!(o.connection_attempts, Some(3));
+    }
+
+    /// Ignored keywords whose value would change behaviour are refused.
+    #[test]
+    fn unsupported_values_refused() {
+        for src in [
+            "Tunnel yes\n",
+            "ProxyUseFdpass yes\n",
+            "PKCS11Provider /usr/lib/opensc-pkcs11.so\n",
+            "RequiredRSASize 4096\n",
+        ] {
+            assert!(
+                matches!(
+                    SshClientConfig::parse(src),
+                    Err(ConfigError::Unsupported { .. })
+                ),
+                "{src}"
+            );
+        }
+    }
+
+    #[test]
+    fn ignore_unknown_applies_to_later_lines() {
+        assert!(SshClientConfig::parse("UseFoo yes\nIgnoreUnknown UseFoo\n").is_err());
+        let cfg = SshClientConfig::parse("IgnoreUnknown Use*,Bar\nUseFoo yes\nHost x\n  Bar 1\n");
+        assert!(cfg.is_ok(), "{cfg:?}");
+        assert!(SshClientConfig::parse("IgnoreUnknown Bar\nBaz 1\n").is_err());
+    }
+
+    #[test]
+    fn escape_char_forms() {
+        assert_eq!(parse_escape_char("none"), Some(None));
+        assert_eq!(parse_escape_char("~"), Some(Some(b'~')));
+        assert_eq!(parse_escape_char("^A"), Some(Some(1)));
+        assert_eq!(parse_escape_char("ab"), None);
     }
 
     #[test]

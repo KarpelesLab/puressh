@@ -1031,8 +1031,15 @@ fn authenticate_client(
              keyboard-interactive auth disabled",
         );
     }
-    let password_enabled = !batch && can_prompt && password_allowed_by_prefs && max_prompts > 0;
-    let kbdint_enabled = !batch && can_prompt && kbdint_allowed_by_prefs;
+    let password_enabled = !batch
+        && can_prompt
+        && password_allowed_by_prefs
+        && max_prompts > 0
+        && cfg_block.password_authentication != Some(false);
+    let kbdint_enabled = !batch
+        && can_prompt
+        && kbdint_allowed_by_prefs
+        && cfg_block.kbd_interactive_authentication != Some(false);
 
     let mut auth = client.new_auth_driver(user);
     if !credentials.is_empty() {
@@ -1109,7 +1116,8 @@ fn config_for_host(
         .clone()
         .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
     let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
-    let policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
+    let mut policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
+    common::apply_known_hosts_options(&mut policy, cfg_block)?;
 
     // HostKeyAlgorithms +ssh-rsa opt-in: if the resolved host-key list names
     // legacy bare `ssh-rsa`, enable SHA-1 host-key verification. This is the
@@ -1470,6 +1478,43 @@ fn print_config(
             "numberofpasswordprompts {}",
             c.number_of_password_prompts.unwrap_or(3)
         ),
+        format!(
+            "passwordauthentication {}",
+            yn(c.password_authentication, true)
+        ),
+        format!(
+            "kbdinteractiveauthentication {}",
+            yn(c.kbd_interactive_authentication, true)
+        ),
+        format!("connectionattempts {}", c.connection_attempts.unwrap_or(1)),
+        format!(
+            "escapechar {}",
+            match cli.escape_char.unwrap_or(Some(b'~')) {
+                None => "none".to_string(),
+                Some(b) if b < 0x20 => format!("^{}", (b + b'@') as char),
+                Some(b) => (b as char).to_string(),
+            }
+        ),
+        format!(
+            "globalknownhostsfile {}",
+            c.global_known_hosts_files
+                .as_ref()
+                .map(|f| f.join(" "))
+                .unwrap_or_else(|| "/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2".into())
+        ),
+        format!(
+            "sessiontype {}",
+            match c.session_type {
+                Some(puressh::config::SessionType::None) => "none",
+                Some(puressh::config::SessionType::Subsystem) => "subsystem",
+                _ => "default",
+            }
+        ),
+        format!("stdinnull {}", yn(c.stdin_null, false)),
+        format!(
+            "forkafterauthentication {}",
+            yn(c.fork_after_authentication, false)
+        ),
     ];
     let identities: Vec<String> = if !cli.identities.is_empty() || !c.identity_files.is_empty() {
         cli.identities
@@ -1507,6 +1552,15 @@ fn print_config(
     }
     if let Some(b) = &c.bind_address {
         out.push(format!("bindaddress {b}"));
+        if let Some(a) = &c.host_key_alias {
+            out.push(format!("hostkeyalias {a}"));
+        }
+        if let Some(r) = &c.revoked_host_keys {
+            out.push(format!("revokedhostkeys {r}"));
+        }
+        if let Some(r) = &c.remote_command {
+            out.push(format!("remotecommand {r}"));
+        }
     }
     if let Some(p) = &c.preferred_authentications {
         out.push(format!("preferredauthentications {}", p.join(",")));
@@ -1626,6 +1680,34 @@ fn run() -> Result<i32, String> {
     // `-o KEY=VALUE` overlays the matched block at the highest precedence,
     // re-using the strict config parser for validation.
     apply_extra_o(&mut cfg_block, &cli.extra_o)?;
+
+    // ssh_config equivalents of command-line flags; a flag always wins.
+    match cfg_block.session_type {
+        Some(puressh::config::SessionType::None) if cli.command.is_none() => cli.no_command = true,
+        Some(puressh::config::SessionType::Subsystem) => cli.subsystem = true,
+        _ => {}
+    }
+    if cli.command.is_none()
+        && !cli.no_command
+        && let Some(cmd) = cfg_block.remote_command.as_deref()
+        && !cmd.eq_ignore_ascii_case("none")
+    {
+        cli.command = Some(cmd.to_string());
+    }
+    if cli.escape_char.is_none() {
+        cli.escape_char = cfg_block.escape_char;
+    }
+    if cfg_block.fork_after_authentication == Some(true) {
+        cli.fork_after_auth = true;
+    }
+    if (cfg_block.stdin_null == Some(true) || cli.fork_after_auth) && !cli.stdin_null {
+        cli.stdin_null = true;
+        #[cfg(unix)]
+        {
+            let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
+            nix::unistd::dup2_stdin(&null).map_err(|e| format!("StdinNull: {e}"))?;
+        }
+    }
 
     // Compression requires the `compress` feature. Reject up front (rather
     // than silently advertising `none`) so the directive can never look like
@@ -3403,18 +3485,25 @@ fn dial_tcp(
 ) -> Result<TcpStream, String> {
     let timeout = connect_timeout(cfg_block);
 
-    // Try each candidate address until one connects.
+    // Try each candidate address until one connects; `ConnectionAttempts`
+    // rounds, a second apart, as in OpenSSH.
     let mut last_err: Option<String> = None;
-    for addr in resolve_addrs(host, port, cfg_block)? {
-        let sock = match connect_one(addr, cfg_block.bind_address.as_deref(), timeout) {
-            Ok(s) => s,
-            Err(e) => {
-                last_err = Some(e);
-                continue;
-            }
-        };
-        configure_socket(&sock, cfg_block)?;
-        return Ok(sock);
+    let attempts = cfg_block.connection_attempts.unwrap_or(1).max(1);
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        for addr in resolve_addrs(host, port, cfg_block)? {
+            let sock = match connect_one(addr, cfg_block.bind_address.as_deref(), timeout) {
+                Ok(s) => s,
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+            configure_socket(&sock, cfg_block)?;
+            return Ok(sock);
+        }
     }
     Err(last_err.unwrap_or_else(|| format!("could not connect to {host}:{port}")))
 }

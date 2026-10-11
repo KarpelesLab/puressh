@@ -859,9 +859,17 @@ fn run_fingerprint(args: &Args) -> Result<i32, String> {
 
 /// `user@host`, the default key comment and RFC 4716 "converted by".
 fn user_at_host() -> String {
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "user".into());
+    #[cfg(unix)]
+    let pw = nix::unistd::User::from_uid(nix::unistd::getuid())
+        .ok()
+        .flatten()
+        .map(|u| u.name);
+    #[cfg(not(unix))]
+    let pw: Option<String> = None;
+    let user = pw
+        .or_else(|| std::env::var("USER").ok())
+        .or_else(|| std::env::var("LOGNAME").ok())
+        .unwrap_or_else(|| "user".into());
     let host = fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| fs::read_to_string("/etc/hostname"))
         .map(|h| h.trim().to_string())
@@ -937,9 +945,11 @@ fn encode_private(sk: &PrivateKey, args: &Args, passphrase: &str) -> Result<Stri
 fn run_extract_public(args: &Args) -> Result<i32, String> {
     let file = ensure_file_in(&args.file)?;
     let text = read_to_string(&file)?;
+    // `-P` as with OpenSSH (`-N` still accepted).
     let pem_pass = args
-        .new_pass
+        .old_pass
         .as_deref()
+        .or(args.new_pass.as_deref())
         .map(String::as_str)
         .filter(|p| !p.is_empty());
     let sk = match PrivateKey::parse_pem(&text, pem_pass.map(str::as_bytes)) {

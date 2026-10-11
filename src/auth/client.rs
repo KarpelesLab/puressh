@@ -436,7 +436,13 @@ impl ClientAuth {
             hk.algorithm(),
             &public_blob,
         );
-        let signature = hk.sign(&signed)?;
+        let signature = match hk.sign(&signed) {
+            Ok(s) => s,
+            // The key could not be unlocked (no or wrong passphrase): like
+            // OpenSSH, skip it and try the next credential.
+            Err(Error::Crypto(_)) => return self.advance_to_next_credential(),
+            Err(e) => return Err(e),
+        };
         let req = UserauthRequest {
             user: self.user.clone(),
             service: self.service.into(),

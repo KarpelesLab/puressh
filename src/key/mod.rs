@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
 
 pub(crate) mod base64;
+mod encrypted;
 mod export;
 mod pkcs;
 mod writer;
@@ -663,6 +664,28 @@ impl PrivateKey {
                 comment: comment.clone(),
             },
         }
+    }
+
+    /// The public key of a private key file without decrypting it: the
+    /// OpenSSH container keeps it in the clear (other formats are parsed,
+    /// so an encrypted PEM / PKCS#8 key needs its `.pub` file instead).
+    pub fn public_key_from_pem(pem: &str) -> Result<PublicKey> {
+        if !pem.contains("-----BEGIN OPENSSH PRIVATE KEY-----") {
+            return Self::parse_pem(pem, None).map(|k| k.public_key());
+        }
+        let body = strip_pem(pem)?;
+        let raw = base64::decode(body.as_bytes())?;
+        if raw.len() < MAGIC.len() || &raw[..MAGIC.len()] != MAGIC {
+            return Err(Error::Format("openssh key: bad magic"));
+        }
+        let mut r = Reader::new(&raw[MAGIC.len()..]);
+        let _ciphername = r.read_string()?;
+        let _kdfname = r.read_string()?;
+        let _kdfoptions = r.read_string()?;
+        if r.read_u32()? != 1 {
+            return Err(Error::Unsupported("openssh key: multiple keys"));
+        }
+        PublicKey::parse_wire_blob(r.read_string()?)
     }
 
     /// Parse an OpenSSH "new" PEM-encoded private key.

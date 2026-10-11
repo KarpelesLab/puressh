@@ -86,11 +86,26 @@ impl PrivateKey {
     /// time.
     pub fn parse_pem(pem: &str, passphrase: Option<&[u8]>) -> Result<Self> {
         let label = detect_pem_label(pem)?;
+        // A wrong passphrase can still decrypt to well-padded garbage;
+        // a DER error after decryption means the passphrase was wrong.
+        let decrypted = |r: Result<Self>| {
+            r.map_err(|_| Error::Crypto("incorrect passphrase supplied to decrypt private key"))
+        };
         match label {
             "OPENSSH PRIVATE KEY" => Self::parse_openssh_pem(pem, passphrase),
-            "ENCRYPTED PRIVATE KEY" => Err(Error::Unsupported(
-                "encrypted PKCS#8 private keys are not supported (convert with `ssh-keygen -p`)",
-            )),
+            "ENCRYPTED PRIVATE KEY" => {
+                let der = pem_decode(pem, label).map_err(der_err)?;
+                let plain = super::encrypted::decrypt_pkcs8(&der, passphrase)?;
+                decrypted(parse_pkcs8_der(&plain))
+            }
+            "RSA PRIVATE KEY" if super::encrypted::is_encrypted_traditional(pem) => {
+                let plain = super::encrypted::decrypt_traditional(pem, passphrase)?;
+                decrypted(parse_pkcs1_rsa_der(&plain))
+            }
+            "EC PRIVATE KEY" if super::encrypted::is_encrypted_traditional(pem) => {
+                let plain = super::encrypted::decrypt_traditional(pem, passphrase)?;
+                decrypted(parse_sec1_ec_der(&plain, None))
+            }
             "RSA PRIVATE KEY" => {
                 reject_if_dek_encrypted(pem)?;
                 parse_pkcs1_rsa_der(&pem_decode(pem, label).map_err(der_err)?)
@@ -462,22 +477,53 @@ MC4CAQAwBQYDK2VwBCIEIP25lZxmkjhgqz9jZyWGosODPfV94yOgGOShmCsQ0PE2
         assert_eq!(got, want, "Ed25519 PKCS#8 public key mismatch");
     }
 
-    #[test]
-    fn encrypted_pkcs8_is_rejected() {
-        let pem =
-            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB\n-----END ENCRYPTED PRIVATE KEY-----\n";
-        let err = PrivateKey::parse_pem(pem, None).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
-    }
+    /// `ssh-keygen -t ecdsa -m PEM -N fixture-pass`: traditional PEM with
+    /// `DEK-Info: AES-128-CBC`.
+    const ENC_TRADITIONAL_PEM: &str = r#"-----BEGIN EC PRIVATE KEY-----
+Proc-Type: 4,ENCRYPTED
+DEK-Info: AES-128-CBC,36EE8F68C6C0F9DC18B294C8A9ECC832
+
+OMfpQ3zRtbIm+w9A/HsE8CTiHgZ6sxEj7AlyzYeURxZpb5z/7/Ss+8Lm3DPGVeMg
+kXV2JuDfY1msAICDRbTHn+QKmbLKiDcfN89L9yl8ALUhGa/NlypKwzgZTxhGRLrz
+PyoyYr2TqEiT79617Ui9iAAul8yOMWxBrIUVp1HEYio=
+-----END EC PRIVATE KEY-----"#;
+    const ENC_TRADITIONAL_PUB: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBAhsyi22Hdgtwj9Rmw4PTfL1zKF6dqKvose8+gxfK8b6cmHy2TslmZtMefOyMTcaSitIsRVqRtbDaC1VNWRrj8E= pem";
+    /// `ssh-keygen -t ecdsa -m PKCS8 -N fixture-pass`: PBES2.
+    const ENC_PKCS8_PEM: &str = r#"-----BEGIN ENCRYPTED PRIVATE KEY-----
+MIH0MF8GCSqGSIb3DQEFDTBSMDEGCSqGSIb3DQEFDDAkBBDDeP+X3wqirYNR2Fds
+7QLJAgIIADAMBggqhkiG9w0CCQUAMB0GCWCGSAFlAwQBAgQQxR3r8GYWMFlvzzVu
+6MOQAwSBkGgq7F7k4d25eK2D1Fqrnu3Uo4S0VleUvBQ6xsqwZAiTyvrp5NGerkO3
+eQrvYGrNCSPpWXghXzoNzQcAP8AhGm4gePNQORAz8mAWq6DMDlrFSfeFeZ5oSf/s
+qjENnR0rwjNPHlbkAgpdsrGAuD/8Jszi+EUt40ZuKQXtlj63DZWL4+8MBX3HAVau
+JIa2gE35cg==
+-----END ENCRYPTED PRIVATE KEY-----"#;
+    const ENC_PKCS8_PUB: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBK9eRe1jGZ9B5zYs36hZssRFPTAl5GhuOzMWGIl1Wutd7CrRyRYfwjCYA6K4OvwbGu/9kerz//8croxOlLH3cis= p8";
 
     #[test]
-    fn dek_encrypted_traditional_pem_is_rejected() {
-        let pem = "-----BEGIN RSA PRIVATE KEY-----\n\
-            Proc-Type: 4,ENCRYPTED\n\
-            DEK-Info: AES-128-CBC,0123\n\n\
-            MIIB\n-----END RSA PRIVATE KEY-----\n";
-        let err = PrivateKey::parse_pem(pem, None).unwrap_err();
-        assert!(matches!(err, Error::Unsupported(_)), "got {err:?}");
+    fn encrypted_keys_decrypt() {
+        for (pem, public) in [
+            (ENC_TRADITIONAL_PEM, ENC_TRADITIONAL_PUB),
+            (ENC_PKCS8_PEM, ENC_PKCS8_PUB),
+        ] {
+            let want = PublicKey::parse_authorized_keys_line(public)
+                .unwrap()
+                .wire_blob();
+            let sk = PrivateKey::parse_pem(pem, Some(b"fixture-pass")).expect("decrypt");
+            assert_eq!(sk.public_key().wire_blob(), want);
+            // No or a wrong passphrase: a crypto error, so callers ask again.
+            assert!(matches!(
+                PrivateKey::parse_pem(pem, None),
+                Err(Error::Crypto(_))
+            ));
+            assert!(matches!(
+                PrivateKey::parse_pem(pem, Some(b"wrong")),
+                Err(Error::Crypto(_))
+            ));
+        }
+        // Truncated ciphertext is an error, not a panic.
+        let broken =
+            "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIB\n-----END ENCRYPTED PRIVATE KEY-----\n";
+        assert!(PrivateKey::parse_pem(broken, Some(b"x")).is_err());
     }
 
     // OpenSSH container must still route through the unified entry point.

@@ -40,8 +40,8 @@ macro_rules! warn {
 use common::{KeystrokeObfuscator, TickAction};
 use common::{
     StrictMode, build_host_key_policy, connect_agent_credentials, default_identity_paths,
-    expand_tilde, load_identity, parse_target, read_kbdint_response, read_password_from_stdin,
-    resolve_user, sanitize_terminal_str, set_verbose, try_load_default_identity, vlog,
+    expand_tilde, parse_target, read_kbdint_response, read_password_from_stdin, resolve_user,
+    sanitize_terminal_str, set_verbose, vlog,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -866,9 +866,9 @@ fn collect_credentials(
                 Some(k) => std::slice::from_ref(k),
                 None => &key_paths[..],
             };
+            let batch = cfg_block.batch_mode == Some(true);
             for kp in pair_with {
-                let Ok(pk) = load_identity(kp) else { continue };
-                let Ok(signer) = pk.into_host_key_sync() else {
+                let Ok(Some(signer)) = common::identity_signer(kp, own_key.is_some(), batch) else {
                     continue;
                 };
                 if signer.public_blob() != cert.embedded_pubkey_blob {
@@ -895,57 +895,33 @@ fn collect_credentials(
             }
         }
     }
-    for id_path in cli_identities {
-        let pk = match load_identity(id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
+    let batch = cfg_block.batch_mode == Some(true);
+    let explicit = cli_identities
+        .iter()
+        .cloned()
+        .chain(cfg_block.identity_files.iter().map(|p| expand_tilde(p)));
+    for id_path in explicit {
+        match common::identity_credential(&id_path, false, batch) {
+            Ok(Some(c)) => {
                 vlog(1, &format!("identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
+                credentials.push(c);
             }
-            Err(e) => warn!("warning: identity {id_path}: {e}"),
-        }
-    }
-    for id_path_raw in &cfg_block.identity_files {
-        let id_path = expand_tilde(id_path_raw);
-        let pk = match load_identity(&id_path) {
-            Ok(p) => p,
-            Err(e) => {
-                warn!("warning: {e}");
-                continue;
-            }
-        };
-        match pk.into_host_key() {
-            Ok(hk) => {
-                vlog(1, &format!("config identity {id_path}: loaded"));
-                credentials.push(ClientCredential::PublicKey(hk));
-            }
-            Err(e) => warn!("warning: config identity {id_path}: {e}"),
+            Ok(None) => {}
+            Err(e) => warn!("warning: {e}"),
         }
     }
     // Like OpenSSH, the default identities are used only when no -i or
     // IdentityFile names one (IdentitiesOnly restricts agent keys, not these).
     if cli_identities.is_empty() && cfg_block.identity_files.is_empty() {
         for path in default_identity_paths() {
-            match try_load_default_identity(&path) {
-                Ok(Some(pk)) => match pk.into_host_key() {
-                    Ok(hk) => {
-                        vlog(1, &format!("default identity {}: loaded", path.display()));
-                        credentials.push(ClientCredential::PublicKey(hk));
-                    }
-                    Err(e) => {
-                        warn!("warning: default identity {}: {e}", path.display());
-                    }
-                },
-                Ok(None) => {
-                    vlog(2, &format!("default identity {}: skipped", path.display()));
+            let path = path.display().to_string();
+            match common::identity_credential(&path, true, batch) {
+                Ok(Some(c)) => {
+                    vlog(1, &format!("default identity {path}: loaded"));
+                    credentials.push(c);
                 }
-                Err(msg) => warn!("warning: {msg}"),
+                Ok(None) => vlog(2, &format!("default identity {path}: skipped")),
+                Err(e) => warn!("warning: {e}"),
             }
         }
     }
@@ -1285,7 +1261,7 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
     for path in paths {
         // Missing / unreadable files are normal for the default identity
         // list; load_identity already logs read errors, so skip silently.
-        if let Ok(pk) = load_identity(&path) {
+        if let Ok(pk) = common::load_identity(&path) {
             match agent.add_identity(&pk) {
                 Ok(()) => vlog(1, &format!("AddKeysToAgent: added {path}")),
                 Err(e) => warn!("warning: AddKeysToAgent: add {path}: {e}"),

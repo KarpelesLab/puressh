@@ -78,7 +78,21 @@ pub fn resolve_user(cli_user: Option<&str>, user_in_host: Option<&str>) -> Resul
     if let Some(u) = user_in_host {
         return Ok(u.to_string());
     }
-    std::env::var("USER").map_err(|_| "no user specified and $USER is unset".into())
+    local_user_name().ok_or_else(|| "no user specified and the local user name is unknown".into())
+}
+
+/// The local user's name, as OpenSSH finds it: the password database entry
+/// for our uid ($USER is not set in many containers and services), else
+/// `$USER` / `$LOGNAME`.
+pub fn local_user_name() -> Option<String> {
+    #[cfg(unix)]
+    if let Ok(Some(u)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
+        return Some(u.name);
+    }
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .filter(|u| !u.is_empty())
 }
 
 /// Split a `[user@]host` token. The host portion is whatever follows the
@@ -783,6 +797,121 @@ pub fn load_identity(path: &str) -> Result<PrivateKey, String> {
     let pem = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
     PrivateKey::parse_pem(&pem, None)
         .map_err(|e| format!("parse {path}: {e} (passphrase-protected keys not supported here)"))
+}
+
+/// A passphrase-protected identity file. Like OpenSSH, it is offered by its
+/// public key, and the passphrase is asked for (up to three times) only
+/// when the server would accept the key, at signing time.
+pub struct LazyIdentity {
+    path: String,
+    pem: Zeroizing<String>,
+    algorithm: &'static str,
+    public_blob: Vec<u8>,
+    loaded: Mutex<Option<Box<dyn puressh::hostkey::HostKey + Send + Sync>>>,
+}
+
+impl puressh::hostkey::HostKey for LazyIdentity {
+    fn algorithm(&self) -> &'static str {
+        self.algorithm
+    }
+
+    fn public_blob(&self) -> Vec<u8> {
+        self.public_blob.clone()
+    }
+
+    fn sign(&self, msg: &[u8]) -> puressh::Result<Vec<u8>> {
+        let mut loaded = self
+            .loaded
+            .lock()
+            .map_err(|_| Error::Config("identity lock poisoned"))?;
+        if loaded.is_none() {
+            for _ in 0..3 {
+                let pass = read_secret(&format!("Enter passphrase for key '{}': ", self.path))
+                    .map_err(Error::Io)?;
+                if pass.is_empty() {
+                    break;
+                }
+                match PrivateKey::parse_pem(&self.pem, Some(pass.as_bytes())) {
+                    Ok(k) => {
+                        *loaded = Some(k.into_host_key_sync()?);
+                        break;
+                    }
+                    Err(Error::Crypto(_)) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        match loaded.as_ref() {
+            Some(k) => k.sign(msg),
+            None => Err(Error::Crypto("no passphrase for the identity")),
+        }
+    }
+}
+
+/// An identity file as a publickey credential: loaded now when it is not
+/// encrypted, else a [`LazyIdentity`] (when a passphrase can be asked for).
+/// `Ok(None)` for a default identity that does not exist or is unusable,
+/// and for an encrypted key under BatchMode / without a terminal (OpenSSH
+/// skips those too).
+pub fn identity_credential(
+    path: &str,
+    is_default: bool,
+    batch: bool,
+) -> Result<Option<ClientCredential>, String> {
+    Ok(identity_signer(path, is_default, batch)?.map(|s| ClientCredential::PublicKey(s)))
+}
+
+/// The signer behind [`identity_credential`] (also wrapped by certificates).
+pub fn identity_signer(
+    path: &str,
+    is_default: bool,
+    batch: bool,
+) -> Result<Option<Box<dyn puressh::hostkey::HostKey + Send + Sync>>, String> {
+    let pem = match std::fs::read_to_string(path) {
+        Ok(s) => Zeroizing::new(s),
+        Err(e) if is_default && e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("read {path}: {e}")),
+    };
+    if let Err(banner) = check_identity_perms(Path::new(path)) {
+        if is_default {
+            eprintln!("{banner}");
+            return Ok(None);
+        }
+        return Err(banner);
+    }
+    match PrivateKey::parse_pem(&pem, None) {
+        Ok(k) => Ok(Some(
+            k.into_host_key_sync().map_err(|e| format!("{path}: {e}"))?,
+        )),
+        Err(Error::Crypto(_)) => {
+            if batch || !secret_prompt_available() {
+                vlog(
+                    1,
+                    &format!("{path}: encrypted, and no way to ask for its passphrase"),
+                );
+                return Ok(None);
+            }
+            let public = PrivateKey::public_key_from_pem(&pem)
+                .ok()
+                .or_else(|| {
+                    let line = std::fs::read_to_string(format!("{path}.pub")).ok()?;
+                    puressh::key::PublicKey::parse_authorized_keys_line(line.trim()).ok()
+                })
+                .ok_or_else(|| format!("{path}: encrypted key without a readable {path}.pub"))?;
+            let algorithm = match public.algorithm() {
+                "ssh-rsa" => "rsa-sha2-512",
+                other => other,
+            };
+            Ok(Some(Box::new(LazyIdentity {
+                path: path.to_string(),
+                pem,
+                algorithm,
+                public_blob: public.wire_blob(),
+                loaded: Mutex::new(None),
+            })))
+        }
+        Err(e) => Err(format!("parse {path}: {e}")),
+    }
 }
 
 /// Connect to `$SSH_AUTH_SOCK` (if set), list identities, and wrap each as a

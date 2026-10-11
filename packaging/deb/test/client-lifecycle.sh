@@ -24,6 +24,7 @@ diagnose() {
 	dpkg-divert --list | grep -i ssh || true
 	ls -l /usr/bin/ssh* || true
 	cat "$TMP/sshd.log" 2>/dev/null || true
+	grep -v '^#' /etc/ssh/ssh_config /etc/ssh/ssh_config.d/* 2>/dev/null | grep -v ':$' || true
 	return "$status"
 }
 trap diagnose EXIT
@@ -45,7 +46,10 @@ dpkg-query -W -f='${Status}' openssh-client | grep -q 'install ok installed'
 
 step "use the client programs"
 # Ubuntu's stock /etc/ssh/ssh_config (GSSAPIAuthentication, SendEnv, ...).
-ssh -G localhost | grep -q '^hostname localhost'
+if ! ssh -G localhost >"$TMP/G" 2>&1 || ! grep -q '^hostname localhost' "$TMP/G"; then
+	cat "$TMP/G"
+	exit 1
+fi
 ssh-keygen -q -t ed25519 -N '' -f "$TMP/hostkey"
 ssh-keygen -q -t ed25519 -N '' -f "$TMP/userkey"
 id tester >/dev/null 2>&1 || useradd -m -s /bin/bash tester

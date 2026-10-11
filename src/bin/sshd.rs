@@ -4080,9 +4080,14 @@ mod imp {
     }
 
     fn current_user() -> Result<String, String> {
+        // The password database first: services and containers often run
+        // without $USER.
+        if let Ok(Some(u)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
+            return Ok(u.name);
+        }
         std::env::var("USER")
             .or_else(|_| std::env::var("LOGNAME"))
-            .map_err(|_| "could not determine current user (set $USER)".into())
+            .map_err(|_| "could not determine current user".into())
     }
 
     /// Defense-in-depth: scrub the per-channel SSH `env` list of any name

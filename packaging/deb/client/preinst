@@ -1,0 +1,17 @@
+#!/bin/sh
+# puressh-client preinst: move OpenSSH's client programs aside so ours take
+# their place. openssh-client stays installed (whatever depends on it, such
+# as openssh-server, stays satisfied, and /etc/ssh/ssh_config stays its
+# conffile); removing puressh-client puts OpenSSH's programs back.
+set -e
+
+case "$1" in
+install | upgrade)
+	for p in ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan ssh-copy-id; do
+		dpkg-divert --package puressh-client --quiet --add --rename \
+			--divert "/usr/bin/$p.openssh" "/usr/bin/$p"
+	done
+	;;
+esac
+
+exit 0

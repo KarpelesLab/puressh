@@ -1,5 +1,7 @@
 # Ubuntu packages
 
+## puressh-server
+
 `build-deb.sh` builds `puressh-server`, a drop-in replacement for Ubuntu's
 `openssh-server` on 20.04 (focal), 22.04 (jammy) and 24.04 (noble), amd64 and
 arm64. The release workflow attaches the packages to every GitHub release.
@@ -13,7 +15,8 @@ What the package does:
 - `Provides`/`Conflicts`/`Replaces: openssh-server`, so apt removes OpenSSH's
   server package but keeps everything that depends on it.
 - Installs `/usr/sbin/sshd` and its own `ssh.service` (alias `sshd.service`,
-  `KillMode=process` so restarts never drop open sessions). On 24.04 the
+  `Type=notify` like Ubuntu's, `KillMode=process` so restarts never drop
+  open sessions). On 24.04 the
   socket-activated `ssh.socket` is retired; the daemon listens itself.
 - Takes over `/etc/pam.d/sshd`, `/etc/default/ssh` and the ufw `OpenSSH`
   profile, byte-identical to Ubuntu's copies.
@@ -29,3 +32,27 @@ Going back: `sudo apt install openssh-server`.
 `files/pam-sshd`, `files/default-ssh`, `files/ufw-openssh-server` and
 `sshd_config/*` are copied unchanged from Ubuntu's `openssh-server` packages
 (see `copyright`).
+
+## puressh-client
+
+`build-client-deb.sh` builds `puressh-client` (one package per architecture,
+for every release from 20.04 on): `ssh`, `scp`, `sftp`, `ssh-add`,
+`ssh-agent`, `ssh-keygen`, `ssh-keyscan` and `ssh-copy-id`.
+
+```
+sudo apt install ./puressh-client_<version>-1_amd64.deb
+```
+
+It does not replace `openssh-client`: it diverts its programs
+(`dpkg-divert`), so OpenSSH's stay installed as `/usr/bin/<name>.openssh`.
+Everything that depends on `openssh-client` (`openssh-server` included) stays
+satisfied, `/etc/ssh/ssh_config` remains `openssh-client`'s conffile, and the
+package works next to either SSH server. Removing `puressh-client` gives
+OpenSSH's programs their names back.
+
+## Tests
+
+CI installs both packages on real 22.04 and 24.04 machines (amd64, arm64)
+and in 20.04 containers: `test/lifecycle.sh` (server: replace OpenSSH,
+reload, purge, back), `test/no-systemd.sh` (server without systemd) and
+`test/client-lifecycle.sh` (client: divert, use, restore).

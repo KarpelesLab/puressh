@@ -1,0 +1,14 @@
+#!/bin/sh
+# puressh-client postrm: give OpenSSH's client programs their names back.
+set -e
+
+case "$1" in
+remove | abort-install | disappear)
+	for p in ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan ssh-copy-id; do
+		dpkg-divert --package puressh-client --quiet --remove --rename \
+			--divert "/usr/bin/$p.openssh" "/usr/bin/$p"
+	done
+	;;
+esac
+
+exit 0

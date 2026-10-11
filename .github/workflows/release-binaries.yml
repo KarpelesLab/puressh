@@ -135,7 +135,7 @@ jobs:
 
       - name: Build CLI binaries and C library
         run: |
-          for bin in ssh sshd ssh-keygen sftp scp; do
+          for bin in ssh sshd ssh-keygen sftp scp ssh-add ssh-agent ssh-keyscan; do
             cargo build --release --bin "$bin"
           done
           cargo rustc --lib --release --features ffi --crate-type staticlib
@@ -144,9 +144,10 @@ jobs:
       - name: Stage
         run: |
           mkdir -p staging/bin staging/lib staging/include
-          for bin in ssh sshd ssh-keygen sftp scp; do
+          for bin in ssh sshd ssh-keygen sftp scp ssh-add ssh-agent ssh-keyscan; do
             cp "target/release/$bin" staging/bin/
           done
+          cp scripts/ssh-copy-id staging/bin/
           cp target/release/libpuressh.a target/release/libpuressh.so staging/lib/
           cp include/puressh.h staging/include/
           cp README.md staging/
@@ -180,6 +181,7 @@ jobs:
             for release in focal jammy noble; do
               packaging/deb/build-deb.sh "$release" "$arch" "$version" "$dir/bin" out
             done
+            packaging/deb/build-client-deb.sh "$arch" "$version" "$dir/bin" out
           done
           ls -l out
 

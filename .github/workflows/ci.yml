@@ -141,6 +141,16 @@ jobs:
           cargo test --test e2e_knock --
           --ignored --test-threads=1 --nocapture
 
+      # Ansible (ansible-core from PyPI) through our ssh/scp/sftp to our sshd,
+      # with its own ssh arguments: every file-transfer method, one
+      # ControlMaster connection per run.
+      - name: Run Ansible against puressh
+        run: |
+          cargo build --bins
+          python3 -m venv /tmp/ansible-venv
+          /tmp/ansible-venv/bin/pip install -q ansible-core
+          sh tests/interop/ansible.sh target/debug /tmp/ansible-venv/bin
+
   deb:
     name: Ubuntu package (${{ matrix.release }} ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}

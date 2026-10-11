@@ -123,6 +123,24 @@ pub fn parse_target(target: &str) -> Result<(Option<String>, String, Option<u16>
     // the "was a port given?" bit afterwards. Port 0 is reserved for
     // OS-assigned binds; it's never a meaningful connect target, so
     // using it as the "no port given" marker is unambiguous.
+    // OpenSSH's cleanhostname(): brackets may surround any host, not only an
+    // IPv6 literal (Ansible's sftp/scp pass `[192.0.2.1]`).
+    if let Some((inner, after)) = host_with_port
+        .strip_prefix('[')
+        .and_then(|r| r.split_once(']'))
+        && !inner.is_empty()
+        && inner.parse::<std::net::Ipv6Addr>().is_err()
+    {
+        let port = match after {
+            "" => None,
+            a => Some(
+                a.strip_prefix(':')
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .ok_or_else(|| format!("bad port in {host_with_port:?}"))?,
+            ),
+        };
+        return Ok((user, inner.to_string(), port));
+    }
     let (host, port) =
         puressh::config::parse_host_port(&host_with_port, 0).map_err(|e| format!("{e}"))?;
     let port_opt = if port == 0 { None } else { Some(port) };
@@ -1846,6 +1864,19 @@ mod target_tests {
     #[test]
     fn parse_target_rejects_unmatched_bracket() {
         assert!(parse_target("[2001:db8::1").is_err());
+    }
+
+    #[test]
+    fn parse_target_brackets_around_any_host() {
+        assert_eq!(
+            parse_target("deploy@[192.0.2.1]").unwrap(),
+            (Some("deploy".into()), "192.0.2.1".into(), None)
+        );
+        assert_eq!(
+            parse_target("[web.example]:2222").unwrap(),
+            (None, "web.example".into(), Some(2222))
+        );
+        assert!(parse_target("[web.example]:x").is_err());
     }
 
     #[test]

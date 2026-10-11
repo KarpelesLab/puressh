@@ -4,7 +4,9 @@
 //! still does) and PKCS#8 `ENCRYPTED PRIVATE KEY` (PBES2).
 //!
 //! A wrong passphrase is reported as [`Error::Crypto`], like the OpenSSH
-//! container, so callers ask again.
+//! container, so callers ask again. Writing uses what OpenSSH asks OpenSSL
+//! for: AES-128-CBC, and for PKCS#8 PBES2 with PBKDF2-HMAC-SHA256 (2048
+//! iterations, 16-byte salt — OpenSSL 3's defaults).
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -12,6 +14,7 @@ use alloc::vec::Vec;
 use purecrypto::cipher::{Aes128, Aes192, Aes256, Cbc, Cbc64, Des, TdesEde3};
 use purecrypto::der::{self, Reader as DerReader};
 use purecrypto::hash::{Digest, Md5, Sha1, Sha256};
+use purecrypto::rng::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
@@ -243,4 +246,73 @@ pub(crate) fn decrypt_pkcs8(
         purecrypto::kdf::pbkdf2::<Sha1>(pass, &salt, iterations, &mut key);
     }
     cbc_decrypt(cipher, &key, &iv, data)
+}
+
+/// PKCS#7-pad and encrypt with AES-128-CBC.
+fn aes128_cbc_encrypt(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Vec<u8> {
+    let pad = 16 - data.len() % 16;
+    let mut buf = Zeroizing::new(Vec::with_capacity(data.len() + pad));
+    buf.extend_from_slice(data);
+    buf.resize(data.len() + pad, pad as u8);
+    let k: &[u8; 16] = key.try_into().expect("AES-128 key");
+    Cbc::new(Aes128::new(k), iv)
+        .encrypt(&mut buf)
+        .expect("padded to the block size");
+    buf.to_vec()
+}
+
+/// Encrypt the DER of a traditional `-----BEGIN <label>-----` key: returns
+/// the whole PEM block with its `Proc-Type` / `DEK-Info` headers.
+pub(crate) fn encrypt_traditional<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    label: &str,
+    der_bytes: &[u8],
+    passphrase: &[u8],
+) -> String {
+    let mut iv = [0u8; 16];
+    rng.fill_bytes(&mut iv);
+    let key = bytes_to_key(passphrase, &iv[..8], 16);
+    let data = aes128_cbc_encrypt(&key, &iv, der_bytes);
+    let iv_hex: String = iv.iter().map(|b| alloc::format!("{b:02X}")).collect();
+    let pem = der::pem_encode(label, &data);
+    // Headers go right after the BEGIN line, then a blank line.
+    let (begin, body) = pem.split_once('\n').expect("PEM BEGIN line");
+    alloc::format!("{begin}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,{iv_hex}\n\n{body}")
+}
+
+/// Wrap a PKCS#8 `PrivateKeyInfo` DER into an `EncryptedPrivateKeyInfo`.
+pub(crate) fn encrypt_pkcs8<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    der_bytes: &[u8],
+    passphrase: &[u8],
+) -> Vec<u8> {
+    const ITERATIONS: u32 = 2048;
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 16];
+    rng.fill_bytes(&mut salt);
+    rng.fill_bytes(&mut iv);
+    let mut key = Zeroizing::new([0u8; 16]);
+    purecrypto::kdf::pbkdf2::<Sha256>(passphrase, &salt, ITERATIONS, &mut key[..]);
+    let data = aes128_cbc_encrypt(&key[..], &iv, der_bytes);
+    let seq = |parts: &[&[u8]]| der::encode_sequence(&parts.concat());
+    let kdf = seq(&[
+        &der::oid_tlv(&[1, 2, 840, 113549, 1, 5, 12]),
+        &seq(&[
+            &der::encode_octet_string(&salt),
+            &der::encode_integer(&[(ITERATIONS >> 8) as u8, ITERATIONS as u8]),
+            &seq(&[
+                &der::oid_tlv(&[1, 2, 840, 113549, 2, 9]),
+                &der::encode_null(),
+            ]),
+        ]),
+    ]);
+    let cipher = seq(&[
+        &der::oid_tlv(&[2, 16, 840, 1, 101, 3, 4, 1, 2]),
+        &der::encode_octet_string(&iv),
+    ]);
+    let alg = seq(&[
+        &der::oid_tlv(&[1, 2, 840, 113549, 1, 5, 13]),
+        &seq(&[&kdf, &cipher]),
+    ]);
+    seq(&[&alg, &der::encode_octet_string(&data)])
 }

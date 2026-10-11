@@ -2,8 +2,8 @@
 //! `-i`: PKCS#1 / SEC1 ("PEM") and PKCS#8 private keys, and RFC 4716,
 //! SubjectPublicKeyInfo and PKCS#1 public keys.
 //!
-//! Only unencrypted private keys are written in these formats; the OpenSSH
-//! container stays the format for passphrase-protected keys.
+//! Private keys are written plain or, with a passphrase, encrypted as
+//! OpenSSH has OpenSSL do it (see `encrypted`).
 
 use alloc::format;
 use alloc::string::String;
@@ -14,6 +14,8 @@ use purecrypto::der::{
     self, encode_bit_string, encode_context, encode_integer, encode_null, encode_octet_string,
     encode_sequence, pem_encode,
 };
+
+use purecrypto::rng::{CryptoRng, RngCore};
 
 use super::{PrivateKey, PublicKey};
 use crate::error::{Error, Result};
@@ -125,8 +127,45 @@ impl PrivateKey {
         }
     }
 
+    /// [`Self::to_traditional_pem`], encrypted with `passphrase`
+    /// (AES-128-CBC, `DEK-Info` headers).
+    pub fn to_traditional_pem_encrypted<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        passphrase: &[u8],
+    ) -> Result<String> {
+        let (label, der) = match self {
+            PrivateKey::Rsa { .. } => ("RSA PRIVATE KEY", self.pkcs1_der()?),
+            PrivateKey::Ed25519 { .. } => {
+                return Err(Error::Unsupported(
+                    "Ed25519 keys have no PEM form; use PKCS8",
+                ));
+            }
+            _ => ("EC PRIVATE KEY", self.sec1_der(true)?),
+        };
+        Ok(super::encrypted::encrypt_traditional(
+            rng, label, &der, passphrase,
+        ))
+    }
+
+    /// [`Self::to_pkcs8_pem`], encrypted with `passphrase`: an
+    /// `ENCRYPTED PRIVATE KEY` (PBES2).
+    pub fn to_pkcs8_pem_encrypted<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        passphrase: &[u8],
+    ) -> Result<String> {
+        let der = super::encrypted::encrypt_pkcs8(rng, &self.pkcs8_der()?, passphrase);
+        Ok(pem_encode("ENCRYPTED PRIVATE KEY", &der))
+    }
+
     /// PKCS#8 `PRIVATE KEY` (OpenSSH's `-m PKCS8`).
     pub fn to_pkcs8_pem(&self) -> Result<String> {
+        Ok(pem_encode("PRIVATE KEY", &self.pkcs8_der()?))
+    }
+
+    /// The PKCS#8 `PrivateKeyInfo` DER.
+    fn pkcs8_der(&self) -> Result<Vec<u8>> {
         let (alg, inner) = match self {
             PrivateKey::Rsa { .. } => (seq(&[&oid(OID_RSA), &encode_null()]), self.pkcs1_der()?),
             PrivateKey::Ed25519 { seed, .. } => {
@@ -140,8 +179,11 @@ impl PrivateKey {
                 )
             }
         };
-        let der = seq(&[&encode_integer(&[0]), &alg, &encode_octet_string(&inner)]);
-        Ok(pem_encode("PRIVATE KEY", &der))
+        Ok(seq(&[
+            &encode_integer(&[0]),
+            &alg,
+            &encode_octet_string(&inner),
+        ]))
     }
 }
 

@@ -989,3 +989,28 @@ fn authorized_keys_options_full_set() {
         );
     }
 }
+
+#[test]
+fn encrypted_pem_and_pkcs8_roundtrip() {
+    let mut rng = purecrypto::rng::OsRng;
+    let pass = b"correct horse";
+    let ed = PrivateKey::generate_ed25519(&mut rng, String::new());
+    let ec = PrivateKey::generate_ecdsa(&mut rng, EcdsaCurve::P256, String::new());
+    assert!(ed.to_traditional_pem_encrypted(&mut rng, pass).is_err());
+    let cases = [
+        (&ed, ed.to_pkcs8_pem_encrypted(&mut rng, pass).unwrap()),
+        (&ec, ec.to_pkcs8_pem_encrypted(&mut rng, pass).unwrap()),
+        (
+            &ec,
+            ec.to_traditional_pem_encrypted(&mut rng, pass).unwrap(),
+        ),
+    ];
+    for (key, pem) in &cases {
+        let back = PrivateKey::parse_pem(pem, Some(pass)).unwrap();
+        assert_eq!(back.public_key().wire_blob(), key.public_key().wire_blob());
+        assert!(matches!(
+            PrivateKey::parse_pem(pem, Some(b"wrong")),
+            Err(Error::Crypto(_))
+        ));
+    }
+}

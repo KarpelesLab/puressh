@@ -194,19 +194,25 @@ fn formats_fingerprints_krl_interop() {
         // PEM / PKCS8 private keys we write load in OpenSSH.
         for m in ["PEM", "PKCS8"] {
             // No PEM form for Ed25519; and OpenSSH before 10 cannot load
-            // Ed25519 PKCS8 keys (test only if it can write one itself).
+            // Ed25519 PKCS8 keys (9.6 even writes its own format when asked
+            // for one): test only if it writes and reads one itself.
             if kind == "ed25519"
-                && (m == "PEM"
-                    || !run(
+                && (m == "PEM" || {
+                    run(
                         &dir,
                         "ssh-keygen",
                         &[
                             "-q", "-t", "ed25519", "-m", "PKCS8", "-N", "", "-f", "probe",
                         ],
                         b"",
-                    )
-                    .status
-                    .success())
+                    );
+                    let wrote = std::fs::read_to_string(dir.join("probe"))
+                        .is_ok_and(|p| p.starts_with("-----BEGIN PRIVATE KEY-----"));
+                    !wrote
+                        || !run(&dir, "ssh-keygen", &["-y", "-f", "probe"], b"")
+                            .status
+                            .success()
+                })
             {
                 continue;
             }
@@ -222,6 +228,26 @@ fn formats_fingerprints_krl_interop() {
                 derived.split_whitespace().nth(1),
                 pub_line(&dir, &name).split_whitespace().nth(1)
             );
+            // Passphrase-protected, as OpenSSL writes them for OpenSSH.
+            let enc = format!("{name}_enc");
+            ok(
+                &dir,
+                OURS,
+                &["-q", "-t", kind, "-m", m, "-N", "pass phrase", "-f", &enc],
+                b"",
+            );
+            let derived = ok(
+                &dir,
+                "ssh-keygen",
+                &["-y", "-P", "pass phrase", "-f", &enc],
+                b"",
+            );
+            assert_eq!(
+                derived.split_whitespace().nth(1),
+                pub_line(&dir, &enc).split_whitespace().nth(1)
+            );
+            let wrong = run(&dir, "ssh-keygen", &["-y", "-P", "wrong", "-f", &enc], b"");
+            assert!(!wrong.status.success(), "{enc}: wrong passphrase accepted");
         }
     }
 

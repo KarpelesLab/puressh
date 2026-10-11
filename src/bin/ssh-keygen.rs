@@ -912,7 +912,7 @@ fn run_import(args: &Args) -> Result<i32, String> {
 }
 
 /// A private key serialised in the `-m` format: the OpenSSH container
-/// (default, or `RFC4716`), or unencrypted `PEM` / `PKCS8`.
+/// (default, or `RFC4716`), `PEM` or `PKCS8`.
 fn encode_private(sk: &PrivateKey, args: &Args, passphrase: &str) -> Result<String, String> {
     let format = args
         .format
@@ -928,10 +928,12 @@ fn encode_private(sk: &PrivateKey, args: &Args, passphrase: &str) -> Result<Stri
             None => sk.to_openssh_pem((!passphrase.is_empty()).then_some(passphrase.as_bytes())),
         }
         .map_err(|e| format!("encode: {e}")),
-        "PEM" | "PKCS8" if !passphrase.is_empty() => Err(format!(
-            "passphrase-protected {format} keys are not supported; use the default \
-             OpenSSH format or an empty passphrase"
-        )),
+        "PEM" if !passphrase.is_empty() => sk
+            .to_traditional_pem_encrypted(&mut purecrypto::rng::OsRng, passphrase.as_bytes())
+            .map_err(|e| format!("invalid format: {e}")),
+        "PKCS8" if !passphrase.is_empty() => sk
+            .to_pkcs8_pem_encrypted(&mut purecrypto::rng::OsRng, passphrase.as_bytes())
+            .map_err(|e| format!("invalid format: {e}")),
         "PEM" => sk
             .to_traditional_pem()
             .map_err(|e| format!("invalid format: {e}")),

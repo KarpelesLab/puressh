@@ -207,6 +207,25 @@ impl ShellRuntime {
     }
 }
 
+/// Decode a `pty-req`'s terminal modes (RFC 4254 §8) into `(opcode,
+/// value)` pairs, up to `TTY_OP_END` or the first opcode the RFC leaves
+/// undefined (160–255), where parsing stops.
+pub fn decode_terminal_modes(modes: &[u8]) -> Vec<(u8, u32)> {
+    let mut out = Vec::new();
+    let mut rest = modes;
+    while let Some((&op, tail)) = rest.split_first() {
+        if op == 0 || op >= 160 {
+            break;
+        }
+        let Some(v) = tail.get(..4) else {
+            break;
+        };
+        out.push((op, u32::from_be_bytes([v[0], v[1], v[2], v[3]])));
+        rest = &tail[4..];
+    }
+    out
+}
+
 /// Pseudo-terminal allocation request captured from `"pty-req"`.
 ///
 /// The library never decodes [`modes`] — RFC 4254 §8 mode opcodes are a
@@ -4699,6 +4718,16 @@ fn srv_drive_handshake(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_modes_decode_until_end_or_undefined_opcode() {
+        // VERASE=^H, IXON off, IUTF8 on, END, then garbage.
+        let modes = [3, 0, 0, 0, 8, 38, 0, 0, 0, 0, 42, 0, 0, 0, 1, 0, 99];
+        assert_eq!(decode_terminal_modes(&modes), [(3, 8), (38, 0), (42, 1)]);
+        // An undefined opcode (>= 160) stops parsing, as does truncation.
+        assert_eq!(decode_terminal_modes(&[1, 0, 0, 0, 3, 200, 7]), [(1, 3)]);
+        assert_eq!(decode_terminal_modes(&[1, 0, 0]), []);
+    }
     use crate::auth::{AuthAttempt, AuthDecision, Authenticator};
     use crate::client::{Client, Config as ClientConfig, HostKeyPolicy};
     use crate::hostkey::Ed25519HostKey;

@@ -3125,10 +3125,15 @@ pub fn encode_termios_modes(t: &libc::termios) -> Vec<u8> {
     const INLCR: u8 = 34;
     const IGNCR: u8 = 35;
     const ICRNL: u8 = 36;
-    const IXON: u8 = 39;
-    const IXANY: u8 = 40;
-    const IXOFF: u8 = 41;
-    const IMAXBEL: u8 = 42;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    const IUCLC: u8 = 37;
+    const IXON: u8 = 38;
+    const IXANY: u8 = 39;
+    const IXOFF: u8 = 40;
+    const IMAXBEL: u8 = 41;
+    // RFC 8160.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    const IUTF8: u8 = 42;
     const ISIG: u8 = 50;
     const ICANON: u8 = 51;
     const ECHO: u8 = 53;
@@ -3192,6 +3197,10 @@ pub fn encode_termios_modes(t: &libc::termios) -> Vec<u8> {
     push(IXANY, bit_i(libc::IXANY));
     push(IXOFF, bit_i(libc::IXOFF));
     push(IMAXBEL, bit_i(libc::IMAXBEL));
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    push(IUCLC, bit_i(libc::IUCLC));
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    push(IUTF8, bit_i(libc::IUTF8));
 
     // Local modes.
     let lflag = t.c_lflag;

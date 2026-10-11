@@ -170,6 +170,13 @@ pub struct Session {
     line: String,
 }
 
+impl Session {
+    /// Whether this is the login of session process `pid` on `tty`.
+    pub fn is(&self, pid: i32, tty: &str) -> bool {
+        self.pid == pid && self.line == line_of(tty)
+    }
+}
+
 /// Record the login of `user` (`uid`) on `tty` by session process `pid`,
 /// from `host` / `addr`.
 pub fn login(

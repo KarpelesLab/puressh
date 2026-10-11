@@ -92,7 +92,7 @@ mod imp {
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::net::IpAddr;
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     use std::process::{Command, ExitCode};
@@ -5884,6 +5884,8 @@ mod imp {
             .map_err(nix_io)?;
         }
 
+        apply_pty_modes(pty.slave.as_raw_fd(), &spec.modes);
+
         let slave_path = nix::unistd::ttyname(&pty.slave)
             .map_err(nix_io)?
             .to_string_lossy()
@@ -5917,7 +5919,10 @@ mod imp {
             })?;
             channel_envs.push((kc, vc));
         }
-        for (k, v) in connection_env(Some(&slave_path)) {
+        // TERM from the pty request (it wins over a client `env` TERM, as
+        // with OpenSSH), then the connection variables.
+        let term = (!spec.term.is_empty()).then(|| ("TERM", spec.term.clone()));
+        for (k, v) in term.into_iter().chain(connection_env(Some(&slave_path))) {
             if let (Ok(k), Ok(v)) = (std::ffi::CString::new(k), std::ffi::CString::new(v)) {
                 channel_envs.push((k, v));
             }
@@ -6077,25 +6082,12 @@ mod imp {
                         info.shell_str,
                     );
                 }
-                // utmp / wtmp / lastlog, from the connection's peer.
-                #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                let login = {
-                    let peer = conn_addrs().map(|(p, _)| p.ip());
-                    let host = peer.map(sshd_log::addr_str).unwrap_or_default();
-                    Some(sshd_login::login(
-                        child.as_raw(),
-                        &slave_path,
-                        user,
-                        info.uid.as_raw(),
-                        &host,
-                        peer,
-                    ))
-                };
+                // utmp / wtmp / lastlog.
+                let login = record_login(child.as_raw(), &slave_path, user, info.uid.as_raw());
                 Ok(Box::new(NixShellSession {
                     master: Some(master),
                     child_pid: child,
                     cached_exit: None,
-                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
                     login,
                 }))
             }
@@ -6117,6 +6109,109 @@ mod imp {
         ))
     }
 
+    /// Apply a `pty-req`'s terminal modes to the new pty, as OpenSSH's
+    /// tty_parse_modes does: control characters (255: disabled), flags,
+    /// character size and parity, line speeds. Unknown opcodes are skipped.
+    fn apply_pty_modes(fd: std::os::fd::RawFd, modes: &[u8]) {
+        // SAFETY: termios is plain data, filled in by tcgetattr.
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        if unsafe { libc::tcgetattr(fd, &mut t) } != 0 {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        const VDISABLE: libc::cc_t = 0;
+        #[cfg(not(target_os = "linux"))]
+        const VDISABLE: libc::cc_t = 0xff;
+        let cc = |v: u32| if v == 255 { VDISABLE } else { v as libc::cc_t };
+        for (op, v) in puressh::server::decode_terminal_modes(modes) {
+            let on = v != 0;
+            let set = |field: &mut libc::tcflag_t, bit: libc::tcflag_t| {
+                if on {
+                    *field |= bit;
+                } else {
+                    *field &= !bit;
+                }
+            };
+            match op {
+                1 => t.c_cc[libc::VINTR] = cc(v),
+                2 => t.c_cc[libc::VQUIT] = cc(v),
+                3 => t.c_cc[libc::VERASE] = cc(v),
+                4 => t.c_cc[libc::VKILL] = cc(v),
+                5 => t.c_cc[libc::VEOF] = cc(v),
+                6 => t.c_cc[libc::VEOL] = cc(v),
+                7 => t.c_cc[libc::VEOL2] = cc(v),
+                8 => t.c_cc[libc::VSTART] = cc(v),
+                9 => t.c_cc[libc::VSTOP] = cc(v),
+                10 => t.c_cc[libc::VSUSP] = cc(v),
+                12 => t.c_cc[libc::VREPRINT] = cc(v),
+                13 => t.c_cc[libc::VWERASE] = cc(v),
+                14 => t.c_cc[libc::VLNEXT] = cc(v),
+                18 => t.c_cc[libc::VDISCARD] = cc(v),
+                30 => set(&mut t.c_iflag, libc::IGNPAR),
+                31 => set(&mut t.c_iflag, libc::PARMRK),
+                32 => set(&mut t.c_iflag, libc::INPCK),
+                33 => set(&mut t.c_iflag, libc::ISTRIP),
+                34 => set(&mut t.c_iflag, libc::INLCR),
+                35 => set(&mut t.c_iflag, libc::IGNCR),
+                36 => set(&mut t.c_iflag, libc::ICRNL),
+                #[cfg(target_os = "linux")]
+                37 => set(&mut t.c_iflag, libc::IUCLC),
+                38 => set(&mut t.c_iflag, libc::IXON),
+                39 => set(&mut t.c_iflag, libc::IXANY),
+                40 => set(&mut t.c_iflag, libc::IXOFF),
+                41 => set(&mut t.c_iflag, libc::IMAXBEL),
+                42 => set(&mut t.c_iflag, libc::IUTF8),
+                50 => set(&mut t.c_lflag, libc::ISIG),
+                51 => set(&mut t.c_lflag, libc::ICANON),
+                53 => set(&mut t.c_lflag, libc::ECHO),
+                54 => set(&mut t.c_lflag, libc::ECHOE),
+                55 => set(&mut t.c_lflag, libc::ECHOK),
+                56 => set(&mut t.c_lflag, libc::ECHONL),
+                57 => set(&mut t.c_lflag, libc::NOFLSH),
+                58 => set(&mut t.c_lflag, libc::TOSTOP),
+                59 => set(&mut t.c_lflag, libc::IEXTEN),
+                60 => set(&mut t.c_lflag, libc::ECHOCTL),
+                61 => set(&mut t.c_lflag, libc::ECHOKE),
+                62 => set(&mut t.c_lflag, libc::PENDIN),
+                70 => set(&mut t.c_oflag, libc::OPOST),
+                #[cfg(target_os = "linux")]
+                71 => set(&mut t.c_oflag, libc::OLCUC),
+                72 => set(&mut t.c_oflag, libc::ONLCR),
+                73 => set(&mut t.c_oflag, libc::OCRNL),
+                74 => set(&mut t.c_oflag, libc::ONOCR),
+                75 => set(&mut t.c_oflag, libc::ONLRET),
+                90 | 91 if on => {
+                    t.c_cflag &= !libc::CSIZE;
+                    t.c_cflag |= if op == 90 { libc::CS7 } else { libc::CS8 };
+                }
+                92 => set(&mut t.c_cflag, libc::PARENB),
+                93 => set(&mut t.c_cflag, libc::PARODD),
+                128 | 129 => {
+                    let speed = match v {
+                        9600 => libc::B9600,
+                        19200 => libc::B19200,
+                        38400 => libc::B38400,
+                        57600 => libc::B57600,
+                        115200 => libc::B115200,
+                        230400 => libc::B230400,
+                        _ => continue,
+                    };
+                    // SAFETY: plain setters on the local termios.
+                    unsafe {
+                        if op == 128 {
+                            libc::cfsetispeed(&mut t, speed);
+                        } else {
+                            libc::cfsetospeed(&mut t, speed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        // SAFETY: a valid fd and a fully initialised termios.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &t) };
+    }
+
     fn clamp_u16(v: u32) -> u16 {
         if v > u16::MAX as u32 {
             u16::MAX
@@ -6131,16 +6226,14 @@ mod imp {
         child_pid: Pid,
         cached_exit: Option<ShellExitStatus>,
         /// The utmp/wtmp login, closed when the session ends.
-        #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        login: Option<sshd_login::Session>,
+        login: Option<LoginRecord>,
     }
 
     impl NixShellSession {
         /// Record the logout, once.
         fn logged_out(&mut self) {
-            #[cfg(all(target_os = "linux", target_env = "gnu"))]
             if let Some(l) = self.login.take() {
-                sshd_login::logout(&l);
+                record_logout(&l);
             }
         }
     }
@@ -6425,13 +6518,64 @@ mod imp {
     /// pipe. Idempotent; a no-op when no pipe was set up (tests, or a
     /// pipe() failure at accept time).
     fn notify_parent_authenticated() {
-        let fd = AUTH_NOTIFY_FD.swap(-1, Ordering::Relaxed);
-        if fd >= 0 {
-            // SAFETY: the fd was created by `pipe_cloexec` in the parent and its
-            // ownership handed to this static at fork; nothing else closes it.
-            let tx = unsafe { OwnedFd::from_raw_fd(fd) };
-            let _ = nix::unistd::write(&tx, &[AUTH_OK_BYTE]);
-            drop(tx);
+        tell_parent(&[AUTH_OK_BYTE, b'\n']);
+    }
+
+    /// Send one message line to the daemon parent over this connection's
+    /// pipe, which stays open for the connection's life: `A` (authenticated),
+    /// `L pid tty user uid` / `O pid tty` (a pty login / logout to record —
+    /// the parent is root and the connection no longer is). False when there
+    /// is no pipe (tests, a pipe() failure at accept time).
+    fn tell_parent(line: &[u8]) -> bool {
+        let fd = AUTH_NOTIFY_FD.load(Ordering::Relaxed);
+        if fd < 0 {
+            return false;
+        }
+        // SAFETY: the fd was created by `pipe_cloexec` in the parent and its
+        // ownership handed to this static at fork; nothing closes it.
+        let tx = unsafe { BorrowedFd::borrow_raw(fd) };
+        nix::unistd::write(tx, line).is_ok_and(|n| n == line.len())
+    }
+
+    /// A pty login being recorded: by the daemon parent (normally), or
+    /// directly when there is no parent to ask.
+    enum LoginRecord {
+        Parent {
+            pid: i32,
+            tty: String,
+        },
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        Local(sshd_login::Session),
+    }
+
+    /// Record a pty login (utmp, wtmp, lastlog) of `user` on `tty`.
+    fn record_login(pid: i32, tty: &str, user: &str, uid: u32) -> Option<LoginRecord> {
+        let msg = format!("L\t{pid}\t{tty}\t{user}\t{uid}\n");
+        if tell_parent(msg.as_bytes()) {
+            return Some(LoginRecord::Parent {
+                pid,
+                tty: tty.to_string(),
+            });
+        }
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        {
+            let peer = conn_addrs().map(|(p, _)| p.ip());
+            let host = peer.map(sshd_log::addr_str).unwrap_or_default();
+            Some(LoginRecord::Local(sshd_login::login(
+                pid, tty, user, uid, &host, peer,
+            )))
+        }
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        None
+    }
+
+    fn record_logout(rec: &LoginRecord) {
+        match rec {
+            LoginRecord::Parent { pid, tty } => {
+                tell_parent(format!("O\t{pid}\t{tty}\n").as_bytes());
+            }
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            LoginRecord::Local(s) => sshd_login::logout(s),
         }
     }
 
@@ -6447,6 +6591,86 @@ mod imp {
         /// True once the child reported userauth success; such children no
         /// longer count against `MaxStartups`.
         authenticated: bool,
+        /// Unprocessed bytes from the pipe (messages are lines).
+        buf: Vec<u8>,
+        /// Pty logins recorded for this child, closed when it says so or
+        /// when it is reaped.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        logins: Vec<sshd_login::Session>,
+    }
+
+    impl ChildRecord {
+        /// Handle one message line from the child (see `tell_parent`).
+        fn message(&mut self, line: &[u8]) {
+            if line == [AUTH_OK_BYTE] {
+                self.authenticated = true;
+            } else {
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                self.login_message(line);
+            }
+        }
+
+        /// `L …` / `O …`: record a pty login or logout.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        fn login_message(&mut self, line: &[u8]) {
+            {
+                let Ok(line) = std::str::from_utf8(line) else {
+                    return;
+                };
+                let f: Vec<&str> = line.split('\t').collect();
+                match f.as_slice() {
+                    ["L", pid, tty, user, uid] if self.authenticated && self.logins.len() < 64 => {
+                        let (Ok(pid), Ok(uid)) = (pid.parse::<i32>(), uid.parse::<u32>()) else {
+                            return;
+                        };
+                        if !login_claim_ok(tty, user, uid) {
+                            return;
+                        }
+                        // The peer as this parent knows it, not as claimed.
+                        let host = sshd_log::addr_str(self.ip);
+                        self.logins.push(sshd_login::login(
+                            pid,
+                            tty,
+                            user,
+                            uid,
+                            &host,
+                            Some(self.ip),
+                        ));
+                    }
+                    ["O", pid, tty] => {
+                        let Ok(pid) = pid.parse::<i32>() else {
+                            return;
+                        };
+                        if let Some(i) = self.logins.iter().position(|l| l.is(pid, tty)) {
+                            sshd_login::logout(&self.logins.remove(i));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        /// Close every login still open (the connection is gone).
+        fn close_logins(&mut self) {
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            for l in self.logins.drain(..) {
+                sshd_login::logout(&l);
+            }
+        }
+    }
+
+    /// A child's login claim holds: `tty` is a pty owned by `uid`, which is
+    /// `user`'s. (The child runs as that user: it can only own its ptys.)
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn login_claim_ok(tty: &str, user: &str, uid: u32) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let Some(n) = tty.strip_prefix("/dev/pts/") else {
+            return false;
+        };
+        !n.is_empty()
+            && n.bytes().all(|b| b.is_ascii_digit())
+            && std::fs::metadata(tty).is_ok_and(|m| m.uid() == uid)
+            && lookup_user(user).is_ok_and(|i| i.uid.as_raw() == uid)
     }
 
     /// The daemon parent's table of live connection children, keyed by pid.
@@ -6479,6 +6703,9 @@ mod imp {
                     ip,
                     auth_rx,
                     authenticated: false,
+                    buf: Vec::new(),
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    logins: Vec::new(),
                 },
             );
         }
@@ -6491,7 +6718,13 @@ mod imp {
                     Ok(WaitStatus::StillAlive) | Err(_) => break,
                     Ok(status) => {
                         if let Some(pid) = status.pid()
-                            && self.children.remove(&pid).is_some()
+                            && let Some(mut rec) = self.children.remove(&pid)
+                        {
+                            rec.close_logins();
+                        } else {
+                            continue;
+                        }
+                        if let Some(pid) = status.pid()
                             && debug
                         {
                             eprintln!(
@@ -6543,15 +6776,36 @@ mod imp {
                 let Some(rec) = self.children.get_mut(&pid) else {
                     continue;
                 };
-                let Some(rx) = rec.auth_rx.take() else {
+                let Some(rx) = rec.auth_rx.as_ref() else {
                     continue;
                 };
-                let mut byte = [0u8; 1];
-                if matches!(nix::unistd::read(&rx, &mut byte), Ok(1)) && byte[0] == AUTH_OK_BYTE {
-                    rec.authenticated = true;
+                let mut chunk = [0u8; 4096];
+                match nix::unistd::read(rx, &mut chunk) {
+                    Ok(n) if n > 0 => rec.buf.extend_from_slice(&chunk[..n]),
+                    Err(Errno::EINTR | Errno::EAGAIN) => continue,
+                    // EOF (the child exited) or an error: the pipe is done.
+                    _ => {
+                        rec.auth_rx = None;
+                    }
                 }
-                // `rx` drops here: the parent's read end is closed either way.
+                while let Some(i) = rec.buf.iter().position(|b| *b == b'\n') {
+                    let line: Vec<u8> = rec.buf.drain(..=i).collect();
+                    rec.message(&line[..line.len() - 1]);
+                }
+                // A child that will not end its lines gets no more hearing.
+                if rec.buf.len() > 4096 {
+                    rec.buf.clear();
+                    rec.auth_rx = None;
+                }
             }
+        }
+
+        /// Every open child pipe, for the accept loop's poll set.
+        fn pipe_fds(&self) -> Vec<BorrowedFd<'_>> {
+            self.children
+                .values()
+                .filter_map(|c| c.auth_rx.as_ref().map(|fd| fd.as_fd()))
+                .collect()
         }
 
         /// Apply the two connection caps: `MaxStartups` over the
@@ -7247,6 +7501,17 @@ mod imp {
 
         install_parent_signals()?;
 
+        // The parent holds a pipe per live connection (login records): use
+        // the whole open-file allowance (systemd's soft default is 1024).
+        // SAFETY: getrlimit/setrlimit on a local, fully initialised struct.
+        unsafe {
+            let mut lim: libc::rlimit = std::mem::zeroed();
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur < lim.rlim_max {
+                lim.rlim_cur = lim.rlim_max;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            }
+        }
+
         // As in OpenSSH, an address that cannot be bound (e.g. `::` on a host
         // without IPv6) is reported and skipped; only binding none is fatal.
         let mut listeners = Vec::with_capacity(listen.len());
@@ -7351,6 +7616,13 @@ mod imp {
                 wait.extend(
                     knock
                         .poll_fds()
+                        .into_iter()
+                        .map(|fd| PollFd::new(fd, PollFlags::POLLIN)),
+                );
+                // Children's messages (logins to record) wake the loop too.
+                wait.extend(
+                    children
+                        .pipe_fds()
                         .into_iter()
                         .map(|fd| PollFd::new(fd, PollFlags::POLLIN)),
                 );

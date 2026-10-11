@@ -94,7 +94,14 @@ try_ssh -tt tester@localhost 'tty; sleep 1; who' >/tmp/pty.out
 grep -q /dev/pts/ /tmp/pty.out
 grep -q '^tester  *pts/' /tmp/pty.out
 last -w tester | grep -q '^tester  *pts/'
-printf 'exit\n' | try_ssh -tt tester@localhost | tr -d '\r' | grep -q '^Last login: .* from '
+# One attempt (stdin is consumed), typing `exit` once the shell is up: input
+# typed ahead may be eaten by the image's login scripts.
+(sleep 5; printf 'exit\n') | timeout 60 ssh -tt -F /dev/null -i /root/tester_key -o BatchMode=yes \
+	-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts tester@localhost \
+	>/tmp/login.out 2>&1 && rc=0 || rc=$?
+if [ "$rc" != 0 ] || ! tr -d '\r' </tmp/login.out | grep -q '^Last login: .* from '; then
+	echo "interactive login: exit $rc"; cat -A /tmp/login.out; exit 1
+fi
 ss -ltnp | grep -q ':22 '
 # Logins are logged as OpenSSH logs them (syslog, facility AUTH), where
 # fail2ban and auth.log readers look.

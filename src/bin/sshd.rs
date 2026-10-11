@@ -6277,11 +6277,9 @@ mod imp {
         }
 
         fn close_stdin(&mut self) -> puressh::Result<()> {
-            // No half-close on a PTY master, so send EOT (Ctrl-D) — the
-            // line discipline turns this into EOF for ICANON readers.
-            if let Some(master) = self.master.as_ref() {
-                let _ = nix::unistd::write(master.as_fd(), &[0x04u8]);
-            }
+            // A pty has no half-close, and the client's EOF is not typed
+            // into it (OpenSSH ignores it too): a ^D would reach a raw-mode
+            // reader as data, and one typed ahead of the shell is lost.
             Ok(())
         }
 

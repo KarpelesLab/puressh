@@ -59,6 +59,14 @@ pub enum Error {
     /// signature algorithm is not in the permitted `CASignatureAlgorithms`
     /// set.
     CertBadCaSignature,
+    /// The peer ended the connection with `SSH_MSG_DISCONNECT`.
+    #[cfg(feature = "alloc")]
+    Disconnected {
+        /// Reason code (RFC 4253 §11.1), e.g. 11 for "by application".
+        reason: u32,
+        /// The peer's description, control characters replaced.
+        description: alloc::string::String,
+    },
 }
 
 impl fmt::Display for Error {
@@ -87,6 +95,11 @@ impl fmt::Display for Error {
                 f.write_str("certificate has an unknown critical option")
             }
             Error::CertBadCaSignature => f.write_str("certificate CA signature invalid"),
+            #[cfg(feature = "alloc")]
+            Error::Disconnected {
+                reason,
+                description,
+            } => write!(f, "disconnected by peer: {reason}: {description}"),
         }
     }
 }

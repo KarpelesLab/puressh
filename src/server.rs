@@ -4585,7 +4585,8 @@ fn srv_send(stream: &mut TcpStream, driver: &mut ServerDriver, payload: &[u8]) -
 /// `SSH_MSG_DISCONNECT`, or the socket being reset.
 fn is_peer_close(e: &Error) -> bool {
     match e {
-        Error::Protocol(m) => *m == "connection closed" || *m == "peer sent SSH_MSG_DISCONNECT",
+        Error::Protocol(m) => *m == "connection closed",
+        Error::Disconnected { .. } => true,
         Error::Io(io) => matches!(
             io.kind(),
             std::io::ErrorKind::ConnectionReset

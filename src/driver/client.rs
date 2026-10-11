@@ -360,7 +360,7 @@ impl ClientDriver {
         // after the keys are in (which is what an on-path injector wants).
         let initial_kex = self.phase == Phase::Kex;
         match payload.first().copied() {
-            Some(1) => Err(Error::Protocol("peer sent SSH_MSG_DISCONNECT")),
+            Some(1) => Err(super::disconnect_error(payload)),
             // Generic transport messages during the initial KEX: fatal under
             // strict-kex, dropped otherwise. A PING gets no PONG here — the
             // peer has no business probing an unkeyed connection.

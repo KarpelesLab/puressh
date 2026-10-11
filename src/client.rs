@@ -3077,7 +3077,9 @@ impl Drop for ClientChannelStream<'_> {
 pub(crate) fn io_err(e: Error) -> std::io::Error {
     match e {
         Error::Io(io) => io,
-        other => std::io::Error::other(format!("{:?}", other)),
+        // Keep the error itself (callers can downcast it, e.g. to report a
+        // server's SSH_MSG_DISCONNECT the way OpenSSH does).
+        other => std::io::Error::other(other),
     }
 }
 

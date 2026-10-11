@@ -242,6 +242,8 @@ struct Inner {
     /// When the last packet arrived from the server (see
     /// [`SharedClient::idle_for`]).
     last_rx: std::time::Instant,
+    /// The server's `SSH_MSG_DISCONNECT` (reason, description), once read.
+    disconnect: Option<(u32, alloc::string::String)>,
 }
 
 /// The parts of a [`SharedClient`] needed to rebuild one from inside the
@@ -305,6 +307,7 @@ impl From<Client> for SharedClient {
                 pumping: false,
                 handlers: None,
                 last_rx: std::time::Instant::now(),
+                disconnect: None,
                 self_ref: Some(SelfRef {
                     inner: weak.clone(),
                     lock_waiters: waiters,
@@ -841,6 +844,12 @@ impl SharedClient {
             .conn
             .send_global_request(crate::channel::GlobalRequest::Keepalive, true);
         g.client.write_payload(&p)
+    }
+
+    /// The server's `SSH_MSG_DISCONNECT` (reason code, description), if it
+    /// ended the connection with one.
+    pub fn disconnect_reason(&self) -> Option<(u32, alloc::string::String)> {
+        lock_or_poison(&self.inner).ok()?.disconnect.clone()
     }
 
     /// How long since the last packet arrived from the server.
@@ -1620,7 +1629,15 @@ impl OwnedChannelStream {
         // `Ok(None)` instead of `WouldBlock` / `TimedOut`. Either way the
         // pumper releases the lock immediately after this call and the
         // outer `read_stream` loop re-acquires it.
-        let Some(payload) = g.client.read_one_packet_maybe_timeout().map_err(io_err)? else {
+        let read = g.client.read_one_packet_maybe_timeout();
+        if let Err(Error::Disconnected {
+            reason,
+            description,
+        }) = &read
+        {
+            g.disconnect = Some((*reason, description.clone()));
+        }
+        let Some(payload) = read.map_err(io_err)? else {
             return Ok(());
         };
         g.last_rx = std::time::Instant::now();

@@ -2103,13 +2103,27 @@ fn run() -> Result<i32, String> {
         );
     }
 
+    // A server's SSH_MSG_DISCONNECT is reported as OpenSSH does.
+    let peer = format!("{connect_host} port {port}");
+    let disconnected = move |s: &puressh::shared::SharedClient| -> bool {
+        match s.disconnect_reason() {
+            Some((reason, description)) => {
+                warn!("Received disconnect from {peer}:{reason}: {description}");
+                warn!("Disconnected from {peer}");
+                true
+            }
+            None => false,
+        }
+    };
     // `-N`: no session; keep the connection (and its forwards) alive.
     let run = move |s: &puressh::shared::SharedClient| -> i32 {
         if no_command {
             return match s.pump_until_closed() {
                 Ok(()) => 0,
                 Err(e) => {
-                    warn!("Connection closed: {e}");
+                    if !disconnected(s) {
+                        warn!("Connection closed: {e}");
+                    }
                     255
                 }
             };
@@ -2118,7 +2132,9 @@ fn run() -> Result<i32, String> {
         // connection when the session is not reading.
         let what = session_request(command.as_deref(), subsystem);
         run_session(s, what, use_pty, okt, escape).unwrap_or_else(|e| {
-            eprintln!("ssh: {e}");
+            if !disconnected(s) {
+                eprintln!("ssh: {e}");
+            }
             255
         })
     };

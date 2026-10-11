@@ -409,3 +409,23 @@ mod rekey_tests {
         );
     }
 }
+
+/// `SSH_MSG_DISCONNECT` as an [`Error::Disconnected`]: `uint32 reason`,
+/// `string description`, `string language`.
+pub(crate) fn disconnect_error(payload: &[u8]) -> Error {
+    let mut r = crate::format::Reader::new(payload.get(1..).unwrap_or_default());
+    let reason = r.read_u32().unwrap_or(0);
+    let description = r
+        .read_string()
+        .map(|d| {
+            alloc::string::String::from_utf8_lossy(d)
+                .chars()
+                .map(|c| if c.is_control() { '?' } else { c })
+                .collect()
+        })
+        .unwrap_or_default();
+    Error::Disconnected {
+        reason,
+        description,
+    }
+}

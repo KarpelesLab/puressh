@@ -966,6 +966,35 @@ mod imp {
         }
     }
 
+    /// `Type=notify` (as OpenSSH's units on Ubuntu are): tell systemd the
+    /// daemon is listening by sending `READY=1` to `$NOTIFY_SOCKET`. A
+    /// re-exec on SIGHUP sends it again, which systemd accepts.
+    fn notify_ready() {
+        use std::os::unix::net::UnixDatagram;
+        let Some(path) = std::env::var_os("NOTIFY_SOCKET") else {
+            return;
+        };
+        let Ok(sock) = UnixDatagram::unbound() else {
+            return;
+        };
+        let msg = format!("READY=1\nMAINPID={}", std::process::id());
+        let sent = match path.as_encoded_bytes().strip_prefix(b"@") {
+            // An abstract socket (systemd's usual choice).
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            Some(name) => {
+                use std::os::linux::net::SocketAddrExt;
+                std::os::unix::net::SocketAddr::from_abstract_name(name)
+                    .and_then(|a| sock.send_to_addr(msg.as_bytes(), &a))
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
+            Some(_) => return,
+            None => sock.send_to(msg.as_bytes(), &path),
+        };
+        if let Err(e) = sent {
+            eprintln!("sshd: warning: could not notify systemd: {e}");
+        }
+    }
+
     /// `-T [-C spec]`: print the effective configuration like OpenSSH's
     /// `sshd -T`: lowercase keywords, every setting with its default, and
     /// the `Match` blocks selected by `-C` applied.
@@ -6375,6 +6404,7 @@ mod imp {
         for a in &listen {
             eprintln!("puressh sshd listening on {a} (pid {})", std::process::id());
         }
+        notify_ready();
 
         // Exponential backoff for `fork()` EAGAIN — under a fork-bomb a
         // tight `continue` loop just makes the kernel keep saying no.

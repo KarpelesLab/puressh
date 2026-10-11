@@ -18,7 +18,10 @@ ExecReload=/bin/kill -HUP $MAINPID
 KillMode=process
 Restart=on-failure
 RestartPreventExitStatus=255
-Type=simple
+# The daemon reports readiness (sd_notify), as OpenSSH does on Ubuntu; the
+# same type also keeps a running OpenSSH instance consistent when this unit
+# replaces its definition.
+Type=notify
 RuntimeDirectory=sshd
 RuntimeDirectoryMode=0755
 

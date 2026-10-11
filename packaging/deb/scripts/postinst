@@ -68,13 +68,23 @@ MSG
 	if [ -d /run/systemd/system ]; then
 		wanted=
 		ssh_wanted && wanted=1
+		# Stop the running daemon (OpenSSH's, or ours on upgrade) *before*
+		# systemd reloads unit files: stopping it under a replaced unit
+		# definition has crashed PID 1 (systemd 255, service_sigchld_event).
+		# KillMode=process: only the listener stops, open sessions survive.
+		was_active=
+		systemctl stop ssh.socket >/dev/null 2>&1 || true
+		if systemctl -q is-active ssh.service 2>/dev/null; then
+			was_active=1
+			systemctl stop ssh.service || true
+		fi
+		stop_stale_listeners
 		# openssh-server's postrm masks ssh.service and ssh.socket on 20.04
 		# and 22.04; ssh.service is ours now.
 		deb-systemd-helper unmask ssh.service >/dev/null || true
 		deb-systemd-helper unmask ssh.socket >/dev/null || true
 		# Socket activation (24.04's default) is not used: our daemon
 		# listens on its own. Drop the leftover socket unit.
-		systemctl stop ssh.socket >/dev/null 2>&1 || true
 		deb-systemd-helper purge ssh.socket >/dev/null 2>&1 || true
 		rm -f /etc/systemd/system/sockets.target.wants/ssh.socket
 		# 24.04's ssh.socket is RequiredBy=ssh.service: a leftover link
@@ -96,13 +106,8 @@ MSG
 			# An administrator disabled SSH: respect that.
 			deb-systemd-helper update-state ssh.service >/dev/null || true
 		fi
-		if systemctl -q is-enabled ssh.service 2>/dev/null ||
-			systemctl -q is-active ssh.service 2>/dev/null; then
-			# KillMode=process: only the old listener is replaced, open
-			# sessions survive.
-			systemctl stop ssh.service || true
-			stop_stale_listeners
-			systemctl restart ssh.service
+		if [ -n "$was_active" ] || systemctl -q is-enabled ssh.service 2>/dev/null; then
+			systemctl start ssh.service
 		fi
 	fi
 fi

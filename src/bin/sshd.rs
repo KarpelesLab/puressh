@@ -6508,11 +6508,16 @@ mod imp {
 
         // As OpenSSH does for its session processes: no ptrace attach and no
         // core dumps (host keys, session keys). Forked connection handlers
-        // inherit it; the users' programs (exec) get the default back.
+        // inherit it; the users' programs (exec) get the default back. Only
+        // as root: a daemon run by an ordinary user holds keys that user can
+        // read anyway, and non-dumpable makes /proc/self root-owned, which
+        // breaks PAM modules (pam_loginuid) that user's sessions go through.
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        // SAFETY: PR_SET_DUMPABLE takes plain integer arguments.
-        unsafe {
-            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+        if nix::unistd::geteuid().is_root() {
+            // SAFETY: PR_SET_DUMPABLE takes plain integer arguments.
+            unsafe {
+                libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
+            }
         }
 
         install_parent_signals()?;

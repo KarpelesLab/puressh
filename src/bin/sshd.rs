@@ -80,9 +80,15 @@ fn main() -> std::process::ExitCode {
 #[path = "sshd_log.rs"]
 mod sshd_log;
 
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "sshd_login.rs"]
+mod sshd_login;
+
 #[cfg(unix)]
 mod imp {
     use crate::sshd_log;
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    use crate::sshd_login;
     use std::collections::HashMap;
     use std::ffi::OsStr;
     use std::net::IpAddr;
@@ -1223,6 +1229,7 @@ mod imp {
         );
         line("permittty", yn(opts.permit_tty != Some(false)));
         line("printmotd", yn(opts.print_motd.unwrap_or(true)));
+        line("printlastlog", yn(opts.print_last_log.unwrap_or(true)));
         line(
             "compression",
             yn(!matches!(opts.compression, Some(Compression::No))),
@@ -5777,11 +5784,26 @@ mod imp {
         // ahead of the shell prompt. Default is off, so this is skipped unless
         // PrintMotd=yes — which avoids double-printing when PAM's pam_motd is
         // already configured.
-        let motd: Option<Vec<u8>> = if print_motd {
+        // OpenSSH's check_quietlogin: a command, or ~/.hushlogin, silences
+        // the motd and the last-login line.
+        let quiet = command.is_some() || {
+            let home = lookup_user(user)?.home_str;
+            std::path::Path::new(&home).join(".hushlogin").exists()
+        };
+        let motd: Option<Vec<u8>> = if print_motd && !quiet {
             read_motd_for_pty(debug)
         } else {
             None
         };
+        // PrintLastLog: the previous login, read before this one is recorded.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        let last_login: Option<Vec<u8>> = if PRINT_LAST_LOG.load(Ordering::Relaxed) && !quiet {
+            sshd_login::last_login_message(lookup_user(user)?.uid.as_raw()).map(String::into_bytes)
+        } else {
+            None
+        };
+        #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+        let last_login: Option<Vec<u8>> = None;
 
         let ws = nix::pty::Winsize {
             ws_row: clamp_u16(spec.rows),
@@ -5981,7 +6003,8 @@ mod imp {
                 // shell. `write(2)` is async-signal-safe; the byte buffer was
                 // read in the parent. Best-effort — a short write or error must
                 // not block the login.
-                if let Some(bytes) = &motd {
+                // The last-login line comes first, as with OpenSSH.
+                for bytes in [&last_login, &motd].into_iter().flatten() {
                     // SAFETY: fd 1 is the slave pty; `bytes` is an owned, live
                     // buffer. write() is async-signal-safe in the post-fork
                     // child. Ignore the result (best-effort motd).
@@ -6023,10 +6046,26 @@ mod imp {
                         info.shell_str,
                     );
                 }
+                // utmp / wtmp / lastlog, from the connection's peer.
+                #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                let login = {
+                    let peer = conn_addrs().map(|(p, _)| p.ip());
+                    let host = peer.map(sshd_log::addr_str).unwrap_or_default();
+                    Some(sshd_login::login(
+                        child.as_raw(),
+                        &slave_path,
+                        user,
+                        info.uid.as_raw(),
+                        &host,
+                        peer,
+                    ))
+                };
                 Ok(Box::new(NixShellSession {
                     master: Some(master),
                     child_pid: child,
                     cached_exit: None,
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    login,
                 }))
             }
         }
@@ -6060,6 +6099,19 @@ mod imp {
         master: Option<OwnedFd>,
         child_pid: Pid,
         cached_exit: Option<ShellExitStatus>,
+        /// The utmp/wtmp login, closed when the session ends.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        login: Option<sshd_login::Session>,
+    }
+
+    impl NixShellSession {
+        /// Record the logout, once.
+        fn logged_out(&mut self) {
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if let Some(l) = self.login.take() {
+                sshd_login::logout(&l);
+            }
+        }
     }
 
     impl ShellSession for NixShellSession {
@@ -6133,6 +6185,16 @@ mod imp {
             if let Some(s) = self.cached_exit.clone() {
                 return Some(s);
             }
+            let status = self.wait_child();
+            if status.is_some() {
+                self.logged_out();
+            }
+            status
+        }
+    }
+
+    impl NixShellSession {
+        fn wait_child(&mut self) -> Option<ShellExitStatus> {
             match waitpid(self.child_pid, Some(WaitPidFlag::WNOHANG)) {
                 Ok(WaitStatus::Exited(_, code)) => {
                     let code_u32 = if code < 0 { 255u32 } else { code as u32 };
@@ -6166,6 +6228,7 @@ mod imp {
 
     impl Drop for NixShellSession {
         fn drop(&mut self) {
+            self.logged_out();
             // Best-effort: HUP the child, give it a tick to die, then reap.
             if self.cached_exit.is_none() {
                 let _ = kill(self.child_pid, Signal::SIGHUP);
@@ -6221,6 +6284,9 @@ mod imp {
     extern "C" fn shutdown_handler(_sig: libc::c_int) {
         SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
     }
+
+    /// `PrintLastLog` (global only, as in OpenSSH).
+    static PRINT_LAST_LOG: AtomicBool = AtomicBool::new(true);
 
     /// Set by SIGHUP: re-read the configuration (by re-executing).
     static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -6561,6 +6627,10 @@ mod imp {
                 .unwrap_or(libc::LOG_AUTH);
             let to_stderr = cli.debug || cli.log_stderr || cli.log_file.is_some() || cli.test_only;
             sshd_log::init(level, facility, to_stderr);
+            PRINT_LAST_LOG.store(
+                sshd_cfg.global.print_last_log.unwrap_or(true),
+                Ordering::Relaxed,
+            );
             sshd_log::set_max_auth_tries(
                 sshd_cfg
                     .global

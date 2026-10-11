@@ -253,6 +253,9 @@ pub struct ServerOptions {
     /// `UnusedConnectionTimeout` in seconds: close a connection that has
     /// had no open channel for this long. `Some(0)` is `none`.
     pub unused_connection_timeout: Option<u32>,
+    /// `PrintLastLog` (yes by default): `Last login: … from …` before an
+    /// interactive pty session.
+    pub print_last_log: Option<bool>,
     /// `PrintMotd` (yes/no) — print `/etc/motd` for interactive shells.
     /// `None` ⇒ default (no).
     pub print_motd: Option<bool>,
@@ -573,6 +576,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(x11_forwarding);
     take_scalar!(strict_modes);
     take_scalar!(log_level);
+    take_scalar!(print_last_log);
     take_scalar!(syslog_facility);
     take_scalar!(sftp_enabled);
     take_scalar!(sftp_read_only);
@@ -1106,6 +1110,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                     msg: format!("expected an integer, got {s:?}"),
                 })?);
         }
+        "printlastlog" => {
+            opts.print_last_log = Some(parse_yes_no(line)?);
+        }
         "printmotd" => {
             opts.print_motd = Some(parse_yes_no(line)?);
         }
@@ -1250,7 +1257,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     // Logging, DNS, network tuning, cosmetics.
     ("UseDNS", &["*"], ""),
     ("LogVerbose", &["*"], ""),
-    ("PrintLastLog", &["*"], ""),
     ("TCPKeepAlive", &["*"], ""),
     ("IPQoS", &["*"], ""),
     ("VersionAddendum", &["*"], ""),

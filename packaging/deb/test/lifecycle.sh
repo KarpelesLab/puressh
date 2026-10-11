@@ -81,8 +81,14 @@ fi
 out=$(try_ssh tester@localhost 'echo puressh-ok; id -un')
 echo "$out" | grep -q puressh-ok
 echo "$out" | grep -qx tester
-# A PTY session goes through PAM sessions and the privilege drop.
-try_ssh -tt tester@localhost 'tty' | grep -q /dev/pts/
+# A PTY session goes through PAM sessions and the privilege drop, and is
+# recorded as OpenSSH records it: utmp (who) while it lasts, wtmp (last)
+# and lastlog ("Last login:" at the next interactive login) after.
+try_ssh -tt tester@localhost 'tty; sleep 1; who' >/tmp/pty.out
+grep -q /dev/pts/ /tmp/pty.out
+grep -q '^tester  *pts/' /tmp/pty.out
+last -w tester | grep -q '^tester  *pts/'
+printf 'exit\n' | try_ssh -tt tester@localhost | tr -d '\r' | grep -q '^Last login: .* from '
 ss -ltnp | grep -q ':22 '
 # Logins are logged as OpenSSH logs them (syslog, facility AUTH), where
 # fail2ban and auth.log readers look.

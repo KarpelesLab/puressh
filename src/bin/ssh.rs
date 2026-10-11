@@ -2095,7 +2095,12 @@ fn run() -> Result<i32, String> {
     shared.set_channel_handlers(handlers);
     start_local_forwards(&shared, &cli, &dynamics, gateway, exit_on_forward_failure)?;
     if let Some(interval) = server_alive {
-        spawn_keepalive(&shared, interval);
+        spawn_keepalive(
+            &shared,
+            interval,
+            cfg_block.server_alive_count_max.unwrap_or(3),
+            connect_host.clone(),
+        );
     }
 
     // `-N`: no session; keep the connection (and its forwards) alive.
@@ -2129,15 +2134,39 @@ fn run() -> Result<i32, String> {
 /// `ServerAliveInterval`: a keepalive on the connection every `interval`
 /// seconds, so NAT and firewall state stays up during quiet periods, and
 /// ssh exits (status 255) once the connection can no longer be written to.
-fn spawn_keepalive(shared: &puressh::shared::SharedClient, interval: u32) {
+/// `ServerAliveInterval` / `ServerAliveCountMax`, as OpenSSH: after
+/// `interval` seconds without hearing from the server, send a keepalive
+/// request; once `count_max` of them go unanswered (no traffic at all from
+/// the server meanwhile), give up.
+fn spawn_keepalive(
+    shared: &puressh::shared::SharedClient,
+    interval: u32,
+    count_max: u32,
+    host: String,
+) {
     let s = shared.clone();
+    let interval = std::time::Duration::from_secs(interval as u64);
     thread::spawn(move || {
+        let mut unanswered = 0u32;
         loop {
-            thread::sleep(std::time::Duration::from_secs(interval as u64));
-            if let Err(e) = s.send_ping(b"keepalive") {
-                eprintln!("Timeout, server not responding: {e}");
+            thread::sleep(interval);
+            match s.idle_for() {
+                Ok(idle) if idle < interval => {
+                    unanswered = 0;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(_) => return,
+            }
+            if unanswered >= count_max {
+                eprintln!("Timeout, server {host} not responding.");
                 std::process::exit(255);
             }
+            if s.send_keepalive().is_err() {
+                eprintln!("Timeout, server {host} not responding.");
+                std::process::exit(255);
+            }
+            unanswered += 1;
         }
     });
 }

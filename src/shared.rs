@@ -239,6 +239,9 @@ struct Inner {
     /// Back-reference used to hand accepted channels to their handler
     /// threads from inside the pump (which only holds `&mut Inner`).
     self_ref: Option<SelfRef>,
+    /// When the last packet arrived from the server (see
+    /// [`SharedClient::idle_for`]).
+    last_rx: std::time::Instant,
 }
 
 /// The parts of a [`SharedClient`] needed to rebuild one from inside the
@@ -301,6 +304,7 @@ impl From<Client> for SharedClient {
                 notifiers: BTreeMap::new(),
                 pumping: false,
                 handlers: None,
+                last_rx: std::time::Instant::now(),
                 self_ref: Some(SelfRef {
                     inner: weak.clone(),
                     lock_waiters: waiters,
@@ -825,6 +829,23 @@ impl SharedClient {
     pub fn set_read_timeout(&self, t: Option<core::time::Duration>) -> Result<()> {
         let mut g = lock_or_poison(&self.inner)?;
         g.client.set_read_timeout(t).map_err(Error::Io)
+    }
+
+    /// Send a `keepalive@openssh.com` global request asking for a reply
+    /// (`ServerAliveInterval`): every server answers it, with success or
+    /// failure, so the reply shows up in [`Self::idle_for`].
+    pub fn send_keepalive(&self) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g
+            .client
+            .conn
+            .send_global_request(crate::channel::GlobalRequest::Keepalive, true);
+        g.client.write_payload(&p)
+    }
+
+    /// How long since the last packet arrived from the server.
+    pub fn idle_for(&self) -> Result<Duration> {
+        Ok(lock_or_poison(&self.inner)?.last_rx.elapsed())
     }
 
     /// Send a `ping@openssh.com` `SSH2_MSG_PING` over the transport carrying
@@ -1602,6 +1623,7 @@ impl OwnedChannelStream {
         let Some(payload) = g.client.read_one_packet_maybe_timeout().map_err(io_err)? else {
             return Ok(());
         };
+        g.last_rx = std::time::Instant::now();
         let ev = g.client.conn.on_packet(&payload).map_err(io_err)?;
         dispatch_event(g, ev);
         Ok(())

@@ -470,9 +470,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 }
                 'g' => extra_o.push("GatewayPorts yes".into()),
                 'G' => print_config = true,
-                'K' => {
-                    return Err("-K: GSSAPI authentication is not supported".into());
-                }
+                // GSSAPI authentication / credential delegation: not
+                // implemented, so (as with GSSAPIAuthentication) nothing to
+                // turn on; OpenSSH without a Kerberos ticket behaves alike.
+                'K' => {}
                 'M' => extra_o.push("ControlMaster yes".into()),
                 'n' => stdin_null = true,
                 'N' => no_command = true,

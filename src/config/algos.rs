@@ -4,11 +4,13 @@
 //! preference lists — `Ciphers`, `MACs`, `KexAlgorithms`,
 //! `HostKeyAlgorithms`, and (client-only) `PubkeyAcceptedAlgorithms`.
 //!
-//! puressh runs these in **strict** mode: every algorithm name a directive
-//! resolves to must be one this build actually implements, or the parse
-//! fails with [`ConfigError::BadValue`] naming the offending token and the
-//! source line. A directive that resolves to the empty set is likewise a
-//! `BadValue` — an SSH peer advertising an empty name-list cannot negotiate.
+//! Every algorithm name a directive resolves to is one this build actually
+//! implements. Names OpenSSH knows but puressh lacks (`aes128-cbc`,
+//! `ssh-dss`, ...) are dropped, so configs written for OpenSSH still load;
+//! any other unknown name fails the parse with [`ConfigError::BadValue`]
+//! naming the offending token and the source line. A directive that
+//! resolves to the empty set is likewise a `BadValue` — an SSH peer
+//! advertising an empty name-list cannot negotiate.
 //!
 //! ## List-modifier grammar (OpenSSH `ssh_config(5)`)
 //!
@@ -112,6 +114,97 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
     }
 }
 
+/// Algorithm names OpenSSH knows (some versions of it) that this build does
+/// not implement. Configs written for OpenSSH name them — `Ciphers
+/// +aes128-cbc` for old network gear, `PubkeyAcceptedKeyTypes +ssh-rsa` —
+/// and OpenSSH accepts them; here they are dropped from the list (neither
+/// side could use them), so such a file still loads. Names OpenSSH does not
+/// know either remain an error.
+fn openssh_only(cat: AlgoCategory) -> &'static [&'static str] {
+    const CIPHERS: &[&str] = &[
+        "3des-cbc",
+        "aes128-cbc",
+        "aes192-cbc",
+        "aes256-cbc",
+        "rijndael-cbc@lysator.liu.se",
+        "blowfish-cbc",
+        "cast128-cbc",
+        "arcfour",
+        "arcfour128",
+        "arcfour256",
+        "aes128-ctr",
+        "aes192-ctr",
+        "aes256-ctr",
+        "aes128-gcm@openssh.com",
+        "aes256-gcm@openssh.com",
+        "chacha20-poly1305@openssh.com",
+    ];
+    const MACS: &[&str] = &[
+        "hmac-sha1",
+        "hmac-sha1-96",
+        "hmac-sha2-256",
+        "hmac-sha2-512",
+        "hmac-md5",
+        "hmac-md5-96",
+        "umac-64@openssh.com",
+        "umac-128@openssh.com",
+        "hmac-sha1-etm@openssh.com",
+        "hmac-sha1-96-etm@openssh.com",
+        "hmac-sha2-256-etm@openssh.com",
+        "hmac-sha2-512-etm@openssh.com",
+        "hmac-md5-etm@openssh.com",
+        "hmac-md5-96-etm@openssh.com",
+        "umac-64-etm@openssh.com",
+        "umac-128-etm@openssh.com",
+    ];
+    const KEX: &[&str] = &[
+        "diffie-hellman-group1-sha1",
+        "diffie-hellman-group14-sha1",
+        "diffie-hellman-group14-sha256",
+        "diffie-hellman-group16-sha512",
+        "diffie-hellman-group18-sha512",
+        "diffie-hellman-group-exchange-sha1",
+        "diffie-hellman-group-exchange-sha256",
+        "ecdh-sha2-nistp256",
+        "ecdh-sha2-nistp384",
+        "ecdh-sha2-nistp521",
+        "curve25519-sha256",
+        "curve25519-sha256@libssh.org",
+        "sntrup761x25519-sha512",
+        "sntrup761x25519-sha512@openssh.com",
+        "mlkem768x25519-sha256",
+    ];
+    const KEYS: &[&str] = &[
+        "ssh-ed25519",
+        "ssh-ed25519-cert-v01@openssh.com",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ssh-ed25519-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp521",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+        "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
+        "ssh-dss",
+        "ssh-dss-cert-v01@openssh.com",
+        "ssh-rsa",
+        "ssh-rsa-cert-v01@openssh.com",
+        "rsa-sha2-256",
+        "rsa-sha2-256-cert-v01@openssh.com",
+        "rsa-sha2-512",
+        "rsa-sha2-512-cert-v01@openssh.com",
+    ];
+    match cat {
+        AlgoCategory::Cipher => CIPHERS,
+        AlgoCategory::Mac => MACS,
+        AlgoCategory::Kex => KEX,
+        AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted | AlgoCategory::CaSignature => KEYS,
+    }
+}
+
 /// The built-in default preference list for `cat` (what a bare-replace
 /// directive starts from for `+`/`-`/`^`). The KEX list excludes the
 /// strict-kex markers.
@@ -192,6 +285,24 @@ pub fn resolve_algo_list(
 
     let known = known_names(cat);
     let is_known = |name: &str| known.contains(&name);
+    // Names only OpenSSH implements are dropped here (see `openssh_only`);
+    // `-` takes globs and needs no filtering.
+    let named = tokens.len();
+    let tokens: Vec<String> = if modifier == Some('-') {
+        tokens
+    } else {
+        tokens
+            .into_iter()
+            .filter(|t| is_known(t) || !openssh_only(cat).contains(&t.as_str()))
+            .collect()
+    };
+    if named > 0 && tokens.is_empty() && modifier.is_none() {
+        return Err(bad_value(
+            line_no,
+            keyword,
+            "none of these algorithms is implemented by puressh".to_string(),
+        ));
+    }
 
     let result: Vec<String> = match modifier {
         // `-glob,...` — remove matching entries from the defaults. Tokens are
@@ -462,16 +573,55 @@ mod tests {
     }
 
     #[test]
-    fn pubkey_accepted_rejects_ssh_rsa() {
-        // The SHA-1 opt-in is HostKey-only; pubkey auth must still reject it.
-        let err = resolve_algo_list(
+    fn pubkey_accepted_never_takes_ssh_rsa() {
+        // The SHA-1 opt-in is HostKey-only: `+ssh-rsa` (common in configs
+        // for old servers) loads, as with OpenSSH, but adds nothing.
+        let got = resolve_algo_list(
             AlgoCategory::PubkeyAccepted,
             &args("+ssh-rsa"),
             1,
             "PubkeyAcceptedAlgorithms",
         )
-        .unwrap_err();
-        assert!(matches!(err, ConfigError::BadValue { .. }));
+        .unwrap();
+        assert!(!got.iter().any(|n| n == "ssh-rsa"));
+        assert_eq!(got, default_list(AlgoCategory::PubkeyAccepted));
+    }
+
+    #[test]
+    fn openssh_only_names_are_dropped_unknown_ones_refused() {
+        let got = resolve_algo_list(
+            AlgoCategory::Cipher,
+            &args("+aes128-cbc,3des-cbc"),
+            1,
+            "Ciphers",
+        )
+        .unwrap();
+        assert_eq!(got, default_list(AlgoCategory::Cipher));
+        let got = resolve_algo_list(
+            AlgoCategory::Cipher,
+            &args("aes256-cbc,aes256-ctr"),
+            1,
+            "Ciphers",
+        )
+        .unwrap();
+        assert_eq!(got, vec!["aes256-ctr"]);
+        // Only unimplemented names: nothing left to offer.
+        assert!(
+            resolve_algo_list(AlgoCategory::Cipher, &args("aes128-cbc"), 1, "Ciphers").is_err()
+        );
+        // Not an OpenSSH name either: still a typo to report.
+        assert!(
+            resolve_algo_list(AlgoCategory::Cipher, &args("+aes128-cbx"), 1, "Ciphers").is_err()
+        );
+        assert!(
+            resolve_algo_list(
+                AlgoCategory::Kex,
+                &args("+diffie-hellman-group1-sha1"),
+                1,
+                "KexAlgorithms"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

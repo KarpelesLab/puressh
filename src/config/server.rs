@@ -2674,7 +2674,17 @@ UsePrivilegeSeparation sandbox
         // Keywords OpenSSH rejects unless they are no-ops stay strict.
         assert!(SshServerConfig::parse("PermitTunnel yes\n").is_err());
         assert!(SshServerConfig::parse("PermitTunnel no\n").is_ok());
-        assert!(SshServerConfig::parse("PubkeyAcceptedKeyTypes +ssh-dss\n").is_err());
+        // DSA keys are an OpenSSH algorithm this server lacks: the line loads
+        // (OpenSSH's own configs carry it) and enables nothing.
+        let cfg = SshServerConfig::parse("PubkeyAcceptedKeyTypes +ssh-dss\n").unwrap();
+        let r = cfg.resolve(&MatchContext::default(), ExecPolicy::Deny);
+        assert!(
+            !r.pubkey_accepted_algorithms
+                .unwrap()
+                .iter()
+                .any(|a| a == "ssh-dss")
+        );
+        assert!(SshServerConfig::parse("PubkeyAcceptedKeyTypes +ssh-dsx\n").is_err());
     }
 
     #[test]

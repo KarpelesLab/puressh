@@ -2771,26 +2771,24 @@ Match User alice
         assert_eq!(base.max_auth_tries, Some(3));
 
         // Warnings and errors name the included file, as OpenSSH does.
-        let conf = write(
+        // (Matched on the file name: Windows paths come back with `\`.)
+        write(
             "sshd_config.d/20-krb.conf",
             "\nKerberosAuthentication yes\n",
         );
         let cfg = SshServerConfig::load(&root).expect("load");
         let w: Vec<_> = cfg.warnings().collect();
         assert!(
-            w.iter().any(|w| w.starts_with(&format!(
-                "{} line 2: KerberosAuthentication",
-                conf.display()
-            ))),
+            w.iter().any(|w| w.contains("sshd_config.d")
+                && w.contains("20-krb.conf line 2: KerberosAuthentication")),
             "{w:?}"
         );
-        let bad = write("sshd_config.d/30-bad.conf", "Port nope\n");
+        write("sshd_config.d/30-bad.conf", "Port nope\n");
         let err = SshServerConfig::load(&root).unwrap_err().to_string();
         assert!(
-            err.starts_with(&format!(
-                "config: {} line 1: bad value for port",
-                bad.display()
-            )),
+            err.starts_with("config: ")
+                && err.contains("sshd_config.d")
+                && err.contains("30-bad.conf line 1: bad value for port"),
             "{err}"
         );
 

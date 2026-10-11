@@ -456,49 +456,60 @@ impl SshServerConfig {
         let mut global = ServerOptions::default();
         let mut match_blocks: Vec<ServerMatchBlock> = Vec::new();
         for line in lines {
-            if line.keyword == "include" {
-                // The Include-expansion pass runs before us when the caller
-                // uses SshServerConfig::load (the std-only, file-based entry
-                // point). Seeing an Include here means we were reached via
-                // SshServerConfig::parse(&str), which has no filesystem
-                // context — refuse rather than silently drop.
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "Include requires file-based loading; use SshServerConfig::load() instead"
-                        .into(),
-                });
-            }
-            if line.keyword == "match" {
-                let conditions = parse_match_line_server(&line.args, line.line_no)?;
-                match_blocks.push(ServerMatchBlock {
-                    conditions,
-                    opts: ServerOptions::default(),
-                });
-                continue;
-            }
-            // Route the directive to the current block (the last Match block,
-            // or global if none has opened yet).
-            let in_match = !match_blocks.is_empty();
-            let target = match match_blocks.last_mut() {
-                Some(b) => &mut b.opts,
-                None => &mut global,
-            };
-            if in_match {
-                reject_invalid_in_match(&line)?;
-            }
-            // sshd_config(5): "for each parameter, the first obtained value
-            // will be used" (list keywords accumulate). Applying each line to
-            // a scratch block and merging gives exactly that, so a later
-            // drop-in or line cannot override an earlier one.
-            let mut one = ServerOptions::default();
-            apply_keyword(&mut one, &line)?;
-            target.warnings.append(&mut one.warnings);
-            merge_server_options(target, &one);
+            Self::apply_line(&mut global, &mut match_blocks, &line)
+                .map_err(|e| e.in_file(line.file.as_deref()))?;
         }
         Ok(SshServerConfig {
             global,
             match_blocks,
         })
+    }
+
+    /// Apply one line to the global section or the open `Match` block.
+    fn apply_line(
+        global: &mut ServerOptions,
+        match_blocks: &mut Vec<ServerMatchBlock>,
+        line: &ParsedLine,
+    ) -> Result<(), ConfigError> {
+        if line.keyword == "include" {
+            // The Include-expansion pass runs before us when the caller
+            // uses SshServerConfig::load (the std-only, file-based entry
+            // point). Seeing an Include here means we were reached via
+            // SshServerConfig::parse(&str), which has no filesystem
+            // context — refuse rather than silently drop.
+            return Err(ConfigError::Unsupported {
+                line: line.line_no,
+                msg: "Include requires file-based loading; use SshServerConfig::load() instead"
+                    .into(),
+            });
+        }
+        if line.keyword == "match" {
+            let conditions = parse_match_line_server(&line.args, line.line_no)?;
+            match_blocks.push(ServerMatchBlock {
+                conditions,
+                opts: ServerOptions::default(),
+            });
+            return Ok(());
+        }
+        // Route the directive to the current block (the last Match block,
+        // or global if none has opened yet).
+        let in_match = !match_blocks.is_empty();
+        let target = match match_blocks.last_mut() {
+            Some(b) => &mut b.opts,
+            None => global,
+        };
+        if in_match {
+            reject_invalid_in_match(line)?;
+        }
+        // sshd_config(5): "for each parameter, the first obtained value
+        // will be used" (list keywords accumulate). Applying each line to
+        // a scratch block and merging gives exactly that, so a later
+        // drop-in or line cannot override an earlier one.
+        let mut one = ServerOptions::default();
+        apply_keyword(&mut one, line)?;
+        target.warnings.append(&mut one.warnings);
+        merge_server_options(target, &one);
+        Ok(())
     }
 
     /// Resolve the effective [`ServerOptions`] for `ctx` with `sshd_config(5)`
@@ -1118,9 +1129,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             } else {
                 // Fail closed: the subsystem is simply not offered.
                 opts.warnings.push(format!(
-                    "line {}: Subsystem {name}: external-command subsystems are not \
+                    "{}: Subsystem {name}: external-command subsystems are not \
                      supported; requests for it will be refused",
-                    line.line_no
+                    line.location()
                 ));
             }
         }
@@ -1189,8 +1200,8 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             let lower = value.to_ascii_lowercase();
             if !(quiet.contains(&"*") || quiet.contains(&lower.as_str())) {
                 opts.warnings.push(format!(
-                    "line {}: {name} {value}: not implemented, ignored{}{note}",
-                    line.line_no,
+                    "{}: {name} {value}: not implemented, ignored{}{note}",
+                    line.location(),
                     if note.is_empty() { "" } else { " — " },
                 ));
             }
@@ -1319,8 +1330,8 @@ fn apply_sftp_server_args(
             "-f" | "-l" => i += 1,
             "-d" => {
                 opts.warnings.push(format!(
-                    "line {}: Subsystem sftp -d: start directory ignored",
-                    line.line_no
+                    "{}: Subsystem sftp -d: start directory ignored",
+                    line.location()
                 ));
                 i += 1;
             }
@@ -2758,6 +2769,30 @@ Match User alice
         let base = cfg.resolve(&MatchContext::default(), ExecPolicy::Deny);
         assert_eq!(base.port, Some(2022));
         assert_eq!(base.max_auth_tries, Some(3));
+
+        // Warnings and errors name the included file, as OpenSSH does.
+        let conf = write(
+            "sshd_config.d/20-krb.conf",
+            "\nKerberosAuthentication yes\n",
+        );
+        let cfg = SshServerConfig::load(&root).expect("load");
+        let w: Vec<_> = cfg.warnings().collect();
+        assert!(
+            w.iter().any(|w| w.starts_with(&format!(
+                "{} line 2: KerberosAuthentication",
+                conf.display()
+            ))),
+            "{w:?}"
+        );
+        let bad = write("sshd_config.d/30-bad.conf", "Port nope\n");
+        let err = SshServerConfig::load(&root).unwrap_err().to_string();
+        assert!(
+            err.starts_with(&format!(
+                "config: {} line 1: bad value for port",
+                bad.display()
+            )),
+            "{err}"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

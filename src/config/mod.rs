@@ -104,24 +104,51 @@ pub enum ConfigError {
         /// Human-readable description of the unsupported construct.
         msg: String,
     },
+    /// An error in a file brought in by `Include`.
+    InFile {
+        /// The included file's path.
+        file: String,
+        /// The error, with its line number in that file.
+        error: alloc::boxed::Box<ConfigError>,
+    },
+}
+
+impl ConfigError {
+    /// `error`, located in the included `file` (no-op for `None`).
+    pub(crate) fn in_file(self, file: Option<&str>) -> Self {
+        match file {
+            Some(f) if !matches!(self, ConfigError::InFile { .. }) => ConfigError::InFile {
+                file: f.into(),
+                error: alloc::boxed::Box::new(self),
+            },
+            _ => self,
+        }
+    }
+
+    fn write_located(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ConfigError::Syntax { line, msg } => write!(f, "line {line}: syntax: {msg}"),
+            ConfigError::UnknownKeyword { line, keyword } => {
+                write!(f, "line {line}: unknown keyword: {keyword}")
+            }
+            ConfigError::BadValue { line, keyword, msg } => {
+                write!(f, "line {line}: bad value for {keyword}: {msg}")
+            }
+            ConfigError::Unsupported { line, msg } => {
+                write!(f, "line {line}: unsupported: {msg}")
+            }
+            ConfigError::InFile { file, error } => {
+                write!(f, "{file} ")?;
+                error.write_located(f)
+            }
+        }
+    }
 }
 
 impl core::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            ConfigError::Syntax { line, msg } => {
-                write!(f, "config: line {line}: syntax: {msg}")
-            }
-            ConfigError::UnknownKeyword { line, keyword } => {
-                write!(f, "config: line {line}: unknown keyword: {keyword}")
-            }
-            ConfigError::BadValue { line, keyword, msg } => {
-                write!(f, "config: line {line}: bad value for {keyword}: {msg}")
-            }
-            ConfigError::Unsupported { line, msg } => {
-                write!(f, "config: line {line}: unsupported: {msg}")
-            }
-        }
+        f.write_str("config: ")?;
+        self.write_located(f)
     }
 }
 

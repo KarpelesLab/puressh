@@ -25,6 +25,20 @@ pub struct ParsedLine {
     pub keyword: String,
     /// Whitespace-separated value tokens with quoting/escaping resolved.
     pub args: Vec<String>,
+    /// The file the line came from when an `Include` brought it in (`None`
+    /// for the file or string being parsed itself).
+    pub file: Option<String>,
+}
+
+impl ParsedLine {
+    /// Where the line is, for messages: `line 3`, or `<file> line 3` for an
+    /// included file (as OpenSSH words it).
+    pub fn location(&self) -> String {
+        match &self.file {
+            Some(f) => alloc::format!("{f} line {}", self.line_no),
+            None => alloc::format!("line {}", self.line_no),
+        }
+    }
 }
 
 /// Tokenize `src` into a vector of [`ParsedLine`] events.
@@ -77,6 +91,7 @@ pub fn tokenize(src: &str) -> Result<Vec<ParsedLine>, ConfigError> {
             line_no,
             keyword,
             args: toks,
+            file: None,
         });
     }
     Ok(out)

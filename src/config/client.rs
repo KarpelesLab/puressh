@@ -630,61 +630,65 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
     }];
     let mut ignore_unknown: Option<String> = None;
     for line in lines {
-        match line.keyword.as_str() {
-            "host" => {
-                if line.args.is_empty() {
-                    return Err(ConfigError::BadValue {
-                        line: line.line_no,
-                        keyword: "host".to_string(),
-                        msg: "Host requires at least one pattern".into(),
+        let mut apply = || -> Result<(), ConfigError> {
+            match line.keyword.as_str() {
+                "host" => {
+                    if line.args.is_empty() {
+                        return Err(ConfigError::BadValue {
+                            line: line.line_no,
+                            keyword: "host".to_string(),
+                            msg: "Host requires at least one pattern".into(),
+                        });
+                    }
+                    blocks.push(Block::Host {
+                        patterns: HostPattern::parse_all(&line.args),
+                        opts: ClientOptions::default(),
                     });
                 }
-                blocks.push(Block::Host {
-                    patterns: HostPattern::parse_all(&line.args),
-                    opts: ClientOptions::default(),
-                });
-            }
-            "match" => {
-                let conditions = parse_match_line(&line.args, line.line_no)?;
-                blocks.push(Block::Match {
-                    conditions,
-                    opts: ClientOptions::default(),
-                });
-            }
-            "include" => {
-                // The Include-expansion pass runs before us when the caller
-                // uses SshClientConfig::load* (the std-only entry points). If
-                // we see an Include here, the user reached us via
-                // SshClientConfig::parse(&str), which has no filesystem
-                // context — refuse rather than silently drop.
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "Include requires file-based loading; use SshClientConfig::load() instead"
-                        .into(),
-                });
-            }
-            "ignoreunknown" => {
-                if ignore_unknown.is_none() {
-                    ignore_unknown = Some(line.args.join(","));
+                "match" => {
+                    let conditions = parse_match_line(&line.args, line.line_no)?;
+                    blocks.push(Block::Match {
+                        conditions,
+                        opts: ClientOptions::default(),
+                    });
+                }
+                "include" => {
+                    // The Include-expansion pass runs before us when the caller
+                    // uses SshClientConfig::load* (the std-only entry points). If
+                    // we see an Include here, the user reached us via
+                    // SshClientConfig::parse(&str), which has no filesystem
+                    // context — refuse rather than silently drop.
+                    return Err(ConfigError::Unsupported {
+                        line: line.line_no,
+                        msg: "Include requires file-based loading; use SshClientConfig::load() instead"
+                            .into(),
+                    });
+                }
+                "ignoreunknown" => {
+                    if ignore_unknown.is_none() {
+                        ignore_unknown = Some(line.args.join(","));
+                    }
+                }
+                _ => {
+                    let current = blocks.last_mut().expect("global block always present");
+                    match apply_keyword(current.opts_mut(), &line) {
+                        // `IgnoreUnknown`: unknown keywords matching its
+                        // patterns (seen earlier in the file) are skipped.
+                        Err(ConfigError::UnknownKeyword { .. })
+                            if ignore_unknown.as_deref().is_some_and(|pats| {
+                                let pats: Vec<HostPattern> = pats
+                                    .split(',')
+                                    .map(|p| HostPattern::parse(&p.to_ascii_lowercase()))
+                                    .collect();
+                                host_matches(&pats, &line.keyword)
+                            }) => {}
+                        r => r?,
+                    }
                 }
             }
-            _ => {
-                let current = blocks.last_mut().expect("global block always present");
-                match apply_keyword(current.opts_mut(), &line) {
-                    // `IgnoreUnknown`: unknown keywords matching its
-                    // patterns (seen earlier in the file) are skipped.
-                    Err(ConfigError::UnknownKeyword { .. })
-                        if ignore_unknown.as_deref().is_some_and(|pats| {
-                            let pats: Vec<HostPattern> = pats
-                                .split(',')
-                                .map(|p| HostPattern::parse(&p.to_ascii_lowercase()))
-                                .collect();
-                            host_matches(&pats, &line.keyword)
-                        }) => {}
-                    r => r?,
-                }
-            }
-        }
+            Ok(())
+        };
+        apply().map_err(|e| e.in_file(line.file.as_deref()))?;
     }
     Ok(blocks)
 }
@@ -2803,7 +2807,11 @@ Match host gw
             let p = dir.path.join("loop.cfg");
             let body = format!("Include {}\n", p.display());
             std::fs::write(&p, body).expect("write loop.cfg");
-            let err = SshClientConfig::load(&p).unwrap_err();
+            // Reported in the file whose Include went one level too deep.
+            let err = match SshClientConfig::load(&p).unwrap_err() {
+                ConfigError::InFile { error, .. } => *error,
+                e => e,
+            };
             match err {
                 ConfigError::Syntax { msg, .. } => {
                     assert!(msg.contains("max depth"), "msg = {msg}");

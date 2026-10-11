@@ -94,7 +94,12 @@ fn tokenize_included_file(path: &Path, depth: usize) -> Result<Vec<ParsedLine>, 
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    expand_includes(tokenize(&src)?, &base_dir, depth)
+    let name = path.display().to_string();
+    let mut lines = tokenize(&src).map_err(|e| e.in_file(Some(&name)))?;
+    for l in &mut lines {
+        l.file = Some(name.clone());
+    }
+    expand_includes(lines, &base_dir, depth).map_err(|e| e.in_file(Some(&name)))
 }
 
 /// Walk a token stream and replace every `include` line in-place with the

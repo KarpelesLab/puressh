@@ -195,8 +195,14 @@ impl<S: Read + Write> Receiver<S> {
     }
 
     fn recv_dir(&mut self, mode: u32, name: &str) -> Result<(), ScpError> {
-        let parent = self.current_dir();
-        let target = parent.join(name);
+        // As with OpenSSH's sink, a top-level directory sent to a target
+        // that is not an existing directory becomes the target itself
+        // (`scp -r dir host:newname`).
+        let target = if self.stack.is_empty() && self.opts.target_is_file {
+            self.base.clone()
+        } else {
+            self.current_dir().join(name)
+        };
         self.guard_path(&target)?;
         // If `target` already exists, it MUST be a real directory — not a
         // symlink (even one pointing into a directory), not a regular file.

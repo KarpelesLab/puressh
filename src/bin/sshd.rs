@@ -4499,11 +4499,14 @@ mod imp {
             if self.debug {
                 eprintln!("sshd: sftp session opened for {user}");
             }
+            // Report an exit status like OpenSSH's sftp-server process does:
+            // scp and sftp treat a session without one as a failure.
+            let mut stream = stream;
+            let res = session.run(&mut stream);
+            let _ = stream.send_exit_status(if res.is_ok() { 0 } else { 1 });
             // Map SFTP-protocol errors into the generic puressh error type;
             // the dispatcher only cares whether the handler returned cleanly.
-            session
-                .run(stream)
-                .map_err(|e| puressh::Error::Io(std::io::Error::other(format!("sftp: {e:?}"))))?;
+            res.map_err(|e| puressh::Error::Io(std::io::Error::other(format!("sftp: {e:?}"))))?;
             if self.debug {
                 eprintln!("sshd: sftp session closed for {user}");
             }
@@ -4564,7 +4567,15 @@ mod imp {
             // Cheap pre-check before tokenising. We're after the literal
             // `scp ` prefix optionally preceded by whitespace.
             let t = command.trim_start();
-            t.starts_with("scp ") || t == "scp"
+            if !(t.starts_with("scp ") || t == "scp") {
+                return false;
+            }
+            // Only a plain `scp -t|-f path` runs in-process; anything else
+            // (a remote glob such as `scp -f -- *.txt`, other flags) goes to
+            // the user's shell and the system scp, as with OpenSSH.
+            tokenize_argv(command)
+                .ok()
+                .is_some_and(|argv| parse_scp_args(&argv).is_ok())
         }
 
         fn run(
@@ -4619,7 +4630,8 @@ mod imp {
                 );
             }
 
-            match parsed.role {
+            let mut stream = stream;
+            let res = match parsed.role {
                 ScpRole::To => {
                     // `scp -t` — the peer is the sender, we receive.
                     let mut opts = ScpRecvOptions::default();
@@ -4629,26 +4641,20 @@ mod imp {
                     // directory we use it as the parent; otherwise it's
                     // the literal file path.
                     opts.target_is_file = !abs_path.is_dir();
-                    let mut rx = ScpReceiver::new(stream, &abs_path, opts).map_err(|e| {
-                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
-                    })?;
-                    rx.run().map_err(|e| {
-                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
-                    })?;
+                    ScpReceiver::new(&mut stream, &abs_path, opts).and_then(|mut rx| rx.run())
                 }
                 ScpRole::From => {
                     // `scp -f` — we read from disk and send to the peer.
                     let mut opts = ScpSendOptions::default();
                     opts.recursive = parsed.recursive;
                     opts.preserve_times = parsed.preserve_times;
-                    let mut tx = ScpSender::new(stream).map_err(|e| {
-                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
-                    })?;
-                    tx.send_path(&abs_path, &opts).map_err(|e| {
-                        puressh::Error::Io(std::io::Error::other(format!("scp: {e}")))
-                    })?;
+                    ScpSender::new(&mut stream).and_then(|mut tx| tx.send_path(&abs_path, &opts))
                 }
-            }
+            };
+            // An exit status, as the scp process would have: the client
+            // treats a session without one as a failure.
+            let _ = stream.send_exit_status(if res.is_ok() { 0 } else { 1 });
+            res.map_err(|e| puressh::Error::Io(std::io::Error::other(format!("scp: {e}"))))?;
             Ok(())
         }
     }

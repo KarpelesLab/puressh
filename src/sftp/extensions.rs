@@ -34,7 +34,12 @@ pub const SSH_FXE_STATVFS_ST_RDONLY: u64 = 0x1;
 pub const SSH_FXE_STATVFS_ST_NOSUID: u64 = 0x2;
 
 /// The `(name, version)` pairs we advertise in our `SSH_FXP_VERSION` reply.
+/// `users-groups-by-id@openssh.com`: user and group names for ids (what
+/// `ls -l` shows).
+pub const EXT_USERS_GROUPS_BY_ID: &str = "users-groups-by-id@openssh.com";
+
 pub const ADVERTISED_EXTENSIONS: &[(&str, &str)] = &[
+    (EXT_USERS_GROUPS_BY_ID, "1"),
     (EXT_POSIX_RENAME, "1"),
     (EXT_STATVFS, "2"),
     (EXT_FSTATVFS, "2"),

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use super::extensions::{
     ADVERTISED_EXTENSIONS, EXT_FSTATVFS, EXT_FSYNC, EXT_HARDLINK, EXT_POSIX_RENAME, EXT_STATVFS,
+    EXT_USERS_GROUPS_BY_ID,
 };
 use super::packet::{self, Packet, read_packet, write_packet};
 use super::path::{is_inside, lexically_clean, resolve};
@@ -859,12 +860,58 @@ impl SftpServerSession {
             EXT_FSYNC => self.op_ext_fsync(id, &data),
             EXT_STATVFS => self.op_ext_statvfs(id, &data),
             EXT_FSTATVFS => self.op_ext_fstatvfs(id, &data),
+            EXT_USERS_GROUPS_BY_ID => self.op_ext_users_groups_by_id(id, &data),
             _ => Ok(status_pkt(
                 id,
                 FxpStatus::OpUnsupported,
                 "unknown extension",
             )),
         }
+    }
+
+    /// `users-groups-by-id@openssh.com`: two strings of packed `uint32` ids
+    /// in, two strings of name strings out (empty for an unknown id).
+    fn op_ext_users_groups_by_id(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        /// Ids per request: what one `ls -l` needs, bounded.
+        const MAX_IDS: usize = 1024;
+        let mut r = Reader::new(data);
+        let uids = r.read_string()?.to_vec();
+        let gids = r.read_string()?.to_vec();
+        if uids.len() % 4 != 0 || gids.len() % 4 != 0 || (uids.len() + gids.len()) / 4 > MAX_IDS {
+            return Ok(status_pkt(id, FxpStatus::BadMessage, "bad id list"));
+        }
+        let names = |ids: &[u8], lookup: &dyn Fn(u32) -> Option<String>| {
+            let mut out = Vec::new();
+            for c in ids.chunks(4) {
+                let n = lookup(u32::from_be_bytes([c[0], c[1], c[2], c[3]])).unwrap_or_default();
+                out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+                out.extend_from_slice(n.as_bytes());
+            }
+            out
+        };
+        #[cfg(unix)]
+        let (users, groups) = (
+            names(&uids, &|u| {
+                nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(u))
+                    .ok()
+                    .flatten()
+                    .map(|u| u.name)
+            }),
+            names(&gids, &|g| {
+                nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(g))
+                    .ok()
+                    .flatten()
+                    .map(|g| g.name)
+            }),
+        );
+        #[cfg(not(unix))]
+        let (users, groups) = (names(&uids, &|_| None), names(&gids, &|_| None));
+        let mut reply = Vec::with_capacity(8 + users.len() + groups.len());
+        reply.extend_from_slice(&(users.len() as u32).to_be_bytes());
+        reply.extend_from_slice(&users);
+        reply.extend_from_slice(&(groups.len() as u32).to_be_bytes());
+        reply.extend_from_slice(&groups);
+        Ok(Packet::ExtendedReply { id, data: reply })
     }
 
     fn op_ext_posix_rename(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
@@ -1151,9 +1198,45 @@ fn apply_attrs(
                 fs::set_permissions(path, fs::Permissions::from_mode(masked))?;
             }
         }
-        // chown and atime/mtime require either root or the libc utimes()
-        // wrappers; we punt on them for now (they're rarely exercised by
-        // SFTP clients) and return Ok so partial setstat is honoured.
+        // Ownership and times, as OpenSSH's sftp-server applies them
+        // (`scp -p`, `put -p`, `chown`). Jailed sessions never follow a
+        // symlink at the final component.
+        let follow = if jailed {
+            nix::fcntl::AtFlags::AT_SYMLINK_NOFOLLOW
+        } else {
+            nix::fcntl::AtFlags::empty()
+        };
+        let errno_to_sftp = |e: nix::errno::Errno| match e {
+            nix::errno::Errno::EPERM | nix::errno::Errno::EACCES => {
+                SftpError::status_msg(FxpStatus::PermissionDenied, "permission denied")
+            }
+            nix::errno::Errno::ELOOP => {
+                SftpError::status_msg(FxpStatus::NoSuchFile, "symlink rejected")
+            }
+            other => SftpError::Io(io::Error::from_raw_os_error(other as i32)),
+        };
+        if let Some((uid, gid)) = a.uid_gid {
+            nix::unistd::fchownat(
+                nix::fcntl::AT_FDCWD,
+                path,
+                Some(nix::unistd::Uid::from_raw(uid)),
+                Some(nix::unistd::Gid::from_raw(gid)),
+                follow,
+            )
+            .map_err(errno_to_sftp)?;
+        }
+        if let Some((atime, mtime)) = a.atime_mtime {
+            use nix::sys::time::TimeSpec;
+            let at = TimeSpec::new(i64::from(atime) as _, 0);
+            let mt = TimeSpec::new(i64::from(mtime) as _, 0);
+            let flags = if jailed {
+                nix::sys::stat::UtimensatFlags::NoFollowSymlink
+            } else {
+                nix::sys::stat::UtimensatFlags::FollowSymlink
+            };
+            nix::sys::stat::utimensat(nix::fcntl::AT_FDCWD, path, &at, &mt, flags)
+                .map_err(errno_to_sftp)?;
+        }
     }
     #[cfg(not(unix))]
     {

@@ -1385,35 +1385,8 @@ fn parse_preferred_auth(line: &ParsedLine) -> Result<Vec<String>, ConfigError> {
             msg: "PreferredAuthentications requires at least one method".into(),
         });
     }
-    // Known OpenSSH method names. `gssapi-with-mic` / `hostbased` are
-    // understood-but-unimplemented: we tolerate them in the list (so a
-    // shared config doesn't break) but they contribute nothing usable.
-    const KNOWN: &[&str] = &[
-        "publickey",
-        "password",
-        "keyboard-interactive",
-        "none",
-        "gssapi-with-mic",
-        "hostbased",
-    ];
-    const IMPLEMENTED: &[&str] = &["publickey", "password", "none"];
-    for m in &methods {
-        if !KNOWN.contains(&m.as_str()) {
-            return Err(ConfigError::BadValue {
-                line: line.line_no,
-                keyword: line.keyword.clone(),
-                msg: format!("unknown authentication method {m:?}"),
-            });
-        }
-    }
-    if !methods.iter().any(|m| IMPLEMENTED.contains(&m.as_str())) {
-        return Err(ConfigError::Unsupported {
-            line: line.line_no,
-            msg: "PreferredAuthentications names only methods this client does not \
-                  implement (publickey/password are the supported methods)"
-                .into(),
-        });
-    }
+    // Like OpenSSH, any method name is accepted: Ansible's defaults list
+    // `gssapi-keyex` and `hostbased`, which are simply never tried.
     Ok(methods)
 }
 
@@ -2240,16 +2213,17 @@ Host *.example.com !secret.example.com
     }
 
     #[test]
-    fn preferred_authentications_only_unimplementable_unsupported() {
-        let err = SshClientConfig::parse("PreferredAuthentications gssapi-with-mic,hostbased\n")
-            .unwrap_err();
-        assert!(matches!(err, ConfigError::Unsupported { .. }));
-    }
-
-    #[test]
-    fn preferred_authentications_unknown_method_rejected() {
-        let err = SshClientConfig::parse("PreferredAuthentications quantum\n").unwrap_err();
-        assert!(matches!(err, ConfigError::BadValue { .. }));
+    fn preferred_authentications_accepts_any_method_like_openssh() {
+        // Ansible's default list; methods we lack are just never tried.
+        let cfg = SshClientConfig::parse(
+            "PreferredAuthentications gssapi-with-mic,gssapi-keyex,hostbased,publickey\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.lookup("h").preferred_authentications.unwrap(),
+            ["gssapi-with-mic", "gssapi-keyex", "hostbased", "publickey"]
+        );
+        assert!(SshClientConfig::parse("PreferredAuthentications hostbased\n").is_ok());
     }
 
     #[test]

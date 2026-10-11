@@ -98,6 +98,8 @@ pub struct ClientDriver {
 
     banner_lines: usize,
     banner_total: usize,
+    /// User authentication has succeeded (see [`Self::notify_auth_success`]).
+    authenticated: bool,
 }
 
 impl ClientDriver {
@@ -118,6 +120,7 @@ impl ClientDriver {
             inbox: Vec::new(),
             outbox: VecDeque::new(),
             events: VecDeque::new(),
+            authenticated: false,
             deferred: VecDeque::new(),
             deferred_bytes: 0,
             deferred_out: VecDeque::new(),
@@ -202,6 +205,7 @@ impl ClientDriver {
     /// its auth driver reports success, before the next packet is read.
     pub fn notify_auth_success(&mut self) {
         self.codec.activate_compress();
+        self.authenticated = true;
         self.runner.arm_ext_info_post_auth();
     }
 
@@ -376,6 +380,13 @@ impl ClientDriver {
             }
             Some(SSH_MSG_PONG) => Ok(()),
             Some(SSH_MSG_EXT_INFO) => {
+                // RFC 8308 §2.4 puts the server's second EXT_INFO
+                // immediately *before* USERAUTH_SUCCESS (OpenSSH 8.x sends
+                // it there), so it is accepted throughout user
+                // authentication once the keys are in.
+                if !self.authenticated && self.phase != Phase::Kex {
+                    self.runner.arm_ext_info_post_auth();
+                }
                 if !self.runner.may_accept_ext_info() {
                     return Err(Error::Protocol("unexpected SSH_MSG_EXT_INFO"));
                 }

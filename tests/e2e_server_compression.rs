@@ -121,7 +121,7 @@ fn spawn_our_sshd(tmp: &Path) -> Option<(u16, String, PathBuf, SshdGuard)> {
         // Test keys live in a user-owned tempdir, not root-owned; relax the
         // ownership/permission checks that would otherwise refuse them.
         .arg("--no-strict-modes")
-        .stderr(Stdio::null())
+        .stderr(std::fs::File::create(tmp.join("sshd.log")).expect("sshd log"))
         .stdout(Stdio::null())
         .stdin(Stdio::null())
         .spawn()
@@ -179,8 +179,9 @@ fn server_compresses_large_stdout_for_real_ssh_client() {
     };
     assert!(
         out.status.success(),
-        "ssh exec failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "ssh exec failed: {}\n--- sshd log ---\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        std::fs::read_to_string(tmp.join("sshd.log")).unwrap_or_default()
     );
 
     let expected: String = std::iter::repeat_n(LINE, LINES)

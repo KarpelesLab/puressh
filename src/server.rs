@@ -1180,6 +1180,9 @@ pub struct EffectivePolicy {
     /// `ClientAliveCountMax` — unanswered keepalives tolerated. `None` ⇒
     /// default 3.
     pub client_alive_count_max: Option<u32>,
+    /// `UnusedConnectionTimeout` in seconds (`None`/`0` ⇒ never): close a
+    /// connection with no open channel after this long.
+    pub unused_connection_timeout: Option<u32>,
     /// `PrintMotd` — print `/etc/motd` for interactive shells. `None` ⇒
     /// default (no).
     pub print_motd: Option<bool>,
@@ -1217,6 +1220,7 @@ impl EffectivePolicy {
             chroot_directory: None,
             client_alive_interval: None,
             client_alive_count_max: None,
+            unused_connection_timeout: None,
             print_motd: None,
             permit_tty: None,
             disable_forwarding: None,
@@ -2087,6 +2091,7 @@ fn resolve_effective_policy(
         chroot_directory: opts.chroot_directory,
         client_alive_interval: opts.client_alive_interval,
         client_alive_count_max: opts.client_alive_count_max,
+        unused_connection_timeout: opts.unused_connection_timeout,
         print_motd: opts.print_motd,
         permit_tty: opts.permit_tty,
         disable_forwarding: opts.disable_forwarding,
@@ -2610,6 +2615,9 @@ struct ConnExtras {
     fast_until: Option<Instant>,
     /// Read timeout currently set on the socket while polling.
     tick: Duration,
+    /// Since when the connection has had no open channel (for
+    /// `UnusedConnectionTimeout`).
+    unused_since: Option<Instant>,
 }
 
 /// Poll interval while traffic flows (see [`ConnExtras::fast_until`]).
@@ -2627,6 +2635,7 @@ impl ConnExtras {
             last_activity: now,
             fast_until: None,
             tick: IDLE_TICK,
+            unused_since: Some(now),
             last_keepalive: now,
             missed_keepalives: 0,
         }
@@ -2702,7 +2711,30 @@ fn do_connection_loop(
         // the 50 ms tick even when nothing else is draining, so it can notice
         // a silent peer and emit `keepalive@openssh.com`.
         let keepalive_enabled = effective.client_alive_interval.is_some_and(|i| i > 0);
-        let want_polling = any_shell_alive
+        // No channel open (nothing to forward either): the connection stays
+        // up until the client closes it, as with OpenSSH, unless
+        // UnusedConnectionTimeout says otherwise.
+        let unused = !conn.channels().any(|c| !c.is_fully_closed())
+            && !any_forward_alive
+            && !any_agent_fwd_alive
+            && !any_x11_fwd_alive
+            && !any_streamlocal_fwd_alive;
+        let unused_timeout = effective
+            .unused_connection_timeout
+            .filter(|t| *t > 0)
+            .map(|t| Duration::from_secs(u64::from(t)));
+        if !unused {
+            extras.unused_since = None;
+        } else if let Some(limit) = unused_timeout {
+            let since = *extras.unused_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= limit {
+                // SSH_DISCONNECT_BY_APPLICATION.
+                let _ = srv_send_disconnect(stream, driver, 11, "unused connection timeout");
+                return Ok(());
+            }
+        }
+        let want_polling = (unused && unused_timeout.is_some())
+            || any_shell_alive
             || any_subsystem_alive
             || any_forward_alive
             || any_agent_fwd_alive
@@ -2764,27 +2796,24 @@ fn do_connection_loop(
             }
         }
 
-        if *any_channel_opened
-            && !conn.channels().any(|c| !c.is_fully_closed())
-            && !any_forward_alive
-            && !any_agent_fwd_alive
-            && !any_x11_fwd_alive
-            && !any_streamlocal_fwd_alive
-        {
-            return Ok(());
-        }
+        let _ = &any_channel_opened;
 
         // The driver handles re-key (in `handle_timeout`, ticked by `srv_read`),
         // EXT_INFO, PING/PONG, and KEX routing internally — and buffers app
         // packets received mid-re-key. `srv_read` therefore only ever surfaces
         // an application-layer payload.
-        let payload = if *polling_active {
-            match srv_read_maybe_timeout(stream, driver)? {
-                Some(p) => p,
-                None => continue, // poll tick; re-enter drain checks
-            }
+        // The client ending the connection (EOF, SSH_MSG_DISCONNECT, reset)
+        // is the normal way a session finishes.
+        let read = if *polling_active {
+            srv_read_maybe_timeout(stream, driver)
         } else {
-            srv_read(stream, driver, None)?
+            srv_read(stream, driver, None).map(Some)
+        };
+        let payload = match read {
+            Ok(Some(p)) => p,
+            Ok(None) => continue, // poll tick; re-enter drain checks
+            Err(e) if is_peer_close(&e) => return Ok(()),
+            Err(e) => return Err(e),
         };
 
         // Any inbound packet proves the peer is alive: reset the keepalive
@@ -4550,6 +4579,22 @@ fn srv_pump_out(stream: &mut TcpStream, driver: &mut ServerDriver) -> Result<()>
 fn srv_send(stream: &mut TcpStream, driver: &mut ServerDriver, payload: &[u8]) -> Result<()> {
     driver.enqueue_payload(payload)?;
     srv_pump_out(stream, driver)
+}
+
+/// Whether `e` is the client ending the connection: EOF, its
+/// `SSH_MSG_DISCONNECT`, or the socket being reset.
+fn is_peer_close(e: &Error) -> bool {
+    match e {
+        Error::Protocol(m) => *m == "connection closed" || *m == "peer sent SSH_MSG_DISCONNECT",
+        Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::ConnectionAborted
+        ),
+        _ => false,
+    }
 }
 
 /// Read one chunk off the transport (re-arming the pre-auth `deadline` first)

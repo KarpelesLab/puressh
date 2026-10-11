@@ -699,6 +699,8 @@ mod tests {
         assert_eq!(out, expected, "mio exec stdout round-trips");
         assert_eq!(exit, Some(0));
 
+        // The server keeps the connection until the client closes it.
+        drop(client);
         let start = Instant::now();
         while !*done.lock().unwrap() {
             if start.elapsed() > Duration::from_secs(10) {

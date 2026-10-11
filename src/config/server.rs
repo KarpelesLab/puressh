@@ -235,6 +235,9 @@ pub struct ServerOptions {
     /// `ClientAliveCountMax` — number of unanswered keepalives tolerated before
     /// the connection is dropped. `None` ⇒ default 3.
     pub client_alive_count_max: Option<u32>,
+    /// `UnusedConnectionTimeout` in seconds: close a connection that has
+    /// had no open channel for this long. `Some(0)` is `none`.
+    pub unused_connection_timeout: Option<u32>,
     /// `PrintMotd` (yes/no) — print `/etc/motd` for interactive shells.
     /// `None` ⇒ default (no).
     pub print_motd: Option<bool>,
@@ -570,6 +573,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(chroot_directory);
     take_scalar!(client_alive_interval);
     take_scalar!(client_alive_count_max);
+    take_scalar!(unused_connection_timeout);
     take_scalar!(print_motd);
     take_scalar!(compression);
     take_scalar!(rekey_limit);
@@ -1025,6 +1029,14 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         "clientaliveinterval" => {
             opts.client_alive_interval = Some(parse_duration_seconds(line)?);
         }
+        "unusedconnectiontimeout" => {
+            let v = one_arg(line)?;
+            opts.unused_connection_timeout = Some(if v.eq_ignore_ascii_case("none") {
+                0
+            } else {
+                parse_duration_str(&v, line)?
+            });
+        }
         "clientalivecountmax" => {
             let s = one_arg(line)?;
             opts.client_alive_count_max =
@@ -1195,11 +1207,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("PerSourcePenalties", &["*"], ""),
     ("PerSourcePenaltyExemptList", &["*"], ""),
     ("ChannelTimeout", &["none"], "channels are not timed out"),
-    (
-        "UnusedConnectionTimeout",
-        &["none"],
-        "idle connections are not timed out",
-    ),
     // Features this server does not have: ignoring them fails closed.
     ("SecurityKeyProvider", &["*"], ""),
     ("PubkeyAuthOptions", &["*"], ""),

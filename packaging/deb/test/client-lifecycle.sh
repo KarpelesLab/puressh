@@ -45,6 +45,7 @@ done
 dpkg-query -W -f='${Status}' openssh-client | grep -q 'install ok installed'
 
 step "use the client programs"
+set -x
 # Ubuntu's stock /etc/ssh/ssh_config (GSSAPIAuthentication, SendEnv, ...).
 if ! ssh -G localhost >"$TMP/G" 2>&1 || ! grep -q '^hostname localhost' "$TMP/G"; then
 	cat "$TMP/G"
@@ -83,6 +84,7 @@ cmp "$TMP/file" "$TMP/back"
 ssh-keyscan -p 2222 127.0.0.1 2>/dev/null | grep -q ssh-ed25519
 kill "$SSHD_PID"
 SSHD_PID=
+set +x
 
 step "remove puressh-client"
 apt-get remove -y puressh-client

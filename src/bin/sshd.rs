@@ -1143,6 +1143,13 @@ mod imp {
             &opts.client_alive_count_max.unwrap_or(3).to_string(),
         );
         line(
+            "unusedconnectiontimeout",
+            &match opts.unused_connection_timeout {
+                None | Some(0) => "none".to_string(),
+                Some(t) => t.to_string(),
+            },
+        );
+        line(
             "requiredrsasize",
             &opts
                 .required_rsa_size

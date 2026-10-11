@@ -189,6 +189,7 @@ jobs:
       # Real VM with systemd: stock OpenSSH -> puressh-server -> reload ->
       # purge openssh-server (host keys restored) -> back to OpenSSH.
       - name: Package lifecycle (replace OpenSSH and back)
+        timeout-minutes: 20
         run: sudo packaging/deb/test/lifecycle.sh out/*.deb
 
       # OpenSSH's client programs diverted and restored.

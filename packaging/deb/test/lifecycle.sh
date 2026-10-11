@@ -19,6 +19,12 @@ diagnose() {
 	timeout 20 systemctl status ssh.service ssh.socket --no-pager || true
 	timeout 20 journalctl --no-pager -n 100 || true
 	ps -eo pid,ppid,stat,etime,wchan:20,args --forest | grep -v ' \[' | tail -80 || true
+	for p in $(pgrep -f 'sshd' || true); do
+		printf -- '--- pid %s: %s\n' "$p" "$(tr '\0' ' ' </proc/$p/cmdline 2>/dev/null)"
+		grep -E '^(State|Uid|Gid)' /proc/$p/status 2>/dev/null || true
+		ls -l /proc/$p/fd 2>/dev/null | tail -n +2 || true
+		cat /proc/$p/stack 2>/dev/null || true
+	done
 	return "$status"
 }
 trap diagnose EXIT
@@ -27,7 +33,7 @@ installed() { dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'install o
 try_ssh() {
 	# Retry briefly: the daemon may still be binding after a restart.
 	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		if out=$(ssh -F /dev/null -i /root/tester_key -o BatchMode=yes \
+		if out=$(timeout 30 ssh -F /dev/null -i /root/tester_key -o BatchMode=yes \
 			-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts \
 			"$@" 2>&1); then
 			printf '%s\n' "$out"
@@ -114,7 +120,7 @@ systemctl is-active ssh.service
 try_ssh tester@localhost 'echo reload-ok' | grep -q reload-ok
 echo jailed-data >/tmp/jail.txt
 printf 'pwd\nput /tmp/jail.txt /upload/jail.txt\nls /\n' >/tmp/jail.batch
-if ! sftp -F /dev/null -i /root/tester_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+if ! timeout 60 sftp -F /dev/null -i /root/tester_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
 	-o UserKnownHostsFile=/root/known_hosts -b /tmp/jail.batch jailed@localhost >/tmp/jail.out 2>&1; then
 	cat /tmp/jail.out
 	exit 1
@@ -123,7 +129,7 @@ grep -q 'Remote working directory: /$' /tmp/jail.out
 cmp /tmp/jail.txt /srv/jail/jailed/upload/jail.txt
 # The jail's root is all the session sees, and no shell is to be had.
 if grep -q home /tmp/jail.out; then cat /tmp/jail.out; exit 1; fi
-out=$(ssh -F /dev/null -i /root/tester_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+out=$(timeout 60 ssh -F /dev/null -i /root/tester_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
 	-o UserKnownHostsFile=/root/known_hosts jailed@localhost 'echo shell-ok' </dev/null 2>&1 || true)
 if echo "$out" | grep -q shell-ok; then echo "jailed user got a shell"; exit 1; fi
 rm -f /etc/ssh/sshd_config.d/50-jail.conf

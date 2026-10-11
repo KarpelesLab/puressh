@@ -2603,7 +2603,21 @@ struct ConnExtras {
     last_keepalive: Instant,
     /// Number of keepalive requests sent without a matching reply.
     missed_keepalives: u32,
+    /// While traffic flows, the loop polls at [`FAST_TICK`] instead of
+    /// [`IDLE_TICK`] until this instant, so a reply produced by a handler
+    /// thread (sftp, exec, a shell's echo) goes out at once instead of
+    /// waiting out a read timeout.
+    fast_until: Option<Instant>,
+    /// Read timeout currently set on the socket while polling.
+    tick: Duration,
 }
+
+/// Poll interval while traffic flows (see [`ConnExtras::fast_until`]).
+const FAST_TICK: Duration = Duration::from_millis(1);
+/// Poll interval when the connection is quiet.
+const IDLE_TICK: Duration = Duration::from_millis(50);
+/// How long after the last traffic the loop keeps the fast tick.
+const FAST_WINDOW: Duration = Duration::from_millis(250);
 
 impl ConnExtras {
     fn new() -> Self {
@@ -2611,6 +2625,8 @@ impl ConnExtras {
         ConnExtras {
             session_channels: BTreeSet::new(),
             last_activity: now,
+            fast_until: None,
+            tick: IDLE_TICK,
             last_keepalive: now,
             missed_keepalives: 0,
         }
@@ -2693,8 +2709,14 @@ fn do_connection_loop(
             || any_x11_fwd_alive
             || any_streamlocal_fwd_alive
             || keepalive_enabled;
-        if want_polling && !*polling_active {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
+        let tick = if extras.fast_until.is_some_and(|t| Instant::now() < t) {
+            FAST_TICK
+        } else {
+            IDLE_TICK
+        };
+        if want_polling && (!*polling_active || extras.tick != tick) {
+            let _ = stream.set_read_timeout(Some(tick));
+            extras.tick = tick;
             *polling_active = true;
         } else if !want_polling && *polling_active {
             let _ = stream.set_read_timeout(None);
@@ -2705,6 +2727,7 @@ fn do_connection_loop(
         // initiated `forwarded-tcpip` opens queued by `TcpipForwardHandler`
         // accept-loops. Only when no KEX is in flight.
         if *polling_active && !driver.is_kexing() {
+            let sent_before = driver.payloads_enqueued();
             drain_shells(stream, driver, conn, shells)?;
             finalize_exited_shells(stream, driver, conn, shells)?;
             drain_subsystems(stream, driver, conn, subsystems)?;
@@ -2712,6 +2735,9 @@ fn do_connection_loop(
             agent_forward.drain_pending(stream, driver, conn)?;
             x11_forward.drain_pending(stream, driver, conn)?;
             streamlocal_forward.drain_pending(stream, driver, conn)?;
+            if driver.payloads_enqueued() != sent_before {
+                extras.fast_until = Some(Instant::now() + FAST_WINDOW);
+            }
         }
 
         // ClientAliveInterval / ClientAliveCountMax (OpenSSH server keepalive).
@@ -2755,7 +2781,7 @@ fn do_connection_loop(
         let payload = if *polling_active {
             match srv_read_maybe_timeout(stream, driver)? {
                 Some(p) => p,
-                None => continue, // 50 ms tick; re-enter drain checks
+                None => continue, // poll tick; re-enter drain checks
             }
         } else {
             srv_read(stream, driver, None)?
@@ -2766,6 +2792,7 @@ fn do_connection_loop(
         // keepalive arrives as REQUEST_SUCCESS/FAILURE, but any traffic counts).
         extras.last_activity = Instant::now();
         extras.missed_keepalives = 0;
+        extras.fast_until = Some(extras.last_activity + FAST_WINDOW);
 
         dispatch_app_packet(
             stream,

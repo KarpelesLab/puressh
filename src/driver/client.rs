@@ -251,6 +251,11 @@ impl ClientDriver {
         self.outbox.pop_front()
     }
 
+    /// Whether decoded events are waiting to be popped.
+    pub fn has_pending_events(&self) -> bool {
+        !self.events.is_empty()
+    }
+
     /// Pop the next high-level [`Event`], if any.
     pub fn poll_event(&mut self) -> Option<Event> {
         self.events.pop_front()

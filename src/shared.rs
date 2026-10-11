@@ -102,6 +102,53 @@ use crate::sftp::{SftpClient, SftpError};
 /// burn CPU.
 const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// How long a pumper waits for input with the lock released before it
+/// ticks timers and lets waiters re-check their mailboxes.
+const PUMP_POLL: Duration = Duration::from_millis(50);
+
+/// A duplicate of the transport's descriptor, polled for readability
+/// without holding the connection lock: a pumper blocked in a read would
+/// otherwise hold the lock and delay every writer by up to the read
+/// timeout, one request/response round trip at a time (sftp, git).
+struct PollHandle {
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+}
+
+impl PollHandle {
+    fn from_client(client: &Client) -> Option<Arc<Self>> {
+        #[cfg(unix)]
+        {
+            client
+                .transport_poll_fd()
+                .map(|fd| Arc::new(PollHandle { fd }))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = client;
+            None
+        }
+    }
+
+    /// Whether the transport became readable within `timeout`.
+    fn wait_readable(&self, timeout: Duration) -> bool {
+        #[cfg(unix)]
+        {
+            use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+            use std::os::fd::AsFd;
+            let mut fds = [PollFd::new(self.fd.as_fd(), PollFlags::POLLIN)];
+            let ms = u16::try_from(timeout.as_millis()).unwrap_or(u16::MAX);
+            // Errors (EINTR included) mean "go and look".
+            !matches!(poll(&mut fds, PollTimeout::from(ms)), Ok(0))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = timeout;
+            true
+        }
+    }
+}
+
 /// Lock the shared mutex, mapping poison to `Error::Protocol`. Used by
 /// fallible API paths whose return type is `Result<_, crate::Error>` —
 /// they propagate poisoning as a hard error rather than panicking the
@@ -199,6 +246,7 @@ struct Inner {
 struct SelfRef {
     inner: std::sync::Weak<Mutex<Inner>>,
     lock_waiters: Arc<core::sync::atomic::AtomicUsize>,
+    poll: Option<Arc<PollHandle>>,
 }
 
 /// Server-opened channel callbacks installed with
@@ -236,12 +284,16 @@ pub struct SharedClient {
     /// lock, starving the data-reader thread that would otherwise
     /// drain SHELL prompt bytes.
     lock_waiters: Arc<core::sync::atomic::AtomicUsize>,
+    /// See [`PollHandle`]; `None` when the transport has no descriptor.
+    poll: Option<Arc<PollHandle>>,
 }
 
 impl From<Client> for SharedClient {
     fn from(client: Client) -> Self {
         let lock_waiters = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         let waiters = lock_waiters.clone();
+        let poll = PollHandle::from_client(&client);
+        let poll_ref = poll.clone();
         let inner = Arc::new_cyclic(|weak| {
             Mutex::new(Inner {
                 client,
@@ -252,12 +304,14 @@ impl From<Client> for SharedClient {
                 self_ref: Some(SelfRef {
                     inner: weak.clone(),
                     lock_waiters: waiters,
+                    poll: poll_ref,
                 }),
             })
         });
         Self {
             inner,
             lock_waiters,
+            poll,
         }
     }
 }
@@ -287,6 +341,40 @@ impl Drop for LockTicket<'_> {
 }
 
 impl SharedClient {
+    /// Called by the pumper (with `g.pumping` set) before reading: unless a
+    /// packet is already decoded, release the lock and wait for the
+    /// transport to become readable, so writers get through meanwhile.
+    /// Returns the re-acquired guard and whether there is input to pump.
+    fn await_input<'a>(
+        &'a self,
+        g: std::sync::MutexGuard<'a, Inner>,
+    ) -> std::io::Result<(std::sync::MutexGuard<'a, Inner>, bool)> {
+        let Some(poll) = &self.poll else {
+            return Ok((g, true));
+        };
+        if g.client.has_buffered_input() {
+            return Ok((g, true));
+        }
+        drop(g);
+        let ready = poll.wait_readable(PUMP_POLL);
+        Ok((lock_or_poison_io(&self.inner)?, ready))
+    }
+
+    /// One pump step for a pumper holding `g`: wait for input without the
+    /// lock, then read and dispatch a packet (or tick the timers).
+    fn pump_step<'a>(
+        &'a self,
+        g: std::sync::MutexGuard<'a, Inner>,
+    ) -> std::io::Result<(std::sync::MutexGuard<'a, Inner>, std::io::Result<()>)> {
+        let (mut g, ready) = self.await_input(g)?;
+        let res = if ready {
+            OwnedChannelStream::pump_one_step(&mut g)
+        } else {
+            g.client.tick_idle().map_err(io_err)
+        };
+        Ok((g, res))
+    }
+
     /// Open a session channel, request the `sftp` subsystem, perform the
     /// SFTP `INIT`/`VERSION` handshake, and return an owned
     /// [`SftpSession`]. Multiple SFTP sessions per `SharedClient` are
@@ -519,7 +607,7 @@ impl SharedClient {
                     false
                 } else {
                     g.pumping = true;
-                    let res = OwnedChannelStream::pump_one_step(&mut g);
+                    let (mut g, res) = self.pump_step(g)?;
                     g.pumping = false;
                     for cv in g.notifiers.values() {
                         cv.notify_one();
@@ -627,7 +715,7 @@ impl SharedClient {
             }
             if !g.pumping {
                 g.pumping = true;
-                let res = OwnedChannelStream::pump_one_step(&mut g);
+                let (mut g, res) = self.pump_step(g)?;
                 g.pumping = false;
                 for cv in g.notifiers.values() {
                     cv.notify_one();
@@ -676,7 +764,7 @@ impl SharedClient {
             }
             if !g.pumping {
                 g.pumping = true;
-                let res = OwnedChannelStream::pump_one_step(&mut g);
+                let (mut g, res) = self.pump_step(g)?;
                 g.pumping = false;
                 for cv in g.notifiers.values() {
                     cv.notify_one();
@@ -1058,6 +1146,7 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
     let shared = SharedClient {
         inner: arc,
         lock_waiters: self_ref.lock_waiters.clone(),
+        poll: self_ref.poll.clone(),
     };
     match g.client.conn.accept_open(channel) {
         Ok(p) => {
@@ -1425,7 +1514,7 @@ impl OwnedChannelStream {
             //    while no bytes are arriving.
             if !g.pumping {
                 g.pumping = true;
-                let res = Self::pump_one_step(&mut g);
+                let (mut g, res) = self.shared.pump_step(g)?;
                 g.pumping = false;
                 // Wake one waiter per registered channel. The pumper
                 // already notified the target channel's CV inside
@@ -1550,7 +1639,7 @@ impl Write for OwnedChannelStream {
             }
             if !g.pumping {
                 g.pumping = true;
-                let res = Self::pump_one_step(&mut g);
+                let (mut g, res) = self.shared.pump_step(g)?;
                 g.pumping = false;
                 for cv in g.notifiers.values() {
                     cv.notify_one();

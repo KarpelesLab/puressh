@@ -75,6 +75,9 @@ pub struct ServerDriver {
     /// *new* keys, which is what the peer expects after NEWKEYS.
     deferred_out: VecDeque<Vec<u8>>,
     deferred_out_bytes: usize,
+    /// Application payloads accepted by [`Self::enqueue_payload`]; the
+    /// connection loop reads it to tell whether a tick produced output.
+    payloads_enqueued: u64,
 
     /// The peer's (client's) identification string.
     v_c: Vec<u8>,
@@ -111,6 +114,7 @@ impl ServerDriver {
             deferred_bytes: 0,
             deferred_out: VecDeque::new(),
             deferred_out_bytes: 0,
+            payloads_enqueued: 0,
             v_c: Vec::new(),
             session_id: Vec::new(),
             rekey_policy: RekeyPolicy::default(),
@@ -186,8 +190,14 @@ impl ServerDriver {
 
     // --- pump surface ---
 
+    /// Number of application payloads enqueued so far.
+    pub fn payloads_enqueued(&self) -> u64 {
+        self.payloads_enqueued
+    }
+
     /// Encode `payload` with the current keys and queue it for transmission.
     pub fn enqueue_payload(&mut self, payload: &[u8]) -> Result<()> {
+        self.payloads_enqueued = self.payloads_enqueued.wrapping_add(1);
         // RFC 4253 §7.1: between our KEXINIT and NEWKEYS only messages 1–49
         // may go out. Holding the rest back is not politeness — a strict peer
         // (OpenSSH 10.4+) aborts the connection over a single stray

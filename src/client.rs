@@ -70,6 +70,15 @@ pub trait Transport: Read + Write + Send {
     fn set_write_timeout(&mut self, _t: Option<Duration>) -> std::io::Result<()> {
         Ok(())
     }
+
+    /// A duplicate of the descriptor reads come from, which
+    /// [`crate::shared::SharedClient`] polls for readability *without*
+    /// holding its connection lock, so writers are never stuck behind a
+    /// blocking read. `None` (the default) falls back to timed reads.
+    #[cfg(unix)]
+    fn poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        None
+    }
 }
 
 impl Transport for TcpStream {
@@ -78,6 +87,10 @@ impl Transport for TcpStream {
     }
     fn set_write_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, t)
+    }
+    #[cfg(unix)]
+    fn poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.try_clone().ok().map(std::os::fd::OwnedFd::from)
     }
 }
 
@@ -2691,6 +2704,24 @@ impl Client {
     /// per-channel egress draining, and by the `SharedClient` pump in
     /// short-timeout (interactive) mode to release its inner mutex
     /// between reads so siblings can write.
+    /// Whether a packet is already decoded and waiting (so there is no need
+    /// to wait for the transport).
+    pub(crate) fn has_buffered_input(&self) -> bool {
+        self.driver.has_pending_events()
+    }
+
+    /// See [`Transport::poll_fd`].
+    #[cfg(unix)]
+    pub(crate) fn transport_poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        self.stream.poll_fd()
+    }
+
+    /// Advance re-key / keepalive timers while the wire is idle.
+    pub(crate) fn tick_idle(&mut self) -> Result<()> {
+        self.driver.handle_timeout(Instant::now())?;
+        self.pump_out()
+    }
+
     pub(crate) fn read_one_packet_maybe_timeout(&mut self) -> Result<Option<Vec<u8>>> {
         match self.read_one_packet() {
             Ok(p) => Ok(Some(p)),

@@ -707,7 +707,7 @@ fn options_parser_principals_quoted() {
 
 #[test]
 fn options_parser_rejects_unknown_option() {
-    let line = format!("from=\"10.0.0.0/8\" {ED25519_PUB_LINE}");
+    let line = format!("frobnicate=\"10.0.0.0/8\" {ED25519_PUB_LINE}");
     assert!(PublicKey::parse_authorized_keys_line_with_options(&line).is_err());
 }
 
@@ -949,4 +949,43 @@ fn parse_rejects_rsa_with_inconsistent_private_components() {
         PrivateKey::parse_openssh_pem(&pem, None),
         Err(Error::Format(_))
     ));
+}
+
+#[test]
+fn authorized_keys_options_full_set() {
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGDqLCQkO+7NDJTeuHvKqEGRpz+o1cEdQqN8hHRPPSVt c";
+    let line = format!(
+        "restrict,pty,command=\"borg serve --restrict-to-path \\\"/b k\\\"\",from=\"10.0.0.0/8,!10.1.2.3\",\
+         permitopen=\"db:5432\",permitopen=\"*:80\",expiry-time=\"20300101\",No-X11-Forwarding {key}"
+    );
+    let (_blob, o) = PublicKey::parse_authorized_keys_line_with_options(&line).unwrap();
+    assert_eq!(
+        o.command.as_deref(),
+        Some("borg serve --restrict-to-path \"/b k\"")
+    );
+    assert_eq!(o.from.as_deref(), Some("10.0.0.0/8,!10.1.2.3"));
+    assert_eq!(
+        o.permit_open,
+        vec!["db:5432".to_string(), "*:80".to_string()]
+    );
+    assert_eq!(o.expiry_time.as_deref(), Some("20300101"));
+    assert!(o.restrict && o.allows_pty());
+    assert!(!o.allows_port_forwarding() && !o.allows_agent_forwarding());
+    assert!(!o.allows_x11_forwarding());
+    assert!(!o.is_unrestricted());
+
+    let (_, plain) = PublicKey::parse_authorized_keys_line_with_options(key).unwrap();
+    assert!(plain.is_unrestricted());
+
+    for bad in [
+        format!("bogus-option {key}"),
+        format!("command=unquoted {key}"),
+        format!("no-pty=\"x\" {key}"),
+        format!("command=\"open {key}"),
+    ] {
+        assert!(
+            PublicKey::parse_authorized_keys_line_with_options(&bad).is_err(),
+            "{bad}"
+        );
+    }
 }

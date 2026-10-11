@@ -41,11 +41,12 @@ pub(crate) fn base64_decode(input: &[u8]) -> Result<Vec<u8>> {
     base64::decode(input)
 }
 
-/// The certificate-relevant options recognised on an `authorized_keys` line by
+/// The options of an `authorized_keys` line (`sshd(8)`, "AUTHORIZED_KEYS
+/// FILE FORMAT"), parsed by
 /// [`PublicKey::parse_authorized_keys_line_with_options`].
 ///
-/// Only the options needed for certificate authentication are understood;
-/// anything else is a hard error (the strict "refuse unknown option" stance).
+/// Every OpenSSH option is understood; an unknown or malformed one makes the
+/// whole line invalid, as with OpenSSH (never silently dropped).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct AuthorizedKeyOptions {
@@ -55,17 +56,73 @@ pub struct AuthorizedKeyOptions {
     /// `principals="a,b,c"` — the principals this line authorizes. Empty when
     /// the option was absent.
     pub principals: Vec<String>,
+    /// `command="..."`: run this instead of what the client asks for.
+    pub command: Option<String>,
+    /// `from="pattern-list"`: client addresses / names the key is valid from.
+    pub from: Option<String>,
+    /// `environment="NAME=value"` (only with `PermitUserEnvironment`).
+    pub environment: Vec<String>,
+    /// `permitopen="host:port"`: allowed `-L` destinations (repeatable).
+    pub permit_open: Vec<String>,
+    /// `permitlisten="[host:]port"`: allowed `-R` listeners (repeatable).
+    pub permit_listen: Vec<String>,
+    /// `expiry-time="timespec"`: the key is refused after this time.
+    pub expiry_time: Option<String>,
+    /// `restrict`: everything below off unless re-enabled.
+    pub restrict: bool,
+    /// `pty` / `no-pty`.
+    pub pty: Option<bool>,
+    /// `port-forwarding` / `no-port-forwarding`.
+    pub port_forwarding: Option<bool>,
+    /// `agent-forwarding` / `no-agent-forwarding`.
+    pub agent_forwarding: Option<bool>,
+    /// `X11-forwarding` / `no-X11-forwarding`.
+    pub x11_forwarding: Option<bool>,
+    /// `user-rc` / `no-user-rc`.
+    pub user_rc: Option<bool>,
+    /// `tunnel="n"`.
+    pub tunnel: Option<String>,
+    /// `no-touch-required` (security keys).
+    pub no_touch_required: bool,
+    /// `verify-required` (security keys).
+    pub verify_required: bool,
 }
 
 impl AuthorizedKeyOptions {
+    /// Whether a pty may be allocated (`pty` / `no-pty` / `restrict`).
+    pub fn allows_pty(&self) -> bool {
+        self.pty.unwrap_or(!self.restrict)
+    }
+
+    /// Whether port forwarding is allowed.
+    pub fn allows_port_forwarding(&self) -> bool {
+        self.port_forwarding.unwrap_or(!self.restrict)
+    }
+
+    /// Whether agent forwarding is allowed.
+    pub fn allows_agent_forwarding(&self) -> bool {
+        self.agent_forwarding.unwrap_or(!self.restrict)
+    }
+
+    /// Whether X11 forwarding is allowed.
+    pub fn allows_x11_forwarding(&self) -> bool {
+        self.x11_forwarding.unwrap_or(!self.restrict)
+    }
+
+    /// Whether the line restricts anything at all.
+    pub fn is_unrestricted(&self) -> bool {
+        self.command.is_none()
+            && self.permit_open.is_empty()
+            && self.permit_listen.is_empty()
+            && self.allows_pty()
+            && self.allows_port_forwarding()
+            && self.allows_agent_forwarding()
+            && self.allows_x11_forwarding()
+    }
+
     /// Parse a comma-separated option list (the leading field of an
-    /// `authorized_keys` line). Recognises `cert-authority` and
-    /// `principals="..."`; every other option is rejected with
-    /// [`Error::Format`] rather than silently dropped.
-    ///
-    /// The grammar is intentionally minimal: options are split on commas that
-    /// are not inside a double-quoted value. This covers the
-    /// `cert-authority,principals="alice,bob"` forms used for cert auth.
+    /// `authorized_keys` line). Values are double-quoted, with `\"` for a
+    /// quote inside. Option names are case-insensitive.
     pub fn parse(list: &str) -> Result<Self> {
         let mut out = AuthorizedKeyOptions::default();
         for opt in split_options(list)? {
@@ -73,40 +130,113 @@ impl AuthorizedKeyOptions {
             if opt.is_empty() {
                 continue;
             }
-            if opt.eq_ignore_ascii_case("cert-authority") {
-                out.cert_authority = true;
-            } else if let Some(rest) = opt.strip_prefix("principals=") {
-                let val = rest.trim();
-                let val = val
-                    .strip_prefix('"')
-                    .and_then(|v| v.strip_suffix('"'))
-                    .ok_or(Error::Format(
-                        "authorized_keys: principals= value must be quoted",
-                    ))?;
-                out.principals = val
-                    .split(',')
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-            } else {
-                return Err(Error::Format(
-                    "authorized_keys: unknown option — refusing rather than silently dropping",
-                ));
+            let (name, value) = match opt.split_once('=') {
+                Some((n, v)) => (n.to_ascii_lowercase(), Some(dequote(v.trim())?)),
+                None => (opt.to_ascii_lowercase(), None),
+            };
+            let flag = |v: &Option<String>| {
+                if v.is_some() {
+                    Err(Error::Format("authorized_keys: option takes no value"))
+                } else {
+                    Ok(())
+                }
+            };
+            let need =
+                |v: Option<String>| v.ok_or(Error::Format("authorized_keys: option needs a value"));
+            match name.as_str() {
+                "cert-authority" => {
+                    flag(&value)?;
+                    out.cert_authority = true;
+                }
+                "principals" => {
+                    out.principals = need(value)?
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                }
+                "command" => out.command = Some(need(value)?),
+                "from" => out.from = Some(need(value)?),
+                "environment" => {
+                    let v = need(value)?;
+                    if !v.contains('=') {
+                        return Err(Error::Format("authorized_keys: bad environment"));
+                    }
+                    out.environment.push(v);
+                }
+                "permitopen" => out.permit_open.push(need(value)?),
+                "permitlisten" => out.permit_listen.push(need(value)?),
+                "expiry-time" => out.expiry_time = Some(need(value)?),
+                "tunnel" => out.tunnel = Some(need(value)?),
+                "restrict" => {
+                    flag(&value)?;
+                    out.restrict = true;
+                }
+                other => {
+                    flag(&value)?;
+                    let (on, what) = match other.strip_prefix("no-") {
+                        Some(w) => (false, w),
+                        None => (true, other),
+                    };
+                    match what {
+                        "pty" => out.pty = Some(on),
+                        "port-forwarding" => out.port_forwarding = Some(on),
+                        "agent-forwarding" => out.agent_forwarding = Some(on),
+                        "x11-forwarding" => out.x11_forwarding = Some(on),
+                        "user-rc" => out.user_rc = Some(on),
+                        "touch-required" if !on => out.no_touch_required = true,
+                        "verify-required" if on => out.verify_required = true,
+                        _ => {
+                            return Err(Error::Format(
+                                "authorized_keys: unknown option — refusing rather than silently dropping",
+                            ));
+                        }
+                    }
+                }
             }
         }
         Ok(out)
     }
 }
 
+/// Remove the surrounding double quotes of an option value, unescaping
+/// `\"`.
+fn dequote(v: &str) -> Result<String> {
+    let inner = v
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .ok_or(Error::Format(
+            "authorized_keys: option value must be quoted",
+        ))?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'"') {
+            out.push('"');
+            chars.next();
+        } else {
+            out.push(c);
+        }
+    }
+    Ok(out)
+}
+
 /// Split an `authorized_keys` option list on commas that are not inside a
-/// double-quoted value. Rejects an unterminated quote.
+/// double-quoted value (`\"` does not end a value). Rejects an unterminated
+/// quote.
 fn split_options(list: &str) -> Result<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut in_quotes = false;
+    let mut escaped = false;
     for ch in list.chars() {
         match ch {
-            '"' => {
+            '\\' if in_quotes && !escaped => {
+                escaped = true;
+                cur.push(ch);
+                continue;
+            }
+            '"' if !escaped => {
                 in_quotes = !in_quotes;
                 cur.push(ch);
             }
@@ -115,6 +245,7 @@ fn split_options(list: &str) -> Result<Vec<String>> {
             }
             _ => cur.push(ch),
         }
+        escaped = false;
     }
     if in_quotes {
         return Err(Error::Format(
@@ -123,6 +254,26 @@ fn split_options(list: &str) -> Result<Vec<String>> {
     }
     out.push(cur);
     Ok(out)
+}
+
+/// Length of the options field at the start of an `authorized_keys` line:
+/// up to the first whitespace outside double quotes.
+fn options_field_len(line: &str) -> usize {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (i, ch) in line.char_indices() {
+        match ch {
+            '\\' if in_quotes && !escaped => {
+                escaped = true;
+                continue;
+            }
+            '"' if !escaped => in_quotes = !in_quotes,
+            c if c.is_whitespace() && !in_quotes => return i,
+            _ => {}
+        }
+        escaped = false;
+    }
+    line.len()
 }
 
 /// SSH public key, tagged by algorithm.
@@ -395,15 +546,13 @@ impl PublicKey {
             return Err(Error::Format("authorized_keys: empty or comment line"));
         }
 
-        // The line is `[options] <algo> <base64> [comment]`. The first token is
-        // an algorithm name iff it is a known key/cert type; otherwise it is an
-        // option list (which may itself contain spaces inside quotes — but
-        // OpenSSH option lists never contain unquoted spaces, and the value
-        // quoting we support has no spaces, so a whitespace split is adequate
-        // for the options we accept).
+        // The line is `[options] <algo> <base64> [comment]`. The first field
+        // is an algorithm name iff it is a known key/cert type; otherwise it
+        // is the option list, which ends at the first whitespace outside
+        // double quotes (`command="a b"` keeps its spaces).
         let first_ws = line.find(char::is_whitespace);
-        let (first_tok, rest) = match first_ws {
-            Some(i) => (&line[..i], line[i..].trim_start()),
+        let first_tok = match first_ws {
+            Some(i) => &line[..i],
             None => return Err(Error::Format("authorized_keys: missing key blob")),
         };
 
@@ -411,10 +560,11 @@ impl PublicKey {
         let (algo_tok, after_algo) =
             if is_known_algorithm_name(first_tok) || crate::cert::is_cert_name(first_tok) {
                 // No options prefix.
-                (first_tok, rest)
+                (first_tok, line[first_tok.len()..].trim_start())
             } else {
-                // `first_tok` is an option list. Parse it strictly.
-                options = AuthorizedKeyOptions::parse(first_tok)?;
+                let opt_len = options_field_len(line);
+                options = AuthorizedKeyOptions::parse(&line[..opt_len])?;
+                let rest = line[opt_len..].trim_start();
                 let i = rest.find(char::is_whitespace).ok_or(Error::Format(
                     "authorized_keys: missing key blob after options",
                 ))?;

@@ -233,6 +233,15 @@ pub trait Authenticator: Send {
     /// Evaluate a one-shot attempt (none/password/publickey/keyboard-interactive request).
     fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision;
 
+    /// Restrictions for the session from the key that was just accepted
+    /// (a verified publickey attempt): typically its `authorized_keys`
+    /// options. Combined with a certificate's own restrictions.
+    #[cfg(feature = "alloc")]
+    fn key_restrictions(&mut self, user: &str, public_blob: &[u8]) -> Option<AuthCertCaps> {
+        let _ = (user, public_blob);
+        None
+    }
+
     /// Evaluate the responses to a previously-issued `InteractiveRequest`.
     fn evaluate_interactive(&mut self, user: &str, responses: Vec<String>) -> AuthDecision {
         let _ = (user, responses);
@@ -282,6 +291,12 @@ pub struct AuthCertCaps {
     /// The decoded `force-command` critical option (an SSH `string`), if present.
     /// The connection phase runs this in place of the client's command/shell.
     pub force_command: Option<String>,
+    /// `permitopen=` (authorized_keys): allowed `direct-tcpip` destinations,
+    /// on top of `PermitOpen`. `None` ⇒ no extra restriction.
+    pub permit_open: Option<Vec<crate::config::HostPort>>,
+    /// `permitlisten=` (authorized_keys): allowed `tcpip-forward` binds, on
+    /// top of `PermitListen`. `None` ⇒ no extra restriction.
+    pub permit_listen: Option<Vec<crate::config::HostPort>>,
 }
 
 #[cfg(feature = "alloc")]
@@ -306,8 +321,84 @@ impl AuthCertCaps {
             permit_agent_forwarding: ci.has_extension("permit-agent-forwarding"),
             permit_x11_forwarding: ci.has_extension("permit-X11-forwarding"),
             force_command,
+            permit_open: None,
+            permit_listen: None,
         }
     }
+
+    /// Everything permitted, no forced command: the identity for
+    /// [`Self::intersect`].
+    pub fn unrestricted() -> Self {
+        AuthCertCaps {
+            permit_pty: true,
+            permit_port_forwarding: true,
+            permit_agent_forwarding: true,
+            permit_x11_forwarding: true,
+            force_command: None,
+            permit_open: None,
+            permit_listen: None,
+        }
+    }
+
+    /// Restrictions from an `authorized_keys` line's options (`restrict`,
+    /// `no-pty`, `command=`, `permitopen=`, …).
+    pub fn from_key_options(o: &crate::key::AuthorizedKeyOptions) -> Self {
+        let list = |v: &[String]| {
+            (!v.is_empty()).then(|| v.iter().filter_map(|e| parse_permit(e)).collect())
+        };
+        AuthCertCaps {
+            permit_pty: o.allows_pty(),
+            permit_port_forwarding: o.allows_port_forwarding(),
+            permit_agent_forwarding: o.allows_agent_forwarding(),
+            permit_x11_forwarding: o.allows_x11_forwarding(),
+            force_command: o.command.clone(),
+            permit_open: list(&o.permit_open),
+            permit_listen: list(&o.permit_listen),
+        }
+    }
+
+    /// Both sets of restrictions at once (a certificate and the
+    /// `authorized_keys` line that trusted it). `None` when they force
+    /// different commands, which OpenSSH refuses too.
+    pub fn intersect(self, other: AuthCertCaps) -> Option<AuthCertCaps> {
+        let force_command = match (self.force_command, other.force_command) {
+            (Some(a), Some(b)) if a != b => return None,
+            (a, b) => a.or(b),
+        };
+        let both = |a: Option<Vec<crate::config::HostPort>>, b: Option<Vec<_>>| match (a, b) {
+            (Some(a), Some(b)) => Some(a.into_iter().filter(|e| b.contains(e)).collect()),
+            (a, b) => a.or(b),
+        };
+        Some(AuthCertCaps {
+            permit_pty: self.permit_pty && other.permit_pty,
+            permit_port_forwarding: self.permit_port_forwarding && other.permit_port_forwarding,
+            permit_agent_forwarding: self.permit_agent_forwarding && other.permit_agent_forwarding,
+            permit_x11_forwarding: self.permit_x11_forwarding && other.permit_x11_forwarding,
+            force_command,
+            permit_open: both(self.permit_open, other.permit_open),
+            permit_listen: both(self.permit_listen, other.permit_listen),
+        })
+    }
+}
+
+/// `host:port`, `[v6]:port` or (for `permitlisten`) a bare `port`; `*` for
+/// any port.
+#[cfg(feature = "alloc")]
+fn parse_permit(spec: &str) -> Option<crate::config::HostPort> {
+    let (host, port) = if let Some(rest) = spec.strip_prefix('[') {
+        let (h, p) = rest.split_once("]:")?;
+        (String::from(h), p)
+    } else if let Some((h, p)) = spec.rsplit_once(':') {
+        (String::from(h), p)
+    } else {
+        (String::from("*"), spec)
+    };
+    let port = if port == "*" {
+        None
+    } else {
+        Some(port.parse().ok()?)
+    };
+    Some(crate::config::HostPort { host, port })
 }
 
 /// What the harness should do next on behalf of the server.
@@ -792,11 +883,34 @@ impl ServerAuth {
         let decision = self.auth.evaluate(AuthAttempt::PublicKey {
             user: user.clone(),
             algorithm,
-            public_blob,
+            public_blob: public_blob.clone(),
             probe_only: false,
             verified: true,
             cert: cert_info,
         });
+        // The accepted key's own restrictions (authorized_keys options),
+        // on top of a certificate's.
+        let decision = match decision {
+            d @ (AuthDecision::Accept | AuthDecision::PartialAccept { .. }) => {
+                match self.auth.key_restrictions(&user, &public_blob) {
+                    None => d,
+                    Some(r) => match self.pending_cert_caps.take() {
+                        None => {
+                            self.pending_cert_caps = Some(r);
+                            d
+                        }
+                        Some(c) => match c.intersect(r) {
+                            Some(both) => {
+                                self.pending_cert_caps = Some(both);
+                                d
+                            }
+                            None => AuthDecision::Reject,
+                        },
+                    },
+                }
+            }
+            other => other,
+        };
         self.apply_decision(decision, &user)
     }
 

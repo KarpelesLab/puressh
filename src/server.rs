@@ -1309,19 +1309,21 @@ impl EffectivePolicy {
     /// True iff a `direct-tcpip` open to `(host, port)` is permitted by
     /// `PermitOpen`. Unset ⇒ any; empty list ⇒ none.
     fn permit_open_allows(&self, host: &str, port: u16) -> bool {
-        match &self.permit_open {
-            None => true,
-            Some(list) => list.iter().any(|e| e.matches(host, port)),
-        }
+        let ok = |l: &Option<Vec<crate::config::HostPort>>| {
+            l.as_ref()
+                .is_none_or(|list| list.iter().any(|e| e.matches(host, port)))
+        };
+        ok(&self.permit_open) && self.cert_caps.as_ref().is_none_or(|c| ok(&c.permit_open))
     }
 
     /// True iff a `tcpip-forward` bind to `(host, port)` is permitted by
     /// `PermitListen`. Unset ⇒ any; empty list ⇒ none.
     fn permit_listen_allows(&self, host: &str, port: u16) -> bool {
-        match &self.permit_listen {
-            None => true,
-            Some(list) => list.iter().any(|e| e.matches(host, port)),
-        }
+        let ok = |l: &Option<Vec<crate::config::HostPort>>| {
+            l.as_ref()
+                .is_none_or(|list| list.iter().any(|e| e.matches(host, port)))
+        };
+        ok(&self.permit_listen) && self.cert_caps.as_ref().is_none_or(|c| ok(&c.permit_listen))
     }
 }
 
@@ -7139,6 +7141,8 @@ mod tests {
             permit_agent_forwarding: true,
             permit_x11_forwarding: true,
             force_command: None,
+            permit_open: None,
+            permit_listen: None,
         }
     }
 
@@ -7151,6 +7155,8 @@ mod tests {
             permit_agent_forwarding: false,
             permit_x11_forwarding: false,
             force_command: None,
+            permit_open: None,
+            permit_listen: None,
         }
     }
 
@@ -7227,6 +7233,8 @@ mod tests {
             permit_agent_forwarding: false,
             permit_x11_forwarding: false,
             force_command: None,
+            permit_open: None,
+            permit_listen: None,
         });
         assert!(eff.pty_allowed());
         assert!(!eff.agent_forwarding_allowed());

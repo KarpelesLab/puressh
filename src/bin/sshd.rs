@@ -1812,13 +1812,95 @@ mod imp {
         /// must match (replacing the login-user-must-be-a-principal rule).
         /// `None` ⇒ no `principals=` option on that line.
         cas: Vec<(Vec<u8>, Option<Vec<String>>)>,
+        /// The options of each `blobs` line (same index; a missing entry is
+        /// an unrestricted line).
+        options: Vec<Arc<puressh::key::AuthorizedKeyOptions>>,
+        /// The options of each `cas` line (same index, likewise).
+        ca_options: Vec<Arc<puressh::key::AuthorizedKeyOptions>>,
     }
 
     impl AuthorizedKeys {
         fn append(&mut self, mut other: AuthorizedKeys) {
+            // Keep the option lists aligned with their key lists.
+            self.options.resize_with(self.blobs.len(), Default::default);
+            self.ca_options
+                .resize_with(self.cas.len(), Default::default);
+            other
+                .options
+                .resize_with(other.blobs.len(), Default::default);
+            other
+                .ca_options
+                .resize_with(other.cas.len(), Default::default);
             self.blobs.append(&mut other.blobs);
             self.cas.append(&mut other.cas);
+            self.options.append(&mut other.options);
+            self.ca_options.append(&mut other.ca_options);
         }
+    }
+
+    /// Whether an `authorized_keys` line applies to this connection: its
+    /// `from=` patterns (addresses, `*`/`?` globs, CIDRs, `!` to exclude)
+    /// admit the client, and its `expiry-time=` has not passed.
+    fn key_line_applies(
+        opts: &puressh::key::AuthorizedKeyOptions,
+        peer: Option<&str>,
+        debug: bool,
+    ) -> bool {
+        if let Some(from) = &opts.from {
+            let Some(ip) = peer.and_then(parse_peer_ip) else {
+                return false;
+            };
+            let ip_s = ip.to_string();
+            let mut admitted = false;
+            for pat in from.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                let (negated, p) = match pat.strip_prefix('!') {
+                    Some(p) => (true, p),
+                    None => (false, pat),
+                };
+                let hit = if p.contains('/') {
+                    cidr_matches(p, ip)
+                } else {
+                    puressh::config::host_matches(&[puressh::config::HostPattern::parse(p)], &ip_s)
+                };
+                if hit && negated {
+                    admitted = false;
+                    break;
+                }
+                admitted |= hit;
+            }
+            if !admitted {
+                if debug {
+                    eprintln!("sshd: authorized_keys: from=\"{from}\" does not admit {ip_s}");
+                }
+                return false;
+            }
+        }
+        if let Some(exp) = &opts.expiry_time {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let offset = {
+                let tt = now as libc::time_t;
+                // SAFETY: `tm` is plain data; localtime_r fills it or fails.
+                let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+                if unsafe { libc::localtime_r(&tt, &mut tm) }.is_null() {
+                    0
+                } else {
+                    tm.tm_gmtoff as i64
+                }
+            };
+            match puressh::sshsig::parse_time(exp, offset) {
+                Some(t) if now < t => {}
+                _ => {
+                    if debug {
+                        eprintln!("sshd: authorized_keys: key expired (expiry-time {exp})");
+                    }
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// The OpenSSH default `AuthorizedKeysFile` list, relative to the login
@@ -1863,10 +1945,12 @@ mod imp {
                         // the raw line is consulted for the option's presence.
                         let restricted =
                             !opts.principals.is_empty() || trimmed.contains("principals=");
-                        let principals = restricted.then_some(opts.principals);
+                        let principals = restricted.then(|| opts.principals.clone());
                         out.cas.push((blob, principals));
+                        out.ca_options.push(Arc::new(opts));
                     } else {
                         out.blobs.push(blob);
+                        out.options.push(Arc::new(opts));
                     }
                 }
                 Err(e) => {
@@ -2474,6 +2558,9 @@ mod imp {
         /// publickey attempt (see [`Self::resolved_authorized_keys`]). `None`
         /// until then.
         authorized_keys: Option<AuthorizedKeys>,
+        /// The options of the `authorized_keys` line that accepted the last
+        /// publickey attempt, for [`Authenticator::key_restrictions`].
+        accepted_options: Option<Arc<puressh::key::AuthorizedKeyOptions>>,
         /// CA public-key blobs from `TrustedUserCAKeys` (the file in force for
         /// this connection). A user cert signed by one of these is CA-trusted;
         /// principal authorization is checked separately. CAs from the user's
@@ -2685,12 +2772,24 @@ mod imp {
             // Both routes are evaluated unconditionally so the cost does not
             // depend on which one decides.
             let standard_ok = self.login_user_is_principal(ci, user);
-            let ca_line: Option<Option<Vec<String>>> = self
-                .resolved_authorized_keys(user)
-                .cas
-                .iter()
-                .find(|(blob, _)| *blob == ci.ca_key_blob)
-                .map(|(_, principals)| principals.clone());
+            let peer = self.peer.clone();
+            let debug = self.debug;
+            let (ca_line, ca_opts): (Option<Option<Vec<String>>>, _) = {
+                let set = self.resolved_authorized_keys(user);
+                match set.cas.iter().enumerate().find(|(i, (blob, _))| {
+                    *blob == ci.ca_key_blob
+                        && set
+                            .ca_options
+                            .get(*i)
+                            .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
+                }) {
+                    Some((i, (_, principals))) => {
+                        (Some(principals.clone()), set.ca_options.get(i).cloned())
+                    }
+                    None => (None, None),
+                }
+            };
+            self.accepted_options = ca_opts;
             let line_ok = match &ca_line {
                 None => false,
                 Some(Some(list)) => principals_match_option(list, &ci.valid_principals),
@@ -2777,6 +2876,26 @@ mod imp {
             }
             // Safe: just populated above.
             self.authorized_keys.as_ref().unwrap()
+        }
+
+        /// Whether `blob` is authorized for `user` by a line that applies to
+        /// this connection (`from=`, `expiry-time=`); that line's options are
+        /// kept for [`Authenticator::key_restrictions`].
+        fn key_authorized(&mut self, user: &str, blob: &[u8]) -> bool {
+            let peer = self.peer.clone();
+            let debug = self.debug;
+            let set = self.resolved_authorized_keys(user);
+            let found = set.blobs.iter().enumerate().find(|(i, b)| {
+                b.as_slice() == blob
+                    && set
+                        .options
+                        .get(*i)
+                        .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
+            });
+            let opts = found.map(|(i, _)| set.options.get(i).cloned().unwrap_or_default());
+            let ok = opts.is_some();
+            self.accepted_options = opts;
+            ok
         }
 
         /// [`load_user_authorized_keys`] with this connection's settings.
@@ -3174,6 +3293,17 @@ mod imp {
     }
 
     impl Authenticator for LocalAuthenticator {
+        fn key_restrictions(
+            &mut self,
+            _user: &str,
+            _public_blob: &[u8],
+        ) -> Option<puressh::auth::AuthCertCaps> {
+            self.accepted_options
+                .take()
+                .filter(|o| !o.is_unrestricted())
+                .map(|o| puressh::auth::AuthCertCaps::from_key_options(&o))
+        }
+
         fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
             if self.policy_broken {
                 return AuthDecision::Reject;
@@ -3272,10 +3402,7 @@ mod imp {
                         && size_ok
                         && match &cert {
                             Some(ci) => self.cert_trusted(ci, &user),
-                            None => self
-                                .resolved_authorized_keys(&user)
-                                .blobs
-                                .contains(&public_blob),
+                            None => self.key_authorized(&user, &public_blob),
                         };
                     // PermitRootLogin gate: if the requested user resolves to
                     // the root account (uid 0) and policy forbids it, deny
@@ -3636,6 +3763,7 @@ mod imp {
                 global_authorized_keys: self.global_authorized_keys.clone(),
                 authorized_keys_files: self.authorized_keys_files.clone(),
                 authorized_keys: None,
+                accepted_options: None,
                 trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
                 revoked_keys: self.revoked_keys.clone(),
                 policy: self.policy.clone(),
@@ -6834,6 +6962,7 @@ mod imp {
                 group_lookup: lookup,
                 peer: peer.map(str::to_string),
                 debug: false,
+                accepted_options: None,
             }
         }
 
@@ -7357,6 +7486,7 @@ mod imp {
             a.authorized_keys = Some(AuthorizedKeys {
                 blobs: vec![blob.clone()],
                 cas: Vec::new(),
+                ..Default::default()
             });
             a.revoked_keys = Some(std::sync::Arc::new(krl));
 
@@ -7389,6 +7519,7 @@ mod imp {
             a.authorized_keys = Some(AuthorizedKeys {
                 blobs: vec![blob.to_vec()],
                 cas: Vec::new(),
+                ..Default::default()
             });
             a
         }
@@ -7525,6 +7656,7 @@ mod imp {
             let ak = AuthorizedKeys {
                 blobs: Vec::new(),
                 cas: vec![(ca.clone(), Some(vec!["deploy".to_string()]))],
+                ..Default::default()
             };
             // Cert lists `deploy` but NOT the login user: accepted, because the
             // principals= list replaces the login-user-must-be-a-principal rule.
@@ -7559,6 +7691,7 @@ mod imp {
             let plain = AuthorizedKeys {
                 blobs: Vec::new(),
                 cas: vec![(ca.clone(), None)],
+                ..Default::default()
             };
             let mut d = auth_with(&["*"], &[], &[], &[], Default::default());
             d.authorized_keys = Some(plain.clone());
@@ -7698,6 +7831,7 @@ mod imp {
             a.global_authorized_keys = Some(std::sync::Arc::new(AuthorizedKeys {
                 blobs: vec![vec![9, 9, 9]],
                 cas: Vec::new(),
+                ..Default::default()
             }));
             assert_eq!(
                 a.resolved_authorized_keys("anyone").blobs,
@@ -7859,6 +7993,7 @@ mod imp {
             a.authorized_keys = Some(AuthorizedKeys {
                 blobs: vec![unhex(USERKEY_BLOB_HEX)],
                 cas: Vec::new(),
+                ..Default::default()
             });
             a.policy = Some(pol);
             a.on_user_resolved("alice", &[]);
@@ -8128,6 +8263,7 @@ mod imp {
             a.authorized_keys = Some(AuthorizedKeys {
                 blobs: vec![blob.clone()],
                 cas: Vec::new(),
+                ..Default::default()
             });
             let decision = a.evaluate(AuthAttempt::PublicKey {
                 user: "alice".into(),

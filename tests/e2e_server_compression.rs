@@ -107,7 +107,7 @@ fn spawn_our_sshd(tmp: &Path) -> Option<(u16, String, PathBuf, SshdGuard)> {
     std::fs::write(&authorized, &pubkey).expect("write authorized_keys");
 
     // `Compression yes` makes our server advertise zlib ahead of `none`.
-    std::fs::write(&config, "Compression yes\n").expect("write sshd_config");
+    std::fs::write(&config, "Compression yes\nLogLevel DEBUG\n").expect("write sshd_config");
 
     let user = current_user();
     let port = pick_free_port();
@@ -174,12 +174,14 @@ fn server_compresses_large_stdout_for_real_ssh_client() {
     const LINES: usize = 20_000;
     let out = {
         let mut c = ssh_base(&client_key, port, &user);
-        c.arg(format!("yes {LINE} | head -n {LINES}"));
+        c.arg("-v").arg(format!("yes {LINE} | head -n {LINES}"));
         c.output().expect("ssh exec")
     };
     assert!(
         out.status.success(),
-        "ssh exec failed: {}\n--- sshd log ---\n{}",
+        "ssh exec failed ({}, {} bytes of stdout): {}\n--- sshd log ---\n{}",
+        out.status,
+        out.stdout.len(),
         String::from_utf8_lossy(&out.stderr),
         std::fs::read_to_string(tmp.join("sshd.log")).unwrap_or_default()
     );

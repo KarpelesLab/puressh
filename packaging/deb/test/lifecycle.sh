@@ -97,11 +97,36 @@ ours_log() { journalctl --no-pager -o cat --since "$INSTALLED" SYSLOG_FACILITY=4
 ours_log | grep -q '^Server listening on '
 ours_log | grep -q '^Accepted publickey for tester from .* port [0-9]* ssh2: ED25519 SHA256:'
 
-step "reload (SIGHUP) keeps serving"
+step "reload (SIGHUP) picks up an SFTP-only chroot jail"
+# The common deployment: a drop-in with Match User + ChrootDirectory +
+# ForceCommand internal-sftp, applied by a reload.
+id jailed >/dev/null 2>&1 || useradd -m -s /bin/bash jailed
+install -d -m 700 -o jailed -g jailed /home/jailed/.ssh
+install -m 600 -o jailed -g jailed /root/tester_key.pub /home/jailed/.ssh/authorized_keys
+install -d -m 755 -o root -g root /srv/jail/jailed
+install -d -m 755 -o jailed -g jailed /srv/jail/jailed/upload
+printf '%s\n' 'Match User jailed' '	ChrootDirectory /srv/jail/%u' \
+	'	ForceCommand internal-sftp' '	AllowTcpForwarding no' \
+	>/etc/ssh/sshd_config.d/50-jail.conf
 systemctl reload ssh.service
 sleep 1
 systemctl is-active ssh.service
 try_ssh tester@localhost 'echo reload-ok' | grep -q reload-ok
+echo jailed-data >/tmp/jail.txt
+printf 'pwd\nput /tmp/jail.txt /upload/jail.txt\nls /\n' >/tmp/jail.batch
+if ! sftp -F /dev/null -i /root/tester_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+	-o UserKnownHostsFile=/root/known_hosts -b /tmp/jail.batch jailed@localhost >/tmp/jail.out 2>&1; then
+	cat /tmp/jail.out
+	exit 1
+fi
+grep -q 'Remote working directory: /$' /tmp/jail.out
+cmp /tmp/jail.txt /srv/jail/jailed/upload/jail.txt
+# The jail's root is all the session sees, and no shell is to be had.
+if grep -q home /tmp/jail.out; then cat /tmp/jail.out; exit 1; fi
+out=$(ssh -F /dev/null -i /root/tester_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+	-o UserKnownHostsFile=/root/known_hosts jailed@localhost 'echo shell-ok' </dev/null 2>&1 || true)
+if echo "$out" | grep -q shell-ok; then echo "jailed user got a shell"; exit 1; fi
+rm -f /etc/ssh/sshd_config.d/50-jail.conf
 
 step "purging openssh-server deletes host keys; ssh.service restores them"
 apt-get purge -y -qq openssh-server >/dev/null 2>&1 || true

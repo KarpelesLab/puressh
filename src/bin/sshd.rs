@@ -4525,7 +4525,11 @@ mod imp {
                 }
             } else {
                 // Same uid → still chdir for clean cwd semantics.
-                cmd.current_dir(&info.home_str);
+                cmd.current_dir(if std::path::Path::new(&info.home_str).is_dir() {
+                    info.home_str.as_str()
+                } else {
+                    "/"
+                });
             }
             Ok(cmd)
         }
@@ -5253,9 +5257,12 @@ mod imp {
             // the lookup fails (rare on a configured system), fall back to
             // root: `SftpServerSession` will still operate, just less
             // intuitively.
+            // As OpenSSH: the home directory when it exists (inside a
+            // ChrootDirectory it usually does not), else the root.
             let cwd = lookup_user(user)
                 .ok()
                 .map(|i| std::path::PathBuf::from(&i.home_str))
+                .filter(|h| h.is_dir())
                 .unwrap_or_else(|| std::path::PathBuf::from("/"));
 
             let mut opts = SftpServerOptions::new(cwd);

@@ -2555,6 +2555,12 @@ fn do_connection_phase(
         &mut polling_active,
         &mut extras,
     );
+    // The client going away while we write (it closed right after the
+    // session) ends the connection as cleanly as when we notice it reading.
+    let result = match result {
+        Err(e) if is_peer_close(&e) => Ok(()),
+        r => r,
+    };
     // On teardown — successful or otherwise — release every binding so the
     // TCP listener threads inside the handler exit cleanly.
     if let Some(handler) = cfg.tcpip_forward_handler.clone() {

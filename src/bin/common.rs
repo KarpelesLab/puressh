@@ -116,6 +116,23 @@ pub fn parse_userhost(target: &str) -> (Option<String>, String) {
 /// `@`. Errors are stringified for the bin's existing error-reporting
 /// flow.
 pub fn parse_target(target: &str) -> Result<(Option<String>, String, Option<u16>), String> {
+    // `ssh://[user[;params]@]host[:port][/]` (OpenSSH 7.7+): no path, the
+    // user percent-decoded.
+    if let Some(rest) = target.strip_prefix("ssh://") {
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        if rest.contains('/') {
+            return Err(format!("{target}: a path is not allowed in an ssh:// URI"));
+        }
+        let (user, hostport) = match rest.rfind('@') {
+            Some(i) => {
+                let userinfo = rest[..i].split(';').next().unwrap_or("");
+                (Some(uri_decode(userinfo)), &rest[i + 1..])
+            }
+            None => (None, rest),
+        };
+        let (_, host, port) = parse_target(hostport)?;
+        return Ok((user.filter(|u| !u.is_empty()), host, port));
+    }
     let (user, host_with_port) = parse_userhost(target);
     if host_with_port.is_empty() {
         return Err("empty host".into());
@@ -146,6 +163,28 @@ pub fn parse_target(target: &str) -> Result<(Option<String>, String, Option<u16>
         puressh::config::parse_host_port(&host_with_port, 0).map_err(|e| format!("{e}"))?;
     let port_opt = if port == 0 { None } else { Some(port) };
     Ok((user, host, port_opt))
+}
+
+/// `%XX`-decode a URI component.
+fn uri_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && let Some(v) = b
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .and_then(|h| u8::from_str_radix(h, 16).ok())
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Split a `[user@]host:path` token used by `scp(1)` / `sftp(1)` local-or-
@@ -1333,6 +1372,48 @@ pub fn verbose_level() -> u8 {
 ///
 /// `level` is clamped to `1..=3`; passing 0 means "always print" but
 /// callers should just `eprintln!` directly in that case.
+/// The stderr ssh started with, while `-E` sends its own messages (fd 2)
+/// to a log file: the remote command's stderr still goes here, as with
+/// OpenSSH.
+#[cfg(unix)]
+static ORIGINAL_STDERR: std::sync::OnceLock<std::fs::File> = std::sync::OnceLock::new();
+
+/// `-E file`: ssh's own messages go to `file` from now on.
+#[cfg(unix)]
+#[allow(dead_code)] // ssh only
+pub fn log_to_file(path: &str) -> Result<(), String> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| format!("-E {path}: {e}"))?;
+    let saved = nix::unistd::dup(std::io::stderr()).map_err(|e| format!("-E {path}: {e}"))?;
+    let _ = ORIGINAL_STDERR.set(std::fs::File::from(saved));
+    nix::unistd::dup2_stderr(&f).map_err(|e| format!("-E {path}: {e}"))?;
+    Ok(())
+}
+
+/// Where the remote command's stderr goes: the terminal's stderr, even
+/// under `-E`.
+#[allow(dead_code)] // ssh only
+pub fn remote_stderr() -> Box<dyn std::io::Write + Send> {
+    #[cfg(unix)]
+    if let Some(f) = ORIGINAL_STDERR.get().and_then(|f| f.try_clone().ok()) {
+        return Box::new(f);
+    }
+    Box::new(std::io::stderr())
+}
+
+/// Give fd 2 back to the original stderr (for code that writes the remote
+/// stderr there itself).
+#[allow(dead_code)] // ssh only
+pub fn restore_stderr() {
+    #[cfg(unix)]
+    if let Some(f) = ORIGINAL_STDERR.get() {
+        let _ = nix::unistd::dup2_stderr(f);
+    }
+}
+
 pub fn vlog(level: u8, msg: &str) {
     let level = level.clamp(1, 3);
     if VERBOSE.load(Ordering::Relaxed) >= level {

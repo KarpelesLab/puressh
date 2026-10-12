@@ -421,11 +421,16 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                             if kv.len() > 5
                                 && kv[..4].eq_ignore_ascii_case("user")
                                 && matches!(kv.as_bytes()[4], b'=' | b' ' | b'\t')
+                                // The configuration's own parsing (quotes:
+                                // Ansible passes `-o User="name"`).
+                                && let Some(u) = puressh::config::SshClientConfig::parse(&format!(
+                                    "User {}",
+                                    kv[5..].trim_start_matches(['=', ' ', '\t'])
+                                ))
+                                .ok()
+                                .and_then(|c| c.lookup("*").user)
                             {
-                                let u = kv[5..].trim_start_matches(['=', ' ', '\t']).trim();
-                                if !u.is_empty() {
-                                    first_user.get_or_insert(u.to_string());
-                                }
+                                first_user.get_or_insert(u);
                             }
                             v.clone()
                         },
@@ -1987,15 +1992,11 @@ fn run() -> Result<i32, String> {
     if let Some(q) = cli.query.as_deref() {
         return run_query(q);
     }
-    // `-E file`: diagnostics go to `file` from here on.
+    // `-E file`: ssh's own messages go to `file` from here on; the remote
+    // command's stderr does not (common::remote_stderr).
     #[cfg(unix)]
     if let Some(path) = cli.log_file.as_deref() {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .map_err(|e| format!("-E {path}: {e}"))?;
-        nix::unistd::dup2_stderr(&f).map_err(|e| format!("-E {path}: {e}"))?;
+        common::log_to_file(path)?;
     }
     // `-n` (and `-f`): stdin from /dev/null.
     #[cfg(unix)]
@@ -3401,6 +3402,8 @@ fn run_mux_client(
         None
     };
 
+    // The mux client writes the remote stderr to fd 2.
+    common::restore_stderr();
     puressh::mux::run_client(path, &req, resize).map_err(|e| format!("mux client: {e}"))
 }
 
@@ -4036,7 +4039,7 @@ fn run_session(
     let err_shared = shared.clone();
     let t_err = thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
-        let mut stderr = std::io::stderr();
+        let mut stderr = common::remote_stderr();
         loop {
             match err_shared.channel_recv_stderr(channel_id, &mut buf) {
                 Ok(0) => break,

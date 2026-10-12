@@ -103,7 +103,13 @@ pub struct ClientDriver {
     banner_total: usize,
     /// User authentication has succeeded (see [`Self::notify_auth_success`]).
     authenticated: bool,
+    /// Told of each completed key exchange ([`Self::set_kex_observer`]).
+    kex_observer: Option<KexObserver>,
 }
+
+/// A callback told of each completed key exchange (the first and every
+/// re-key) with the algorithms it chose.
+pub type KexObserver = alloc::sync::Arc<dyn Fn(&crate::transport::Negotiated) + Send + Sync>;
 
 impl ClientDriver {
     /// Build a driver. `algo_overrides` supplies the local algorithm policy
@@ -139,7 +145,15 @@ impl ClientDriver {
             missed_keepalives: 0,
             banner_lines: 0,
             banner_total: 0,
+            kex_observer: None,
         }
+    }
+
+    /// Call `f` after each key exchange completes (the first one and every
+    /// re-key) with the algorithms it chose — for logging, as OpenSSH's
+    /// `kex: algorithm: …` debug lines.
+    pub fn set_kex_observer(&mut self, f: KexObserver) {
+        self.kex_observer = Some(f);
     }
 
     /// Override the re-key thresholds (defaults to [`RekeyPolicy::default`]).
@@ -190,6 +204,12 @@ impl ClientDriver {
     /// compression is visible here.
     pub fn negotiated_compression(&self) -> Option<(String, String)> {
         self.runner.negotiated().map(|n| (n.comp_c2s, n.comp_s2c))
+    }
+
+    /// The algorithms the most recent key exchange chose (`None` before the
+    /// first one has negotiated them).
+    pub fn negotiated(&self) -> Option<crate::transport::Negotiated> {
+        self.runner.negotiated()
     }
 
     /// True once the handshake has completed (post-NEWKEYS).
@@ -298,7 +318,10 @@ impl ClientDriver {
         if self.runner.is_kexing() {
             return Ok(());
         }
-        if let Some(last) = self.last_kex
+        // As OpenSSH, the volume / time limits only re-key once the user
+        // is authenticated.
+        if self.authenticated
+            && let Some(last) = self.last_kex
             && self.rekey_policy.should_rekey(&self.codec, last, now)
         {
             self.initiate_rekey()?;
@@ -411,6 +434,9 @@ impl ClientDriver {
                         self.events.push_back(Event::HandshakeComplete);
                     }
                     self.last_kex = Some(now);
+                    if let (Some(f), Some(n)) = (&self.kex_observer, self.runner.negotiated()) {
+                        f(&n);
+                    }
                     self.drain_deferred_out()?;
                     self.drain_deferred()?;
                 }

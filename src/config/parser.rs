@@ -25,6 +25,10 @@ pub struct ParsedLine {
     pub keyword: String,
     /// Whitespace-separated value tokens with quoting/escaping resolved.
     pub args: Vec<String>,
+    /// The value as written: the rest of the line after the keyword and
+    /// its separating whitespace / `=`, quotes kept — what OpenSSH takes for
+    /// `ProxyCommand`, `LocalCommand` and `RemoteCommand`.
+    pub rest: String,
     /// The file the line came from when an `Include` brought it in (`None`
     /// for the file or string being parsed itself).
     pub file: Option<String>,
@@ -68,6 +72,14 @@ pub fn tokenize(src: &str) -> Result<Vec<ParsedLine>, ConfigError> {
         if toks.is_empty() {
             continue;
         }
+        // The value as written (OpenSSH's parse_command): past the keyword,
+        // which ends at whitespace or `=`, and the separators after it.
+        let kw_end = trimmed
+            .find(|c: char| c.is_whitespace() || c == '=')
+            .unwrap_or(trimmed.len());
+        let rest = trimmed[kw_end..]
+            .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+            .to_string();
         let mut keyword = toks.remove(0);
         // OpenSSH accepts `Keyword=value`, `Keyword =value`, `Keyword= value`,
         // and `Keyword = value`. Resolve each into "keyword + clean args".
@@ -100,6 +112,7 @@ pub fn tokenize(src: &str) -> Result<Vec<ParsedLine>, ConfigError> {
             line_no,
             keyword,
             args: toks,
+            rest,
             file: None,
         });
     }

@@ -26,7 +26,7 @@
 //! substituting the on-wire cookie before forwarding to its local
 //! `$DISPLAY` (see [`crate::client::ClientHandlers::on_x11`]).
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::net::{Shutdown, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -387,12 +387,7 @@ fn spawn_tcp_splice(tcp: TcpStream, stream: ChannelStream) {
     // Direction B: channel → TCP.
     let mut tcp_out_b = tcp_out;
     let b = thread::spawn(move || {
-        while let Ok(Some(chunk)) = chan_rx.recv() {
-            if tcp_out_b.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        let _ = tcp_out_b.shutdown(Shutdown::Read);
+        super::channel_to_socket(&chan_rx, &mut tcp_out_b);
     });
 
     // Reaper: when both directions finish, send Close to drop the channel.
@@ -450,12 +445,7 @@ fn spawn_tcp_splice_with_prelude(tcp: TcpStream, stream: ChannelStream, prelude:
     // Direction B: channel → TCP.
     let mut tcp_out_b = tcp_out;
     let b = thread::spawn(move || {
-        while let Ok(Some(chunk)) = chan_rx.recv() {
-            if tcp_out_b.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        let _ = tcp_out_b.shutdown(Shutdown::Read);
+        super::channel_to_socket(&chan_rx, &mut tcp_out_b);
     });
 
     // Reaper: when both directions finish, send Close to drop the channel.
@@ -738,12 +728,7 @@ fn spawn_unix_splice(uds: std::os::unix::net::UnixStream, stream: ChannelStream)
 
     let mut uds_out_b: UnixStream = uds_out;
     let b = thread::spawn(move || {
-        while let Ok(Some(chunk)) = chan_rx.recv() {
-            if uds_out_b.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        let _ = uds_out_b.shutdown(Shutdown::Read);
+        super::channel_to_socket(&chan_rx, &mut uds_out_b);
     });
 
     thread::spawn(move || {
@@ -758,6 +743,7 @@ fn spawn_unix_splice(uds: std::os::unix::net::UnixStream, stream: ChannelStream)
 #[cfg(all(test, feature = "server"))]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// `setup` binds a TCP listener on the first free port from the
     /// configured range and the returned `display_env` matches.

@@ -19,7 +19,7 @@
 //! - On handle drop (i.e. session-channel close), signals the worker thread
 //!   to stop, joins it, and unlinks the socket on disk.
 
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -332,12 +332,7 @@ fn spawn_unix_splice(uds: UnixStream, stream: ChannelStream) {
     // Direction B: channel → Unix socket.
     let mut uds_out_b = uds_out;
     let b = thread::spawn(move || {
-        while let Ok(Some(chunk)) = chan_rx.recv() {
-            if uds_out_b.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        let _ = uds_out_b.shutdown(std::net::Shutdown::Read);
+        super::channel_to_socket(&chan_rx, &mut uds_out_b);
     });
 
     // Reaper: when both directions finish, send Close to drop the channel.

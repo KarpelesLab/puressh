@@ -609,6 +609,10 @@ pub struct ForwardedStreamlocalOrigin {
 pub type ForwardedStreamlocalCallback =
     dyn Fn(ForwardedStreamlocalOrigin, ChannelStream) + Send + Sync + 'static;
 
+/// Shows the server's pre-authentication banner
+/// ([`Client::set_banner_handler`]).
+type BannerHandler = Box<dyn Fn(&str) + Send + Sync>;
+
 /// Type alias for the [`ClientHandlers::on_auth_agent`] callback.
 ///
 /// Fires on every server-initiated `auth-agent@openssh.com` channel — one
@@ -1020,6 +1024,9 @@ pub struct Client {
     /// The methods the server last said could continue, when
     /// authentication failed ([`Self::auth_methods_left`]).
     auth_methods_left: Vec<String>,
+    /// Shows the server's pre-authentication banner
+    /// ([`Self::set_banner_handler`]).
+    banner_handler: Option<BannerHandler>,
 }
 
 /// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
@@ -1149,6 +1156,7 @@ impl Client {
             streamlocal_forward_grants: Vec::new(),
             host_key_mismatched,
             auth_methods_left: Vec::new(),
+            banner_handler: None,
         };
         me.driver.start(Instant::now())?;
         me.drive_handshake()?;
@@ -1263,11 +1271,38 @@ impl Client {
                     self.auth_methods_left = continuations;
                     return Err(Error::AuthFailed);
                 }
-                ClientStep::Banner { .. } => {}
+                ClientStep::Banner { message, .. } => {
+                    if let Some(show) = &self.banner_handler {
+                        show(&message);
+                    }
+                }
                 ClientStep::Idle => {}
             }
         }
         Err(Error::Protocol("auth: too many steps without termination"))
+    }
+
+    /// The algorithms the most recent key exchange chose (kex, host key,
+    /// ciphers, MACs, compression); `None` before the first one.
+    pub fn negotiated(&self) -> Option<crate::transport::Negotiated> {
+        self.driver.negotiated()
+    }
+
+    /// Call `f` after each key exchange completes — the first one and every
+    /// re-key, including those run once the connection is shared — with the
+    /// algorithms it chose.
+    pub fn set_kex_observer(
+        &mut self,
+        f: impl Fn(&crate::transport::Negotiated) + Send + Sync + 'static,
+    ) {
+        self.driver.set_kex_observer(std::sync::Arc::new(f));
+    }
+
+    /// Show the server's `SSH_MSG_USERAUTH_BANNER` (sshd's `Banner`, sent
+    /// before authentication) with `show`, as [`Self::run_auth`] receives
+    /// it. Without a handler, banners are ignored.
+    pub fn set_banner_handler(&mut self, show: impl Fn(&str) + Send + Sync + 'static) {
+        self.banner_handler = Some(Box::new(show));
     }
 
     /// After [`Self::run_auth`] failed: the methods the server last said

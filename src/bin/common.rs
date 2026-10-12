@@ -1348,6 +1348,20 @@ pub fn set_quiet(on: bool) {
     QUIET.store(on, Ordering::Relaxed);
 }
 
+/// An I/O error as OpenSSH words it (`strerror`): without Rust's
+/// ` (os error N)` suffix.
+#[allow(dead_code)] // not every binary dials out
+pub fn io_reason(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::TimedOut && e.raw_os_error().is_none() {
+        return "Connection timed out".to_string();
+    }
+    let s = e.to_string();
+    match s.find(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
 /// Whether `-q` is in force.
 #[allow(dead_code)]
 pub fn is_quiet() -> bool {

@@ -906,6 +906,27 @@ impl SharedClient {
         })
     }
 
+    /// Open a `direct-streamlocal@openssh.com` channel (OpenSSH extension):
+    /// the server connects to the Unix socket `socket_path` and proxies bytes
+    /// across the returned stream — `ssh -L …:/remote.sock`.
+    pub fn open_direct_streamlocal(&self, socket_path: &str) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = lock_or_poison(&self.inner)?;
+            let (local_id, open_payload) = g.client.conn.open(ChannelOpen::DirectStreamlocal {
+                socket_path: socket_path.to_string(),
+            })?;
+            g.client.write_payload(&open_payload)?;
+            await_open_under_lock(&mut g, local_id, "direct-streamlocal")?;
+            local_id
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+            pty_denied: false,
+        })
+    }
+
     /// Lock the inner client for one synchronous operation. Internal helper
     /// for the FFI layer's `pcssh_client_exec` and friends, which run a
     /// single self-contained method on `Client` while holding the mutex.
@@ -1006,25 +1027,32 @@ fn open_direct_tcpip_under_lock(
         orig_port: orig_port as u32,
     })?;
     g.client.write_payload(&open_payload)?;
+    await_open_under_lock(g, local_id, "direct-tcpip")?;
+    Ok(local_id)
+}
 
+/// Wait (under the held lock) for the server's answer to the channel open
+/// `local_id` just sent, then give it its mailbox. Other channels' events
+/// are dispatched meanwhile.
+fn await_open_under_lock(g: &mut Inner, local_id: u32, what: &'static str) -> Result<()> {
     let mut iter_guard = 0usize;
     loop {
         iter_guard += 1;
         if iter_guard > MAX_OPEN_ITER {
-            return Err(Error::Protocol(open_loop_msg("direct-tcpip")));
+            return Err(Error::Protocol(open_loop_msg(what)));
         }
         let payload = g.client.read_one_packet()?;
         let ev = g.client.conn.on_packet(&payload)?;
         match ev {
             ChannelEvent::OpenConfirmed { channel } if channel == local_id => break,
             ChannelEvent::OpenFailed { channel, .. } if channel == local_id => {
-                return Err(Error::Protocol(open_failed_msg("direct-tcpip")));
+                return Err(Error::Protocol(open_failed_msg(what)));
             }
             other => dispatch_event(&mut *g, other),
         }
     }
     g.queues.entry(local_id).or_default();
-    Ok(local_id)
+    Ok(())
 }
 
 /// Send a channel request and drain inbound packets until the matching
@@ -1065,6 +1093,7 @@ fn open_loop_msg(what: &'static str) -> &'static str {
         "exec" => "exec: open loop did not converge",
         "shell" => "shell: open loop did not converge",
         "direct-tcpip" => "direct-tcpip: open loop did not converge",
+        "direct-streamlocal" => "direct-streamlocal: open loop did not converge",
         _ => "channel: open loop did not converge",
     }
 }
@@ -1075,6 +1104,7 @@ fn open_failed_msg(what: &'static str) -> &'static str {
         "exec" => "exec: channel open failed",
         "shell" => "shell: channel open failed",
         "direct-tcpip" => "direct-tcpip: open failed",
+        "direct-streamlocal" => "direct-streamlocal: open failed",
         _ => "channel: open failed",
     }
 }
@@ -1222,10 +1252,13 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
         IncomingKind::AuthAgent(cb) => cb(cs),
         IncomingKind::X11(cb) => cb(cs),
     });
-    // Handler → channel.
+    // Handler → channel. Its end (the handler's Close, or a failed send)
+    // is what lets the channel close: see below.
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
     let out = shared;
     std::thread::spawn(move || {
         use crate::stream::ChannelEgress;
+        let _done = done_tx;
         while let Ok(msg) = egress_rx.recv() {
             match msg {
                 ChannelEgress::Data(bytes) => {
@@ -1246,7 +1279,9 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
         }
         let _ = out.channel_send_eof(channel);
     });
-    // Channel → handler; dropping the stream at the end closes the channel.
+    // Channel → handler. The peer's EOF is passed on as `None`, but the
+    // handler may still answer (a half-closed connection), so the channel
+    // is closed — by dropping the stream — only once the handler is done.
     std::thread::spawn(move || {
         let mut buf = vec![0u8; 32 * 1024];
         loop {
@@ -1260,6 +1295,8 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
             }
         }
         let _ = ingress_tx.send(None);
+        let _ = done_rx.recv();
+        drop(ingress_tx);
         drop(stream);
     });
 }

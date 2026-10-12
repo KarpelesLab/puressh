@@ -34,8 +34,11 @@ use crate::mac::SshMac;
 /// Block size assumed when no cipher has been negotiated yet (RFC 4253 §6).
 pub const BLOCK_SIZE_DEFAULT: usize = 8;
 
-/// Maximum packet length accepted by [`PacketCodec::decode`] (RFC 4253 §6.1).
-pub const MAX_PACKET_LEN: u32 = 35_000;
+/// Maximum packet length accepted by [`PacketCodec::decode`] (and bound on
+/// what the encoder produces). RFC 4253 §6.1 requires at least 35 000 and
+/// allows more; this is OpenSSH's `PACKET_MAX_SIZE`, so a peer's large
+/// messages (a long pre-auth banner, say) get through as they do with it.
+pub const MAX_PACKET_LEN: u32 = 256 * 1024;
 
 /// Minimum total on-the-wire packet length before MAC, per RFC 4253 §6.
 const MIN_TOTAL_LEN: usize = 16;

@@ -9,12 +9,9 @@
 //! emit `CHANNEL_EOF` + `CHANNEL_CLOSE` on the SSH side via the raw egress
 //! sender obtained from [`ChannelStream::into_raw`].
 
-use std::io::{self, Read, Write};
-use std::net::Shutdown;
+use std::io::{self, Read};
 use std::os::unix::net::UnixStream;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::mpsc::SyncSender;
 use std::thread;
 
 use crate::error::Result;
@@ -139,63 +136,42 @@ impl DirectStreamlocalHandler for DefaultDirectStreamlocalHandler {
 }
 
 /// Splice the SSH `ChannelStream` against an open `UnixStream` in both
-/// directions, returning once either side hits EOF or errors. Mirrors
-/// `splice` in [`crate::forwarding::direct`] but for `UnixStream`.
+/// directions, as OpenSSH does: the socket's EOF is sent as the channel's;
+/// the channel's EOF half-closes the socket (the destination may still
+/// answer); the channel is closed once both directions are done (the
+/// channel's close, or a failed write, ends both).
 fn splice(stream: ChannelStream, uds: UnixStream) -> Result<()> {
     let (raw_rx, raw_tx) = stream.into_raw();
 
-    let uds_for_writer = uds.try_clone().map_err(|e| {
+    let mut reader = uds.try_clone().map_err(|e| {
         crate::error::Error::Io(io::Error::new(
             e.kind(),
             "direct-streamlocal: UnixStream::try_clone failed",
         ))
     })?;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = Arc::clone(&stop);
     let tx_worker = raw_tx.clone();
 
     // Worker: Unix socket → channel.
     let worker = thread::spawn(move || {
-        let mut reader = uds_for_writer;
-        copy_uds_to_channel(&mut reader, &tx_worker, &stop_worker);
+        copy_uds_to_channel(&mut reader, &tx_worker);
+        let _ = tx_worker.send(ChannelEgress::Eof);
     });
 
     // Main: channel → Unix socket.
     let mut writer = uds;
-    copy_channel_to_uds(&raw_rx, &mut writer, &stop);
-
-    let _ = writer.shutdown(Shutdown::Both);
-    stop.store(true, Ordering::SeqCst);
+    super::channel_to_socket(&raw_rx, &mut writer);
     let _ = worker.join();
 
-    let _ = raw_tx.send(ChannelEgress::Eof);
+    // Errors here mean the dispatcher already tore the channel down — fine.
     let _ = raw_tx.send(ChannelEgress::Close);
     Ok(())
 }
 
-fn copy_channel_to_uds(rx: &Receiver<Option<Vec<u8>>>, uds: &mut UnixStream, stop: &AtomicBool) {
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        match rx.recv() {
-            Ok(Some(chunk)) => {
-                if uds.write_all(&chunk).is_err() {
-                    return;
-                }
-            }
-            Ok(None) | Err(_) => return,
-        }
-    }
-}
-
-fn copy_uds_to_channel(uds: &mut UnixStream, tx: &SyncSender<ChannelEgress>, stop: &AtomicBool) {
+/// Read from `uds` and forward each chunk as `ChannelEgress::Data`, until
+/// its EOF or an error, or the egress sender fails (dispatcher gone).
+fn copy_uds_to_channel(uds: &mut UnixStream, tx: &SyncSender<ChannelEgress>) {
     let mut buf = [0u8; 32 * 1024];
     loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
         let n = match uds.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => n,
@@ -211,6 +187,7 @@ fn copy_uds_to_channel(uds: &mut UnixStream, tx: &SyncSender<ChannelEgress>, sto
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::os::unix::net::UnixListener;
     use std::sync::mpsc;
     use std::time::Duration;

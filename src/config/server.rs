@@ -1576,7 +1576,7 @@ fn parse_host_port(spec: &str, line: &ParsedLine) -> Result<HostPort, ConfigErro
 /// Parse a `RekeyLimit` value: `<bytes>[ <time>]` where `<bytes>` accepts
 /// `K`/`M`/`G` suffixes (or `default`/`none`), and `<time>` is an OpenSSH
 /// duration (or `none`).
-fn parse_rekey_limit(line: &ParsedLine) -> Result<RekeyLimit, ConfigError> {
+pub(crate) fn parse_rekey_limit(line: &ParsedLine) -> Result<RekeyLimit, ConfigError> {
     if line.args.is_empty() || line.args.len() > 2 {
         return Err(ConfigError::BadValue {
             line: line.line_no,

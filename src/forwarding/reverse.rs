@@ -20,7 +20,7 @@
 //!   listener.
 
 use std::collections::BTreeMap;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -256,15 +256,7 @@ fn spawn_splice(tcp: TcpStream, stream: crate::server::ChannelStream) {
     // Direction B: channel → TCP.
     let mut tcp_out_b = tcp_out;
     let b = thread::spawn(move || {
-        while let Ok(Some(chunk)) = chan_rx.recv() {
-            if tcp_out_b.write_all(&chunk).is_err() {
-                break;
-            }
-        }
-        // Channel-side returned None (EOF) or an Err (channel torn down).
-        // Stop reading on the local TCP side so the other thread's `read`
-        // returns Ok(0) and exits.
-        let _ = tcp_out_b.shutdown(std::net::Shutdown::Read);
+        super::channel_to_socket(&chan_rx, &mut tcp_out_b);
     });
 
     // Reaper: when both directions have finished, send Close to drop the

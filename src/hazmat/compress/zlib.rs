@@ -26,13 +26,13 @@ use super::{Compress, Decompress};
 const CHUNK: usize = 8 * 1024;
 
 /// Default upper bound on the number of bytes a single inflate call may
-/// produce. SSH's per-packet payload limit is `MAX_PACKET_LEN` (35 000 by
-/// default); a malicious peer could otherwise hand us a tiny compressed
-/// frame that inflates to gigabytes. Capping at `MAX_PACKET_LEN * 64`
-/// (~2 MiB) leaves comfortable headroom for legitimate traffic — even
-/// highly-compressible streams stay well below this — while bounding the
-/// allocator and CPU work a single bad frame can cost us.
-const DEFAULT_MAX_INFLATE_OUTPUT: usize = (MAX_PACKET_LEN as usize) * 64;
+/// produce. SSH's per-packet payload limit is `MAX_PACKET_LEN` (256 KiB);
+/// a malicious peer could otherwise hand us a tiny compressed frame that
+/// inflates to gigabytes. Capping at `MAX_PACKET_LEN * 8` (2 MiB) leaves
+/// comfortable headroom for legitimate traffic — even highly-compressible
+/// streams stay well below this — while bounding the allocator and CPU
+/// work a single bad frame can cost us.
+const DEFAULT_MAX_INFLATE_OUTPUT: usize = (MAX_PACKET_LEN as usize) * 8;
 
 struct ZlibDeflate {
     enc: CcEncoder,

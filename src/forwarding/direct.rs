@@ -8,11 +8,9 @@
 //! explicitly emit `CHANNEL_EOF` + `CHANNEL_CLOSE` on the SSH side via the
 //! raw egress sender obtained from [`ChannelStream::into_raw`].
 
-use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender};
+use std::io::{self, Read};
+use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::Duration;
 
@@ -196,88 +194,42 @@ fn connect_with_timeout(host: &str, port: u16, timeout: Option<Duration>) -> io:
 }
 
 /// Splice the SSH `ChannelStream` against an open `TcpStream` in both
-/// directions, returning once either side hits EOF or errors.
-///
-/// Implementation notes:
-/// - We decompose the `ChannelStream` into its raw mpsc handles so each
-///   direction can be driven from a separate thread without needing to
-///   interrupt a blocked `Read::read`.
-/// - The TCP→Channel half runs on the calling thread; the Channel→TCP half
-///   runs on a worker thread.
-/// - When either half completes we set a shared `stop` flag and
-///   `tcp.shutdown(Both)` so the other thread unblocks quickly (either via
-///   a TCP read returning 0/err, or via the channel ingress receiver being
-///   dropped when the dispatcher tears the channel down).
-/// - On exit we explicitly emit `Eof` + `Close` on the egress sender. The
-///   `ChannelStream::into_raw` path suppresses auto-EOF on drop, so this is
-///   the only place those markers are produced.
+/// directions, as OpenSSH does: the socket's EOF is sent as the channel's;
+/// the channel's EOF half-closes the socket (the destination may still
+/// answer); the channel is closed once both directions are done (the
+/// channel's close, or a failed write, ends both).
 fn splice(stream: ChannelStream, tcp: TcpStream) -> Result<()> {
     let (raw_rx, raw_tx) = stream.into_raw();
 
-    // Clone the TCP handle so each direction has its own owned view; that
-    // also lets either thread call `shutdown(Both)` on its companion.
-    let tcp_for_writer = tcp.try_clone().map_err(|e| {
+    let mut reader = tcp.try_clone().map_err(|e| {
         crate::error::Error::Io(io::Error::new(
             e.kind(),
             "direct-tcpip: TcpStream::try_clone failed",
         ))
     })?;
-
-    let stop = Arc::new(AtomicBool::new(false));
-    let stop_worker = Arc::clone(&stop);
     let tx_worker = raw_tx.clone();
 
-    // Worker: TCP → Channel.
+    // Worker: TCP → channel.
     let worker = thread::spawn(move || {
-        let mut reader = tcp_for_writer;
-        copy_tcp_to_channel(&mut reader, &tx_worker, &stop_worker);
+        copy_tcp_to_channel(&mut reader, &tx_worker);
+        let _ = tx_worker.send(ChannelEgress::Eof);
     });
 
-    // Main: Channel → TCP.
+    // Main: channel → TCP.
     let mut writer = tcp;
-    copy_channel_to_tcp(&raw_rx, &mut writer, &stop);
-
-    // We're done with our direction. Wake the worker if it's still parked
-    // in a TCP read (its cloned handle shares the underlying socket).
-    let _ = writer.shutdown(Shutdown::Both);
-    stop.store(true, Ordering::SeqCst);
+    super::channel_to_socket(&raw_rx, &mut writer);
     let _ = worker.join();
 
-    // Tell the dispatcher the SSH side is finished. Errors here mean the
-    // dispatcher already tore the channel down — fine.
-    let _ = raw_tx.send(ChannelEgress::Eof);
+    // Errors here mean the dispatcher already tore the channel down — fine.
     let _ = raw_tx.send(ChannelEgress::Close);
     Ok(())
 }
 
-/// Drain the channel-ingress receiver, writing each chunk to `tcp`. Returns
-/// when the peer sends EOF (`None`), the receiver is closed, or `tcp`
-/// returns an error.
-fn copy_channel_to_tcp(rx: &Receiver<Option<Vec<u8>>>, tcp: &mut TcpStream, stop: &AtomicBool) {
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
-        match rx.recv() {
-            Ok(Some(chunk)) => {
-                if tcp.write_all(&chunk).is_err() {
-                    return;
-                }
-            }
-            Ok(None) | Err(_) => return,
-        }
-    }
-}
-
-/// Read from `tcp` and forward each chunk as `ChannelEgress::Data`. Returns
-/// when `tcp` reaches EOF or errors (e.g. the peer half-shut the socket),
-/// or when the egress sender fails (dispatcher gone).
-fn copy_tcp_to_channel(tcp: &mut TcpStream, tx: &SyncSender<ChannelEgress>, stop: &AtomicBool) {
+/// Read from `tcp` and forward each chunk as `ChannelEgress::Data`, until
+/// its EOF or an error, or the egress sender fails (dispatcher gone).
+fn copy_tcp_to_channel(tcp: &mut TcpStream, tx: &SyncSender<ChannelEgress>) {
     let mut buf = [0u8; 32 * 1024];
     loop {
-        if stop.load(Ordering::SeqCst) {
-            return;
-        }
         let n = match tcp.read(&mut buf) {
             Ok(0) => return,
             Ok(n) => n,
@@ -293,6 +245,7 @@ fn copy_tcp_to_channel(tcp: &mut TcpStream, tx: &SyncSender<ChannelEgress>, stop
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::time::Duration;

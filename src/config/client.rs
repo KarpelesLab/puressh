@@ -22,7 +22,9 @@ use alloc::vec::Vec;
 use super::ConfigError;
 use super::algos::{AlgoCategory, resolve_algo_list};
 use super::glob::{HostPattern, host_matches};
-use super::match_block::{ExecPolicy, MatchCondition, MatchContext, all_match, parse_match_line};
+use super::match_block::{
+    ExecPolicy, MatchCondition, MatchContext, all_match, evaluate, parse_match_line,
+};
 use super::parser::{ParsedLine, tokenize};
 
 /// `StrictHostKeyChecking` value — maps OpenSSH's keyword set to puressh's
@@ -254,6 +256,10 @@ pub struct LocalForwardSpec {
     pub remote_host: String,
     /// Remote destination port.
     pub remote_port: u16,
+    /// A Unix socket to listen on instead of `[bind:]port`.
+    pub listen_path: Option<String>,
+    /// A Unix socket on the server to connect to instead of `host:port`.
+    pub connect_path: Option<String>,
 }
 
 impl LocalForwardSpec {
@@ -269,12 +275,16 @@ impl LocalForwardSpec {
             listen_port,
             remote_host: remote_host.into(),
             remote_port,
+            listen_path: None,
+            connect_path: None,
         }
     }
 }
 
 /// One `RemoteForward` entry. Wire form `[bind:]port host:hostport`, e.g.
-/// `8080 127.0.0.1:8080`.
+/// `8080 127.0.0.1:8080`, or `[bind:]port` alone for a SOCKS proxy on the
+/// server whose connections the client dials (see
+/// [`RemoteForwardSpec::dynamic`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct RemoteForwardSpec {
@@ -286,6 +296,13 @@ pub struct RemoteForwardSpec {
     pub local_host: String,
     /// Local destination port.
     pub local_port: u16,
+    /// `RemoteForward [bind:]port` with no destination: each forwarded
+    /// connection is a SOCKS request (`local_host` / `local_port` unused).
+    pub dynamic: bool,
+    /// A Unix socket for the server to listen on instead of `[bind:]port`.
+    pub listen_path: Option<String>,
+    /// A local Unix socket to connect to instead of `host:port`.
+    pub connect_path: Option<String>,
 }
 
 impl RemoteForwardSpec {
@@ -301,6 +318,23 @@ impl RemoteForwardSpec {
             remote_port,
             local_host: local_host.into(),
             local_port,
+            dynamic: false,
+            listen_path: None,
+            connect_path: None,
+        }
+    }
+
+    /// A SOCKS forward: the server listens on `[bind:]remote_port` and the
+    /// client dials whatever each connection asks for.
+    pub fn dynamic(bind_addr: Option<String>, remote_port: u16) -> Self {
+        Self {
+            bind_addr,
+            remote_port,
+            local_host: String::new(),
+            local_port: 0,
+            dynamic: true,
+            listen_path: None,
+            connect_path: None,
         }
     }
 }
@@ -353,6 +387,12 @@ pub struct ClientOptions {
     pub request_tty: Option<RequestTty>,
     /// `CanonicalizeHostname`.
     pub canonicalize_hostname: Option<CanonicalizeHostname>,
+    /// `RekeyLimit`: re-key after this much data / time.
+    pub rekey_limit: Option<crate::config::RekeyLimit>,
+    /// `PermitRemoteOpen`: the destinations a SOCKS `RemoteForward` may
+    /// reach, as written (`any`, `none`, or `host:port` entries where either
+    /// part may be `*`).
+    pub permit_remote_open: Option<Vec<String>>,
     /// `CanonicalDomains`: the suffixes tried, in order.
     pub canonical_domains: Option<Vec<String>>,
     /// `CanonicalizeMaxDots` (default 1): names with more dots are taken as
@@ -465,6 +505,11 @@ pub struct ClientOptions {
     pub escape_char: Option<Option<u8>>,
     /// `RemoteCommand` (raw; `none` means no command).
     pub remote_command: Option<String>,
+    /// `LocalCommand`: run locally once connected, when
+    /// [`Self::permit_local_command`] (raw; `none` means none).
+    pub local_command: Option<String>,
+    /// `PermitLocalCommand` (default no).
+    pub permit_local_command: Option<bool>,
     /// `SessionType`.
     pub session_type: Option<SessionType>,
     /// `StdinNull` (like `-n`).
@@ -660,6 +705,35 @@ impl SshClientConfig {
         }
         out
     }
+
+    /// Like [`Self::lookup_with`], with `Match exec` decided by `exec`: it is
+    /// given the command as written and the options matched so far (for
+    /// expanding `%h`, `%p`, `%r`, … as OpenSSH does), and says whether the
+    /// criterion matched. It is only called when the criteria before it on
+    /// the line matched.
+    pub fn lookup_with_exec(
+        &self,
+        ctx: MatchContext<'_>,
+        exec: &mut dyn FnMut(&str, &ClientOptions) -> bool,
+    ) -> ClientOptions {
+        let mut out = ClientOptions::default();
+        for block in &self.blocks {
+            let matches = match block {
+                Block::Host { patterns, .. } => host_matches(patterns, ctx.host),
+                Block::Match { conditions, .. } => {
+                    !conditions.is_empty()
+                        && conditions.iter().all(|c| match c {
+                            MatchCondition::Exec(cmd) => exec(cmd, &out),
+                            other => evaluate(other, &ctx, ExecPolicy::Deny),
+                        })
+                }
+            };
+            if matches {
+                merge_into(&mut out, block.opts());
+            }
+        }
+        out
+    }
 }
 
 /// Walk the tokenised stream and split it into [`Block`]s. Lines outside any
@@ -827,6 +901,30 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "requesttty" => {
             opts.request_tty = Some(parse_request_tty(line)?);
         }
+        "permitremoteopen" => {
+            let alone = |v: &str| v.eq_ignore_ascii_case("any") || v.eq_ignore_ascii_case("none");
+            for a in args.iter() {
+                let ok = if alone(a) {
+                    args.len() == 1
+                } else {
+                    match a.rsplit_once(':') {
+                        Some((h, p)) => !h.is_empty() && (p == "*" || p.parse::<u16>().is_ok()),
+                        None => false,
+                    }
+                };
+                if !ok {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("invalid permission {a:?}"),
+                    });
+                }
+            }
+            opts.permit_remote_open = Some(args.to_vec());
+        }
+        "rekeylimit" => {
+            opts.rekey_limit = Some(super::server::parse_rekey_limit(line)?);
+        }
         "canonicalizehostname" => {
             let v = one_arg(line)?.to_ascii_lowercase();
             opts.canonicalize_hostname = Some(match v.as_str() {
@@ -912,7 +1010,7 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             if args.len() == 1 && args[0].eq_ignore_ascii_case("none") {
                 opts.proxy_command = None;
             } else {
-                opts.proxy_command = Some(args.join(" "));
+                opts.proxy_command = Some(line.rest.clone());
             }
         }
         "proxyjump" => {
@@ -1172,10 +1270,19 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     msg: format!("expected a character, ^X or none, got {v:?}"),
                 })?);
         }
+        "localcommand" => {
+            // The rest of the line, verbatim.
+            if opts.local_command.is_none() {
+                opts.local_command = Some(line.rest.clone());
+            }
+        }
+        "permitlocalcommand" => {
+            opts.permit_local_command = Some(parse_yes_no(line)?);
+        }
         "remotecommand" => {
             // The rest of the line, verbatim.
             if opts.remote_command.is_none() {
-                opts.remote_command = Some(line.args.join(" "));
+                opts.remote_command = Some(line.rest.clone());
             }
         }
         "sessiontype" => {
@@ -1297,15 +1404,8 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("IPQoS", &["*"], ""),
     ("KbdInteractiveDevices", &["*"], ""),
     ("KnownHostsCommand", &["*"], ""),
-    ("LocalCommand", &["*"], ""),
     ("LogVerbose", &["*"], ""),
     ("NoHostAuthenticationForLocalhost", &["*"], ""),
-    ("PermitLocalCommand", &["*"], ""),
-    (
-        "PermitRemoteOpen",
-        &["any"],
-        "restricting remote dynamic forwarding destinations is not supported",
-    ),
     (
         "PKCS11Provider",
         &["none"],
@@ -1316,7 +1416,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
         &["no"],
         "a ProxyCommand that passes a file descriptor is not supported",
     ),
-    ("RekeyLimit", &["*"], ""),
     (
         "RequiredRSASize",
         &["1024", "2048"],
@@ -1388,6 +1487,8 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(forward_x11_trusted);
     take_scalar!(request_tty);
     take_scalar!(canonicalize_hostname);
+    take_scalar!(rekey_limit);
+    take_scalar!(permit_remote_open);
     take_scalar!(canonical_domains);
     take_scalar!(canonicalize_max_dots);
     take_scalar!(canonicalize_fallback_local);
@@ -1428,6 +1529,8 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(knock_port);
     take_scalar!(escape_char);
     take_scalar!(remote_command);
+    take_scalar!(local_command);
+    take_scalar!(permit_local_command);
     take_scalar!(session_type);
     take_scalar!(stdin_null);
     take_scalar!(fork_after_authentication);
@@ -1723,43 +1826,201 @@ fn parse_log_level(line: &ParsedLine) -> Result<u8, ConfigError> {
     }
 }
 
-/// Parse a `LocalForward` argument list. OpenSSH accepts two whitespace-
-/// separated tokens: `[bind:]port host:hostport`.
+/// `LocalForward listen connect`: parsed as OpenSSH does, joined with `:`
+/// (see [`parse_forward`]).
 fn parse_local_forward(line: &ParsedLine) -> Result<LocalForwardSpec, ConfigError> {
+    let bad = || ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: "Bad forwarding specification".into(),
+    };
     if line.args.len() != 2 {
-        return Err(ConfigError::BadValue {
-            line: line.line_no,
-            keyword: line.keyword.clone(),
-            msg: format!("expected 2 tokens, got {}", line.args.len()),
-        });
+        return Err(bad());
     }
-    let (bind_addr, listen_port) = split_bind_port(&line.args[0], line)?;
-    let (remote_host, remote_port) = split_host_port(&line.args[1], line)?;
-    Ok(LocalForwardSpec {
-        bind_addr,
-        listen_port,
-        remote_host,
-        remote_port,
-    })
+    let f = parse_forward(&alloc::format!("{}:{}", line.args[0], line.args[1]), false)
+        .ok_or_else(bad)?;
+    f.into_local().ok_or_else(bad)
 }
 
-/// Parse a `RemoteForward` argument list. Same shape as `LocalForward`.
+/// `RemoteForward listen [connect]` (no `connect`: a SOCKS proxy on the
+/// server), parsed as OpenSSH does (see [`parse_forward`]).
 fn parse_remote_forward(line: &ParsedLine) -> Result<RemoteForwardSpec, ConfigError> {
-    if line.args.len() != 2 {
-        return Err(ConfigError::BadValue {
-            line: line.line_no,
-            keyword: line.keyword.clone(),
-            msg: format!("expected 2 tokens, got {}", line.args.len()),
-        });
+    let bad = || ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: "Bad forwarding specification".into(),
+    };
+    let spec = match line.args.as_slice() {
+        [a] => a.clone(),
+        [a, b] => alloc::format!("{a}:{b}"),
+        _ => return Err(bad()),
+    };
+    Ok(parse_forward(&spec, true).ok_or_else(bad)?.into_remote())
+}
+
+/// One end of a forwarding: a TCP `[host:]port` or a Unix-socket path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ForwardEndpoint {
+    /// A TCP port, with the host (or bind address) when one was given.
+    Tcp {
+        /// Host name or address; `None` when only a port was given.
+        host: Option<String>,
+        /// Port (`0`: chosen by the listener, for remote forwards).
+        port: u16,
+    },
+    /// A Unix-domain socket path.
+    Path(String),
+}
+
+/// A forwarding specification as OpenSSH's `parse_forward` reads the
+/// `-L` / `-R` argument and the `LocalForward` / `RemoteForward` values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ForwardSpec {
+    /// Where to listen.
+    pub listen: ForwardEndpoint,
+    /// Where to connect each forwarded connection; `None` for a SOCKS proxy
+    /// (`-R [bind:]port`), which takes the destination from each request.
+    pub connect: Option<ForwardEndpoint>,
+}
+
+impl ForwardSpec {
+    /// As a [`LocalForwardSpec`]; `None` for a SOCKS forward (that is
+    /// `DynamicForward`).
+    pub fn into_local(self) -> Option<LocalForwardSpec> {
+        let mut out = LocalForwardSpec::new(None, 0, String::new(), 0);
+        match self.listen {
+            ForwardEndpoint::Tcp { host, port } => {
+                out.bind_addr = host;
+                out.listen_port = port;
+            }
+            ForwardEndpoint::Path(p) => out.listen_path = Some(p),
+        }
+        match self.connect? {
+            ForwardEndpoint::Tcp { host, port } => {
+                out.remote_host = host?;
+                out.remote_port = port;
+            }
+            ForwardEndpoint::Path(p) => out.connect_path = Some(p),
+        }
+        Some(out)
     }
-    let (bind_addr, remote_port) = split_bind_port(&line.args[0], line)?;
-    let (local_host, local_port) = split_host_port(&line.args[1], line)?;
-    Ok(RemoteForwardSpec {
-        bind_addr,
-        remote_port,
-        local_host,
-        local_port,
-    })
+
+    /// As a [`RemoteForwardSpec`].
+    pub fn into_remote(self) -> RemoteForwardSpec {
+        let mut out = RemoteForwardSpec::dynamic(None, 0);
+        match self.listen {
+            ForwardEndpoint::Tcp { host, port } => {
+                out.bind_addr = host;
+                out.remote_port = port;
+            }
+            ForwardEndpoint::Path(p) => out.listen_path = Some(p),
+        }
+        match self.connect {
+            None => {}
+            Some(ForwardEndpoint::Tcp { host, port }) => {
+                out.dynamic = false;
+                out.local_host = host.unwrap_or_default();
+                out.local_port = port;
+            }
+            Some(ForwardEndpoint::Path(p)) => {
+                out.dynamic = false;
+                out.connect_path = Some(p);
+            }
+        }
+        out
+    }
+}
+
+/// Parse a forwarding specification as OpenSSH's `parse_forward`:
+/// `:`-separated fields, each optionally `[bracketed]` (taken literally) or
+/// with `\`-escapes; a field containing `/` is a Unix socket path.
+///
+/// - `[bind:]port:host:hostport`, `port:/path`, `[bind:]port:/path`,
+///   `/path:host:hostport`, `/path:/path` — a forward;
+/// - `[bind:]port` or `/path` — a SOCKS proxy, accepted only for `remote`
+///   (`-R`; locally that is `-D`).
+///
+/// A local listen port may not be 0. `None` for anything else.
+pub fn parse_forward(spec: &str, remote: bool) -> Option<ForwardSpec> {
+    struct Field {
+        arg: String,
+        is_path: bool,
+    }
+    let mut fields: Vec<Field> = Vec::new();
+    let mut rest = spec.trim_start();
+    while !rest.is_empty() {
+        if fields.len() == 4 {
+            return None;
+        }
+        if let Some(r) = rest.strip_prefix('[') {
+            let close = r.find(']')?;
+            let after = &r[close + 1..];
+            if !(after.is_empty() || after.starts_with(':')) {
+                return None;
+            }
+            fields.push(Field {
+                arg: r[..close].to_string(),
+                is_path: r[..close].contains('/'),
+            });
+            rest = after.strip_prefix(':').unwrap_or(after);
+            continue;
+        }
+        let mut arg = String::new();
+        let mut is_path = false;
+        let mut chars = rest.char_indices();
+        let mut next = "";
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => arg.push(chars.next()?.1),
+                ':' => {
+                    next = &rest[i + 1..];
+                    break;
+                }
+                c => {
+                    if c == '/' {
+                        is_path = true;
+                    }
+                    arg.push(c);
+                }
+            }
+        }
+        fields.push(Field { arg, is_path });
+        rest = next;
+    }
+    let port = |s: &str| s.parse::<u16>().ok();
+    let tcp = |host: Option<&Field>, p: &Field| {
+        Some(ForwardEndpoint::Tcp {
+            host: host.map(|h| h.arg.clone()),
+            port: port(&p.arg)?,
+        })
+    };
+    let path = |f: &Field| ForwardEndpoint::Path(f.arg.clone());
+    let (listen, connect) = match fields.as_slice() {
+        [a] if a.is_path => (path(a), None),
+        [a] => (tcp(None, a)?, None),
+        [a, b] if a.is_path && b.is_path => (path(a), Some(path(b))),
+        [a, b] if b.is_path => (tcp(None, a)?, Some(path(b))),
+        [a, b] => (tcp(Some(a), b)?, None),
+        [a, b, c] if a.is_path => (path(a), Some(tcp(Some(b), c)?)),
+        [a, b, c] if c.is_path => (tcp(Some(a), b)?, Some(path(c))),
+        [a, b, c] => (tcp(None, a)?, Some(tcp(Some(b), c)?)),
+        [a, b, c, d] => (tcp(Some(a), b)?, Some(tcp(Some(c), d)?)),
+        _ => return None,
+    };
+    if connect.is_none() && !remote {
+        return None;
+    }
+    if let Some(ForwardEndpoint::Tcp { host, port }) = &connect
+        && (*port == 0 || host.as_deref().is_none_or(str::is_empty))
+    {
+        return None;
+    }
+    if !remote && matches!(listen, ForwardEndpoint::Tcp { port: 0, .. }) {
+        return None;
+    }
+    Some(ForwardSpec { listen, connect })
 }
 
 /// `[bind:]port` → `(Some("bind"), port)` or `(None, port)`. IPv6 literal
@@ -1798,40 +2059,6 @@ fn split_bind_port(s: &str, line: &ParsedLine) -> Result<(Option<String>, u16), 
             })?;
             Ok((None, port))
         }
-    }
-}
-
-/// `host:port` or `[host]:port`.
-fn split_host_port(s: &str, line: &ParsedLine) -> Result<(String, u16), ConfigError> {
-    if let Some(rest) = s.strip_prefix('[') {
-        if let Some((addr, port)) = rest.split_once("]:") {
-            let port = port.parse::<u16>().map_err(|_| ConfigError::BadValue {
-                line: line.line_no,
-                keyword: line.keyword.clone(),
-                msg: format!("bad port in {s:?}"),
-            })?;
-            return Ok((addr.to_string(), port));
-        }
-        return Err(ConfigError::BadValue {
-            line: line.line_no,
-            keyword: line.keyword.clone(),
-            msg: format!("malformed bracketed host:port {s:?}"),
-        });
-    }
-    match s.rsplit_once(':') {
-        Some((host, port)) => {
-            let port = port.parse::<u16>().map_err(|_| ConfigError::BadValue {
-                line: line.line_no,
-                keyword: line.keyword.clone(),
-                msg: format!("bad port in {s:?}"),
-            })?;
-            Ok((host.to_string(), port))
-        }
-        None => Err(ConfigError::BadValue {
-            line: line.line_no,
-            keyword: line.keyword.clone(),
-            msg: format!("expected host:port, got {s:?}"),
-        }),
     }
 }
 

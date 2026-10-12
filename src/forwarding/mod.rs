@@ -83,3 +83,52 @@ pub mod streamlocal;
 pub mod socks;
 #[cfg(unix)]
 pub mod x11;
+
+/// A local socket a forwarded channel is spliced with.
+#[allow(dead_code)] // which splices are built depends on the features
+pub(crate) trait SpliceSocket: std::io::Write {
+    /// `shutdown(2)` the socket.
+    fn shutdown_socket(&self, how: std::net::Shutdown) -> std::io::Result<()>;
+}
+
+impl SpliceSocket for std::net::TcpStream {
+    fn shutdown_socket(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+#[cfg(unix)]
+impl SpliceSocket for std::os::unix::net::UnixStream {
+    fn shutdown_socket(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        self.shutdown(how)
+    }
+}
+
+/// The channel → socket half of a splice: copy what the channel receives
+/// (`Some` data; `None` is its EOF; the sender is dropped on its close) to
+/// `out`. The channel's EOF half-closes the socket, as OpenSSH's, so the
+/// local side can still answer (the other direction ends when it closes);
+/// the channel's close, or a failed write, shuts the socket down both ways,
+/// which also ends the other direction's read.
+#[allow(dead_code)] // which splices are built depends on the features
+pub(crate) fn channel_to_socket<S: SpliceSocket>(
+    rx: &std::sync::mpsc::Receiver<Option<alloc::vec::Vec<u8>>>,
+    out: &mut S,
+) {
+    let closed = loop {
+        match rx.recv() {
+            Ok(Some(chunk)) => {
+                if out.write_all(&chunk).is_err() {
+                    break true;
+                }
+            }
+            Ok(None) => break false,
+            Err(_) => break true,
+        }
+    };
+    let _ = out.shutdown_socket(if closed {
+        std::net::Shutdown::Both
+    } else {
+        std::net::Shutdown::Write
+    });
+}

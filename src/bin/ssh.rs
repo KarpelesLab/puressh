@@ -21,8 +21,8 @@ use std::thread;
 use puressh::auth::SecretString;
 use puressh::auth::{ClientCredential, KeyboardInteractiveResponder};
 use puressh::client::{
-    AlgoOverrides, ChannelStream, Client, ClientHandlers, Config, ForwardedTcpipCallback,
-    ForwardedTcpipOrigin,
+    AlgoOverrides, ChannelStream, Client, ClientHandlers, Config, ForwardedStreamlocalCallback,
+    ForwardedStreamlocalOrigin, ForwardedTcpipCallback, ForwardedTcpipOrigin,
 };
 
 #[path = "common.rs"]
@@ -54,19 +54,9 @@ const USAGE: &str = "usage: ssh [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface] [
                      [-R address] [-S ctl_path] [-W host:port] [-w local_tun[:remote_tun]]\n           \
                      destination [command [argument ...]]";
 
-/// Parsed `-L LPORT:RHOST:RPORT` spec — client binds `LPORT` on loopback;
-/// each accepted connection becomes a `direct-tcpip` channel to the server
-/// targeting `RHOST:RPORT`. Each forward gets a dedicated accept thread
-/// that opens a `direct-tcpip` channel on the shared connection per connection.
-#[derive(Clone, Debug)]
-struct LocalForward {
-    /// Local port to bind on `127.0.0.1`.
-    listen_port: u16,
-    /// Destination hostname/IP the server is asked to dial.
-    remote_host: String,
-    /// Destination TCP port.
-    remote_port: u16,
-}
+/// A `-L` / `LocalForward`: listen on a local port or Unix socket; each
+/// connection becomes a `direct-tcpip` (or `direct-streamlocal`) channel.
+type LocalForward = puressh::config::LocalForwardSpec;
 
 /// Parsed `-D [bind:]port` spec — client binds a SOCKS proxy listener;
 /// each accepted SOCKS CONNECT becomes a `direct-tcpip` channel to the
@@ -92,18 +82,10 @@ enum X11Forward {
     Trusted,
 }
 
-/// Parsed `-R RPORT:LHOST:LPORT` spec — client asks the server to bind
-/// `RPORT`; each incoming connection arrives as a `forwarded-tcpip` open
-/// which the client splices to a fresh TCP connection on `LHOST:LPORT`.
-#[derive(Clone, Debug)]
-struct RemoteForward {
-    /// Remote port the server is asked to bind on `127.0.0.1`.
-    remote_port: u16,
-    /// Local destination the client dials per accepted forward.
-    local_host: String,
-    /// Local destination TCP port.
-    local_port: u16,
-}
+/// A `-R` / `RemoteForward`: the server listens (on a port or a Unix
+/// socket) and each connection is spliced to a local port or socket, or is
+/// a SOCKS request when there is no destination.
+type RemoteForward = puressh::config::RemoteForwardSpec;
 
 struct Cli {
     /// `-F path`: load this `ssh_config` instead of the defaults.
@@ -112,6 +94,9 @@ struct Cli {
     port: Option<u16>,
     identities: Vec<String>,
     cli_user: Option<String>,
+    /// `cli_user` came from `-o User=…`, which (unlike `-l` and `user@`)
+    /// takes %tokens as the configuration's User does.
+    user_from_o: bool,
     /// `None` when `-o StrictHostKeyChecking=…` wasn't supplied.
     strict: Option<StrictMode>,
     known_hosts_path: Option<PathBuf>,
@@ -187,18 +172,12 @@ struct Cli {
     command: Option<String>,
 }
 
-/// Parse one `-L` arg value: `LPORT:RHOST:RPORT`. `RHOST` may be a bare
-/// IPv4 / hostname, a bare IPv6 literal, OR an RFC-3986 bracketed IPv6
-/// literal (`[2001:db8::1]`) — the bracketed form is needed for v6
-/// because the literal itself contains colons that the `:`-split below
-/// would otherwise mangle.
+/// Parse one `-L` value as OpenSSH: `[bind_address:]port:host:hostport`,
+/// with Unix socket paths allowed for either end.
 fn parse_local_forward(s: &str) -> Result<LocalForward, String> {
-    let (listen_port, remote_host, remote_port) = split_forward_triple(s, "-L")?;
-    Ok(LocalForward {
-        listen_port,
-        remote_host,
-        remote_port,
-    })
+    puressh::config::parse_forward(&expand_env(s), false)
+        .and_then(puressh::config::ForwardSpec::into_local)
+        .ok_or_else(|| format!("Bad local forwarding specification '{s}'"))
 }
 
 /// Parse one `-D` arg value: `[bind_address:]port`. Reuses the config-layer
@@ -237,65 +216,13 @@ fn parse_dynamic_forward(s: &str) -> Result<puressh::config::DynamicForwardSpec,
     }
 }
 
-/// Parse one `-R` arg value: `RPORT:LHOST:LPORT`. Same v6 rules as `-L`.
+/// Parse one `-R` value as OpenSSH: `[bind_address:]port:host:hostport`
+/// (Unix socket paths allowed for either end), or `[bind_address:]port`
+/// for a SOCKS proxy on the server whose connections the client dials.
 fn parse_remote_forward(s: &str) -> Result<RemoteForward, String> {
-    let (remote_port, local_host, local_port) = split_forward_triple(s, "-R")?;
-    Ok(RemoteForward {
-        remote_port,
-        local_host,
-        local_port,
-    })
-}
-
-/// Common splitter for `-L` / `-R` triples: `PORT:HOST:PORT`. Handles a
-/// bracketed-IPv6 middle field by skipping past the `]` before looking
-/// for the second `:` separator. The `flag` argument is the originating
-/// CLI flag name (e.g. `"-L"`) for the error messages.
-fn split_forward_triple(s: &str, flag: &str) -> Result<(u16, String, u16), String> {
-    // First `:` ends the leading port. Always unambiguous — a port is
-    // numeric, no colons.
-    let (port1_str, after_p1) = s
-        .split_once(':')
-        .ok_or_else(|| format!("{flag} expects PORT:HOST:PORT, got {s:?}"))?;
-    let port1: u16 = port1_str
-        .parse()
-        .map_err(|_| format!("{flag}: invalid leading port {port1_str:?}"))?;
-
-    // Middle host field: bracketed v6 or plain.
-    let (host, after_host) = if let Some(rest) = after_p1.strip_prefix('[') {
-        // [v6]:port form — find the closing `]`. The host token is
-        // taken verbatim; we don't validate v6 here because the kernel
-        // will (TcpStream::connect) and a stricter check would just
-        // duplicate that work without catching anything user-meaningful.
-        let close = rest
-            .find(']')
-            .ok_or_else(|| format!("{flag}: missing `]` in {s:?}"))?;
-        let host = rest[..close].to_string();
-        let after = &rest[close + 1..];
-        let after = after
-            .strip_prefix(':')
-            .ok_or_else(|| format!("{flag}: expected `:port` after `]` in {s:?}"))?;
-        (host, after)
-    } else {
-        // Plain `host:port` — split on the FIRST `:`. A bare v6 with no
-        // brackets is ambiguous in this position (the colons of the
-        // address collide with the port separator); we require brackets
-        // for v6, matching OpenSSH's `-L` behaviour.
-        let (h, p) = after_p1
-            .split_once(':')
-            .ok_or_else(|| format!("{flag} expects PORT:HOST:PORT, got {s:?}"))?;
-        if h.is_empty() {
-            return Err(format!("{flag}: HOST cannot be empty"));
-        }
-        (h.to_string(), p)
-    };
-    if host.is_empty() {
-        return Err(format!("{flag}: HOST cannot be empty"));
-    }
-    let port2: u16 = after_host
-        .parse()
-        .map_err(|_| format!("{flag}: invalid trailing port {after_host:?}"))?;
-    Ok((port1, host, port2))
+    puressh::config::parse_forward(&expand_env(s), true)
+        .map(puressh::config::ForwardSpec::into_remote)
+        .ok_or_else(|| format!("Bad remote forwarding specification '{s}'"))
 }
 
 /// Options of OpenSSH's `ssh` that take a value (its getopt string is
@@ -361,6 +288,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut host_arg: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
     let mut first_user: Option<String> = None;
+    let mut user_from_o = false;
 
     let mut i = 0;
     while i < args.len() {
@@ -430,6 +358,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                                 .ok()
                                 .and_then(|c| c.lookup("*").user)
                             {
+                                user_from_o |= first_user.is_none();
                                 first_user.get_or_insert(u);
                             }
                             v.clone()
@@ -540,6 +469,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             port,
             identities,
             cli_user,
+            user_from_o,
             strict,
             known_hosts_path,
             hash_known_hosts,
@@ -594,6 +524,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         port,
         identities,
         cli_user,
+        user_from_o,
         strict,
         known_hosts_path,
         hash_known_hosts,
@@ -955,6 +886,42 @@ impl KeyboardInteractiveResponder for StdinKbdResponder {
     }
 }
 
+/// A completed key exchange, as OpenSSH's `-v` shows it.
+fn log_kex(n: &puressh::hazmat::transport::Negotiated) {
+    if common::verbose_level() == 0 {
+        return;
+    }
+    let mac = |m: &str| {
+        if m.is_empty() {
+            "<implicit>".to_string()
+        } else {
+            m.to_string()
+        }
+    };
+    vlog(1, &format!("kex: algorithm: {}", n.kex));
+    vlog(1, &format!("kex: host key algorithm: {}", n.host_key));
+    vlog(
+        1,
+        &format!(
+            "kex: server->client cipher: {} MAC: {} compression: {}",
+            n.cipher_s2c,
+            mac(&n.mac_s2c),
+            n.comp_s2c
+        ),
+    );
+    vlog(
+        1,
+        &format!(
+            "kex: client->server cipher: {} MAC: {} compression: {}",
+            n.cipher_c2s,
+            mac(&n.mac_c2s),
+            n.comp_c2s
+        ),
+    );
+    vlog(1, "SSH2_MSG_NEWKEYS sent");
+    vlog(1, "SSH2_MSG_NEWKEYS received");
+}
+
 /// Authenticate `client` as `user`. Builds a SINGLE `ClientAuth` driver for
 /// this connection — publickey credentials first, then a re-promptable
 /// password closure, then a keyboard-interactive responder — and runs it once.
@@ -969,6 +936,12 @@ fn authenticate_client(
     credentials: Vec<ClientCredential>,
     cfg_block: &puressh::config::ClientOptions,
 ) -> Result<(), String> {
+    // Each key exchange in OpenSSH's debug words (the first has already run).
+    if let Some(n) = client.negotiated() {
+        log_kex(&n);
+    }
+    client.set_kex_observer(log_kex);
+
     // Whether password auth is permitted: BatchMode disables it outright;
     // PreferredAuthentications must include "password"; NumberOfPasswordPrompts
     // 0 also disables it.
@@ -1007,6 +980,28 @@ fn authenticate_client(
         && kbdint_allowed_by_prefs
         && cfg_block.kbd_interactive_authentication != Some(false);
 
+    // The server's banner, on stderr as OpenSSH shows it (not with -q or a
+    // LogLevel below INFO); control characters other than newlines and
+    // tabs are shown as `\ooo`.
+    client.set_banner_handler(|msg: &str| {
+        if common::is_quiet() {
+            return;
+        }
+        let mut out = String::with_capacity(msg.len());
+        for c in msg.chars() {
+            if (c.is_control() && !matches!(c, '\n' | '\r' | '\t')) || c == '\u{7f}' {
+                for b in c.to_string().bytes() {
+                    out.push_str(&format!("\\{b:03o}"));
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        // The terminal's stderr even under -E, as OpenSSH writes it.
+        let mut err = common::remote_stderr();
+        let _ = err.write_all(out.as_bytes());
+        let _ = err.flush();
+    });
     let mut auth = client.new_auth_driver(user);
     // OpenSSH starts with "none": it learns which methods the server takes
     // (for `Permission denied (…)`) and logs in where none is enough.
@@ -1436,7 +1431,12 @@ fn final_config_pass(
     ctx.local_user = Some(local_user);
     ctx.canonical = true;
     ctx.final_pass = true;
-    let fin = ssh_cfg.lookup_with(ctx);
+    let earlier = cfg_block.clone();
+    let fin = ssh_cfg.lookup_with_exec(ctx, &mut |cmd, so_far| {
+        let mut opts = earlier.clone();
+        opts.merge_lower(so_far);
+        match_exec(cmd, &opts, cli, true)
+    });
     cfg_block.merge_lower(&fin);
     // Blocks matched on both passes added their lists twice; OpenSSH skips
     // duplicate identities and forwards.
@@ -1609,6 +1609,18 @@ fn print_config(
             }
         ),
         "canonicalizePermittedcnames none".to_string(),
+        format!(
+            "permitremoteopen {}",
+            c.permit_remote_open
+                .as_ref()
+                .map_or("any".to_string(), |v| v.join(" "))
+        ),
+        // In bytes and seconds, 0 for the defaults, as OpenSSH prints it.
+        format!(
+            "rekeylimit {} {}",
+            c.rekey_limit.and_then(|r| r.max_bytes).unwrap_or(0),
+            c.rekey_limit.and_then(|r| r.max_seconds).unwrap_or(0)
+        ),
         format!(
             "addkeystoagent {}",
             if c.add_keys_to_agent == Some(true) {
@@ -1798,7 +1810,6 @@ fn print_config(
         ("fingerprinthash", "SHA256"),
         ("hostbasedauthentication", "no"),
         ("nohostauthenticationforlocalhost", "no"),
-        ("permitlocalcommand", "no"),
         ("proxyusefdpass", "no"),
         ("streamlocalbindunlink", "no"),
         ("tunnel", "false"),
@@ -1811,10 +1822,8 @@ fn print_config(
         ("xauthlocation", "/usr/bin/xauth"),
         ("logverbose", "none"),
         ("channeltimeout", "none"),
-        ("permitremoteopen", "any"),
         ("tunneldevice", "any:any"),
         ("ipqos", "af21 cs1"),
-        ("rekeylimit", "0 0"),
         ("streamlocalbindmask", "0177"),
         ("syslogfacility", "USER"),
     ] {
@@ -1862,34 +1871,67 @@ fn print_config(
     if let Some(r) = &c.remote_command {
         out.push(format!("remotecommand {r}"));
     }
+    match &c.identity_agent {
+        Some(puressh::config::IdentityAgent::Path(p)) => out.push(format!("identityagent {p}")),
+        Some(puressh::config::IdentityAgent::None) => out.push("identityagent none".to_string()),
+        _ => {}
+    }
+    out.push(format!(
+        "permitlocalcommand {}",
+        if c.permit_local_command == Some(true) {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(l) = c
+        .local_command
+        .as_ref()
+        .filter(|l| !l.eq_ignore_ascii_case("none"))
+    {
+        out.push(format!("localcommand {l}"));
+    }
     if let Some(p) = &c.preferred_authentications {
         out.push(format!("preferredauthentications {}", p.join(",")));
     }
     out.extend(c.send_env.iter().map(|e| format!("sendenv {e}")));
     out.extend(c.set_env.iter().map(|(k, v)| format!("setenv {k}={v}")));
-    for f in &c.local_forwards {
-        out.push(format!(
-            "localforward {}:{} {}:{}",
-            f.bind_addr.as_deref().unwrap_or("[localhost]"),
-            f.listen_port,
-            f.remote_host,
-            f.remote_port
-        ));
+    // As OpenSSH's dump_cfg_forwards: a listen port without an address is
+    // bare, any address is bracketed.
+    let listen = |a: &Option<String>, p: u16| match a {
+        Some(a) => format!("[{a}]:{p}"),
+        None => p.to_string(),
+    };
+    // The command line's and the configuration's, as OpenSSH keeps them.
+    for f in &cli.locals {
+        let from = f
+            .listen_path
+            .clone()
+            .unwrap_or_else(|| listen(&f.bind_addr, f.listen_port));
+        let to = f
+            .connect_path
+            .clone()
+            .unwrap_or_else(|| format!("[{}]:{}", f.remote_host, f.remote_port));
+        out.push(format!("localforward {from} {to}"));
     }
-    for f in &c.remote_forwards {
-        out.push(format!(
-            "remoteforward {}:{} {}:{}",
-            f.bind_addr.as_deref().unwrap_or("[localhost]"),
-            f.remote_port,
-            f.local_host,
-            f.local_port
-        ));
+    for f in &cli.remotes {
+        let from = f
+            .listen_path
+            .clone()
+            .unwrap_or_else(|| listen(&f.bind_addr, f.remote_port));
+        match &f.connect_path {
+            Some(to) => out.push(format!("remoteforward {from} {to}")),
+            None if f.dynamic => out.push(format!("remoteforward {from}")),
+            None => out.push(format!(
+                "remoteforward {from} [{}]:{}",
+                f.local_host, f.local_port
+            )),
+        }
     }
     for f in &c.dynamic_forwards {
         out.push(format!(
-            "dynamicforward {}:{}",
-            f.bind_addr.as_deref().unwrap_or("[localhost]"),
-            f.listen_port
+            "dynamicforward {}",
+            listen(&f.bind_addr, f.listen_port)
         ));
     }
     for line in out {
@@ -1901,7 +1943,13 @@ fn print_config(
 fn run_query(kind: &str) -> Result<i32, String> {
     use puressh::config::{AlgoCategory, supported_algorithms};
     let list: Vec<&str> = match kind {
-        "cipher" | "cipher-auth" => supported_algorithms(AlgoCategory::Cipher),
+        "cipher" => supported_algorithms(AlgoCategory::Cipher),
+        // The ciphers that authenticate (AEAD), as OpenSSH lists them.
+        "cipher-auth" => vec![
+            "aes128-gcm@openssh.com",
+            "aes256-gcm@openssh.com",
+            "chacha20-poly1305@openssh.com",
+        ],
         "mac" => supported_algorithms(AlgoCategory::Mac),
         "kex" => supported_algorithms(AlgoCategory::Kex),
         // As OpenSSH's: key types (`ssh-rsa` for RSA keys), then with their
@@ -1983,6 +2031,7 @@ fn run() -> Result<i32, String> {
     let mut cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
     set_verbose(cli.verbose);
     common::set_quiet(cli.quiet);
+    LOG_QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
 
     // `-V`: like OpenSSH, the version goes to stderr.
     if cli.version {
@@ -2011,6 +2060,20 @@ fn run() -> Result<i32, String> {
     let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
     // `Match user` / `localuser` see the user named on the command line
     // (else the local one), as OpenSSH's first pass does.
+    // As OpenSSH, values from the command line that end up in %tokens are
+    // checked before the configuration is read.
+    if let Some(u) = cli
+        .cli_user
+        .as_deref()
+        .filter(|_| !cli.user_from_o)
+        .or(cli.user_in_host.as_deref())
+        && !valid_ruser(u)
+    {
+        return Err("remote username contains invalid characters".into());
+    }
+    if !valid_hostname(&cli.host) {
+        return Err("hostname contains invalid characters".into());
+    }
     let local_user = common::local_user_name().unwrap_or_default();
     let named_user = cli
         .cli_user
@@ -2022,7 +2085,8 @@ fn run() -> Result<i32, String> {
     ctx.original_host = Some(&cli.host);
     ctx.user = Some(&named_user);
     ctx.local_user = Some(&local_user);
-    let mut cfg_block = ssh_cfg.lookup_with(ctx);
+    let mut cfg_block =
+        ssh_cfg.lookup_with_exec(ctx, &mut |cmd, so_far| match_exec(cmd, so_far, &cli, false));
     // `-o KEY=VALUE` overlays the matched block at the highest precedence,
     // re-using the strict config parser for validation.
     apply_extra_o(&mut cfg_block, &cli.extra_o)?;
@@ -2086,18 +2150,10 @@ fn run() -> Result<i32, String> {
     // (Both lists are additive; OpenSSH treats `LocalForward` entries the
     // same as `-L` arguments.)
     for lf in &cfg_block.local_forwards {
-        cli.locals.push(LocalForward {
-            listen_port: lf.listen_port,
-            remote_host: lf.remote_host.clone(),
-            remote_port: lf.remote_port,
-        });
+        cli.locals.push(lf.clone());
     }
     for rf in &cfg_block.remote_forwards {
-        cli.remotes.push(RemoteForward {
-            remote_port: rf.remote_port,
-            local_host: rf.local_host.clone(),
-            local_port: rf.local_port,
-        });
+        cli.remotes.push(rf.clone());
     }
     // DynamicForward: gather `-D` and config entries, resolving each
     // listener's bind address through GatewayPorts.
@@ -2138,10 +2194,14 @@ fn run() -> Result<i32, String> {
     // messages (`Warning: Permanently added …`), as -q does; VERBOSE and
     // DEBUGn are -v levels.
     if cli.verbose == 0
+        && !cli.quiet
         && let Some(level) = cfg_block.log_level
     {
         match level {
-            0..=2 => common::set_quiet(true),
+            0..=2 => {
+                common::set_quiet(true);
+                LOG_QUIET.store(level == 0, std::sync::atomic::Ordering::Relaxed);
+            }
             3 => {}
             4 | 5 => set_verbose(1),
             6 => set_verbose(2),
@@ -2156,7 +2216,7 @@ fn run() -> Result<i32, String> {
         .clone()
         .or_else(|| cli.user_in_host.clone())
         .or_else(|| cfg_block.user.clone());
-    let user = resolve_user(cli_user.as_deref(), None)?;
+    let mut user = resolve_user(cli_user.as_deref(), None)?;
 
     let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
     let port = common::pick(cli.port, cfg_block.port, 22);
@@ -2176,8 +2236,46 @@ fn run() -> Result<i32, String> {
     // ssh_config(5) TOKENS in the directives that take them (before -G
     // prints them, except IdentityFile / CertificateFile, which OpenSSH
     // prints as written).
+    // A configured User takes the tokens (but not %r, itself, or %C, which
+    // hashes it) and ${VAR}; a name that expansion changed is checked as a
+    // command-line one is.
+    let configured = if cli.user_from_o {
+        cli.cli_user.clone()
+    } else if cli.cli_user.is_none() && cli.user_in_host.is_none() {
+        cfg_block.user.clone()
+    } else {
+        None
+    };
+    if let Some(configured) = configured {
+        let t = Tokens::new(&cli.host, &connect_host, port, "%r", &cfg_block, &cli);
+        let expanded = t.expand(&expand_env(&configured.replace("%C", "%%C")));
+        if expanded != configured {
+            if !valid_ruser(&expanded) {
+                return Err("remote username contains invalid characters".into());
+            }
+            user = expanded.clone();
+            if cli.user_from_o {
+                cli.cli_user = Some(expanded.clone());
+            }
+            cfg_block.user = Some(expanded);
+        }
+    }
     let tokens = Tokens::new(&cli.host, &connect_host, port, &user, &cfg_block, &cli);
     tokens.expand_options(&mut cfg_block);
+    // Unix socket paths in forwards take tokens and ${VAR}.
+    let socket_path = |p: &mut Option<String>| {
+        if let Some(p) = p {
+            *p = tokens.expand(&expand_env(p));
+        }
+    };
+    for f in cli.locals.iter_mut() {
+        socket_path(&mut f.listen_path);
+        socket_path(&mut f.connect_path);
+    }
+    for f in cli.remotes.iter_mut() {
+        socket_path(&mut f.listen_path);
+        socket_path(&mut f.connect_path);
+    }
     if let Some(p) = &cli.known_hosts_path {
         cli.known_hosts_path = Some(PathBuf::from(tokens.expand_path(&p.to_string_lossy())));
     }
@@ -2417,6 +2515,17 @@ fn run() -> Result<i32, String> {
             collect_credentials(&cfg_block, &cli.identities, identities_only)
         }
     };
+    // RekeyLimit: re-key after that much data / time (else the defaults).
+    if let Some(rk) = cfg_block.rekey_limit {
+        let mut policy = puressh::hazmat::transport::RekeyPolicy::default();
+        if let Some(b) = rk.max_bytes {
+            policy.max_bytes = b;
+        }
+        if let Some(secs) = rk.max_seconds {
+            policy.max_duration = std::time::Duration::from_secs(secs as u64);
+        }
+        client.set_rekey_policy(policy);
+    }
     authenticate_client(&mut client, &connect_host, &user, credentials, &cfg_block)?;
 
     // AddKeysToAgent yes: push the supplied identities into the local agent.
@@ -2445,6 +2554,7 @@ fn run() -> Result<i32, String> {
     // `-W host:port`: stdin/stdout become a tunnel to host:port (the usual
     // `ProxyCommand ssh -W %h:%p jump` form); no session.
     if let Some(spec) = cli.stdio_forward.clone() {
+        background_ready();
         return run_stdio_forward(client, &spec);
     }
 
@@ -2458,8 +2568,17 @@ fn run() -> Result<i32, String> {
         .gateway_ports
         .unwrap_or(puressh::config::GatewayPorts::No);
     let mut handlers = ClientHandlers::new();
-    if let Some(cb) = request_remote_forwards(&mut client, &cli, exit_on_forward_failure)? {
+    let (tcp_cb, path_cb) = request_remote_forwards(
+        &mut client,
+        &cli,
+        exit_on_forward_failure,
+        cfg_block.permit_remote_open.as_deref(),
+    )?;
+    if let Some(cb) = tcp_cb {
         handlers = handlers.with_forwarded_tcpip(cb);
+    }
+    if let Some(cb) = path_cb {
+        handlers = handlers.with_forwarded_streamlocal(cb);
     }
     if cli.agent_forward {
         #[cfg(unix)]
@@ -2579,8 +2698,21 @@ fn run() -> Result<i32, String> {
             None => false,
         }
     };
+    // LocalCommand (PermitLocalCommand yes): run here once the connection
+    // and its forwards are up, waiting for it, as OpenSSH's ssh_session2.
+    if cfg_block.permit_local_command == Some(true)
+        && let Some(cmd) = cfg_block
+            .local_command
+            .as_deref()
+            .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none"))
+    {
+        run_local_command(&tokens.expand(&cmd.replace("%T", "NONE")));
+    }
+
     // `-N`: no session; keep the connection (and its forwards) alive.
     let run = move |s: &puressh::shared::SharedClient| -> i32 {
+        // Forwards up, control socket (if any) bound: `-f` may detach.
+        background_ready();
         if no_command {
             return match s.pump_until_closed() {
                 Ok(()) => 0,
@@ -2610,6 +2742,32 @@ fn run() -> Result<i32, String> {
         return become_master(dec, &cli, &cfg_block, shared, run);
     }
     Ok(run(&shared))
+}
+
+/// Run a `LocalCommand` with the user's shell (`$SHELL`, else `/bin/sh`;
+/// `cmd` on Windows) and wait for it; its output goes to ssh's own stdout and stderr.
+fn run_local_command(cmd: &str) {
+    #[cfg(unix)]
+    let (shell, flag) = (
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string()),
+        "-c",
+    );
+    #[cfg(not(unix))]
+    let (shell, flag) = ("cmd".to_string(), "/C");
+    vlog(3, &format!("Executing {shell} {flag} \"{cmd}\""));
+    if let Err(e) = std::process::Command::new(&shell)
+        .arg(flag)
+        .arg(cmd)
+        .status()
+    {
+        warn!(
+            "Couldn't execute {shell} -c \"{cmd}\": {}",
+            common::io_reason(&e)
+        );
+    }
 }
 
 /// `ServerAliveInterval`: a keepalive on the connection every `interval`
@@ -2652,76 +2810,298 @@ fn spawn_keepalive(
     });
 }
 
+/// Where a `-R` connection goes on this side.
+#[derive(Clone, Debug)]
+enum RemoteDest {
+    Tcp(String, u16),
+    Path(String),
+    /// `-R [bind:]port`: the connection is a SOCKS request.
+    Socks,
+}
+
+impl RemoteDest {
+    fn of(r: &RemoteForward) -> Self {
+        match &r.connect_path {
+            Some(p) => RemoteDest::Path(p.clone()),
+            None if r.dynamic => RemoteDest::Socks,
+            None => RemoteDest::Tcp(r.local_host.clone(), r.local_port),
+        }
+    }
+}
+
+/// The handlers for the server's `forwarded-tcpip` and
+/// `forwarded-streamlocal` channels, when there are remote forwards.
+type RemoteForwardHandlers = (
+    Option<Arc<ForwardedTcpipCallback>>,
+    Option<Arc<ForwardedStreamlocalCallback>>,
+);
+
 /// `-R`: ask the server to listen for every remote forward (before the
 /// connection is shared: the replies are awaited synchronously) and return
-/// the callback that connects each forwarded connection to its local
-/// target. `None` when there are no remote forwards.
+/// the callbacks that connect each forwarded connection to its local
+/// destination.
 fn request_remote_forwards(
     client: &mut Client,
     cli: &Cli,
     exit_on_forward_failure: bool,
-) -> Result<Option<Arc<ForwardedTcpipCallback>>, String> {
+    permit_remote_open: Option<&[String]>,
+) -> Result<RemoteForwardHandlers, String> {
     if cli.remotes.is_empty() {
-        return Ok(None);
+        return Ok((None, None));
     }
-    let mut routes: std::collections::BTreeMap<(String, u16), (String, u16)> =
+    let permit: Arc<Option<Vec<String>>> = Arc::new(permit_remote_open.map(<[String]>::to_vec));
+    let mut routes: std::collections::BTreeMap<(String, u16), RemoteDest> =
+        std::collections::BTreeMap::new();
+    let mut path_routes: std::collections::BTreeMap<String, RemoteDest> =
         std::collections::BTreeMap::new();
     for r in &cli.remotes {
-        let bound_port = match client.request_tcpip_forward("127.0.0.1", r.remote_port) {
+        let dest = RemoteDest::of(r);
+        let shown = match &dest {
+            RemoteDest::Tcp(h, p) => format!("{h}:{p}"),
+            RemoteDest::Path(p) => p.clone(),
+            RemoteDest::Socks => "SOCKS".to_string(),
+        };
+        let fail = |what: String, e: puressh::Error| -> Result<(), String> {
+            let msg = format!("remote port forwarding failed for listen {what}: {e}");
+            if exit_on_forward_failure {
+                return Err(msg);
+            }
+            warn!("Warning: {msg}");
+            Ok(())
+        };
+        if let Some(path) = &r.listen_path {
+            match client.request_streamlocal_forward(path) {
+                Ok(()) => {
+                    vlog(1, &format!("-R {path}:{shown} active"));
+                    path_routes.insert(path.clone(), dest);
+                }
+                Err(e) => fail(format!("path {path}"), e)?,
+            }
+            continue;
+        }
+        // As OpenSSH's channel_rfwd_bind_host: no address is the server's
+        // loopback, `*` (or empty) all of its interfaces.
+        let bind = match r.bind_addr.as_deref() {
+            None => "localhost",
+            Some("" | "*") => "",
+            Some(a) => a,
+        };
+        let bound_port = match client.request_tcpip_forward(bind, r.remote_port) {
             Ok(p) => p,
             Err(e) => {
-                let msg = format!(
-                    "remote port forwarding failed for listen port {}: {e}",
-                    r.remote_port
-                );
-                if exit_on_forward_failure {
-                    return Err(msg);
-                }
-                warn!("Warning: {msg}");
+                fail(format!("port {}", r.remote_port), e)?;
                 continue;
             }
         };
-        vlog(
-            1,
-            &format!(
-                "-R 127.0.0.1:{}:{}:{} active",
-                bound_port, r.local_host, r.local_port
-            ),
-        );
+        vlog(1, &format!("-R {bind}:{bound_port}:{shown} active"));
         // OpenSSH reports the port the server picked for `-R 0:…`.
         if r.remote_port == 0 {
-            warn!(
-                "Allocated port {bound_port} for remote forward to {}:{}",
-                r.local_host, r.local_port
-            );
-        }
-        routes.insert(
-            ("127.0.0.1".to_string(), bound_port),
-            (r.local_host.clone(), r.local_port),
-        );
-    }
-    let routes = Arc::new(routes);
-    let cb: Arc<ForwardedTcpipCallback> =
-        Arc::new(move |origin: ForwardedTcpipOrigin, stream: ChannelStream| {
-            let Some((local_host, local_port)) = routes
-                .get(&(origin.bound_address.clone(), origin.bound_port))
-                .cloned()
-            else {
-                warn!(
-                    "Warning: forwarded connection for unknown listener {}:{}; dropping",
-                    origin.bound_address, origin.bound_port
-                );
-                return;
-            };
-            match TcpStream::connect((local_host.as_str(), local_port)) {
-                Ok(tcp) => spawn_splice_to_tcp(stream, tcp),
-                Err(e) => warn!(
-                    "connect to {local_host} port {local_port} failed: {e} (forwarded from {}:{})",
-                    origin.orig_address, origin.orig_port
-                ),
+            match &dest {
+                RemoteDest::Socks => warn!("Allocated port {bound_port} for remote forward"),
+                _ => warn!("Allocated port {bound_port} for remote forward to {shown}"),
             }
-        });
-    Ok(Some(cb))
+        }
+        routes.insert((bind.to_string(), bound_port), dest);
+    }
+    let tcp_cb: Option<Arc<ForwardedTcpipCallback>> = (!routes.is_empty()).then(|| {
+        let permit = permit.clone();
+        let cb: Arc<ForwardedTcpipCallback> =
+            Arc::new(move |origin: ForwardedTcpipOrigin, stream: ChannelStream| {
+                // The server names the listener as it was requested; a
+                // server that normalises the address is matched on the port.
+                let route = routes
+                    .get(&(origin.bound_address.clone(), origin.bound_port))
+                    .or_else(|| {
+                        let mut by_port =
+                            routes.iter().filter(|((_, p), _)| *p == origin.bound_port);
+                        match (by_port.next(), by_port.next()) {
+                            (Some((_, t)), None) => Some(t),
+                            _ => None,
+                        }
+                    })
+                    .cloned();
+                match route {
+                    Some(dest) => serve_remote_dest(stream, dest, permit.clone()),
+                    None => warn!(
+                        "Warning: forwarded connection for unknown listener {}:{}; dropping",
+                        origin.bound_address, origin.bound_port
+                    ),
+                }
+            });
+        cb
+    });
+    let path_cb: Option<Arc<ForwardedStreamlocalCallback>> = (!path_routes.is_empty()).then(|| {
+        let cb: Arc<ForwardedStreamlocalCallback> = Arc::new(
+            move |origin: ForwardedStreamlocalOrigin, stream: ChannelStream| match path_routes
+                .get(&origin.socket_path)
+                .cloned()
+            {
+                Some(dest) => serve_remote_dest(stream, dest, permit.clone()),
+                None => warn!(
+                    "Warning: forwarded connection for unknown listener {}; dropping",
+                    origin.socket_path
+                ),
+            },
+        );
+        cb
+    });
+    Ok((tcp_cb, path_cb))
+}
+
+/// Connect one forwarded connection to its local destination. Runs off the
+/// connection's I/O thread: connecting, or reading a SOCKS request from the
+/// channel, may block.
+fn serve_remote_dest(stream: ChannelStream, dest: RemoteDest, permit: Arc<Option<Vec<String>>>) {
+    thread::spawn(move || match dest {
+        RemoteDest::Socks => socks_to_local(stream, permit.as_deref()),
+        RemoteDest::Tcp(host, port) => match TcpStream::connect((host.as_str(), port)) {
+            Ok(tcp) => spawn_splice_to_tcp(stream, tcp),
+            Err(e) => warn!(
+                "connect to {host} port {port} failed: {}",
+                common::io_reason(&e)
+            ),
+        },
+        RemoteDest::Path(path) => match LocalConn::connect_path(&path) {
+            Ok(conn) => spawn_splice_to_tcp(stream, conn),
+            Err(e) => warn!("connect to {path} failed: {}", common::io_reason(&e)),
+        },
+    });
+}
+
+/// The local end of a forwarded connection: a TCP or Unix-domain stream.
+enum LocalConn {
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixStream),
+}
+
+impl LocalConn {
+    /// Connect to a Unix socket (not available on Windows).
+    fn connect_path(path: &str) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        return std::os::unix::net::UnixStream::connect(path).map(LocalConn::Unix);
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(std::io::Error::new(
+                ErrorKind::Unsupported,
+                "Unix domain sockets are not supported on this platform",
+            ))
+        }
+    }
+
+    fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            LocalConn::Tcp(t) => t.try_clone().map(LocalConn::Tcp),
+            #[cfg(unix)]
+            LocalConn::Unix(u) => u.try_clone().map(LocalConn::Unix),
+        }
+    }
+
+    fn shutdown(&self, how: std::net::Shutdown) -> std::io::Result<()> {
+        match self {
+            LocalConn::Tcp(t) => t.shutdown(how),
+            #[cfg(unix)]
+            LocalConn::Unix(u) => u.shutdown(how),
+        }
+    }
+}
+
+impl From<TcpStream> for LocalConn {
+    fn from(t: TcpStream) -> Self {
+        LocalConn::Tcp(t)
+    }
+}
+
+impl Read for LocalConn {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            LocalConn::Tcp(t) => t.read(buf),
+            #[cfg(unix)]
+            LocalConn::Unix(u) => u.read(buf),
+        }
+    }
+}
+
+impl Write for LocalConn {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            LocalConn::Tcp(t) => t.write(buf),
+            #[cfg(unix)]
+            LocalConn::Unix(u) => u.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            LocalConn::Tcp(t) => t.flush(),
+            #[cfg(unix)]
+            LocalConn::Unix(u) => u.flush(),
+        }
+    }
+}
+
+/// `PermitRemoteOpen`, as OpenSSH's open_match: unset or `any` allows all,
+/// `none` nothing, else a `host:port` entry must match (`*` for either part;
+/// IPv6 hosts may be bracketed).
+fn remote_open_permitted(permit: Option<&[String]>, host: &str, port: u16) -> bool {
+    let Some(list) = permit else {
+        return true;
+    };
+    list.iter().any(|e| {
+        if e.eq_ignore_ascii_case("any") {
+            return true;
+        }
+        let Some((h, p)) = e.rsplit_once(':') else {
+            return false;
+        };
+        let h = h
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(h);
+        (h == "*" || h == host) && (p == "*" || p.parse::<u16>() == Ok(port))
+    })
+}
+
+/// Serve one `-R [bind:]port` connection: read its SOCKS request, connect to
+/// the destination from here, reply, then splice the two.
+fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
+    use puressh::forwarding::socks;
+    let target = match socks::handshake(&mut stream) {
+        Ok(t) => t,
+        Err(e) => {
+            vlog(1, &format!("-R SOCKS handshake: {e}"));
+            return;
+        }
+    };
+    if !remote_open_permitted(permit, &target.host, target.port) {
+        warn!(
+            "Rejected connection to {} port {}: not permitted by PermitRemoteOpen",
+            target.host, target.port
+        );
+        let _ = socks::write_reply(&mut stream, target.version, false);
+        return;
+    }
+    match TcpStream::connect((target.host.as_str(), target.port)) {
+        Ok(mut tcp) => {
+            if socks::write_reply(&mut stream, target.version, true).is_err() {
+                return;
+            }
+            // Anything the SOCKS client sent along with its request.
+            let early = stream.take_buffered();
+            if !early.is_empty() && tcp.write_all(&early).is_err() {
+                return;
+            }
+            spawn_splice_to_tcp(stream, tcp);
+        }
+        Err(e) => {
+            warn!(
+                "connect to {} port {} failed: {e}",
+                target.host, target.port
+            );
+            let _ = socks::write_reply(&mut stream, target.version, false);
+        }
+    }
 }
 
 /// `-L` and `-D`: bind the local listeners; each accepted connection opens
@@ -2734,16 +3114,43 @@ fn start_local_forwards(
     gateway: puressh::config::GatewayPorts,
     exit_on_forward_failure: bool,
 ) -> Result<(), String> {
-    let bind_ip = resolve_bind_addr(gateway, None);
     for l in &cli.locals {
+        let shown_to = match &l.connect_path {
+            Some(p) => p.clone(),
+            None => format!("{}:{}", l.remote_host, l.remote_port),
+        };
+        if let Some(path) = &l.listen_path {
+            match bind_unix_listener(path) {
+                Ok(listener) => {
+                    vlog(1, &format!("-L {path}:{shown_to} active"));
+                    #[cfg(unix)]
+                    spawn_local_path_listener(listener, l.clone(), shared.clone());
+                    #[cfg(not(unix))]
+                    let () = listener;
+                }
+                Err(e) => {
+                    let msg = format!("unix_listener: cannot bind to path {path}: {e}");
+                    if exit_on_forward_failure {
+                        return Err(msg);
+                    }
+                    warn!("{msg}");
+                }
+            }
+            continue;
+        }
+        // As OpenSSH's channel_fwd_bind_addr for the client: an address in
+        // the spec is used as given (`*` or empty: all interfaces).
+        let bind_ip = match l.bind_addr.as_deref() {
+            None => resolve_bind_addr(gateway, None),
+            Some("" | "*") => "0.0.0.0".to_string(),
+            Some("localhost") => "127.0.0.1".to_string(),
+            Some(a) => a.to_string(),
+        };
         match TcpListener::bind((bind_ip.as_str(), l.listen_port)) {
             Ok(listener) => {
                 vlog(
                     1,
-                    &format!(
-                        "-L {}:{}:{}:{} active",
-                        bind_ip, l.listen_port, l.remote_host, l.remote_port
-                    ),
+                    &format!("-L {}:{}:{} active", bind_ip, l.listen_port, shown_to),
                 );
                 spawn_local_forward_listener(listener, l.clone(), shared.clone());
             }
@@ -2782,8 +3189,9 @@ fn start_local_forwards(
 fn splice_shared_with_tcp(
     shared: puressh::shared::SharedClient,
     mut stream: puressh::shared::OwnedChannelStream,
-    tcp: TcpStream,
+    tcp: impl Into<LocalConn>,
 ) {
+    let tcp: LocalConn = tcp.into();
     let channel = stream.channel_id();
     let Ok(mut tcp_in) = tcp.try_clone() else {
         return;
@@ -2834,20 +3242,66 @@ fn session_request(command: Option<&str>, subsystem: bool) -> puressh::shared::S
 }
 
 /// `ssh -f`: after authentication, keep going in a child process that
-/// leaves the terminal's session, and let the parent exit 0 — so
-/// `ssh -fN -L …` returns to the shell with the tunnel up.
+/// leaves the terminal's session. As OpenSSH's, the parent returns to the
+/// shell only once the forwards and the control socket are set up
+/// ([`background_ready`]): with status 0, or the child's own status if it
+/// fails first (`ExitOnForwardFailure`) — so `ssh -fN -L …` returns with the
+/// tunnel up.
 #[cfg(unix)]
 fn fork_to_background() -> Result<(), String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0; 2];
+    // SAFETY: pipe() fills the two-element array.
+    if unsafe { nix::libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(format!("pipe: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: both descriptors were just created and are owned here.
+    let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     // SAFETY: called while single-threaded (no session or forwarding threads
     // have been started); the child continues with ordinary Rust code.
     match unsafe { nix::libc::fork() } {
         -1 => Err(format!("fork: {}", std::io::Error::last_os_error())),
         0 => {
+            drop(rd);
             // SAFETY: setsid() in the child; failure is harmless.
             unsafe { nix::libc::setsid() };
+            if let Ok(mut g) = BACKGROUND_READY.lock() {
+                *g = Some(std::fs::File::from(wr));
+            }
             Ok(())
         }
-        _ => std::process::exit(0),
+        child => {
+            drop(wr);
+            let mut b = [0u8; 1];
+            if matches!(std::fs::File::from(rd).read(&mut b), Ok(1)) {
+                std::process::exit(0);
+            }
+            // The child ended before it was ready: its status is ours.
+            let mut status = 0;
+            // SAFETY: waiting for our own child.
+            unsafe { nix::libc::waitpid(child, &mut status, 0) };
+            let code = if nix::libc::WIFEXITED(status) {
+                nix::libc::WEXITSTATUS(status)
+            } else {
+                255
+            };
+            std::process::exit(code)
+        }
+    }
+}
+
+/// The `-f` child's end of the pipe its parent waits on.
+#[cfg(unix)]
+static BACKGROUND_READY: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// Tell the parent of an `ssh -f` that the connection is set up, so it
+/// returns to the shell (no-op otherwise, and after the first call).
+fn background_ready() {
+    #[cfg(unix)]
+    if let Ok(mut g) = BACKGROUND_READY.lock()
+        && let Some(mut f) = g.take()
+    {
+        let _ = f.write_all(b"1");
     }
 }
 
@@ -3047,8 +3501,14 @@ impl Tokens {
     }
 
     /// A file name as OpenSSH takes it: `~`, then `${VAR}`, then tokens.
+    /// (`~` alone is the home directory with a `/`, as tilde_expand_filename.)
     fn expand_path(&self, s: &str) -> String {
-        self.expand(&expand_env(&expand_tilde(s)))
+        let s = if s == "~" {
+            expand_tilde("~/")
+        } else {
+            expand_tilde(s)
+        };
+        self.expand(&expand_env(&s))
     }
 
     /// The directives `-G` prints expanded: UserKnownHostsFile, ControlPath,
@@ -3069,14 +3529,26 @@ impl Tokens {
                 *p = self.expand_path(p);
             }
         }
+        // An agent socket named by a variable (`SSH_AUTH_SOCK`, `$VAR`) is
+        // read from the environment when used; `${VAR}` is expanded here.
+        let names_variable =
+            |p: &str| p == "SSH_AUTH_SOCK" || (p.starts_with('$') && !p.starts_with("${"));
         if let Some(puressh::config::IdentityAgent::Path(p)) = &mut cfg.identity_agent
-            && p != "SSH_AUTH_SOCK"
-            && !p.starts_with('$')
+            && !names_variable(p)
+        {
+            *p = self.expand_path(p);
+        }
+        if let Some(p) = &mut cfg.forward_agent_socket
+            && !names_variable(p)
         {
             *p = self.expand_path(p);
         }
         if let Some(c) = &mut cfg.remote_command {
             *c = self.expand(c);
+        }
+        // SetEnv values (not the names).
+        for (_, v) in cfg.set_env.iter_mut() {
+            *v = self.expand(&expand_env(v));
         }
     }
 
@@ -3090,6 +3562,91 @@ impl Tokens {
             *p = self.expand_path(p);
         }
     }
+}
+
+/// `Match exec`: run `cmd`, its tokens expanded from the options matched so
+/// far, with the user's shell (stdin and stdout on /dev/null); exit status 0
+/// is a match. As OpenSSH's expand_match_exec_or_include_path and
+/// execute_in_shell.
+fn match_exec(
+    cmd: &str,
+    opts: &puressh::config::ClientOptions,
+    cli: &Cli,
+    final_pass: bool,
+) -> bool {
+    let host = match &opts.host_name {
+        Some(h) if final_pass => h.clone(),
+        Some(h) => h
+            .replace("%%", "\0")
+            .replace("%h", &cli.host)
+            .replace('\0', "%"),
+        None => cli.host.clone(),
+    };
+    let port = cli.port.or(opts.port).unwrap_or(22);
+    let ruser = cli
+        .cli_user
+        .clone()
+        .or_else(|| cli.user_in_host.clone())
+        .or_else(|| opts.user.clone())
+        .or_else(common::local_user_name)
+        .unwrap_or_default();
+    let mut tokens = Tokens::new(&cli.host, &host, port, &ruser, opts, cli);
+    tokens.key_alias = opts.host_key_alias.clone().unwrap_or_else(|| host.clone());
+    let cmd = tokens.expand(cmd);
+    #[cfg(unix)]
+    let (shell, flag) = (
+        std::env::var("SHELL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string()),
+        "-c",
+    );
+    #[cfg(not(unix))]
+    let (shell, flag) = ("cmd".to_string(), "/C");
+    vlog(1, &format!("Executing command: '{cmd}'"));
+    match std::process::Command::new(&shell)
+        .arg(flag)
+        .arg(&cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .status()
+    {
+        Ok(st) => st.success(),
+        Err(e) => {
+            warn!("Unable to execute '{cmd}': {}", common::io_reason(&e));
+            false
+        }
+    }
+}
+
+/// OpenSSH's ssh_valid_ruser: no control or shell-special characters, no
+/// leading `-` (nor one after whitespace), no trailing `\\`.
+fn valid_ruser(s: &str) -> bool {
+    if s.starts_with('-') {
+        return false;
+    }
+    let b = s.as_bytes();
+    for (i, &c) in b.iter().enumerate() {
+        if c.is_ascii_control() || b"'`\";&<>|(){}".contains(&c) {
+            return false;
+        }
+        if c.is_ascii_whitespace() && b.get(i + 1) == Some(&b'-') {
+            return false;
+        }
+        if c == b'\\' && i + 1 == b.len() {
+            return false;
+        }
+    }
+    true
+}
+
+/// OpenSSH's ssh_valid_hostname: no leading `-`, whitespace, control or
+/// shell-special characters.
+fn valid_hostname(s: &str) -> bool {
+    !s.starts_with('-')
+        && !s.bytes().any(|c| {
+            c.is_ascii_whitespace() || c.is_ascii_control() || b"'`\"$\\;&<>|(){},".contains(&c)
+        })
 }
 
 /// `${NAME}` environment references (OpenSSH expands them in file names);
@@ -3235,6 +3792,11 @@ fn run_mux_forwarding(
     // -L: each accepted TCP connection → one direct-tcpip forward to the
     // fixed remote_host:remote_port.
     for l in &cli.locals {
+        if l.listen_path.is_some() || l.connect_path.is_some() {
+            return Err(
+                "Unix socket forwarding is not supported through a ControlMaster connection".into(),
+            );
+        }
         let bind_ip = "127.0.0.1";
         let listener = TcpListener::bind((bind_ip, l.listen_port))
             .map_err(|e| format!("-L bind {bind_ip}:{}: {e}", l.listen_port))?;
@@ -3439,7 +4001,17 @@ fn become_master<F>(
 where
     F: FnOnce(&puressh::shared::SharedClient) -> i32 + Send + 'static,
 {
-    let cfg = puressh::mux::MasterConfig::new(dec.path.clone(), dec.persist);
+    // `-O exit` ends the master process, whatever its own session is doing
+    // (status 255, as OpenSSH's client loop leaves it).
+    let cfg = puressh::mux::MasterConfig::new(dec.path.clone(), dec.persist).with_on_exit(|| {
+        if let Ok(g) = ORIGINAL_TERMIOS.lock()
+            && let Some(t) = g.as_ref()
+        {
+            // SAFETY: restoring a termios captured from fd 0.
+            unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, t) };
+        }
+        std::process::exit(255);
+    });
 
     // ControlPersist no: master lives and dies with the foreground session in
     // this process. No daemonization.
@@ -3492,6 +4064,10 @@ fn daemonize_master(
             // New session: detach from the controlling terminal so the master
             // is not killed when the launching shell / terminal goes away.
             let _ = setsid();
+            // An `ssh -f` parent waits on the launcher, not on this daemon.
+            if let Ok(mut g) = BACKGROUND_READY.lock() {
+                g.take();
+            }
             // Detach stdio: the daemon must not hold the terminal's fds open
             // (that would wedge the parent's tty on exit) nor write to it.
             detach_stdio();
@@ -4113,12 +4689,13 @@ fn query_window_size() -> (u32, u32, u32, u32) {
 
 /// Splice a `forwarded-tcpip` channel against a fresh outbound `TcpStream`
 /// (the local destination the user nominated with `-R RPORT:LHOST:LPORT`).
-/// Each direction runs on its own thread; when one side finishes we emit
-/// EOF/Close on the channel and `shutdown(Read)` on the TCP socket so the
-/// other thread unblocks and exits. Mirrors `forwarding::reverse::spawn_splice`
+/// Each direction runs on its own thread: the local side's EOF is sent as
+/// the channel's, the channel's EOF half-closes the socket, and Close
+/// follows once both directions are done. Mirrors `forwarding::reverse::spawn_splice`
 /// but for the client side.
-fn spawn_splice_to_tcp(stream: ChannelStream, tcp: TcpStream) {
+fn spawn_splice_to_tcp(stream: ChannelStream, tcp: impl Into<LocalConn>) {
     use puressh::client::ChannelEgress;
+    let tcp: LocalConn = tcp.into();
     let (chan_rx, chan_tx) = stream.into_raw();
     let tcp_in = match tcp.try_clone() {
         Ok(c) => c,
@@ -4156,12 +4733,25 @@ fn spawn_splice_to_tcp(stream: ChannelStream, tcp: TcpStream) {
     // Channel → TCP.
     let mut tcp_out_b = tcp_out;
     let b = thread::spawn(move || {
-        while let Ok(Some(chunk)) = chan_rx.recv() {
-            if tcp_out_b.write_all(&chunk).is_err() {
-                break;
+        // EOF from the channel half-closes the socket (the local side may
+        // still answer, and closes it in the end); the channel going away,
+        // or a failed write, ends both directions.
+        let closed = loop {
+            match chan_rx.recv() {
+                Ok(Some(chunk)) => {
+                    if tcp_out_b.write_all(&chunk).is_err() {
+                        break true;
+                    }
+                }
+                Ok(None) => break false,
+                Err(_) => break true,
             }
-        }
-        let _ = tcp_out_b.shutdown(std::net::Shutdown::Read);
+        };
+        let _ = tcp_out_b.shutdown(if closed {
+            std::net::Shutdown::Both
+        } else {
+            std::net::Shutdown::Write
+        });
     });
 
     // Reaper: emit Close once both halves are done.
@@ -4203,7 +4793,7 @@ fn dial_tcp(
 
     // Try each candidate address until one connects; `ConnectionAttempts`
     // rounds, a second apart, as in OpenSSH.
-    let mut last_err: Option<String> = None;
+    let mut last_err: Option<std::io::Error> = None;
     let attempts = cfg_block.connection_attempts.unwrap_or(1).max(1);
     for attempt in 0..attempts {
         if attempt > 0 {
@@ -4221,7 +4811,13 @@ fn dial_tcp(
             return Ok(sock);
         }
     }
-    Err(last_err.unwrap_or_else(|| format!("could not connect to {host}:{port}")))
+    Err(match last_err {
+        Some(e) => format!(
+            "connect to host {host} port {port}: {}",
+            common::io_reason(&e)
+        ),
+        None => format!("connect to host {host} port {port}: no address"),
+    })
 }
 
 /// `ConnectTimeout` as a `Duration`.
@@ -4281,7 +4877,7 @@ fn connect_one(
     addr: std::net::SocketAddr,
     bind_address: Option<&str>,
     timeout: Option<std::time::Duration>,
-) -> Result<TcpStream, String> {
+) -> std::io::Result<TcpStream> {
     if let Some(bind) = bind_address {
         // A local source bind requires the two-step socket2-style dance,
         // which std doesn't expose directly. Use a TcpSocket-free approach
@@ -4289,9 +4885,8 @@ fn connect_one(
         return connect_bound(addr, bind, timeout);
     }
     match timeout {
-        Some(t) => TcpStream::connect_timeout(&addr, t)
-            .map_err(|e| format!("connect {addr} (timeout {}s): {e}", t.as_secs())),
-        None => TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}")),
+        Some(t) => TcpStream::connect_timeout(&addr, t),
+        None => TcpStream::connect(addr),
     }
 }
 
@@ -4304,7 +4899,8 @@ fn connect_bound(
     addr: std::net::SocketAddr,
     bind: &str,
     timeout: Option<std::time::Duration>,
-) -> Result<TcpStream, String> {
+) -> std::io::Result<TcpStream> {
+    use std::io::Error as IoError;
     use std::net::ToSocketAddrs;
     use std::os::unix::io::FromRawFd;
 
@@ -4312,9 +4908,13 @@ fn connect_bound(
     // the target.
     let bind_addr = (bind, 0u16)
         .to_socket_addrs()
-        .map_err(|e| format!("resolve BindAddress {bind}: {e}"))?
+        .map_err(|e| IoError::other(format!("resolve BindAddress {bind}: {e}")))?
         .find(|a| a.is_ipv4() == addr.is_ipv4())
-        .ok_or_else(|| format!("BindAddress {bind} has no address matching the target family"))?;
+        .ok_or_else(|| {
+            IoError::other(format!(
+                "BindAddress {bind} has no address matching the target family"
+            ))
+        })?;
 
     let domain = if addr.is_ipv4() {
         nix::libc::AF_INET
@@ -4325,7 +4925,7 @@ fn connect_bound(
     // via from_raw_fd below (or closed on the error paths).
     let fd = unsafe { nix::libc::socket(domain, nix::libc::SOCK_STREAM, 0) };
     if fd < 0 {
-        return Err(format!("socket(): {}", std::io::Error::last_os_error()));
+        return Err(IoError::last_os_error());
     }
     // Wrap immediately so any early return closes the fd via Drop.
     let stream = unsafe { TcpStream::from_raw_fd(fd) };
@@ -4340,10 +4940,8 @@ fn connect_bound(
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "bind {bind_addr}: {}",
-            std::io::Error::last_os_error()
-        ));
+        let e = IoError::last_os_error();
+        return Err(IoError::new(e.kind(), format!("bind {bind_addr}: {e}")));
     }
 
     let (target_storage, target_len) = sockaddr_bytes(&addr);
@@ -4356,10 +4954,7 @@ fn connect_bound(
         )
     };
     if rc != 0 {
-        return Err(format!(
-            "connect {addr}: {}",
-            std::io::Error::last_os_error()
-        ));
+        return Err(IoError::last_os_error());
     }
     // ConnectTimeout with a bound source address would need non-blocking
     // connect + poll; we keep the simple blocking path and apply the timeout
@@ -4376,8 +4971,10 @@ fn connect_bound(
     _addr: std::net::SocketAddr,
     _bind: &str,
     _timeout: Option<std::time::Duration>,
-) -> Result<TcpStream, String> {
-    Err("BindAddress is only supported on Unix".into())
+) -> std::io::Result<TcpStream> {
+    Err(std::io::Error::other(
+        "BindAddress is only supported on Unix",
+    ))
 }
 
 /// Encode a `SocketAddr` into a `sockaddr_storage` byte buffer + length for
@@ -4448,9 +5045,8 @@ fn set_so_keepalive(_sock: &TcpStream, _on: bool) -> Result<(), String> {
     Err("TCPKeepAlive is only supported on Unix".into())
 }
 
-/// Per-`-L` accept loop. Each accepted TCP connection becomes one
-/// `direct-tcpip` channel on the shared connection, spliced against the
-/// TCP socket in both directions until either side closes.
+/// Per-`-L` accept loop on a TCP port: each connection gets a channel to
+/// the forward's destination on the shared connection.
 fn spawn_local_forward_listener(
     listener: TcpListener,
     spec: LocalForward,
@@ -4461,7 +5057,7 @@ fn spawn_local_forward_listener(
             let tcp = match accept {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("ssh: -L accept on 127.0.0.1:{}: {e}", spec.listen_port);
+                    eprintln!("ssh: -L accept on port {}: {e}", spec.listen_port);
                     continue;
                 }
             };
@@ -4469,20 +5065,80 @@ fn spawn_local_forward_listener(
                 .peer_addr()
                 .map(|a| (a.ip().to_string(), a.port()))
                 .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
-            let stream =
-                match ctx.open_direct_tcpip(&spec.remote_host, spec.remote_port, &orig.0, orig.1) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        eprintln!(
-                            "ssh: -L direct-tcpip {}:{}: {e}",
-                            spec.remote_host, spec.remote_port
-                        );
-                        continue;
-                    }
-                };
-            splice_shared_with_tcp(ctx.clone(), stream, tcp);
+            if let Some(stream) = open_local_forward_channel(&ctx, &spec, &orig) {
+                splice_shared_with_tcp(ctx.clone(), stream, tcp);
+            }
         }
     });
+}
+
+/// Per-`-L` accept loop on a Unix socket.
+#[cfg(unix)]
+fn spawn_local_path_listener(
+    listener: std::os::unix::net::UnixListener,
+    spec: LocalForward,
+    ctx: puressh::shared::SharedClient,
+) {
+    thread::spawn(move || {
+        for accept in listener.incoming() {
+            let conn = match accept {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("ssh: -L accept: {e}");
+                    continue;
+                }
+            };
+            let orig = ("127.0.0.1".to_string(), 0);
+            if let Some(stream) = open_local_forward_channel(&ctx, &spec, &orig) {
+                splice_shared_with_tcp(ctx.clone(), stream, LocalConn::Unix(conn));
+            }
+        }
+    });
+}
+
+/// The channel for one `-L` connection: `direct-streamlocal` to a socket
+/// path, else `direct-tcpip`. `None` (reported) when the server refuses.
+fn open_local_forward_channel(
+    ctx: &puressh::shared::SharedClient,
+    spec: &LocalForward,
+    orig: &(String, u16),
+) -> Option<puressh::shared::OwnedChannelStream> {
+    let opened = match &spec.connect_path {
+        Some(path) => ctx.open_direct_streamlocal(path),
+        None => ctx.open_direct_tcpip(&spec.remote_host, spec.remote_port, &orig.0, orig.1),
+    };
+    match opened {
+        Ok(s) => Some(s),
+        Err(e) => {
+            match &spec.connect_path {
+                Some(path) => eprintln!("ssh: -L direct-streamlocal {path}: {e}"),
+                None => eprintln!(
+                    "ssh: -L direct-tcpip {}:{}: {e}",
+                    spec.remote_host, spec.remote_port
+                ),
+            }
+            None
+        }
+    }
+}
+
+/// Listen on a Unix socket for `-L /path:…`, owner-only as OpenSSH's
+/// (StreamLocalBindMask 0177). An existing file is not replaced
+/// (StreamLocalBindUnlink no).
+#[cfg(unix)]
+fn bind_unix_listener(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    let l = std::os::unix::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(l)
+}
+
+#[cfg(not(unix))]
+fn bind_unix_listener(_path: &str) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "Unix domain sockets are not supported on this platform",
+    ))
 }
 
 /// Per-`-D` SOCKS accept loop. Each accepted TCP connection runs the SOCKS
@@ -4574,6 +5230,9 @@ fn mint_x11_cookie() -> Result<String, String> {
     Ok(s)
 }
 
+/// `LogLevel QUIET` (`-q`): not even the fatal error ending ssh is shown.
+static LOG_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn main() -> ExitCode {
     match run() {
         Ok(code) => {
@@ -4582,7 +5241,7 @@ fn main() -> ExitCode {
         }
         Err(msg) => {
             // Empty: the error was already reported in OpenSSH's words.
-            if !msg.is_empty() {
+            if !msg.is_empty() && !LOG_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("ssh: {msg}");
             }
             ExitCode::from(255)
@@ -4638,9 +5297,7 @@ mod knock_support {
         let addrs = resolve_addrs(host, port, cfg_block)?;
         let timeout = connect_timeout(cfg_block);
         let bind = cfg_block.bind_address.clone();
-        let dialer: TcpDialer = Arc::new(move |a| {
-            connect_one(a, bind.as_deref(), timeout).map_err(std::io::Error::other)
-        });
+        let dialer: TcpDialer = Arc::new(move |a| connect_one(a, bind.as_deref(), timeout));
 
         let mut sig1_cache = Sig1Cache::load();
         let identities: Vec<KnockIdentity<'_>> = signers
@@ -4705,7 +5362,11 @@ mod knock_support {
                 Ok(stream)
             }
             Ok(_) => Err(format!("connect {host}:{port}: unsupported knock outcome")),
-            Err(e) => Err(format!("connect {host}:{port}: {e}")),
+            Err(puressh::Error::Io(e)) => Err(format!(
+                "connect to host {host} port {port}: {}",
+                common::io_reason(&e)
+            )),
+            Err(e) => Err(format!("connect to host {host} port {port}: {e}")),
         }
     }
 
@@ -5018,66 +5679,74 @@ mod forward_tests {
     use super::*;
 
     #[test]
-    fn local_forward_plain() {
+    fn local_forward_forms() {
         let f = parse_local_forward("8080:example.com:80").unwrap();
-        assert_eq!(f.listen_port, 8080);
-        assert_eq!(f.remote_host, "example.com");
-        assert_eq!(f.remote_port, 80);
-    }
-
-    #[test]
-    fn local_forward_v4() {
-        let f = parse_local_forward("8080:192.0.2.1:80").unwrap();
-        assert_eq!(f.remote_host, "192.0.2.1");
-        assert_eq!(f.remote_port, 80);
-    }
-
-    #[test]
-    fn local_forward_bracketed_v6() {
+        assert_eq!((f.bind_addr.as_deref(), f.listen_port), (None, 8080));
+        assert_eq!((f.remote_host.as_str(), f.remote_port), ("example.com", 80));
         let f = parse_local_forward("8080:[2001:db8::1]:80").unwrap();
-        assert_eq!(f.listen_port, 8080);
         assert_eq!(f.remote_host, "2001:db8::1");
-        assert_eq!(f.remote_port, 80);
+        let f = parse_local_forward("127.0.0.2:8080:example.com:80").unwrap();
+        assert_eq!(f.bind_addr.as_deref(), Some("127.0.0.2"));
+        let f = parse_local_forward("[::1]:8080:[2001:db8::1]:80").unwrap();
+        assert_eq!(f.bind_addr.as_deref(), Some("::1"));
+        let f = parse_local_forward("*:8080:h:80").unwrap();
+        assert_eq!(f.bind_addr.as_deref(), Some("*"));
+        // Unix socket paths at either end.
+        let f = parse_local_forward("/tmp/l.sock:/run/r.sock").unwrap();
+        assert_eq!(f.listen_path.as_deref(), Some("/tmp/l.sock"));
+        assert_eq!(f.connect_path.as_deref(), Some("/run/r.sock"));
+        let f = parse_local_forward("8080:/run/r.sock").unwrap();
+        assert_eq!(
+            (f.listen_port, f.connect_path.as_deref()),
+            (8080, Some("/run/r.sock"))
+        );
+        let f = parse_local_forward("/tmp/l.sock:h:22").unwrap();
+        assert_eq!(f.listen_path.as_deref(), Some("/tmp/l.sock"));
+        assert_eq!((f.remote_host.as_str(), f.remote_port), ("h", 22));
     }
 
     #[test]
-    fn local_forward_bracketed_v6_loopback() {
-        let f = parse_local_forward("8080:[::1]:80").unwrap();
-        assert_eq!(f.remote_host, "::1");
-        assert_eq!(f.remote_port, 80);
+    fn local_forward_rejects() {
+        for bad in [
+            "8080:[2001:db8::1:80",
+            "8080:[2001:db8::1]",
+            "8080:[2001:db8::1]junk",
+            "only-one-field",
+            "80:hostonly",
+            "0:h:22",
+            "a:b:c:d:e",
+            "8080",
+        ] {
+            assert!(parse_local_forward(bad).is_err(), "{bad}");
+        }
+        assert_eq!(
+            parse_local_forward("x").unwrap_err(),
+            "Bad local forwarding specification 'x'"
+        );
     }
 
     #[test]
-    fn local_forward_rejects_missing_close_bracket() {
-        assert!(parse_local_forward("8080:[2001:db8::1:80").is_err());
-    }
-
-    #[test]
-    fn local_forward_rejects_missing_trailing_port() {
-        // `[v6]` with no `:port` afterwards.
-        assert!(parse_local_forward("8080:[2001:db8::1]").is_err());
-        assert!(parse_local_forward("8080:[2001:db8::1]junk").is_err());
-    }
-
-    #[test]
-    fn local_forward_rejects_too_few_fields() {
-        assert!(parse_local_forward("only-one-field").is_err());
-        assert!(parse_local_forward("80:hostonly").is_err());
-    }
-
-    #[test]
-    fn remote_forward_plain() {
+    fn remote_forward_forms() {
         let f = parse_remote_forward("9090:127.0.0.1:22").unwrap();
-        assert_eq!(f.remote_port, 9090);
-        assert_eq!(f.local_host, "127.0.0.1");
-        assert_eq!(f.local_port, 22);
-    }
-
-    #[test]
-    fn remote_forward_bracketed_v6() {
+        assert_eq!((f.bind_addr, f.remote_port), (None, 9090));
+        assert_eq!(
+            (f.local_host.as_str(), f.local_port, f.dynamic),
+            ("127.0.0.1", 22, false)
+        );
         let f = parse_remote_forward("9090:[2001:db8::2]:22").unwrap();
-        assert_eq!(f.remote_port, 9090);
         assert_eq!(f.local_host, "2001:db8::2");
-        assert_eq!(f.local_port, 22);
+        let f = parse_remote_forward("4243").unwrap();
+        assert!(f.dynamic && f.bind_addr.is_none() && f.remote_port == 4243);
+        let f = parse_remote_forward("[::1]:4243").unwrap();
+        assert!(f.dynamic && f.bind_addr.as_deref() == Some("::1"));
+        let f = parse_remote_forward("0.0.0.0:9090:h:22").unwrap();
+        assert_eq!(f.bind_addr.as_deref(), Some("0.0.0.0"));
+        let f = parse_remote_forward("0:h:22").unwrap();
+        assert_eq!(f.remote_port, 0);
+        let f = parse_remote_forward("/tmp/r.sock:/tmp/l.sock").unwrap();
+        assert_eq!(f.listen_path.as_deref(), Some("/tmp/r.sock"));
+        assert_eq!(f.connect_path.as_deref(), Some("/tmp/l.sock"));
+        assert!(parse_remote_forward("a:b:c:d:e").is_err());
+        assert!(parse_remote_forward("nope").is_err());
     }
 }

@@ -393,13 +393,10 @@ fn parse_match_line_impl(
                         msg: "Match exec requires a command argument".into(),
                     });
                 }
-                // `exec` consumes the REST of the line as a single command
-                // string (joined by spaces, matching OpenSSH). The tokenizer
-                // has already resolved quoting, so this is a faithful
-                // reconstruction modulo runs of internal whitespace.
-                let cmd = args[i + 1..].join(" ");
-                out.push(MatchCondition::Exec(cmd));
-                i = args.len();
+                // As OpenSSH: one argument (quote a command with spaces),
+                // and further criteria may follow it.
+                out.push(MatchCondition::Exec(args[i + 1].clone()));
+                i += 2;
             }
             other => {
                 return Err(ConfigError::BadValue {

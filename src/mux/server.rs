@@ -45,6 +45,10 @@ pub struct MasterConfig {
     pub control_path: PathBuf,
     /// ControlPersist behaviour.
     pub persist: Persist,
+    /// Called (after the control socket is unlinked) when an attached client
+    /// sends `-O exit`. A master whose foreground never returns on its own
+    /// (`ssh -M -N -D …`) uses it to end the process, as OpenSSH's does.
+    pub on_exit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl MasterConfig {
@@ -53,7 +57,14 @@ impl MasterConfig {
         Self {
             control_path,
             persist,
+            on_exit: None,
         }
+    }
+
+    /// Run `f` when an `-O exit` request arrives (see [`MasterConfig::on_exit`]).
+    pub fn with_on_exit(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
+        self.on_exit = Some(Arc::new(f));
+        self
     }
 }
 
@@ -67,6 +78,10 @@ struct MasterState {
     shutdown: AtomicBool,
     /// Last time the client count dropped to zero (for the Seconds linger).
     last_idle: Mutex<Option<Instant>>,
+    /// The control socket, unlinked before `on_exit` runs.
+    control_path: PathBuf,
+    /// See [`MasterConfig::on_exit`].
+    on_exit: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// Bind the control socket at `cfg.control_path`, taking care not to clobber a
@@ -129,6 +144,8 @@ where
         foreground_done: AtomicBool::new(false),
         shutdown: AtomicBool::new(false),
         last_idle: Mutex::new(Some(Instant::now())),
+        control_path: cfg.control_path.clone(),
+        on_exit: cfg.on_exit.clone(),
     });
 
     // Accept loop in its own thread so the foreground session can run
@@ -199,6 +216,8 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         foreground_done: AtomicBool::new(true),
         shutdown: AtomicBool::new(false),
         last_idle: Mutex::new(Some(Instant::now())),
+        control_path: cfg.control_path.clone(),
+        on_exit: cfg.on_exit.clone(),
     });
 
     let accept_shared = shared.clone();
@@ -345,6 +364,10 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
         Frame::ExitRequest => {
             // `ssh -O exit`: ask the whole master to shut down.
             state.shutdown.store(true, Ordering::SeqCst);
+            if let Some(f) = &state.on_exit {
+                let _ = fs::remove_file(&state.control_path);
+                f();
+            }
             return;
         }
         Frame::AliveCheck => {

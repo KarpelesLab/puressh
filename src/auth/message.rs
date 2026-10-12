@@ -29,11 +29,11 @@ pub const SSH_MSG_USERAUTH_INFO_REQUEST: u8 = 60;
 pub const SSH_MSG_USERAUTH_INFO_RESPONSE: u8 = 61;
 
 /// Per-field upper bound on userauth strings. RFC 4252 / RFC 4256 don't
-/// fix a maximum, but every real-world field (user name, prompts,
-/// responses, banner text, public-key blob, signature) fits in well
-/// under this; capping protects against a peer sending a 4 GiB string
-/// length and forcing a huge allocation before any validation runs.
-const MAX_USERAUTH_STRING: usize = 64 * 1024;
+/// fix a maximum; capping protects against a peer sending a 4 GiB string
+/// length and forcing a huge allocation before any validation runs. A
+/// field may fill a whole packet, as OpenSSH allows: sshd's `Banner` is
+/// sent as one string however long the file is.
+const MAX_USERAUTH_STRING: usize = crate::transport::MAX_PACKET_LEN as usize;
 
 fn read_utf8(r: &mut Reader<'_>) -> Result<String> {
     let bytes = read_bytes_capped(r)?;

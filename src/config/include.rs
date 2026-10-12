@@ -150,6 +150,7 @@ pub fn expand_includes(
                     line_no: line.line_no,
                     keyword: keyword.to_string(),
                     args: Vec::new(),
+                    rest: String::new(),
                     file: line.file.clone(),
                 };
                 out.push(marker(INCLUDE_BEGIN));

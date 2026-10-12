@@ -647,6 +647,10 @@ pub struct ForwardContext {
     /// `SSH_MSG_CHANNEL_OPEN forwarded-tcpip` and parks a reply slot until
     /// the matching `OPEN_CONFIRMATION` / `OPEN_FAILURE` lands.
     req_tx: Sender<ForwardOpenRequest>,
+    /// The address the client asked to listen on, which each open names
+    /// whatever the listener was bound to (GatewayPorts may have rewritten
+    /// it): clients match their forwards on it, as OpenSSH's sshd sends it.
+    requested_address: Option<String>,
 }
 
 /// One pending server-initiated `forwarded-tcpip` open. Carries the wire
@@ -668,7 +672,16 @@ pub(crate) struct ForwardOpenRequest {
 impl ForwardContext {
     /// Used by the connection loop; not for user code.
     pub(crate) fn new(req_tx: Sender<ForwardOpenRequest>) -> Self {
-        Self { req_tx }
+        Self {
+            req_tx,
+            requested_address: None,
+        }
+    }
+
+    /// Name `address` (the client's `tcpip-forward` request) in each open.
+    pub(crate) fn with_requested_address(mut self, address: String) -> Self {
+        self.requested_address = Some(address);
+        self
     }
 
     /// Build a [`ForwardContext`] whose [`Self::open_forwarded_tcpip`]
@@ -682,7 +695,10 @@ impl ForwardContext {
         // `Error::Protocol`.
         let (tx, _rx) = mpsc::channel();
         drop(_rx);
-        Self { req_tx: tx }
+        Self {
+            req_tx: tx,
+            requested_address: None,
+        }
     }
 
     /// Ask the connection loop to open a `forwarded-tcpip` channel toward
@@ -704,7 +720,10 @@ impl ForwardContext {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.req_tx
             .send(ForwardOpenRequest {
-                bound_address: bound_address.to_string(),
+                bound_address: self
+                    .requested_address
+                    .clone()
+                    .unwrap_or_else(|| bound_address.to_string()),
                 bound_port: bound_port as u32,
                 orig_address: orig_address.to_string(),
                 orig_port: orig_port as u32,
@@ -3765,7 +3784,8 @@ fn handle_global_request(
             let bound = if !policy_ok || bind_port > u16::MAX as u32 {
                 None
             } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
-                let ctx = ForwardContext::new(forward.req_tx.clone());
+                let ctx = ForwardContext::new(forward.req_tx.clone())
+                    .with_requested_address(bind_address.clone());
                 handler
                     .bind(user, &effective_bind, bind_port as u16, ctx)
                     .ok()

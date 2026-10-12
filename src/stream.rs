@@ -144,6 +144,14 @@ impl ChannelStream {
         (rx, tx)
     }
 
+    /// Take the bytes already received but not yet read, which
+    /// [`Self::into_raw`] would otherwise drop: a caller that reads a
+    /// header (e.g. a SOCKS request) and then splices the raw halves sends
+    /// these on first.
+    pub fn take_buffered(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.buf)
+    }
+
     /// Fallible variant of [`Self::into_raw`]. Returns `None` if either
     /// half of the duplex has already been moved out. Provided so future
     /// constructors / sub-takers can compose without an `unreachable!`.

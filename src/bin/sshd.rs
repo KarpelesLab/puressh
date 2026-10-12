@@ -1282,6 +1282,7 @@ mod imp {
         line("forcecommand", &none_or(&opts.force_command));
         line("chrootdirectory", &none_or(&opts.chroot_directory));
         line("permituserrc", yn(opts.permit_user_rc.unwrap_or(true)));
+        line("tcpkeepalive", yn(opts.tcp_keep_alive.unwrap_or(true)));
         line(
             "permituserenvironment",
             opts.permit_user_environment.as_deref().unwrap_or("no"),
@@ -7983,6 +7984,17 @@ mod imp {
                 }
             }
 
+            // TCPKeepAlive (default yes, as OpenSSH): a peer that vanished
+            // is noticed and its session cleaned up.
+            if sshd_cfg.global.tcp_keep_alive != Some(false) {
+                for (stream, _, _) in &incoming {
+                    let _ = nix::sys::socket::setsockopt(
+                        stream,
+                        nix::sys::socket::sockopt::KeepAlive,
+                        &true,
+                    );
+                }
+            }
             let mut incoming = incoming.into_iter();
             #[allow(clippy::while_let_on_iterator)] // the child drops `incoming` mid-loop
             while let Some((stream, peer, knock_user)) = incoming.next() {

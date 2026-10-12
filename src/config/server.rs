@@ -144,6 +144,8 @@ pub struct ServerOptions {
     pub x11_forwarding: Option<bool>,
     /// `PermitUserRC` (yes/no): whether `~/.ssh/rc` runs at session start.
     pub permit_user_rc: Option<bool>,
+    /// `TCPKeepAlive` (yes/no; default yes): `SO_KEEPALIVE` on connections.
+    pub tcp_keep_alive: Option<bool>,
     /// `XAuthLocation`: the `xauth` that adds a forwarded display's cookie
     /// (`none` ⇒ never run).
     pub xauth_location: Option<String>,
@@ -608,6 +610,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(allow_agent_forwarding);
     take_scalar!(x11_forwarding);
     take_scalar!(permit_user_rc);
+    take_scalar!(tcp_keep_alive);
     take_scalar!(xauth_location);
     take_scalar!(strict_modes);
     take_scalar!(log_level);
@@ -910,6 +913,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "x11forwarding" => {
             opts.x11_forwarding = Some(parse_yes_no(line)?);
+        }
+        "tcpkeepalive" => {
+            opts.tcp_keep_alive = Some(parse_yes_no(line)?);
         }
         "permituserrc" => {
             opts.permit_user_rc = Some(parse_yes_no(line)?);
@@ -1325,7 +1331,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     // Logging, DNS, network tuning, cosmetics.
     ("UseDNS", &["*"], ""),
     ("LogVerbose", &["*"], ""),
-    ("TCPKeepAlive", &["*"], ""),
     ("IPQoS", &["*"], ""),
     ("VersionAddendum", &["*"], ""),
     ("DebianBanner", &["*"], ""),
@@ -2746,7 +2751,10 @@ UsePrivilegeSeparation sandbox
         assert!(w[1].contains("KerberosAuthentication"));
         assert!(w.iter().all(|x| !x.contains("UseDNS")));
         // Implemented now: no warning.
-        assert!(w.iter().all(|x| !x.contains("SetEnv") && !x.contains("PermitUserEnv")));
+        assert!(
+            w.iter()
+                .all(|x| !x.contains("SetEnv") && !x.contains("PermitUserEnv"))
+        );
     }
 
     #[test]

@@ -1049,13 +1049,26 @@ fn config_for_host(
     if cfg_block.batch_mode == Some(true) && strict == StrictMode::Ask {
         strict = StrictMode::Yes;
     }
-    let known_hosts_path = cli
-        .known_hosts_path
-        .clone()
-        .or_else(|| cfg_block.user_known_hosts.as_ref().map(PathBuf::from));
+    // UserKnownHostsFile: a list, as OpenSSH's (default known_hosts and
+    // known_hosts2); new keys go to the first, all are read. `none`: none.
+    let mut user_files = user_known_hosts_files(cli, cfg_block);
+    let first = (!user_files.is_empty()).then(|| user_files.remove(0));
     let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
-    let mut policy = build_host_key_policy(strict, known_hosts_path, hash_known_hosts)?;
+    let mut policy = build_host_key_policy(
+        strict,
+        Some(first.unwrap_or_else(|| PathBuf::from("/dev/null"))),
+        hash_known_hosts,
+    )?;
     common::apply_known_hosts_options(&mut policy, cfg_block)?;
+    if let puressh::client::HostKeyPolicy::KnownHosts(kh) = &mut policy {
+        for path in user_files {
+            match puressh::known_hosts::KnownHosts::load(&path) {
+                Ok(store) => kh.global.push(Arc::new(store)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => vlog(1, &format!("known_hosts {}: {e}", path.display())),
+            }
+        }
+    }
 
     // HostKeyAlgorithms +ssh-rsa opt-in: if the resolved host-key list names
     // legacy bare `ssh-rsa`, enable SHA-1 host-key verification. This is the
@@ -1255,6 +1268,27 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
 
 #[cfg(not(unix))]
 fn maybe_add_keys_to_agent(_cfg_block: &puressh::config::ClientOptions, _cli: &Cli) {}
+
+/// The `UserKnownHostsFile` list (`-o` / config, else OpenSSH's default
+/// `~/.ssh/known_hosts ~/.ssh/known_hosts2`); empty for `none`.
+fn user_known_hosts_files(cli: &Cli, cfg_block: &puressh::config::ClientOptions) -> Vec<PathBuf> {
+    let spec = cli
+        .known_hosts_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
+        .or_else(|| cfg_block.user_known_hosts.clone());
+    match spec {
+        Some(s) if s.trim().eq_ignore_ascii_case("none") => Vec::new(),
+        Some(s) => s.split_whitespace().map(PathBuf::from).collect(),
+        None => match common::default_known_hosts_path() {
+            Some(p) => {
+                let second = p.with_file_name("known_hosts2");
+                vec![p, second]
+            }
+            None => Vec::new(),
+        },
+    }
+}
 
 /// `CanonicalizeHostname`, then the final pass over the configuration, as
 /// OpenSSH: with canonicalisation on, or a `Match final`, the
@@ -1645,7 +1679,13 @@ fn print_config(
         .as_ref()
         .map(|p| p.display().to_string())
         .or_else(|| c.user_known_hosts.clone())
-        .unwrap_or_else(|| expand_tilde("~/.ssh/known_hosts"));
+        .unwrap_or_else(|| {
+            format!(
+                "{} {}",
+                expand_tilde("~/.ssh/known_hosts"),
+                expand_tilde("~/.ssh/known_hosts2")
+            )
+        });
     out.push(format!("userknownhostsfile {known_hosts}"));
     if let Some(p) = cli.proxy_jump.as_ref().or(c.proxy_jump.as_ref()) {
         out.push(format!("proxyjump {p}"));

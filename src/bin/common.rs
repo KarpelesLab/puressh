@@ -83,7 +83,7 @@ pub fn resolve_user(cli_user: Option<&str>, user_in_host: Option<&str>) -> Resul
 
 /// The local user's name, as OpenSSH finds it: the password database entry
 /// for our uid ($USER is not set in many containers and services), else
-/// `$USER` / `$LOGNAME`.
+/// `$USER` / `$LOGNAME` (`%USERNAME%` on Windows).
 pub fn local_user_name() -> Option<String> {
     #[cfg(unix)]
     if let Ok(Some(u)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
@@ -91,6 +91,7 @@ pub fn local_user_name() -> Option<String> {
     }
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
+        .or_else(|_| std::env::var("USERNAME"))
         .ok()
         .filter(|u| !u.is_empty())
 }

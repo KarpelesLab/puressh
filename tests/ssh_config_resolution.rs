@@ -77,3 +77,15 @@ fn canonicalize_hostname_reparses_for_the_canonical_name() {
     let out = g("Match canonical\n  ConnectTimeout 7\n", &["box"]);
     assert_eq!(value(&out, "connecttimeout"), ["none"]);
 }
+
+#[test]
+fn user_known_hosts_files_default_to_both() {
+    let out = g("", &["h"]);
+    let files = value(&out, "userknownhostsfile");
+    assert_eq!(files.len(), 1, "{out}");
+    let files: Vec<&str> = files[0].split(' ').collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    assert!(files[0].ends_with("known_hosts") && files[1].ends_with("known_hosts2"));
+    let out = g("UserKnownHostsFile none\n", &["h"]);
+    assert_eq!(value(&out, "userknownhostsfile"), ["none"]);
+}

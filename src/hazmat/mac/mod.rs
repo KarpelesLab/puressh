@@ -23,8 +23,10 @@ use crate::error::{Error, Result};
 #[cfg(feature = "alloc")]
 use alloc::boxed::Box;
 
+use purecrypto::hash::{Digest, Hmac, Md5, Sha1, Sha256, Sha512};
+#[cfg(test)]
 use purecrypto::hash::{HmacSha256, HmacSha512};
-use zeroize::ZeroizeOnDrop;
+use purecrypto::mac::{Umac64, Umac128};
 
 /// SSH-side identifier and key/tag geometry for a MAC.
 #[derive(Debug, Clone, Copy)]
@@ -32,7 +34,7 @@ use zeroize::ZeroizeOnDrop;
 pub struct MacSpec {
     /// On-the-wire SSH name.
     pub name: &'static str,
-    /// Underlying hash output size in bytes (= HMAC key length).
+    /// MAC key length in bytes (the HMAC hash's output size; 16 for UMAC).
     pub key_len: usize,
     /// Tag length appended to each packet, in bytes.
     pub tag_len: usize,
@@ -40,32 +42,34 @@ pub struct MacSpec {
     pub etm: bool,
 }
 
-/// Catalogue of MACs this build supports.
+const fn spec(name: &'static str, key_len: usize, tag_len: usize, etm: bool) -> MacSpec {
+    MacSpec {
+        name,
+        key_len,
+        tag_len,
+        etm,
+    }
+}
+
+/// Catalogue of MACs this build supports: OpenSSH's (its defaults first, in
+/// its order, then the ones it only uses when configured).
 pub const ALL: &[MacSpec] = &[
-    MacSpec {
-        name: "hmac-sha2-256-etm@openssh.com",
-        key_len: 32,
-        tag_len: 32,
-        etm: true,
-    },
-    MacSpec {
-        name: "hmac-sha2-512-etm@openssh.com",
-        key_len: 64,
-        tag_len: 64,
-        etm: true,
-    },
-    MacSpec {
-        name: "hmac-sha2-256",
-        key_len: 32,
-        tag_len: 32,
-        etm: false,
-    },
-    MacSpec {
-        name: "hmac-sha2-512",
-        key_len: 64,
-        tag_len: 64,
-        etm: false,
-    },
+    spec("umac-64-etm@openssh.com", 16, 8, true),
+    spec("umac-128-etm@openssh.com", 16, 16, true),
+    spec("hmac-sha2-256-etm@openssh.com", 32, 32, true),
+    spec("hmac-sha2-512-etm@openssh.com", 64, 64, true),
+    spec("hmac-sha1-etm@openssh.com", 20, 20, true),
+    spec("umac-64@openssh.com", 16, 8, false),
+    spec("umac-128@openssh.com", 16, 16, false),
+    spec("hmac-sha2-256", 32, 32, false),
+    spec("hmac-sha2-512", 64, 64, false),
+    spec("hmac-sha1", 20, 20, false),
+    spec("hmac-sha1-96-etm@openssh.com", 20, 12, true),
+    spec("hmac-md5-etm@openssh.com", 16, 16, true),
+    spec("hmac-md5-96-etm@openssh.com", 16, 12, true),
+    spec("hmac-sha1-96", 20, 12, false),
+    spec("hmac-md5", 16, 16, false),
+    spec("hmac-md5-96", 16, 12, false),
 ];
 
 /// Look up a [`MacSpec`] by SSH name.
@@ -94,16 +98,32 @@ pub trait SshMac {
     fn verify(&self, seq: u32, msg: &[u8], tag: &[u8]) -> Result<()>;
 }
 
-#[derive(ZeroizeOnDrop)]
-struct HmacSha256Mac {
-    key: [u8; 32],
-    #[zeroize(skip)]
+/// Constant-time equality of two equal-length byte strings.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// HMAC over `seq_u32_be || msg` (RFC 4253 §6.4), possibly truncated (the
+/// `-96` suites). The keyed state is computed once and cloned per packet;
+/// [`Hmac`] wipes itself on drop.
+struct HmacMac<D: Digest> {
+    keyed: Hmac<D>,
+    tag_len: usize,
     etm: bool,
 }
 
-impl SshMac for HmacSha256Mac {
+impl<D: Digest> HmacMac<D> {
+    fn tag(&self, seq: u32, msg: &[u8]) -> D::Output {
+        let mut h = self.keyed.clone();
+        h.update(&seq.to_be_bytes());
+        h.update(msg);
+        h.finalize()
+    }
+}
+
+impl<D: Digest> SshMac for HmacMac<D> {
     fn tag_len(&self) -> usize {
-        32
+        self.tag_len
     }
 
     fn etm(&self) -> bool {
@@ -111,25 +131,15 @@ impl SshMac for HmacSha256Mac {
     }
 
     fn compute(&self, seq: u32, msg: &[u8], out: &mut [u8]) -> Result<()> {
-        if out.len() != 32 {
-            return Err(Error::Crypto("hmac-sha2-256: tag buffer must be 32 bytes"));
+        if out.len() != self.tag_len {
+            return Err(Error::Crypto("hmac: tag buffer has the wrong length"));
         }
-        let mut h = HmacSha256::new(&self.key);
-        h.update(&seq.to_be_bytes());
-        h.update(msg);
-        let tag = h.finalize();
-        out.copy_from_slice(tag.as_ref());
+        out.copy_from_slice(&self.tag(seq, msg).as_ref()[..self.tag_len]);
         Ok(())
     }
 
     fn verify(&self, seq: u32, msg: &[u8], tag: &[u8]) -> Result<()> {
-        if tag.len() != 32 {
-            return Err(Error::BadMac);
-        }
-        let mut h = HmacSha256::new(&self.key);
-        h.update(&seq.to_be_bytes());
-        h.update(msg);
-        if bool::from(h.verify(tag)) {
+        if tag.len() == self.tag_len && ct_eq(&self.tag(seq, msg).as_ref()[..self.tag_len], tag) {
             Ok(())
         } else {
             Err(Error::BadMac)
@@ -137,16 +147,42 @@ impl SshMac for HmacSha256Mac {
     }
 }
 
-#[derive(ZeroizeOnDrop)]
-struct HmacSha512Mac {
-    key: [u8; 64],
-    #[zeroize(skip)]
+/// `umac-64@openssh.com` / `umac-128@openssh.com` (and their EtM forms):
+/// UMAC (RFC 4418) over the packet, with the sequence number as the 8-byte
+/// big-endian nonce, as OpenSSH's `mac_compute` does.
+#[derive(Clone)]
+enum Umac {
+    U64(Box<Umac64>),
+    U128(Box<Umac128>),
+}
+
+struct UmacMac {
+    keyed: Umac,
     etm: bool,
 }
 
-impl SshMac for HmacSha512Mac {
+impl UmacMac {
+    fn tag(&self, seq: u32, msg: &[u8], out: &mut [u8]) {
+        let nonce = u64::from(seq).to_be_bytes();
+        match self.keyed.clone() {
+            Umac::U64(mut u) => {
+                u.update(msg);
+                out.copy_from_slice(&u.finalize(&nonce));
+            }
+            Umac::U128(mut u) => {
+                u.update(msg);
+                out.copy_from_slice(&u.finalize(&nonce));
+            }
+        }
+    }
+}
+
+impl SshMac for UmacMac {
     fn tag_len(&self) -> usize {
-        64
+        match self.keyed {
+            Umac::U64(_) => 8,
+            Umac::U128(_) => 16,
+        }
     }
 
     fn etm(&self) -> bool {
@@ -154,25 +190,18 @@ impl SshMac for HmacSha512Mac {
     }
 
     fn compute(&self, seq: u32, msg: &[u8], out: &mut [u8]) -> Result<()> {
-        if out.len() != 64 {
-            return Err(Error::Crypto("hmac-sha2-512: tag buffer must be 64 bytes"));
+        if out.len() != self.tag_len() {
+            return Err(Error::Crypto("umac: tag buffer has the wrong length"));
         }
-        let mut h = HmacSha512::new(&self.key);
-        h.update(&seq.to_be_bytes());
-        h.update(msg);
-        let tag = h.finalize();
-        out.copy_from_slice(tag.as_ref());
+        self.tag(seq, msg, out);
         Ok(())
     }
 
     fn verify(&self, seq: u32, msg: &[u8], tag: &[u8]) -> Result<()> {
-        if tag.len() != 64 {
-            return Err(Error::BadMac);
-        }
-        let mut h = HmacSha512::new(&self.key);
-        h.update(&seq.to_be_bytes());
-        h.update(msg);
-        if bool::from(h.verify(tag)) {
+        let mut want = [0u8; 16];
+        let want = &mut want[..self.tag_len()];
+        self.tag(seq, msg, want);
+        if ct_eq(want, tag) {
             Ok(())
         } else {
             Err(Error::BadMac)
@@ -187,31 +216,44 @@ impl SshMac for HmacSha512Mac {
 /// keying material before any tag is produced.
 #[cfg(feature = "alloc")]
 pub fn mac_by_name(name: &str, key: &[u8]) -> Option<Box<dyn SshMac + Send + Sync>> {
-    match name {
-        "hmac-sha2-256" | "hmac-sha2-256-etm@openssh.com" => {
-            if key.len() != 32 {
-                return None;
-            }
-            let mut k = [0u8; 32];
-            k.copy_from_slice(key);
-            Some(Box::new(HmacSha256Mac {
-                key: k,
-                etm: name == "hmac-sha2-256-etm@openssh.com",
-            }))
-        }
-        "hmac-sha2-512" | "hmac-sha2-512-etm@openssh.com" => {
-            if key.len() != 64 {
-                return None;
-            }
-            let mut k = [0u8; 64];
-            k.copy_from_slice(key);
-            Some(Box::new(HmacSha512Mac {
-                key: k,
-                etm: name == "hmac-sha2-512-etm@openssh.com",
-            }))
-        }
-        _ => None,
+    let spec = by_name(name)?;
+    if key.len() != spec.key_len {
+        return None;
     }
+    let (tag_len, etm) = (spec.tag_len, spec.etm);
+    let base = name.strip_suffix("-etm@openssh.com").unwrap_or(name);
+    Some(match base {
+        "hmac-sha2-256" => Box::new(HmacMac::<Sha256> {
+            keyed: Hmac::new(key),
+            tag_len,
+            etm,
+        }),
+        "hmac-sha2-512" => Box::new(HmacMac::<Sha512> {
+            keyed: Hmac::new(key),
+            tag_len,
+            etm,
+        }),
+        "hmac-sha1" | "hmac-sha1-96" => Box::new(HmacMac::<Sha1> {
+            keyed: Hmac::new(key),
+            tag_len,
+            etm,
+        }),
+        "hmac-md5" | "hmac-md5-96" => Box::new(HmacMac::<Md5> {
+            keyed: Hmac::new(key),
+            tag_len,
+            etm,
+        }),
+        "umac-64" | "umac-64@openssh.com" | "umac-128" | "umac-128@openssh.com" => {
+            let k: &[u8; 16] = key.try_into().ok()?;
+            let keyed = if base.starts_with("umac-64") {
+                Umac::U64(Box::new(Umac64::new(k)))
+            } else {
+                Umac::U128(Box::new(Umac128::new(k)))
+            };
+            Box::new(UmacMac { keyed, etm })
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(all(test, feature = "alloc"))]
@@ -290,8 +332,52 @@ mod tests {
     }
 
     #[test]
+    fn every_catalogued_mac_round_trips() {
+        for spec in ALL {
+            let key = alloc::vec![0x5au8; spec.key_len];
+            let mac = mac_by_name(spec.name, &key).expect(spec.name);
+            assert_eq!(mac.tag_len(), spec.tag_len, "{}", spec.name);
+            assert_eq!(mac.etm(), spec.etm, "{}", spec.name);
+            let mut tag = alloc::vec![0u8; spec.tag_len];
+            mac.compute(7, b"packet", &mut tag).unwrap();
+            mac.verify(7, b"packet", &tag).unwrap();
+            assert!(mac.verify(8, b"packet", &tag).is_err(), "{}", spec.name);
+            assert!(
+                mac.verify(7, b"packet", &tag[1..]).is_err(),
+                "{}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn hmac_sha1_and_md5_rfc2202_tc2() {
+        // RFC 2202 test case 2 ("Jefe"), with the 4-byte sequence number
+        // taken from the front of the message.
+        let data = b"what do ya want for nothing?";
+        let seq = u32::from_be_bytes(data[..4].try_into().unwrap());
+        let mut key = alloc::vec![0u8; 20];
+        key[..4].copy_from_slice(b"Jefe");
+        let mac = mac_by_name("hmac-sha1", &key).unwrap();
+        let mut tag = [0u8; 20];
+        mac.compute(seq, &data[4..], &mut tag).unwrap();
+        assert_eq!(
+            &tag[..],
+            &unhex("effcdf6ae5eb2fa2d27416d5f184df9c259a7c79")[..]
+        );
+        let mac = mac_by_name("hmac-sha1-96", &key).unwrap();
+        let mut tag = [0u8; 12];
+        mac.compute(seq, &data[4..], &mut tag).unwrap();
+        assert_eq!(&tag[..], &unhex("effcdf6ae5eb2fa2d27416d5")[..]);
+        let mac = mac_by_name("hmac-md5", &key[..16]).unwrap();
+        let mut tag = [0u8; 16];
+        mac.compute(seq, &data[4..], &mut tag).unwrap();
+        assert_eq!(&tag[..], &unhex("750c783e6ab0b503eaa86e310a5db738")[..]);
+    }
+
+    #[test]
     fn factory_unknown_name() {
-        assert!(mac_by_name("hmac-md5", &[0u8; 16]).is_none());
+        assert!(mac_by_name("hmac-md4", &[0u8; 16]).is_none());
     }
 
     #[test]

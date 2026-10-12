@@ -591,7 +591,7 @@ mod tests {
     fn openssh_only_names_are_dropped_unknown_ones_refused() {
         let got = resolve_algo_list(
             AlgoCategory::Cipher,
-            &args("+aes128-cbc,3des-cbc"),
+            &args("+blowfish-cbc,arcfour"),
             1,
             "Ciphers",
         )
@@ -599,15 +599,24 @@ mod tests {
         assert_eq!(got, default_list(AlgoCategory::Cipher));
         let got = resolve_algo_list(
             AlgoCategory::Cipher,
-            &args("aes256-cbc,aes256-ctr"),
+            &args("arcfour256,aes256-ctr"),
             1,
             "Ciphers",
         )
         .unwrap();
         assert_eq!(got, vec!["aes256-ctr"]);
+        // Implemented legacy names are appended (never defaults).
+        let got = resolve_algo_list(
+            AlgoCategory::Cipher,
+            &args("+aes128-cbc,3des-cbc"),
+            1,
+            "Ciphers",
+        )
+        .unwrap();
+        assert_eq!(&got[got.len() - 2..], &["aes128-cbc", "3des-cbc"]);
         // Only unimplemented names: nothing left to offer.
         assert!(
-            resolve_algo_list(AlgoCategory::Cipher, &args("aes128-cbc"), 1, "Ciphers").is_err()
+            resolve_algo_list(AlgoCategory::Cipher, &args("blowfish-cbc"), 1, "Ciphers").is_err()
         );
         // Not an OpenSSH name either: still a typo to report.
         assert!(

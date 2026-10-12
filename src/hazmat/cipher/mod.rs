@@ -4,13 +4,17 @@
 //!
 //! - **`aes*-ctr`** (RFC 4344) — paired with a separate HMAC, possibly in EtM mode.
 //! - **`aes*-gcm@openssh.com`** (RFC 5647) — AEAD with implicit 12-byte nonce.
+//! - **`aes*-cbc`, `3des-cbc`** (RFC 4253) — legacy, never offered unless
+//!   configured; paired with a separate HMAC like CTR.
 //! - **`chacha20-poly1305@openssh.com`** — AEAD with two ChaCha20 keys (one
 //!   for the length field, one for the payload) and a Poly1305 tag.
 
+mod cbc;
 mod chachapoly;
 mod ctr;
 mod gcm;
 
+use cbc::CbcState;
 use chachapoly::ChaChaPoly;
 use ctr::AesCtr;
 use gcm::GcmState;
@@ -85,6 +89,38 @@ pub const ALL: &[CipherSpec] = &[
         aead: false,
         tag_len: 0,
     },
+    CipherSpec {
+        name: "aes128-cbc",
+        key_len: 16,
+        iv_len: 16,
+        block_size: 16,
+        aead: false,
+        tag_len: 0,
+    },
+    CipherSpec {
+        name: "aes192-cbc",
+        key_len: 24,
+        iv_len: 16,
+        block_size: 16,
+        aead: false,
+        tag_len: 0,
+    },
+    CipherSpec {
+        name: "aes256-cbc",
+        key_len: 32,
+        iv_len: 16,
+        block_size: 16,
+        aead: false,
+        tag_len: 0,
+    },
+    CipherSpec {
+        name: "3des-cbc",
+        key_len: 24,
+        iv_len: 8,
+        block_size: 8,
+        aead: false,
+        tag_len: 0,
+    },
 ];
 
 /// Look up a [`CipherSpec`] by SSH name.
@@ -112,6 +148,8 @@ pub enum SshCipher {
     Ctr(AesCtr),
     /// `aes128-gcm@openssh.com` / `aes256-gcm@openssh.com`.
     Gcm(GcmState),
+    /// `aes*-cbc` / `3des-cbc` (legacy, configured only).
+    Cbc(CbcState),
     /// `chacha20-poly1305@openssh.com`.
     ChaChaPoly(ChaChaPoly),
 }
@@ -127,13 +165,48 @@ impl SshCipher {
             "aes128-gcm@openssh.com" => Ok(SshCipher::Gcm(GcmState::new_128(key, iv)?)),
             "aes256-gcm@openssh.com" => Ok(SshCipher::Gcm(GcmState::new_256(key, iv)?)),
             "chacha20-poly1305@openssh.com" => Ok(SshCipher::ChaChaPoly(ChaChaPoly::new(key)?)),
+            "aes128-cbc" | "aes192-cbc" | "aes256-cbc" | "3des-cbc" => {
+                Ok(SshCipher::Cbc(CbcState::new(name, key, iv)?))
+            }
             _ => Err(Error::Unsupported("cipher")),
         }
     }
 
     /// Whether this suite is an AEAD (no separate MAC).
     pub fn is_aead(&self) -> bool {
-        !matches!(self, SshCipher::Ctr(_))
+        !matches!(self, SshCipher::Ctr(_) | SshCipher::Cbc(_))
+    }
+
+    /// The block size the packet length and padding are aligned to, for the
+    /// non-AEAD suites (8 for 3DES, 16 otherwise).
+    pub fn block_size(&self) -> usize {
+        match self {
+            SshCipher::Cbc(c) => c.block_size(),
+            _ => 16,
+        }
+    }
+
+    /// Encrypt whole blocks in place (a non-AEAD suite: CTR or CBC).
+    ///
+    /// # Errors
+    /// [`Error::Unsupported`] on an AEAD suite; [`Error::Protocol`] if a CBC
+    /// input is not block-aligned.
+    pub fn encrypt_blocks(&mut self, buf: &mut [u8]) -> Result<()> {
+        match self {
+            SshCipher::Cbc(c) => c.encrypt(buf),
+            _ => self.stream(buf),
+        }
+    }
+
+    /// Decrypt whole blocks in place (a non-AEAD suite: CTR or CBC).
+    ///
+    /// # Errors
+    /// As [`Self::encrypt_blocks`].
+    pub fn decrypt_blocks(&mut self, buf: &mut [u8]) -> Result<()> {
+        match self {
+            SshCipher::Cbc(c) => c.decrypt(buf),
+            _ => self.stream(buf),
+        }
     }
 
     /// Whether this suite encrypts the binary-packet length field on the wire.

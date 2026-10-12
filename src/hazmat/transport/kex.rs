@@ -128,19 +128,25 @@ pub mod defaults {
     /// Cipher algorithms (same list for both directions).
     pub const CIPHERS: &[&str] = &[
         "chacha20-poly1305@openssh.com",
-        "aes256-gcm@openssh.com",
         "aes128-gcm@openssh.com",
-        "aes256-ctr",
-        "aes192-ctr",
+        "aes256-gcm@openssh.com",
         "aes128-ctr",
+        "aes192-ctr",
+        "aes256-ctr",
     ];
 
     /// MAC algorithms (ignored for AEAD ciphers).
     pub const MACS: &[&str] = &[
+        "umac-64-etm@openssh.com",
+        "umac-128-etm@openssh.com",
         "hmac-sha2-256-etm@openssh.com",
         "hmac-sha2-512-etm@openssh.com",
+        "hmac-sha1-etm@openssh.com",
+        "umac-64@openssh.com",
+        "umac-128@openssh.com",
         "hmac-sha2-256",
         "hmac-sha2-512",
+        "hmac-sha1",
     ];
 
     /// Compression algorithms.

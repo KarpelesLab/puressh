@@ -62,7 +62,7 @@ enum CipherSlot {
 #[cfg(feature = "alloc")]
 fn classify(cipher: SshCipher, mac: Option<Box<dyn SshMac + Send + Sync>>) -> Result<CipherSlot> {
     match (&cipher, cipher.is_aead()) {
-        (SshCipher::Ctr(_), _) => {
+        (SshCipher::Ctr(_) | SshCipher::Cbc(_), _) => {
             let mac = mac.ok_or(Error::Protocol("MAC required for non-AEAD cipher"))?;
             Ok(CipherSlot::Stream { cipher, mac })
         }
@@ -465,11 +465,13 @@ fn encode_stream<R: CryptoRng + RngCore>(
     if !payload_within_limit(payload.len()) {
         return Err(Error::Protocol("payload exceeds encoder limit"));
     }
-    let block_size = 16usize;
+    let block_size = cipher.block_size();
     let etm = mac.etm();
     let pad = padding_for(payload.len(), block_size, !etm);
     let packet_length = 1 + payload.len() + pad;
-    if packet_length + 4 < MIN_TOTAL_LEN {
+    // With EtM the length is outside the encrypted blocks: like OpenSSH, no
+    // 16-byte minimum (3des-cbc's 8-byte blocks make 12-byte packets).
+    if !etm && packet_length + 4 < MIN_TOTAL_LEN {
         return Err(Error::Protocol("packet too short"));
     }
 
@@ -485,14 +487,14 @@ fn encode_stream<R: CryptoRng + RngCore>(
     let mac_input_end = frame.len();
 
     if etm {
-        cipher.stream(&mut frame[4..mac_input_end])?;
+        cipher.encrypt_blocks(&mut frame[4..mac_input_end])?;
         let mut tag = vec![0u8; tag_len];
         mac.compute(seq, &frame[..mac_input_end], &mut tag)?;
         frame.extend_from_slice(&tag);
     } else {
         let mut tag = vec![0u8; tag_len];
         mac.compute(seq, &frame[..mac_input_end], &mut tag)?;
-        cipher.stream(&mut frame[..mac_input_end])?;
+        cipher.encrypt_blocks(&mut frame[..mac_input_end])?;
         frame.extend_from_slice(&tag);
     }
 
@@ -507,7 +509,7 @@ fn decode_stream(
     mac: &dyn SshMac,
     pending: &mut Option<Vec<u8>>,
 ) -> Result<Option<(Vec<u8>, usize)>> {
-    let block_size = 16usize;
+    let block_size = cipher.block_size();
     let tag_len = mac.tag_len();
     let etm = mac.etm();
 
@@ -524,7 +526,7 @@ fn decode_stream(
             return Err(Error::Protocol("packet body not block-aligned"));
         }
         let total = 4 + body_len + tag_len;
-        if 4 + body_len < MIN_TOTAL_LEN {
+        if body_len < block_size {
             return Err(Error::Protocol("packet too short"));
         }
         if buf.len() < total {
@@ -534,7 +536,7 @@ fn decode_stream(
         let tag = &buf[4 + body_len..total];
         mac.verify(seq, mac_input, tag)?;
         let mut body = buf[4..4 + body_len].to_vec();
-        cipher.stream(&mut body)?;
+        cipher.decrypt_blocks(&mut body)?;
         let pad_len = body[0] as usize;
         if !(4..=255).contains(&pad_len) {
             return Err(Error::BadPadding);
@@ -553,7 +555,7 @@ fn decode_stream(
         Some(b) => b,
         None => {
             let mut b = buf[..block_size].to_vec();
-            cipher.stream(&mut b)?;
+            cipher.decrypt_blocks(&mut b)?;
             b
         }
     };
@@ -583,7 +585,7 @@ fn decode_stream(
     plain.extend_from_slice(&first_block);
     if 4 + body_len > block_size {
         let mut rest = buf[block_size..4 + body_len].to_vec();
-        cipher.stream(&mut rest)?;
+        cipher.decrypt_blocks(&mut rest)?;
         plain.extend_from_slice(&rest);
     }
 

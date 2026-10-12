@@ -2967,39 +2967,71 @@ fn resolve_mux(
     }))
 }
 
-/// Handle `ssh -O check|exit|stop`: talk to the master at `path` and report.
-///
-/// * `check` — print whether a live master is present; exit 0 if alive, 255 if
-///   not (matching OpenSSH's "Master running"/"... not running" semantics).
-/// * `exit` / `stop` — ask the master to tear down and unlink its socket.
+/// Handle `ssh -O check|exit|stop`: talk to the master at `path` and report
+/// on stderr, worded as OpenSSH's: `Master running (pid=N)`, `Exit request
+/// sent.`, `Stop listening request sent.`; no master: `Control socket
+/// connect(PATH): <reason>` and exit 255.
 #[cfg(unix)]
 fn run_control_command(cmd: &str, path: &std::path::Path) -> Result<i32, String> {
     use puressh::mux::ControlCommand;
+    // Reach the master first: the error is OpenSSH's message when absent.
+    let pid = match std::os::unix::net::UnixStream::connect(path) {
+        Ok(s) => master_pid(&s),
+        Err(e) => {
+            let e = e.to_string();
+            let e = e.split(" (os error").next().unwrap_or(&e).to_string();
+            eprintln!("Control socket connect({}): {e}", path.display());
+            return Ok(255);
+        }
+    };
     match cmd {
         "check" => {
             let alive = puressh::mux::send_control_command(path, ControlCommand::Check)
                 .map_err(|e| format!("-O check: {e}"))?;
-            if alive {
-                println!("Master running (control socket {})", path.display());
-                Ok(0)
-            } else {
-                println!("No master running on {}", path.display());
-                Ok(255)
+            if !alive {
+                eprintln!(
+                    "Control socket connect({}): Connection refused",
+                    path.display()
+                );
+                return Ok(255);
             }
+            match pid {
+                Some(pid) => eprintln!("Master running (pid={pid})"),
+                None => eprintln!("Master running"),
+            }
+            Ok(0)
         }
         "exit" | "stop" => {
-            // First confirm something is there; an absent socket is a no-op
-            // success (nothing to stop) under OpenSSH, but we report it.
-            if puressh::mux::probe_master(path) != puressh::mux::ProbeOutcome::Live {
-                println!("No master running on {}", path.display());
-                return Ok(0);
-            }
             puressh::mux::send_control_command(path, ControlCommand::Exit)
                 .map_err(|e| format!("-O {cmd}: {e}"))?;
-            println!("Exit request sent to master on {}", path.display());
+            if cmd == "exit" {
+                eprintln!("Exit request sent.");
+            } else {
+                eprintln!("Stop listening request sent.");
+            }
             Ok(0)
         }
         other => Err(format!("-O: unsupported control command {other:?}")),
+    }
+}
+
+/// The master's process id, from the control socket's peer credentials.
+#[cfg(unix)]
+fn master_pid(sock: &std::os::unix::net::UnixStream) -> Option<i32> {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        nix::sys::socket::getsockopt(sock, nix::sys::socket::sockopt::PeerCredentials)
+            .ok()
+            .map(|c| c.pid())
+    }
+    #[cfg(target_vendor = "apple")]
+    {
+        nix::sys::socket::getsockopt(sock, nix::sys::socket::sockopt::LocalPeerPid).ok()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+    {
+        let _ = sock;
+        None
     }
 }
 

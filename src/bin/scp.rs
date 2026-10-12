@@ -271,6 +271,13 @@ fn local_target(target: &Path, name: &str, many: bool) -> Result<PathBuf, String
 
 /// Report an error OpenSSH-style and remember that one happened.
 fn fail(errs: &mut u32, msg: impl std::fmt::Display) {
+    // Without Rust's ` (os error N)`: OpenSSH says `No such file or
+    // directory`.
+    let msg = msg.to_string();
+    let msg = match msg.find(" (os error ") {
+        Some(i) if msg.ends_with(')') => &msg[..i],
+        _ => &msg,
+    };
     eprintln!("scp: {msg}");
     *errs += 1;
 }

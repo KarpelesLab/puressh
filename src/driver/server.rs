@@ -166,6 +166,11 @@ impl ServerDriver {
         &self.session_id
     }
 
+    /// The algorithms the most recent key exchange chose.
+    pub fn negotiated(&self) -> Option<crate::transport::Negotiated> {
+        self.runner.negotiated()
+    }
+
     /// The peer's negotiated EXT_INFO, if any.
     pub fn peer_ext_info(&self) -> Option<&ExtInfo> {
         self.runner.peer_ext_info()

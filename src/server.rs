@@ -2682,6 +2682,20 @@ fn do_connection_phase(
     effective: &EffectivePolicy,
 ) -> Result<()> {
     let mut conn = ConnectionState::new();
+    // As OpenSSH's sshd: tell the client all our host keys, so one with
+    // UpdateHostKeys can learn those it lacks (proving them with
+    // `hostkeys-prove-00@openssh.com`).
+    let announced = host_keys_announcement(cfg);
+    if !announced.is_empty() {
+        let p = conn.send_global_request(
+            crate::channel::GlobalRequest::Other {
+                name: "hostkeys-00@openssh.com".into(),
+                raw: announced,
+            },
+            false,
+        );
+        srv_send(stream, driver, &p)?;
+    }
     let mut any_channel_opened = false;
     let mut steps = 0usize;
     // Per-channel interactive-shell state. Empty when no `shell` request
@@ -3904,6 +3918,16 @@ fn handle_global_request(
             };
             srv_send(stream, driver, &p)?;
         }
+        GlobalRequest::Other { name, raw } if name == "hostkeys-prove-00@openssh.com" => {
+            let proof = prove_host_keys(cfg, driver, &raw);
+            if want_reply {
+                let p = match proof {
+                    Some(sigs) => conn.send_global_success(&sigs),
+                    None => conn.send_global_failure(),
+                };
+                srv_send(stream, driver, &p)?;
+            }
+        }
         GlobalRequest::Keepalive | GlobalRequest::Other { .. } => {
             if want_reply {
                 let p = conn.send_global_failure();
@@ -3912,6 +3936,85 @@ fn handle_global_request(
         }
     }
     Ok(())
+}
+
+/// The body of `hostkeys-00@openssh.com`: each plain host key's public
+/// blob (certificates left out, each key once).
+fn host_keys_announcement(cfg: &Config) -> Vec<u8> {
+    let mut seen: Vec<Vec<u8>> = Vec::new();
+    for k in &cfg.host_keys {
+        if crate::cert::is_cert_name(k.algorithm()) {
+            continue;
+        }
+        let blob = k.public_blob();
+        if !seen.contains(&blob) {
+            seen.push(blob);
+        }
+    }
+    let mut out = Vec::new();
+    for blob in seen {
+        out.extend_from_slice(&(blob.len() as u32).to_be_bytes());
+        out.extend_from_slice(&blob);
+    }
+    out
+}
+
+/// Answer `hostkeys-prove-00@openssh.com`: for each key the client lists,
+/// a signature by that host key over `hostkeys-prove-00@openssh.com`, the
+/// session id and the key — RSA with the negotiated RSA algorithm, else
+/// SHA-512 (OpenSSH's choice). `None` if a listed key is not ours.
+fn prove_host_keys(cfg: &Config, driver: &ServerDriver, raw: &[u8]) -> Option<Vec<u8>> {
+    let negotiated = driver.negotiated().map(|n| n.host_key);
+    let rsa_alg = match negotiated.as_deref() {
+        Some(a @ ("rsa-sha2-256" | "rsa-sha2-512")) => a.to_string(),
+        _ => "rsa-sha2-512".to_string(),
+    };
+    let mut out = Vec::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let n = u32::from_be_bytes(rest.get(..4)?.try_into().ok()?) as usize;
+        let blob = rest.get(4..4 + n)?;
+        rest = &rest[4 + n..];
+        let candidates: Vec<&(dyn HostKey + Send + Sync)> = cfg
+            .host_keys
+            .iter()
+            .map(|k| k.as_ref())
+            .filter(|k| !crate::cert::is_cert_name(k.algorithm()) && k.public_blob() == blob)
+            .collect();
+        let is_rsa = candidates
+            .iter()
+            .any(|k| matches!(k.algorithm(), "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa"));
+        let key = if is_rsa {
+            candidates
+                .iter()
+                .copied()
+                .find(|k| k.algorithm() == rsa_alg)
+                .or_else(|| candidates.first().copied())?
+        } else {
+            candidates.first().copied()?
+        };
+        let mut signed = Vec::new();
+        for part in [
+            b"hostkeys-prove-00@openssh.com".as_slice(),
+            driver.session_id(),
+            blob,
+        ] {
+            signed.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            signed.extend_from_slice(part);
+        }
+        // An RSA key held under another hash signs through its variant.
+        let sig = if is_rsa && key.algorithm() != rsa_alg {
+            key.upgraded_for(&rsa_alg)
+                .map(|k| k.sign(&signed))
+                .unwrap_or_else(|| key.sign(&signed))
+        } else {
+            key.sign(&signed)
+        }
+        .ok()?;
+        out.extend_from_slice(&(sig.len() as u32).to_be_bytes());
+        out.extend_from_slice(&sig);
+    }
+    Some(out)
 }
 
 /// If a `pty-req` is pending on `channel` and the shell handler can run

@@ -31,7 +31,6 @@ use std::process::ExitCode;
 use purecrypto::rng::{OsRng, RngCore};
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
 use puressh::known_hosts::KnownHosts;
-use puressh::known_hosts::format_entry;
 use zeroize::Zeroizing;
 
 /// Open a file with `create_new` semantics, applying the requested Unix mode
@@ -324,7 +323,21 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
 }
 
 fn read_to_string(path: &str) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))
+    fs::read_to_string(path).map_err(|e| format!("{path}: {}", io_reason(&e)))
+}
+
+/// Marks an error message printed as is, without the `ssh-keygen: ` prefix
+/// (OpenSSH words some failures that way).
+const RAW: char = '\u{1}';
+
+/// Why a private key could not be loaded, as OpenSSH says it.
+fn load_reason(e: &puressh::Error) -> String {
+    match e {
+        puressh::Error::Crypto(m) if m.contains("passphrase") => {
+            "incorrect passphrase supplied to decrypt private key".into()
+        }
+        other => other.to_string(),
+    }
 }
 
 fn write_private(path: &str, contents: &str) -> Result<(), String> {
@@ -809,23 +822,30 @@ fn run_fingerprint(args: &Args) -> Result<i32, String> {
     let file = ensure_file_in(&args.file)?;
     // A key file, or every key line of an authorized_keys / known_hosts
     // style file.
-    let keys: Vec<PublicKey> = match load_public(&file) {
-        Ok(pk) => vec![pk],
+    // (key, the comment to show: a known_hosts line's host field).
+    let keys: Vec<(PublicKey, Option<String>)> = match load_public(&file) {
+        Ok(pk) => vec![(pk, None)],
         Err(e) => {
             let text = read_to_string(&file)?;
-            let keys: Vec<PublicKey> = text
+            let keys: Vec<(PublicKey, Option<String>)> = text
                 .lines()
                 .filter_map(|l| {
                     let l = l.trim();
                     if l.is_empty() || l.starts_with('#') {
                         return None;
                     }
-                    PublicKey::parse_authorized_keys_line(l).ok().or_else(|| {
-                        // known_hosts: `hosts keytype base64`.
-                        l.split_once(char::is_whitespace).and_then(|(_, rest)| {
-                            PublicKey::parse_authorized_keys_line(rest.trim()).ok()
-                        })
-                    })
+                    if let Ok(pk) = PublicKey::parse_authorized_keys_line(l) {
+                        return Some((pk, None));
+                    }
+                    // known_hosts: `hosts keytype base64`; OpenSSH skips
+                    // the @cert-authority / @revoked lines.
+                    if l.starts_with('@') {
+                        return None;
+                    }
+                    let (hosts, rest) = l.split_once(char::is_whitespace)?;
+                    PublicKey::parse_authorized_keys_line(rest.trim())
+                        .ok()
+                        .map(|pk| (pk, Some(hosts.to_string())))
                 })
                 .collect();
             if keys.is_empty() {
@@ -834,12 +854,12 @@ fn run_fingerprint(args: &Args) -> Result<i32, String> {
             keys
         }
     };
-    for pk in keys {
+    for (pk, hosts) in keys {
         let fp = fingerprint_text(&pk, args)?;
-        let comment = if pk.comment().is_empty() {
-            "no comment"
-        } else {
-            pk.comment()
+        let comment = match &hosts {
+            Some(h) => h.as_str(),
+            None if pk.comment().is_empty() => "no comment",
+            None => pk.comment(),
         };
         println!(
             "{} {fp} {comment} ({})",
@@ -966,9 +986,9 @@ fn run_extract_public(args: &Args) -> Result<i32, String> {
                     Some(pp.as_bytes())
                 },
             )
-            .map_err(|e| format!("parse {file}: {e}"))?
+            .map_err(|e| format!("{RAW}Load key \"{file}\": {}", load_reason(&e)))?
         }
-        Err(e) => return Err(format!("parse {file}: {e}")),
+        Err(e) => return Err(format!("{RAW}Load key \"{file}\": {}", load_reason(&e))),
     };
     let pub_line = sk.public_key().to_authorized_keys_line();
     println!("{pub_line}");
@@ -995,9 +1015,14 @@ fn run_change_passphrase(args: &Args) -> Result<i32, String> {
                     Some(pp.as_bytes())
                 },
             )
-            .map_err(|e| format!("parse {file}: {e}"))?
+            .map_err(|e| format!("{RAW}Failed to load key {file}: {}", load_reason(&e)))?
         }
-        Err(e) => return Err(format!("parse {file}: {e}")),
+        Err(e) => {
+            return Err(format!(
+                "{RAW}Failed to load key {file}: {}",
+                load_reason(&e)
+            ));
+        }
     };
 
     let new_pass: Zeroizing<String> = if args.new_pass_set {
@@ -1044,33 +1069,103 @@ fn resolve_known_hosts_path(args: &Args) -> Result<String, String> {
     Ok(format!("{home}/.ssh/known_hosts"))
 }
 
+/// `[host]:port` → (`host`, port); anything else is a host on `port`.
+fn split_host_port(spec: &str, port: u16) -> (&str, u16) {
+    if let Some(rest) = spec.strip_prefix('[')
+        && let Some((h, p)) = rest.split_once("]:")
+        && let Ok(p) = p.parse()
+    {
+        return (h, p);
+    }
+    (spec, port)
+}
+
+/// The lines of a known_hosts file that are entries for `host`: (1-based
+/// line number, marker: `CA` / `REVOKED` / ``).
+fn known_hosts_matches(text: &str, host: &str, port: u16) -> Vec<(usize, &'static str)> {
+    use puressh::known_hosts::Marker;
+    let (host, port) = split_host_port(host, port);
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let one = KnownHosts::from_bytes(line.as_bytes());
+        if let Some(e) = one.find(host, port).first() {
+            let marker = match e.marker {
+                Some(Marker::CertAuthority) => "CA",
+                Some(Marker::Revoked) => "REVOKED",
+                _ => "",
+            };
+            out.push((i + 1, marker));
+        }
+    }
+    out
+}
+
+/// `-R host`: remove the host's lines, as OpenSSH: each found line is
+/// reported, the original is kept as `<file>.old`.
 fn run_known_hosts_remove(args: &Args, host: &str) -> Result<i32, String> {
     let path = resolve_known_hosts_path(args)?;
-    let mut kh = KnownHosts::load(&path).map_err(|e| format!("load {path}: {e}"))?;
-    let removed = kh.remove(host, args.port);
-    if removed == 0 {
-        eprintln!("ssh-keygen: no matching entries found in {path}");
-        return Ok(1);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
+    let matches = known_hosts_matches(&text, host, args.port);
+    if matches.is_empty() {
+        eprintln!("Host {host} not found in {path}\r");
+        return Ok(0);
     }
-    kh.save(&path).map_err(|e| format!("save {path}: {e}"))?;
-    println!("# Host {host} found: line(s) removed: {removed}");
-    println!("# Updated {path}");
+    let gone: Vec<usize> = matches.iter().map(|(n, _)| *n).collect();
+    let mut kept = String::with_capacity(text.len());
+    for (i, line) in text.lines().enumerate() {
+        if !gone.contains(&(i + 1)) {
+            kept.push_str(line);
+            kept.push('\n');
+        }
+    }
+    let old = format!("{path}.old");
+    std::fs::copy(&path, &old).map_err(|e| format!("{old}: {}", io_reason(&e)))?;
+    let tmp = format!("{path}.XXXXXXXXXX");
+    std::fs::write(&tmp, kept).map_err(|e| format!("{tmp}: {}", io_reason(&e)))?;
+    if let Ok(meta) = std::fs::metadata(&old) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
+    if !args.quiet {
+        for n in gone {
+            println!("# Host {host} found: line {n}");
+        }
+        println!("{path} updated.");
+        println!("Original contents retained as {old}");
+    }
     Ok(0)
 }
 
+/// `-F host`: print the host's lines as written, each after OpenSSH's
+/// `# Host … found: line N` header (`-q`: lines only). Exit 1 if none.
 fn run_known_hosts_find(args: &Args, host: &str) -> Result<i32, String> {
     let path = resolve_known_hosts_path(args)?;
-    let kh = KnownHosts::load(&path).map_err(|e| format!("load {path}: {e}"))?;
-    let matches = kh.find(host, args.port);
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
+    let matches = known_hosts_matches(&text, host, args.port);
     if matches.is_empty() {
-        // OpenSSH exits 1 with no output when nothing matches.
         return Ok(1);
     }
-    println!("# Host {host} found: line(s): {}", matches.len());
-    for entry in matches {
-        println!("{}", format_entry(entry));
+    let lines: Vec<&str> = text.lines().collect();
+    for (n, marker) in matches {
+        if !args.quiet {
+            println!("# Host {host} found: line {n} {marker}");
+        }
+        println!("{}", lines[n - 1]);
     }
     Ok(0)
+}
+
+/// An I/O error as OpenSSH words it (`No such file or directory`).
+fn io_reason(e: &std::io::Error) -> String {
+    let s = e.to_string();
+    match s.find(" (os error") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
 }
 
 fn run_known_hosts_hash(args: &Args) -> Result<i32, String> {
@@ -1195,7 +1290,10 @@ fn run() -> Result<i32, i32> {
     match res {
         Ok(code) => Ok(code),
         Err(msg) => {
-            eprintln!("ssh-keygen: {msg}");
+            match msg.strip_prefix(RAW) {
+                Some(raw) => eprintln!("{raw}"),
+                None => eprintln!("ssh-keygen: {msg}"),
+            }
             let lower = msg.to_lowercase();
             let crypto = lower.contains("passphrase")
                 || lower.contains("signature")
@@ -2038,9 +2136,10 @@ mod certs {
 
     pub(super) fn list(args: &Args) -> Result<i32, String> {
         let path = args.file.as_deref().ok_or("-f is required")?;
-        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("{path}: {}", super::io_reason(&e)))?;
         let cert = Certificate::parse_openssh_line(text.trim())
-            .map_err(|e| format!("{path} is not a certificate: {e}"))?;
+            .map_err(|_| format!("{}{path}:1 is not a certificate", super::RAW))?;
         let key = PublicKey::parse_wire_blob(cert.embedded_pubkey_blob())
             .map_err(|e| format!("{path}: {e}"))?;
         let ca = PublicKey::parse_wire_blob(&cert.signature_key_blob)

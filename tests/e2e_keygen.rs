@@ -278,3 +278,64 @@ fn formats_fingerprints_krl_interop() {
         assert_eq!(ours.status.code(), theirs.status.code(), "{krl}");
     }
 }
+
+/// The known_hosts operations print exactly what OpenSSH's do — Ansible's
+/// known_hosts module parses `ssh-keygen -F`'s `found: line N` — and leave
+/// the same files behind.
+#[test]
+#[ignore]
+fn known_hosts_operations_match_openssh() {
+    let dir = tempdir("knownhosts");
+    keygen(&dir, "ed25519", "a");
+    keygen(&dir, "rsa", "b");
+    let (a, b) = (pub_line(&dir, "a"), pub_line(&dir, "b"));
+    let text =
+        format!("h1 {a}\n# comment\nh2,h1 {b}\n@cert-authority *.example {a}\n[h3]:2222 {b}\n");
+    let same = |args: &[&str]| {
+        for name in ["theirs", "ours"] {
+            std::fs::write(dir.join(name), &text).unwrap();
+            let _ = std::fs::remove_file(dir.join(format!("{name}.old")));
+        }
+        let mut theirs: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        theirs.extend(["-f".into(), "theirs".into()]);
+        let mut ours: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        ours.extend(["-f".into(), "ours".into()]);
+        let t = run(
+            &dir,
+            "ssh-keygen",
+            &theirs.iter().map(String::as_str).collect::<Vec<_>>(),
+            b"",
+        );
+        let o = run(
+            &dir,
+            OURS,
+            &ours.iter().map(String::as_str).collect::<Vec<_>>(),
+            b"",
+        );
+        let norm = |b: &[u8]| {
+            String::from_utf8_lossy(b)
+                .replace("theirs", "F")
+                .replace("ours", "F")
+        };
+        assert_eq!(norm(&o.stdout), norm(&t.stdout), "stdout of {args:?}");
+        assert_eq!(o.status.code(), t.status.code(), "exit status of {args:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("ours")).unwrap(),
+            std::fs::read_to_string(dir.join("theirs")).unwrap(),
+            "file after {args:?}"
+        );
+        assert_eq!(
+            dir.join("ours.old").exists(),
+            dir.join("theirs.old").exists()
+        );
+    };
+    same(&["-F", "h1"]);
+    same(&["-q", "-F", "h1"]);
+    same(&["-F", "x.example"]);
+    same(&["-F", "[h3]:2222"]);
+    same(&["-F", "nope"]);
+    same(&["-R", "h1"]);
+    same(&["-R", "nope"]);
+    same(&["-l"]);
+    let _ = std::fs::remove_dir_all(&dir);
+}

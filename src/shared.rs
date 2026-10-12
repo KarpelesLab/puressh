@@ -244,6 +244,10 @@ struct Inner {
     last_rx: std::time::Instant,
     /// The server's `SSH_MSG_DISCONNECT` (reason, description), once read.
     disconnect: Option<(u32, alloc::string::String)>,
+    /// Keepalive requests still awaiting their reply: the server answers
+    /// global requests in order, so these come before the reply to any
+    /// request sent after them.
+    pending_keepalives: u32,
 }
 
 /// The parts of a [`SharedClient`] needed to rebuild one from inside the
@@ -308,6 +312,7 @@ impl From<Client> for SharedClient {
                 handlers: None,
                 last_rx: std::time::Instant::now(),
                 disconnect: None,
+                pending_keepalives: 0,
                 self_ref: Some(SelfRef {
                     inner: weak.clone(),
                     lock_waiters: waiters,
@@ -856,7 +861,100 @@ impl SharedClient {
             .client
             .conn
             .send_global_request(crate::channel::GlobalRequest::Keepalive, true);
-        g.client.write_payload(&p)
+        g.client.write_payload(&p)?;
+        g.pending_keepalives += 1;
+        Ok(())
+    }
+
+    /// Ask the server to listen on `bind_address:bind_port` and forward its
+    /// connections here (`tcpip-forward`, RFC 4254 §7.1) — `ssh -R` added to
+    /// a connection already in use (`ssh -O forward`). Returns the port the
+    /// server listens on (its choice when `bind_port` is 0). The
+    /// connections arrive through the handlers given to
+    /// [`Self::set_channel_handlers`].
+    pub fn request_tcpip_forward(&self, bind_address: &str, bind_port: u16) -> Result<u16> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g.client.conn.send_global_request(
+            crate::channel::GlobalRequest::TcpipForward {
+                bind_address: bind_address.to_string(),
+                bind_port: bind_port as u32,
+            },
+            true,
+        );
+        g.client.write_payload(&p)?;
+        let data = await_global_reply_under_lock(&mut g)?;
+        let port = if bind_port == 0 {
+            let p = crate::format::Reader::new(&data)
+                .read_u32()
+                .map_err(|_| Error::Protocol("tcpip-forward: server omitted assigned-port tail"))?;
+            u16::try_from(p)
+                .map_err(|_| Error::Protocol("tcpip-forward: server returned out-of-range port"))?
+        } else {
+            bind_port
+        };
+        g.client
+            .tcpip_forward_grants
+            .push((bind_address.to_string(), port));
+        Ok(port)
+    }
+
+    /// Undo a [`Self::request_tcpip_forward`] (`cancel-tcpip-forward`).
+    pub fn cancel_tcpip_forward(&self, bind_address: &str, bind_port: u16) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g.client.conn.send_global_request(
+            crate::channel::GlobalRequest::CancelTcpipForward {
+                bind_address: bind_address.to_string(),
+                bind_port: bind_port as u32,
+            },
+            true,
+        );
+        g.client.write_payload(&p)?;
+        await_global_reply_under_lock(&mut g)?;
+        let grants = &mut g.client.tcpip_forward_grants;
+        if let Some(i) = grants
+            .iter()
+            .position(|(a, p)| a == bind_address && *p == bind_port)
+            .or_else(|| grants.iter().position(|(_, p)| *p == bind_port))
+        {
+            grants.swap_remove(i);
+        }
+        Ok(())
+    }
+
+    /// Ask the server to listen on the Unix socket `socket_path` and
+    /// forward its connections here (`streamlocal-forward@openssh.com`) —
+    /// `ssh -R /path:…` on a connection already in use.
+    pub fn request_streamlocal_forward(&self, socket_path: &str) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g.client.conn.send_global_request(
+            crate::channel::GlobalRequest::StreamlocalForward {
+                socket_path: socket_path.to_string(),
+            },
+            true,
+        );
+        g.client.write_payload(&p)?;
+        await_global_reply_under_lock(&mut g)?;
+        g.client
+            .streamlocal_forward_grants
+            .push(socket_path.to_string());
+        Ok(())
+    }
+
+    /// Undo a [`Self::request_streamlocal_forward`].
+    pub fn cancel_streamlocal_forward(&self, socket_path: &str) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g.client.conn.send_global_request(
+            crate::channel::GlobalRequest::CancelStreamlocalForward {
+                socket_path: socket_path.to_string(),
+            },
+            true,
+        );
+        g.client.write_payload(&p)?;
+        await_global_reply_under_lock(&mut g)?;
+        g.client
+            .streamlocal_forward_grants
+            .retain(|p| p != socket_path);
+        Ok(())
     }
 
     /// The server's `SSH_MSG_DISCONNECT` (reason code, description), if it
@@ -1029,6 +1127,33 @@ fn open_direct_tcpip_under_lock(
     g.client.write_payload(&open_payload)?;
     await_open_under_lock(g, local_id, "direct-tcpip")?;
     Ok(local_id)
+}
+
+/// Wait (under the held lock) for the reply to the global request just
+/// sent: its data on success. Replies to keepalives sent before it come
+/// first and are skipped; other packets are dispatched meanwhile.
+fn await_global_reply_under_lock(g: &mut Inner) -> Result<Vec<u8>> {
+    let mut iter_guard = 0usize;
+    loop {
+        iter_guard += 1;
+        if iter_guard > MAX_OPEN_ITER {
+            return Err(Error::Protocol(
+                "global request: reply loop did not converge",
+            ));
+        }
+        let payload = g.client.read_one_packet()?;
+        g.last_rx = std::time::Instant::now();
+        match g.client.conn.on_packet(&payload)? {
+            ChannelEvent::GlobalSuccess { .. } | ChannelEvent::GlobalFailure
+                if g.pending_keepalives > 0 =>
+            {
+                g.pending_keepalives -= 1;
+            }
+            ChannelEvent::GlobalSuccess { data } => return Ok(data),
+            ChannelEvent::GlobalFailure => return Err(Error::Protocol("global request denied")),
+            other => dispatch_event(&mut *g, other),
+        }
+    }
 }
 
 /// Wait (under the held lock) for the server's answer to the channel open
@@ -1311,6 +1436,12 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
     {
         accept_incoming(g, *channel, handler);
         return;
+    }
+    if matches!(
+        ev,
+        ChannelEvent::GlobalSuccess { .. } | ChannelEvent::GlobalFailure
+    ) {
+        g.pending_keepalives = g.pending_keepalives.saturating_sub(1);
     }
     // Peer-initiated opens (we accept none on a SharedClient) and global
     // requests that want a reply (sshd keepalives) are answered here, on

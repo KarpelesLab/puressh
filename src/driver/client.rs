@@ -177,6 +177,13 @@ impl ClientDriver {
         let advert = crate::client::build_default_kexinit(&mut self.rng, &self.algo_overrides)
             .with_ext_info_marker(Role::Client);
         self.runner = KexRunner::new(Role::Client, advert);
+        // As OpenSSH's client: ask a server that sends EXT_INFO to send its
+        // `server-sig-algs` again once it knows the user (its `Match` blocks
+        // may change them), during authentication.
+        let mut ext = ExtInfo::new();
+        ext.raw
+            .push(("ext-info-in-auth@openssh.com".into(), "0".into()));
+        self.runner.set_outbound_ext_info(ext);
         let initial = self.runner.start(&mut self.rng)?;
         for p in initial.outbound {
             self.enqueue_payload(&p)?;

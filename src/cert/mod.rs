@@ -535,23 +535,30 @@ impl Certificate {
         Ok(())
     }
 
-    /// Check that `name` is among the valid principals. An empty principals
-    /// list authorizes any principal (OpenSSH semantics).
+    /// Check that `name` is among the valid principals.
     ///
-    /// For **host** certificates the principals are DNS host names, which are
-    /// case-insensitive; we compare with `eq_ignore_ascii_case`, matching
-    /// OpenSSH (and the case-insensitive `@cert-authority` host-pattern gate
-    /// that precedes this call). For **user** certificates the principals are
-    /// login names and the comparison stays case-sensitive.
+    /// For **host** certificates the principals are host names or patterns
+    /// (`*`, `?`), compared without regard to case, and an empty list is
+    /// refused (OpenSSH's sshkey_cert_check_host). For **user**
+    /// certificates the principals are login names, compared exactly, and an
+    /// empty list authorizes any principal.
     pub fn check_principal(&self, name: &str) -> Result<()> {
+        // A host certificate must name its hosts, and may do so with
+        // patterns (OpenSSH's sshkey_cert_check_host); host names compare
+        // without regard to case.
         if self.valid_principals.is_empty() {
-            return Ok(());
+            return match self.cert_type {
+                CertType::Host => Err(Error::CertPrincipalMismatch),
+                CertType::User => Ok(()),
+            };
         }
         let matched = match self.cert_type {
-            CertType::Host => self
-                .valid_principals
-                .iter()
-                .any(|p| p.eq_ignore_ascii_case(name)),
+            CertType::Host => {
+                let name = name.to_ascii_lowercase();
+                self.valid_principals
+                    .iter()
+                    .any(|p| crate::config::glob::glob_match(&p.to_ascii_lowercase(), &name))
+            }
             CertType::User => self.valid_principals.iter().any(|p| p == name),
         };
         if matched {

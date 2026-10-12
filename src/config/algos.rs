@@ -121,6 +121,7 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
         // for old peers).
         AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted => {
             let mut names = default_list(cat);
+            names.push("ssh-rsa-cert-v01@openssh.com");
             names.push("ssh-rsa");
             names
         }
@@ -322,6 +323,34 @@ pub fn resolve_algo_list(
         ));
     }
 
+    // Each name may be a pattern (`*`, `?`): it stands for every supported
+    // algorithm it matches, in the catalogue's order, as OpenSSH's
+    // kex_assemble_names; a plain name must be a supported one.
+    let expand = |t: &str| -> Result<Vec<String>, ConfigError> {
+        if t.contains(['*', '?']) {
+            return Ok(known
+                .iter()
+                .filter(|n| glob_match(t, n))
+                .map(|n| n.to_string())
+                .collect());
+        }
+        if !is_known(t) {
+            return Err(bad_value(
+                line_no,
+                keyword,
+                format!("unknown algorithm {t:?}"),
+            ));
+        }
+        Ok(alloc::vec![t.to_string()])
+    };
+    let push_unique = |out: &mut Vec<String>, names: Vec<String>| {
+        for n in names {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    };
+
     let result: Vec<String> = match modifier {
         // `-glob,...` — remove matching entries from the defaults. Tokens are
         // globs, not exact names, so they are NOT validated against the
@@ -332,66 +361,42 @@ pub fn resolve_algo_list(
             .map(|s| s.to_string())
             .collect(),
 
-        // `+a,b` — append validated names to the end of the defaults,
-        // skipping any already present.
+        // `+a,b` — append to the end of the defaults, skipping any already
+        // present.
         Some('+') => {
-            for t in &tokens {
-                if !is_known(t) {
-                    return Err(bad_value(
-                        line_no,
-                        keyword,
-                        format!("unknown algorithm {t:?}"),
-                    ));
-                }
-            }
             let mut out: Vec<String> = default_list(cat)
                 .into_iter()
                 .map(|s| s.to_string())
                 .collect();
-            for t in tokens {
-                if !out.contains(&t) {
-                    out.push(t);
-                }
+            for t in &tokens {
+                push_unique(&mut out, expand(t)?);
             }
             out
         }
 
-        // `^a,b` — prepend validated names to the front of the defaults,
-        // de-duplicating the (now-redundant) later occurrences.
+        // `^a,b` — prepend to the front of the defaults, de-duplicating the
+        // (now-redundant) later occurrences.
         Some('^') => {
+            let mut out: Vec<String> = Vec::new();
             for t in &tokens {
-                if !is_known(t) {
-                    return Err(bad_value(
-                        line_no,
-                        keyword,
-                        format!("unknown algorithm {t:?}"),
-                    ));
-                }
+                push_unique(&mut out, expand(t)?);
             }
-            let mut out: Vec<String> = tokens;
-            for name in default_list(cat) {
-                if !out.iter().any(|e| e == name) {
-                    out.push(name.to_string());
-                }
-            }
+            push_unique(
+                &mut out,
+                default_list(cat)
+                    .into_iter()
+                    .map(|s| s.to_string())
+                    .collect(),
+            );
             out
         }
 
         // Bare list — replace the defaults wholesale with exactly these
-        // validated names (preserving the user's order; de-duplicated).
+        // names (preserving the user's order; de-duplicated).
         None => {
             let mut out: Vec<String> = Vec::with_capacity(tokens.len());
-            for t in tokens {
-                if !is_known(&t) {
-                    return Err(bad_value(
-                        line_no,
-                        keyword,
-                        format!("unknown algorithm {t:?}"),
-                    ));
-                }
-                if !out.contains(&t) {
-                    out.push(t);
-                }
+            for t in &tokens {
+                push_unique(&mut out, expand(t)?);
             }
             out
         }
@@ -663,5 +668,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(got, vec!["ssh-ed25519", "rsa-sha2-512"]);
+    }
+
+    #[test]
+    fn patterns_stand_for_the_supported_names_they_match() {
+        let all = resolve_algo_list(AlgoCategory::PubkeyAccepted, &args("*"), 1, "k").unwrap();
+        assert_eq!(all, known_names(AlgoCategory::PubkeyAccepted));
+        let ctr = resolve_algo_list(AlgoCategory::Cipher, &args("aes*-ctr"), 1, "k").unwrap();
+        assert_eq!(ctr, ["aes256-ctr", "aes192-ctr", "aes128-ctr"]);
+        let plus = resolve_algo_list(AlgoCategory::Mac, &args("+hmac-md5*"), 1, "k").unwrap();
+        assert!(plus.iter().any(|m| m == "hmac-md5-96"));
+        assert!(resolve_algo_list(AlgoCategory::Cipher, &args("nope*"), 1, "k").is_err());
     }
 }

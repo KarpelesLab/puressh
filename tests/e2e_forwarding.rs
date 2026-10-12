@@ -368,3 +368,37 @@ fn fork_returns_with_the_forward_up_and_exit_ends_it() {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+#[test]
+#[ignore]
+fn control_persist_master_serves_its_forwards() {
+    let Some(s) = setup("cp") else {
+        eprintln!("e2e_forwarding: skipping (OpenSSH ssh/sshd/ssh-keygen not found)");
+        return;
+    };
+    let tcp_echo = spawn_tcp_echo();
+    let l = free_port();
+    let ctl = s.dir.join("ctl");
+    // `-N` with ControlPersist: ssh returns at once, the daemonized master
+    // keeps the connection and serves the forward.
+    let st = s
+        .client(true, s.openssh_port)
+        .args(["-N", "-M", "-o", "ControlPersist=yes", "-S"])
+        .arg(&ctl)
+        .args(["-L", &format!("{l}:127.0.0.1:{tcp_echo}")])
+        .arg(format!("{}@127.0.0.1", s.user))
+        .stdin(Stdio::null())
+        .status()
+        .expect("ssh");
+    assert!(st.success(), "ssh -N -M ControlPersist failed: {st}");
+    let reply = exchange(&End::Port(l), None);
+    let exit = s
+        .client(true, s.openssh_port)
+        .args(["-O", "exit", "-S"])
+        .arg(&ctl)
+        .arg("x")
+        .output()
+        .unwrap();
+    assert_eq!(reply.as_deref(), Ok("echo:hi"));
+    assert!(exit.status.success(), "{exit:?}");
+}

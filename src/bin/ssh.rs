@@ -757,11 +757,24 @@ fn collect_credentials(
             );
         }
         for kp in implicit_keys {
+            // The identity's own `.pub`, when that is a certificate (OpenSSH
+            // takes the identity's public half from it), then its
+            // `-cert.pub`.
+            let pub_path = format!("{kp}.pub");
+            let pub_is_cert = std::fs::read_to_string(&pub_path)
+                .ok()
+                .and_then(|t| t.split_whitespace().next().map(str::to_string))
+                .is_some_and(|t| puressh::cert::is_cert_name(&t));
             let cert_path = format!("{kp}-cert.pub");
-            if std::path::Path::new(&cert_path).exists()
-                && !candidates.iter().any(|(c, _)| *c == cert_path)
+            for path in [pub_is_cert.then_some(pub_path), Some(cert_path)]
+                .into_iter()
+                .flatten()
             {
-                candidates.push((cert_path, Some(kp)));
+                if std::path::Path::new(&path).exists()
+                    && !candidates.iter().any(|(c, _)| *c == path)
+                {
+                    candidates.push((path, Some(kp.clone())));
+                }
             }
         }
 
@@ -804,6 +817,23 @@ fn collect_credentials(
                         credentials.push(ClientCredential::PublicKey(Box::new(ch)));
                         paired = true;
                         break;
+                    }
+                    Err(e) => warn!("warning: CertificateFile {cert_path}: {e}"),
+                }
+            }
+            // Else a key the agent holds.
+            #[cfg(unix)]
+            if !paired
+                && let Some(signer) = common::agent_signer_for(&cert.embedded_pubkey_blob)
+                && let Some(cert_name) = puressh::cert::cert_name_for_key_type(
+                    puressh::hostkey::HostKey::algorithm(&signer),
+                )
+            {
+                match CertHostKey::new(Box::new(signer), &cert, cert_name) {
+                    Ok(ch) => {
+                        vlog(1, &format!("certificate {cert_path}: offered (agent key)"));
+                        credentials.push(ClientCredential::PublicKey(Box::new(ch)));
+                        paired = true;
                     }
                     Err(e) => warn!("warning: CertificateFile {cert_path}: {e}"),
                 }
@@ -1114,11 +1144,10 @@ fn config_for_host(
     // is interop with ancient peers in known-controlled environments. The flag
     // is process-wide (a single atomic), so once any host's config opts in it
     // affects subsequent host-key verification in this process.
-    if cfg_block
-        .host_key_algorithms
-        .as_ref()
-        .is_some_and(|list| list.iter().any(|n| n == "ssh-rsa"))
-    {
+    if cfg_block.host_key_algorithms.as_ref().is_some_and(|list| {
+        list.iter()
+            .any(|n| n == "ssh-rsa" || n == "ssh-rsa-cert-v01@openssh.com")
+    }) {
         vlog(
             1,
             "HostKeyAlgorithms names ssh-rsa: enabling legacy SHA-1 host-key verification \
@@ -1131,7 +1160,10 @@ fn config_for_host(
     if cfg_block
         .pubkey_accepted_algorithms
         .as_ref()
-        .is_some_and(|list| list.iter().any(|n| n == "ssh-rsa"))
+        .is_some_and(|list| {
+            list.iter()
+                .any(|n| n == "ssh-rsa" || n == "ssh-rsa-cert-v01@openssh.com")
+        })
     {
         vlog(
             1,
@@ -1942,6 +1974,21 @@ fn print_config(
 /// `ssh -Q KIND`: list the algorithms this build supports, one per line.
 fn run_query(kind: &str) -> Result<i32, String> {
     use puressh::config::{AlgoCategory, supported_algorithms};
+    // The configuration keywords name their lists too (any case), as in
+    // OpenSSH.
+    let kind = match kind.to_ascii_lowercase().as_str() {
+        "ciphers" => "cipher",
+        "macs" => "mac",
+        "kexalgorithms" => "kex",
+        "casignaturealgorithms" => "key-ca-sign",
+        "pubkeyacceptedalgorithms"
+        | "pubkeyacceptedkeytypes"
+        | "hostkeyalgorithms"
+        | "hostbasedacceptedalgorithms"
+        | "hostbasedacceptedkeytypes"
+        | "hostbasedkeytypes" => "key-sig",
+        _ => kind,
+    };
     let list: Vec<&str> = match kind {
         "cipher" => supported_algorithms(AlgoCategory::Cipher),
         // The ciphers that authenticate (AEAD), as OpenSSH lists them.
@@ -1986,13 +2033,10 @@ fn run_query(kind: &str) -> Result<i32, String> {
         }
         "key-cert" => puressh::hostkey::HOST_KEY_CERT_VERIFY_NAMES.to_vec(),
         "key-sig" => supported_algorithms(AlgoCategory::HostKey),
-        "sig" => {
+        "sig" | "key-ca-sign" => {
             let mut v = puressh::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
             v.push("ssh-rsa");
             v
-        }
-        "HostKeyAlgorithms" | "PubkeyAcceptedAlgorithms" => {
-            puressh::config::default_algorithms(AlgoCategory::HostKey)
         }
         "compression" => vec!["none", "zlib@openssh.com"],
         "protocol-version" => vec!["2"],
@@ -2002,6 +2046,7 @@ fn run_query(kind: &str) -> Result<i32, String> {
             "compression",
             "kex",
             "key",
+            "key-ca-sign",
             "key-cert",
             "key-plain",
             "key-sig",
@@ -2676,15 +2721,17 @@ fn run() -> Result<i32, String> {
     let no_command = cli.no_command;
     let shared: puressh::shared::SharedClient = client.into();
     shared.set_channel_handlers(handlers);
-    start_local_forwards(&shared, &cli, &dynamics, gateway, exit_on_forward_failure)?;
-    if let Some(interval) = server_alive {
-        spawn_keepalive(
-            &shared,
-            interval,
-            cfg_block.server_alive_count_max.unwrap_or(3),
-            connect_host.clone(),
-        );
-    }
+    let listeners = bind_local_forwards(&cli, &dynamics, gateway, exit_on_forward_failure)?;
+    // The threads serving the connection — forward listeners, keepalive —
+    // start in the process that keeps it (a ControlPersist master forks).
+    let alive_count = cfg_block.server_alive_count_max.unwrap_or(3);
+    let alive_host = connect_host.clone();
+    let start_serving = move |shared: &puressh::shared::SharedClient| {
+        serve_local_listeners(listeners, shared);
+        if let Some(interval) = server_alive {
+            spawn_keepalive(shared, interval, alive_count, alive_host);
+        }
+    };
 
     // A server's SSH_MSG_DISCONNECT is reported as OpenSSH does.
     let peer = format!("{connect_host} port {port}");
@@ -2739,8 +2786,9 @@ fn run() -> Result<i32, String> {
     // the foreground one.
     #[cfg(unix)]
     if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
-        return become_master(dec, &cli, &cfg_block, shared, run);
+        return become_master(dec, &cli, &cfg_block, shared, start_serving, run);
     }
+    start_serving(&shared);
     Ok(run(&shared))
 }
 
@@ -3104,16 +3152,26 @@ fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
     }
 }
 
-/// `-L` and `-D`: bind the local listeners; each accepted connection opens
-/// a `direct-tcpip` channel on the shared connection. The bind address
-/// follows `GatewayPorts` (loopback by default).
-fn start_local_forwards(
-    shared: &puressh::shared::SharedClient,
+/// A bound `-L` / `-D` listener, not yet accepting.
+enum LocalListener {
+    Tcp(TcpListener, LocalForward),
+    #[cfg(unix)]
+    Unix(std::os::unix::net::UnixListener, LocalForward),
+    Socks(TcpListener, u16),
+}
+
+/// `-L` and `-D`: bind the local listeners (the bind address follows
+/// `GatewayPorts`; loopback by default). They start accepting with
+/// [`serve_local_listeners`], in the process that keeps the connection:
+/// a ControlPersist master forks first, and its listening sockets go with
+/// it while threads would not.
+fn bind_local_forwards(
     cli: &Cli,
     dynamics: &[DynamicForward],
     gateway: puressh::config::GatewayPorts,
     exit_on_forward_failure: bool,
-) -> Result<(), String> {
+) -> Result<Vec<LocalListener>, String> {
+    let mut out = Vec::new();
     for l in &cli.locals {
         let shown_to = match &l.connect_path {
             Some(p) => p.clone(),
@@ -3124,7 +3182,7 @@ fn start_local_forwards(
                 Ok(listener) => {
                     vlog(1, &format!("-L {path}:{shown_to} active"));
                     #[cfg(unix)]
-                    spawn_local_path_listener(listener, l.clone(), shared.clone());
+                    out.push(LocalListener::Unix(listener, l.clone()));
                     #[cfg(not(unix))]
                     let () = listener;
                 }
@@ -3152,7 +3210,7 @@ fn start_local_forwards(
                     1,
                     &format!("-L {}:{}:{} active", bind_ip, l.listen_port, shown_to),
                 );
-                spawn_local_forward_listener(listener, l.clone(), shared.clone());
+                out.push(LocalListener::Tcp(listener, l.clone()));
             }
             Err(e) => {
                 let msg = format!("bind [{bind_ip}]:{}: {e}", l.listen_port);
@@ -3170,7 +3228,7 @@ fn start_local_forwards(
                     1,
                     &format!("-D {}:{} (SOCKS) active", d.bind_addr, d.listen_port),
                 );
-                spawn_dynamic_forward_listener(listener, d.listen_port, shared.clone());
+                out.push(LocalListener::Socks(listener, d.listen_port));
             }
             Err(e) => {
                 let msg = format!("bind [{}]:{}: {e}", d.bind_addr, d.listen_port);
@@ -3181,7 +3239,25 @@ fn start_local_forwards(
             }
         }
     }
-    Ok(())
+    Ok(out)
+}
+
+/// Start accepting on the listeners [`bind_local_forwards`] bound.
+fn serve_local_listeners(listeners: Vec<LocalListener>, shared: &puressh::shared::SharedClient) {
+    for l in listeners {
+        match l {
+            LocalListener::Tcp(listener, spec) => {
+                spawn_local_forward_listener(listener, spec, shared.clone())
+            }
+            #[cfg(unix)]
+            LocalListener::Unix(listener, spec) => {
+                spawn_local_path_listener(listener, spec, shared.clone())
+            }
+            LocalListener::Socks(listener, port) => {
+                spawn_dynamic_forward_listener(listener, port, shared.clone())
+            }
+        }
+    }
 }
 
 /// Splice a `direct-tcpip` channel on the shared connection with a local TCP
@@ -3996,6 +4072,7 @@ fn become_master<F>(
     cli: &Cli,
     cfg_block: &puressh::config::ClientOptions,
     shared: puressh::shared::SharedClient,
+    start_serving: impl FnOnce(&puressh::shared::SharedClient),
     foreground: F,
 ) -> Result<i32, String>
 where
@@ -4020,6 +4097,7 @@ where
             1,
             &format!("mux: becoming master at {}", dec.path.display()),
         );
+        start_serving(&shared);
         return puressh::mux::run_master(cfg, shared, foreground);
     }
 
@@ -4031,7 +4109,7 @@ where
             dec.path.display()
         ),
     );
-    daemonize_master(dec, cli, cfg_block, shared, cfg)
+    daemonize_master(dec, cli, cfg_block, shared, cfg, start_serving)
 }
 
 /// Fork the authenticated connection into a detached daemon that owns the
@@ -4051,13 +4129,14 @@ fn daemonize_master(
     cfg_block: &puressh::config::ClientOptions,
     shared: puressh::shared::SharedClient,
     cfg: puressh::mux::MasterConfig,
+    start_serving: impl FnOnce(&puressh::shared::SharedClient),
 ) -> Result<i32, String> {
     use nix::unistd::{ForkResult, fork, setsid};
 
     // SAFETY: the binary is outside the library's `forbid(unsafe_code)`. At
     // this point we are still single-threaded (no serve / I/O threads have
-    // been spawned yet — those start inside run_master_daemon in the child),
-    // so fork() does not orphan any locks.
+    // been spawned yet — `start_serving` and run_master_daemon start them in
+    // the child), so fork() does not orphan any locks.
     match unsafe { fork() }.map_err(|e| format!("ControlPersist: fork failed: {e}"))? {
         ForkResult::Child => {
             // --- Daemon master process ---
@@ -4071,6 +4150,7 @@ fn daemonize_master(
             // Detach stdio: the daemon must not hold the terminal's fds open
             // (that would wedge the parent's tty on exit) nor write to it.
             detach_stdio();
+            start_serving(&shared);
             // Serve until the persist policy / `-O exit` tears us down. The
             // daemon never returns to `run()`; exit directly with its status.
             let code = match puressh::mux::run_master_daemon(cfg, shared) {
@@ -4086,8 +4166,10 @@ fn daemonize_master(
         ForkResult::Parent { .. } => {
             // --- Foreground (launcher) process ---
             // We must NOT run Drop on our copy of the connection: the daemon
-            // owns the SSH socket now. Leak the handle deliberately.
+            // owns the SSH socket now. Leak the handle deliberately. Our
+            // copies of the forward listeners close: the daemon serves them.
             core::mem::forget(shared);
+            drop(start_serving);
 
             // Wait for the daemon to bind + answer on the control socket.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -4104,6 +4186,11 @@ fn daemonize_master(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
 
+            // `-N`: nothing more to do here; the daemon keeps the connection
+            // and its forwards (OpenSSH backgrounds the master likewise).
+            if cli.no_command {
+                return Ok(0);
+            }
             // Run our own session as a normal mux client over the daemon.
             run_mux_client(cli, cfg_block, &dec.path)
         }

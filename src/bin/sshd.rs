@@ -7179,9 +7179,10 @@ mod imp {
         // `PubkeyAcceptedAlgorithms +ssh-rsa` (global or in a Match block):
         // accept old clients' SHA-1 RSA signatures, as OpenSSH then does.
         let names_ssh_rsa = |o: &puressh::config::ServerOptions| {
-            o.pubkey_accepted_algorithms
-                .as_ref()
-                .is_some_and(|l| l.iter().any(|a| a == "ssh-rsa"))
+            o.pubkey_accepted_algorithms.as_ref().is_some_and(|l| {
+                l.iter()
+                    .any(|a| a == "ssh-rsa" || a == "ssh-rsa-cert-v01@openssh.com")
+            })
         };
         if names_ssh_rsa(&sshd_cfg.global)
             || sshd_cfg.match_blocks.iter().any(|b| names_ssh_rsa(&b.opts))

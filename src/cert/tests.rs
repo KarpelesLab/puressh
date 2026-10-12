@@ -584,3 +584,20 @@ fn cert_names_for_key_types() {
     );
     assert_eq!(cert_name_for_key_type("ssh-dss"), None);
 }
+
+#[test]
+fn host_principals_are_patterns_and_must_be_present() {
+    let mut cert = Certificate::parse(&load_cert_blob("h_ed25519-cert.pub")).unwrap();
+    cert.valid_principals = vec!["*.example.com".into(), "loc?lhost".into()];
+    cert.check_principal("host.example.com").unwrap();
+    cert.check_principal("LOCALHOST").unwrap();
+    assert!(cert.check_principal("example.org").is_err());
+    // A host certificate naming no host is refused (a user one is not).
+    cert.valid_principals.clear();
+    assert!(matches!(
+        cert.check_principal("host.example.com"),
+        Err(Error::CertPrincipalMismatch)
+    ));
+    cert.cert_type = CertType::User;
+    cert.check_principal("anyone").unwrap();
+}

@@ -1248,10 +1248,25 @@ impl Client {
         self.write_payload(&first)?;
 
         let mismatched = self.host_key_mismatched();
+        let sig_algs = |c: &Self| {
+            c.driver
+                .peer_ext_info()
+                .and_then(|e| e.server_sig_algs.clone())
+        };
+        let mut known_sig_algs = sig_algs(self);
         for _ in 0..MAX_AUTH_STEPS {
             // `read_one_packet` surfaces post-NEWKEYS payloads (userauth here)
             // from the driver; transport concerns stay inside it.
             let payload = self.read_one_packet()?;
+            // A server told our `ext-info-in-auth@openssh.com` sends its
+            // `server-sig-algs` again once it knows the user.
+            let now_sig_algs = sig_algs(self);
+            if now_sig_algs != known_sig_algs {
+                if let Some(algs) = now_sig_algs.as_deref() {
+                    auth.set_server_sig_algs(algs);
+                }
+                known_sig_algs = now_sig_algs;
+            }
             match auth.on_packet(&payload)? {
                 // Never let a password / keyboard-interactive answer out
                 // over a changed host key, whatever the caller put in the
@@ -3659,6 +3674,10 @@ pub(crate) fn build_verifier(
     // decision per policy. The signature over `H` is verified against the
     // certificate's EMBEDDED key (built below); the CA signature ties the
     // embedded key to a trusted CA.
+    // A certificate whose CA known_hosts does not list is checked as the
+    // plain key it certifies (OpenSSH: "No matching CA found. Retry with
+    // plain key").
+    let mut plain_from_cert: Option<Vec<u8>> = None;
     if crate::cert::is_cert_name(&neg.host_key) {
         let cert = crate::cert::Certificate::parse(k_s)?;
         let ca_algos: Vec<&str> = match ca_signature_algorithms {
@@ -3705,7 +3724,16 @@ pub(crate) fn build_verifier(
                 {
                     return Err(Error::HostKeyRejected);
                 }
-                let user = store.verify_host_cert(host, port, &cert, &ca_algos, now);
+                let has_ca = store.has_ca_for(host, port, &cert)
+                    || kh.global.iter().any(|g| g.has_ca_for(host, port, &cert));
+                if !has_ca {
+                    plain_from_cert = Some(cert.embedded_pubkey_blob.clone());
+                }
+                let user = if has_ca {
+                    store.verify_host_cert(host, port, &cert, &ca_algos, now)
+                } else {
+                    Ok(())
+                };
                 if user.is_err()
                     && kh.global.iter().any(|g| {
                         g.verify_host_cert(host, port, &cert, &ca_algos, now)
@@ -3720,8 +3748,14 @@ pub(crate) fn build_verifier(
         }
         // Build the exchange-hash verifier from the cert's embedded key, keyed
         // on the negotiated cert name (which pins the RSA hash).
-        return host_key_verify_by_name(&neg.host_key, k_s);
+        if plain_from_cert.is_none() {
+            return host_key_verify_by_name(&neg.host_key, k_s);
+        }
     }
+    // The key known_hosts is checked for: the host key, or the key a
+    // certificate from an unlisted CA certifies.
+    let host_k_s = k_s;
+    let k_s: &[u8] = plain_from_cert.as_deref().unwrap_or(k_s);
 
     match policy {
         HostKeyPolicy::AcceptAny => {}
@@ -3732,6 +3766,13 @@ pub(crate) fn build_verifier(
             }
         }
         HostKeyPolicy::KnownHosts(kh) => {
+            // known_hosts records the key's type (`ssh-rsa`), not the
+            // signature algorithm negotiated for it (`rsa-sha2-512`).
+            let key_type: String = crate::format::Reader::new(k_s)
+                .read_string()
+                .ok()
+                .and_then(|t| core::str::from_utf8(t).ok())
+                .map_or_else(|| neg.host_key.clone(), str::to_string);
             // Host-empty / port-zero already rejected above. Past this
             // point we have a real (host, port) pair, so the lookup can
             // proceed. `HostKeyAlias` replaces both for the lookup.
@@ -3740,16 +3781,14 @@ pub(crate) fn build_verifier(
                 None => (target_host, target_port),
             };
             if kh.revoked.as_ref().is_some_and(|r| r.is_revoked_key(k_s)) {
-                print_revoked_banner(&neg.host_key, target_host, target_port);
+                print_revoked_banner(&key_type, target_host, target_port);
                 return Err(Error::HostKeyRejected);
             }
             let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
-            let mut lookup = store.lookup(target_host, target_port, &neg.host_key, k_s);
+            let mut lookup = store.lookup(target_host, target_port, &key_type, k_s);
             for g in &kh.global {
-                lookup = combine_lookups(
-                    lookup,
-                    g.lookup(target_host, target_port, &neg.host_key, k_s),
-                );
+                lookup =
+                    combine_lookups(lookup, g.lookup(target_host, target_port, &key_type, k_s));
             }
             match lookup {
                 LookupResult::Match => {}
@@ -3758,7 +3797,7 @@ pub(crate) fn build_verifier(
                     // `on_mismatch` — no `StrictHostKeyChecking=no` accept,
                     // no prompt, no rotation of the store. OpenSSH aborts
                     // the connection here too.
-                    print_revoked_banner(&neg.host_key, target_host, target_port);
+                    print_revoked_banner(&key_type, target_host, target_port);
                     return Err(Error::HostKeyRejected);
                 }
                 LookupResult::Mismatch { expected } => {
@@ -3771,13 +3810,7 @@ pub(crate) fn build_verifier(
                     // the same information via `HostKeyPrompt` and owns its
                     // own user-facing display.
                     if !matches!(&kh.on_mismatch, TofuAction::PromptDetailed(_)) {
-                        print_mismatch_banner(
-                            target_host,
-                            target_port,
-                            &expected,
-                            &neg.host_key,
-                            k_s,
-                        );
+                        print_mismatch_banner(target_host, target_port, &expected, &key_type, k_s);
                     }
 
                     let accept = match &kh.on_mismatch {
@@ -3814,7 +3847,7 @@ pub(crate) fn build_verifier(
                             // so the callback only needs to ask the
                             // accept/refuse question.
                             drop(store);
-                            let ok = cb(target_host, target_port, &neg.host_key, k_s);
+                            let ok = cb(target_host, target_port, &key_type, k_s);
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
                             ok
                         }
@@ -3827,7 +3860,7 @@ pub(crate) fn build_verifier(
                                 change: HostKeyChange::Changed,
                                 host: target_host,
                                 port: target_port,
-                                key_type: &neg.host_key,
+                                key_type: &key_type,
                                 key_blob: k_s,
                                 fingerprint: host_key_fingerprint(k_s),
                                 existing: &expected,
@@ -3862,7 +3895,7 @@ pub(crate) fn build_verifier(
                         // single host's key rotation — the broad
                         // `remove` would silently delete them.
                         let _ = store.remove_exact(target_host, target_port);
-                        store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
+                        store.add(target_host, target_port, &key_type, k_s, kh.hash_new);
                         if let Some(path) = &kh.save_path {
                             save_known_hosts(&store, path);
                         }
@@ -3877,7 +3910,7 @@ pub(crate) fn build_verifier(
                             // callback — it may block on stdin and
                             // shouldn't hold up other policy users.
                             drop(store);
-                            let ok = cb(target_host, target_port, &neg.host_key, k_s);
+                            let ok = cb(target_host, target_port, &key_type, k_s);
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
                             ok
                         }
@@ -3889,7 +3922,7 @@ pub(crate) fn build_verifier(
                                 change: HostKeyChange::Unknown,
                                 host: target_host,
                                 port: target_port,
-                                key_type: &neg.host_key,
+                                key_type: &key_type,
                                 key_blob: k_s,
                                 fingerprint: host_key_fingerprint(k_s),
                                 existing: &[],
@@ -3902,7 +3935,7 @@ pub(crate) fn build_verifier(
                     if !accept {
                         return Err(Error::HostKeyRejected);
                     }
-                    store.add(target_host, target_port, &neg.host_key, k_s, kh.hash_new);
+                    store.add(target_host, target_port, &key_type, k_s, kh.hash_new);
                     if let Some(path) = &kh.save_path {
                         save_known_hosts(&store, path);
                     }
@@ -3911,7 +3944,7 @@ pub(crate) fn build_verifier(
         }
     }
 
-    host_key_verify_by_name(&neg.host_key, k_s)
+    host_key_verify_by_name(&neg.host_key, host_k_s)
 }
 
 /// OpenSSH's banner for a revoked host key.

@@ -73,6 +73,61 @@ impl HostKey for CertHostKey {
         // exactly what the verifier expects from `Certificate::embedded_verifier`.
         self.inner.sign(msg)
     }
+
+    /// An RSA certificate under another of its algorithms — the first of
+    /// `rsa-sha2-512`, `rsa-sha2-256`, `ssh-rsa` (SHA-1) whose certificate
+    /// name or signature name `allowed` lists — signing with the matching
+    /// hash.
+    fn upgraded_for(&self, allowed: &str) -> Option<Box<dyn HostKey>> {
+        const RSA: [(&str, &str); 3] = [
+            ("rsa-sha2-512-cert-v01@openssh.com", "rsa-sha2-512"),
+            ("rsa-sha2-256-cert-v01@openssh.com", "rsa-sha2-256"),
+            ("ssh-rsa-cert-v01@openssh.com", "ssh-rsa"),
+        ];
+        if !RSA.iter().any(|(c, _)| *c == self.cert_algo) {
+            return None;
+        }
+        let listed = |n: &str| allowed.split(',').any(|a| a.trim() == n);
+        let mut chosen = None;
+        for &(c, s) in RSA.iter() {
+            if listed(c) || listed(s) {
+                chosen = Some((c, s));
+                break;
+            }
+        }
+        let (cert_algo, sig) = chosen?;
+        let inner = self.inner.upgraded_for(sig)?;
+        if inner.algorithm() != sig {
+            return None;
+        }
+        Some(Box::new(UpgradedCert {
+            inner,
+            cert_blob: self.cert_blob.clone(),
+            cert_algo,
+        }))
+    }
+}
+
+/// A [`CertHostKey`] moved to another RSA algorithm by
+/// [`HostKey::upgraded_for`].
+struct UpgradedCert {
+    inner: Box<dyn HostKey>,
+    cert_blob: Vec<u8>,
+    cert_algo: &'static str,
+}
+
+impl HostKey for UpgradedCert {
+    fn algorithm(&self) -> &'static str {
+        self.cert_algo
+    }
+
+    fn public_blob(&self) -> Vec<u8> {
+        self.cert_blob.clone()
+    }
+
+    fn sign(&self, msg: &[u8]) -> Result<Vec<u8>> {
+        self.inner.sign(msg)
+    }
 }
 
 #[cfg(all(test, feature = "alloc"))]

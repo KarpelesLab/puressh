@@ -266,7 +266,15 @@ impl ClientAuth {
                     if allowed.iter().any(|a| a == algo) {
                         ClientCredential::PublicKey(hk)
                     } else {
-                        let csv = allowed.join(",");
+                        // A certificate is allowed by its certificate names
+                        // only (`ssh-rsa-cert-v01@openssh.com`, not `ssh-rsa`).
+                        let is_cert = |a: &str| a.ends_with("-cert-v01@openssh.com");
+                        let csv = allowed
+                            .iter()
+                            .filter(|a| is_cert(a) == is_cert(algo))
+                            .map(String::as_str)
+                            .collect::<Vec<_>>()
+                            .join(",");
                         match hk.upgraded_for(&csv) {
                             Some(upgraded) => ClientCredential::PublicKey(upgraded),
                             None => continue,

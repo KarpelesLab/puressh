@@ -117,6 +117,10 @@ pub fn parse_line(raw: &str) -> ParsedLine {
     };
 
     let key_type = match tokens.next() {
+        // An RSA key recorded under a signature algorithm's name (as older
+        // puressh releases wrote it; OpenSSH reads it as RSA too) is an
+        // `ssh-rsa` key.
+        Some("rsa-sha2-256" | "rsa-sha2-512") => "ssh-rsa".to_string(),
         Some(s) => s.to_string(),
         None => return ParsedLine::Verbatim(raw.to_string()),
     };

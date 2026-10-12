@@ -972,6 +972,26 @@ pub fn identity_signer(
     }
 }
 
+/// The agent's signer for the public key `blob`, if the agent holds it
+/// (to pair a `CertificateFile` with an agent key, as OpenSSH does).
+#[cfg(unix)]
+#[allow(dead_code)] // ssh only
+pub fn agent_signer_for(blob: &[u8]) -> Option<AgentHostKey> {
+    let agent = Agent::connect_env().ok()??;
+    let agent = Arc::new(Mutex::new(agent));
+    let held = agent
+        .lock()
+        .ok()?
+        .identities()
+        .ok()?
+        .into_iter()
+        .any(|i| i.key_blob == blob);
+    if !held {
+        return None;
+    }
+    AgentHostKey::from_identity(agent, blob.to_vec()).ok()
+}
+
 /// Connect to `$SSH_AUTH_SOCK` (if set), list identities, and wrap each as a
 /// publickey credential backed by [`AgentHostKey`]. Returns `Ok(empty)` when
 /// no agent is reachable — that's an expected "no agent" state, not an

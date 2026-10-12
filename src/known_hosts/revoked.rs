@@ -13,7 +13,8 @@ pub enum RevokedHostKeys {
     /// A binary OpenSSH key revocation list.
     Krl(Krl),
     /// Public-key wire blobs, one per line of a text file
-    /// (`keytype base64 [comment]`; blank lines and `#` comments skipped).
+    /// (`keytype base64 [comment]`; blank lines and `#` comments skipped; a
+    /// certificate stands for the key it certifies).
     Keys(Vec<Vec<u8>>),
 }
 
@@ -46,7 +47,13 @@ impl RevokedHostKeys {
                 .split_whitespace()
                 .nth(1)
                 .ok_or(crate::Error::Format("revoked host keys: bad line"))?;
-            keys.push(crate::key::base64_decode(b64.as_bytes())?);
+            let blob = crate::key::base64_decode(b64.as_bytes())?;
+            // A certificate listed here revokes the key it certifies:
+            // OpenSSH compares public keys, whatever the line's form.
+            match Certificate::parse(&blob) {
+                Ok(cert) => keys.push(cert.embedded_pubkey_blob),
+                Err(_) => keys.push(blob),
+            }
         }
         Ok(Self::Keys(keys))
     }

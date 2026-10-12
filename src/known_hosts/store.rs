@@ -302,8 +302,27 @@ impl KnownHosts {
         cert.check_validity(now)?;
         cert.require_known_critical_options()?;
 
-        // Pass 2: find a matching @cert-authority entry for `[host]:port`,
-        // then (like OpenSSH, for a non-default port) for the bare host.
+        // As OpenSSH's check_host_cert: a host certificate carries no
+        // critical options.
+        if !cert.critical_options.is_empty() {
+            return Err(Error::CertUnknownCriticalOption);
+        }
+
+        // Pass 2: a matching @cert-authority entry for this host.
+        if self.has_ca_for(host, port, cert) {
+            // This CA is trusted for this host. Verify the CA signature and
+            // the principal binding.
+            cert.verify_ca_signature(allowed_ca_algos)?;
+            cert.check_principal(host)?;
+            return Ok(());
+        }
+        Err(Error::HostKeyRejected)
+    }
+
+    /// Whether an `@cert-authority` line names the certificate's CA for
+    /// `[host]:port` (or, like OpenSSH, for a non-default port, the bare
+    /// host).
+    pub fn has_ca_for(&self, host: &str, port: u16, cert: &crate::cert::Certificate) -> bool {
         let ca_trusted = |port: u16| {
             self.lines.iter().any(|slot| {
                 matches!(slot, Slot::Entry(e)
@@ -312,14 +331,7 @@ impl KnownHosts {
                         && host_field_matches(&e.host_spec, host, port))
             })
         };
-        if ca_trusted(port) || (port != 22 && ca_trusted(22)) {
-            // This CA is trusted for this host. Verify the CA signature and
-            // the principal binding.
-            cert.verify_ca_signature(allowed_ca_algos)?;
-            cert.check_principal(host)?;
-            return Ok(());
-        }
-        Err(Error::HostKeyRejected)
+        ca_trusted(port) || (port != 22 && ca_trusted(22))
     }
 
     /// Whether an `@revoked` line for `host[:port]` names the certificate's

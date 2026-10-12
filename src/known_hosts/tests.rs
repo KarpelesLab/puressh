@@ -635,3 +635,13 @@ fn revoked_host_keys_list_and_krl() {
     // An empty file revokes nothing.
     assert!(!RevokedHostKeys::parse(b"").unwrap().is_revoked_key(&a));
 }
+
+#[test]
+fn rsa_entry_under_a_signature_name_is_an_rsa_key() {
+    // `AAAB` decodes to the opaque blob [0x00, 0x00, 0x01].
+    let kh = KnownHosts::from_bytes(b"example.com rsa-sha2-512 AAAB\n");
+    match kh.lookup("example.com", 22, "ssh-rsa", &[0, 0, 1]) {
+        LookupResult::Match => {}
+        r => panic!("expected Match, got {r:?}"),
+    }
+}

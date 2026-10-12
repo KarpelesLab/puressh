@@ -546,6 +546,10 @@ fn splice(ctrl: UnixStream, chan: OwnedChannelStream, shared: &SharedClient) {
             Err(_) => break,
         }
     }
+    // The exit status can come after EOF (OpenSSH's server sends EOF first
+    // for a command that printed nothing): wait for it, else a failure
+    // would be reported as success.
+    let _ = chan.wait_exit_status(None);
 
     let _ = t_err.join();
 

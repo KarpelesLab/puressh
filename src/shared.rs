@@ -1494,6 +1494,42 @@ impl OwnedChannelStream {
         g.queues.get(&self.channel).and_then(|q| q.exit_status)
     }
 
+    /// Wait until the peer reports how the channel's command ended — its
+    /// `exit-status` or `exit-signal` — or closes the channel, pumping the
+    /// connection meanwhile; then [`Self::exit_status`]. A server may send
+    /// EOF before `exit-status` (OpenSSH does for a command that printed
+    /// nothing), so a reader that stops at EOF must wait for it. `None`
+    /// timeout: until one arrives.
+    pub fn wait_exit_status(&mut self, timeout: Option<Duration>) -> Option<i32> {
+        let deadline = timeout.map(|t| std::time::Instant::now() + t);
+        let _ticket = LockTicket::new(&self.shared.lock_waiters);
+        loop {
+            let mut g = self.shared.inner.lock().ok()?;
+            let q = g.queues.entry(self.channel).or_default();
+            if q.exit_status.is_some() || q.exit_signal.is_some() || q.remote_close {
+                return q.exit_status;
+            }
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return None;
+            }
+            if !g.pumping {
+                g.pumping = true;
+                let (mut g, res) = self.shared.pump_step(g).ok()?;
+                g.pumping = false;
+                for cv in g.notifiers.values() {
+                    cv.notify_one();
+                }
+                if res.is_err() {
+                    // The connection is gone: whatever arrived is all.
+                    return g.queues.get(&self.channel).and_then(|q| q.exit_status);
+                }
+            } else {
+                let cv = notifier_for(&mut g, self.channel);
+                let _ = cv.wait_timeout(g, WAIT_TIMEOUT);
+            }
+        }
+    }
+
     /// Snapshot of the most recent `exit-signal` request name (e.g.
     /// `"TERM"`, `"KILL"`) the peer sent on this channel, if any.
     pub fn exit_signal(&self) -> Option<String> {

@@ -3843,6 +3843,10 @@ fn run_session(
                 Err(_) => break,
             }
         }
+        // EOF can come before the exit status (OpenSSH's server sends it
+        // first for a command that printed nothing): wait for it, as ssh
+        // waits for the channel to close.
+        let _ = stream.wait_exit_status(None);
         out_done.store(true, Ordering::Relaxed);
         let _ = stream_tx.send(stream);
     });

@@ -1534,9 +1534,11 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
 ///
 /// A missing file is silently skipped. Errors: a file that exists but won't
 /// parse, or a `~/.ssh/config` with bad ownership / permissions (see
-/// [`check_user_config_perms`]).
+/// [`check_user_config_perms`]). `Include` paths get their `%` tokens from
+/// `expand`.
 pub fn load_client_config(
     explicit: Option<&Path>,
+    expand: &dyn Fn(&str) -> String,
 ) -> Result<puressh::config::SshClientConfig, String> {
     use puressh::config::SshClientConfig;
     if let Some(path) = explicit {
@@ -1546,7 +1548,8 @@ pub fn load_client_config(
         }
         // File-based load so `Include` directives resolve (each anchored to
         // the including file's own directory). `-F` means this file only.
-        return SshClientConfig::load(path).map_err(|e| format!("{}: {e}", path.display()));
+        return SshClientConfig::load_expanding(path, expand)
+            .map_err(|e| format!("{}: {e}", path.display()));
     }
     // Default search path: user file first (wins), then system file. Each is
     // loaded independently so its `Include`s anchor to that file's directory;
@@ -1556,14 +1559,16 @@ pub fn load_client_config(
         let user = PathBuf::from(home).join(".ssh").join("config");
         if user.exists() {
             check_user_config_perms(&user)?;
-            cfg =
-                Some(SshClientConfig::load(&user).map_err(|e| format!("{}: {e}", user.display()))?);
+            cfg = Some(
+                SshClientConfig::load_expanding(&user, expand)
+                    .map_err(|e| format!("{}: {e}", user.display()))?,
+            );
         }
     }
     let system = Path::new("/etc/ssh/ssh_config");
     if system.exists() {
-        let sys =
-            SshClientConfig::load(system).map_err(|e| format!("{}: {e}", system.display()))?;
+        let sys = SshClientConfig::load_expanding(system, expand)
+            .map_err(|e| format!("{}: {e}", system.display()))?;
         match cfg.as_mut() {
             Some(existing) => existing.append(sys),
             None => cfg = Some(sys),

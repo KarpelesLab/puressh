@@ -189,6 +189,20 @@ pub(crate) fn host_key_verify_by_name(
     }
 }
 
+/// Verify the SSH signature `sig_blob` (`string alg, string sig`) over
+/// `msg` with the public key `key_blob`, using the signature algorithm
+/// `alg` (which, for RSA, pins the hash). For OpenSSH extensions that ask a
+/// server to sign with its keys (`hostkeys-prove-00@openssh.com`).
+#[cfg(feature = "alloc")]
+pub fn verify_signature(
+    alg: &str,
+    key_blob: &[u8],
+    msg: &[u8],
+    sig_blob: &[u8],
+) -> crate::Result<()> {
+    host_key_verify_by_name(alg, key_blob)?.verify(msg, sig_blob)
+}
+
 #[cfg(all(test, feature = "alloc"))]
 mod tests {
     use super::*;

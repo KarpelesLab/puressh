@@ -72,6 +72,25 @@ pub struct Negotiated {
     pub comp_c2s: alloc::string::String,
     /// Server to client compression.
     pub comp_s2c: alloc::string::String,
+    /// For a group exchange the client ran: what it asked for and got.
+    pub gex: Option<GexSizes>,
+}
+
+/// The sizes of a Diffie-Hellman group exchange, as OpenSSH's client logs
+/// them (`SSH2_MSG_KEX_DH_GEX_REQUEST(min<n<max) sent`, `bits set: s/p`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct GexSizes {
+    /// Smallest group asked for, in bits.
+    pub min: u32,
+    /// Preferred group size asked for.
+    pub n: u32,
+    /// Largest group asked for.
+    pub max: u32,
+    /// Size of the group the server chose.
+    pub group_bits: u32,
+    /// Bits set in the client's public value.
+    pub bits_set: u32,
 }
 
 /// `kex-strict-c-v00@openssh.com` — sentinel name advertised by the client

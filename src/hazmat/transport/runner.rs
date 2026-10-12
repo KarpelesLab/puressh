@@ -37,7 +37,7 @@ use purecrypto::dh::{DhGroup, group14, group16, group18};
 use zeroize::{ZeroizeOnDrop, Zeroizing};
 
 use super::ext_info::ExtInfo;
-use super::kex::Negotiated;
+use super::kex::{GexSizes, Negotiated};
 use super::kexinit::{KexInit, NegotiatedOwned, SSH_MSG_NEWKEYS, negotiate};
 use super::packet::PacketCodec;
 
@@ -156,6 +156,26 @@ impl KexBackend {
             _ => Err(Error::Unsupported("KEX algorithm")),
         }
     }
+}
+
+/// OpenSSH's `dh_need` for the negotiated algorithms: the largest, in
+/// bytes, of each direction's cipher security length (3des counts 14 of
+/// its 24 key bytes), block size, IV length and MAC key length.
+fn dh_need(n: &NegotiatedOwned) -> usize {
+    let mut need = 0;
+    for (cipher, mac) in [(&n.cipher_c2s, &n.mac_c2s), (&n.cipher_s2c, &n.mac_s2c)] {
+        if let Some(c) = crate::cipher::ALL
+            .iter()
+            .find(|c| c.name == cipher.as_str())
+        {
+            let seclen = if c.name == "3des-cbc" { 14 } else { c.key_len };
+            need = need.max(seclen).max(c.block_size).max(c.iv_len);
+        }
+        if let Some(m) = crate::mac::ALL.iter().find(|m| m.name == mac.as_str()) {
+            need = need.max(m.key_len);
+        }
+    }
+    need
 }
 
 /// Default GEX group selection (RFC 4419 §3). Honour the `[min, max]`
@@ -294,6 +314,8 @@ pub struct KexRunner {
     /// Becomes false again on the very next packet of any kind from the
     /// peer (whether or not it was the ext-info).
     accept_ext_info_now: bool,
+    /// The sizes of the last group exchange this client ran.
+    gex_sizes: Option<GexSizes>,
 }
 
 impl KexRunner {
@@ -324,6 +346,7 @@ impl KexRunner {
             outbound_ext_info: None,
             peer_ext_info: None,
             accept_ext_info_now: false,
+            gex_sizes: None,
         }
     }
 
@@ -370,6 +393,7 @@ impl KexRunner {
         self.our_advert_bytes = bytes;
         self.peer_advert_bytes = None;
         self.negotiated = None;
+        self.gex_sizes = None;
         self.backend = None;
         self.current_h = None;
         self.current_k = None;
@@ -569,6 +593,7 @@ impl KexRunner {
             mac_s2c: n.mac_s2c.clone(),
             comp_c2s: n.comp_c2s.clone(),
             comp_s2c: n.comp_s2c.clone(),
+            gex: self.gex_sizes,
         })
     }
 
@@ -779,9 +804,16 @@ impl KexRunner {
             }
             KexBackend::Gex | KexBackend::GexSha1 => {
                 // Step 1 of the three-trip: send GEX_REQUEST with our
-                // preferred prime-size range. The actual `e` value is built
+                // preferred prime-size range, sized as OpenSSH's for the
+                // negotiated cipher and MAC. The actual `e` value is built
                 // later, after the server tells us which group it chose.
-                let (s, out) = GexSha256::client_request(GexRequest::default());
+                let request = self
+                    .negotiated
+                    .as_ref()
+                    .map_or_else(GexRequest::default, |n| {
+                        GexRequest::for_strength(dh_need(n))
+                    });
+                let (s, out) = GexSha256::client_request(request);
                 (ClientStateInner::Gex(s), out.payload)
             }
             KexBackend::MlKem768X25519 => {
@@ -1065,6 +1097,14 @@ impl KexRunner {
             _ => return Err(Error::Protocol("GEX_GROUP without prior request")),
         };
         let (state, out) = GexSha256::client_init(state, payload, rng)?;
+        let req = state.request();
+        self.gex_sizes = Some(GexSizes {
+            min: req.min,
+            n: req.n,
+            max: req.max,
+            group_bits: state.group_bits(),
+            bits_set: state.e_bits_set(),
+        });
         self.phase = Phase::GexClientAwaitReply {
             client_state: state,
         };

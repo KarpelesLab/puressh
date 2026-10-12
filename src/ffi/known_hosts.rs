@@ -579,6 +579,7 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
                     global: Vec::new(),
                     host_key_alias: None,
                     revoked: None,
+                    command: None,
                 };
                 Config {
                     host_key_policy: HostKeyPolicy::KnownHosts(policy),

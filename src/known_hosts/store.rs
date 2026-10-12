@@ -511,6 +511,83 @@ impl KnownHosts {
     }
 }
 
+/// What OpenSSH's `UpdateHostKeys` would change in a known_hosts file for
+/// one host, given the host keys the server offered (see
+/// [`KnownHosts::host_keys_update`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HostKeysUpdate {
+    /// Indexes (into the offered keys) of the keys not yet recorded: they
+    /// must be proven by the server before being added.
+    pub new: Vec<usize>,
+    /// Recorded keys for the host the server no longer offers.
+    pub old: Vec<Vec<u8>>,
+    /// Why the file must be left alone (a marker line or a multi-name /
+    /// wildcard entry for the host, or an offered key recorded under
+    /// another name), if it must.
+    pub blocked: Option<&'static str>,
+}
+
+impl KnownHosts {
+    /// Plan an `UpdateHostKeys` change for `host:port` from the plain host
+    /// keys the server offered, as OpenSSH's client_input_hostkeys.
+    pub fn host_keys_update(&self, host: &str, port: u16, offered: &[Vec<u8>]) -> HostKeysUpdate {
+        let mut plan = HostKeysUpdate::default();
+        let mut known = alloc::vec![false; offered.len()];
+        for slot in &self.lines {
+            let Slot::Entry(e) = slot else {
+                continue;
+            };
+            let ours = host_field_matches(&e.host_spec, host, port);
+            if !ours {
+                if offered.contains(&e.key_blob) && e.marker.is_none() {
+                    plan.blocked = Some("host key found under another name");
+                }
+                continue;
+            }
+            let simple = e.marker.is_none()
+                && match &e.host_spec {
+                    HostSpec::Hashed(_) => true,
+                    HostSpec::Patterns(p) => p.len() == 1 && !p[0].contains(['*', '?', '!']),
+                };
+            if !simple {
+                plan.blocked = Some("marker, host list or wildcard entry for the host");
+                continue;
+            }
+            match offered.iter().position(|k| *k == e.key_blob) {
+                Some(i) => known[i] = true,
+                None => plan.old.push(e.key_blob.clone()),
+            }
+        }
+        plan.new = (0..offered.len()).filter(|i| !known[*i]).collect();
+        plan
+    }
+
+    /// Apply an `UpdateHostKeys` change for `host:port`: drop its entries
+    /// for the keys in `remove`, then record `add` (`(key_type, blob)`),
+    /// hashed when `hashed`.
+    pub fn update_host_keys(
+        &mut self,
+        host: &str,
+        port: u16,
+        remove: &[Vec<u8>],
+        add: &[(String, Vec<u8>)],
+        hashed: bool,
+    ) {
+        self.lines.retain(|slot| match slot {
+            Slot::Entry(e) => {
+                !(e.marker.is_none()
+                    && remove.contains(&e.key_blob)
+                    && host_field_matches(&e.host_spec, host, port))
+            }
+            _ => true,
+        });
+        for (key_type, blob) in add {
+            self.add(host, port, key_type, blob, hashed);
+        }
+    }
+}
+
 /// Write `data` to `path` with permissions `0o600` on Unix. The file is
 /// opened with `O_EXCL` (`create_new`) so a pre-existing symlink in the
 /// target directory cannot be used to redirect the write — the open

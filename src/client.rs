@@ -286,7 +286,15 @@ pub struct KnownHostsPolicy {
     pub host_key_alias: Option<String>,
     /// `RevokedHostKeys`: host keys (and certificates) refused outright.
     pub revoked: Option<Arc<crate::known_hosts::RevokedHostKeys>>,
+    /// `KnownHostsCommand`: given the server's key type and key blob, the
+    /// `known_hosts` lines to trust for it (read with the global files), or
+    /// `None` when the command failed.
+    pub command: Option<Arc<KnownHostsCommandFn>>,
 }
+
+/// Callback type for [`KnownHostsPolicy::command`] — `(key_type,
+/// key_blob) → known_hosts text`.
+pub type KnownHostsCommandFn = dyn Fn(&str, &[u8]) -> Option<Vec<u8>> + Send + Sync;
 
 impl KnownHostsPolicy {
     /// Build a policy with the OpenSSH-safe defaults: reject unknown
@@ -301,6 +309,7 @@ impl KnownHostsPolicy {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         }
     }
 }
@@ -612,6 +621,9 @@ pub type ForwardedStreamlocalCallback =
 /// Shows the server's pre-authentication banner
 /// ([`Client::set_banner_handler`]).
 type BannerHandler = Box<dyn Fn(&str) + Send + Sync>;
+
+/// See [`Client::set_global_request_hook`].
+type GlobalRequestHook = Arc<dyn Fn(&str, &[u8]) + Send + Sync>;
 
 /// Type alias for the [`ClientHandlers::on_auth_agent`] callback.
 ///
@@ -1027,6 +1039,8 @@ pub struct Client {
     /// Shows the server's pre-authentication banner
     /// ([`Self::set_banner_handler`]).
     banner_handler: Option<BannerHandler>,
+    /// See [`Self::set_global_request_hook`].
+    global_request_hook: Option<GlobalRequestHook>,
 }
 
 /// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
@@ -1157,6 +1171,7 @@ impl Client {
             host_key_mismatched,
             auth_methods_left: Vec::new(),
             banner_handler: None,
+            global_request_hook: None,
         };
         me.driver.start(Instant::now())?;
         me.drive_handshake()?;
@@ -1185,10 +1200,34 @@ impl Client {
     /// Send whatever reply [`unsolicited_reply`] says the peer is owed for
     /// `ev`; the catch-all arm of every single-channel packet loop.
     pub(crate) fn handle_unsolicited(&mut self, ev: &ChannelEvent) -> Result<()> {
+        self.notify_global_request(ev);
         if let Some(p) = unsolicited_reply(&mut self.conn, ev)? {
             self.write_payload(&p)?;
         }
         Ok(())
+    }
+
+    /// Call `f` with the name and body of each global request the server
+    /// sends that the library does not handle itself — OpenSSH's
+    /// `hostkeys-00@openssh.com` (its host keys, for `UpdateHostKeys`), say.
+    /// Requests wanting a reply are still refused. Stays in effect once the
+    /// connection is shared.
+    pub fn set_global_request_hook(&mut self, f: impl Fn(&str, &[u8]) + Send + Sync + 'static) {
+        self.global_request_hook = Some(Arc::new(f));
+    }
+
+    /// Pass an unhandled server global request to the hook, if any.
+    pub(crate) fn notify_global_request(&self, ev: &ChannelEvent) {
+        if let (
+            Some(f),
+            ChannelEvent::GlobalRequest {
+                request: crate::channel::GlobalRequest::Other { name, raw },
+                ..
+            },
+        ) = (&self.global_request_hook, ev)
+        {
+            f(name, raw);
+        }
     }
 
     /// Override the re-key thresholds (defaults to
@@ -3674,6 +3713,20 @@ pub(crate) fn build_verifier(
     // decision per policy. The signature over `H` is verified against the
     // certificate's EMBEDDED key (built below); the CA signature ties the
     // embedded key to a trusted CA.
+    // `KnownHostsCommand`: the known_hosts lines it prints for this key,
+    // read with the global files.
+    let command_hosts = |blob: &[u8]| -> Option<Arc<KnownHosts>> {
+        let HostKeyPolicy::KnownHosts(kh) = policy else {
+            return None;
+        };
+        let f = kh.command.as_ref()?;
+        let key_type = crate::format::Reader::new(blob)
+            .read_string()
+            .ok()
+            .and_then(|t| core::str::from_utf8(t).ok())?
+            .to_string();
+        f(&key_type, blob).map(|text| Arc::new(KnownHosts::from_bytes(&text)))
+    };
     // A certificate whose CA known_hosts does not list is checked as the
     // plain key it certifies (OpenSSH: "No matching CA found. Retry with
     // plain key").
@@ -3706,6 +3759,7 @@ pub(crate) fn build_verifier(
             // Trust via known_hosts `@cert-authority` (and `@revoked`), in
             // the user file or a global one.
             HostKeyPolicy::KnownHosts(kh) => {
+                let from_command = command_hosts(k_s);
                 let (host, port) = match &kh.host_key_alias {
                     Some(alias) => (alias.as_str(), 22),
                     None => (target_host, target_port),
@@ -3720,12 +3774,20 @@ pub(crate) fn build_verifier(
                 }
                 let store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
                 if store.revokes_cert(host, port, &cert)
-                    || kh.global.iter().any(|g| g.revokes_cert(host, port, &cert))
+                    || kh
+                        .global
+                        .iter()
+                        .chain(from_command.iter())
+                        .any(|g| g.revokes_cert(host, port, &cert))
                 {
                     return Err(Error::HostKeyRejected);
                 }
                 let has_ca = store.has_ca_for(host, port, &cert)
-                    || kh.global.iter().any(|g| g.has_ca_for(host, port, &cert));
+                    || kh
+                        .global
+                        .iter()
+                        .chain(from_command.iter())
+                        .any(|g| g.has_ca_for(host, port, &cert));
                 if !has_ca {
                     plain_from_cert = Some(cert.embedded_pubkey_blob.clone());
                 }
@@ -3735,7 +3797,7 @@ pub(crate) fn build_verifier(
                     Ok(())
                 };
                 if user.is_err()
-                    && kh.global.iter().any(|g| {
+                    && kh.global.iter().chain(from_command.iter()).any(|g| {
                         g.verify_host_cert(host, port, &cert, &ca_algos, now)
                             .is_ok()
                     })
@@ -3766,6 +3828,7 @@ pub(crate) fn build_verifier(
             }
         }
         HostKeyPolicy::KnownHosts(kh) => {
+            let from_command = command_hosts(k_s);
             // known_hosts records the key's type (`ssh-rsa`), not the
             // signature algorithm negotiated for it (`rsa-sha2-512`).
             let key_type: String = crate::format::Reader::new(k_s)
@@ -3786,7 +3849,7 @@ pub(crate) fn build_verifier(
             }
             let mut store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
             let mut lookup = store.lookup(target_host, target_port, &key_type, k_s);
-            for g in &kh.global {
+            for g in kh.global.iter().chain(from_command.iter()) {
                 lookup =
                     combine_lookups(lookup, g.lookup(target_host, target_port, &key_type, k_s));
             }
@@ -4994,6 +5057,7 @@ mod tests {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5043,6 +5107,7 @@ mod tests {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5104,6 +5169,7 @@ mod tests {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5160,6 +5226,7 @@ mod tests {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5216,6 +5283,7 @@ mod tests {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5266,6 +5334,7 @@ mod tests {
             global: Vec::new(),
             host_key_alias: None,
             revoked: None,
+            command: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),

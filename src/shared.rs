@@ -623,8 +623,14 @@ impl SharedClient {
     /// that. Cooperates with stream readers: it only pumps while nobody
     /// else does. Returns the error that ended the connection.
     pub fn pump_until_closed(&self) -> Result<()> {
+        self.pump_while(|| true)
+    }
+
+    /// [`Self::pump_until_closed`], stopping (with `Ok`) once `keep_going`
+    /// says so — checked between steps, every few milliseconds.
+    pub fn pump_while(&self, keep_going: impl Fn() -> bool) -> Result<()> {
         self.set_read_timeout(Some(Duration::from_millis(50)))?;
-        loop {
+        while keep_going() {
             let pumped = {
                 let _ticket = LockTicket::new(&self.lock_waiters);
                 let mut g = lock_or_poison(&self.inner)?;
@@ -649,6 +655,7 @@ impl SharedClient {
                 Duration::from_millis(10)
             });
         }
+        Ok(())
     }
 
     /// Accept the channels the server opens toward the client — the
@@ -938,6 +945,27 @@ impl SharedClient {
             .streamlocal_forward_grants
             .push(socket_path.to_string());
         Ok(())
+    }
+
+    /// Send the global request `name` with body `data`, wanting a reply,
+    /// and return the reply's data (for OpenSSH extensions such as
+    /// `hostkeys-prove-00@openssh.com`).
+    pub fn global_request(&self, name: &str, data: &[u8]) -> Result<Vec<u8>> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g.client.conn.send_global_request(
+            crate::channel::GlobalRequest::Other {
+                name: name.to_string(),
+                raw: data.to_vec(),
+            },
+            true,
+        );
+        g.client.write_payload(&p)?;
+        await_global_reply_under_lock(&mut g)
+    }
+
+    /// The session identifier (the first key exchange's hash).
+    pub fn session_id(&self) -> Result<Vec<u8>> {
+        Ok(lock_or_poison(&self.inner)?.client.session_id().to_vec())
     }
 
     /// Undo a [`Self::request_streamlocal_forward`].
@@ -1443,6 +1471,7 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
     ) {
         g.pending_keepalives = g.pending_keepalives.saturating_sub(1);
     }
+    g.client.notify_global_request(&ev);
     // Peer-initiated opens (we accept none on a SharedClient) and global
     // requests that want a reply (sshd keepalives) are answered here, on
     // the pump path, so no consumer thread has to know about them. Best

@@ -422,11 +422,13 @@ pub struct ClientOptions {
     pub ca_signature_algorithms: Option<Vec<String>>,
     /// `ProxyCommand` — shell command (with `%h`/`%p`/`%r`/`%%` tokens
     /// un-expanded) to spawn and use as the connection transport. The
-    /// literal `none` clears it back to `None`.
+    /// literal `none` (kept, so it wins over later settings as in OpenSSH)
+    /// means no command. Whichever of `ProxyCommand` and `ProxyJump` is
+    /// obtained first is the one set.
     pub proxy_command: Option<String>,
     /// `ProxyJump` — comma-separated `[user@]host[:port]` jump-host chain
-    /// to tunnel the connection through. The literal `none` clears it.
-    /// Takes precedence over [`Self::proxy_command`] when both are set.
+    /// to tunnel the connection through. The literal `none` (kept, like
+    /// [`Self::proxy_command`]'s) means no jump host.
     pub proxy_jump: Option<String>,
     /// `Compression` (yes/no). `Some(true)` advertises
     /// `zlib@openssh.com` ahead of `none`. Requires the `compress`
@@ -505,6 +507,14 @@ pub struct ClientOptions {
     pub escape_char: Option<Option<u8>>,
     /// `RemoteCommand` (raw; `none` means no command).
     pub remote_command: Option<String>,
+    /// `KnownHostsCommand` (raw; `none` means none): prints known_hosts
+    /// lines for the server's key.
+    pub known_hosts_command: Option<String>,
+    /// `UpdateHostKeys`: `yes`, `no` or `ask` (unset: OpenSSH's default,
+    /// yes unless UserKnownHostsFile names other files).
+    pub update_host_keys: Option<String>,
+    /// `Tag`: the name `Match tagged` compares (`ssh -P` sets it too).
+    pub tag: Option<String>,
     /// `LocalCommand`: run locally once connected, when
     /// [`Self::permit_local_command`] (raw; `none` means none).
     pub local_command: Option<String>,
@@ -598,6 +608,23 @@ impl SshClientConfig {
     #[cfg(feature = "std")]
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ConfigError> {
         let lines = super::include::tokenize_file_with_includes(path.as_ref(), 0)?;
+        let blocks = parse_blocks(lines)?;
+        Ok(SshClientConfig {
+            blocks,
+            enable_match_exec: false,
+        })
+    }
+
+    /// [`Self::load`], with each `Include` path's `%` tokens expanded by
+    /// `expand` (OpenSSH expands them for the connection being made: `%h`,
+    /// `%u`, …).
+    #[cfg(feature = "std")]
+    pub fn load_expanding<P: AsRef<std::path::Path>>(
+        path: P,
+        expand: &dyn Fn(&str) -> String,
+    ) -> Result<Self, ConfigError> {
+        let lines =
+            super::include::tokenize_file_with_includes_expanding(path.as_ref(), 0, expand)?;
         let blocks = parse_blocks(lines)?;
         Ok(SshClientConfig {
             blocks,
@@ -722,10 +749,9 @@ impl SshClientConfig {
                 Block::Host { patterns, .. } => host_matches(patterns, ctx.host),
                 Block::Match { conditions, .. } => {
                     !conditions.is_empty()
-                        && conditions.iter().all(|c| match c {
-                            MatchCondition::Exec(cmd) => exec(cmd, &out),
-                            other => evaluate(other, &ctx, ExecPolicy::Deny),
-                        })
+                        && conditions
+                            .iter()
+                            .all(|c| eval_with_options(c, &ctx, &out, exec))
                 }
             };
             if matches {
@@ -733,6 +759,26 @@ impl SshClientConfig {
             }
         }
         out
+    }
+}
+
+/// Evaluate one `Match` criterion with the options matched so far: `exec`
+/// runs through the caller, `tagged` also sees a `Tag` set by an earlier
+/// block.
+fn eval_with_options(
+    c: &MatchCondition,
+    ctx: &MatchContext<'_>,
+    so_far: &ClientOptions,
+    exec: &mut dyn FnMut(&str, &ClientOptions) -> bool,
+) -> bool {
+    match c {
+        MatchCondition::Exec(cmd) => exec(cmd, so_far),
+        MatchCondition::Not(inner) => !eval_with_options(inner, ctx, so_far, exec),
+        MatchCondition::Tagged(patterns) => {
+            let tag = ctx.tag.or(so_far.tag.as_deref()).unwrap_or("");
+            crate::config::host_matches(patterns, tag)
+        }
+        other => evaluate(other, ctx, ExecPolicy::Deny),
     }
 }
 
@@ -749,11 +795,39 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
     // block open before it is open again (OpenSSH), as a fresh block after
     // the included ones.
     let mut at_include: Vec<usize> = Vec::new();
+    // The conditions of the blocks enclosing each `Include`: as in OpenSSH,
+    // an included file is only read where its `Include` applies, so each
+    // block it opens carries them too (a `Host` block evaluates as `Match
+    // host`).
+    let mut guards: Vec<Vec<MatchCondition>> = Vec::new();
     for line in lines {
         let mut apply = || -> Result<(), ConfigError> {
+            let guard: Vec<MatchCondition> = guards.iter().flatten().cloned().collect();
             match line.keyword.as_str() {
-                super::parser::INCLUDE_BEGIN => at_include.push(blocks.len()),
+                super::parser::INCLUDE_BEGIN => {
+                    at_include.push(blocks.len());
+                    let enclosing = match blocks.last() {
+                        Some(Block::Host { patterns, .. })
+                            if !matches!(patterns.as_slice(), [HostPattern::Any]) =>
+                        {
+                            vec![MatchCondition::Host(patterns.clone())]
+                        }
+                        Some(Block::Match { conditions, .. }) => conditions.clone(),
+                        _ => Vec::new(),
+                    };
+                    // A Match block's conditions already hold the outer guards.
+                    let own: Vec<MatchCondition> = enclosing
+                        .into_iter()
+                        .skip(if matches!(blocks.last(), Some(Block::Match { .. })) {
+                            guard.len()
+                        } else {
+                            0
+                        })
+                        .collect();
+                    guards.push(own);
+                }
                 super::parser::INCLUDE_END => {
+                    guards.pop();
                     let saved = at_include.pop().unwrap_or(blocks.len());
                     if saved != blocks.len() {
                         let reopened = match &blocks[saved - 1] {
@@ -777,13 +851,24 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
                             msg: "Host requires at least one pattern".into(),
                         });
                     }
-                    blocks.push(Block::Host {
-                        patterns: HostPattern::parse_all(&line.args),
-                        opts: ClientOptions::default(),
-                    });
+                    let patterns = HostPattern::parse_all(&line.args);
+                    if guard.is_empty() {
+                        blocks.push(Block::Host {
+                            patterns,
+                            opts: ClientOptions::default(),
+                        });
+                    } else {
+                        let mut conditions = guard;
+                        conditions.push(MatchCondition::Host(patterns));
+                        blocks.push(Block::Match {
+                            conditions,
+                            opts: ClientOptions::default(),
+                        });
+                    }
                 }
                 "match" => {
-                    let conditions = parse_match_line(&line.args, line.line_no)?;
+                    let mut conditions = guard;
+                    conditions.extend(parse_match_line(&line.args, line.line_no)?);
                     blocks.push(Block::Match {
                         conditions,
                         opts: ClientOptions::default(),
@@ -1007,18 +1092,25 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     msg: "ProxyCommand requires a command (or 'none')".into(),
                 });
             }
-            if args.len() == 1 && args[0].eq_ignore_ascii_case("none") {
-                opts.proxy_command = None;
-            } else {
-                opts.proxy_command = Some(line.rest.clone());
+            // First obtained wins, and a ProxyJump obtained first excludes
+            // it (OpenSSH).
+            if opts.proxy_command.is_none() && opts.proxy_jump.is_none() {
+                opts.proxy_command =
+                    Some(if args.len() == 1 && args[0].eq_ignore_ascii_case("none") {
+                        "none".to_string()
+                    } else {
+                        line.rest.clone()
+                    });
             }
         }
         "proxyjump" => {
             let v = one_arg(line)?;
-            if v.eq_ignore_ascii_case("none") {
-                opts.proxy_jump = None;
-            } else {
-                opts.proxy_jump = Some(v);
+            if opts.proxy_jump.is_none() && opts.proxy_command.is_none() {
+                opts.proxy_jump = Some(if v.eq_ignore_ascii_case("none") {
+                    "none".to_string()
+                } else {
+                    v
+                });
             }
         }
         "compression" => {
@@ -1270,6 +1362,35 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     msg: format!("expected a character, ^X or none, got {v:?}"),
                 })?);
         }
+        "knownhostscommand" => {
+            if opts.known_hosts_command.is_none() {
+                opts.known_hosts_command = Some(line.rest.clone());
+            }
+        }
+        "updatehostkeys" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            let v = match v.as_str() {
+                "yes" | "true" => "yes",
+                "no" | "false" => "no",
+                "ask" => "ask",
+                _ => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected yes/no/ask, got {v:?}"),
+                    });
+                }
+            };
+            if opts.update_host_keys.is_none() {
+                opts.update_host_keys = Some(v.to_string());
+            }
+        }
+        "tag" => {
+            let v = one_arg(line)?;
+            if opts.tag.is_none() {
+                opts.tag = Some(v);
+            }
+        }
         "localcommand" => {
             // The rest of the line, verbatim.
             if opts.local_command.is_none() {
@@ -1403,7 +1524,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("HostbasedAuthentication", &["*"], ""),
     ("IPQoS", &["*"], ""),
     ("KbdInteractiveDevices", &["*"], ""),
-    ("KnownHostsCommand", &["*"], ""),
     ("LogVerbose", &["*"], ""),
     ("NoHostAuthenticationForLocalhost", &["*"], ""),
     (
@@ -1425,14 +1545,12 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("StreamLocalBindMask", &["*"], ""),
     ("StreamLocalBindUnlink", &["*"], ""),
     ("SyslogFacility", &["*"], ""),
-    ("Tag", &["*"], ""),
     (
         "Tunnel",
         &["no", "false"],
         "tun/tap forwarding is not supported",
     ),
     ("TunnelDevice", &["*"], ""),
-    ("UpdateHostKeys", &["*"], ""),
     ("UseKeychain", &["*"], ""),
     ("VerifyHostKeyDNS", &["*"], ""),
     ("VisualHostKey", &["*"], ""),
@@ -1502,8 +1620,13 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(host_key_algorithms);
     take_scalar!(pubkey_accepted_algorithms);
     take_scalar!(ca_signature_algorithms);
-    take_scalar!(proxy_command);
-    take_scalar!(proxy_jump);
+    // Whichever of the two was obtained first excludes the other.
+    if dst.proxy_jump.is_none() {
+        take_scalar!(proxy_command);
+    }
+    if dst.proxy_command.is_none() {
+        take_scalar!(proxy_jump);
+    }
     take_scalar!(compression);
     take_scalar!(connect_timeout);
     take_scalar!(server_alive_interval);
@@ -1530,6 +1653,9 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(escape_char);
     take_scalar!(remote_command);
     take_scalar!(local_command);
+    take_scalar!(tag);
+    take_scalar!(update_host_keys);
+    take_scalar!(known_hosts_command);
     take_scalar!(permit_local_command);
     take_scalar!(session_type);
     take_scalar!(stdin_null);
@@ -2194,7 +2320,46 @@ Host gw
   ProxyCommand none
 ";
         let cfg = SshClientConfig::parse(src).unwrap();
-        assert_eq!(cfg.lookup("gw").proxy_command, None);
+        assert_eq!(cfg.lookup("gw").proxy_command.as_deref(), Some("none"));
+    }
+
+    #[test]
+    fn match_criteria_take_values_negation_and_tags() {
+        let src = "\
+Match host=a !user nobody
+  Port 1001
+Match host=b tagged t1
+  Port 1002
+Match host=b !tagged t1
+  Port 1003
+";
+        let cfg = SshClientConfig::parse(src).unwrap();
+        let ctx = |host| MatchContext {
+            host,
+            user: Some("me"),
+            ..Default::default()
+        };
+        assert_eq!(cfg.lookup_with(ctx("a")).port, Some(1001));
+        assert_eq!(cfg.lookup_with(ctx("b")).port, Some(1003));
+        let mut tagged = ctx("b");
+        tagged.tag = Some("t1");
+        assert_eq!(cfg.lookup_with(tagged).port, Some(1002));
+    }
+
+    #[test]
+    fn proxy_jump_and_proxy_command_first_obtained_wins() {
+        let cfg = SshClientConfig::parse("ProxyJump j\nProxyCommand c\n").unwrap();
+        let eff = cfg.lookup("h");
+        assert_eq!(
+            (eff.proxy_jump.as_deref(), eff.proxy_command),
+            (Some("j"), None)
+        );
+        let cfg = SshClientConfig::parse("ProxyCommand none\nProxyJump j\n").unwrap();
+        let eff = cfg.lookup("h");
+        assert_eq!(
+            (eff.proxy_jump, eff.proxy_command.as_deref()),
+            (None, Some("none"))
+        );
     }
 
     #[test]
@@ -2231,7 +2396,7 @@ Host target
   ProxyJump none
 ";
         let cfg = SshClientConfig::parse(src).unwrap();
-        assert_eq!(cfg.lookup("target").proxy_jump, None);
+        assert_eq!(cfg.lookup("target").proxy_jump.as_deref(), Some("none"));
     }
 
     #[test]
@@ -3184,6 +3349,38 @@ Match host gw
             assert_eq!(eff.port, Some(2001));
             assert_eq!(eff.user.as_deref(), Some("u2"));
             assert_eq!(eff.identity_files, vec!["/tmp/k3"]);
+        }
+
+        #[test]
+        fn include_inside_a_block_applies_only_where_the_block_does() {
+            // As OpenSSH: an included file is read only where its Include
+            // applies, so its blocks carry the enclosing condition too.
+            let dir = TempDir::new("cond");
+            dir.write("inc.cfg", "Host *\n  Port 2222\nMatch all\n  User inc\n");
+            let root = dir.write(
+                "root.cfg",
+                &format!(
+                    "Host gw\n  Include {}/inc.cfg\nHost *\n  Port 22\n",
+                    dir.path.display()
+                ),
+            );
+            let cfg = SshClientConfig::load(&root).unwrap();
+            assert_eq!(cfg.lookup("gw").port, Some(2222));
+            assert_eq!(cfg.lookup("gw").user.as_deref(), Some("inc"));
+            assert_eq!(cfg.lookup("other").port, Some(22));
+            assert_eq!(cfg.lookup("other").user, None);
+        }
+
+        #[test]
+        fn include_paths_take_tokens_and_variables() {
+            let dir = TempDir::new("tokens");
+            dir.write("inc.gw", "Port 2022\n");
+            let root = dir.write(
+                "root.cfg",
+                &format!("Include {}/inc.%h\n", dir.path.display()),
+            );
+            let cfg = SshClientConfig::load_expanding(&root, &|p| p.replace("%h", "gw")).unwrap();
+            assert_eq!(cfg.lookup("gw").port, Some(2022));
         }
 
         #[test]

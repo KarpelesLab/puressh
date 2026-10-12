@@ -40,4 +40,4 @@ mod tests;
 
 pub use format::{Entry, HostSpec, Marker, format_entry};
 pub use revoked::RevokedHostKeys;
-pub use store::{KnownHosts, LookupResult};
+pub use store::{HostKeysUpdate, KnownHosts, LookupResult};

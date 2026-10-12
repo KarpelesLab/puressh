@@ -321,6 +321,29 @@ pub struct GexRequest {
     pub max: u32,
 }
 
+impl GexRequest {
+    /// OpenSSH's request for a connection whose symmetric algorithms need
+    /// `need_bytes` of security (the largest cipher security length, block,
+    /// IV or MAC key): 2048..=8192, preferring `dh_estimate(need * 8)`.
+    pub fn for_strength(need_bytes: usize) -> Self {
+        let bits = need_bytes * 8;
+        let n = if bits <= 112 {
+            2048
+        } else if bits <= 128 {
+            3072
+        } else if bits <= 192 {
+            7680
+        } else {
+            8192
+        };
+        GexRequest {
+            min: 2048,
+            n,
+            max: 8192,
+        }
+    }
+}
+
 impl Default for GexRequest {
     fn default() -> Self {
         // OpenSSH defaults: 2048..=8192, preferring 8192.
@@ -341,6 +364,30 @@ pub struct GexClientState {
     g_bytes: Vec<u8>,
     secret: Option<DhPrivateKey>,
     e_mag: Vec<u8>,
+}
+
+impl GexClientState {
+    /// The `(min, n, max)` sent in `SSH_MSG_KEX_DH_GEX_REQUEST`.
+    pub fn request(&self) -> GexRequest {
+        self.request
+    }
+
+    /// The size in bits of the group the server chose (0 before it did).
+    pub fn group_bits(&self) -> u32 {
+        let p = self.p_bytes.iter().skip_while(|b| **b == 0);
+        let lead = p.clone().next().copied().unwrap_or(0);
+        let n = p.count() as u32;
+        if n == 0 {
+            0
+        } else {
+            (n - 1) * 8 + (8 - lead.leading_zeros())
+        }
+    }
+
+    /// How many bits are set in our public value `e` (OpenSSH logs it).
+    pub fn e_bits_set(&self) -> u32 {
+        self.e_mag.iter().map(|b| b.count_ones()).sum()
+    }
 }
 
 impl GexSha256 {

@@ -645,3 +645,39 @@ fn rsa_entry_under_a_signature_name_is_an_rsa_key() {
         r => panic!("expected Match, got {r:?}"),
     }
 }
+
+#[test]
+fn host_keys_update_plans_new_and_obsolete_keys() {
+    let (a, b, c) = (ed25519_blob(1), ed25519_blob(2), ed25519_blob(3));
+    let mut kh = KnownHosts::new();
+    kh.add("h", 22, "ssh-ed25519", &a, false);
+    kh.add("h", 22, "ssh-ed25519", &b, false);
+    kh.add("other", 22, "ssh-ed25519", &c, false);
+    // The server now offers a and a new key d: d is new, b is obsolete.
+    let d = ed25519_blob(4);
+    let plan = kh.host_keys_update("h", 22, &[a.clone(), d.clone()]);
+    assert_eq!(plan.new, vec![1]);
+    assert_eq!(plan.old, vec![b.clone()]);
+    assert_eq!(plan.blocked, None);
+    kh.update_host_keys(
+        "h",
+        22,
+        &plan.old,
+        &[("ssh-ed25519".into(), d.clone())],
+        false,
+    );
+    assert!(matches!(
+        kh.lookup("h", 22, "ssh-ed25519", &d),
+        LookupResult::Match
+    ));
+    assert!(matches!(
+        kh.lookup("h", 22, "ssh-ed25519", &b),
+        LookupResult::Mismatch { .. }
+    ));
+    assert!(matches!(
+        kh.lookup("other", 22, "ssh-ed25519", &c),
+        LookupResult::Match
+    ));
+    // A key the server offers that is recorded under another name: hands off.
+    assert!(kh.host_keys_update("h", 22, &[c]).blocked.is_some());
+}

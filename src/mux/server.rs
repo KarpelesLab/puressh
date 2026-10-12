@@ -233,14 +233,26 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         reaper_loop(persist, reaper_state, &reaper_path);
     });
 
-    // Block here until something flips `shutdown` — the reaper (Seconds linger)
-    // or an `-O exit` handler. Then make sure the socket is gone and join.
+    // Keep the connection read even while no client runs a session: the
+    // server's channel opens (`-R`, `-A`, `-X`) and keepalives arrive at any
+    // time. Its end (the server went away) ends the master too.
+    let pump_shared = shared.clone();
+    let pump_state = state.clone();
+    let pump = thread::spawn(move || {
+        let _ = pump_shared.pump_while(|| !pump_state.shutdown.load(Ordering::SeqCst));
+        pump_state.shutdown.store(true, Ordering::SeqCst);
+    });
+
+    // Block here until something flips `shutdown` — the reaper (Seconds linger),
+    // an `-O exit` handler, or the connection ending. Then make sure the
+    // socket is gone and join.
     while !state.shutdown.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(100));
     }
     let _ = fs::remove_file(&cfg.control_path);
     let _ = accept.join();
     let _ = reaper.join();
+    let _ = pump.join();
     Ok(())
 }
 
@@ -581,7 +593,9 @@ fn splice(ctrl: UnixStream, chan: OwnedChannelStream, shared: &SharedClient) {
         if let Some(sig) = chan.exit_signal() {
             let _ = write_frame(&mut *g, &Frame::ExitSignal { name: sig });
         }
-        let code = chan.exit_status().unwrap_or(0);
+        // No status (the server closed the channel, a ChannelTimeout say):
+        // 255, as OpenSSH's client exits.
+        let code = chan.exit_status().unwrap_or(255);
         let _ = write_frame(&mut *g, &Frame::ExitStatus { code: code as u32 });
         let _ = write_frame(&mut *g, &Frame::Eof);
         let _ = g.flush();

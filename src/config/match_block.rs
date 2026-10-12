@@ -216,6 +216,13 @@ pub enum MatchCondition {
     /// `Match final` — fires only on the final pass
     /// ([`MatchContext::final_pass`]).
     Final,
+    /// `Match tagged <pattern-list>` — **client-side**: the `Tag` set with
+    /// `ssh -P` or the configuration ([`MatchContext::tag`]); no tag is
+    /// the empty string.
+    Tagged(Vec<HostPattern>),
+    /// `Match !criterion …` — **client-side**: the criterion does not
+    /// match.
+    Not(alloc::boxed::Box<MatchCondition>),
 }
 
 /// Inputs the resolver supplies to evaluate `Match` criteria.
@@ -258,6 +265,8 @@ pub struct MatchContext<'a> {
     /// canonicalisation, or because a `Match final` asked for one): `Match
     /// final` matches.
     pub final_pass: bool,
+    /// **Client-side**: the tag `Match tagged` compares (`ssh -P`).
+    pub tag: Option<&'a str>,
 }
 
 impl MatchContext<'_> {
@@ -306,10 +315,59 @@ fn parse_match_line_impl(
     side: MatchSide,
 ) -> Result<Vec<MatchCondition>, ConfigError> {
     let server = side == MatchSide::Server;
+    // `criterion=value` is `criterion value` (OpenSSH's attrib=arg form).
+    let with_value: &[&str] = if server {
+        &[
+            "user",
+            "group",
+            "host",
+            "address",
+            "localaddress",
+            "localport",
+            "rdomain",
+            "version",
+        ]
+    } else {
+        &[
+            "host",
+            "originalhost",
+            "user",
+            "localuser",
+            "localnetwork",
+            "version",
+            "tagged",
+            "command",
+            "exec",
+        ]
+    };
+    let mut split: Vec<String> = Vec::with_capacity(args.len());
+    for a in args {
+        match a.split_once('=') {
+            Some((k, v))
+                if with_value
+                    .iter()
+                    .any(|w| k.trim_start_matches('!').eq_ignore_ascii_case(w)) =>
+            {
+                split.push(k.to_string());
+                split.push(v.to_string());
+            }
+            _ => split.push(a.clone()),
+        }
+    }
+    let args = &split[..];
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        let kw = args[i].to_ascii_lowercase();
+        // `!criterion`: the criterion must not match (client side).
+        let negate = !server && args[i].starts_with('!');
+        let before = out.len();
+        let kw = args[i].trim_start_matches('!').to_ascii_lowercase();
+        let negated_arm = |out: &mut Vec<MatchCondition>| {
+            if negate && out.len() == before + 1 {
+                let c = out.pop().expect("just pushed");
+                out.push(MatchCondition::Not(alloc::boxed::Box::new(c)));
+            }
+        };
         match kw.as_str() {
             "all" => {
                 out.push(MatchCondition::All);
@@ -398,6 +456,10 @@ fn parse_match_line_impl(
                 out.push(MatchCondition::Exec(args[i + 1].clone()));
                 i += 2;
             }
+            "tagged" if !server => {
+                let patterns = take_pattern_list(args, &mut i, &kw, line_no)?;
+                out.push(MatchCondition::Tagged(patterns));
+            }
             other => {
                 return Err(ConfigError::BadValue {
                     line: line_no,
@@ -406,6 +468,7 @@ fn parse_match_line_impl(
                 });
             }
         }
+        negated_arm(&mut out);
     }
     if out.is_empty() {
         return Err(ConfigError::BadValue {
@@ -513,6 +576,8 @@ pub fn evaluate(cond: &MatchCondition, ctx: &MatchContext<'_>, policy: ExecPolic
             ExecPolicy::Deny => false,
             ExecPolicy::Allow => run_exec_match(cmd),
         },
+        MatchCondition::Tagged(patterns) => host_matches(patterns, ctx.tag.unwrap_or("")),
+        MatchCondition::Not(c) => !evaluate(c, ctx, policy),
     }
 }
 

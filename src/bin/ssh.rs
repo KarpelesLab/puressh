@@ -94,6 +94,8 @@ struct Cli {
     port: Option<u16>,
     identities: Vec<String>,
     cli_user: Option<String>,
+    /// `-P tag` (`Match tagged`).
+    tag: Option<String>,
     /// `cli_user` came from `-o User=…`, which (unlike `-l` and `user@`)
     /// takes %tokens as the configuration's User does.
     user_from_o: bool,
@@ -289,6 +291,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut command_args: Vec<String> = Vec::new();
     let mut first_user: Option<String> = None;
     let mut user_from_o = false;
+    let mut tag: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -379,7 +382,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     'E' => log_file = Some(v),
                     'F' => config_file = Some(PathBuf::from(v)),
                     'I' => return Err("-I: PKCS#11 tokens are not supported".into()),
-                    'J' => proxy_jump = Some(v),
+                    // Also a first-obtained `ProxyJump` (so it excludes a
+                    // configured ProxyCommand, as OpenSSH's).
+                    'J' => {
+                        extra_o.push(format!("ProxyJump {v}"));
+                        proxy_jump = Some(v);
+                    }
                     'L' => locals.push(parse_local_forward(&v)?),
                     // `-O <cmd>`: control a running ControlMaster. We accept
                     // the multiplexing control commands puressh's mux master
@@ -393,9 +401,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                             ));
                         }
                     },
-                    // `-P tag` (the `Tag` keyword) only selects config
-                    // blocks via `Match tagged`; not supported, ignored.
-                    'P' => {}
+                    // `-P tag`: the `Tag` that `Match tagged` compares.
+                    'P' => {
+                        extra_o.push(format!("Tag {v}"));
+                        tag.get_or_insert(v);
+                    }
                     'Q' => query = Some(v),
                     'R' => remotes.push(parse_remote_forward(&v)?),
                     'S' => extra_o.push(format!("ControlPath {v}")),
@@ -470,6 +480,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             identities,
             cli_user,
             user_from_o,
+            tag,
             strict,
             known_hosts_path,
             hash_known_hosts,
@@ -525,6 +536,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         identities,
         cli_user,
         user_from_o,
+        tag,
         strict,
         known_hosts_path,
         hash_known_hosts,
@@ -656,6 +668,27 @@ fn apply_extra_o(
     o.merge_lower(cfg_block);
     *cfg_block = o;
     Ok(())
+}
+
+/// The agent's key for the identity `path` — the public key in `path`
+/// itself or in `path.pub` — unless `have` already offers it.
+#[cfg(unix)]
+fn agent_identity_for(path: &str, have: &[ClientCredential]) -> Option<ClientCredential> {
+    let blob_of = |p: &str| {
+        let text = std::fs::read_to_string(p).ok()?;
+        let b64 = text.split_whitespace().nth(1)?;
+        purecrypto::der::base64_decode(b64).ok()
+    };
+    let blob = blob_of(path).or_else(|| blob_of(&format!("{path}.pub")))?;
+    let offered = have.iter().any(|c| match c {
+        ClientCredential::PublicKey(k) => k.public_blob() == blob,
+        _ => false,
+    });
+    if offered {
+        return None;
+    }
+    let signer = common::agent_signer_for(&blob)?;
+    Some(ClientCredential::PublicKey(Box::new(signer)))
 }
 
 /// One parsed `ProxyJump` hop: `[user@]host[:port]`.
@@ -851,14 +884,33 @@ fn collect_credentials(
         .cloned()
         .chain(cfg_block.identity_files.iter().map(|p| expand_tilde(p)));
     for id_path in explicit {
-        match common::identity_credential(&id_path, false, batch) {
+        let loaded = match common::identity_credential(&id_path, false, batch) {
             Ok(Some(c)) => {
                 vlog(1, &format!("identity {id_path}: loaded"));
                 credentials.push(c);
+                true
             }
-            Ok(None) => {}
-            Err(e) => warn!("warning: {e}"),
+            Ok(None) => false,
+            Err(e) => {
+                // A public key (`-i key.pub`) whose private half the agent
+                // holds is used through the agent, as OpenSSH does.
+                #[cfg(unix)]
+                if let Some(c) = agent_identity_for(&id_path, &credentials) {
+                    vlog(1, &format!("identity {id_path}: agent key"));
+                    credentials.push(c);
+                    continue;
+                }
+                warn!("warning: {e}");
+                continue;
+            }
+        };
+        #[cfg(unix)]
+        if !loaded && let Some(c) = agent_identity_for(&id_path, &credentials) {
+            vlog(1, &format!("identity {id_path}: agent key"));
+            credentials.push(c);
         }
+        #[cfg(not(unix))]
+        let _ = loaded;
     }
     // Like OpenSSH, the default identities are used only when no -i or
     // IdentityFile names one (IdentitiesOnly restricts agent keys, not these).
@@ -948,6 +1000,17 @@ fn log_kex(n: &puressh::hazmat::transport::Negotiated) {
             n.comp_c2s
         ),
     );
+    if let Some(g) = n.gex {
+        vlog(
+            1,
+            &format!(
+                "SSH2_MSG_KEX_DH_GEX_REQUEST({}<{}<{}) sent",
+                g.min, g.n, g.max
+            ),
+        );
+        vlog(1, "SSH2_MSG_KEX_DH_GEX_GROUP received");
+        vlog(2, &format!("bits set: {}/{}", g.bits_set, g.group_bits));
+    }
     vlog(1, "SSH2_MSG_NEWKEYS sent");
     vlog(1, "SSH2_MSG_NEWKEYS received");
 }
@@ -1463,6 +1526,7 @@ fn final_config_pass(
     ctx.local_user = Some(local_user);
     ctx.canonical = true;
     ctx.final_pass = true;
+    ctx.tag = cli.tag.as_deref();
     let earlier = cfg_block.clone();
     let fin = ssh_cfg.lookup_with_exec(ctx, &mut |cmd, so_far| {
         let mut opts = earlier.clone();
@@ -1885,10 +1949,35 @@ fn print_config(
             )
         });
     out.push(format!("userknownhostsfile {known_hosts}"));
-    if let Some(p) = cli.proxy_jump.as_ref().or(c.proxy_jump.as_ref()) {
-        out.push(format!("proxyjump {p}"));
+    let not_none = |p: &&String| !p.eq_ignore_ascii_case("none");
+    if let Some(p) = cli
+        .proxy_jump
+        .as_ref()
+        .or(c.proxy_jump.as_ref())
+        .filter(not_none)
+    {
+        // As OpenSSH keeps them: `[user@]host[:port]` (ssh:// URIs too).
+        let hops: Vec<String> = match parse_jump_hops(p) {
+            Ok(hops) => hops
+                .iter()
+                .map(|h| {
+                    let mut s = String::new();
+                    if let Some(u) = &h.user {
+                        s.push_str(u);
+                        s.push('@');
+                    }
+                    s.push_str(&h.host);
+                    if let Some(port) = h.port {
+                        s.push_str(&format!(":{port}"));
+                    }
+                    s
+                })
+                .collect(),
+            Err(_) => vec![p.clone()],
+        };
+        out.push(format!("proxyjump {}", hops.join(",")));
     }
-    if let Some(p) = &c.proxy_command {
+    if let Some(p) = c.proxy_command.as_ref().filter(not_none) {
         out.push(format!("proxycommand {p}"));
     }
     if let Some(p) = &c.control_path {
@@ -1902,6 +1991,9 @@ fn print_config(
     }
     if let Some(r) = &c.remote_command {
         out.push(format!("remotecommand {r}"));
+    }
+    if let Some(t) = &c.tag {
+        out.push(format!("tag {t}"));
     }
     match &c.identity_agent {
         Some(puressh::config::IdentityAgent::Path(p)) => out.push(format!("identityagent {p}")),
@@ -2102,7 +2194,27 @@ fn run() -> Result<i32, String> {
     // Resolve the ssh_config block matching the user-typed host name. CLI
     // values then take precedence over the block; the block over built-in
     // defaults (OpenSSH's documented order).
-    let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
+    // `Include` paths take the %tokens known before the configuration is
+    // read: the destination as given, the command line's user and port.
+    let include_tokens = {
+        let user = cli
+            .cli_user
+            .clone()
+            .or_else(|| cli.user_in_host.clone())
+            .or_else(common::local_user_name)
+            .unwrap_or_default();
+        Tokens::new(
+            &cli.host,
+            &cli.host,
+            cli.port.unwrap_or(22),
+            &user,
+            &puressh::config::ClientOptions::default(),
+            &cli,
+        )
+    };
+    let ssh_cfg = common::load_client_config(cli.config_file.as_deref(), &|p: &str| {
+        include_tokens.expand(p)
+    })?;
     // `Match user` / `localuser` see the user named on the command line
     // (else the local one), as OpenSSH's first pass does.
     // As OpenSSH, values from the command line that end up in %tokens are
@@ -2119,6 +2231,29 @@ fn run() -> Result<i32, String> {
     if !valid_hostname(&cli.host) {
         return Err("hostname contains invalid characters".into());
     }
+    // Jump hosts from the command line (-J, -o ProxyJump) are checked too
+    // (those from a file are not).
+    let jump_ok = |spec: &str| {
+        spec.eq_ignore_ascii_case("none")
+            || parse_jump_hops(spec).is_ok_and(|hops| {
+                hops.iter()
+                    .all(|h| valid_hostname(&h.host) && h.user.as_deref().is_none_or(valid_ruser))
+            })
+    };
+    if let Some(j) = &cli.proxy_jump
+        && !jump_ok(j)
+    {
+        return Err("Invalid -J argument".into());
+    }
+    for o in &cli.extra_o {
+        let o = o.trim_start();
+        if o.len() > 9 && o[..9].eq_ignore_ascii_case("proxyjump") {
+            let v = o[9..].trim_start_matches(['=', ' ', '\t']).trim();
+            if !jump_ok(v) {
+                return Err("Invalid ProxyJump argument".into());
+            }
+        }
+    }
     let local_user = common::local_user_name().unwrap_or_default();
     let named_user = cli
         .cli_user
@@ -2130,6 +2265,7 @@ fn run() -> Result<i32, String> {
     ctx.original_host = Some(&cli.host);
     ctx.user = Some(&named_user);
     ctx.local_user = Some(&local_user);
+    ctx.tag = cli.tag.as_deref();
     let mut cfg_block =
         ssh_cfg.lookup_with_exec(ctx, &mut |cmd, so_far| match_exec(cmd, so_far, &cli, false));
     // `-o KEY=VALUE` overlays the matched block at the highest precedence,
@@ -2340,7 +2476,24 @@ fn run() -> Result<i32, String> {
         .iter()
         .map(|p| tokens.expand_path(p))
         .collect();
-    let cfg = config_for_host(&cfg_block, &cli)?;
+    let mut cfg = config_for_host(&cfg_block, &cli)?;
+    // KnownHostsCommand: its output joins the global known_hosts files.
+    if let Some(template) = cfg_block
+        .known_hosts_command
+        .clone()
+        .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none"))
+        && let puressh::client::HostKeyPolicy::KnownHosts(kh) = &mut cfg.host_key_policy
+    {
+        let tokens = tokens.clone();
+        let looked_up = match &cfg_block.host_key_alias {
+            Some(a) => a.clone(),
+            None if port == 22 => connect_host.clone(),
+            None => format!("[{connect_host}]:{port}"),
+        };
+        kh.command = Some(Arc::new(move |key_type: &str, blob: &[u8]| {
+            known_hosts_command(&template, &tokens, &looked_up, key_type, blob)
+        }));
+    }
 
     // ---- Connection multiplexing (ControlMaster/ControlPath/ControlPersist) ----
     // Resolve the control settings once. The honoring is Unix-only; the
@@ -2429,8 +2582,12 @@ fn run() -> Result<i32, String> {
     let proxy_jump = cli
         .proxy_jump
         .clone()
-        .or_else(|| cfg_block.proxy_jump.clone());
-    let proxy_command = cfg_block.proxy_command.clone();
+        .or_else(|| cfg_block.proxy_jump.clone())
+        .filter(|p| !p.eq_ignore_ascii_case("none"));
+    let proxy_command = cfg_block
+        .proxy_command
+        .clone()
+        .filter(|p| !p.eq_ignore_ascii_case("none"));
     if proxy_jump.is_some() && proxy_command.is_some() {
         warn!("warning: both ProxyJump and ProxyCommand set; using ProxyJump");
     }
@@ -2570,6 +2727,19 @@ fn run() -> Result<i32, String> {
             policy.max_duration = std::time::Duration::from_secs(secs as u64);
         }
         client.set_rekey_policy(policy);
+    }
+    // UpdateHostKeys: the server's `hostkeys-00@openssh.com` (sent after
+    // authentication) is acted on once the connection is shared.
+    let hostkeys_updater = HostKeysUpdater::for_connection(&cli, &cfg_block, &connect_host, port);
+    if let Some(u) = &hostkeys_updater {
+        let u = u.clone();
+        let negotiated = client.negotiated().map(|n| n.host_key);
+        u.state.lock().map(|mut g| g.host_key_alg = negotiated).ok();
+        client.set_global_request_hook(move |name, raw| {
+            if name == "hostkeys-00@openssh.com" {
+                u.received(raw.to_vec());
+            }
+        });
     }
     authenticate_client(&mut client, &connect_host, &user, credentials, &cfg_block)?;
 
@@ -2786,10 +2956,303 @@ fn run() -> Result<i32, String> {
     // the foreground one.
     #[cfg(unix)]
     if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
+        if let Some(u) = &hostkeys_updater {
+            u.attach(shared.clone());
+        }
         return become_master(dec, &cli, &cfg_block, shared, start_serving, run);
     }
+    if let Some(u) = &hostkeys_updater {
+        u.attach(shared.clone());
+    }
     start_serving(&shared);
-    Ok(run(&shared))
+    let code = run(&shared);
+    // Let an UpdateHostKeys exchange in flight finish.
+    if let Some(u) = &hostkeys_updater {
+        u.wait(std::time::Duration::from_secs(5));
+    }
+    Ok(code)
+}
+
+/// `UpdateHostKeys`, as OpenSSH's client: after authentication the server
+/// lists all its host keys (`hostkeys-00@openssh.com`); keys the user's
+/// known_hosts does not have for this host are proven by the server
+/// (`hostkeys-prove-00@openssh.com`, signed over the session id) and
+/// recorded, and recorded keys it no longer offers are removed.
+struct HostKeysUpdater {
+    /// The name the host is recorded under, and its port.
+    host: String,
+    port: u16,
+    /// The known_hosts file updated (the first user one).
+    file: PathBuf,
+    hash: bool,
+    /// `HostKeyAlgorithms`: offered keys of other types are not learned.
+    algorithms: Vec<String>,
+    state: std::sync::Mutex<HostKeysUpdateState>,
+    done: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct HostKeysUpdateState {
+    offered: Option<Vec<u8>>,
+    shared: Option<puressh::shared::SharedClient>,
+    host_key_alg: Option<String>,
+    started: bool,
+    finished: bool,
+}
+
+impl HostKeysUpdater {
+    /// The updater for this connection, unless UpdateHostKeys is off (by
+    /// default it is on when UserKnownHostsFile is not set, or is just
+    /// `~/.ssh/known_hosts`).
+    fn for_connection(
+        cli: &Cli,
+        cfg_block: &puressh::config::ClientOptions,
+        host: &str,
+        port: u16,
+    ) -> Option<Arc<Self>> {
+        let files = user_known_hosts_files(cli, cfg_block);
+        let explicit = cli.known_hosts_path.is_some() || cfg_block.user_known_hosts.is_some();
+        let on = match cfg_block.update_host_keys.as_deref() {
+            Some("yes") => true,
+            Some(_) => false,
+            None => {
+                !explicit
+                    || (files.len() == 1
+                        && common::default_known_hosts_path().as_ref() == files.first())
+            }
+        };
+        let file = files.into_iter().next()?;
+        if !on || file == std::path::Path::new("/dev/null") {
+            return None;
+        }
+        let (host, port) = match &cfg_block.host_key_alias {
+            Some(a) => (a.clone(), 22),
+            None => (host.to_string(), port),
+        };
+        Some(Arc::new(Self {
+            host,
+            port,
+            file,
+            hash: cli.hash_known_hosts.or(cfg_block.hash_known_hosts) == Some(true),
+            algorithms: cfg_block.host_key_algorithms.clone().unwrap_or_else(|| {
+                puressh::config::default_algorithms(puressh::config::AlgoCategory::HostKey)
+                    .into_iter()
+                    .map(String::from)
+                    .collect()
+            }),
+            state: std::sync::Mutex::new(HostKeysUpdateState::default()),
+            done: std::sync::Condvar::new(),
+        }))
+    }
+
+    /// The server's host key list arrived.
+    fn received(self: &Arc<Self>, raw: Vec<u8>) {
+        if let Ok(mut g) = self.state.lock()
+            && g.offered.is_none()
+        {
+            g.offered = Some(raw);
+            self.maybe_start(&mut g);
+        }
+    }
+
+    /// The connection is shared from now on.
+    fn attach(self: &Arc<Self>, shared: puressh::shared::SharedClient) {
+        if let Ok(mut g) = self.state.lock() {
+            g.shared = Some(shared);
+            self.maybe_start(&mut g);
+        }
+    }
+
+    fn maybe_start(self: &Arc<Self>, g: &mut HostKeysUpdateState) {
+        let (Some(raw), Some(shared)) = (g.offered.clone(), g.shared.clone()) else {
+            return;
+        };
+        if g.started {
+            return;
+        }
+        g.started = true;
+        let me = self.clone();
+        let host_key_alg = g.host_key_alg.clone();
+        thread::spawn(move || {
+            me.update(&shared, &raw, host_key_alg.as_deref());
+            if let Ok(mut g) = me.state.lock() {
+                g.finished = true;
+            }
+            me.done.notify_all();
+        });
+    }
+
+    /// Wait (up to `limit`) for an update that has started.
+    fn wait(&self, limit: std::time::Duration) {
+        let Ok(mut g) = self.state.lock() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + limit;
+        while g.started && !g.finished {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            match self.done.wait_timeout(g, left) {
+                Ok((ng, _)) => g = ng,
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Whether `HostKeyAlgorithms` allows a key of type `key_type`.
+    fn permitted(&self, key_type: &str) -> bool {
+        let rsa = ["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"];
+        self.algorithms
+            .iter()
+            .any(|a| a == key_type || (key_type == "ssh-rsa" && rsa.contains(&a.as_str())))
+    }
+
+    fn update(
+        &self,
+        shared: &puressh::shared::SharedClient,
+        raw: &[u8],
+        host_key_alg: Option<&str>,
+    ) {
+        // The offered keys: plain ones HostKeyAlgorithms allows.
+        let mut offered: Vec<Vec<u8>> = Vec::new();
+        let mut rest = raw;
+        while rest.len() >= 4 {
+            let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
+            if rest.len() < 4 + n {
+                vlog(1, "UpdateHostKeys: malformed hostkeys message");
+                return;
+            }
+            let blob = rest[4..4 + n].to_vec();
+            rest = &rest[4 + n..];
+            let Some(t) = key_blob_type(&blob) else {
+                continue;
+            };
+            if puressh::cert::is_cert_name(&t) || !self.permitted(&t) {
+                continue;
+            }
+            if offered.contains(&blob) {
+                vlog(
+                    1,
+                    &format!("UpdateHostKeys: received duplicated {t} host key"),
+                );
+                return;
+            }
+            offered.push(blob);
+        }
+        if offered.is_empty() {
+            return;
+        }
+        let mut kh = match std::fs::read(&self.file) {
+            Ok(b) => puressh::known_hosts::KnownHosts::from_bytes(&b),
+            Err(e) if e.kind() == ErrorKind::NotFound => puressh::known_hosts::KnownHosts::new(),
+            Err(_) => return,
+        };
+        let plan = kh.host_keys_update(&self.host, self.port, &offered);
+        if let Some(why) = plan.blocked {
+            vlog(
+                1,
+                &format!("UpdateHostKeys: {why}; skipping known_hosts update"),
+            );
+            return;
+        }
+        if plan.new.is_empty() && plan.old.is_empty() {
+            return;
+        }
+        let mut add: Vec<(String, Vec<u8>)> = Vec::new();
+        if !plan.new.is_empty() {
+            let mut req = Vec::new();
+            for &i in &plan.new {
+                req.extend_from_slice(&(offered[i].len() as u32).to_be_bytes());
+                req.extend_from_slice(&offered[i]);
+            }
+            let reply = match shared.global_request("hostkeys-prove-00@openssh.com", &req) {
+                Ok(r) => r,
+                Err(_) => {
+                    warn!("Server failed to confirm ownership of private host keys");
+                    return;
+                }
+            };
+            let Ok(session_id) = shared.session_id() else {
+                return;
+            };
+            let mut sigs = &reply[..];
+            for &i in &plan.new {
+                let key = &offered[i];
+                if sigs.len() < 4 {
+                    return;
+                }
+                let n = u32::from_be_bytes([sigs[0], sigs[1], sigs[2], sigs[3]]) as usize;
+                if sigs.len() < 4 + n {
+                    return;
+                }
+                let sig = &sigs[4..4 + n];
+                sigs = &sigs[4 + n..];
+                let Some(key_type) = key_blob_type(key) else {
+                    return;
+                };
+                let Some(alg) = key_blob_type(sig) else {
+                    return;
+                };
+                // RSA proofs: the negotiated RSA algorithm, else SHA-2 only.
+                let alg = if key_type == "ssh-rsa" {
+                    match host_key_alg.filter(|a| a.starts_with("rsa-sha2-") || *a == "ssh-rsa") {
+                        Some(a) => a.to_string(),
+                        None if alg.starts_with("rsa-sha2-") => alg,
+                        None => continue,
+                    }
+                } else {
+                    alg
+                };
+                let mut signed = Vec::new();
+                for part in [
+                    b"hostkeys-prove-00@openssh.com".as_slice(),
+                    &session_id,
+                    key,
+                ] {
+                    signed.extend_from_slice(&(part.len() as u32).to_be_bytes());
+                    signed.extend_from_slice(part);
+                }
+                if puressh::hostkey::verify_signature(&alg, key, &signed, sig).is_err() {
+                    warn!("server gave bad signature for {key_type} key {i}");
+                    return;
+                }
+                vlog(
+                    1,
+                    &format!(
+                        "Learned new hostkey: {} {}",
+                        puressh::client::host_key_type_label(key),
+                        common::fingerprint_b64_sha256(key)
+                    ),
+                );
+                add.push((key_type, key.clone()));
+            }
+        }
+        for old in &plan.old {
+            vlog(
+                1,
+                &format!(
+                    "Deprecating obsolete hostkey: {}",
+                    common::fingerprint_b64_sha256(old)
+                ),
+            );
+        }
+        kh.update_host_keys(&self.host, self.port, &plan.old, &add, self.hash);
+        if let Err(e) = kh.save(&self.file) {
+            warn!(
+                "UpdateHostKeys: {}: {}",
+                self.file.display(),
+                common::io_reason(&e)
+            );
+        }
+    }
+}
+
+/// The algorithm name a key or signature blob starts with.
+fn key_blob_type(blob: &[u8]) -> Option<String> {
+    let n = u32::from_be_bytes(blob.get(..4)?.try_into().ok()?) as usize;
+    let name = blob.get(4..4 + n)?;
+    core::str::from_utf8(name).ok().map(str::to_string)
 }
 
 /// Run a `LocalCommand` with the user's shell (`$SHELL`, else `/bin/sh`;
@@ -3458,6 +3921,7 @@ struct MuxDecision {
 }
 
 /// The `%` tokens of ssh_config(5) for this connection.
+#[derive(Clone)]
 struct Tokens {
     /// `%n`: the host name as given.
     original: String,
@@ -3545,6 +4009,11 @@ impl Tokens {
     /// Expand `%C %d %h %i %j %k %L %l %n %p %r %u %%`; any other `%x` is
     /// left as written.
     fn expand(&self, s: &str) -> String {
+        self.expand_with(s, &[])
+    }
+
+    /// [`Self::expand`], with `extra` tokens (`%t`, `%K`, …) as well.
+    fn expand_with(&self, s: &str, extra: &[(char, &str)]) -> String {
         let mut out = String::with_capacity(s.len());
         let mut chars = s.chars();
         while let Some(c) = chars.next() {
@@ -3552,7 +4021,12 @@ impl Tokens {
                 out.push(c);
                 continue;
             }
-            match chars.next() {
+            let next = chars.next();
+            if let Some((_, v)) = next.and_then(|c| extra.iter().find(|(k, _)| *k == c)) {
+                out.push_str(v);
+                continue;
+            }
+            match next {
                 Some('%') => out.push('%'),
                 Some('C') => out.push_str(&self.connection_hash()),
                 Some('d') => out.push_str(&self.home),
@@ -3723,6 +4197,94 @@ fn valid_hostname(s: &str) -> bool {
         && !s.bytes().any(|c| {
             c.is_ascii_whitespace() || c.is_ascii_control() || b"'`\"$\\;&<>|(){},".contains(&c)
         })
+}
+
+/// Run `KnownHostsCommand` for the server's key, as OpenSSH's
+/// load_hostkeys_command: the template split into arguments (no shell),
+/// each with the tokens expanded — `%H` the name looked up, `%I`
+/// `HOSTNAME`, `%t` the key type, `%K` the key, `%f` its fingerprint —
+/// and its output read as known_hosts lines. `None` if it fails.
+fn known_hosts_command(
+    template: &str,
+    tokens: &Tokens,
+    looked_up: &str,
+    key_type: &str,
+    blob: &[u8],
+) -> Option<Vec<u8>> {
+    let key = purecrypto::der::base64_encode(blob);
+    let fp = common::fingerprint_b64_sha256(blob);
+    let extra = [
+        ('H', looked_up),
+        ('I', "HOSTNAME"),
+        ('t', key_type),
+        ('K', key.as_str()),
+        ('f', fp.as_str()),
+    ];
+    let argv: Vec<String> = split_command_args(template)
+        .iter()
+        .map(|a| tokens.expand_with(a, &extra))
+        .collect();
+    let (prog, args) = argv.split_first()?;
+    vlog(
+        1,
+        &format!("Executing KnownHostsCommand: {}", argv.join(" ")),
+    );
+    match std::process::Command::new(prog)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Ok(out) if out.status.success() => Some(out.stdout),
+        Ok(out) => {
+            warn!("KnownHostsCommand {prog} failed, {}", out.status);
+            None
+        }
+        Err(e) => {
+            warn!("KnownHostsCommand {prog}: {}", common::io_reason(&e));
+            None
+        }
+    }
+}
+
+/// Split a command line into arguments as OpenSSH's argv_split: on
+/// whitespace, with `'…'` / `"…"` quoting and `\` escaping the next
+/// character.
+fn split_command_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_arg = false;
+    let mut quote: Option<char> = None;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (quote, c) {
+            (_, '\\') => {
+                if let Some(n) = chars.next() {
+                    cur.push(n);
+                }
+                in_arg = true;
+            }
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, '\'' | '"') => {
+                quote = Some(c);
+                in_arg = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if in_arg {
+                    out.push(core::mem::take(&mut cur));
+                    in_arg = false;
+                }
+            }
+            (None, c) => {
+                cur.push(c);
+                in_arg = true;
+            }
+        }
+    }
+    if in_arg {
+        out.push(cur);
+    }
+    out
 }
 
 /// `${NAME}` environment references (OpenSSH expands them in file names);

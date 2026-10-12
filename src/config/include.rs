@@ -62,6 +62,17 @@ pub fn tokenize_file_with_includes(
     path: &Path,
     depth: usize,
 ) -> Result<Vec<ParsedLine>, ConfigError> {
+    tokenize_file_with_includes_expanding(path, depth, &|p| p.to_string())
+}
+
+/// [`tokenize_file_with_includes`], with each `Include` path passed through
+/// `expand` (for the `%` tokens, which depend on the connection) after its
+/// `${VAR}` references are replaced, as OpenSSH's percent_dollar_expand.
+pub fn tokenize_file_with_includes_expanding(
+    path: &Path,
+    depth: usize,
+    expand: &dyn Fn(&str) -> String,
+) -> Result<Vec<ParsedLine>, ConfigError> {
     if depth >= MAX_INCLUDE_DEPTH {
         return Err(ConfigError::Syntax {
             line: 0,
@@ -76,13 +87,17 @@ pub fn tokenize_file_with_includes(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .to_path_buf();
-    expand_includes(tokenize(&src)?, &base_dir, depth)
+    expand_includes_expanding(tokenize(&src)?, &base_dir, depth, expand)
 }
 
 /// Same as [`tokenize_file_with_includes`] but treats "file not found" / any
 /// I/O failure as a silent skip (returning `Ok(empty)`). Used for the
 /// recursive Include path, where ssh_config(5) says to warn and continue.
-fn tokenize_included_file(path: &Path, depth: usize) -> Result<Vec<ParsedLine>, ConfigError> {
+fn tokenize_included_file(
+    path: &Path,
+    depth: usize,
+    expand: &dyn Fn(&str) -> String,
+) -> Result<Vec<ParsedLine>, ConfigError> {
     if depth >= MAX_INCLUDE_DEPTH {
         return Err(ConfigError::Syntax {
             line: 0,
@@ -102,7 +117,7 @@ fn tokenize_included_file(path: &Path, depth: usize) -> Result<Vec<ParsedLine>, 
     for l in &mut lines {
         l.file = Some(name.clone());
     }
-    expand_includes(lines, &base_dir, depth).map_err(|e| e.in_file(Some(&name)))
+    expand_includes_expanding(lines, &base_dir, depth, expand).map_err(|e| e.in_file(Some(&name)))
 }
 
 /// Walk a token stream and replace every `include` line in-place with the
@@ -118,6 +133,17 @@ pub fn expand_includes(
     base_dir: &Path,
     depth: usize,
 ) -> Result<Vec<ParsedLine>, ConfigError> {
+    expand_includes_expanding(lines, base_dir, depth, &|p| p.to_string())
+}
+
+/// [`expand_includes`], with `Include` paths expanded as in
+/// [`tokenize_file_with_includes_expanding`].
+pub fn expand_includes_expanding(
+    lines: Vec<ParsedLine>,
+    base_dir: &Path,
+    depth: usize,
+    expand: &dyn Fn(&str) -> String,
+) -> Result<Vec<ParsedLine>, ConfigError> {
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
         if line.keyword != "include" {
@@ -132,7 +158,7 @@ pub fn expand_includes(
             });
         }
         for raw_path in &line.args {
-            let expanded = expand_tilde(raw_path);
+            let expanded = expand_tilde(&expand(&dollar_expand(raw_path)));
             let resolved = resolve_relative(&expanded, base_dir);
             let matches = match expand_glob(&resolved) {
                 Ok(v) => v,
@@ -145,7 +171,7 @@ pub fn expand_includes(
                         msg: "Include: max depth exceeded".into(),
                     });
                 }
-                let child_lines = tokenize_included_file(&matched, depth + 1)?;
+                let child_lines = tokenize_included_file(&matched, depth + 1, expand)?;
                 let marker = |keyword: &str| ParsedLine {
                     line_no: line.line_no,
                     keyword: keyword.to_string(),
@@ -160,6 +186,22 @@ pub fn expand_includes(
         }
     }
     Ok(out)
+}
+
+/// `${NAME}` → the environment variable's value (empty when unset).
+fn dollar_expand(s: &str) -> alloc::string::String {
+    let mut out = alloc::string::String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("${") {
+        let Some(end) = rest[i + 2..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..i]);
+        out.push_str(&std::env::var(&rest[i + 2..i + 2 + end]).unwrap_or_default());
+        rest = &rest[i + 3 + end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `~` → `$HOME`; `~/foo` → `$HOME/foo`. Other forms (`~user/foo`) aren't

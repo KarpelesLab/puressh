@@ -25,7 +25,7 @@ pub use ext_info::{
 };
 pub use kex::{GexSizes, KexAlgorithms, Negotiated};
 pub use kexinit::{KexAlgorithmsOwned, KexInit, NegotiatedOwned, SSH_MSG_KEXINIT, SSH_MSG_NEWKEYS};
-pub use packet::{BLOCK_SIZE_DEFAULT, MAX_PACKET_LEN, Packet, PacketCodec};
+pub use packet::{BLOCK_SIZE_DEFAULT, MAX_PACKET_LEN, Packet, PacketCodec, TrafficStats};
 #[cfg(feature = "alloc")]
 pub use ping::{SSH_MSG_PING, SSH_MSG_PONG, encode_ping, encode_pong, pong_for_ping};
 #[cfg(feature = "alloc")]

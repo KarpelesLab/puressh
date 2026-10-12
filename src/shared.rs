@@ -963,6 +963,16 @@ impl SharedClient {
         await_global_reply_under_lock(&mut g)
     }
 
+    /// The algorithms the most recent key exchange chose.
+    pub fn negotiated(&self) -> Option<crate::transport::Negotiated> {
+        lock_or_poison(&self.inner).ok()?.client.negotiated()
+    }
+
+    /// Packet and byte totals of the connection so far.
+    pub fn traffic(&self) -> Result<crate::transport::TrafficStats> {
+        Ok(lock_or_poison(&self.inner)?.client.traffic())
+    }
+
     /// The session identifier (the first key exchange's hash).
     pub fn session_id(&self) -> Result<Vec<u8>> {
         Ok(lock_or_poison(&self.inner)?.client.session_id().to_vec())

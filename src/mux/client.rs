@@ -131,24 +131,7 @@ pub fn open_forward(
     orig_host: &str,
     orig_port: u16,
 ) -> Result<UnixStream, MuxError> {
-    let mut sock = connect_control_socket(path).map_err(MuxError::Io)?;
-
-    write_frame(
-        &mut sock,
-        &Frame::Hello {
-            version: PROTOCOL_VERSION,
-        },
-    )?;
-    match read_frame(&mut sock)? {
-        Some(Frame::Hello { version }) if version == PROTOCOL_VERSION => {}
-        Some(Frame::Hello { version }) => {
-            return Err(MuxError::VersionMismatch {
-                ours: PROTOCOL_VERSION,
-                theirs: version,
-            });
-        }
-        _ => return Err(MuxError::Unexpected("expected HELLO from master")),
-    }
+    let mut sock = hello(path)?;
 
     write_frame(
         &mut sock,
@@ -166,6 +149,58 @@ pub fn open_forward(
         _ => Err(MuxError::Unexpected(
             "expected OPEN_OK/OPEN_FAIL from master",
         )),
+    }
+}
+
+/// Connect to the master at `path` and exchange HELLOs.
+fn hello(path: &Path) -> Result<UnixStream, MuxError> {
+    let mut sock = connect_control_socket(path).map_err(MuxError::Io)?;
+    write_frame(
+        &mut sock,
+        &Frame::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
+    match read_frame(&mut sock)? {
+        Some(Frame::Hello { version }) if version == PROTOCOL_VERSION => Ok(sock),
+        Some(Frame::Hello { version }) => Err(MuxError::VersionMismatch {
+            ours: PROTOCOL_VERSION,
+            theirs: version,
+        }),
+        _ => Err(MuxError::Unexpected("expected HELLO from master")),
+    }
+}
+
+/// `ssh -O forward` / `-O cancel`: ask the master at `path` to add (or
+/// remove) the forward `spec` given with the `ssh` option `kind` (`b'L'`,
+/// `b'R'`, `b'D'`). Returns the port the server chose for `-R 0:…` (else
+/// 0); a refusal is [`MuxError::ForwardFailed`] with the master's reason.
+pub fn request_forward(path: &Path, kind: u8, spec: &str, cancel: bool) -> Result<u16, MuxError> {
+    let mut sock = hello(path)?;
+    write_frame(
+        &mut sock,
+        &Frame::Forward {
+            kind,
+            spec: spec.to_string(),
+            cancel,
+        },
+    )?;
+    match read_frame(&mut sock)? {
+        Some(Frame::ForwardOk { port }) => Ok(port as u16),
+        Some(Frame::OpenFail { reason }) => Err(MuxError::ForwardFailed(reason)),
+        _ => Err(MuxError::Unexpected(
+            "expected FORWARD_OK/OPEN_FAIL from master",
+        )),
+    }
+}
+
+/// `ssh -O conninfo`: the master's description of its connection.
+pub fn conninfo(path: &Path) -> Result<String, MuxError> {
+    let mut sock = hello(path)?;
+    write_frame(&mut sock, &Frame::ConnInfo)?;
+    match read_frame(&mut sock)? {
+        Some(Frame::ConnInfoReply { text }) => Ok(text),
+        _ => Err(MuxError::Unexpected("expected CONNINFO_REPLY from master")),
     }
 }
 

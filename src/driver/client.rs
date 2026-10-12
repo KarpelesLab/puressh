@@ -204,6 +204,11 @@ impl ClientDriver {
         self.runner.peer_ext_info()
     }
 
+    /// Packet and byte totals of the connection so far.
+    pub fn traffic(&self) -> crate::transport::TrafficStats {
+        self.codec.traffic
+    }
+
     /// The compression algorithms chosen by the most recent key exchange, as
     /// `(client→server, server→client)` — e.g. `("zlib@openssh.com",
     /// "zlib@openssh.com")` or `("none", "none")`. `None` before the first

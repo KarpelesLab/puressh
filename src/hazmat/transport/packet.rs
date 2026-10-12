@@ -114,6 +114,31 @@ pub struct PacketCodec {
     outbound_compress: Box<dyn Compress>,
     /// Inbound decompression channel; defaults to `NoneDecompress`.
     inbound_decompress: Box<dyn Decompress>,
+    /// Totals since the codec was created (never reset by a re-key).
+    pub traffic: TrafficStats,
+}
+
+/// Packet and byte totals of a connection, as `ssh -O conninfo` reports
+/// them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TrafficStats {
+    /// Packets received.
+    pub packets_in: u64,
+    /// Packets sent.
+    pub packets_out: u64,
+    /// On-wire bytes received.
+    pub bytes_in: u64,
+    /// On-wire bytes sent.
+    pub bytes_out: u64,
+    /// Payload bytes received while decompressing, before / after.
+    pub compressed_in: u64,
+    /// Decompressed size of those.
+    pub raw_in: u64,
+    /// Payload bytes sent while compressing, before compression.
+    pub raw_out: u64,
+    /// Compressed size of those.
+    pub compressed_out: u64,
 }
 
 #[cfg(feature = "alloc")]
@@ -139,6 +164,7 @@ impl PacketCodec {
             inbound: CipherSlot::None,
             pending_first_block: None,
             outbound_compress: Box::new(NoneCompress),
+            traffic: TrafficStats::default(),
             inbound_decompress: Box::new(NoneDecompress),
         }
     }
@@ -296,6 +322,8 @@ impl PacketCodec {
         let to_frame: &[u8] =
             if self.outbound_compress.active() && self.outbound_compress.name() != "none" {
                 compressed = self.outbound_compress.compress(payload)?;
+                self.traffic.raw_out += payload.len() as u64;
+                self.traffic.compressed_out += compressed.len() as u64;
                 &compressed
             } else {
                 payload
@@ -318,6 +346,8 @@ impl PacketCodec {
         // long before the counter gets there.
         self.seq_out = self.seq_out.wrapping_add(1);
         self.bytes_out = self.bytes_out.saturating_add(frame.len() as u64);
+        self.traffic.packets_out += 1;
+        self.traffic.bytes_out += frame.len() as u64;
         Ok(frame)
     }
 
@@ -342,9 +372,14 @@ impl PacketCodec {
             // packet limit rotates keys well before then (see `encode`).
             self.seq_in = self.seq_in.wrapping_add(1);
             self.bytes_in = self.bytes_in.saturating_add(consumed as u64);
+            self.traffic.packets_in += 1;
+            self.traffic.bytes_in += consumed as u64;
             let payload =
                 if self.inbound_decompress.active() && self.inbound_decompress.name() != "none" {
-                    self.inbound_decompress.decompress(&payload)?
+                    let raw = self.inbound_decompress.decompress(&payload)?;
+                    self.traffic.compressed_in += payload.len() as u64;
+                    self.traffic.raw_in += raw.len() as u64;
+                    raw
                 } else {
                     payload
                 };

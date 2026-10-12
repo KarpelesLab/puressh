@@ -402,3 +402,73 @@ fn control_persist_master_serves_its_forwards() {
     assert_eq!(reply.as_deref(), Ok("echo:hi"));
     assert!(exit.status.success(), "{exit:?}");
 }
+
+#[test]
+#[ignore]
+fn master_adds_and_cancels_forwards_and_describes_itself() {
+    let Some(s) = setup("mx") else {
+        eprintln!("e2e_forwarding: skipping (OpenSSH ssh/sshd/ssh-keygen not found)");
+        return;
+    };
+    let tcp_echo = spawn_tcp_echo();
+    let ctl = s.dir.join("ctl");
+    let master = |args: &[&str]| {
+        s.client(true, s.openssh_port)
+            .args(args)
+            .arg("-S")
+            .arg(&ctl)
+            .arg(format!("{}@127.0.0.1", s.user))
+            .stdin(Stdio::null())
+            .output()
+            .expect("ssh")
+    };
+    // `-f` keeps stdout / stderr (as OpenSSH's): wait for the exit only.
+    let st = s
+        .client(true, s.openssh_port)
+        .args(["-f", "-N", "-M", "-S"])
+        .arg(&ctl)
+        .arg(format!("{}@127.0.0.1", s.user))
+        .stdin(Stdio::null())
+        .status()
+        .expect("ssh -f");
+    assert!(st.success());
+
+    // -O forward -L: the master listens; -O cancel: it stops.
+    let l = free_port();
+    let spec = format!("{l}:127.0.0.1:{tcp_echo}");
+    let out = master(&["-O", "forward", "-L", &spec]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(exchange(&End::Port(l), None).as_deref(), Ok("echo:hi"));
+    let out = master(&["-O", "cancel", "-L", &spec]);
+    assert!(out.status.success(), "{out:?}");
+    let start = Instant::now();
+    while TcpStream::connect(("127.0.0.1", l)).is_ok() {
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "-L still listening"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // -O forward -R 0:…: the server's port on stdout.
+    let out = master(&["-O", "forward", "-R", &format!("0:127.0.0.1:{tcp_echo}")]);
+    assert!(out.status.success(), "{out:?}");
+    let port: u16 = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .expect("port");
+    assert_eq!(exchange(&End::Port(port), None).as_deref(), Ok("echo:hi"));
+
+    // -O conninfo, as OpenSSH's.
+    let out = master(&["-O", "conninfo"]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{out:?}");
+    assert!(text.contains("Connection information for"), "{text}");
+    assert!(
+        text.contains(&format!("-> 127.0.0.1:{}", s.openssh_port)),
+        "{text}"
+    );
+    assert!(text.contains("kexalgorithm "), "{text}");
+
+    assert!(master(&["-O", "exit"]).status.success());
+}

@@ -53,14 +53,15 @@ pub use path::{
 #[cfg(feature = "multichannel")]
 mod server;
 #[cfg(feature = "multichannel")]
-pub use server::{MasterConfig, Persist, run_master, run_master_daemon};
+pub use server::{ForwardHook, MasterConfig, Persist, run_master, run_master_daemon};
 
 #[cfg(feature = "multichannel")]
 mod client;
 #[cfg(feature = "multichannel")]
 pub use client::{
-    ControlCommand, ProbeOutcome, SessionRequest, TryCloneStream, open_forward, probe_master,
-    run_client, send_control_command, splice_forward, validate_control_socket,
+    ControlCommand, ProbeOutcome, SessionRequest, TryCloneStream, conninfo, open_forward,
+    probe_master, request_forward, run_client, send_control_command, splice_forward,
+    validate_control_socket,
 };
 
 #[cfg(feature = "multichannel")]

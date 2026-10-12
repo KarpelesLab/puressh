@@ -1336,6 +1336,11 @@ impl Client {
         Err(Error::Protocol("auth: too many steps without termination"))
     }
 
+    /// Packet and byte totals of the connection so far.
+    pub fn traffic(&self) -> crate::transport::TrafficStats {
+        self.driver.traffic()
+    }
+
     /// The algorithms the most recent key exchange chose (kex, host key,
     /// ciphers, MACs, compression); `None` before the first one.
     pub fn negotiated(&self) -> Option<crate::transport::Negotiated> {

@@ -49,7 +49,17 @@ pub struct MasterConfig {
     /// sends `-O exit`. A master whose foreground never returns on its own
     /// (`ssh -M -N -D …`) uses it to end the process, as OpenSSH's does.
     pub on_exit: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Adds or removes a forward for `ssh -O forward` / `-O cancel`: given
+    /// the option letter (`b'L'`, `b'R'`, `b'D'`), the specification and
+    /// whether to cancel, the port the server chose (`-R 0:…`, else 0) or
+    /// why it failed. Without it those commands are refused.
+    pub on_forward: Option<ForwardHook>,
+    /// Describes the connection for `ssh -O conninfo`.
+    pub on_conninfo: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
+
+/// See [`MasterConfig::on_forward`].
+pub type ForwardHook = Arc<dyn Fn(u8, &str, bool) -> Result<u16, String> + Send + Sync>;
 
 impl MasterConfig {
     /// Pair a (length-checked) control-socket path with a persist policy.
@@ -58,7 +68,25 @@ impl MasterConfig {
             control_path,
             persist,
             on_exit: None,
+            on_forward: None,
+            on_conninfo: None,
         }
+    }
+
+    /// Serve `ssh -O forward` / `-O cancel` with `f` (see
+    /// [`MasterConfig::on_forward`]).
+    pub fn with_on_forward(
+        mut self,
+        f: impl Fn(u8, &str, bool) -> Result<u16, String> + Send + Sync + 'static,
+    ) -> Self {
+        self.on_forward = Some(Arc::new(f));
+        self
+    }
+
+    /// Serve `ssh -O conninfo` with `f`.
+    pub fn with_on_conninfo(mut self, f: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        self.on_conninfo = Some(Arc::new(f));
+        self
     }
 
     /// Run `f` when an `-O exit` request arrives (see [`MasterConfig::on_exit`]).
@@ -82,6 +110,10 @@ struct MasterState {
     control_path: PathBuf,
     /// See [`MasterConfig::on_exit`].
     on_exit: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// See [`MasterConfig::on_forward`].
+    on_forward: Option<ForwardHook>,
+    /// See [`MasterConfig::on_conninfo`].
+    on_conninfo: Option<Arc<dyn Fn() -> String + Send + Sync>>,
 }
 
 /// Bind the control socket at `cfg.control_path`, taking care not to clobber a
@@ -146,6 +178,8 @@ where
         last_idle: Mutex::new(Some(Instant::now())),
         control_path: cfg.control_path.clone(),
         on_exit: cfg.on_exit.clone(),
+        on_forward: cfg.on_forward.clone(),
+        on_conninfo: cfg.on_conninfo.clone(),
     });
 
     // Accept loop in its own thread so the foreground session can run
@@ -218,6 +252,8 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         last_idle: Mutex::new(Some(Instant::now())),
         control_path: cfg.control_path.clone(),
         on_exit: cfg.on_exit.clone(),
+        on_forward: cfg.on_forward.clone(),
+        on_conninfo: cfg.on_conninfo.clone(),
     });
 
     let accept_shared = shared.clone();
@@ -384,6 +420,24 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
         }
         Frame::AliveCheck => {
             let _ = write_frame(&mut ctrl, &Frame::AliveOk);
+            return;
+        }
+        Frame::Forward { kind, spec, cancel } => {
+            let reply = match &state.on_forward {
+                Some(f) => match f(kind, &spec, cancel) {
+                    Ok(port) => Frame::ForwardOk { port: port as u32 },
+                    Err(reason) => Frame::OpenFail { reason },
+                },
+                None => Frame::OpenFail {
+                    reason: "forwarding requests are not supported by this master".into(),
+                },
+            };
+            let _ = write_frame(&mut ctrl, &reply);
+            return;
+        }
+        Frame::ConnInfo => {
+            let text = state.on_conninfo.as_ref().map_or_else(String::new, |f| f());
+            let _ = write_frame(&mut ctrl, &Frame::ConnInfoReply { text });
             return;
         }
         Frame::OpenDirectTcpip {

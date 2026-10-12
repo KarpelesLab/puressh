@@ -33,6 +33,10 @@ const T_EXIT_REQUEST: u8 = 12;
 const T_OPEN_DIRECT_TCPIP: u8 = 13;
 const T_OPEN_OK: u8 = 14;
 const T_OPEN_FAIL: u8 = 15;
+const T_FORWARD: u8 = 16;
+const T_FORWARD_OK: u8 = 17;
+const T_CONNINFO: u8 = 18;
+const T_CONNINFO_REPLY: u8 = 19;
 
 /// A decoded mux control-socket message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -110,10 +114,34 @@ pub enum Frame {
     /// follows. Sent in reply to [`Frame::OpenDirectTcpip`].
     OpenOk,
     /// Master → client: the requested channel open failed. `reason` is a
-    /// human-readable diagnostic. Sent in reply to [`Frame::OpenDirectTcpip`].
+    /// human-readable diagnostic. Sent in reply to [`Frame::OpenDirectTcpip`]
+    /// and [`Frame::Forward`].
     OpenFail {
         /// Human-readable failure reason.
         reason: String,
+    },
+    /// Client → master: add (or, with `cancel`, remove) a forward on the
+    /// master's connection — `ssh -O forward` / `-O cancel`.
+    Forward {
+        /// `b'L'`, `b'R'` or `b'D'`, as the `ssh` option.
+        kind: u8,
+        /// The forwarding specification as given to that option.
+        spec: String,
+        /// Remove the forward instead of adding it.
+        cancel: bool,
+    },
+    /// Master → client: the forward is in place; `port` is the one the
+    /// server chose for `-R 0:…` (else 0).
+    ForwardOk {
+        /// Allocated listen port, or 0.
+        port: u32,
+    },
+    /// Client → master: describe the connection (`ssh -O conninfo`).
+    ConnInfo,
+    /// Master → client: the description.
+    ConnInfoReply {
+        /// Text, as OpenSSH prints it.
+        text: String,
     },
 }
 
@@ -211,6 +239,21 @@ impl Frame {
                 out.push(T_OPEN_FAIL);
                 put_str(out, reason);
             }
+            Frame::Forward { kind, spec, cancel } => {
+                out.push(T_FORWARD);
+                out.push(*kind);
+                put_str(out, spec);
+                out.push(*cancel as u8);
+            }
+            Frame::ForwardOk { port } => {
+                out.push(T_FORWARD_OK);
+                out.extend_from_slice(&port.to_be_bytes());
+            }
+            Frame::ConnInfo => out.push(T_CONNINFO),
+            Frame::ConnInfoReply { text } => {
+                out.push(T_CONNINFO_REPLY);
+                put_str(out, text);
+            }
         }
     }
 
@@ -296,6 +339,19 @@ impl Frame {
             }
             T_OPEN_OK => Frame::OpenOk,
             T_OPEN_FAIL => Frame::OpenFail { reason: r.str()? },
+            T_FORWARD => {
+                let kind = r.u8()?;
+                let spec = r.str()?;
+                let cancel = match r.u8()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(MuxError::Malformed("FORWARD: bad cancel flag")),
+                };
+                Frame::Forward { kind, spec, cancel }
+            }
+            T_FORWARD_OK => Frame::ForwardOk { port: r.u32()? },
+            T_CONNINFO => Frame::ConnInfo,
+            T_CONNINFO_REPLY => Frame::ConnInfoReply { text: r.str()? },
             other => return Err(MuxError::UnknownType(other)),
         };
         // Variants with fixed-length payloads must consume the whole body;
@@ -433,6 +489,21 @@ mod tests {
 
     #[test]
     fn round_trip_all_variants() {
+        round_trip(Frame::Forward {
+            kind: b'R',
+            spec: "0:localhost:22".into(),
+            cancel: false,
+        });
+        round_trip(Frame::Forward {
+            kind: b'L',
+            spec: "/tmp/s:/run/s".into(),
+            cancel: true,
+        });
+        round_trip(Frame::ForwardOk { port: 4242 });
+        round_trip(Frame::ConnInfo);
+        round_trip(Frame::ConnInfoReply {
+            text: "Connection information\r\n".into(),
+        });
         round_trip(Frame::Hello { version: 1 });
         round_trip(Frame::Hello {
             version: 0xDEAD_BEEF,

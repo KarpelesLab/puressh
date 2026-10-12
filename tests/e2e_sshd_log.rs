@@ -136,6 +136,48 @@ fn auth_log_lines_match_openssh() {
         format!("127.0.0.1 {} 127.0.0.1 {port}", c[1]),
         "{env}"
     );
+    // A shell without a terminal (`ssh host < script`) reads its commands
+    // from the channel, as under OpenSSH.
+    let mut piped = Command::new("ssh")
+        .args(["-T", "-F", "/dev/null", "-o", "StrictHostKeyChecking=no"])
+        .args(["-o", "UserKnownHostsFile=/dev/null", "-o", "BatchMode=yes"])
+        .args(["-o", "LogLevel=ERROR", "-p", &port.to_string(), "-i"])
+        .arg(p("user"))
+        .arg(format!("{user}@127.0.0.1"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = piped.stdin.take().unwrap();
+        stdin.write_all(b"echo piped-$((6*7)); tty\n").unwrap();
+    }
+    let out = piped.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("piped-42"), "{text}");
+    assert!(text.contains("not a tty"), "{text}");
+    // A terminal session does not start with SIGPIPE ignored (an ignored
+    // signal survives exec: `yes | head` would complain).
+    if cfg!(target_os = "linux") {
+        let out = ssh_cmd(
+            "user",
+            &user,
+            &["-o", "BatchMode=yes", "-tt"],
+            "grep SigIgn /proc/self/status",
+        );
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let mask = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|h| u64::from_str_radix(h, 16).ok())
+            .unwrap_or(u64::MAX);
+        assert_eq!(
+            mask & (1 << 12),
+            0,
+            "SIGPIPE ignored in a pty session: {text}"
+        );
+    }
     ssh("user", "nosuchuser", &["-o", "BatchMode=yes"]);
     ssh("user", "nobody", &["-o", "BatchMode=yes"]);
     ssh(

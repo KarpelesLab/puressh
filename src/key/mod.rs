@@ -94,6 +94,12 @@ impl AuthorizedKeyOptions {
         self.pty.unwrap_or(!self.restrict)
     }
 
+    /// Whether `~/.ssh/rc` may run (`no-user-rc`, or `restrict` without
+    /// `user-rc`, forbid it).
+    pub fn allows_user_rc(&self) -> bool {
+        self.user_rc.unwrap_or(!self.restrict)
+    }
+
     /// Whether port forwarding is allowed.
     pub fn allows_port_forwarding(&self) -> bool {
         self.port_forwarding.unwrap_or(!self.restrict)
@@ -118,6 +124,7 @@ impl AuthorizedKeyOptions {
             && self.allows_port_forwarding()
             && self.allows_agent_forwarding()
             && self.allows_x11_forwarding()
+            && self.allows_user_rc()
     }
 
     /// Parse a comma-separated option list (the leading field of an

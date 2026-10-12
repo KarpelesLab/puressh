@@ -298,6 +298,9 @@ pub struct AuthCertCaps {
     pub permit_agent_forwarding: bool,
     /// `permit-X11-forwarding` present ⇒ `x11-req` allowed.
     pub permit_x11_forwarding: bool,
+    /// `permit-user-rc` present (or no `no-user-rc` key option) ⇒ the
+    /// session may run `~/.ssh/rc`.
+    pub permit_user_rc: bool,
     /// The decoded `force-command` critical option (an SSH `string`), if present.
     /// The connection phase runs this in place of the client's command/shell.
     pub force_command: Option<String>,
@@ -330,6 +333,7 @@ impl AuthCertCaps {
             permit_port_forwarding: ci.has_extension("permit-port-forwarding"),
             permit_agent_forwarding: ci.has_extension("permit-agent-forwarding"),
             permit_x11_forwarding: ci.has_extension("permit-X11-forwarding"),
+            permit_user_rc: ci.has_extension("permit-user-rc"),
             force_command,
             permit_open: None,
             permit_listen: None,
@@ -344,6 +348,7 @@ impl AuthCertCaps {
             permit_port_forwarding: true,
             permit_agent_forwarding: true,
             permit_x11_forwarding: true,
+            permit_user_rc: true,
             force_command: None,
             permit_open: None,
             permit_listen: None,
@@ -361,6 +366,7 @@ impl AuthCertCaps {
             permit_port_forwarding: o.allows_port_forwarding(),
             permit_agent_forwarding: o.allows_agent_forwarding(),
             permit_x11_forwarding: o.allows_x11_forwarding(),
+            permit_user_rc: o.allows_user_rc(),
             force_command: o.command.clone(),
             permit_open: list(&o.permit_open),
             permit_listen: list(&o.permit_listen),
@@ -384,6 +390,7 @@ impl AuthCertCaps {
             permit_port_forwarding: self.permit_port_forwarding && other.permit_port_forwarding,
             permit_agent_forwarding: self.permit_agent_forwarding && other.permit_agent_forwarding,
             permit_x11_forwarding: self.permit_x11_forwarding && other.permit_x11_forwarding,
+            permit_user_rc: self.permit_user_rc && other.permit_user_rc,
             force_command,
             permit_open: both(self.permit_open, other.permit_open),
             permit_listen: both(self.permit_listen, other.permit_listen),

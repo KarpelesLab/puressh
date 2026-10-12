@@ -103,6 +103,18 @@ last -w tester | grep -q '^tester  *pts/'
 if [ "$rc" = 124 ] || ! tr -d '\r' </tmp/login.out | grep -q '^Last login: .* from '; then
 	echo "interactive login: exit $rc"; cat -A /tmp/login.out; exit 1
 fi
+# ~/.ssh/rc runs at session start, as the user, in the home directory; and
+# a shell without a terminal (`ssh host < script`) reads its commands.
+printf 'echo "rc-ran $(id -un) $(pwd)" >rc.out\n' >/home/tester/.ssh/rc
+chown tester:tester /home/tester/.ssh/rc
+try_ssh tester@localhost true
+grep -qx 'rc-ran tester /home/tester' /home/tester/rc.out
+rm -f /home/tester/.ssh/rc /home/tester/rc.out
+out=$(printf 'echo piped-$((6*7)); tty\n' | timeout 30 ssh -T -F /dev/null -i /root/tester_key \
+	-o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts \
+	tester@localhost 2>&1 || true)
+echo "$out" | grep -q piped-42 || { echo "shell without a terminal: $out"; exit 1; }
+echo "$out" | grep -q 'not a tty'
 ss -ltnp | grep -q ':22 '
 # Logins are logged as OpenSSH logs them (syslog, facility AUTH), where
 # fail2ban and auth.log readers look.

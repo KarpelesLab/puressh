@@ -142,6 +142,11 @@ pub struct ServerOptions {
     pub allow_agent_forwarding: Option<bool>,
     /// `X11Forwarding` (yes/no).
     pub x11_forwarding: Option<bool>,
+    /// `PermitUserRC` (yes/no): whether `~/.ssh/rc` runs at session start.
+    pub permit_user_rc: Option<bool>,
+    /// `XAuthLocation`: the `xauth` that adds a forwarded display's cookie
+    /// (`none` ⇒ never run).
+    pub xauth_location: Option<String>,
     /// `AcceptEnv` patterns — cumulative.
     pub accept_env: Vec<String>,
     /// `StrictModes` (yes/no).
@@ -596,6 +601,8 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(max_startups_early);
     take_scalar!(allow_agent_forwarding);
     take_scalar!(x11_forwarding);
+    take_scalar!(permit_user_rc);
+    take_scalar!(xauth_location);
     take_scalar!(strict_modes);
     take_scalar!(log_level);
     take_scalar!(print_last_log);
@@ -893,6 +900,12 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "x11forwarding" => {
             opts.x11_forwarding = Some(parse_yes_no(line)?);
+        }
+        "permituserrc" => {
+            opts.permit_user_rc = Some(parse_yes_no(line)?);
+        }
+        "xauthlocation" => {
+            opts.xauth_location = Some(one_arg(line)?);
         }
         "acceptenv" => {
             if line.args.is_empty() {
@@ -1287,7 +1300,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("ModuliFile", &["*"], ""),
     ("X11DisplayOffset", &["*"], ""),
     ("X11UseLocalhost", &["*"], ""),
-    ("XAuthLocation", &["*"], ""),
     ("StreamLocalBindMask", &["*"], ""),
     ("StreamLocalBindUnlink", &["*"], ""),
     ("PerSourceNetBlockSize", &["*"], ""),
@@ -1303,7 +1315,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
         &["none"],
         "host keys held by an agent are not used",
     ),
-    ("PermitUserRC", &["*"], ""),
     (
         "PermitUserEnvironment",
         &["no"],

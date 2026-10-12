@@ -1281,6 +1281,11 @@ mod imp {
         line("banner", &none_or(&opts.banner));
         line("forcecommand", &none_or(&opts.force_command));
         line("chrootdirectory", &none_or(&opts.chroot_directory));
+        line("permituserrc", yn(opts.permit_user_rc.unwrap_or(true)));
+        line(
+            "xauthlocation",
+            opts.xauth_location.as_deref().unwrap_or("/usr/bin/xauth"),
+        );
         line(
             "pidfile",
             &if opts.pid_file_set {
@@ -4427,7 +4432,14 @@ mod imp {
         /// Everything needed to run `command` for `user`, short of spawning:
         /// logging, the passwd lookup, PAM session, environment and the
         /// privilege drop (in `pre_exec`). `Err` is a message for stderr.
-        fn prepare(&self, user: &str, env: &SessionEnv, command: &str) -> Result<Command, String> {
+        /// `command: None` runs the login shell itself (a `shell` request
+        /// without a terminal), as OpenSSH: argv0 `-bash`, commands on stdin.
+        fn prepare(
+            &self,
+            user: &str,
+            env: &SessionEnv,
+            command: Option<&str>,
+        ) -> Result<Command, String> {
             // Both the config `ForceCommand` directive and a user certificate's
             // `force-command` critical option are applied uniformly by the
             // server connection-phase dispatcher (it rewrites `command` to the
@@ -4435,7 +4447,9 @@ mod imp {
             // env before this handler runs). The handler therefore sees the
             // already-forced command and the populated env — no separate
             // force-command path lives here.
-            if self.debug {
+            if self.debug
+                && let Some(command) = command
+            {
                 if self.debug_commands {
                     eprintln!("sshd: exec by {user}: {}", sanitize_log(command));
                 } else {
@@ -4472,7 +4486,15 @@ mod imp {
             // Run the command via the user's login shell so that
             // /etc/passwd-configured shells (zsh, fish, …) are honoured.
             let mut cmd = Command::new(&info.shell_str);
-            cmd.args(["-c", command]).env_clear();
+            match command {
+                Some(command) => {
+                    cmd.args(["-c", command]);
+                }
+                None => {
+                    cmd.arg0(OsStr::from_bytes(info.argv0_c.to_bytes()));
+                }
+            }
+            cmd.env_clear();
             for (k, v) in &envs {
                 cmd.env(
                     OsStr::from_bytes(k.to_bytes()),
@@ -4536,6 +4558,22 @@ mod imp {
                     "/"
                 });
             }
+            // The rc files / xauth, as the user, in the home directory, with
+            // the session's environment (std only installs it at exec).
+            let vars: Vec<(String, String)> = cmd
+                .get_envs()
+                .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+                .collect();
+            if let Some(rc) = startup_rc(&info, env, false, Some(vars)) {
+                // SAFETY: runs after the privilege drop above (closures run
+                // in order); `run_startup_rc` is post-fork safe.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        run_startup_rc(&rc);
+                        Ok(())
+                    });
+                }
+            }
             Ok(cmd)
         }
 
@@ -4547,7 +4585,7 @@ mod imp {
             &self,
             user: &str,
             env: &SessionEnv,
-            command: &str,
+            command: Option<&str>,
             mut stream: ChannelStream,
         ) -> puressh::Result<()> {
             use puressh::server::ChannelEgress;
@@ -4636,7 +4674,7 @@ mod imp {
 
     impl CommandHandler for ShellCommandHandler {
         fn handle(&self, user: &str, env: &SessionEnv, command: &str) -> ExecResult {
-            let mut cmd = match self.prepare(user, env, command) {
+            let mut cmd = match self.prepare(user, env, Some(command)) {
                 Ok(c) => c,
                 Err(msg) => return ExecResult::new(Vec::new(), msg.into_bytes(), 255),
             };
@@ -4887,6 +4925,141 @@ mod imp {
     // when the daemon's already running as the target uid (e.g. an
     // unprivileged smoke test where `-u $USER`), the drop is a no-op.
     // -------------------------------------------------------------------------
+
+    /// `XAuthLocation` (`None`: `none`), set once at startup.
+    static XAUTH_LOCATION: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+    /// What runs in the session process just before its shell or command,
+    /// as OpenSSH's do_rc_files: `~/.ssh/rc` (through the user's shell,
+    /// when allowed), else `/etc/ssh/sshrc`, each fed `proto cookie` of a
+    /// forwarded X11 display on stdin; else, for X11, `xauth` adding the
+    /// display's cookie. Built before the fork: running it only uses
+    /// async-signal-safe calls.
+    struct StartupRc {
+        _strings: Vec<std::ffi::CString>,
+        argv: Vec<*const libc::c_char>,
+        /// `None`: the current environment (the pty child has set it up).
+        envp: Option<Vec<*const libc::c_char>>,
+        input: Vec<u8>,
+    }
+
+    // SAFETY: the pointers point into `_strings` (or into CStrings owned by
+    // the same closure), which live as long as the plan and never move.
+    unsafe impl Send for StartupRc {}
+    unsafe impl Sync for StartupRc {}
+
+    /// The plan for a session of `info` with `env` (`None`: nothing runs).
+    /// `subsystem`: only `/etc/ssh/sshrc` applies, as in OpenSSH.
+    fn startup_rc(
+        info: &UserInfo,
+        env: &SessionEnv,
+        subsystem: bool,
+        envp: Option<Vec<(String, String)>>,
+    ) -> Option<StartupRc> {
+        let x11 = env.x11_auth();
+        let cookie_line = x11.map(|(proto, cookie, _)| format!("{proto} {cookie}\n"));
+        let user_rc = format!("{}/.ssh/rc", info.home_str);
+        let (command, input) =
+            if !subsystem && env.user_rc_allowed() && std::path::Path::new(&user_rc).exists() {
+                (
+                    format!("{} -c '/bin/sh {user_rc}'", info.shell_str),
+                    cookie_line,
+                )
+            } else if std::path::Path::new("/etc/ssh/sshrc").exists() {
+                ("/bin/sh /etc/ssh/sshrc".to_string(), cookie_line)
+            } else if let (Some((proto, cookie, display)), Some(Some(xauth))) =
+                (x11, XAUTH_LOCATION.get())
+            {
+                (
+                    format!("{xauth} -q -"),
+                    Some(format!(
+                        "remove {display}\nadd {display} {proto} {cookie}\n"
+                    )),
+                )
+            } else {
+                return None;
+            };
+        let mut strings = Vec::new();
+        for a in ["/bin/sh", "-c", command.as_str()] {
+            strings.push(std::ffi::CString::new(a).ok()?);
+        }
+        let n_argv = strings.len();
+        if let Some(vars) = &envp {
+            for (k, v) in vars {
+                strings.push(std::ffi::CString::new(format!("{k}={v}")).ok()?);
+            }
+        }
+        let ptrs: Vec<*const libc::c_char> = strings.iter().map(|s| s.as_ptr()).collect();
+        let mut argv = ptrs[..n_argv].to_vec();
+        argv.push(std::ptr::null());
+        let envp = envp.map(|_| {
+            let mut e = ptrs[n_argv..].to_vec();
+            e.push(std::ptr::null());
+            e
+        });
+        Some(StartupRc {
+            _strings: strings,
+            argv,
+            envp,
+            input: input.unwrap_or_default().into_bytes(),
+        })
+    }
+
+    /// Run `rc` and wait for it, feeding its stdin; its stdout / stderr are
+    /// the session's. Post-fork safe: no allocation.
+    fn run_startup_rc(rc: &StartupRc) {
+        // SAFETY: plain fd / process syscalls on fds this function owns;
+        // argv / envp are NUL-terminated arrays of live C strings.
+        unsafe {
+            let mut fds = [0 as libc::c_int; 2];
+            if libc::pipe(fds.as_mut_ptr()) != 0 {
+                return;
+            }
+            // Writing to an rc that does not read must not kill us.
+            let old = libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            let pid = libc::fork();
+            if pid == 0 {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                libc::dup2(fds[0], 0);
+                libc::close(fds[0]);
+                libc::close(fds[1]);
+                match &rc.envp {
+                    Some(envp) => libc::execve(rc.argv[0], rc.argv.as_ptr(), envp.as_ptr()),
+                    None => libc::execv(rc.argv[0], rc.argv.as_ptr()),
+                };
+                libc::_exit(127);
+            }
+            libc::close(fds[0]);
+            if pid > 0 {
+                let mut off = 0;
+                while off < rc.input.len() {
+                    let n = libc::write(
+                        fds[1],
+                        rc.input[off..].as_ptr() as *const libc::c_void,
+                        rc.input.len() - off,
+                    );
+                    if n <= 0 {
+                        if n < 0
+                            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                        {
+                            continue;
+                        }
+                        break;
+                    }
+                    off += n as usize;
+                }
+            }
+            libc::close(fds[1]);
+            if pid > 0 {
+                let mut status = 0;
+                while libc::waitpid(pid, &mut status, 0) < 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
+                {
+                }
+            }
+            libc::signal(libc::SIGPIPE, old);
+        }
+    }
 
     /// Resolved POSIX identity for a login user. Captured pre-fork so
     /// every field is already owned and async-signal-safe to consume
@@ -5153,8 +5326,11 @@ mod imp {
             match pty {
                 Some(spec) => {
                     let print_motd = self.print_motd.load(std::sync::atomic::Ordering::Relaxed);
+                    let startup = lookup_user(user)
+                        .ok()
+                        .and_then(|info| startup_rc(&info, env, false, None));
                     spawn_pty_shell(
-                        &self.pam, user, &env_pairs, &spec, self.debug, print_motd, None,
+                        &self.pam, user, &env_pairs, &spec, self.debug, print_motd, None, startup,
                     )
                 }
                 None => spawn_pipe_shell(&self.pam, user, &env_pairs, self.debug),
@@ -5175,6 +5351,9 @@ mod imp {
                 .into_iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect();
+            let startup = lookup_user(user)
+                .ok()
+                .and_then(|info| startup_rc(&info, env, false, None));
             spawn_pty_shell(
                 &self.pam,
                 user,
@@ -5183,6 +5362,7 @@ mod imp {
                 self.debug,
                 false,
                 Some(command),
+                startup,
             )
         }
     }
@@ -5340,8 +5520,21 @@ mod imp {
         ) -> puressh::Result<()> {
             match &self.scp {
                 Some(scp) if scp.claims(command) => scp.run(user, env, command, stream),
-                _ => self.shell.run_streaming(user, env, command, stream),
+                _ => self.shell.run_streaming(user, env, Some(command), stream),
             }
+        }
+
+        fn claims_login_shell(&self) -> bool {
+            true
+        }
+
+        fn run_login_shell(
+            &self,
+            user: &str,
+            env: &SessionEnv,
+            stream: ChannelStream,
+        ) -> puressh::Result<()> {
+            self.shell.run_streaming(user, env, None, stream)
         }
     }
 
@@ -5792,6 +5985,7 @@ mod imp {
         debug: bool,
         print_motd: bool,
         command: Option<&str>,
+        startup: Option<StartupRc>,
     ) -> puressh::Result<Box<dyn ShellSession>> {
         // argv for `shell -c command`, built pre-fork (allocation is not
         // async-signal-safe after fork).
@@ -6059,6 +6253,18 @@ mod imp {
                     unsafe {
                         let _ = libc::write(1, bytes.as_ptr() as *const libc::c_void, bytes.len());
                     }
+                }
+
+                // The rc files / xauth (environment and cwd are set up),
+                // then SIGPIPE back to its default: Rust ignores it, and an
+                // ignored signal would survive into the user's shell
+                // (`yes | head` complaining of a broken pipe).
+                if let Some(rc) = &startup {
+                    run_startup_rc(rc);
+                }
+                // SAFETY: resetting a disposition; async-signal-safe.
+                unsafe {
+                    libc::signal(libc::SIGPIPE, libc::SIG_DFL);
                 }
 
                 // `exec` on a pty: `shell -c command`, plain argv0.
@@ -6917,6 +7123,11 @@ mod imp {
         // CLI flags always win over the config file.
         let mut sshd_cfg = load_effective_config(&cli)?;
         apply_openssh_defaults(&mut sshd_cfg.global);
+        let _ = XAUTH_LOCATION.set(match sshd_cfg.global.xauth_location.as_deref() {
+            Some(p) if p.eq_ignore_ascii_case("none") => None,
+            Some(p) => Some(p.to_string()),
+            None => Some("/usr/bin/xauth".to_string()),
+        });
         // `PubkeyAcceptedAlgorithms +ssh-rsa` (global or in a Match block):
         // accept old clients' SHA-1 RSA signatures, as OpenSSH then does.
         let names_ssh_rsa = |o: &puressh::config::ServerOptions| {

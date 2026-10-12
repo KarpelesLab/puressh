@@ -133,19 +133,54 @@ impl ExecResult {
 #[derive(Debug, Default, Clone)]
 pub struct SessionEnv {
     vars: BTreeMap<String, String>,
+    /// The forwarded display's `(protocol, cookie, xauth display)`, set by
+    /// an accepted `x11-req` ([`Self::x11_auth`]).
+    x11: Option<(String, String, String)>,
+    /// `~/.ssh/rc` refused by policy ([`Self::user_rc_allowed`]).
+    no_user_rc: bool,
 }
 
 impl SessionEnv {
     /// An empty environment.
     pub fn new() -> Self {
-        Self {
-            vars: BTreeMap::new(),
-        }
+        Self::default()
     }
 
     /// Insert or overwrite a key. Returns the previous value if any.
     pub fn insert(&mut self, key: impl Into<String>, value: impl Into<String>) -> Option<String> {
         self.vars.insert(key.into(), value.into())
+    }
+
+    /// The session's forwarded X11 display, for the programs that set up
+    /// its authority at session start (OpenSSH's do_rc_files): the
+    /// authorization protocol and hex cookie the client sent, and the
+    /// display as `xauth` names it (`unix:10.0`). `None` without `x11-req`.
+    pub fn x11_auth(&self) -> Option<(&str, &str, &str)> {
+        self.x11
+            .as_ref()
+            .map(|(p, c, d)| (p.as_str(), c.as_str(), d.as_str()))
+    }
+
+    /// Record the session's forwarded X11 display (see [`Self::x11_auth`]).
+    pub fn set_x11_auth(
+        &mut self,
+        protocol: impl Into<String>,
+        cookie: impl Into<String>,
+        display: impl Into<String>,
+    ) {
+        self.x11 = Some((protocol.into(), cookie.into(), display.into()));
+    }
+
+    /// Whether the session may run the user's `~/.ssh/rc`: `PermitUserRC`,
+    /// the key's `no-user-rc` / the certificate's `permit-user-rc`, and no
+    /// admin `ForceCommand`. `/etc/ssh/sshrc` is not affected.
+    pub fn user_rc_allowed(&self) -> bool {
+        !self.no_user_rc
+    }
+
+    /// Set [`Self::user_rc_allowed`].
+    pub fn set_user_rc_allowed(&mut self, allowed: bool) {
+        self.no_user_rc = !allowed;
     }
 
     /// Borrow a value by key.
@@ -433,6 +468,20 @@ pub trait ExecStreamHandler: Send + Sync {
     /// session-level environment at the time of the claim.
     fn run(&self, user: &str, env: &SessionEnv, command: &str, stream: ChannelStream)
     -> Result<()>;
+
+    /// Whether [`Self::run_login_shell`] serves a `shell` request that came
+    /// without a `pty-req` (`ssh host < script`). Default: no.
+    fn claims_login_shell(&self) -> bool {
+        false
+    }
+
+    /// Run the user's login shell over pipes (stdin from the channel,
+    /// stdout / stderr as data / extended data), as OpenSSH does for a shell
+    /// without a terminal. Called on a dedicated thread, like [`Self::run`].
+    fn run_login_shell(&self, user: &str, env: &SessionEnv, stream: ChannelStream) -> Result<()> {
+        let _ = (user, env, stream);
+        Err(Error::Unsupported("login shell without a terminal"))
+    }
 }
 
 /// Decoded `direct-tcpip` channel-open request (RFC 4254 §7.2).
@@ -1189,6 +1238,8 @@ pub struct EffectivePolicy {
     /// `ForceCommand` — overrides the client's exec/shell command. The
     /// original command is exposed as `SSH_ORIGINAL_COMMAND`.
     pub force_command: Option<String>,
+    /// `PermitUserRC` — `Some(false)` ⇒ `~/.ssh/rc` never runs.
+    pub permit_user_rc: Option<bool>,
     /// `ChrootDirectory` — the directory the session is confined to. Passed to
     /// the [`Config::on_session_open`] hook so it can `chroot()` (while still
     /// root, before any `setuid`) — confining shell, exec, and the in-process
@@ -1236,6 +1287,7 @@ impl EffectivePolicy {
             permit_listen: None,
             gateway_ports: None,
             force_command: None,
+            permit_user_rc: None,
             chroot_directory: None,
             client_alive_interval: None,
             client_alive_count_max: None,
@@ -1253,6 +1305,15 @@ impl EffectivePolicy {
     /// certificate must carry the `permit-pty` extension (default-deny).
     fn pty_allowed(&self) -> bool {
         self.permit_tty != Some(false) && self.cert_caps.as_ref().is_none_or(|c| c.permit_pty)
+    }
+
+    /// True iff `~/.ssh/rc` may run (OpenSSH's do_rc_files): not refused by
+    /// `PermitUserRC no` or the key / certificate, and no admin
+    /// `ForceCommand`.
+    fn user_rc_allowed(&self) -> bool {
+        self.permit_user_rc != Some(false)
+            && self.force_command.is_none()
+            && self.cert_caps.as_ref().is_none_or(|c| c.permit_user_rc)
     }
 
     /// `DisableForwarding yes` in force.
@@ -2109,6 +2170,7 @@ fn resolve_effective_policy(
         permit_listen: opts.permit_listen,
         gateway_ports: opts.gateway_ports,
         force_command: opts.force_command,
+        permit_user_rc: opts.permit_user_rc,
         chroot_directory: opts.chroot_directory,
         client_alive_interval: opts.client_alive_interval,
         client_alive_count_max: opts.client_alive_count_max,
@@ -3834,6 +3896,9 @@ fn handle_channel_request(
     // whose Open we somehow missed. Cheap insert; subsequent lookups are
     // O(log n) on the BTreeMap.
     let empty_env = SessionEnv::new();
+    envs.entry(channel)
+        .or_default()
+        .set_user_rc_allowed(effective.user_rc_allowed());
     match request {
         ChannelRequest::Exec { command } => {
             // ForceCommand (capability ceiling): when set, the client's
@@ -3902,7 +3967,7 @@ fn handle_channel_request(
             // ForceCommand on an interactive shell: OpenSSH runs the forced
             // command instead of the login shell, with an empty
             // SSH_ORIGINAL_COMMAND. `internal-sftp` routes to SFTP; any other
-            // forced command runs through the buffered command handler.
+            // forced command runs as an exec would.
             if let Some(forced) = effective.force_command.as_deref() {
                 envs.entry(channel)
                     .or_default()
@@ -3920,33 +3985,28 @@ fn handle_channel_request(
                         stream, driver, conn, channel, want_reply, shells, handled,
                     );
                 }
-                let env_ref = envs.get(&channel).unwrap_or(&empty_env);
-                let result = cfg.command_handler.handle(user, env_ref, forced);
+                return run_exec_command(
+                    stream, driver, conn, cfg, user, channel, forced, want_reply, subsystems, envs,
+                );
+            }
+            // No terminal: the login shell over pipes, when the handler can.
+            let no_pty = shells
+                .get(&channel)
+                .is_none_or(|rt| rt.pending_pty.is_none());
+            if no_pty
+                && let Some(handler) = cfg.exec_stream_handler.clone()
+                && handler.claims_login_shell()
+            {
+                shells.remove(&channel);
+                let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
+                let user_owned = user.to_string();
+                start_stream_handler(subsystems, channel, move |cs| {
+                    let _ = handler.run_login_shell(&user_owned, &env_snapshot, cs);
+                });
                 if want_reply {
                     let p = conn.send_request_success(channel)?;
                     srv_send(stream, driver, &p)?;
                 }
-                drain_send(stream, driver, conn, channel, &result.stdout, None)?;
-                drain_send(
-                    stream,
-                    driver,
-                    conn,
-                    channel,
-                    &result.stderr,
-                    Some(SSH_EXTENDED_DATA_STDERR),
-                )?;
-                let p = conn.send_request(
-                    channel,
-                    ChannelRequest::ExitStatus {
-                        code: result.exit_status,
-                    },
-                    false,
-                )?;
-                srv_send(stream, driver, &p)?;
-                let p = conn.send_eof(channel)?;
-                srv_send(stream, driver, &p)?;
-                let p = conn.send_close(channel)?;
-                srv_send(stream, driver, &p)?;
                 return Ok(());
             }
             if let Some(handler) = cfg.shell_handler.clone() {
@@ -4168,9 +4228,15 @@ fn handle_channel_request(
                     ctx,
                 ) {
                     Ok(handle) => {
-                        envs.entry(channel)
-                            .or_default()
-                            .insert("DISPLAY".to_string(), handle.display_env.clone());
+                        let env = envs.entry(channel).or_default();
+                        env.insert("DISPLAY".to_string(), handle.display_env.clone());
+                        // For xauth / the rc files: X11UseLocalhost's
+                        // `unix:N.S` entry, as OpenSSH writes it.
+                        env.set_x11_auth(
+                            auth_protocol.as_str(),
+                            auth_cookie.as_str(),
+                            alloc::format!("unix:{}.{screen}", handle.display_number),
+                        );
                         x11_forward.active.insert(channel, handle);
                         if want_reply {
                             let p = conn.send_request_success(channel)?;
@@ -4206,6 +4272,33 @@ fn handle_channel_request(
 /// buffered [`CommandHandler`] and close the channel. Shared by the `exec`
 /// request path and by `subsystem` requests rewritten by `ForceCommand`, so a
 /// forced command behaves identically however the session was requested.
+/// Run `body` on its own thread over a [`ChannelStream`] for `channel`,
+/// registered like a subsystem so the dispatcher pumps it.
+fn start_stream_handler(
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+    channel: u32,
+    body: impl FnOnce(ChannelStream) + Send + 'static,
+) {
+    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+    let cs = ChannelStream::new(ingress_rx, egress_tx);
+    thread::spawn(move || body(cs));
+    subsystems.insert(
+        channel,
+        SubsystemRuntime {
+            ingress_tx,
+            egress_rx,
+            pending_data: Vec::new(),
+            pending_eof: false,
+            pending_close: false,
+            pending_stderr: Vec::new(),
+            pending_exit: None,
+            eof_sent: false,
+            close_sent: false,
+        },
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_exec_command(
     stream: &mut TcpStream,
@@ -4231,32 +4324,14 @@ fn run_exec_command(
     if let Some(handler) = cfg.exec_stream_handler.clone()
         && handler.claims(command)
     {
-        let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
-        let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
-        let cs = ChannelStream::new(ingress_rx, egress_tx);
         let user_owned = user.to_string();
         let command_owned = command.to_string();
         let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
-        let handler_for_thread = handler;
-        thread::spawn(move || {
+        start_stream_handler(subsystems, channel, move |cs| {
             // Errors swallowed: the stream auto-emits
             // EOF + Close on drop, so the peer sees teardown.
-            let _ = handler_for_thread.run(&user_owned, &env_snapshot, &command_owned, cs);
+            let _ = handler.run(&user_owned, &env_snapshot, &command_owned, cs);
         });
-        subsystems.insert(
-            channel,
-            SubsystemRuntime {
-                ingress_tx,
-                egress_rx,
-                pending_data: Vec::new(),
-                pending_eof: false,
-                pending_close: false,
-                pending_stderr: Vec::new(),
-                pending_exit: None,
-                eof_sent: false,
-                close_sent: false,
-            },
-        );
         if want_reply {
             let p = conn.send_request_success(channel)?;
             srv_send(stream, driver, &p)?;
@@ -7178,6 +7253,7 @@ mod tests {
             permit_port_forwarding: true,
             permit_agent_forwarding: true,
             permit_x11_forwarding: true,
+            permit_user_rc: true,
             force_command: None,
             permit_open: None,
             permit_listen: None,
@@ -7192,6 +7268,7 @@ mod tests {
             permit_port_forwarding: false,
             permit_agent_forwarding: false,
             permit_x11_forwarding: false,
+            permit_user_rc: false,
             force_command: None,
             permit_open: None,
             permit_listen: None,
@@ -7270,6 +7347,7 @@ mod tests {
             permit_port_forwarding: false,
             permit_agent_forwarding: false,
             permit_x11_forwarding: false,
+            permit_user_rc: false,
             force_command: None,
             permit_open: None,
             permit_listen: None,

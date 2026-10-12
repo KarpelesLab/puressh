@@ -266,8 +266,12 @@ mod auth_sock_tests {
     /// and the listener (held by the caller so the socket stays alive).
     fn make_socket() -> (PathBuf, UnixListener) {
         let dir = std::env::temp_dir();
+        // A counter as well: macOS clocks tick in microseconds, so two
+        // tests running at once could otherwise pick the same name.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let unique = format!(
-            "puressh-auth-sock-test-{}-{}",
+            "puressh-auth-sock-test-{}-{}-{}",
+            N.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

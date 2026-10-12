@@ -944,9 +944,15 @@ pub fn identity_signer(
 /// second" credential layering without platform checks.
 #[cfg(unix)]
 pub fn connect_agent_credentials() -> Result<Vec<ClientCredential>, String> {
-    let agent = match Agent::connect_env().map_err(|e| format!("connect: {e}"))? {
-        Some(a) => a,
-        None => return Ok(Vec::new()),
+    // No agent, or a stale $SSH_AUTH_SOCK: carry on without (OpenSSH only
+    // says so at debug level).
+    let agent = match Agent::connect_env() {
+        Ok(Some(a)) => a,
+        Ok(None) => return Ok(Vec::new()),
+        Err(e) => {
+            vlog(1, &format!("agent: {e}"));
+            return Ok(Vec::new());
+        }
     };
     let agent = Arc::new(Mutex::new(agent));
     let identities = {

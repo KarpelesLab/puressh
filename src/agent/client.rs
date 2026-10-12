@@ -81,30 +81,14 @@ impl Agent {
         Ok(Self { stream })
     }
 
-    /// Connect using `$SSH_AUTH_SOCK`. Returns `None` if the env var is
-    /// unset or empty — callers typically degrade to "no agent
-    /// available" rather than treating that as an error.
+    /// Connect to the agent named by `$SSH_AUTH_SOCK`: `Ok(None)` when it is
+    /// unset or empty; an error when it names no Unix-domain socket (a
+    /// stale path after a logout) or the connection fails.
     ///
-    /// Security: a malicious or careless setup can point `SSH_AUTH_SOCK`
-    /// at a symlink, a regular file, or a socket owned by another user
-    /// (or world-writable) and trick this process into asking the wrong
-    /// agent to sign challenges — i.e. impersonate us against any server
-    /// we contact. Before connecting we therefore validate the path with
-    /// `lstat`-equivalent semantics:
-    ///
-    /// - the path must exist and not be a symlink (`symlink_metadata`,
-    ///   `file_type().is_symlink()` check);
-    /// - it must be a Unix-domain socket (the file type bits via
-    ///   `libc::stat`, since the standard library does not expose
-    ///   `is_socket()` directly);
-    /// - it must be owned by the calling user (`st_uid == geteuid()`);
-    /// - it must not be group- or world-accessible
-    ///   (`st_mode & 0o077 == 0`).
-    ///
-    /// Any failure is reported on stderr and the function returns
-    /// `Ok(None)` so the caller falls back to other auth methods rather
-    /// than aborting the whole session. We only return `Err` when the
-    /// underlying connect itself fails after the path passed validation.
+    /// As OpenSSH, the path is taken as given: a symlink to the socket (a
+    /// `~/.ssh/auth_sock` kept for tmux, 1Password's `agent.sock`) and an
+    /// agent owned by another user (`sudo` with `SSH_AUTH_SOCK` kept) are
+    /// used; access is the filesystem's to grant.
     pub fn connect_env() -> Result<Option<Self>> {
         let raw: OsString = match std::env::var_os("SSH_AUTH_SOCK") {
             Some(v) if !v.is_empty() => v,
@@ -112,11 +96,7 @@ impl Agent {
         };
         let path = PathBuf::from(raw);
         if let Err(why) = validate_auth_sock(&path) {
-            eprintln!(
-                "warning: SSH_AUTH_SOCK={} rejected: {why}; ignoring agent",
-                path.display()
-            );
-            return Ok(None);
+            return Err(Error::Io(std::io::Error::other(why)));
         }
         Self::connect(path).map(Some)
     }
@@ -261,60 +241,19 @@ impl Agent {
     }
 }
 
-/// Validate a candidate `SSH_AUTH_SOCK` path. See [`Agent::connect_env`]
-/// for the security rationale. Returns the human-readable reason on
-/// failure so callers can log it. Crate-visible so agent *forwarding*
-/// (`forwarding::agent`) applies the same trust check before splicing a
-/// remote `auth-agent@openssh.com` channel into the local agent.
+/// Whether `path` is a Unix-domain socket (following symlinks, as
+/// OpenSSH's `connect(2)` does). The reason when not: `No such file or
+/// directory` for a stale path. Crate-visible so agent *forwarding*
+/// (`forwarding::agent`) skips a missing agent the same way.
 pub(crate) fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
-    // `symlink_metadata` does not follow symlinks; combined with the
-    // `is_symlink()` check this means a symlink anywhere in the *final*
-    // component is rejected outright. We intentionally do NOT canonicalize
-    // — canonicalization would silently follow the symlink we're trying to
-    // diagnose. Symlinks earlier in the path (parent directories) are still
-    // allowed because they typically belong to the OS (e.g. `/tmp` on macOS
-    // is a symlink to `/private/tmp`).
-    let md = std::fs::symlink_metadata(path)
-        .map_err(|e| format!("cannot stat: {e} (does the agent socket exist?)"))?;
-    if md.file_type().is_symlink() {
-        return Err(
-            "path is a symlink (a malicious symlink could redirect to another agent)".into(),
-        );
-    }
-
-    // The standard library exposes file_type().is_file() / .is_dir() but
-    // not .is_socket(); on Unix, std::os::unix::fs::FileTypeExt gives us
-    // is_socket() and MetadataExt exposes raw st_mode / st_uid bits — both
-    // routed through the already-fetched `md`, avoiding both a second
-    // syscall and any unsafe libc surface. (The library forbids
-    // `unsafe_code` outside the `ffi` feature; nix::unistd::geteuid wraps
-    // the syscall safely for us.)
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::fs::FileTypeExt;
+    let md = std::fs::metadata(path).map_err(|e| {
+        let s = e.to_string();
+        s.split(" (os error").next().unwrap_or(&s).to_string()
+    })?;
     if !md.file_type().is_socket() {
-        return Err("path is not a Unix-domain socket".into());
+        return Err("not a Unix-domain socket".into());
     }
-
-    let euid = nix::unistd::geteuid().as_raw();
-    if md.uid() != euid {
-        return Err(format!(
-            "socket is owned by uid {} but we are euid {} (refusing to trust another user's agent)",
-            md.uid(),
-            euid
-        ));
-    }
-
-    // Group + other bits must all be clear. World-writable agents are an
-    // obvious foot-gun; group-writable is also unsafe in any multi-user
-    // setup. OpenSSH enforces the same on `ssh-agent -a`. The constant is
-    // 0o077 (rwx for group and other).
-    let mode = md.mode();
-    if (mode & 0o077) != 0 {
-        return Err(format!(
-            "socket is group/world-accessible (mode {:o}); refusing to use it",
-            mode & 0o777
-        ));
-    }
-
     Ok(())
 }
 
@@ -386,7 +325,8 @@ mod auth_sock_tests {
     }
 
     #[test]
-    fn symlink_is_rejected() {
+    fn symlink_to_a_socket_is_accepted() {
+        // As OpenSSH (a ~/.ssh/auth_sock for tmux, 1Password's agent.sock).
         let (target, _l) = make_socket();
         let link = std::env::temp_dir().join(format!(
             "puressh-symlink-{}-{}",
@@ -401,18 +341,18 @@ mod auth_sock_tests {
         let r = validate_auth_sock(&link);
         std::fs::remove_file(&link).ok();
         std::fs::remove_file(&target).ok();
-        let msg = r.unwrap_err();
-        assert!(msg.contains("symlink"), "got: {msg}");
+        assert!(r.is_ok(), "{r:?}");
     }
 
     #[test]
-    fn group_or_world_accessible_is_rejected() {
+    fn group_accessible_socket_is_accepted() {
+        // Desktop keyring agents' sockets are often group-accessible; the
+        // filesystem decides who may connect, as with OpenSSH.
         let (p, _l) = make_socket();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o775)).unwrap();
         let r = validate_auth_sock(&p);
         std::fs::remove_file(&p).ok();
-        let msg = r.unwrap_err();
-        assert!(msg.contains("group/world-accessible"), "got: {msg}");
+        assert!(r.is_ok(), "{r:?}");
     }
 }

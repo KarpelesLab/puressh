@@ -390,12 +390,8 @@ pub fn splice_to_unix_socket_callback(
 
 /// Convenience over [`splice_to_unix_socket_callback`] that pulls the
 /// socket path from the process env (`$SSH_AUTH_SOCK`). Returns `None` if
-/// the env var is unset or empty, or if the path fails the same trust check
-/// credential lookup applies (`Agent::connect_env`): it must exist, be a
-/// Unix-domain socket rather than a symlink, be owned by our effective uid,
-/// and carry no group/other permission bits. A rejection is reported on
-/// stderr — `ssh -A` would otherwise hand every forwarded agent request to
-/// whatever another local user planted at that path.
+/// the env var is unset or empty, or names no Unix-domain socket (nothing
+/// to forward; OpenSSH says nothing either).
 pub fn splice_to_local_agent_callback() -> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>>
 {
     let raw = std::env::var("SSH_AUTH_SOCK").ok()?;
@@ -403,11 +399,7 @@ pub fn splice_to_local_agent_callback() -> Option<Arc<dyn Fn(ChannelStream) + Se
         return None;
     }
     let path = PathBuf::from(raw);
-    if let Err(why) = crate::agent::client::validate_auth_sock(&path) {
-        eprintln!(
-            "warning: SSH_AUTH_SOCK={} rejected: {why}; not forwarding the agent",
-            path.display()
-        );
+    if crate::agent::client::validate_auth_sock(&path).is_err() {
         return None;
     }
     splice_to_unix_socket_callback(path)

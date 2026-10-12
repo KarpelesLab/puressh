@@ -208,6 +208,10 @@ mod imp {
                 eprintln!("Could not open a connection to your authentication agent.");
                 return 2;
             }
+            Err(puressh::Error::Io(e)) => {
+                eprintln!("Error connecting to agent: {e}");
+                return 2;
+            }
             Err(e) => {
                 eprintln!("Error connecting to agent: {e}");
                 return 2;

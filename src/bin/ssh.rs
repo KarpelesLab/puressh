@@ -1239,11 +1239,11 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
     let mut agent = match Agent::connect_env() {
         Ok(Some(a)) => a,
         Ok(None) => {
-            warn!("warning: AddKeysToAgent: no agent at $SSH_AUTH_SOCK; skipping");
+            vlog(1, "AddKeysToAgent: no authentication agent, not adding key");
             return;
         }
         Err(e) => {
-            warn!("warning: AddKeysToAgent: agent connect: {e}");
+            vlog(1, &format!("AddKeysToAgent: agent: {e}"));
             return;
         }
     };

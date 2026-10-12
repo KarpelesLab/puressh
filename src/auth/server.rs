@@ -301,6 +301,9 @@ pub struct AuthCertCaps {
     /// `permit-user-rc` present (or no `no-user-rc` key option) ⇒ the
     /// session may run `~/.ssh/rc`.
     pub permit_user_rc: bool,
+    /// `environment="NAME=value"` key options, set in the session when
+    /// `PermitUserEnvironment` allows.
+    pub environment: Vec<String>,
     /// The decoded `force-command` critical option (an SSH `string`), if present.
     /// The connection phase runs this in place of the client's command/shell.
     pub force_command: Option<String>,
@@ -334,6 +337,7 @@ impl AuthCertCaps {
             permit_agent_forwarding: ci.has_extension("permit-agent-forwarding"),
             permit_x11_forwarding: ci.has_extension("permit-X11-forwarding"),
             permit_user_rc: ci.has_extension("permit-user-rc"),
+            environment: Vec::new(),
             force_command,
             permit_open: None,
             permit_listen: None,
@@ -349,6 +353,7 @@ impl AuthCertCaps {
             permit_agent_forwarding: true,
             permit_x11_forwarding: true,
             permit_user_rc: true,
+            environment: Vec::new(),
             force_command: None,
             permit_open: None,
             permit_listen: None,
@@ -367,6 +372,7 @@ impl AuthCertCaps {
             permit_agent_forwarding: o.allows_agent_forwarding(),
             permit_x11_forwarding: o.allows_x11_forwarding(),
             permit_user_rc: o.allows_user_rc(),
+            environment: o.environment.clone(),
             force_command: o.command.clone(),
             permit_open: list(&o.permit_open),
             permit_listen: list(&o.permit_listen),
@@ -385,12 +391,15 @@ impl AuthCertCaps {
             (Some(a), Some(b)) => Some(a.into_iter().filter(|e| b.contains(e)).collect()),
             (a, b) => a.or(b),
         };
+        let mut environment = self.environment;
+        environment.extend(other.environment);
         Some(AuthCertCaps {
             permit_pty: self.permit_pty && other.permit_pty,
             permit_port_forwarding: self.permit_port_forwarding && other.permit_port_forwarding,
             permit_agent_forwarding: self.permit_agent_forwarding && other.permit_agent_forwarding,
             permit_x11_forwarding: self.permit_x11_forwarding && other.permit_x11_forwarding,
             permit_user_rc: self.permit_user_rc && other.permit_user_rc,
+            environment,
             force_command,
             permit_open: both(self.permit_open, other.permit_open),
             permit_listen: both(self.permit_listen, other.permit_listen),

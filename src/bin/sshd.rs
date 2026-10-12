@@ -1283,6 +1283,13 @@ mod imp {
         line("chrootdirectory", &none_or(&opts.chroot_directory));
         line("permituserrc", yn(opts.permit_user_rc.unwrap_or(true)));
         line(
+            "permituserenvironment",
+            opts.permit_user_environment.as_deref().unwrap_or("no"),
+        );
+        for e in &opts.set_env {
+            line("setenv", e);
+        }
+        line(
             "xauthlocation",
             opts.xauth_location.as_deref().unwrap_or("/usr/bin/xauth"),
         );
@@ -1345,7 +1352,6 @@ mod imp {
             ("hostbasedauthentication", "no"),
             ("ignorerhosts", "yes"),
             ("gssapiauthentication", "no"),
-            ("permituserenvironment", "no"),
             ("permittunnel", "no"),
             ("exposeauthinfo", "no"),
             ("usedns", "no"),
@@ -4507,7 +4513,7 @@ mod imp {
             // dispatcher already discards the env on channel close.
             // safe_session_env enforces a defense-in-depth blocklist
             // (LD_PRELOAD/IFS/PATH/etc.) on top of the server's filter.
-            for (k, v) in safe_session_env(env) {
+            for (k, v) in session_vars(env, &info.home_str) {
                 cmd.env(k, v);
             }
             for (k, v) in connection_env(None) {
@@ -4898,6 +4904,49 @@ mod imp {
                 !k.contains('\0') && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
             })
             .collect()
+    }
+
+    /// The session's variables, layered as OpenSSH does: the client's
+    /// (`AcceptEnv`) and `environment=` key options, then the user's
+    /// `~/.ssh/environment` where `PermitUserEnvironment` allows, then the
+    /// administrator's `SetEnv`, which wins. `home` is read as the user.
+    fn session_vars(env: &SessionEnv, home: &str) -> Vec<(String, String)> {
+        let mut vars: Vec<(String, String)> = safe_session_env(env)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let mut set = |k: &str, v: &str| {
+            if k.is_empty() || k.contains('\0') || v.contains('\0') {
+                return;
+            }
+            match vars.iter_mut().find(|(n, _)| n == k) {
+                Some(slot) => slot.1 = v.to_string(),
+                None => vars.push((k.to_string(), v.to_string())),
+            }
+        };
+        if env.user_environment_enabled() {
+            // OpenSSH's read_environment_file: NAME=value lines, comments
+            // and blank lines skipped, at most 1000 entries.
+            let path = format!("{home}/.ssh/environment");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                for line in text.lines().take(1000) {
+                    let line = line.trim_start();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some((k, v)) = line.split_once('=')
+                        && env.user_environment_permits(k)
+                        && !HARD_BLOCKED_ENV_NAMES.contains(&k)
+                    {
+                        set(k, v);
+                    }
+                }
+            }
+        }
+        for (k, v) in env.admin_env() {
+            set(k, v);
+        }
+        vars
     }
 
     /// Same filter as [`safe_session_env`], but on an owned `(String,
@@ -5319,10 +5368,9 @@ mod imp {
             // across that boundary, so we hand it owned (key, value) pairs.
             // safe_session_env enforces a defense-in-depth blocklist
             // (LD_PRELOAD/IFS/PATH/etc.) on top of the server's filter.
-            let env_pairs: Vec<(String, String)> = safe_session_env(env)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+            let env_pairs = lookup_user(user)
+                .map(|info| session_vars(env, &info.home_str))
+                .unwrap_or_default();
             match pty {
                 Some(spec) => {
                     let print_motd = self.print_motd.load(std::sync::atomic::Ordering::Relaxed);
@@ -5347,10 +5395,9 @@ mod imp {
             pty: PtySpec,
             command: &str,
         ) -> puressh::Result<Box<dyn ShellSession>> {
-            let env_pairs: Vec<(String, String)> = safe_session_env(env)
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect();
+            let env_pairs = lookup_user(user)
+                .map(|info| session_vars(env, &info.home_str))
+                .unwrap_or_default();
             let startup = lookup_user(user)
                 .ok()
                 .and_then(|info| startup_rc(&info, env, false, None));

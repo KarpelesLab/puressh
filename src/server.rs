@@ -138,6 +138,10 @@ pub struct SessionEnv {
     x11: Option<(String, String, String)>,
     /// `~/.ssh/rc` refused by policy ([`Self::user_rc_allowed`]).
     no_user_rc: bool,
+    /// `SetEnv` ([`Self::admin_env`]).
+    admin_env: Vec<(String, String)>,
+    /// `PermitUserEnvironment` patterns ([`Self::user_environment_permits`]).
+    user_env: Option<String>,
 }
 
 impl SessionEnv {
@@ -181,6 +185,65 @@ impl SessionEnv {
     /// Set [`Self::user_rc_allowed`].
     pub fn set_user_rc_allowed(&mut self, allowed: bool) {
         self.no_user_rc = !allowed;
+    }
+
+    /// The administrator's `SetEnv` variables, to set last: they override
+    /// the client's ([`Self::iter`]) and the user's `~/.ssh/environment`.
+    pub fn admin_env(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.admin_env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Set [`Self::admin_env`] from `NAME=value` entries (the first value of
+    /// a name wins, as in OpenSSH).
+    pub fn set_admin_env<'a>(&mut self, entries: impl IntoIterator<Item = &'a str>) {
+        self.admin_env.clear();
+        for e in entries {
+            if let Some((k, v)) = e.split_once('=')
+                && !self.admin_env.iter().any(|(n, _)| n == k)
+            {
+                self.admin_env.push((k.to_string(), v.to_string()));
+            }
+        }
+    }
+
+    /// Whether `PermitUserEnvironment` lets `~/.ssh/environment` (or an
+    /// `environment=` key option) set `name`.
+    pub fn user_environment_permits(&self, name: &str) -> bool {
+        match self.user_env.as_deref() {
+            None => false,
+            Some(v) if v.eq_ignore_ascii_case("no") => false,
+            Some(v) if v.eq_ignore_ascii_case("yes") => true,
+            Some(v) => {
+                let pats: Vec<String> = v.split(',').map(|p| p.trim().to_string()).collect();
+                crate::config::glob::host_matches(
+                    &crate::config::glob::HostPattern::parse_all(&pats),
+                    name,
+                )
+            }
+        }
+    }
+
+    /// Whether `PermitUserEnvironment` is on at all (`~/.ssh/environment`
+    /// is read).
+    pub fn user_environment_enabled(&self) -> bool {
+        self.user_env
+            .as_deref()
+            .is_some_and(|v| !v.eq_ignore_ascii_case("no"))
+    }
+
+    /// Set [`Self::user_environment_permits`] (`PermitUserEnvironment`).
+    ///
+    /// ```
+    /// let mut env = puressh::server::SessionEnv::new();
+    /// assert!(!env.user_environment_permits("LANG"));
+    /// env.set_user_environment(Some("LANG,!LC_ALL,LC_*"));
+    /// assert!(env.user_environment_permits("LANG") && env.user_environment_permits("LC_TIME"));
+    /// assert!(!env.user_environment_permits("LC_ALL") && !env.user_environment_permits("PATH"));
+    /// env.set_admin_env(["A=1", "B=2", "A=3"]);
+    /// assert_eq!(env.admin_env().collect::<Vec<_>>(), [("A", "1"), ("B", "2")]);
+    /// ```
+    pub fn set_user_environment(&mut self, setting: Option<&str>) {
+        self.user_env = setting.map(str::to_string);
     }
 
     /// Borrow a value by key.
@@ -1240,6 +1303,12 @@ pub struct EffectivePolicy {
     pub force_command: Option<String>,
     /// `PermitUserRC` — `Some(false)` ⇒ `~/.ssh/rc` never runs.
     pub permit_user_rc: Option<bool>,
+    /// `SetEnv` — `NAME=value` set in every session, overriding the
+    /// client's and the user's variables (first value of a name wins).
+    pub set_env: Vec<String>,
+    /// `PermitUserEnvironment` — `None` / `no` ⇒ `~/.ssh/environment` and
+    /// `environment=` key options are ignored.
+    pub permit_user_environment: Option<String>,
     /// `ChrootDirectory` — the directory the session is confined to. Passed to
     /// the [`Config::on_session_open`] hook so it can `chroot()` (while still
     /// root, before any `setuid`) — confining shell, exec, and the in-process
@@ -1288,6 +1357,8 @@ impl EffectivePolicy {
             gateway_ports: None,
             force_command: None,
             permit_user_rc: None,
+            set_env: Vec::new(),
+            permit_user_environment: None,
             chroot_directory: None,
             client_alive_interval: None,
             client_alive_count_max: None,
@@ -2171,6 +2242,8 @@ fn resolve_effective_policy(
         gateway_ports: opts.gateway_ports,
         force_command: opts.force_command,
         permit_user_rc: opts.permit_user_rc,
+        set_env: opts.set_env,
+        permit_user_environment: opts.permit_user_environment,
         chroot_directory: opts.chroot_directory,
         client_alive_interval: opts.client_alive_interval,
         client_alive_count_max: opts.client_alive_count_max,
@@ -3896,9 +3969,23 @@ fn handle_channel_request(
     // whose Open we somehow missed. Cheap insert; subsequent lookups are
     // O(log n) on the BTreeMap.
     let empty_env = SessionEnv::new();
-    envs.entry(channel)
-        .or_default()
-        .set_user_rc_allowed(effective.user_rc_allowed());
+    {
+        let env = envs.entry(channel).or_default();
+        env.set_user_rc_allowed(effective.user_rc_allowed());
+        env.set_admin_env(effective.set_env.iter().map(String::as_str));
+        env.set_user_environment(effective.permit_user_environment.as_deref());
+        // `environment=` key options, where PermitUserEnvironment allows.
+        if let Some(caps) = &effective.cert_caps {
+            for e in &caps.environment {
+                if let Some((k, v)) = e.split_once('=')
+                    && env.user_environment_permits(k)
+                    && !HARD_BLOCKED_ENV_NAMES.contains(&k)
+                {
+                    env.insert(k, v);
+                }
+            }
+        }
+    }
     match request {
         ChannelRequest::Exec { command } => {
             // ForceCommand (capability ceiling): when set, the client's
@@ -7254,6 +7341,7 @@ mod tests {
             permit_agent_forwarding: true,
             permit_x11_forwarding: true,
             permit_user_rc: true,
+            environment: Vec::new(),
             force_command: None,
             permit_open: None,
             permit_listen: None,
@@ -7269,6 +7357,7 @@ mod tests {
             permit_agent_forwarding: false,
             permit_x11_forwarding: false,
             permit_user_rc: false,
+            environment: Vec::new(),
             force_command: None,
             permit_open: None,
             permit_listen: None,
@@ -7348,6 +7437,7 @@ mod tests {
             permit_agent_forwarding: false,
             permit_x11_forwarding: false,
             permit_user_rc: false,
+            environment: Vec::new(),
             force_command: None,
             permit_open: None,
             permit_listen: None,

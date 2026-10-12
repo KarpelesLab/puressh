@@ -125,6 +125,7 @@ impl AuthorizedKeyOptions {
             && self.allows_agent_forwarding()
             && self.allows_x11_forwarding()
             && self.allows_user_rc()
+            && self.environment.is_empty()
     }
 
     /// Parse a comma-separated option list (the leading field of an

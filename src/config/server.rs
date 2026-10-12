@@ -149,6 +149,12 @@ pub struct ServerOptions {
     pub xauth_location: Option<String>,
     /// `AcceptEnv` patterns — cumulative.
     pub accept_env: Vec<String>,
+    /// `SetEnv` `NAME=value` entries — cumulative; the first value of a
+    /// name wins. They override the client's and the user's variables.
+    pub set_env: Vec<String>,
+    /// `PermitUserEnvironment`: `no`, `yes`, or a pattern list of the
+    /// variable names `~/.ssh/environment` and `environment=` may set.
+    pub permit_user_environment: Option<String>,
     /// `StrictModes` (yes/no).
     pub strict_modes: Option<bool>,
     /// `LogLevel`, numbered as OpenSSH orders them: 0 QUIET, 1 FATAL,
@@ -675,6 +681,10 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(authorized_principals_command_user);
     dst.allow_users.extend(src.allow_users.iter().cloned());
     dst.accept_env.extend(src.accept_env.iter().cloned());
+    dst.set_env.extend(src.set_env.iter().cloned());
+    if dst.permit_user_environment.is_none() {
+        dst.permit_user_environment = src.permit_user_environment.clone();
+    }
     dst.deny_users.extend(src.deny_users.iter().cloned());
     dst.allow_groups.extend(src.allow_groups.iter().cloned());
     dst.deny_groups.extend(src.deny_groups.iter().cloned());
@@ -918,6 +928,29 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             for p in &line.args {
                 opts.accept_env.push(p.clone());
             }
+        }
+        "setenv" => {
+            for a in &line.args {
+                if !a.contains('=') || a.starts_with('=') {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: kw.to_string(),
+                        msg: alloc::format!("expected NAME=value, got {a:?}"),
+                    });
+                }
+                opts.set_env.push(a.clone());
+            }
+        }
+        "permituserenvironment" => {
+            let v = line.args.join(",");
+            if v.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected yes, no or a pattern list".into(),
+                });
+            }
+            opts.permit_user_environment = Some(v);
         }
         "strictmodes" => {
             opts.strict_modes = Some(parse_yes_no(line)?);
@@ -1315,12 +1348,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
         &["none"],
         "host keys held by an agent are not used",
     ),
-    (
-        "PermitUserEnvironment",
-        &["no"],
-        "~/.ssh/environment is never read",
-    ),
-    ("SetEnv", &[], "the variables are not set in sessions"),
     (
         "GSSAPIAuthentication",
         &["no"],
@@ -1974,6 +2001,31 @@ Match Group ops
                 "/etc/ssh/ca_lan.pub".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn set_env_and_permit_user_environment_parse() {
+        let cfg = SshServerConfig::parse(
+            "SetEnv A=1 \"B=two words\"\nSetEnv A=ignored\nPermitUserEnvironment LANG,TZ\n\
+             Match User x\n\tSetEnv C=3\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.global.set_env, ["A=1", "B=two words", "A=ignored"]);
+        assert_eq!(
+            cfg.global.permit_user_environment.as_deref(),
+            Some("LANG,TZ")
+        );
+        let ctx = MatchContext {
+            user: Some("x"),
+            ..MatchContext::default()
+        };
+        assert!(
+            cfg.resolve(&ctx, ExecPolicy::Deny)
+                .set_env
+                .contains(&"C=3".to_string())
+        );
+        assert!(SshServerConfig::parse("SetEnv NOEQUALS\n").is_err());
+        assert_eq!(cfg.warnings().count(), 0);
     }
 
     #[test]
@@ -2689,10 +2741,12 @@ UsePrivilegeSeparation sandbox
         )
         .unwrap();
         let w: Vec<_> = cfg.warnings().collect();
-        assert_eq!(w.len(), 4, "{w:?}");
+        assert_eq!(w.len(), 2, "{w:?}");
         assert!(w[0].contains("GSSAPIAuthentication") && w[0].contains("line 1"));
         assert!(w[1].contains("KerberosAuthentication"));
         assert!(w.iter().all(|x| !x.contains("UseDNS")));
+        // Implemented now: no warning.
+        assert!(w.iter().all(|x| !x.contains("SetEnv") && !x.contains("PermitUserEnv")));
     }
 
     #[test]

@@ -72,6 +72,7 @@ fn auth_log_lines_match_openssh() {
     )
     .unwrap();
     let child = Command::new(env!("CARGO_BIN_EXE_sshd"))
+        .arg("-D")
         .arg("-e")
         .arg("-f")
         .arg(p("sshd_config"))

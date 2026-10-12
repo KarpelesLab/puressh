@@ -112,6 +112,7 @@ fn spawn_our_sshd(tmp: &Path) -> Option<(u16, String, PathBuf, SshdGuard)> {
     let user = current_user();
     let port = pick_free_port();
     let child = Command::new(&sshd_bin)
+        .arg("-D")
         .args(["-f", &config.display().to_string()])
         .args(["-b", "127.0.0.1"])
         .args(["-p", &port.to_string()])

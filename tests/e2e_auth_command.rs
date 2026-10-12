@@ -172,6 +172,7 @@ fn authorized_keys_and_principals_commands() {
 
     let port = pick_free_port();
     let child = Command::new(env!("CARGO_BIN_EXE_sshd"))
+        .arg("-D")
         .arg("-f")
         .arg(p("sshd_config"))
         .args(["-b", "127.0.0.1", "-p", &port.to_string(), "-u", &user])

@@ -746,6 +746,9 @@ mod imp {
         connection_spec: Vec<String>,
         /// `-t`: check the configuration and host keys, then exit.
         test_only: bool,
+        /// `-D`: stay in the foreground. Without it (and without `-d`), the
+        /// daemon detaches once it is listening, as OpenSSH's does.
+        no_detach: bool,
         /// `-4` / `-6`.
         address_family: Option<puressh::config::ServerAddressFamily>,
         /// `-E file`: append diagnostics to `file` instead of stderr.
@@ -1371,6 +1374,7 @@ mod imp {
         let mut dump_config = false;
         let mut connection_spec: Vec<String> = Vec::new();
         let mut test_only = false;
+        let mut no_detach = false;
         let mut log_stderr = false;
         let mut quiet = false;
         let mut address_family: Option<puressh::config::ServerAddressFamily> = None;
@@ -1443,10 +1447,10 @@ mod imp {
                 // `-e`: log to stderr rather than syslog; `-q`: log nothing.
                 "-e" => log_stderr = true,
                 "-q" => quiet = true,
-                // OpenSSH compatibility no-ops: sshd always stays in the
-                // foreground (`-D`); `-r` no re-exec, `-k` obsolete key
-                // regeneration.
-                "-D" | "-r" => {}
+                "-D" => no_detach = true,
+                // OpenSSH compatibility no-ops: `-r` no re-exec, `-k`
+                // obsolete key regeneration.
+                "-r" => {}
                 "-k" => i += 1,
                 "-b" => {
                     i += 1;
@@ -1558,6 +1562,7 @@ mod imp {
             dump_config,
             connection_spec,
             test_only,
+            no_detach,
             address_family,
             log_file,
             log_stderr,
@@ -6450,8 +6455,36 @@ mod imp {
         };
         eprintln!("sshd: SIGHUP: re-executing {}", exe.display());
         // Listening sockets are close-on-exec; the new process binds afresh.
-        let err = Command::new(&exe).args(args).exec();
+        // A detached daemon stays this process (same PID, PidFile right).
+        let mut args = args.to_vec();
+        if !cli.no_detach {
+            args.push("-D".into());
+        }
+        let err = Command::new(&exe).args(&args).exec();
         eprintln!("sshd: SIGHUP: exec {}: {err}", exe.display());
+    }
+
+    /// Become a background daemon (see the caller).
+    fn detach(keep_stderr: bool) -> Result<(), String> {
+        // SAFETY: the daemon parent has no other threads at this point.
+        match unsafe { nix::unistd::fork() } {
+            Ok(ForkResult::Parent { .. }) => std::process::exit(0),
+            Ok(ForkResult::Child) => {}
+            Err(e) => return Err(format!("fork: {e}")),
+        }
+        nix::unistd::setsid().map_err(|e| format!("setsid: {e}"))?;
+        let _ = std::env::set_current_dir("/");
+        let null = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| format!("/dev/null: {e}"))?;
+        let _ = nix::unistd::dup2_stdin(&null);
+        let _ = nix::unistd::dup2_stdout(&null);
+        if !keep_stderr {
+            let _ = nix::unistd::dup2_stderr(&null);
+        }
+        Ok(())
     }
 
     /// Install SIGCHLD (wake the accept loop to reap) and SIGTERM/SIGINT
@@ -7477,9 +7510,13 @@ mod imp {
         // listener family.
         let address_family = cli.address_family.or(sshd_cfg.global.address_family);
         let listen = listen_addrs(&bind_specs, &ports, address_family)?;
-        // PidFile (startup-only): write our PID after bind unless `none`.
+        // PidFile (startup-only): write our PID after bind unless `none`;
+        // OpenSSH's /run/sshd.pid by default (as root: elsewhere it could
+        // not be written).
         let pid_file = if sshd_cfg.global.pid_file_set {
             sshd_cfg.global.pid_file.clone()
+        } else if nix::unistd::geteuid().is_root() {
+            Some("/run/sshd.pid".to_string())
         } else {
             None
         };
@@ -7560,6 +7597,15 @@ mod imp {
             &host_key_files,
             cli.debug,
         )?;
+
+        // Without `-D` (or `-d`): detach now that the listeners are up (so a
+        // bind failure still reaches the terminal and the exit status), as
+        // OpenSSH's daemon(0, 0): fork, the parent exits, a new session,
+        // `/` as the working directory, stdio on /dev/null (except a `-E`
+        // log, which is stderr). The parent is still single-threaded.
+        if !cli.no_detach && !cli.debug {
+            detach(cli.log_file.is_some())?;
+        }
 
         // PidFile: write our PID now that the listener is up.
         if let Some(path) = pid_file.as_deref()

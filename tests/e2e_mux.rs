@@ -70,6 +70,7 @@ fn control_master_shares_one_connection() {
         .unwrap()
         .port();
     let child = Command::new(env!("CARGO_BIN_EXE_sshd"))
+        .arg("-D")
         .args([
             "-f",
             "/dev/null",

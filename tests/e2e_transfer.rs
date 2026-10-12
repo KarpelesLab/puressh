@@ -47,6 +47,7 @@ fn fixture(label: &str) -> Fixture {
     let user = std::env::var("USER").expect("$USER");
     let sshd = ChildGuard::spawn(
         Command::new(env!("CARGO_BIN_EXE_sshd"))
+            .arg("-D")
             .args([
                 "-f",
                 "/dev/null",

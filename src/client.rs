@@ -1017,6 +1017,9 @@ pub struct Client {
     /// (which runs on every KEX, including re-keys). See
     /// [`Self::host_key_mismatched`].
     host_key_mismatched: Arc<AtomicBool>,
+    /// The methods the server last said could continue, when
+    /// authentication failed ([`Self::auth_methods_left`]).
+    auth_methods_left: Vec<String>,
 }
 
 /// Wire arguments captured by [`Client::set_request_x11_forwarding`] and
@@ -1145,6 +1148,7 @@ impl Client {
             tcpip_forward_grants: Vec::new(),
             streamlocal_forward_grants: Vec::new(),
             host_key_mismatched,
+            auth_methods_left: Vec::new(),
         };
         me.driver.start(Instant::now())?;
         me.drive_handshake()?;
@@ -1255,12 +1259,21 @@ impl Client {
                     self.driver.notify_auth_success();
                     return Ok(());
                 }
-                ClientStep::Failed { .. } => return Err(Error::AuthFailed),
+                ClientStep::Failed { continuations, .. } => {
+                    self.auth_methods_left = continuations;
+                    return Err(Error::AuthFailed);
+                }
                 ClientStep::Banner { .. } => {}
                 ClientStep::Idle => {}
             }
         }
         Err(Error::Protocol("auth: too many steps without termination"))
+    }
+
+    /// After [`Self::run_auth`] failed: the methods the server last said
+    /// could continue (OpenSSH prints them: `Permission denied (publickey).`).
+    pub fn auth_methods_left(&self) -> &[String] {
+        &self.auth_methods_left
     }
 
     /// Build a [`ClientAuth`] for `user` with this connection's resolved
@@ -3410,8 +3423,8 @@ fn owned_or_default(over: &Option<Vec<String>>, default: &[&str]) -> Vec<String>
 /// Build the client's advertised KEXINIT, applying any config algorithm
 /// overrides over the built-in defaults.
 ///
-/// The strict-kex signalling markers (`kex-strict-{c,s}-v00@openssh.com`)
-/// are re-appended here, *after* the (possibly user-supplied) kex list, so a
+/// The client's strict-kex marker (`kex-strict-c-v00@openssh.com`; only the
+/// server sends the `-s` one, as with OpenSSH) is re-appended here, *after* the (possibly user-supplied) kex list, so a
 /// `KexAlgorithms` override can never strip the Terrapin (CVE-2023-48795)
 /// mitigation. The non-marker default order is taken from `defaults::KEX`.
 pub(crate) fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverrides) -> KexInit {
@@ -3423,13 +3436,11 @@ pub(crate) fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverride
         .collect();
 
     let mut kex = owned_or_default(&over.kex_algorithms, &default_kex);
-    // Re-append the strict-kex markers in their canonical trailing order,
-    // skipping any that somehow already slipped in.
-    for marker in defaults::KEX.iter().filter(|n| is_strict_kex_marker(n)) {
-        if !kex.iter().any(|k| k == marker) {
-            kex.push((*marker).to_string());
-        }
-    }
+    // Re-append the client's strict-kex marker. Offering the server's too
+    // would let a peer with no real KEX in common "choose" it (OpenSSH then
+    // fails with an internal error instead of "no matching key exchange").
+    kex.retain(|k| !is_strict_kex_marker(k));
+    kex.push(crate::transport::kex::STRICT_KEX_CLIENT_MARKER.to_string());
 
     let ciphers = owned_or_default(&over.ciphers, defaults::CIPHERS);
     let macs = owned_or_default(&over.macs, defaults::MACS);
@@ -5266,12 +5277,13 @@ mod tests {
         let want_ciphers: Vec<String> = defaults::CIPHERS.iter().map(|s| s.to_string()).collect();
         assert_eq!(advert.ciphers_c2s, want_ciphers);
         assert_eq!(advert.ciphers_s2c, want_ciphers);
-        // The kex list ends with both strict-kex markers.
+        // The kex list ends with the client's strict-kex marker only.
         let n = advert.kex.len();
-        assert!(crate::transport::kex::is_strict_kex_marker(
-            &advert.kex[n - 1]
-        ));
-        assert!(crate::transport::kex::is_strict_kex_marker(
+        assert_eq!(
+            advert.kex[n - 1],
+            crate::transport::kex::STRICT_KEX_CLIENT_MARKER
+        );
+        assert!(!crate::transport::kex::is_strict_kex_marker(
             &advert.kex[n - 2]
         ));
     }
@@ -5308,7 +5320,7 @@ mod tests {
             .iter()
             .filter(|k| crate::transport::kex::is_strict_kex_marker(k))
             .count();
-        assert_eq!(markers, 2, "both strict-kex markers must be re-appended");
+        assert_eq!(markers, 1, "the client's strict-kex marker is re-appended");
     }
 
     #[test]
@@ -5322,7 +5334,14 @@ mod tests {
         };
         let client =
             build_default_kexinit(&mut OsRng, &client_over).with_ext_info_marker(Role::Client);
-        let server = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
+        let mut server = build_default_kexinit(&mut OsRng, &AlgoOverrides::default());
+        // (A client-built proposal: give it the server's strict-kex marker.)
+        server
+            .kex
+            .retain(|k| !crate::transport::kex::is_strict_kex_marker(k));
+        server
+            .kex
+            .push(crate::transport::kex::STRICT_KEX_SERVER_MARKER.to_string());
         let neg = negotiate(&client, &server).expect("should negotiate");
         assert_eq!(neg.cipher_c2s, "aes128-ctr");
         assert_eq!(neg.cipher_s2c, "aes128-ctr");
@@ -5345,7 +5364,7 @@ mod tests {
         let server = build_default_kexinit(&mut OsRng, &server_over);
         assert!(matches!(
             negotiate(&client, &server),
-            Err(Error::NoCommonAlgorithm(_))
+            Err(Error::NoMatch { .. })
         ));
     }
 }

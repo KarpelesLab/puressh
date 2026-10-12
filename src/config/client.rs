@@ -1782,13 +1782,14 @@ Host gw
     }
 
     #[test]
-    fn pubkey_accepted_ssh_rsa_loads_but_is_never_used() {
-        // The SHA-1 opt-in is HostKey-only; for pubkey auth the name is
-        // accepted (as OpenSSH does) and dropped.
+    fn pubkey_accepted_ssh_rsa_is_an_opt_in() {
+        // `+ssh-rsa` appends the legacy SHA-1 name (for servers before
+        // OpenSSH 7.2); it is never a default.
         let src = "Host legacy\n  PubkeyAcceptedAlgorithms +ssh-rsa\n";
         let cfg = SshClientConfig::parse(src).unwrap();
         let algs = cfg.lookup("legacy").pubkey_accepted_algorithms.unwrap();
-        assert!(!algs.iter().any(|a| a == "ssh-rsa"), "{algs:?}");
+        assert_eq!(algs.last().map(String::as_str), Some("ssh-rsa"), "{algs:?}");
+        assert!(algs.iter().any(|a| a == "rsa-sha2-512"), "{algs:?}");
     }
 
     #[test]

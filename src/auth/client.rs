@@ -275,6 +275,25 @@ impl ClientAuth {
                 }
                 (other, _) => other,
             };
+            // No `server-sig-algs` (a server before OpenSSH 7.2): like
+            // OpenSSH, an RSA key signs with plain `ssh-rsa` when the local
+            // PubkeyAcceptedAlgorithms allows it — such servers know no other.
+            let cred = match cred {
+                ClientCredential::PublicKey(hk)
+                    if self.server_sig_algs.is_none()
+                        && hk.algorithm().starts_with("rsa-sha2-")
+                        && self
+                            .pubkey_accepted
+                            .as_ref()
+                            .is_some_and(|a| a.iter().any(|n| n == "ssh-rsa")) =>
+                {
+                    match hk.upgraded_for("ssh-rsa") {
+                        Some(sha1) => ClientCredential::PublicKey(sha1),
+                        None => ClientCredential::PublicKey(hk),
+                    }
+                }
+                other => other,
+            };
             // RFC 8308 §3.1 publickey filtering. When the server advertised
             // `server-sig-algs`, a publickey credential whose signature
             // algorithm is not on the list is either upgraded to a

@@ -6884,6 +6884,18 @@ mod imp {
         // CLI flags always win over the config file.
         let mut sshd_cfg = load_effective_config(&cli)?;
         apply_openssh_defaults(&mut sshd_cfg.global);
+        // `PubkeyAcceptedAlgorithms +ssh-rsa` (global or in a Match block):
+        // accept old clients' SHA-1 RSA signatures, as OpenSSH then does.
+        let names_ssh_rsa = |o: &puressh::config::ServerOptions| {
+            o.pubkey_accepted_algorithms
+                .as_ref()
+                .is_some_and(|l| l.iter().any(|a| a == "ssh-rsa"))
+        };
+        if names_ssh_rsa(&sshd_cfg.global)
+            || sshd_cfg.match_blocks.iter().any(|b| names_ssh_rsa(&b.opts))
+        {
+            puressh::hostkey::set_allow_rsa_sha1(true);
+        }
         let sshd_cfg = Arc::new(sshd_cfg);
         // OpenSSH keywords we accept but do not implement, ignored arguments.
         for w in sshd_cfg.warnings() {
@@ -7814,7 +7826,10 @@ mod imp {
                             {
                                 sshd_log::End::Closed
                             }
-                            Err(e) => sshd_log::End::Error(e.to_string()),
+                            Err(e) => match e.openssh_negotiation_message(false) {
+                                Some(m) => sshd_log::End::NoMatch(m),
+                                None => sshd_log::End::Error(e.to_string()),
+                            },
                         });
                         let rc = match result {
                             Ok(()) => 0,

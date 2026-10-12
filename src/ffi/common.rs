@@ -49,7 +49,7 @@ pub(crate) fn map_error(err: &Error) -> c_int {
     match err {
         Error::Io(_) => PCSSH_ERR_IO,
         Error::Format(_) => PCSSH_ERR_PARSE,
-        Error::NoCommonAlgorithm(_) => PCSSH_ERR_KEX,
+        Error::NoCommonAlgorithm(_) | Error::NoMatch { .. } => PCSSH_ERR_KEX,
         Error::Protocol(_) | Error::Disconnected { .. } => PCSSH_ERR_PROTOCOL,
         Error::BadMac
         | Error::BadTag

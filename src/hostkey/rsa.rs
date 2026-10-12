@@ -399,6 +399,33 @@ fn preferred_rsa_sha2(server_sig_algs: &str) -> Option<&'static str> {
     }
 }
 
+/// The signature algorithm an RSA identity should use given an algorithm
+/// list (`server-sig-algs`, or the local `PubkeyAcceptedAlgorithms`):
+/// `rsa-sha2-512`, then `rsa-sha2-256`, then — only with the process-wide
+/// SHA-1 opt-in ([`super::allow_rsa_sha1`]) — legacy `ssh-rsa`.
+#[cfg(feature = "alloc")]
+fn rsa_variant_for(
+    private: &Option<BoxedRsaPrivateKey>,
+    public: &BoxedRsaPublicKey,
+    k: usize,
+    current: &str,
+    sig_algs: &str,
+) -> Option<Box<dyn HostKey>> {
+    let name = preferred_rsa_sha2(sig_algs).or_else(|| {
+        (super::allow_rsa_sha1() && sig_algs.split(',').any(|a| a.trim() == SshRsa::NAME))
+            .then_some(SshRsa::NAME)
+    })?;
+    if name == current {
+        return None;
+    }
+    let (private, public, k) = clone_rsa_parts(private, public, k);
+    Some(match name {
+        "rsa-sha2-512" => Box::new(RsaSha2_512HostKey::from_rsa_parts(private, public, k)),
+        "rsa-sha2-256" => Box::new(RsaSha2_256HostKey::from_rsa_parts(private, public, k)),
+        _ => Box::new(RsaSha1HostKey::from_rsa_parts(private, public, k)),
+    })
+}
+
 /// Clone an RSA host key's inner `(private, public, k)` triple so a
 /// sibling variant (e.g. SHA-1 → SHA-512 over the same key) can be
 /// constructed from the same material.
@@ -437,14 +464,30 @@ rsa_host_key!(
     RsaHash::Sha256,
     RsaSha2_256::NAME,
     "RSA host key signing with `rsa-sha2-256` (RSA + SHA-256).",
-    (|_: &RsaSha2_256HostKey, _: &str| -> Option<Box<dyn HostKey>> { None })
+    (|this: &RsaSha2_256HostKey, sig_algs: &str| -> Option<Box<dyn HostKey>> {
+        rsa_variant_for(
+            &this.private,
+            &this.public,
+            this.k,
+            RsaSha2_256::NAME,
+            sig_algs,
+        )
+    })
 );
 rsa_host_key!(
     RsaSha2_512HostKey,
     RsaHash::Sha512,
     RsaSha2_512::NAME,
     "RSA host key signing with `rsa-sha2-512` (RSA + SHA-512).",
-    (|_: &RsaSha2_512HostKey, _: &str| -> Option<Box<dyn HostKey>> { None })
+    (|this: &RsaSha2_512HostKey, sig_algs: &str| -> Option<Box<dyn HostKey>> {
+        rsa_variant_for(
+            &this.private,
+            &this.public,
+            this.k,
+            RsaSha2_512::NAME,
+            sig_algs,
+        )
+    })
 );
 
 #[cfg(all(test, feature = "alloc"))]
@@ -652,14 +695,22 @@ mod tests {
     }
 
     #[test]
-    fn rsa_sha2_256_signer_does_not_upgrade() {
+    fn rsa_sha2_signers_switch_to_what_the_list_allows() {
+        // The auth layer only asks when the current algorithm is not on
+        // the list; the variant is then the best one that is.
         let (n, e) = known_n_e();
-        let s256 = RsaSha2_256HostKey::from_public_components(n, e).unwrap();
-        // Even when the server advertises sha2-512, the typed
-        // RsaSha2_256HostKey deliberately stays put — the caller picked
-        // 256 explicitly, and the auth layer's exact-match path
-        // already keeps it as-is.
-        assert!(s256.upgraded_for("rsa-sha2-512").is_none());
+        let s256 = RsaSha2_256HostKey::from_public_components(n.clone(), e.clone()).unwrap();
+        assert_eq!(
+            s256.upgraded_for("rsa-sha2-512").unwrap().algorithm(),
+            "rsa-sha2-512"
+        );
+        let s512 = RsaSha2_512HostKey::from_public_components(n, e).unwrap();
+        assert_eq!(
+            s512.upgraded_for("ssh-ed25519,rsa-sha2-256")
+                .unwrap()
+                .algorithm(),
+            "rsa-sha2-256"
+        );
     }
 
     #[test]

@@ -313,7 +313,11 @@ fn pick<'a>(category: &'static str, client: &'a [String], server: &[String]) -> 
             return Ok(name.as_str());
         }
     }
-    Err(Error::NoCommonAlgorithm(category))
+    Err(Error::NoMatch {
+        category,
+        client: client.join(","),
+        server: server.join(","),
+    })
 }
 
 /// Negotiate algorithms between a `client` KEXINIT and a `server` KEXINIT.
@@ -491,10 +495,7 @@ mod tests {
         let mut b = a.clone();
         a.kex = vec!["curve25519-sha256".into()];
         b.kex = vec!["diffie-hellman-group14-sha256".into()];
-        assert!(matches!(
-            negotiate(&a, &b),
-            Err(Error::NoCommonAlgorithm(_))
-        ));
+        assert!(matches!(negotiate(&a, &b), Err(Error::NoMatch { .. })));
     }
 
     #[test]
@@ -529,10 +530,7 @@ mod tests {
         // Only common entries are the strict markers. Picker must reject.
         a.kex = vec![STRICT_KEX_CLIENT_MARKER.to_string()];
         b.kex = vec![STRICT_KEX_CLIENT_MARKER.to_string()];
-        assert!(matches!(
-            negotiate(&a, &b),
-            Err(Error::NoCommonAlgorithm(_))
-        ));
+        assert!(matches!(negotiate(&a, &b), Err(Error::NoMatch { .. })));
     }
 
     #[test]
@@ -551,10 +549,7 @@ mod tests {
         let mut b = base.clone();
         a.kex = vec![EXT_INFO_CLIENT_MARKER.to_string()];
         b.kex = vec![EXT_INFO_CLIENT_MARKER.to_string()];
-        assert!(matches!(
-            negotiate(&a, &b),
-            Err(Error::NoCommonAlgorithm(_))
-        ));
+        assert!(matches!(negotiate(&a, &b), Err(Error::NoMatch { .. })));
     }
 
     #[test]

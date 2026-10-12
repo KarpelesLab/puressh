@@ -88,6 +88,14 @@ pub fn kex_names() -> Vec<&'static str> {
         .collect()
 }
 
+/// Key exchanges implemented for old peers but, as in OpenSSH, only used
+/// when configured (`KexAlgorithms +diffie-hellman-group14-sha1`).
+const LEGACY_KEX: &[&str] = &[
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group-exchange-sha1",
+    "diffie-hellman-group1-sha1",
+];
+
 /// The set of valid algorithm names for `cat`, derived from the live
 /// catalogues (so it can never drift from what the crypto layer implements).
 ///
@@ -102,14 +110,24 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
     match cat {
         AlgoCategory::Cipher => crate::cipher::ALL.iter().map(|c| c.name).collect(),
         AlgoCategory::Mac => crate::mac::ALL.iter().map(|m| m.name).collect(),
-        AlgoCategory::Kex => kex_names(),
+        AlgoCategory::Kex => {
+            let mut v = kex_names();
+            v.extend_from_slice(LEGACY_KEX);
+            v
+        }
         AlgoCategory::HostKey => {
             let mut names = crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
             // Legacy SHA-1 host-key verification, opt-in via config only.
             names.push("ssh-rsa");
             names
         }
-        AlgoCategory::PubkeyAccepted => crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec(),
+        // Plus legacy `ssh-rsa` (SHA-1): namable, never a default, as in
+        // OpenSSH (`PubkeyAcceptedAlgorithms +ssh-rsa` for old servers).
+        AlgoCategory::PubkeyAccepted => {
+            let mut v = crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
+            v.push("ssh-rsa");
+            v
+        }
         AlgoCategory::CaSignature => CA_SIGNATURE_DEFAULTS.to_vec(),
     }
 }
@@ -550,8 +568,9 @@ mod tests {
         // ...but never a default, so it only enters a resolved list when the
         // config explicitly requests it.
         assert!(!default_list(AlgoCategory::HostKey).contains(&"ssh-rsa"));
-        // PubkeyAcceptedAlgorithms stays strict — no SHA-1 pubkey auth.
-        assert!(!known_names(AlgoCategory::PubkeyAccepted).contains(&"ssh-rsa"));
+        // Likewise for PubkeyAcceptedAlgorithms: namable, never a default.
+        assert!(known_names(AlgoCategory::PubkeyAccepted).contains(&"ssh-rsa"));
+        assert!(!default_list(AlgoCategory::PubkeyAccepted).contains(&"ssh-rsa"));
     }
 
     #[test]
@@ -573,9 +592,9 @@ mod tests {
     }
 
     #[test]
-    fn pubkey_accepted_never_takes_ssh_rsa() {
-        // The SHA-1 opt-in is HostKey-only: `+ssh-rsa` (common in configs
-        // for old servers) loads, as with OpenSSH, but adds nothing.
+    fn pubkey_accepted_plus_ssh_rsa_appends_it() {
+        // `+ssh-rsa` (common in configs for servers before OpenSSH 7.2)
+        // appends the SHA-1 name after the defaults, as with OpenSSH.
         let got = resolve_algo_list(
             AlgoCategory::PubkeyAccepted,
             &args("+ssh-rsa"),
@@ -583,8 +602,9 @@ mod tests {
             "PubkeyAcceptedAlgorithms",
         )
         .unwrap();
-        assert!(!got.iter().any(|n| n == "ssh-rsa"));
-        assert_eq!(got, default_list(AlgoCategory::PubkeyAccepted));
+        let mut want = default_list(AlgoCategory::PubkeyAccepted);
+        want.push("ssh-rsa");
+        assert_eq!(got, want);
     }
 
     #[test]

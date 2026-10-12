@@ -4413,21 +4413,26 @@ pub(crate) fn pick_host_key<'a>(
 pub(crate) fn server_ext_info() -> ExtInfo {
     // Algorithms we are willing to verify a client publickey signature with.
     // Order is the same priority as our host-key KEX list — strongest first.
-    // Legacy `ssh-rsa` (SHA-1) is intentionally omitted; it stays opt-in via
-    // hostkey::set_allow_rsa_sha1.
+    // Legacy `ssh-rsa` (SHA-1) is listed only with the opt-in
+    // (hostkey::set_allow_rsa_sha1; sshd sets it for
+    // `PubkeyAcceptedAlgorithms +ssh-rsa`), as old clients need it listed.
     // The certificate key-type names are advertised too, so a client holding a
     // user certificate offers it (its `HostKey::algorithm()` is the cert name,
     // which the client filters against this list). Accepting the resulting
     // signature still requires CA trust + principal authorization at the
     // authenticator — advertising the name does not weaken anything.
-    ExtInfo::new().with_server_sig_algs(
+    let mut algs = String::from(
         "ssh-ed25519-cert-v01@openssh.com,\
          ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,\
          ecdsa-sha2-nistp521-cert-v01@openssh.com,\
          rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,\
          ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
          rsa-sha2-512,rsa-sha2-256",
-    )
+    );
+    if crate::hostkey::allow_rsa_sha1() {
+        algs.push_str(",ssh-rsa");
+    }
+    ExtInfo::new().with_server_sig_algs(algs)
 }
 
 /// Current wall-clock time as Unix seconds, for certificate validity checks.
@@ -4513,11 +4518,9 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
         .filter(|n| !is_strict_kex_marker(n))
         .collect();
     let mut kex = owned_or_default(&cfg.kex_algorithms, &default_kex);
-    for marker in defaults::KEX.iter().filter(|n| is_strict_kex_marker(n)) {
-        if !kex.iter().any(|k| k == marker) {
-            kex.push((*marker).to_string());
-        }
-    }
+    // The server's marker only, as OpenSSH sends (see the client's).
+    kex.retain(|k| !is_strict_kex_marker(k));
+    kex.push(crate::transport::kex::STRICT_KEX_SERVER_MARKER.to_string());
 
     let ciphers = owned_or_default(&cfg.ciphers, defaults::CIPHERS);
     let macs = owned_or_default(&cfg.macs, defaults::MACS);
@@ -5562,7 +5565,7 @@ mod tests {
             .iter()
             .filter(|k| is_strict_kex_marker(k))
             .count();
-        assert_eq!(markers, 2);
+        assert_eq!(markers, 1);
     }
 
     #[test]

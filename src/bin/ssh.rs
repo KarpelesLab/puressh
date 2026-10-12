@@ -925,6 +925,7 @@ impl KeyboardInteractiveResponder for StdinKbdResponder {
 /// hop.
 fn authenticate_client(
     client: &mut Client,
+    host: &str,
     user: &str,
     credentials: Vec<ClientCredential>,
     cfg_block: &puressh::config::ClientOptions,
@@ -968,6 +969,9 @@ fn authenticate_client(
         && cfg_block.kbd_interactive_authentication != Some(false);
 
     let mut auth = client.new_auth_driver(user);
+    // OpenSSH starts with "none": it learns which methods the server takes
+    // (for `Permission denied (…)`) and logs in where none is enough.
+    auth.add_credential(ClientCredential::None);
     if !credentials.is_empty() {
         vlog(
             1,
@@ -1021,6 +1025,14 @@ fn authenticate_client(
             vlog(1, &format!("authenticated as {user}"));
             Ok(())
         }
+        // OpenSSH's wording, which sshpass, Ansible and scripts look for.
+        Err(puressh::Error::AuthFailed) => {
+            eprintln!(
+                "{user}@{host}: Permission denied ({}).",
+                client.auth_methods_left().join(",")
+            );
+            Err(String::new())
+        }
         Err(e) => Err(format!("Auth failed: {e}")),
     }
 }
@@ -1061,6 +1073,20 @@ fn config_for_host(
         vlog(
             1,
             "HostKeyAlgorithms names ssh-rsa: enabling legacy SHA-1 host-key verification \
+             (insecure; interop opt-in)",
+        );
+        puressh::hostkey::set_allow_rsa_sha1(true);
+    }
+    // Likewise `PubkeyAcceptedAlgorithms +ssh-rsa`: sign with SHA-1 RSA for
+    // servers that take nothing else (before OpenSSH 7.2).
+    if cfg_block
+        .pubkey_accepted_algorithms
+        .as_ref()
+        .is_some_and(|list| list.iter().any(|n| n == "ssh-rsa"))
+    {
+        vlog(
+            1,
+            "PubkeyAcceptedAlgorithms names ssh-rsa: enabling legacy SHA-1 RSA signatures \
              (insecure; interop opt-in)",
         );
         puressh::hostkey::set_allow_rsa_sha1(true);
@@ -1125,8 +1151,15 @@ fn connect_jump_chain(
         // ProxyJump hops authenticate with config/agent/default identities
         // only — the CLI `-i` list belongs to the final target.
         let credentials = collect_credentials(&block, &[], block.identities_only.unwrap_or(false));
-        authenticate_client(&mut hop_client, &user, credentials, &block)
-            .map_err(|e| format!("proxyjump hop {}: {e}", idx + 1))?;
+        authenticate_client(&mut hop_client, &connect_host, &user, credentials, &block).map_err(
+            |e| {
+                if e.is_empty() {
+                    e
+                } else {
+                    format!("proxyjump hop {}: {e}", idx + 1)
+                }
+            },
+        )?;
         vlog(1, &format!("proxyjump hop {}: authenticated", idx + 1));
 
         current = Some(hop_client.into());
@@ -1948,8 +1981,20 @@ fn run() -> Result<i32, String> {
             early_credentials = Some(creds);
             sock
         };
+        let peer_ip = sock
+            .peer_addr()
+            .map(|a| a.ip().to_canonical().to_string())
+            .unwrap_or_else(|_| connect_host.clone());
         let client = Client::connect_via(Box::new(sock), connect_host.as_str(), port, cfg)
-            .map_err(|e| format!("connect: {e}"))?;
+            .map_err(|e| match e.openssh_negotiation_message(true) {
+                // OpenSSH's wording, which admins and tools (Ansible's
+                // error hints) recognise: the fix is in "Their offer".
+                Some(m) => {
+                    eprintln!("Unable to negotiate with {peer_ip} port {port}: {m}");
+                    String::new()
+                }
+                None => format!("connect: {e}"),
+            })?;
         vlog(1, &format!("connected to {connect_host}:{port}"));
         client
     };
@@ -1966,7 +2011,7 @@ fn run() -> Result<i32, String> {
             collect_credentials(&cfg_block, &cli.identities, identities_only)
         }
     };
-    authenticate_client(&mut client, &user, credentials, &cfg_block)?;
+    authenticate_client(&mut client, &connect_host, &user, credentials, &cfg_block)?;
 
     // AddKeysToAgent yes: push the supplied identities into the local agent.
     maybe_add_keys_to_agent(&cfg_block, &cli);
@@ -4055,7 +4100,10 @@ fn main() -> ExitCode {
             ExitCode::from(clamped)
         }
         Err(msg) => {
-            eprintln!("ssh: {msg}");
+            // Empty: the error was already reported in OpenSSH's words.
+            if !msg.is_empty() {
+                eprintln!("ssh: {msg}");
+            }
             ExitCode::from(255)
         }
     }

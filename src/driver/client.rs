@@ -39,6 +39,9 @@ use super::{
     generic_msg_during_initial_kex, keepalive_request,
 };
 
+/// `SSH_MSG_KEX_DH_GEX_REPLY` (RFC 4419): a group exchange's reply.
+const SSH_MSG_KEX_DH_GEX_REPLY: u8 = 33;
+
 /// Builds the exchange-hash host-key verifier from the `SSH_MSG_KEX_ECDH_REPLY`
 /// payload, applying the frontend's host-key policy. Receives the live
 /// [`KexRunner`] so it can read the negotiated host-key algorithm. Returning
@@ -435,10 +438,17 @@ impl ClientDriver {
     }
 
     /// Feed one KEX-stream packet into the runner, building the host-key
-    /// verifier on `SSH_MSG_KEX_ECDH_REPLY`, and enqueue its output.
+    /// verifier on the reply carrying the host key (`SSH_MSG_KEX_ECDH_REPLY`,
+    /// or `SSH_MSG_KEX_DH_GEX_REPLY` for a group exchange, where 31 is
+    /// `GEX_GROUP`), and enqueue its output.
     fn route_kex(&mut self, payload: &[u8]) -> Result<()> {
         let msg = *payload.first().ok_or(Error::Format("empty kex payload"))?;
-        let verifier: Option<Box<dyn HostKeyVerify>> = if msg == SSH_MSG_KEX_ECDH_REPLY {
+        let reply = if self.runner.uses_gex() {
+            SSH_MSG_KEX_DH_GEX_REPLY
+        } else {
+            SSH_MSG_KEX_ECDH_REPLY
+        };
+        let verifier: Option<Box<dyn HostKeyVerify>> = if msg == reply {
             Some((self.verifier_factory)(payload, &self.runner)?)
         } else {
             None

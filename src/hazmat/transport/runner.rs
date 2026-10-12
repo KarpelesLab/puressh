@@ -25,7 +25,10 @@ use crate::hostkey::{HostKey, HostKeyVerify};
 use crate::kex::{
     KexContext,
     curve25519::Curve25519Sha256,
-    dh::{GexClientState, GexRequest, GexSha256, Group14Sha256, Group16Sha512, Group18Sha512},
+    dh::{
+        GexClientState, GexRequest, GexSha1, GexSha256, Group1Sha1, Group14Sha1, Group14Sha256,
+        Group16Sha512, Group18Sha512,
+    },
     ecdh::{EcdhSha2Nistp256, EcdhSha2Nistp384, EcdhSha2Nistp521},
     mlkem768x25519::MlKem768X25519Sha256,
 };
@@ -125,6 +128,12 @@ enum KexBackend {
     Dh18,
     /// `diffie-hellman-group-exchange-sha256` — RFC 4419 three-trip.
     Gex,
+    /// `diffie-hellman-group1-sha1` (legacy, configured only).
+    Dh1Sha1,
+    /// `diffie-hellman-group14-sha1` (legacy, configured only).
+    Dh14Sha1,
+    /// `diffie-hellman-group-exchange-sha1` (legacy, configured only).
+    GexSha1,
     /// `mlkem768x25519-sha256` — hybrid ML-KEM-768 + X25519 (OpenSSH 9.9+).
     MlKem768X25519,
 }
@@ -140,6 +149,9 @@ impl KexBackend {
             "diffie-hellman-group16-sha512" => Ok(Self::Dh16),
             "diffie-hellman-group18-sha512" => Ok(Self::Dh18),
             "diffie-hellman-group-exchange-sha256" => Ok(Self::Gex),
+            "diffie-hellman-group1-sha1" => Ok(Self::Dh1Sha1),
+            "diffie-hellman-group14-sha1" => Ok(Self::Dh14Sha1),
+            "diffie-hellman-group-exchange-sha1" => Ok(Self::GexSha1),
             "mlkem768x25519-sha256" => Ok(Self::MlKem768X25519),
             _ => Err(Error::Unsupported("KEX algorithm")),
         }
@@ -470,7 +482,7 @@ impl KexRunner {
             return Err(Error::Protocol("non-KEX message during strict-kex window"));
         }
 
-        let backend_is_gex = matches!(self.backend, Some(KexBackend::Gex));
+        let backend_is_gex = matches!(self.backend, Some(KexBackend::Gex | KexBackend::GexSha1));
         let mut adv = match (&self.phase, msg) {
             (Phase::SentKexInit, super::kexinit::SSH_MSG_KEXINIT) => {
                 self.handle_peer_kexinit(rng, codec.seq_in, payload, v_c, v_s)?
@@ -530,6 +542,14 @@ impl KexRunner {
         };
         adv.completed = matches!(self.phase, Phase::Completed);
         Ok(adv)
+    }
+
+    /// Whether the negotiated KEX is a group exchange (RFC 4419), whose
+    /// host key arrives in `SSH_MSG_KEX_DH_GEX_REPLY` (33) rather than the
+    /// `SSH_MSG_KEX_ECDH_REPLY` / `KEXDH_REPLY` (31) of the other methods —
+    /// 31 being `GEX_GROUP` there.
+    pub fn uses_gex(&self) -> bool {
+        matches!(self.backend, Some(KexBackend::Gex | KexBackend::GexSha1))
     }
 
     /// The session id (exchange hash of the *first* KEX on this connection).
@@ -703,7 +723,7 @@ impl KexRunner {
         // server has emitted nothing and is waiting for `GEX_REQUEST`.
         // Park them in the dedicated intermediate phases.
         self.phase = match (self.role, self.backend) {
-            (Role::Client, Some(KexBackend::Gex)) => match client_state {
+            (Role::Client, Some(KexBackend::Gex | KexBackend::GexSha1)) => match client_state {
                 Some(ClientStateInner::Gex(s)) => Phase::GexClientAwaitGroup { client_state: s },
                 _ => return Err(Error::Protocol("GEX backend without GEX state")),
             },
@@ -749,7 +769,15 @@ impl KexRunner {
                 let (s, out) = Group18Sha512::client_init(rng);
                 (ClientStateInner::Dh(s), out.payload)
             }
-            KexBackend::Gex => {
+            KexBackend::Dh1Sha1 => {
+                let (s, out) = Group1Sha1::client_init(rng);
+                (ClientStateInner::Dh(s), out.payload)
+            }
+            KexBackend::Dh14Sha1 => {
+                let (s, out) = Group14Sha1::client_init(rng);
+                (ClientStateInner::Dh(s), out.payload)
+            }
+            KexBackend::Gex | KexBackend::GexSha1 => {
                 // Step 1 of the three-trip: send GEX_REQUEST with our
                 // preferred prime-size range. The actual `e` value is built
                 // later, after the server tells us which group it chose.
@@ -829,6 +857,22 @@ impl KexRunner {
                     core::mem::take(&mut out.kex.h),
                 )
             }
+            KexBackend::Dh1Sha1 => {
+                let mut out = Group1Sha1::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
+            }
+            KexBackend::Dh14Sha1 => {
+                let mut out = Group14Sha1::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
+            }
             KexBackend::Dh16 => {
                 let mut out = Group16Sha512::server_reply(rng, payload, hk, &ctx)?;
                 (
@@ -855,7 +899,9 @@ impl KexRunner {
             }
             // GEX takes a separate three-trip path via handle_gex_*; this
             // arm is unreachable thanks to the backend gate in `on_packet`.
-            KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),
+            KexBackend::Gex | KexBackend::GexSha1 => {
+                return Err(Error::Protocol("GEX routed wrong"));
+            }
         };
 
         self.current_k = Some(Zeroizing::new(k));
@@ -934,7 +980,11 @@ impl KexRunner {
                 };
                 (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
-            KexBackend::Dh14 | KexBackend::Dh16 | KexBackend::Dh18 => {
+            KexBackend::Dh14
+            | KexBackend::Dh16
+            | KexBackend::Dh18
+            | KexBackend::Dh1Sha1
+            | KexBackend::Dh14Sha1 => {
                 let st = match state {
                     ClientStateInner::Dh(s) => s,
                     _ => return Err(Error::Protocol("client state type mismatch")),
@@ -948,6 +998,12 @@ impl KexRunner {
                     }
                     KexBackend::Dh18 => {
                         Group18Sha512::client_finish(st, payload, verifier_ref, &ctx)?
+                    }
+                    KexBackend::Dh1Sha1 => {
+                        Group1Sha1::client_finish(st, payload, verifier_ref, &ctx)?
+                    }
+                    KexBackend::Dh14Sha1 => {
+                        Group14Sha1::client_finish(st, payload, verifier_ref, &ctx)?
                     }
                     _ => unreachable!(),
                 };
@@ -963,7 +1019,9 @@ impl KexRunner {
                 (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
             // GEX uses handle_gex_reply, not this path.
-            KexBackend::Gex => return Err(Error::Protocol("GEX routed wrong")),
+            KexBackend::Gex | KexBackend::GexSha1 => {
+                return Err(Error::Protocol("GEX routed wrong"));
+            }
         };
 
         self.current_k = Some(Zeroizing::new(k));
@@ -1040,7 +1098,11 @@ impl KexRunner {
             i_c,
             i_s: &i_s,
         };
-        let mut out = GexSha256::server_reply(rng, request, &group, payload, hk, &ctx)?;
+        let mut out = if self.backend == Some(KexBackend::GexSha1) {
+            GexSha1::server_reply(rng, request, &group, payload, hk, &ctx)?
+        } else {
+            GexSha256::server_reply(rng, request, &group, payload, hk, &ctx)?
+        };
 
         // KexOutput is ZeroizeOnDrop: take instead of moving fields out.
         self.current_k = Some(Zeroizing::new(core::mem::take(&mut out.kex.k)));
@@ -1083,7 +1145,11 @@ impl KexRunner {
             i_c: &i_c,
             i_s: &i_s,
         };
-        let mut out = GexSha256::client_finish(state, payload, verifier_ref, &ctx)?;
+        let mut out = if self.backend == Some(KexBackend::GexSha1) {
+            GexSha1::client_finish(state, payload, verifier_ref, &ctx)?
+        } else {
+            GexSha256::client_finish(state, payload, verifier_ref, &ctx)?
+        };
 
         // KexOutput is ZeroizeOnDrop: take instead of moving fields out.
         self.current_k = Some(Zeroizing::new(core::mem::take(&mut out.k)));
@@ -1309,6 +1375,9 @@ fn kdf(
         | KexBackend::Gex
         | KexBackend::MlKem768X25519 => derive_with::<Sha256>(k, h, sid, letter, n),
         KexBackend::EcdhP384 => derive_with::<Sha384>(k, h, sid, letter, n),
+        KexBackend::Dh1Sha1 | KexBackend::Dh14Sha1 | KexBackend::GexSha1 => {
+            derive_with::<purecrypto::hash::Sha1>(k, h, sid, letter, n)
+        }
         KexBackend::EcdhP521 | KexBackend::Dh16 | KexBackend::Dh18 => {
             derive_with::<Sha512>(k, h, sid, letter, n)
         }

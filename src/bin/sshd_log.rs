@@ -276,6 +276,8 @@ pub enum End<'a> {
     GraceTimeout,
     /// Authentication was refused for good (MaxAuthTries, not allowed).
     AuthFailed,
+    /// No algorithm in common: `no matching cipher found. Their offer: …`.
+    NoMatch(String),
     /// Anything else (protocol error, ...).
     Error(String),
 }
@@ -316,6 +318,8 @@ pub fn conn_end(end: End<'_>) {
             ));
             info(&format!("Disconnected from {who}{peer}{preauth}"));
         }
+        // fail2ban's sshd filter (aggressive mode) matches this line.
+        End::NoMatch(m) => info(&format!("Unable to negotiate with {peer}: {m}{preauth}")),
         End::Error(e) if !c.authenticated => {
             info(&format!("Connection closed by {who}{peer}: {e}{preauth}"));
         }

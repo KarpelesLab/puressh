@@ -59,6 +59,19 @@ pub enum Error {
     /// signature algorithm is not in the permitted `CASignatureAlgorithms`
     /// set.
     CertBadCaSignature,
+    /// Negotiation failed: no algorithm of `category` (`"kex algorithm"`,
+    /// `"host-key algorithm"`, `"cipher c2s"`, `"mac s2c"`, …) is on both
+    /// sides' lists. Carries both offers (comma-joined), for messages like
+    /// OpenSSH's ([`Error::openssh_negotiation_message`]).
+    #[cfg(feature = "alloc")]
+    NoMatch {
+        /// What failed to match.
+        category: &'static str,
+        /// The client's offer.
+        client: alloc::string::String,
+        /// The server's offer.
+        server: alloc::string::String,
+    },
     /// The peer ended the connection with `SSH_MSG_DISCONNECT`.
     #[cfg(feature = "alloc")]
     Disconnected {
@@ -96,11 +109,53 @@ impl fmt::Display for Error {
             }
             Error::CertBadCaSignature => f.write_str("certificate CA signature invalid"),
             #[cfg(feature = "alloc")]
+            Error::NoMatch {
+                category,
+                client,
+                server,
+            } => write!(
+                f,
+                "no common {category} (client offer: {client}; server offer: {server})"
+            ),
+            #[cfg(feature = "alloc")]
             Error::Disconnected {
                 reason,
                 description,
             } => write!(f, "disconnected by peer: {reason}: {description}"),
         }
+    }
+}
+
+#[cfg(feature = "alloc")]
+impl Error {
+    /// A negotiation failure as OpenSSH words it, with the *peer's* offer
+    /// (the server's for a client, `peer_is_server`; the client's for a
+    /// server): `no matching key exchange method found. Their offer: …`.
+    /// `None` for any other error.
+    pub fn openssh_negotiation_message(
+        &self,
+        peer_is_server: bool,
+    ) -> Option<alloc::string::String> {
+        let Error::NoMatch {
+            category,
+            client,
+            server,
+        } = self
+        else {
+            return None;
+        };
+        let what = match category.split(' ').next().unwrap_or("") {
+            "kex" => "key exchange method",
+            "host-key" => "host key type",
+            "cipher" => "cipher",
+            "mac" => "MAC",
+            "compression" => "compression method",
+            _ => category,
+        };
+        let offer = if peer_is_server { server } else { client };
+        Some(alloc::format!(
+            "no matching {what} found. Their offer: {offer}"
+        ))
     }
 }
 

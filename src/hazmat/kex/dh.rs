@@ -1,5 +1,7 @@
 //! `diffie-hellman-group{14,16,18}-sha{256,512}` (RFC 8268) and
-//! `diffie-hellman-group-exchange-sha256` (RFC 4419).
+//! `diffie-hellman-group-exchange-sha256` (RFC 4419), plus the SHA-1 forms
+//! OpenSSH keeps for old peers when configured (`group1-sha1`,
+//! `group14-sha1`, `group-exchange-sha1`; RFC 4253 / 4419).
 //!
 //! Backed by [`purecrypto::dh`]: the RFC 3526 safe-prime groups (`group14`,
 //! `group16`, `group18`) and `DhPrivateKey::generate` for the ephemeral
@@ -9,7 +11,7 @@ use alloc::vec::Vec;
 
 use purecrypto::bignum::BoxedUint;
 use purecrypto::dh::{DhGroup, DhPrivateKey, DhPublicKey, group14, group16, group18};
-use purecrypto::hash::{Digest, Sha256, Sha512};
+use purecrypto::hash::{Digest, Sha1, Sha256, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
 use zeroize::Zeroizing;
 
@@ -50,6 +52,50 @@ pub struct GexSha256;
 impl Kex for GexSha256 {
     const NAME: &'static str = "diffie-hellman-group-exchange-sha256";
     const HASH_LEN: usize = 32;
+}
+
+/// `diffie-hellman-group14-sha1` — RFC 3526 2048-bit group, SHA-1 (legacy).
+pub struct Group14Sha1;
+impl Kex for Group14Sha1 {
+    const NAME: &'static str = "diffie-hellman-group14-sha1";
+    const HASH_LEN: usize = 20;
+}
+
+/// `diffie-hellman-group1-sha1` — RFC 2409 1024-bit Oakley group 2, SHA-1
+/// (legacy; old devices offer nothing else).
+pub struct Group1Sha1;
+impl Kex for Group1Sha1 {
+    const NAME: &'static str = "diffie-hellman-group1-sha1";
+    const HASH_LEN: usize = 20;
+}
+
+/// `diffie-hellman-group-exchange-sha1` — RFC 4419 GEX, SHA-1 (legacy).
+pub struct GexSha1;
+impl Kex for GexSha1 {
+    const NAME: &'static str = "diffie-hellman-group-exchange-sha1";
+    const HASH_LEN: usize = 20;
+}
+
+/// RFC 2409 §6.2 Oakley group 2: the 1024-bit MODP safe prime, `g = 2`.
+fn group1() -> DhGroup {
+    const P: &str = "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1\
+                     29024E088A67CC74020BBEA63B139B22514A08798E3404DD\
+                     EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245\
+                     E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED\
+                     EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE65381\
+                     FFFFFFFFFFFFFFFF";
+    let digits: Vec<u8> = P.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    let p: Vec<u8> = digits
+        .chunks(2)
+        .map(|h| {
+            let n = |c: u8| (c as char).to_digit(16).unwrap_or(0) as u8;
+            (n(h[0]) << 4) | n(h[1])
+        })
+        .collect();
+    // A published safe prime (below the 2048-bit floor `from_custom`
+    // enforces for peer-chosen groups); 256-bit exponents as for group14.
+    DhGroup::from_custom_unchecked(BoxedUint::from_be_bytes(&p), BoxedUint::from_u64(2), 256)
+        .expect("RFC 2409 group 2 is well-formed")
 }
 
 /// Client state for a fixed-group DH exchange.
@@ -256,6 +302,8 @@ macro_rules! dh_fixed_group_impl {
 dh_fixed_group_impl!(Group14Sha256, group14, Sha256);
 dh_fixed_group_impl!(Group16Sha512, group16, Sha512);
 dh_fixed_group_impl!(Group18Sha512, group18, Sha512);
+dh_fixed_group_impl!(Group14Sha1, group14, Sha1);
+dh_fixed_group_impl!(Group1Sha1, group1, Sha1);
 
 // -----------------------------------------------------------------------------
 // RFC 4419 — diffie-hellman-group-exchange-sha256.
@@ -381,7 +429,11 @@ impl GexSha256 {
             return Err(Error::Crypto("GEX group out of requested range"));
         }
         let priv_bits = bits.clamp(160, 512);
-        let group = DhGroup::from_custom(p, g, priv_bits)
+        // Size-checked above; no primality proof, as with OpenSSH's client
+        // (dh_new_group + dh_pub_is_valid): the group comes from the server
+        // the exchange is authenticated against, and proving an 8192-bit
+        // prime safe took seconds per login.
+        let group = DhGroup::from_custom_unchecked(p, g, priv_bits)
             .map_err(|_| Error::Format("invalid GEX group"))?;
         let secret = DhPrivateKey::generate(group.clone(), rng);
         let pub_key = secret.public_key();
@@ -403,6 +455,35 @@ impl GexSha256 {
     /// emit `SSH_MSG_KEX_DH_GEX_REPLY`. Returns the `(K, H)` and the wire
     /// payload to send.
     pub fn server_reply<R, S>(
+        rng: &mut R,
+        request: GexRequest,
+        group: &DhGroup,
+        init_payload: &[u8],
+        host_key: &S,
+        ctx: &KexContext<'_>,
+    ) -> Result<DhServerReplyOut>
+    where
+        R: RngCore + CryptoRng,
+        S: crate::hostkey::HostKey + ?Sized,
+    {
+        Self::server_reply_with::<Sha256, _, _>(rng, request, group, init_payload, host_key, ctx)
+    }
+
+    /// Step 5 (client side): parse `SSH_MSG_KEX_DH_GEX_REPLY`, verify the
+    /// host-key signature on `H`, and return `(K, H)`.
+    pub fn client_finish(
+        state: GexClientState,
+        reply_payload: &[u8],
+        verifier: &dyn HostKeyVerify,
+        ctx: &KexContext<'_>,
+    ) -> Result<KexOutput> {
+        Self::client_finish_with::<Sha256>(state, reply_payload, verifier, ctx)
+    }
+
+    /// Step 4 (server → client): parse `SSH_MSG_KEX_DH_GEX_INIT`, agree, sign,
+    /// emit `SSH_MSG_KEX_DH_GEX_REPLY`. Returns the `(K, H)` and the wire
+    /// payload to send.
+    fn server_reply_with<D: Digest, R, S>(
         rng: &mut R,
         request: GexRequest,
         group: &DhGroup,
@@ -436,7 +517,7 @@ impl GexSha256 {
         let g_mag = group.g().to_be_bytes(group.byte_size());
 
         let k_s = host_key.public_blob();
-        let mut eh = ExchangeHash::<Sha256>::new();
+        let mut eh = ExchangeHash::<D>::new();
         eh.write_string(ctx.v_c);
         eh.write_string(ctx.v_s);
         eh.write_string(ctx.i_c);
@@ -471,7 +552,7 @@ impl GexSha256 {
 
     /// Step 5 (client side): parse `SSH_MSG_KEX_DH_GEX_REPLY`, verify the
     /// host-key signature on `H`, and return `(K, H)`.
-    pub fn client_finish(
+    fn client_finish_with<D: Digest>(
         state: GexClientState,
         reply_payload: &[u8],
         verifier: &dyn HostKeyVerify,
@@ -503,7 +584,7 @@ impl GexSha256 {
         // Wipe the locally-materialised raw GEX shared secret on return.
         let k_mag: Zeroizing<Vec<u8>> = Zeroizing::new(shared.into_bytes());
 
-        let mut eh = ExchangeHash::<Sha256>::new();
+        let mut eh = ExchangeHash::<D>::new();
         eh.write_string(ctx.v_c);
         eh.write_string(ctx.v_s);
         eh.write_string(ctx.i_c);
@@ -523,6 +604,40 @@ impl GexSha256 {
 
         let k = mpint_bytes(&k_mag);
         Ok(KexOutput { k, h })
+    }
+}
+
+impl GexSha1 {
+    /// Algorithm name.
+    pub const NAME: &'static str = <Self as Kex>::NAME;
+    /// Exchange-hash output length in bytes.
+    pub const HASH_LEN: usize = <Self as Kex>::HASH_LEN;
+
+    /// As [`GexSha256::server_reply`], hashing with SHA-1. (The request,
+    /// group and init steps do not depend on the hash: use [`GexSha256`]'s.)
+    pub fn server_reply<R, S>(
+        rng: &mut R,
+        request: GexRequest,
+        group: &DhGroup,
+        init_payload: &[u8],
+        host_key: &S,
+        ctx: &KexContext<'_>,
+    ) -> Result<DhServerReplyOut>
+    where
+        R: RngCore + CryptoRng,
+        S: crate::hostkey::HostKey + ?Sized,
+    {
+        GexSha256::server_reply_with::<Sha1, _, _>(rng, request, group, init_payload, host_key, ctx)
+    }
+
+    /// As [`GexSha256::client_finish`], hashing with SHA-1.
+    pub fn client_finish(
+        state: GexClientState,
+        reply_payload: &[u8],
+        verifier: &dyn HostKeyVerify,
+        ctx: &KexContext<'_>,
+    ) -> Result<KexOutput> {
+        GexSha256::client_finish_with::<Sha1>(state, reply_payload, verifier, ctx)
     }
 }
 

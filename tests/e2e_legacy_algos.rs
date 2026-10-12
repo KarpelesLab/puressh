@@ -314,6 +314,53 @@ fn legacy_algorithms_interoperate_with_openssh() {
     )) {
         failures.push(format!("auth failure wording: {out}"));
     }
+    // Host keys are judged and reported as OpenSSH reports them.
+    let host_key_run = |kh: &Path, strict: &str| {
+        let out = Command::new(env!("CARGO_BIN_EXE_ssh"))
+            .args(["-F", "/dev/null", "-p", &s.openssh_port.to_string(), "-i"])
+            .arg(s.dir.join("user"))
+            .args(["-o", "BatchMode=yes", "-o", "IdentityAgent=none"])
+            .args(["-o", "GlobalKnownHostsFile=none", "-o"])
+            .arg(format!("UserKnownHostsFile={}", kh.display()))
+            .arg("-o")
+            .arg(format!("StrictHostKeyChecking={strict}"))
+            .arg(format!("{}@127.0.0.1", s.user))
+            .arg("true")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let kh = s.dir.join("kh");
+    std::fs::write(&kh, "").unwrap();
+    let target = format!("[127.0.0.1]:{}", s.openssh_port);
+    let err = host_key_run(&kh, "yes");
+    if !err.contains(&format!(
+        "No ED25519 host key is known for {target} and you have requested strict checking.\n\
+         Host key verification failed."
+    )) {
+        failures.push(format!("unknown host key, strict: {err}"));
+    }
+    let err = host_key_run(&kh, "accept-new");
+    if !err.contains(&format!("Warning: Permanently added '{target}' (ED25519)")) {
+        failures.push(format!("accept-new: {err}"));
+    }
+    // A different key on file for the host: refused, the stale line named.
+    let other = std::fs::read_to_string(s.dir.join("stranger.pub")).unwrap();
+    let other = other.split(' ').take(2).collect::<Vec<_>>().join(" ");
+    std::fs::write(&kh, format!("{target} {other}\n")).unwrap();
+    let err = host_key_run(&kh, "yes");
+    for want in [
+        "WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!",
+        &format!("Offending ED25519 key in {}:1", kh.display()),
+        &format!("Host key for {target} has changed and you have requested strict checking."),
+        "Host key verification failed.",
+    ] {
+        if !err.contains(want) {
+            failures.push(format!("changed host key: missing {want:?} in {err}"));
+        }
+    }
+
     // Our sshd logs the client's offer, as OpenSSH does.
     let _ = s.run(
         false,

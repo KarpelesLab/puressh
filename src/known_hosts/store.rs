@@ -420,6 +420,24 @@ impl KnownHosts {
             .collect()
     }
 
+    /// The host fields of the plain entries holding `key_blob`, as written
+    /// (`[hashed name]` for hashed ones), for OpenSSH's "This host key is
+    /// known by the following other names/addresses".
+    pub fn find_key(&self, key_blob: &[u8]) -> Vec<String> {
+        self.lines
+            .iter()
+            .filter_map(|s| match s {
+                Slot::Entry(e) if e.marker.is_none() && e.key_blob == key_blob => {
+                    Some(match &e.host_spec {
+                        HostSpec::Hashed(_) => "[hashed name]".to_string(),
+                        spec => spec.to_field(),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Hash every unhashed entry in place using fresh salts. Equivalent
     /// to `ssh-keygen -H`.
     ///

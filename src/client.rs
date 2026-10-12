@@ -3377,17 +3377,13 @@ pub fn host_key_fingerprint(blob: &[u8]) -> String {
 /// proceeds, `Prompt` asks. The banner itself never changes — only the
 /// follow-up wording does.
 fn print_mismatch_banner(
-    host: &str,
-    port: u16,
-    expected: &[(String, Vec<u8>)],
-    new_key_type: &str,
+    _host: &str,
+    _port: u16,
+    _expected: &[(String, Vec<u8>)],
+    _new_key_type: &str,
     new_key_blob: &[u8],
 ) {
-    let target = if port == 22 {
-        host.to_string()
-    } else {
-        format!("[{host}]:{port}")
-    };
+    // OpenSSH's wording, line for line.
     eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
     eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
     eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
@@ -3395,20 +3391,42 @@ fn print_mismatch_banner(
     eprintln!("Someone could be eavesdropping on you right now (man-in-the-middle attack)!");
     eprintln!("It is also possible that a host key has just been changed.");
     eprintln!(
-        "The host key for {target} has changed; the known_hosts entry does not match \
-         what the server presented."
-    );
-    if expected.is_empty() {
-        eprintln!("Old fingerprint: <none on file>");
-    } else {
-        for (kt, blob) in expected {
-            eprintln!("Old fingerprint: {} ({kt})", host_key_fingerprint(blob));
-        }
-    }
-    eprintln!(
-        "New fingerprint: {} ({new_key_type})",
+        "The fingerprint for the {} key sent by the remote host is\n{}.",
+        host_key_type_label(new_key_blob),
         host_key_fingerprint(new_key_blob),
     );
+    eprintln!("Please contact your system administrator.");
+}
+
+/// A host key's type as OpenSSH names it in messages: `ED25519`, `RSA`,
+/// `ECDSA`, `ED25519-SK`, `ECDSA-SK`, `DSA`, with `-CERT` for
+/// certificates.
+pub fn host_key_type_label(key_blob: &[u8]) -> String {
+    let name = crate::format::Reader::new(key_blob)
+        .read_string()
+        .ok()
+        .and_then(|n| core::str::from_utf8(n).ok())
+        .unwrap_or("");
+    let base = if name.starts_with("sk-ssh-ed25519") {
+        "ED25519-SK"
+    } else if name.starts_with("ssh-ed25519") {
+        "ED25519"
+    } else if name.starts_with("sk-ecdsa") {
+        "ECDSA-SK"
+    } else if name.starts_with("ecdsa-sha2") {
+        "ECDSA"
+    } else if name.starts_with("ssh-rsa") || name.starts_with("rsa-sha2") {
+        "RSA"
+    } else if name.starts_with("ssh-dss") {
+        "DSA"
+    } else {
+        return name.to_string();
+    };
+    if name.contains("-cert-v01@") {
+        format!("{base}-CERT")
+    } else {
+        base.to_string()
+    }
 }
 
 /// Helper: turn an `Option<Vec<String>>` override into an owned list,
@@ -3736,9 +3754,15 @@ pub(crate) fn build_verifier(
                             // rotate the stored key. We follow suit —
                             // the warning was printed above; nothing
                             // touches the store.
+                            // OpenSSH's notice; the trusted entry is not
+                            // updated either.
                             eprintln!(
-                                "Connecting anyway because StrictHostKeyChecking is set to no; \
-                                 the trusted entry in known_hosts is NOT being updated."
+                                "Password authentication is disabled to avoid \
+                                 man-in-the-middle attacks."
+                            );
+                            eprintln!(
+                                "Keyboard-interactive authentication is disabled to avoid \
+                                 man-in-the-middle attacks."
                             );
                             // Remember that this session rides on an
                             // unverified key so the frontends can refuse

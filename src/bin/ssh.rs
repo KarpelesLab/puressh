@@ -1051,13 +1051,15 @@ fn config_for_host(
     }
     // UserKnownHostsFile: a list, as OpenSSH's (default known_hosts and
     // known_hosts2); new keys go to the first, all are read. `none`: none.
-    let mut user_files = user_known_hosts_files(cli, cfg_block);
+    let all_user_files = user_known_hosts_files(cli, cfg_block);
+    let mut user_files = all_user_files.clone();
     let first = (!user_files.is_empty()).then(|| user_files.remove(0));
     let hash_known_hosts = common::pick(cli.hash_known_hosts, cfg_block.hash_known_hosts, false);
     let mut policy = build_host_key_policy(
         strict,
         Some(first.unwrap_or_else(|| PathBuf::from("/dev/null"))),
         hash_known_hosts,
+        all_user_files,
     )?;
     common::apply_known_hosts_options(&mut policy, cfg_block)?;
     if let puressh::client::HostKeyPolicy::KnownHosts(kh) = &mut policy {
@@ -1149,7 +1151,7 @@ fn connect_jump_chain(
         let mut hop_client = match &current {
             // First hop: direct TCP.
             None => Client::connect_to_host(connect_host.as_str(), port, cfg)
-                .map_err(|e| format!("proxyjump hop {}: connect: {e}", idx + 1))?,
+                .map_err(|e| hop_connect_error(idx, "connect", e))?,
             // Subsequent hop: tunnel a direct-tcpip channel through the
             // previous hop and run the client over it.
             Some(prev) => {
@@ -1157,7 +1159,7 @@ fn connect_jump_chain(
                     .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
                     .map_err(|e| format!("proxyjump hop {}: open channel: {e}", idx + 1))?;
                 Client::connect_via(Box::new(ch), connect_host.as_str(), port, cfg)
-                    .map_err(|e| format!("proxyjump hop {}: handshake: {e}", idx + 1))?
+                    .map_err(|e| hop_connect_error(idx, "handshake", e))?
             }
         };
 
@@ -1268,6 +1270,16 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
 
 #[cfg(not(unix))]
 fn maybe_add_keys_to_agent(_cfg_block: &puressh::config::ClientOptions, _cli: &Cli) {}
+
+/// A ProxyJump hop's connection failure; a refused host key as OpenSSH
+/// reports it.
+fn hop_connect_error(idx: usize, stage: &str, e: puressh::Error) -> String {
+    if matches!(e, puressh::Error::HostKeyRejected) {
+        eprintln!("Host key verification failed.");
+        return String::new();
+    }
+    format!("proxyjump hop {}: {stage}: {e}", idx + 1)
+}
 
 /// The `UserKnownHostsFile` list (`-o` / config, else OpenSSH's default
 /// `~/.ssh/known_hosts ~/.ssh/known_hosts2`); empty for `none`.
@@ -1555,6 +1567,18 @@ fn print_config(
             }
         ),
         "canonicalizePermittedcnames none".to_string(),
+        format!(
+            "loglevel {}",
+            match (cli.quiet, cli.verbose) {
+                (true, _) => "QUIET",
+                (_, 1) => "DEBUG1",
+                (_, 2) => "DEBUG2",
+                (_, v) if v >= 3 => "DEBUG3",
+                _ =>
+                    puressh::config::server::LOG_LEVELS
+                        [usize::from(c.log_level.unwrap_or(3).min(7))],
+            }
+        ),
         format!(
             "requesttty {}",
             match cli.request_tty.or(c.request_tty) {
@@ -1941,10 +1965,19 @@ fn run() -> Result<i32, String> {
             X11Forward::Untrusted
         });
     }
+    // LogLevel (OpenSSH's numbering): QUIET..ERROR hide the informational
+    // messages (`Warning: Permanently added …`), as -q does; VERBOSE and
+    // DEBUGn are -v levels.
     if cli.verbose == 0
         && let Some(level) = cfg_block.log_level
     {
-        set_verbose(level);
+        match level {
+            0..=2 => common::set_quiet(true),
+            3 => {}
+            4 | 5 => set_verbose(1),
+            6 => set_verbose(2),
+            _ => set_verbose(3),
+        }
     }
 
     // CLI `-l user` > `user@host` > config `User` > the local user, as
@@ -2180,6 +2213,7 @@ fn run() -> Result<i32, String> {
             early_credentials = Some(creds);
             sock
         };
+        common::set_peer_addr(sock.peer_addr().ok());
         let peer_ip = sock
             .peer_addr()
             .map(|a| a.ip().to_canonical().to_string())
@@ -2190,6 +2224,10 @@ fn run() -> Result<i32, String> {
                 // error hints) recognise: the fix is in "Their offer".
                 Some(m) => {
                     eprintln!("Unable to negotiate with {peer_ip} port {port}: {m}");
+                    String::new()
+                }
+                None if matches!(e, puressh::Error::HostKeyRejected) => {
+                    eprintln!("Host key verification failed.");
                     String::new()
                 }
                 None => format!("connect: {e}"),

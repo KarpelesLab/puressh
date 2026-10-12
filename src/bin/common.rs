@@ -17,7 +17,7 @@
 //!   `read_password_from_stdin`): collecting whatever the user gave us into
 //!   the lib's [`ClientCredential`] vector.
 //! - **Host-key policy** (`build_host_key_policy`, `default_known_hosts_path`,
-//!   `tofu_prompt`, `fingerprint_b64_sha256`, `base64_no_pad`): mapping
+//!   host-key prompts, `fingerprint_b64_sha256`, `base64_no_pad`): mapping
 //!   OpenSSH-style `StrictHostKeyChecking` semantics into a
 //!   [`HostKeyPolicy`].
 //! - **`StrictMode`**: the four-valued enum that drives the policy choice.
@@ -1018,99 +1018,191 @@ pub fn base64_no_pad(bytes: &[u8]) -> String {
     out
 }
 
-/// The first-time / unknown-host TOFU prompt — mimics OpenSSH's
-/// wording so muscle-memory ports. Returns `true` only if the user types
-/// `yes` (case-insensitive) on the controlling terminal; anything else —
-/// including `y`, an empty line, EOF, or the absence of a terminal — is a
-/// refusal.
-///
-/// The answer is read from `/dev/tty` (see [`PromptTty`]), never from
-/// stdin, so `ssh host < file` / `yes | ssh host` / a CI runner can never
-/// accept an unknown key by accident. Without a terminal this fails closed
-/// with `Host key verification failed`, like OpenSSH.
-///
-/// **Do not** reuse this for the mismatch path: a "yes" here is a
-/// trust-on-first-use decision, not a "the key I trusted yesterday is
-/// gone and I'm fine with that" decision. See [`tofu_mismatch_prompt`]
-/// for the mismatch variant, which is preceded by the loud
-/// `WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!` banner (emitted
-/// by `client::build_verifier`).
-pub fn tofu_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
-    let fp = fingerprint_b64_sha256(key_blob);
-    let target = if port == 22 {
+/// The connection's peer address, for the host-key prompt's `'host
+/// (address)'`: set once the TCP connection is up.
+static PEER_ADDR: Mutex<Option<std::net::SocketAddr>> = Mutex::new(None);
+
+/// Record the peer of the connection being set up (see [`PEER_ADDR`]).
+#[allow(dead_code)] // ssh only
+pub fn set_peer_addr(addr: Option<std::net::SocketAddr>) {
+    if let Ok(mut g) = PEER_ADDR.lock() {
+        *g = addr;
+    }
+}
+
+/// `host`, or `[host]:port` off port 22, as OpenSSH names hosts.
+fn host_target(host: &str, port: u16) -> String {
+    if port == 22 {
         host.to_string()
     } else {
         format!("[{host}]:{port}")
-    };
-    let banner = format!(
-        "The authenticity of host '{target}' can't be established.\n\
-         {key_type} key fingerprint is {fp}.\n"
-    );
-    confirm_yes_on_tty(
-        &banner,
-        "Are you sure you want to continue connecting (yes/no)? ",
-    )
+    }
 }
 
-/// The mismatch TOFU prompt — used when the host IS already in
-/// `known_hosts` but the key the server just presented does NOT match
-/// any stored entry. The loud `WARNING: REMOTE HOST IDENTIFICATION
-/// HAS CHANGED!` banner (with both old and new fingerprints) is
-/// already printed by the verifier in `client::build_verifier` before
-/// this function runs.
-///
-/// Like [`tofu_prompt`] this reads its answer from the controlling
-/// terminal only and requires the full word `yes` — no `y` shortcut, and
-/// the default on empty input / EOF / no terminal is **deny**. Here that
-/// really matters: users have muscle-memory for hitting Enter through
-/// TOFU prompts, and a changed key is the MITM signature.
-pub fn tofu_mismatch_prompt(host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> bool {
-    let fp = fingerprint_b64_sha256(key_blob);
-    let target = if port == 22 {
-        host.to_string()
+/// Every known_hosts line (`file`, 1-based line, entry) in `files`.
+fn known_hosts_lines(files: &[PathBuf]) -> Vec<(PathBuf, usize, KnownHosts)> {
+    let mut out = Vec::new();
+    for f in files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        for (i, line) in text.lines().enumerate() {
+            let t = line.trim_start();
+            if t.is_empty() || t.starts_with('#') {
+                continue;
+            }
+            out.push((f.clone(), i + 1, KnownHosts::from_bytes(line.as_bytes())));
+        }
+    }
+    out
+}
+
+/// Host-key decisions worded as OpenSSH words them (`StrictHostKeyChecking`
+/// `strict`; `files`: the user known_hosts files, new keys going to the
+/// first): an unknown key is refused (`yes`), asked about (`ask`: `yes`,
+/// `no` or the fingerprint), or added with `Warning: Permanently added`;
+/// a changed key is refused with the file and line of the stale entry
+/// (`no` connects anyway; that is [`TofuAction::AcceptWithWarning`]).
+fn openssh_host_key_actions(strict: StrictMode, files: Vec<PathBuf>) -> (TofuAction, TofuAction) {
+    let files = Arc::new(files);
+    let unknown_files = Arc::clone(&files);
+    let unknown =
+        TofuAction::PromptDetailed(Arc::new(move |p: &puressh::client::HostKeyPrompt| {
+            let label = puressh::client::host_key_type_label(p.key_blob);
+            let target = host_target(p.host, p.port);
+            let accepted = match strict {
+                StrictMode::Yes => {
+                    eprintln!(
+                        "No {label} host key is known for {target} and you have requested strict \
+                     checking."
+                    );
+                    false
+                }
+                StrictMode::Ask => ask_unknown_host(p, &label, &target, &unknown_files),
+                StrictMode::AcceptNew | StrictMode::No => true,
+                // A keyword value this binary predates: fail closed.
+                _ => false,
+            };
+            if accepted && !is_quiet() {
+                eprintln!(
+                    "Warning: Permanently added '{target}' ({label}) to the list of known hosts."
+                );
+            }
+            accepted
+        }));
+    let changed =
+        TofuAction::PromptDetailed(Arc::new(move |p: &puressh::client::HostKeyPrompt| {
+            let label = puressh::client::host_key_type_label(p.key_blob);
+            let target = host_target(p.host, p.port);
+            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+            eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+            eprintln!("IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!");
+            eprintln!(
+                "Someone could be eavesdropping on you right now (man-in-the-middle attack)!"
+            );
+            eprintln!("It is also possible that a host key has just been changed.");
+            eprintln!(
+                "The fingerprint for the {label} key sent by the remote host is\n{}.",
+                p.fingerprint
+            );
+            eprintln!("Please contact your system administrator.");
+            if let Some(first) = files.first() {
+                eprintln!(
+                    "Add correct host key in {} to get rid of this message.",
+                    first.display()
+                );
+            }
+            for (file, line, store) in known_hosts_lines(&files) {
+                for e in store.find(p.host, p.port) {
+                    if e.marker.is_none() {
+                        eprintln!(
+                            "Offending {} key in {}:{line}",
+                            puressh::client::host_key_type_label(&e.key_blob),
+                            file.display()
+                        );
+                    }
+                }
+            }
+            eprintln!("Host key for {target} has changed and you have requested strict checking.");
+            false
+        }));
+    let changed = if strict == StrictMode::No {
+        TofuAction::AcceptWithWarning
     } else {
-        format!("[{host}]:{port}")
+        changed
     };
-    let banner = format!(
-        "Host key verification for '{target}' FAILED: the {key_type} key the server presented \
-         ({fp}) does not match any entry in your known_hosts file.\n\
-         If you are absolutely sure this is the new legitimate key for this host, type `yes` \
-         to accept it and overwrite the trusted entry. Anything else (including just pressing \
-         Enter) will refuse the connection.\n"
-    );
-    confirm_yes_on_tty(
-        &banner,
-        "Accept the new key and replace the trusted entry (type `yes` to confirm)? ",
-    )
+    (unknown, changed)
 }
 
-/// Print `banner` + `question` on the controlling terminal and return
-/// whether the user typed exactly `yes` (case-insensitive, surrounding
-/// whitespace ignored). Any read error, EOF, other answer, or a missing
-/// terminal yields `false`.
-fn confirm_yes_on_tty(banner: &str, question: &str) -> bool {
+/// OpenSSH's first-contact question; `yes` or the key's fingerprint
+/// accepts, `no` refuses, anything else asks again. No terminal: refused.
+fn ask_unknown_host(
+    p: &puressh::client::HostKeyPrompt,
+    label: &str,
+    target: &str,
+    files: &[PathBuf],
+) -> bool {
+    let addr = PEER_ADDR
+        .lock()
+        .ok()
+        .and_then(|g| *g)
+        .map(|a| host_target(&a.ip().to_canonical().to_string(), a.port()))
+        .unwrap_or_else(|| target.to_string());
+    let mut banner = format!(
+        "The authenticity of host '{target} ({addr})' can't be established.\n\
+         {label} key fingerprint is {}.\n",
+        p.fingerprint
+    );
+    let others: Vec<String> = known_hosts_lines(files)
+        .into_iter()
+        .flat_map(|(file, line, store)| {
+            store
+                .find_key(p.key_blob)
+                .into_iter()
+                .map(move |name| format!("    {}:{line}: {name}", file.display()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    if others.is_empty() {
+        banner.push_str("This key is not known by any other names.\n");
+    } else {
+        banner.push_str("This host key is known by the following other names/addresses:\n");
+        for o in others.iter().take(8) {
+            banner.push_str(o);
+            banner.push('\n');
+        }
+    }
     let Some(mut tty) = open_prompt_tty() else {
         eprint!("{banner}");
-        eprintln!(
-            "Host key verification failed: no controlling terminal to confirm the key on \
-             (add the key to known_hosts, or use StrictHostKeyChecking=accept-new)."
-        );
         return false;
     };
-    if tty
-        .output
-        .write_all(banner.as_bytes())
-        .and_then(|()| tty.output.write_all(question.as_bytes()))
-        .and_then(|()| tty.output.flush())
-        .is_err()
-    {
+    let mut question = "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+    if tty.output.write_all(banner.as_bytes()).is_err() {
         return false;
     }
-    let mut line = String::new();
-    if read_one_line(&mut tty.input, &mut line, 256).is_err() {
-        return false;
+    loop {
+        if tty
+            .output
+            .write_all(question.as_bytes())
+            .and_then(|()| tty.output.flush())
+            .is_err()
+        {
+            return false;
+        }
+        let mut line = String::new();
+        if read_one_line(&mut tty.input, &mut line, 256).is_err() || line.is_empty() {
+            return false;
+        }
+        let answer = line.trim();
+        if answer.eq_ignore_ascii_case("yes") || answer == p.fingerprint {
+            return true;
+        }
+        if answer.eq_ignore_ascii_case("no") {
+            return false;
+        }
+        question = "Please type 'yes', 'no' or the fingerprint: ";
     }
-    line.trim().eq_ignore_ascii_case("yes")
 }
 
 /// Build the [`HostKeyPolicy`] for a given strict mode + optional override
@@ -1127,6 +1219,7 @@ pub fn build_host_key_policy(
     strict: StrictMode,
     explicit_path: Option<PathBuf>,
     hash_known_hosts: bool,
+    user_files: Vec<PathBuf>,
 ) -> Result<HostKeyPolicy, String> {
     let path = match explicit_path {
         Some(p) => p,
@@ -1135,30 +1228,10 @@ pub fn build_host_key_policy(
     };
     let store = KnownHosts::load(&path).map_err(|e| format!("load {}: {e}", path.display()))?;
 
-    let (on_unknown, on_mismatch) = match strict {
-        StrictMode::Yes => (TofuAction::Reject, TofuAction::Reject),
-        // `accept-new` ONLY auto-accepts truly new hosts — never a
-        // changed key. Mismatches still go through the strict
-        // mismatch prompt so the user has a chance to see the loud
-        // banner and explicitly accept (or, more likely, refuse).
-        StrictMode::AcceptNew => (
-            TofuAction::Accept,
-            TofuAction::Prompt(Arc::new(tofu_mismatch_prompt)),
-        ),
-        StrictMode::Ask => (
-            TofuAction::Prompt(Arc::new(tofu_prompt)),
-            TofuAction::Prompt(Arc::new(tofu_mismatch_prompt)),
-        ),
-        // `No` mirrors OpenSSH: silently accept unknown, and proceed
-        // on mismatch *with a very loud banner* (handled in
-        // `client::build_verifier` via `TofuAction::AcceptWithWarning`).
-        // The known_hosts file is still consulted but NOT mutated —
-        // OpenSSH does the same: the warning is the deterrent, not a
-        // silent key rotation.
-        StrictMode::No => (TofuAction::Accept, TofuAction::AcceptWithWarning),
-        // A keyword value this binary predates: fail closed.
-        _ => (TofuAction::Reject, TofuAction::Reject),
-    };
+    // OpenSSH's decisions and wording: refuse / ask / add an unknown key;
+    // refuse a changed one (`no`: connect anyway, loudly, without
+    // updating the file). The answer is read from the terminal only.
+    let (on_unknown, on_mismatch) = openssh_host_key_actions(strict, user_files);
 
     let mut policy = KnownHostsPolicy::strict(Arc::new(Mutex::new(store)));
     policy.save_path = Some(path);

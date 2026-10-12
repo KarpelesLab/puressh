@@ -353,7 +353,9 @@ pub struct ClientOptions {
     /// `CanonicalizeFallbackLocal` (default yes): use the name as given when
     /// no domain qualifies it (else fail).
     pub canonicalize_fallback_local: Option<bool>,
-    /// `LogLevel`: 0 = QUIET/INFO, 1 = VERBOSE/DEBUG1, 2 = DEBUG2, 3 = DEBUG3.
+    /// `LogLevel`, numbered as OpenSSH's (0 QUIET, 1 FATAL, 2 ERROR, 3
+    /// INFO, 4 VERBOSE, 5 DEBUG1, 6 DEBUG2, 7 DEBUG3; see
+    /// [`crate::config::server::LOG_LEVELS`]).
     pub log_level: Option<u8>,
     /// `Ciphers` — resolved cipher preference list (strict-validated, with
     /// list modifiers already applied). `None` ⇒ built-in default.
@@ -1631,12 +1633,14 @@ fn parse_request_tty(line: &ParsedLine) -> Result<RequestTty, ConfigError> {
 
 fn parse_log_level(line: &ParsedLine) -> Result<u8, ConfigError> {
     let s = one_arg(line)?.to_ascii_uppercase();
-    match s.as_str() {
-        "QUIET" | "FATAL" | "ERROR" | "INFO" => Ok(0),
-        "VERBOSE" | "DEBUG" | "DEBUG1" => Ok(1),
-        "DEBUG2" => Ok(2),
-        "DEBUG3" => Ok(3),
-        _ => Err(ConfigError::BadValue {
+    let s = if s == "DEBUG" {
+        "DEBUG1".to_string()
+    } else {
+        s
+    };
+    match super::server::LOG_LEVELS.iter().position(|l| *l == s) {
+        Some(n) => Ok(n as u8),
+        None => Err(ConfigError::BadValue {
             line: line.line_no,
             keyword: line.keyword.clone(),
             msg: format!("expected QUIET..DEBUG3, got {s:?}"),

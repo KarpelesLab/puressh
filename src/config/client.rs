@@ -335,8 +335,16 @@ pub struct ClientOptions {
     pub local_forwards: Vec<LocalForwardSpec>,
     /// `RemoteForward` entries (cumulative).
     pub remote_forwards: Vec<RemoteForwardSpec>,
-    /// `ForwardAgent` (yes/no).
+    /// `ForwardAgent` (yes/no, or a socket: see
+    /// [`Self::forward_agent_socket`]).
     pub forward_agent: Option<bool>,
+    /// Keywords this build accepts but does not act on (`IPQoS`,
+    /// `TunnelDevice`, …), lowercased, with the value as written: the first
+    /// per keyword, for `ssh -G`.
+    pub unimplemented: Vec<(String, String)>,
+    /// `ForwardAgent <path>` / `ForwardAgent $VAR`: the agent socket to
+    /// forward instead of `$SSH_AUTH_SOCK` (`forward_agent` is then on).
+    pub forward_agent_socket: Option<String>,
     /// `ForwardX11` (yes/no).
     pub forward_x11: Option<bool>,
     /// `ForwardX11Trusted` (yes/no).
@@ -781,7 +789,15 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             opts.strict_host_key = Some(parse_strict(line)?);
         }
         "userknownhostsfile" => {
-            opts.user_known_hosts = Some(one_arg(line)?);
+            // A list of files, as OpenSSH's (kept space-separated).
+            if args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: "expected one or more files".into(),
+                });
+            }
+            opts.user_known_hosts = Some(args.join(" "));
         }
         "hashknownhosts" => {
             opts.hash_known_hosts = Some(parse_yes_no(line)?);
@@ -793,7 +809,14 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             opts.remote_forwards.push(parse_remote_forward(line)?);
         }
         "forwardagent" => {
-            opts.forward_agent = Some(parse_yes_no(line)?);
+            // yes / no, or the socket to forward (a path or `$VARIABLE`).
+            match parse_yes_no(line) {
+                Ok(v) => opts.forward_agent = Some(v),
+                Err(_) => {
+                    opts.forward_agent = Some(true);
+                    opts.forward_agent_socket = Some(one_arg(line)?);
+                }
+            }
         }
         "forwardx11" => {
             opts.forward_x11 = Some(parse_yes_no(line)?);
@@ -954,18 +977,17 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             }
         }
         "connecttimeout" => {
-            let secs = parse_u32(line)?;
-            if secs == 0 {
-                return Err(ConfigError::BadValue {
-                    line: line.line_no,
-                    keyword: line.keyword.clone(),
-                    msg: "ConnectTimeout must be a positive number of seconds".into(),
-                });
-            }
-            opts.connect_timeout = Some(secs);
+            // A time (`30`, `1m`) or `none` (kept as 0: no timeout).
+            let v = one_arg(line)?;
+            opts.connect_timeout = Some(if v.eq_ignore_ascii_case("none") {
+                0
+            } else {
+                parse_time(line, &v)?
+            });
         }
         "serveraliveinterval" => {
-            opts.server_alive_interval = Some(parse_u32(line)?);
+            let v = one_arg(line)?;
+            opts.server_alive_interval = Some(parse_time(line, &v)?);
         }
         "serveralivecountmax" => {
             opts.server_alive_count_max = Some(parse_u32(line)?);
@@ -1210,6 +1232,9 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     || allowed.contains(&"*")
                     || allowed.iter().any(|a| a.eq_ignore_ascii_case(&value))
                 {
+                    if !opts.unimplemented.iter().any(|(k, _)| k == kw) {
+                        opts.unimplemented.push((kw.to_string(), value));
+                    }
                     return Ok(());
                 }
                 return Err(ConfigError::Unsupported {
@@ -1302,7 +1327,11 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("StreamLocalBindUnlink", &["*"], ""),
     ("SyslogFacility", &["*"], ""),
     ("Tag", &["*"], ""),
-    ("Tunnel", &["no"], "tun/tap forwarding is not supported"),
+    (
+        "Tunnel",
+        &["no", "false"],
+        "tun/tap forwarding is not supported",
+    ),
     ("TunnelDevice", &["*"], ""),
     ("UpdateHostKeys", &["*"], ""),
     ("UseKeychain", &["*"], ""),
@@ -1334,6 +1363,11 @@ impl ClientOptions {
 /// First-match-wins merge of `src` over `dst`. Scalars only overwrite if
 /// `dst` had `None`; list fields concatenate.
 fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
+    for (k, v) in &src.unimplemented {
+        if !dst.unimplemented.iter().any(|(d, _)| d == k) {
+            dst.unimplemented.push((k.clone(), v.clone()));
+        }
+    }
     macro_rules! take_scalar {
         ($field:ident) => {
             if dst.$field.is_none() {
@@ -1349,6 +1383,7 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(user_known_hosts);
     take_scalar!(hash_known_hosts);
     take_scalar!(forward_agent);
+    take_scalar!(forward_agent_socket);
     take_scalar!(forward_x11);
     take_scalar!(forward_x11_trusted);
     take_scalar!(request_tty);
@@ -1495,6 +1530,46 @@ fn parse_dynamic_forward(line: &ParsedLine) -> Result<DynamicForwardSpec, Config
 /// A bare integer is seconds. A trailing `s`/`m`/`h` suffix scales to
 /// seconds (`m` ⇒ ×60, `h` ⇒ ×3600). A literal `0` means "no persist"
 /// (≡ `no`), matching OpenSSH. Overflow on the multiply is rejected.
+/// A time as OpenSSH's `convtime` reads it: seconds, or numbers with
+/// `s` / `m` / `h` / `d` / `w` units, run together (`1h30m`).
+fn parse_time(line: &ParsedLine, v: &str) -> Result<u32, ConfigError> {
+    let bad = || ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: format!("expected a time (e.g. 30, 1m, 1h30m), got {v:?}"),
+    };
+    let mut total: u64 = 0;
+    let mut num: Option<u64> = None;
+    for c in v.chars() {
+        if let Some(d) = c.to_digit(10) {
+            num = Some(num.unwrap_or(0).checked_mul(10).ok_or_else(bad)? + u64::from(d));
+            continue;
+        }
+        let scale = match c.to_ascii_lowercase() {
+            's' => 1,
+            'm' => 60,
+            'h' => 3600,
+            'd' => 86400,
+            'w' => 604800,
+            _ => return Err(bad()),
+        };
+        total = total
+            .checked_add(
+                num.take()
+                    .ok_or_else(bad)?
+                    .checked_mul(scale)
+                    .ok_or_else(bad)?,
+            )
+            .ok_or_else(bad)?;
+    }
+    if let Some(n) = num {
+        total = total.checked_add(n).ok_or_else(bad)?;
+    } else if v.is_empty() {
+        return Err(bad());
+    }
+    u32::try_from(total).map_err(|_| bad())
+}
+
 fn parse_control_persist(line: &ParsedLine) -> Result<ControlPersist, ConfigError> {
     let s = one_arg(line)?.to_ascii_lowercase();
     match s.as_str() {
@@ -1604,8 +1679,8 @@ fn parse_yes_no(line: &ParsedLine) -> Result<bool, ConfigError> {
 fn parse_strict(line: &ParsedLine) -> Result<StrictMode, ConfigError> {
     let s = one_arg(line)?.to_ascii_lowercase();
     match s.as_str() {
-        "yes" => Ok(StrictMode::Yes),
-        "no" | "off" => Ok(StrictMode::No),
+        "yes" | "true" => Ok(StrictMode::Yes),
+        "no" | "off" | "false" => Ok(StrictMode::No),
         "accept-new" => Ok(StrictMode::AcceptNew),
         "ask" => Ok(StrictMode::Ask),
         _ => Err(ConfigError::BadValue {
@@ -2225,11 +2300,17 @@ Host *.example.com !secret.example.com
     }
 
     #[test]
-    fn connect_timeout_parses_and_rejects_zero() {
-        let cfg = SshClientConfig::parse("ConnectTimeout 10\n").unwrap();
-        assert_eq!(cfg.lookup("h").connect_timeout, Some(10));
-        let err = SshClientConfig::parse("ConnectTimeout 0\n").unwrap_err();
-        assert!(matches!(err, ConfigError::BadValue { .. }));
+    fn connect_timeout_takes_times_and_none() {
+        let t = |s: &str| {
+            SshClientConfig::parse(&format!("ConnectTimeout {s}\n"))
+                .map(|c| c.lookup("h").connect_timeout)
+        };
+        assert_eq!(t("10").unwrap(), Some(10));
+        assert_eq!(t("1m30s").unwrap(), Some(90));
+        assert_eq!(t("2h").unwrap(), Some(7200));
+        // `none` (and 0): no timeout, kept so a later line cannot set one.
+        assert_eq!(t("none").unwrap(), Some(0));
+        assert!(matches!(t("10x"), Err(ConfigError::BadValue { .. })));
     }
 
     #[test]

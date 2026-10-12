@@ -360,6 +360,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut tty_count = 0u8;
     let mut host_arg: Option<String> = None;
     let mut command_args: Vec<String> = Vec::new();
+    let mut first_user: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -370,12 +371,18 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             let mut rest = args[i + 1..].iter().cloned();
             if host_arg.is_none() {
                 host_arg = rest.next();
+                if let Some(Ok((Some(u), _, _))) = host_arg.as_deref().map(parse_target) {
+                    first_user.get_or_insert(u);
+                }
             }
             command_args.extend(rest);
             break;
         }
         if !a.starts_with('-') || a == "-" {
             if host_arg.is_none() {
+                if let Ok((Some(u), _, _)) = parse_target(a) {
+                    first_user.get_or_insert(u);
+                }
                 host_arg = Some(a.clone());
                 i += 1;
                 continue;
@@ -403,10 +410,25 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     'c' => extra_o.push(format!("Ciphers {v}")),
                     'e' => escape_char = Some(parse_escape_char(&v)?),
                     'i' => identities.push(v),
-                    'l' => cli_user = Some(v),
+                    // The first user named (-l, -o User, user@host) wins.
+                    'l' => {
+                        first_user.get_or_insert(v);
+                    }
                     'm' => extra_o.push(format!("MACs {v}")),
                     'o' => apply_dash_o(
-                        &v,
+                        &{
+                            let kv = v.trim_start();
+                            if kv.len() > 5
+                                && kv[..4].eq_ignore_ascii_case("user")
+                                && matches!(kv.as_bytes()[4], b'=' | b' ' | b'\t')
+                            {
+                                let u = kv[5..].trim_start_matches(['=', ' ', '\t']).trim();
+                                if !u.is_empty() {
+                                    first_user.get_or_insert(u.to_string());
+                                }
+                            }
+                            v.clone()
+                        },
                         &mut strict,
                         &mut known_hosts_path,
                         &mut hash_known_hosts,
@@ -495,6 +517,9 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             j += 1;
         }
         i += 1;
+    }
+    if first_user.is_some() {
+        cli_user = first_user;
     }
     // `-t` asks for a terminal when stdin is one; `-tt` always.
     match tty_count {
@@ -627,38 +652,47 @@ fn apply_dash_o(
             .map(|(k, val)| (k, val.trim()))
             .ok_or_else(|| format!("-o expects KEY=VALUE, got {v:?}"))?,
     };
+    // The first value given wins, as for every option (OpenSSH).
+    let yes_no = |val: &str| match val.to_ascii_lowercase().as_str() {
+        "yes" | "on" | "true" => Some(true),
+        "no" | "off" | "false" => Some(false),
+        _ => None,
+    };
     match k.to_ascii_lowercase().as_str() {
         "stricthostkeychecking" => {
-            *strict = Some(match val.to_ascii_lowercase().as_str() {
-                "yes" => StrictMode::Yes,
-                "no" | "off" => StrictMode::No,
+            let mode = match val.to_ascii_lowercase().as_str() {
+                "yes" | "true" => StrictMode::Yes,
+                "no" | "off" | "false" => StrictMode::No,
                 "accept-new" => StrictMode::AcceptNew,
                 "ask" => StrictMode::Ask,
                 other => return Err(format!("unknown StrictHostKeyChecking={other}")),
-            });
+            };
+            strict.get_or_insert(mode);
         }
-        "userknownhostsfile" => *known_hosts_path = Some(PathBuf::from(val)),
+        "userknownhostsfile" => {
+            known_hosts_path.get_or_insert_with(|| PathBuf::from(val));
+        }
         "hashknownhosts" => {
-            *hash_known_hosts = Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+            let v = yes_no(val).ok_or_else(|| format!("unknown HashKnownHosts={val}"))?;
+            hash_known_hosts.get_or_insert(v);
         }
         "identitiesonly" => {
-            *identities_only = Some(matches!(val.to_ascii_lowercase().as_str(), "yes" | "on"));
+            let v = yes_no(val).ok_or_else(|| format!("unknown IdentitiesOnly={val}"))?;
+            identities_only.get_or_insert(v);
         }
         "compression" => {
-            *compression = Some(match val.to_ascii_lowercase().as_str() {
-                "yes" | "on" | "true" => true,
-                "no" | "off" | "false" => false,
-                other => return Err(format!("unknown Compression={other}")),
-            });
+            let v = yes_no(val).ok_or_else(|| format!("unknown Compression={val}"))?;
+            compression.get_or_insert(v);
         }
         "requesttty" => {
-            *request_tty = Some(match val.to_ascii_lowercase().as_str() {
-                "no" => puressh::config::RequestTty::No,
-                "yes" => puressh::config::RequestTty::Yes,
+            let v = match val.to_ascii_lowercase().as_str() {
+                "no" | "false" => puressh::config::RequestTty::No,
+                "yes" | "true" => puressh::config::RequestTty::Yes,
                 "force" => puressh::config::RequestTty::Force,
                 "auto" => puressh::config::RequestTty::Auto,
                 other => return Err(format!("unknown RequestTTY={other}")),
-            });
+            };
+            request_tty.get_or_insert(v);
         }
         _ => extra_o.push(format!("{k} {val}")),
     }
@@ -1516,7 +1550,10 @@ fn print_config(
         ),
         format!(
             "forwardagent {}",
-            yn(c.forward_agent.or(Some(cli.agent_forward)), false)
+            match &c.forward_agent_socket {
+                Some(sock) if c.forward_agent == Some(true) => sock.clone(),
+                _ => yn(c.forward_agent.or(Some(cli.agent_forward)), false).to_string(),
+            }
         ),
         format!("forwardx11 {}", yn(c.forward_x11, false)),
         format!("forwardx11trusted {}", yn(c.forward_x11_trusted, false)),
@@ -1567,6 +1604,60 @@ fn print_config(
             }
         ),
         "canonicalizePermittedcnames none".to_string(),
+        format!(
+            "addkeystoagent {}",
+            if c.add_keys_to_agent == Some(true) {
+                "true"
+            } else {
+                "false"
+            }
+        ),
+        format!(
+            "casignaturealgorithms {}",
+            list(
+                &c.ca_signature_algorithms,
+                puressh::config::AlgoCategory::CaSignature
+            )
+        ),
+        format!(
+            "controlpersist {}",
+            match c.control_persist {
+                Some(puressh::config::ControlPersist::Yes) => "yes".to_string(),
+                Some(puressh::config::ControlPersist::Seconds(n)) => n.to_string(),
+                _ => "no".to_string(),
+            }
+        ),
+        format!(
+            "gatewayports {}",
+            match c.gateway_ports {
+                Some(puressh::config::GatewayPorts::Yes) => "yes",
+                _ => "no",
+            }
+        ),
+        format!(
+            "obscurekeystroketiming {}",
+            match c.obscure_keystroke_timing {
+                Some(puressh::config::ObscureKeystrokeTiming::Off) => "no".to_string(),
+                Some(puressh::config::ObscureKeystrokeTiming::On { interval_ms })
+                    if interval_ms != 20 =>
+                {
+                    format!("interval:{interval_ms}")
+                }
+                _ => "yes".to_string(),
+            }
+        ),
+        format!(
+            "pubkeyauthentication {}",
+            if c.pubkey_authentication == Some(false) {
+                "false"
+            } else {
+                "true"
+            }
+        ),
+        format!(
+            "revokedhostkeys {}",
+            c.revoked_host_keys.as_deref().unwrap_or("none")
+        ),
         format!(
             "loglevel {}",
             match (cli.quiet, cli.verbose) {
@@ -1621,7 +1712,9 @@ fn print_config(
         ),
         format!(
             "connecttimeout {}",
-            c.connect_timeout.map_or("none".into(), |t| t.to_string())
+            c.connect_timeout
+                .filter(|t| *t > 0)
+                .map_or("none".into(), |t| t.to_string())
         ),
         format!(
             "serveraliveinterval {}",
@@ -1692,6 +1785,41 @@ fn print_config(
         .map(|n| format!("~/.ssh/{n}"))
         .collect()
     };
+    // Keywords this build accepts without acting on them: as configured,
+    // else OpenSSH's default (as Ubuntu's OpenSSH prints it).
+    for (key, default) in [
+        ("checkhostip", "no"),
+        ("enablesshkeysign", "no"),
+        ("fingerprinthash", "SHA256"),
+        ("hostbasedauthentication", "no"),
+        ("nohostauthenticationforlocalhost", "no"),
+        ("permitlocalcommand", "no"),
+        ("proxyusefdpass", "no"),
+        ("streamlocalbindunlink", "no"),
+        ("tunnel", "false"),
+        ("verifyhostkeydns", "false"),
+        ("visualhostkey", "no"),
+        ("updatehostkeys", "true"),
+        ("enableescapecommandline", "no"),
+        ("forwardx11timeout", "1200"),
+        ("requiredrsasize", "1024"),
+        ("xauthlocation", "/usr/bin/xauth"),
+        ("logverbose", "none"),
+        ("channeltimeout", "none"),
+        ("permitremoteopen", "any"),
+        ("tunneldevice", "any:any"),
+        ("ipqos", "af21 cs1"),
+        ("rekeylimit", "0 0"),
+        ("streamlocalbindmask", "0177"),
+        ("syslogfacility", "USER"),
+    ] {
+        let value = c
+            .unimplemented
+            .iter()
+            .find(|(k, _)| k == key)
+            .map_or(default, |(_, v)| v.as_str());
+        out.push(format!("{key} {value}"));
+    }
     out.extend(identities.into_iter().map(|p| format!("identityfile {p}")));
     out.extend(
         c.certificate_files
@@ -1725,9 +1853,6 @@ fn print_config(
     }
     if let Some(a) = &c.host_key_alias {
         out.push(format!("hostkeyalias {a}"));
-    }
-    if let Some(r) = &c.revoked_host_keys {
-        out.push(format!("revokedhostkeys {r}"));
     }
     if let Some(r) = &c.remote_command {
         out.push(format!("remotecommand {r}"));
@@ -1774,11 +1899,48 @@ fn run_query(kind: &str) -> Result<i32, String> {
         "cipher" | "cipher-auth" => supported_algorithms(AlgoCategory::Cipher),
         "mac" => supported_algorithms(AlgoCategory::Mac),
         "kex" => supported_algorithms(AlgoCategory::Kex),
-        "key" | "key-plain" | "key-sig" | "HostKeyAlgorithms" | "PubkeyAcceptedAlgorithms" => {
-            supported_algorithms(AlgoCategory::HostKey)
+        // As OpenSSH's: key types (`ssh-rsa` for RSA keys), then with their
+        // certificate types; signature algorithms; the default lists.
+        "key-plain" => vec![
+            "ssh-ed25519",
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+            "ssh-rsa",
+        ],
+        "key" => {
+            let mut v: Vec<&str> = Vec::new();
+            for (plain, cert) in [
+                ("ssh-ed25519", "ssh-ed25519-cert-v01@openssh.com"),
+                (
+                    "ecdsa-sha2-nistp256",
+                    "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+                ),
+                (
+                    "ecdsa-sha2-nistp384",
+                    "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+                ),
+                (
+                    "ecdsa-sha2-nistp521",
+                    "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+                ),
+                ("ssh-rsa", "ssh-rsa-cert-v01@openssh.com"),
+            ] {
+                v.push(plain);
+                v.push(cert);
+            }
+            v
         }
         "key-cert" => puressh::hostkey::HOST_KEY_CERT_VERIFY_NAMES.to_vec(),
-        "sig" => supported_algorithms(AlgoCategory::PubkeyAccepted),
+        "key-sig" => supported_algorithms(AlgoCategory::HostKey),
+        "sig" => {
+            let mut v = puressh::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
+            v.push("ssh-rsa");
+            v
+        }
+        "HostKeyAlgorithms" | "PubkeyAcceptedAlgorithms" => {
+            puressh::config::default_algorithms(AlgoCategory::HostKey)
+        }
         "compression" => vec!["none", "zlib@openssh.com"],
         "protocol-version" => vec!["2"],
         "help" => vec![
@@ -1864,6 +2026,12 @@ fn run() -> Result<i32, String> {
     // re-using the strict config parser for validation.
     apply_extra_o(&mut cfg_block, &cli.extra_o)?;
     final_config_pass(&ssh_cfg, &mut cfg_block, &cli, &local_user)?;
+    // -W implies ExitOnForwardFailure and ClearAllForwardings, unless the
+    // configuration or -o says otherwise (OpenSSH).
+    if cli.stdio_forward.is_some() {
+        cfg_block.exit_on_forward_failure.get_or_insert(true);
+        cfg_block.clear_all_forwardings.get_or_insert(true);
+    }
 
     // ssh_config equivalents of command-line flags; a flag always wins.
     match cfg_block.session_type {
@@ -2297,7 +2465,20 @@ fn run() -> Result<i32, String> {
         {
             // No usable agent: no forwarding, as with OpenSSH (which only
             // finds out when the server first asks for it).
-            match puressh::forwarding::agent::splice_to_local_agent_callback() {
+            // `ForwardAgent <path>` / `$VARIABLE`: that socket, else
+            // $SSH_AUTH_SOCK's.
+            let named = cfg_block.forward_agent_socket.as_deref().map(|s| {
+                let s = match s.strip_prefix('$') {
+                    Some(var) => std::env::var(var).unwrap_or_default(),
+                    None => s.to_string(),
+                };
+                PathBuf::from(expand_tilde(&s))
+            });
+            let cb = match named {
+                Some(path) => puressh::forwarding::agent::splice_to_unix_socket_callback(path),
+                None => puressh::forwarding::agent::splice_to_local_agent_callback(),
+            };
+            match cb {
                 Some(cb) => {
                     handlers = handlers.with_auth_agent(cb);
                     client.set_request_auth_agent_forwarding(true);
@@ -4044,6 +4225,7 @@ fn dial_tcp(
 fn connect_timeout(cfg_block: &puressh::config::ClientOptions) -> Option<std::time::Duration> {
     cfg_block
         .connect_timeout
+        .filter(|s| *s > 0)
         .map(|s| std::time::Duration::from_secs(s as u64))
 }
 

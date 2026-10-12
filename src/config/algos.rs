@@ -115,18 +115,14 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
             v.extend_from_slice(LEGACY_KEX);
             v
         }
-        AlgoCategory::HostKey => {
-            let mut names = crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
-            // Legacy SHA-1 host-key verification, opt-in via config only.
+        // The defaults (certificate types included), plus legacy `ssh-rsa`
+        // (SHA-1): namable, never a default, as in OpenSSH
+        // (`HostKeyAlgorithms +ssh-rsa`, `PubkeyAcceptedAlgorithms +ssh-rsa`
+        // for old peers).
+        AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted => {
+            let mut names = default_list(cat);
             names.push("ssh-rsa");
             names
-        }
-        // Plus legacy `ssh-rsa` (SHA-1): namable, never a default, as in
-        // OpenSSH (`PubkeyAcceptedAlgorithms +ssh-rsa` for old servers).
-        AlgoCategory::PubkeyAccepted => {
-            let mut v = crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
-            v.push("ssh-rsa");
-            v
         }
         AlgoCategory::CaSignature => CA_SIGNATURE_DEFAULTS.to_vec(),
     }
@@ -231,8 +227,12 @@ pub fn default_list(cat: AlgoCategory) -> Vec<&'static str> {
         AlgoCategory::Cipher => defaults::CIPHERS.to_vec(),
         AlgoCategory::Mac => defaults::MACS.to_vec(),
         AlgoCategory::Kex => kex_names(),
+        // Certificate types first, then plain keys, as OpenSSH lists them
+        // (so `-ssh-rsa` and the like keep certificates working).
         AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted => {
-            crate::hostkey::HOST_KEY_VERIFY_NAMES.to_vec()
+            let mut v = crate::cert::CERT_KEY_NAMES.to_vec();
+            v.extend_from_slice(crate::hostkey::HOST_KEY_VERIFY_NAMES);
+            v
         }
         AlgoCategory::CaSignature => CA_SIGNATURE_DEFAULTS.to_vec(),
     }

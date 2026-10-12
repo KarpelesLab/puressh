@@ -6,8 +6,7 @@
 //! already used for `Host` blocks (`,`-separated, `*` / `?` globs, `!`
 //! negation per pattern).
 //!
-//! We support the subset that's meaningful for a client-side library that
-//! does no hostname canonicalisation:
+//! We support:
 //!
 //! - `host`, `originalhost`, `user`, `localuser` — pattern-list matches.
 //! - `all` — unconditional match (alone or with other always-true criteria).
@@ -15,9 +14,9 @@
 //!   **Default-deny**: requires the caller to opt in via
 //!   [`SshClientConfig::enable_match_exec`](super::SshClientConfig::enable_match_exec).
 //!   Running shell commands during config parse is a confused-deputy hazard.
-//! - `canonical` / `final` — parsed but never match in the first cut, since
-//!   we don't perform `CanonicalizeHostname` (they only fire on the
-//!   post-canonicalisation pass).
+//! - `canonical` / `final` — match in the final pass over the configuration
+//!   ([`MatchContext::canonical`] / [`MatchContext::final_pass`]), which the
+//!   `ssh` binary runs after `CanonicalizeHostname`, or for these criteria.
 
 use core::net::IpAddr;
 
@@ -211,14 +210,11 @@ pub enum MatchCondition {
     /// no other criteria *other than* `canonical` / `final`; we don't enforce
     /// that here (last-token-wins behaves the same in practice).
     All,
-    /// `Match canonical` — fires only on the post-canonicalisation pass.
-    /// puressh does not currently canonicalise host names, so this never
-    /// matches; the keyword is accepted so configs that mention it don't
-    /// hard-error.
-    // TODO(canonicalize): wire this up once CanonicalizeHostname lands.
+    /// `Match canonical` — fires only on the post-canonicalisation pass
+    /// ([`MatchContext::canonical`]).
     Canonical,
-    /// `Match final` — same caveat as [`MatchCondition::Canonical`].
-    // TODO(canonicalize): wire this up once CanonicalizeHostname lands.
+    /// `Match final` — fires only on the final pass
+    /// ([`MatchContext::final_pass`]).
     Final,
 }
 
@@ -254,6 +250,14 @@ pub struct MatchContext<'a> {
     /// convention — a criterion that depends on a missing field is treated as
     /// not-matching, never as a silent wildcard).
     pub groups: Option<&'a [String]>,
+    /// **Client-side**: the post-canonicalisation pass: `Match canonical`
+    /// matches (OpenSSH runs it, and matches, whenever
+    /// `CanonicalizeHostname` is on, whether or not the name changed).
+    pub canonical: bool,
+    /// **Client-side**: this is the final pass over the configuration (after
+    /// canonicalisation, or because a `Match final` asked for one): `Match
+    /// final` matches.
+    pub final_pass: bool,
 }
 
 impl MatchContext<'_> {
@@ -477,10 +481,8 @@ pub enum ExecPolicy {
 pub fn evaluate(cond: &MatchCondition, ctx: &MatchContext<'_>, policy: ExecPolicy) -> bool {
     match cond {
         MatchCondition::All => true,
-        // First-cut: we don't canonicalise, so the second-pass criteria never
-        // fire. Returning `false` is the safe choice — an `all` is the
-        // documented way to ask for "always match".
-        MatchCondition::Canonical | MatchCondition::Final => false,
+        MatchCondition::Canonical => ctx.canonical,
+        MatchCondition::Final => ctx.final_pass,
         MatchCondition::Host(patterns) => host_matches(patterns, ctx.host),
         MatchCondition::OriginalHost(patterns) => {
             host_matches(patterns, ctx.original_host_or_host())
@@ -625,10 +627,14 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_canonical_never_matches() {
-        let c = ctx("anything");
+    fn evaluate_canonical_and_final_follow_the_pass() {
+        let mut c = ctx("anything");
         assert!(!evaluate(&MatchCondition::Canonical, &c, ExecPolicy::Deny));
         assert!(!evaluate(&MatchCondition::Final, &c, ExecPolicy::Deny));
+        c.canonical = true;
+        c.final_pass = true;
+        assert!(evaluate(&MatchCondition::Canonical, &c, ExecPolicy::Deny));
+        assert!(evaluate(&MatchCondition::Final, &c, ExecPolicy::Deny));
     }
 
     #[test]

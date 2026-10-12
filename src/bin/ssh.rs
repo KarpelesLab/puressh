@@ -1123,7 +1123,7 @@ fn connect_jump_chain(
         let port = hop.port.or(block.port).unwrap_or(22);
         // Hop user: `user@` in the hop spec wins over the hop's config User,
         // then the local user. CLI `-l` targets the final host, not hops.
-        let user = resolve_user(block.user.as_deref(), hop.user.as_deref())?;
+        let user = resolve_user(hop.user.as_deref(), block.user.as_deref())?;
         let cfg = config_for_host(&block, cli)?;
 
         vlog(
@@ -1256,6 +1256,122 @@ fn maybe_add_keys_to_agent(cfg_block: &puressh::config::ClientOptions, cli: &Cli
 #[cfg(not(unix))]
 fn maybe_add_keys_to_agent(_cfg_block: &puressh::config::ClientOptions, _cli: &Cli) {}
 
+/// `CanonicalizeHostname`, then the final pass over the configuration, as
+/// OpenSSH: with canonicalisation on, or a `Match final`, the
+/// configuration is read again for the final host name (`Host` patterns
+/// match it, `Match canonical` / `final` fire), filling what the first pass
+/// left unset.
+fn final_config_pass(
+    ssh_cfg: &puressh::config::SshClientConfig,
+    cfg_block: &mut puressh::config::ClientOptions,
+    cli: &Cli,
+    local_user: &str,
+) -> Result<(), String> {
+    use puressh::config::CanonicalizeHostname as Canon;
+    let expanded = cfg_block
+        .host_name
+        .as_deref()
+        .map(|h| {
+            h.replace("%%", "\0")
+                .replace("%h", &cli.host)
+                .replace('\0', "%")
+        })
+        .unwrap_or_else(|| cli.host.clone());
+    let is_addr = expanded.parse::<std::net::IpAddr>().is_ok();
+    let mut host = if is_addr {
+        expanded
+    } else {
+        expanded.to_ascii_lowercase()
+    };
+    let direct = cfg_block
+        .proxy_command
+        .as_deref()
+        .is_none_or(|p| p.eq_ignore_ascii_case("none"))
+        && cfg_block
+            .proxy_jump
+            .as_deref()
+            .is_none_or(|p| p.eq_ignore_ascii_case("none"))
+        && cli.proxy_jump.is_none();
+    let mode = cfg_block.canonicalize_hostname.unwrap_or(Canon::No);
+    let mut canonical = false;
+    if mode != Canon::No && (direct || mode == Canon::Always) && !is_addr {
+        let resolves = |name: &str| {
+            let port = cli.port.or(cfg_block.port).unwrap_or(22);
+            // A trailing dot keeps the resolver's search list out of it.
+            let q = if cfg!(unix) {
+                format!("{name}.")
+            } else {
+                name.to_string()
+            };
+            std::net::ToSocketAddrs::to_socket_addrs(&(q.as_str(), port))
+                .is_ok_and(|mut a| a.next().is_some())
+        };
+        if let Some(anchored) = host.strip_suffix('.') {
+            // An anchored name is already fully qualified.
+            host = anchored.to_string();
+            canonical = true;
+        } else if host.matches('.').count() as u32 <= cfg_block.canonicalize_max_dots.unwrap_or(1) {
+            let domains = cfg_block.canonical_domains.clone().unwrap_or_default();
+            if let Some(full) = domains
+                .iter()
+                .map(|d| format!("{host}.{d}"))
+                .find(|full| resolves(full))
+            {
+                vlog(
+                    1,
+                    &format!("Canonicalized hostname \"{host}\" => \"{full}\""),
+                );
+                host = full;
+                canonical = true;
+            } else if cfg_block.canonicalize_fallback_local == Some(false) {
+                return Err(format!("Could not resolve host \"{host}\""));
+            }
+        }
+    }
+    // As OpenSSH: any CanonicalizeHostname other than `no` (whether or not
+    // the name changed), or a `Match final`, means a final pass, in which
+    // `Match canonical` and `Match final` both match.
+    if mode == Canon::No && !ssh_cfg.wants_final_pass() {
+        return Ok(());
+    }
+    if canonical {
+        // The canonical name is the connection target from now on.
+        cfg_block.host_name = Some(host.clone());
+    }
+    let user = cli
+        .cli_user
+        .clone()
+        .or_else(|| cli.user_in_host.clone())
+        .or_else(|| cfg_block.user.clone())
+        .unwrap_or_else(|| local_user.to_string());
+    let mut ctx = puressh::config::MatchContext::default();
+    ctx.host = &host;
+    ctx.original_host = Some(&cli.host);
+    ctx.user = Some(&user);
+    ctx.local_user = Some(local_user);
+    ctx.canonical = true;
+    ctx.final_pass = true;
+    let fin = ssh_cfg.lookup_with(ctx);
+    cfg_block.merge_lower(&fin);
+    // Blocks matched on both passes added their lists twice; OpenSSH skips
+    // duplicate identities and forwards.
+    fn dedup<T: PartialEq + Clone>(v: &mut Vec<T>) {
+        let mut out: Vec<T> = Vec::with_capacity(v.len());
+        for x in v.drain(..) {
+            if !out.contains(&x) {
+                out.push(x);
+            }
+        }
+        *v = out;
+    }
+    dedup(&mut cfg_block.identity_files);
+    dedup(&mut cfg_block.certificate_files);
+    dedup(&mut cfg_block.local_forwards);
+    dedup(&mut cfg_block.remote_forwards);
+    dedup(&mut cfg_block.dynamic_forwards);
+    Ok(())
+}
+
 /// Whether to request a PTY, with OpenSSH's rules (CLI `-t`/`-T`/`-o
 /// RequestTTY` over the config keyword): always for `-tt` (`force`); when
 /// stdin is a terminal for `-t` (`yes`); by default (`auto`) only for an
@@ -1381,6 +1497,30 @@ fn print_config(
                 _ => "ask",
             }
         ),
+        format!(
+            "canonicalizefallbacklocal {}",
+            yn(c.canonicalize_fallback_local, true)
+        ),
+        format!(
+            "canonicalizehostname {}",
+            match c.canonicalize_hostname {
+                Some(puressh::config::CanonicalizeHostname::Yes) => "true",
+                Some(puressh::config::CanonicalizeHostname::Always) => "always",
+                _ => "false",
+            }
+        ),
+        format!(
+            "canonicalizemaxdots {}",
+            c.canonicalize_max_dots.unwrap_or(1)
+        ),
+        format!(
+            "canonicaldomains {}",
+            match c.canonical_domains.as_deref() {
+                Some(d) if !d.is_empty() => d.join(" "),
+                _ => "none".to_string(),
+            }
+        ),
+        "canonicalizePermittedcnames none".to_string(),
         format!(
             "requesttty {}",
             match cli.request_tty.or(c.request_tty) {
@@ -1642,10 +1782,24 @@ fn run() -> Result<i32, String> {
     // values then take precedence over the block; the block over built-in
     // defaults (OpenSSH's documented order).
     let ssh_cfg = common::load_client_config(cli.config_file.as_deref())?;
-    let mut cfg_block = ssh_cfg.lookup(&cli.host);
+    // `Match user` / `localuser` see the user named on the command line
+    // (else the local one), as OpenSSH's first pass does.
+    let local_user = common::local_user_name().unwrap_or_default();
+    let named_user = cli
+        .cli_user
+        .clone()
+        .or_else(|| cli.user_in_host.clone())
+        .unwrap_or_else(|| local_user.clone());
+    let mut ctx = puressh::config::MatchContext::default();
+    ctx.host = &cli.host;
+    ctx.original_host = Some(&cli.host);
+    ctx.user = Some(&named_user);
+    ctx.local_user = Some(&local_user);
+    let mut cfg_block = ssh_cfg.lookup_with(ctx);
     // `-o KEY=VALUE` overlays the matched block at the highest precedence,
     // re-using the strict config parser for validation.
     apply_extra_o(&mut cfg_block, &cli.extra_o)?;
+    final_config_pass(&ssh_cfg, &mut cfg_block, &cli, &local_user)?;
 
     // ssh_config equivalents of command-line flags; a flag always wins.
     match cfg_block.session_type {
@@ -1753,9 +1907,14 @@ fn run() -> Result<i32, String> {
         set_verbose(level);
     }
 
-    // CLI `-l user` > config `User` > `user@host` syntax > $USER.
-    let cli_user = cli.cli_user.clone().or_else(|| cfg_block.user.clone());
-    let user = resolve_user(cli_user.as_deref(), cli.user_in_host.as_deref())?;
+    // CLI `-l user` > `user@host` > config `User` > the local user, as
+    // OpenSSH (the command line is read before the configuration).
+    let cli_user = cli
+        .cli_user
+        .clone()
+        .or_else(|| cli.user_in_host.clone())
+        .or_else(|| cfg_block.user.clone());
+    let user = resolve_user(cli_user.as_deref(), None)?;
 
     let identities_only = common::pick(cli.identities_only, cfg_block.identities_only, false);
     let port = common::pick(cli.port, cfg_block.port, 22);

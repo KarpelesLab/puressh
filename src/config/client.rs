@@ -58,6 +58,18 @@ pub enum RequestTty {
     Auto,
 }
 
+/// `CanonicalizeHostname` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CanonicalizeHostname {
+    /// `no` (the default): names are used as given.
+    No,
+    /// `yes`: canonicalise direct connections (not through a proxy).
+    Yes,
+    /// `always`: canonicalise proxied connections too.
+    Always,
+}
+
 /// `SessionType` value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -331,6 +343,16 @@ pub struct ClientOptions {
     pub forward_x11_trusted: Option<bool>,
     /// `RequestTTY` (yes/no/force/auto).
     pub request_tty: Option<RequestTty>,
+    /// `CanonicalizeHostname`.
+    pub canonicalize_hostname: Option<CanonicalizeHostname>,
+    /// `CanonicalDomains`: the suffixes tried, in order.
+    pub canonical_domains: Option<Vec<String>>,
+    /// `CanonicalizeMaxDots` (default 1): names with more dots are taken as
+    /// already qualified.
+    pub canonicalize_max_dots: Option<u32>,
+    /// `CanonicalizeFallbackLocal` (default yes): use the name as given when
+    /// no domain qualifies it (else fail).
+    pub canonicalize_fallback_local: Option<bool>,
     /// `LogLevel`: 0 = QUIET/INFO, 1 = VERBOSE/DEBUG1, 2 = DEBUG2, 3 = DEBUG3.
     pub log_level: Option<u8>,
     /// `Ciphers` — resolved cipher preference list (strict-validated, with
@@ -598,6 +620,16 @@ impl SshClientConfig {
         })
     }
 
+    /// Whether the configuration asks for a final pass (`Match final`),
+    /// which OpenSSH then runs even without canonicalisation. (`Match
+    /// canonical` alone does not.)
+    pub fn wants_final_pass(&self) -> bool {
+        self.blocks.iter().any(|b| {
+            matches!(b, Block::Match { conditions, .. }
+                if conditions.iter().any(|c| matches!(c, MatchCondition::Final)))
+        })
+    }
+
     /// Like [`Self::lookup`] but supplies a full [`MatchContext`] so `Match`
     /// blocks with `user` / `localuser` / `originalhost` criteria can match.
     pub fn lookup_with(&self, ctx: MatchContext<'_>) -> ClientOptions {
@@ -769,6 +801,35 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "requesttty" => {
             opts.request_tty = Some(parse_request_tty(line)?);
+        }
+        "canonicalizehostname" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            opts.canonicalize_hostname = Some(match v.as_str() {
+                "no" | "false" => CanonicalizeHostname::No,
+                "yes" | "true" => CanonicalizeHostname::Yes,
+                "always" => CanonicalizeHostname::Always,
+                _ => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: line.keyword.clone(),
+                        msg: format!("expected no/yes/always, got {v:?}"),
+                    });
+                }
+            });
+        }
+        "canonicaldomains" => {
+            opts.canonical_domains = Some(
+                args.iter()
+                    .filter(|d| !d.eq_ignore_ascii_case("none"))
+                    .map(|d| d.trim_end_matches('.').to_ascii_lowercase())
+                    .collect(),
+            );
+        }
+        "canonicalizemaxdots" => {
+            opts.canonicalize_max_dots = Some(parse_u32(line)?);
+        }
+        "canonicalizefallbacklocal" => {
+            opts.canonicalize_fallback_local = Some(parse_yes_no(line)?);
         }
         "loglevel" => {
             opts.log_level = Some(parse_log_level(line)?);
@@ -1184,10 +1245,6 @@ pub fn parse_escape_char(v: &str) -> Option<Option<u8>> {
 /// security or break the connection is refused instead.
 const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("BindInterface", &["*"], ""),
-    ("CanonicalDomains", &["*"], ""),
-    ("CanonicalizeFallbackLocal", &["*"], ""),
-    ("CanonicalizeHostname", &["*"], ""),
-    ("CanonicalizeMaxDots", &["*"], ""),
     ("CanonicalizePermittedCNAMEs", &["*"], ""),
     ("ChannelTimeout", &["*"], ""),
     ("CheckHostIP", &["*"], ""),
@@ -1293,6 +1350,10 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(forward_x11);
     take_scalar!(forward_x11_trusted);
     take_scalar!(request_tty);
+    take_scalar!(canonicalize_hostname);
+    take_scalar!(canonical_domains);
+    take_scalar!(canonicalize_max_dots);
+    take_scalar!(canonicalize_fallback_local);
     take_scalar!(log_level);
     // Algorithm overrides are first-match-wins scalars: the whole resolved
     // list from the earliest matching block wins (OpenSSH semantics — a
@@ -2467,13 +2528,45 @@ Match canonical
     }
 
     #[test]
-    fn match_final_never_matches_in_first_pass() {
+    fn match_final_matches_only_in_the_final_pass() {
         let src = "\
 Match final
   Port 4242
 ";
         let cfg = SshClientConfig::parse(src).unwrap();
         assert_eq!(cfg.lookup("anything").port, None);
+        assert!(cfg.wants_final_pass());
+        let ctx = MatchContext {
+            host: "anything",
+            final_pass: true,
+            ..MatchContext::default()
+        };
+        assert_eq!(cfg.lookup_with(ctx).port, Some(4242));
+        assert!(
+            !SshClientConfig::parse("Host x\n  Port 1\n")
+                .unwrap()
+                .wants_final_pass()
+        );
+        let canonical_only = SshClientConfig::parse("Match canonical\n  Port 1\n").unwrap();
+        assert!(!canonical_only.wants_final_pass());
+    }
+
+    #[test]
+    fn canonicalize_options_parse() {
+        let cfg = SshClientConfig::parse(
+            "CanonicalizeHostname always\nCanonicalDomains Example.COM. b.org\n\
+             CanonicalizeMaxDots 0\nCanonicalizeFallbackLocal no\n",
+        )
+        .unwrap();
+        let o = cfg.lookup("h");
+        assert_eq!(o.canonicalize_hostname, Some(CanonicalizeHostname::Always));
+        assert_eq!(
+            o.canonical_domains.as_deref(),
+            Some(&["example.com".to_string(), "b.org".to_string()][..])
+        );
+        assert_eq!(o.canonicalize_max_dots, Some(0));
+        assert_eq!(o.canonicalize_fallback_local, Some(false));
+        assert!(SshClientConfig::parse("CanonicalizeHostname maybe\n").is_err());
     }
 
     #[test]

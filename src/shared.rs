@@ -408,6 +408,7 @@ impl SharedClient {
             shared: self.clone(),
             channel: local_id,
             local_close_sent: false,
+            pty_denied: false,
         };
         match SftpClient::new(stream) {
             Ok(c) => Ok(SftpSession {
@@ -453,6 +454,7 @@ impl SharedClient {
             shared: self.clone(),
             channel: local_id,
             local_close_sent: false,
+            pty_denied: false,
         })
     }
 
@@ -519,6 +521,7 @@ impl SharedClient {
             shared: self.clone(),
             channel: local_id,
             local_close_sent: false,
+            pty_denied: false,
         })
     }
 
@@ -542,6 +545,7 @@ impl SharedClient {
             shared: self.clone(),
             channel: local_id,
             local_close_sent: false,
+            pty_denied: false,
         })
     }
 
@@ -557,11 +561,15 @@ impl SharedClient {
         what: SessionRequest<'_>,
         pty: Option<PtyRequest>,
     ) -> Result<OwnedChannelStream> {
+        let mut pty_denied = false;
         let local_id = {
             let mut g = lock_or_poison(&self.inner)?;
             let id = open_session_under_lock(&mut g, "session")?;
             if let Some(p) = pty {
-                send_request_and_await(
+                // A refused terminal is not fatal: the session goes on
+                // without one, as OpenSSH's does ([`OwnedChannelStream::
+                // pty_denied`]).
+                match send_request_and_await(
                     &mut g,
                     id,
                     ChannelRequest::PtyReq {
@@ -573,7 +581,11 @@ impl SharedClient {
                         modes: p.modes,
                     },
                     "session: pty-req",
-                )?;
+                ) {
+                    Ok(()) => {}
+                    Err(Error::Protocol("PTY allocation request failed")) => pty_denied = true,
+                    Err(e) => return Err(e),
+                }
             }
             let (req, what_msg) = match what {
                 SessionRequest::Shell => (ChannelRequest::Shell, "session: shell"),
@@ -595,6 +607,7 @@ impl SharedClient {
             shared: self.clone(),
             channel: local_id,
             local_close_sent: false,
+            pty_denied,
         })
     }
 
@@ -889,6 +902,7 @@ impl SharedClient {
             shared: self.clone(),
             channel: local_id,
             local_close_sent: false,
+            pty_denied: false,
         })
     }
 
@@ -1081,6 +1095,11 @@ fn reply_failed_msg(what: &'static str) -> &'static str {
         "exec: command" => "exec: command request denied",
         "shell: pty-req" => "shell: pty-req denied",
         "shell: shell-req" => "shell: shell-req denied",
+        // OpenSSH's words (`… on channel N` is the caller's to add).
+        "session: pty-req" => "PTY allocation request failed",
+        "session: shell" => "shell request failed",
+        "session: exec" => "exec request failed",
+        "session: subsystem" => "subsystem request failed",
         _ => "channel: request denied",
     }
 }
@@ -1191,6 +1210,7 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
         shared: shared.clone(),
         channel,
         local_close_sent: false,
+        pty_denied: false,
     };
     let (ingress_tx, ingress_rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
     let (egress_tx, egress_rx) =
@@ -1416,6 +1436,8 @@ pub struct OwnedChannelStream {
     channel: u32,
     /// Whether we've already emitted CHANNEL_CLOSE locally.
     local_close_sent: bool,
+    /// The server refused the `pty-req` ([`Self::pty_denied`]).
+    pty_denied: bool,
 }
 
 /// Which queue inside a [`ChannelQueue`] a drain or stash should target.
@@ -1429,6 +1451,12 @@ enum Stream {
 }
 
 impl OwnedChannelStream {
+    /// Whether the server refused the terminal asked for when the session
+    /// opened (the session runs without one).
+    pub fn pty_denied(&self) -> bool {
+        self.pty_denied
+    }
+
     /// Local channel id this stream owns. Pass this to
     /// [`SharedClient::send_window_change`] (or any sibling control
     /// method that takes a channel id) when driving the channel from a

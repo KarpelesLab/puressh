@@ -2357,6 +2357,12 @@ fn run() -> Result<i32, String> {
     }
     let has_command = cli.command.is_some();
     let use_pty = want_pty(&cli, &cfg_block, has_command, cli.subsystem);
+    // A terminal asked for explicitly (-t, RequestTTY yes / force) must be
+    // granted, as OpenSSH; one it chose to ask for may be refused.
+    let pty_required = matches!(
+        cli.request_tty.or(cfg_block.request_tty),
+        Some(puressh::config::RequestTty::Yes | puressh::config::RequestTty::Force)
+    );
     // EscapeChar: `-e`, else `~`.
     let escape: Option<u8> = cli.escape_char.unwrap_or(Some(b'~'));
     // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms); only used
@@ -2407,8 +2413,9 @@ fn run() -> Result<i32, String> {
         // With forwards or remote channels to serve, keep pumping the
         // connection when the session is not reading.
         let what = session_request(command.as_deref(), subsystem);
-        run_session(s, what, use_pty, okt, escape).unwrap_or_else(|e| {
-            if !disconnected(s) {
+        run_session(s, what, use_pty, pty_required, okt, escape).unwrap_or_else(|e| {
+            // Empty: already reported in OpenSSH's words.
+            if !e.is_empty() && !disconnected(s) {
                 eprintln!("ssh: {e}");
             }
             255
@@ -3669,6 +3676,7 @@ fn run_session(
     shared: &puressh::shared::SharedClient,
     what: puressh::shared::SessionRequest<'_>,
     want_pty: bool,
+    pty_required: bool,
     okt: puressh::config::ObscureKeystrokeTiming,
     escape: Option<u8>,
 ) -> Result<i32, String> {
@@ -3679,7 +3687,7 @@ fn run_session(
 
     // Terminal: size, modes, raw mode (only when stdin is a terminal).
     #[cfg(unix)]
-    let (pty, _raw_guard) = {
+    let (pty, mut raw_guard) = {
         if want_pty {
             let (cols, rows, px_w, px_h) = query_window_size();
             let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
@@ -3704,10 +3712,25 @@ fn run_session(
     #[cfg(not(unix))]
     let pty = want_pty.then(|| puressh::shared::PtyRequest::new("xterm", 80, 24));
 
-    let stream = shared
-        .session_stream(what, pty)
-        .map_err(|e| e.to_string())?;
+    let stream = shared.session_stream(what, pty).map_err(|e| match e {
+        // OpenSSH's report of a refused shell / exec / subsystem.
+        puressh::Error::Protocol(m) if m.ends_with("request failed") => {
+            eprintln!("{m} on channel 0");
+            String::new()
+        }
+        e => e.to_string(),
+    })?;
     let channel_id = stream.channel_id();
+    if stream.pty_denied() {
+        // As OpenSSH: say so and leave raw mode; a terminal asked for with
+        // -t / RequestTTY yes|force is required, else carry on without.
+        #[cfg(unix)]
+        drop(raw_guard.take());
+        eprintln!("PTY allocation request failed on channel {channel_id}");
+        if pty_required {
+            return Err(String::new());
+        }
+    }
     // A short read timeout makes the stdout pump release the SharedClient
     // lock regularly, so the stdin writer and resize threads get through.
     let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));

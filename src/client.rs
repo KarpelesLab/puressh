@@ -2989,6 +2989,12 @@ impl Client {
     /// Encode `payload` and send it. The sans-IO driver owns the codec, so this
     /// queues the frame and flushes the outbound queue immediately (preserving
     /// the old eager-send semantics).
+    /// Start a key re-exchange now (`ssh`'s `~R`), unless one is running.
+    pub fn rekey(&mut self) -> Result<()> {
+        self.driver.request_rekey()?;
+        self.pump_out()
+    }
+
     pub(crate) fn write_payload(&mut self, payload: &[u8]) -> Result<()> {
         self.driver.enqueue_payload(payload)?;
         self.pump_out()

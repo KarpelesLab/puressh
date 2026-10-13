@@ -947,6 +947,26 @@ impl SharedClient {
         Ok(())
     }
 
+    /// Start a key re-exchange now (`ssh`'s `~R`), unless one is running.
+    pub fn rekey(&self) -> Result<()> {
+        lock_or_poison(&self.inner)?.client.rekey()
+    }
+
+    /// Send a `break` request on `channel` (RFC 4335), `ms` long: `ssh`'s
+    /// `~B`.
+    pub fn send_break(&self, channel: u32, ms: u32) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let payload = g.client.conn.send_request(
+            channel,
+            ChannelRequest::Other {
+                name: "break".into(),
+                raw: ms.to_be_bytes().to_vec(),
+            },
+            false,
+        )?;
+        g.client.write_payload(&payload)
+    }
+
     /// Send the global request `name` with body `data`, wanting a reply,
     /// and return the reply's data (for OpenSSH extensions such as
     /// `hostkeys-prove-00@openssh.com`).

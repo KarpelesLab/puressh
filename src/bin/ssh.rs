@@ -5398,6 +5398,10 @@ enum EscapeAction {
     LessVerbose,
     /// `~I`: describe the connection.
     ConnInfo,
+    /// `~B`: send a BREAK to the remote system.
+    Break,
+    /// `~R`: re-key the connection.
+    Rekey,
 }
 
 /// What `~I` prints (set once the connection is up).
@@ -5430,6 +5434,8 @@ impl EscapeFilter {
                     b'V' => Some(EscapeAction::MoreVerbose),
                     b'v' => Some(EscapeAction::LessVerbose),
                     b'I' => Some(EscapeAction::ConnInfo),
+                    b'B' => Some(EscapeAction::Break),
+                    b'R' => Some(EscapeAction::Rekey),
                     _ => None,
                 };
                 match action {
@@ -5467,8 +5473,9 @@ impl EscapeFilter {
 #[cfg(unix)]
 static ORIGINAL_TERMIOS: std::sync::Mutex<Option<nix::libc::termios>> = std::sync::Mutex::new(None);
 
-/// Carry out an escape action on behalf of the stdin thread.
-fn run_escape(action: EscapeAction, ch: u8) {
+/// Carry out an escape action on behalf of the stdin thread, for the
+/// session `channel` of `shared`.
+fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClient, channel: u32) {
     let show = |c: u8| -> String {
         if c < 0x20 {
             format!("^{}", (c + b'@') as char)
@@ -5493,6 +5500,8 @@ fn run_escape(action: EscapeAction, ch: u8) {
             let lines = [
                 "Supported escape sequences:".to_string(),
                 format!(" {e}.   - terminate connection"),
+                format!(" {e}B   - send a BREAK to the remote system"),
+                format!(" {e}R   - request rekey"),
                 format!(" {e}^Z  - suspend ssh"),
                 format!(" {e}#   - list forwarded connections"),
                 format!(" {e}V/v - increase/decrease verbosity"),
@@ -5504,6 +5513,14 @@ fn run_escape(action: EscapeAction, ch: u8) {
             for l in lines {
                 eprint!("{l}\r\n");
             }
+        }
+        EscapeAction::Break => {
+            eprint!("{e}B\r\n");
+            let _ = shared.send_break(channel, 1000);
+        }
+        EscapeAction::Rekey => {
+            eprint!("{e}R\r\n");
+            let _ = shared.rekey();
         }
         EscapeAction::ListForwards => {
             eprint!("The following connections are open:\r\n  #0 session\r\n");
@@ -5577,7 +5594,9 @@ fn run_session(
 ) -> Result<i32, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[cfg(unix)]
     let stdin_tty = stdin_is_tty();
+    #[cfg(unix)]
     let interactive = want_pty && stdin_tty;
 
     // Terminal: size, modes, raw mode (only when stdin is a terminal).
@@ -5631,7 +5650,13 @@ fn run_session(
     let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
 
     let done = Arc::new(AtomicBool::new(false));
-    let escape = if interactive { escape } else { None };
+    // As OpenSSH: escapes work whenever the session has a terminal (`-tt`
+    // with a pipe on stdin included).
+    let escape = if want_pty && !stream.pty_denied() {
+        escape
+    } else {
+        None
+    };
 
     // stdin → channel.
     #[cfg(unix)]
@@ -5671,7 +5696,7 @@ fn run_session(
                                     return;
                                 }
                                 sent = at;
-                                run_escape(action, f.ch);
+                                run_escape(action, f.ch, &w, channel_id);
                             }
                             if !send_all(&w, channel_id, &out[sent..]) {
                                 return;

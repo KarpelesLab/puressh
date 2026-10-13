@@ -537,6 +537,14 @@ impl ClientDriver {
         Ok(())
     }
 
+    /// Start a re-key now (`~R`), unless one is already running.
+    pub fn request_rekey(&mut self) -> Result<()> {
+        if self.runner.is_kexing() || !self.runner.is_completed() {
+            return Ok(());
+        }
+        self.initiate_rekey()
+    }
+
     /// Reset the keepalive activity clock on any inbound packet.
     fn note_activity(&mut self, now: Instant) {
         self.last_activity = now;

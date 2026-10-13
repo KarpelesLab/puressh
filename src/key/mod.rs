@@ -744,6 +744,18 @@ impl PrivateKey {
         }
     }
 
+    /// Replace the comment.
+    pub fn set_comment(&mut self, comment: impl Into<String>) {
+        match self {
+            PrivateKey::Ed25519 { comment: c, .. }
+            | PrivateKey::EcdsaP256 { comment: c, .. }
+            | PrivateKey::EcdsaP384 { comment: c, .. }
+            | PrivateKey::EcdsaP521 { comment: c, .. }
+            | PrivateKey::Rsa { comment: c, .. }
+            | PrivateKey::MlDsa44Ed25519 { comment: c, .. } => *c = comment.into(),
+        }
+    }
+
     /// Comment.
     pub fn comment(&self) -> &str {
         match self {

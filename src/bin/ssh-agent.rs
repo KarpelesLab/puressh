@@ -41,7 +41,7 @@ mod imp {
     use std::time::Duration;
 
     use nix::libc;
-    use puressh::agent::AgentState;
+    use puressh::agent::{AgentState, ConnectionState};
 
     const USAGE: &str = "usage: ssh-agent [-c | -s] [-Dd] [-a bind_address] [-E fingerprint_hash]\n                 [-O option] [-P allowed_providers] [-t life]\n       ssh-agent [-c | -s] [-Dd] [-a bind_address] [-E fingerprint_hash]\n                 [-O option] [-P allowed_providers] [-t life] command [arg ...]\n       ssh-agent [-c | -s] -k";
 
@@ -49,6 +49,19 @@ mod imp {
     const MAX_REQUEST: usize = 256 * 1024;
 
     static STOP: AtomicBool = AtomicBool::new(false);
+    /// SIGUSR1 drops every key (OpenSSH's agent does the same).
+    static KEYDROP: AtomicBool = AtomicBool::new(false);
+
+    extern "C" fn on_keydrop(_: libc::c_int) {
+        KEYDROP.store(true, Ordering::Relaxed);
+    }
+
+    /// Act on a pending SIGUSR1.
+    fn drop_keys_if_signalled(state: &mut AgentState) {
+        if KEYDROP.swap(false, Ordering::Relaxed) {
+            state.remove_all();
+        }
+    }
 
     extern "C" fn on_signal(_: libc::c_int) {
         STOP.store(true, Ordering::Relaxed);
@@ -248,6 +261,7 @@ mod imp {
             }
             return;
         }
+        let mut conn = ConnectionState::default();
         let mut len = [0u8; 4];
         loop {
             if stream.read_exact(&mut len).is_err() {
@@ -262,7 +276,10 @@ mod imp {
                 return;
             }
             let resp = match state.lock() {
-                Ok(mut s) => s.handle(&req),
+                Ok(mut s) => {
+                    drop_keys_if_signalled(&mut s);
+                    s.handle_on(&mut conn, &req)
+                }
                 Err(_) => return,
             };
             if debug {
@@ -306,6 +323,9 @@ mod imp {
     ) {
         let _ = listener.set_nonblocking(true);
         while !STOP.load(Ordering::Relaxed) {
+            if let Ok(mut s) = state.lock() {
+                drop_keys_if_signalled(&mut s);
+            }
             match listener.accept() {
                 Ok((stream, _)) => {
                     let _ = stream.set_nonblocking(false);
@@ -330,6 +350,39 @@ mod imp {
         }
     }
 
+    /// OpenSSH's `ask_permission`: run the askpass helper (`$SSH_ASKPASS`,
+    /// with `SSH_ASKPASS_PROMPT=confirm`) when a display is available (or
+    /// `SSH_ASKPASS_REQUIRE=force`); an empty answer or "yes" allows.
+    fn ask_permission(prompt: &str) -> bool {
+        let set = |v: &str| std::env::var_os(v).is_some_and(|s| !s.is_empty());
+        let require = std::env::var("SSH_ASKPASS_REQUIRE").unwrap_or_default();
+        let allowed = if require.eq_ignore_ascii_case("force") {
+            true
+        } else if require.eq_ignore_ascii_case("never") {
+            false
+        } else {
+            set("DISPLAY") || set("WAYLAND_DISPLAY")
+        };
+        if !allowed {
+            return false;
+        }
+        let askpass = std::env::var_os("SSH_ASKPASS")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/usr/bin/ssh-askpass".into());
+        let Ok(out) = std::process::Command::new(askpass)
+            .arg(prompt)
+            .env("SSH_ASKPASS_PROMPT", "confirm")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
+            .output()
+        else {
+            return false;
+        };
+        let answer = String::from_utf8_lossy(&out.stdout);
+        let answer = answer.split(['\r', '\n']).next().unwrap_or("");
+        out.status.success() && (answer.is_empty() || answer.eq_ignore_ascii_case("yes"))
+    }
+
     fn install_signals() {
         // SAFETY: the handler only stores into an AtomicBool.
         unsafe {
@@ -337,6 +390,7 @@ mod imp {
                 libc::signal(sig, on_signal as *const () as libc::sighandler_t);
             }
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            libc::signal(libc::SIGUSR1, on_keydrop as *const () as libc::sighandler_t);
         }
     }
 
@@ -386,6 +440,7 @@ mod imp {
 
         let mut state = AgentState::new();
         state.set_default_lifetime(o.lifetime);
+        state.set_confirm(Box::new(ask_permission));
         let state = Arc::new(Mutex::new(state));
 
         if o.foreground {

@@ -46,8 +46,14 @@ pub const SSH_AGENTC_ADD_ID_CONSTRAINED: u8 = 25;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
 /// `SSH_AGENT_EXTENSION_FAILURE`.
 pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
+/// `SSH_AGENT_EXTENSION_RESPONSE`.
+pub const SSH_AGENT_EXTENSION_RESPONSE: u8 = 29;
 /// Key constraint: lifetime in seconds (`uint32`).
 pub const SSH_AGENT_CONSTRAIN_LIFETIME: u8 = 1;
+/// Key constraint: confirm each use.
+pub const SSH_AGENT_CONSTRAIN_CONFIRM: u8 = 2;
+/// Key constraint: `string name` and extension-specific data.
+pub const SSH_AGENT_CONSTRAIN_EXTENSION: u8 = 255;
 
 /// Cap on how large a single agent reply we'll buffer. The OpenSSH
 /// agent reports its own ~256 KiB ceiling — we go larger to tolerate

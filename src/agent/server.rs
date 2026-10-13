@@ -5,11 +5,18 @@
 //!
 //! Supported (draft-miller-ssh-agent / OpenSSH `PROTOCOL.agent`): listing,
 //! signing (RSA `rsa-sha2-256` / `rsa-sha2-512` flags, legacy SHA-1 when no
-//! flag), adding keys with an optional lifetime constraint, removing one or
-//! all keys, and locking / unlocking with a passphrase. Requests this agent
-//! cannot honour — the `confirm` constraint (no askpass UI), destination
-//! constraints, smartcards, extensions — are refused, never silently
-//! weakened.
+//! flag), adding keys and certificates with lifetime, `confirm` (when a
+//! confirmation callback is set) and destination
+//! (`restrict-destination-v00@openssh.com`) constraints, removing one or
+//! all keys, locking / unlocking with a passphrase, and the `query` and
+//! `session-bind@openssh.com` extensions. Requests this agent cannot honour
+//! — smartcards, security-key providers, other extensions — are refused,
+//! never silently weakened.
+//!
+//! Destination constraints follow OpenSSH's `ssh-agent`: each connection
+//! records the sessions `ssh` bound it to ([`ConnectionState`]), and a
+//! constrained key is only listed, and only signs `publickey` requests,
+//! along a path of hops its constraints allow.
 
 use alloc::vec::Vec;
 use std::time::{Duration, Instant};
@@ -27,7 +34,68 @@ struct Held {
     blob: Vec<u8>,
     comment: String,
     expires: Option<Instant>,
+    confirm: bool,
+    dest: Vec<DestConstraint>,
 }
+
+/// One hop of a destination constraint: a user pattern, a host name and
+/// its host (or CA) keys.
+#[derive(Debug, Default)]
+struct Hop {
+    user: Option<String>,
+    hostname: Option<String>,
+    /// `(key blob, is a CA key)`.
+    keys: Vec<(Vec<u8>, bool)>,
+}
+
+/// `from > to`: the key may be used to reach `to` from `from` (from the
+/// origin when `from` has no host).
+#[derive(Debug)]
+struct DestConstraint {
+    from: Hop,
+    to: Hop,
+}
+
+/// A session an agent connection was bound to by `ssh`
+/// (`session-bind@openssh.com`).
+#[derive(Debug)]
+struct Bind {
+    host_key: Vec<u8>,
+    session_id: Vec<u8>,
+    forwarded: bool,
+}
+
+/// Most bindings one connection may record, longest session ID, most
+/// destination constraints per key, longest user pattern (OpenSSH's).
+const MAX_SESSION_IDS: usize = 16;
+const MAX_SID_LEN: usize = 128;
+const MAX_DEST_CONSTRAINTS: usize = 1024;
+const MAX_USER_PATTERN: usize = 256;
+
+/// CA signature algorithms a host certificate in a destination constraint
+/// may be signed with (OpenSSH's `SSH_ALLOWED_CA_SIGALGS`).
+const ALLOWED_CA_SIGALGS: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+    "ssh-mldsa44-ed25519@openssh.com",
+];
+
+/// What one agent connection has been bound to: the sessions `ssh`
+/// recorded on it, oldest (the first hop) first. Requests on a connection
+/// go through [`AgentState::handle_on`] with its state.
+#[derive(Debug, Default)]
+pub struct ConnectionState {
+    binds: Vec<Bind>,
+    bind_attempted: bool,
+}
+
+/// Asks the user whether a key may be used: given the prompt, returns
+/// `true` to allow it.
+pub type ConfirmFn = Box<dyn FnMut(&str) -> bool + Send>;
 
 /// The keys an agent holds and its lock state.
 pub struct AgentState {
@@ -35,6 +103,7 @@ pub struct AgentState {
     /// SHA-512 of the lock passphrase while locked.
     locked: Option<Zeroizing<[u8; 64]>>,
     default_lifetime: Option<Duration>,
+    confirm: Option<ConfirmFn>,
 }
 
 impl Default for AgentState {
@@ -74,7 +143,20 @@ impl AgentState {
             keys: Vec::new(),
             locked: None,
             default_lifetime: None,
+            confirm: None,
         }
+    }
+
+    /// Forget every key (`ssh-agent` on SIGUSR1).
+    pub fn remove_all(&mut self) {
+        self.keys.clear();
+    }
+
+    /// Accept the `confirm` constraint (`ssh-add -c`), asking `confirm`
+    /// before each use of such a key. Without it, keys added with the
+    /// constraint are refused.
+    pub fn set_confirm(&mut self, confirm: ConfirmFn) {
+        self.confirm = Some(confirm);
     }
 
     /// Give keys added without a lifetime constraint this lifetime
@@ -101,21 +183,38 @@ impl AgentState {
 
     /// Handle one request (`type byte ‖ body`) and return the reply
     /// (`type byte ‖ body`), ready to be length-prefixed onto the socket.
+    /// The request is taken as coming from a connection of its own, never
+    /// bound to a session; a server keeps a [`ConnectionState`] per
+    /// connection and uses [`Self::handle_on`].
     pub fn handle(&mut self, request: &[u8]) -> Vec<u8> {
+        self.handle_on(&mut ConnectionState::default(), request)
+    }
+
+    /// Handle one request received on the connection `conn`.
+    pub fn handle_on(&mut self, conn: &mut ConnectionState, request: &[u8]) -> Vec<u8> {
         self.expire();
         let Some((&msg_type, body)) = request.split_first() else {
             return failure();
         };
         let locked = self.locked.is_some();
+        if locked && msg_type != SSH_AGENTC_UNLOCK {
+            // A locked agent lists nothing and refuses everything else.
+            return if msg_type == SSH_AGENTC_REQUEST_IDENTITIES {
+                reply(SSH_AGENT_IDENTITIES_ANSWER, &0u32.to_be_bytes())
+            } else {
+                failure()
+            };
+        }
         match msg_type {
             SSH_AGENTC_REQUEST_IDENTITIES => {
                 let mut w = Writer::new();
-                // A locked agent lists nothing.
-                let shown: Vec<&Held> = if locked {
-                    Vec::new()
-                } else {
-                    self.keys.iter().collect()
-                };
+                // Keys not permitted along this connection's path are
+                // not shown.
+                let shown: Vec<&Held> = self
+                    .keys
+                    .iter()
+                    .filter(|k| identity_permitted(k, conn, None))
+                    .collect();
                 w.write_u32(shown.len() as u32);
                 for k in shown {
                     w.write_string(&k.blob);
@@ -123,28 +222,29 @@ impl AgentState {
                 }
                 reply(SSH_AGENT_IDENTITIES_ANSWER, w.as_slice())
             }
-            SSH_AGENTC_SIGN_REQUEST if !locked => self.sign(body).unwrap_or_else(failure),
-            SSH_AGENTC_ADD_IDENTITY | SSH_AGENTC_ADD_ID_CONSTRAINED if !locked => self
-                .add(body, msg_type == SSH_AGENTC_ADD_ID_CONSTRAINED)
+            SSH_AGENTC_SIGN_REQUEST => self.sign(conn, body).unwrap_or_else(failure),
+            SSH_AGENTC_ADD_IDENTITY | SSH_AGENTC_ADD_ID_CONSTRAINED => self
+                .add(conn, body, msg_type == SSH_AGENTC_ADD_ID_CONSTRAINED)
                 .unwrap_or_else(failure),
-            SSH_AGENTC_REMOVE_IDENTITY if !locked => {
+            SSH_AGENTC_REMOVE_IDENTITY => {
                 let mut r = Reader::new(body);
                 let Ok(blob) = r.read_string() else {
                     return failure();
                 };
-                let before = self.keys.len();
-                self.keys.retain(|k| k.blob != blob);
-                if self.keys.len() < before {
-                    success()
-                } else {
-                    failure()
+                // A key this connection cannot see cannot be removed.
+                match self.keys.iter().position(|k| k.blob == blob) {
+                    Some(i) if identity_permitted(&self.keys[i], conn, None) => {
+                        self.keys.remove(i);
+                        success()
+                    }
+                    _ => failure(),
                 }
             }
-            SSH_AGENTC_REMOVE_ALL_IDENTITIES if !locked => {
+            SSH_AGENTC_REMOVE_ALL_IDENTITIES => {
                 self.keys.clear();
                 success()
             }
-            SSH_AGENTC_LOCK if !locked => {
+            SSH_AGENTC_LOCK => {
                 let mut r = Reader::new(body);
                 let Ok(pass) = r.read_string() else {
                     return failure();
@@ -169,17 +269,70 @@ impl AgentState {
                     failure()
                 }
             }
-            SSH_AGENTC_EXTENSION => vec![SSH_AGENT_EXTENSION_FAILURE],
+            SSH_AGENTC_EXTENSION => {
+                let mut r = Reader::new(body);
+                match r.read_string() {
+                    Ok(b"query") => {
+                        let mut w = Writer::new();
+                        w.write_string(b"query");
+                        w.write_string(b"session-bind@openssh.com");
+                        reply(SSH_AGENT_EXTENSION_RESPONSE, w.as_slice())
+                    }
+                    Ok(b"session-bind@openssh.com") => {
+                        if session_bind(conn, &mut r) {
+                            success()
+                        } else {
+                            vec![SSH_AGENT_EXTENSION_FAILURE]
+                        }
+                    }
+                    _ => failure(),
+                }
+            }
             _ => failure(),
         }
     }
 
-    fn sign(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+    fn sign(&mut self, conn: &ConnectionState, body: &[u8]) -> Option<Vec<u8>> {
         let mut r = Reader::new(body);
         let blob = r.read_string().ok()?;
         let data = r.read_string().ok()?;
         let flags = r.read_u32().unwrap_or(0);
         let held = self.keys.iter().find(|k| k.blob == blob)?;
+        let mut sig_dest = None;
+        if !held.dest.is_empty() {
+            // A destination-constrained key signs only a `publickey`
+            // request for the session most recently bound, along a path
+            // its constraints allow.
+            let last = conn.binds.last()?;
+            let req = parse_userauth_request(data, blob)?;
+            if !identity_permitted(held, conn, Some(&req.user)) || req.session_id != last.session_id
+            {
+                return None;
+            }
+            match &req.host_key {
+                None if conn.binds.len() > 1 => return None,
+                Some(k) if *k != last.host_key => return None,
+                _ => {}
+            }
+            sig_dest = Some(format!(
+                "public key authentication request for user \"{}\" to listed host",
+                req.user
+            ));
+        }
+        if held.confirm {
+            let mut prompt = format!(
+                "Allow use of key {}?\nKey fingerprint {}.",
+                held.comment,
+                held.key.public_key().sha256_fingerprint()
+            );
+            if let Some(d) = sig_dest {
+                prompt.push('\n');
+                prompt.push_str(&d);
+            }
+            if !self.confirm.as_mut().is_some_and(|ask| ask(&prompt)) {
+                return None;
+            }
+        }
         let signer = held.key.agent_signer(flags).ok()?;
         let sig = signer.sign(data).ok()?;
         let mut w = Writer::new();
@@ -187,7 +340,7 @@ impl AgentState {
         Some(reply(SSH_AGENT_SIGN_RESPONSE, w.as_slice()))
     }
 
-    fn add(&mut self, body: &[u8], constrained: bool) -> Option<Vec<u8>> {
+    fn add(&mut self, conn: &ConnectionState, body: &[u8], constrained: bool) -> Option<Vec<u8>> {
         let mut r = Reader::new(body);
         let is_cert = Reader::new(body)
             .read_string()
@@ -202,17 +355,34 @@ impl AgentState {
         } else {
             (PrivateKey::from_agent_add_body(&mut r).ok()?, None)
         };
-        let mut lifetime = self.default_lifetime;
+        let mut lifetime = None;
+        let mut confirm = false;
+        let mut dest: Option<Vec<DestConstraint>> = None;
         if constrained {
             while !r.is_empty() {
                 match r.read_u8().ok()? {
-                    SSH_AGENT_CONSTRAIN_LIFETIME => {
+                    SSH_AGENT_CONSTRAIN_LIFETIME if lifetime.is_none() => {
                         lifetime = Some(Duration::from_secs(r.read_u32().ok()? as u64));
                     }
-                    // `confirm` needs an askpass prompt per use and
-                    // extensions (e.g. destination restrictions) narrow
-                    // where a key may be used: refuse rather than hold the
-                    // key without honouring them.
+                    // Without a way to ask, a key to confirm is refused
+                    // rather than held unconfirmed.
+                    SSH_AGENT_CONSTRAIN_CONFIRM if !confirm && self.confirm.is_some() => {
+                        confirm = true;
+                    }
+                    SSH_AGENT_CONSTRAIN_EXTENSION => match r.read_string().ok()? {
+                        b"restrict-destination-v00@openssh.com" if dest.is_none() => {
+                            let mut b = Reader::new(r.read_string().ok()?);
+                            let mut list = Vec::new();
+                            while !b.is_empty() {
+                                if list.len() >= MAX_DEST_CONSTRAINTS {
+                                    return None;
+                                }
+                                list.push(parse_dest_constraint(&mut b)?);
+                            }
+                            dest = Some(list);
+                        }
+                        _ => return None,
+                    },
                     _ => return None,
                 }
             }
@@ -221,17 +391,291 @@ impl AgentState {
         }
         let blob = cert.unwrap_or_else(|| key.public_key().wire_blob());
         let comment = key.comment().to_string();
-        let expires = lifetime.map(|d| Instant::now() + d);
-        // Re-adding a key replaces it (new comment / lifetime).
-        self.keys.retain(|k| k.blob != blob);
+        let expires = lifetime
+            .or(self.default_lifetime)
+            .map(|d| Instant::now() + d);
+        // Re-adding a key replaces it (new comment / constraints), unless
+        // this connection could not see it.
+        if let Some(i) = self.keys.iter().position(|k| k.blob == blob) {
+            if !identity_permitted(&self.keys[i], conn, None) {
+                return None;
+            }
+            self.keys.remove(i);
+        }
         self.keys.push(Held {
             key,
             blob,
             comment,
             expires,
+            confirm,
+            dest: dest.unwrap_or_default(),
         });
         Some(success())
     }
+}
+
+/// `session-bind@openssh.com`: record that `conn` serves the session whose
+/// ID the host key signed (`forwarded`: for a forwarded agent rather than
+/// authentication). Returns whether the binding was accepted.
+fn session_bind(conn: &mut ConnectionState, r: &mut Reader<'_>) -> bool {
+    conn.bind_attempted = true;
+    let parsed = (|| {
+        let key = r.read_string().ok()?.to_vec();
+        let sid = r.read_string().ok()?.to_vec();
+        let sig = r.read_string().ok()?.to_vec();
+        let fwd = r.read_u8().ok()? != 0;
+        Some((key, sid, sig, fwd))
+    })();
+    let Some((host_key, session_id, sig, forwarded)) = parsed else {
+        return false;
+    };
+    if session_id.len() > MAX_SID_LEN || !verify_by_key(&host_key, &session_id, &sig) {
+        return false;
+    }
+    for b in &conn.binds {
+        // A connection used for authentication is not reused for another
+        // session.
+        if !b.forwarded {
+            return false;
+        }
+        if b.session_id == session_id {
+            return b.host_key == host_key;
+        }
+    }
+    if conn.binds.len() >= MAX_SESSION_IDS {
+        return false;
+    }
+    conn.binds.push(Bind {
+        host_key,
+        session_id,
+        forwarded,
+    });
+    true
+}
+
+/// Verify `sig` over `data` with the key (or certificate's key) `key`.
+fn verify_by_key(key: &[u8], data: &[u8], sig: &[u8]) -> bool {
+    let plain;
+    let blob = if is_cert_blob(key) {
+        match crate::cert::Certificate::parse(key) {
+            Ok(c) => {
+                plain = c.embedded_pubkey_blob().to_vec();
+                &plain[..]
+            }
+            Err(_) => return false,
+        }
+    } else {
+        key
+    };
+    let Some(alg) = Reader::new(sig)
+        .read_string()
+        .ok()
+        .and_then(|a| core::str::from_utf8(a).ok())
+    else {
+        return false;
+    };
+    crate::hostkey::host_key_verify_by_name(alg, blob)
+        .and_then(|v| v.verify(data, sig))
+        .is_ok()
+}
+
+fn is_cert_blob(blob: &[u8]) -> bool {
+    Reader::new(blob)
+        .read_string()
+        .ok()
+        .and_then(|t| core::str::from_utf8(t).ok())
+        .is_some_and(crate::cert::is_cert_name)
+}
+
+/// The key type a signature algorithm is made with (`rsa-sha2-512` is an
+/// `ssh-rsa` key's).
+fn key_type_of(alg: &[u8]) -> &[u8] {
+    match alg {
+        b"rsa-sha2-256" | b"rsa-sha2-512" => b"ssh-rsa",
+        b"rsa-sha2-256-cert-v01@openssh.com" | b"rsa-sha2-512-cert-v01@openssh.com" => {
+            b"ssh-rsa-cert-v01@openssh.com"
+        }
+        other => other,
+    }
+}
+
+/// The parts of a `publickey` userauth request an agent checks.
+struct UserauthRequest {
+    session_id: Vec<u8>,
+    user: String,
+    host_key: Option<Vec<u8>>,
+}
+
+/// Parse `data` as the `publickey` (or `publickey-hostbound-v00`) userauth
+/// request a key signs, for the key `key`; `None` if it is anything else.
+fn parse_userauth_request(data: &[u8], key: &[u8]) -> Option<UserauthRequest> {
+    let mut r = Reader::new(data);
+    let session_id = r.read_string().ok()?.to_vec();
+    if session_id.is_empty() || r.read_u8().ok()? != 50 {
+        return None;
+    }
+    let user = core::str::from_utf8(r.read_string().ok()?)
+        .ok()?
+        .to_string();
+    let service = r.read_string().ok()?;
+    let method = r.read_string().ok()?;
+    let sig_follows = r.read_u8().ok()?;
+    let pkalg = r.read_string().ok()?;
+    let mkey = r.read_string().ok()?;
+    let key_type = Reader::new(key).read_string().ok()?;
+    if sig_follows != 1
+        || service != b"ssh-connection"
+        || mkey != key
+        || key_type_of(pkalg) != key_type
+    {
+        return None;
+    }
+    let host_key = match method {
+        b"publickey-hostbound-v00@openssh.com" => Some(r.read_string().ok()?.to_vec()),
+        b"publickey" => None,
+        _ => return None,
+    };
+    if !r.is_empty() {
+        return None;
+    }
+    Some(UserauthRequest {
+        session_id,
+        user,
+        host_key,
+    })
+}
+
+fn parse_hop(b: &[u8]) -> Option<Hop> {
+    let mut r = Reader::new(b);
+    let user = core::str::from_utf8(r.read_string().ok()?).ok()?;
+    let hostname = core::str::from_utf8(r.read_string().ok()?).ok()?;
+    if !r.read_string().ok()?.is_empty() || user.len() > MAX_USER_PATTERN {
+        return None;
+    }
+    let mut hop = Hop {
+        user: (!user.is_empty()).then(|| user.to_string()),
+        hostname: (!hostname.is_empty()).then(|| hostname.to_string()),
+        keys: Vec::new(),
+    };
+    while !r.is_empty() {
+        let key = r.read_string().ok()?;
+        crate::key::PublicKey::parse_wire_blob(key)
+            .map(|_| ())
+            .or_else(|_| crate::cert::Certificate::parse(key).map(|_| ()))
+            .ok()?;
+        let is_ca = r.read_u8().ok()? != 0;
+        hop.keys.push((key.to_vec(), is_ca));
+    }
+    Some(hop)
+}
+
+fn parse_dest_constraint(m: &mut Reader<'_>) -> Option<DestConstraint> {
+    let mut r = Reader::new(m.read_string().ok()?);
+    let from = parse_hop(r.read_string().ok()?)?;
+    let to = parse_hop(r.read_string().ok()?)?;
+    if !r.read_string().ok()?.is_empty() {
+        return None;
+    }
+    // `from` names a host with its keys, or neither (the origin), and
+    // never a user; `to` always names a host with keys.
+    if from.hostname.is_none() != from.keys.is_empty()
+        || from.user.is_some()
+        || to.hostname.is_none()
+        || to.keys.is_empty()
+    {
+        return None;
+    }
+    Some(DestConstraint { from, to })
+}
+
+/// Whether the host key (or host certificate) `key` is one of `hop`'s:
+/// a plain key listed as such, or a certificate for the hop's host name
+/// signed by a CA key listed for it.
+fn match_key_hop(key: &[u8], hop: &Hop) -> bool {
+    let cert = if is_cert_blob(key) {
+        match crate::cert::Certificate::parse(key) {
+            Ok(c) => Some(c),
+            Err(_) => return false,
+        }
+    } else {
+        None
+    };
+    let hostname = hop.hostname.as_deref().unwrap_or("(ORIGIN)");
+    hop.keys.iter().any(|(k, is_ca)| match &cert {
+        None => !is_ca && k == key,
+        Some(c) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            *is_ca
+                && c.signature_key_blob == *k
+                && c.check_type(crate::cert::CertType::Host).is_ok()
+                && c.check_validity(now).is_ok()
+                && (c.valid_principals.is_empty()
+                    || c.valid_principals.iter().any(|p| p == hostname))
+                && c.verify_ca_signature(ALLOWED_CA_SIGALGS).is_ok()
+        }
+    })
+}
+
+/// Whether one of `held`'s constraints allows the hop from `from` (the
+/// origin when `None`) to `to` (any host when `None`) for `user`.
+fn permitted_by_dest_constraints(
+    from: Option<&[u8]>,
+    to: Option<&[u8]>,
+    held: &Held,
+    user: Option<&str>,
+) -> bool {
+    held.dest.iter().any(|d| {
+        let from_ok = match from {
+            None => d.from.hostname.is_none() && d.from.keys.is_empty(),
+            Some(k) => match_key_hop(k, &d.from),
+        };
+        let to_ok = to.is_none_or(|k| match_key_hop(k, &d.to));
+        let user_ok = match (&d.to.user, user) {
+            (Some(pat), Some(u)) => crate::config::glob::glob_match(pat, u),
+            _ => true,
+        };
+        from_ok && to_ok && user_ok
+    })
+}
+
+/// OpenSSH's `identity_permitted`: whether `held` may be seen or used on
+/// `conn`, walking the hops the connection was bound along; `user` is the
+/// target user of a signature request.
+fn identity_permitted(held: &Held, conn: &ConnectionState, user: Option<&str>) -> bool {
+    if held.dest.is_empty() {
+        return true;
+    }
+    if conn.binds.is_empty() {
+        // Local use, unless a bind was attempted and failed.
+        return !conn.bind_attempted;
+    }
+    let last = conn.binds.len() - 1;
+    let mut from: Option<&[u8]> = None;
+    for (i, b) in conn.binds.iter().enumerate() {
+        let mut test_user = None;
+        if i == last {
+            // The user can only be checked at the final hop, which must
+            // not be a forwarding when signing.
+            test_user = user;
+            if b.forwarded && user.is_some() {
+                return false;
+            }
+        } else if !b.forwarded {
+            return false;
+        }
+        if !permitted_by_dest_constraints(from, Some(&b.host_key), held, test_user) {
+            return false;
+        }
+        from = Some(&b.host_key);
+    }
+    // Listing through a forwarding: only keys usable beyond this host.
+    let b = &conn.binds[last];
+    if b.forwarded && user.is_none() {
+        return permitted_by_dest_constraints(Some(&b.host_key), None, held, None);
+    }
+    true
 }
 
 #[cfg(test)]
@@ -365,6 +809,183 @@ mod tests {
         );
     }
 
+    /// `session-bind@openssh.com` for `host` over `sid`.
+    fn bind(
+        state: &mut AgentState,
+        conn: &mut ConnectionState,
+        host: &PrivateKey,
+        sid: &[u8],
+        fwd: bool,
+    ) -> u8 {
+        let sig = host.agent_signer(0).unwrap().sign(sid).unwrap();
+        let mut w = Writer::new();
+        w.write_string(b"session-bind@openssh.com");
+        w.write_string(&host.public_key().wire_blob());
+        w.write_string(sid);
+        w.write_string(&sig);
+        w.write_u8(u8::from(fwd));
+        state.handle_on(conn, &msg(SSH_AGENTC_EXTENSION, w.as_slice()))[0]
+    }
+
+    /// The data a client signs for `publickey-hostbound-v00`.
+    fn userauth(sid: &[u8], user: &str, key: &[u8], host: &[u8]) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.write_string(sid);
+        w.write_u8(50);
+        w.write_string(user.as_bytes());
+        w.write_string(b"ssh-connection");
+        w.write_string(b"publickey-hostbound-v00@openssh.com");
+        w.write_u8(1);
+        w.write_string(b"ssh-ed25519");
+        w.write_string(key);
+        w.write_string(host);
+        w.into_vec()
+    }
+
+    fn sign_on(state: &mut AgentState, conn: &mut ConnectionState, blob: &[u8], data: &[u8]) -> u8 {
+        let mut w = Writer::new();
+        w.write_string(blob);
+        w.write_string(data);
+        w.write_u32(0);
+        state.handle_on(conn, &msg(SSH_AGENTC_SIGN_REQUEST, w.as_slice()))[0]
+    }
+
+    fn listed(state: &mut AgentState, conn: &mut ConnectionState) -> u32 {
+        let r = state.handle_on(conn, &[SSH_AGENTC_REQUEST_IDENTITIES]);
+        Reader::new(&r[1..]).read_u32().unwrap()
+    }
+
+    #[test]
+    fn destination_constraints() {
+        let mut s = AgentState::new();
+        let user_key = fixture("u_ed25519");
+        let host = fixture("h_ed25519");
+        let other_host = fixture("u_ecdsa");
+        let host_blob = host.public_key().wire_blob();
+        let key_blob = user_key.public_key().wire_blob();
+
+        // Usable as alice (pattern) at `host`, from the origin.
+        let mut c = crate::agent::AddConstraints::default();
+        c.destinations
+            .push(crate::agent::DestinationConstraint::new(
+                crate::agent::DestinationHop::default(),
+                crate::agent::DestinationHop::new(
+                    Some("ali*".into()),
+                    Some("host".into()),
+                    vec![(host_blob.clone(), false)],
+                ),
+            ));
+        let mut body = user_key.to_agent_add_body();
+        let mut probe = Writer::new();
+        probe.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+        probe.write_string(b"restrict-destination-v00@openssh.com");
+        let mut list = Writer::new();
+        for d in &c.destinations {
+            let mut w = Writer::new();
+            w.write_string(&d.from.encode_for_test());
+            w.write_string(&d.to.encode_for_test());
+            w.write_string(b"");
+            list.write_string(w.as_slice());
+        }
+        probe.write_string(list.as_slice());
+        body.extend_from_slice(probe.as_slice());
+        assert_eq!(
+            s.handle(&msg(SSH_AGENTC_ADD_ID_CONSTRAINED, &body))[0],
+            SSH_AGENT_SUCCESS
+        );
+
+        // Local, unbound use: listed, but signing needs a bound session.
+        let mut local = ConnectionState::default();
+        assert_eq!(listed(&mut s, &mut local), 1);
+        let sid = b"session-id-1";
+        let data = userauth(sid, "alice", &key_blob, &host_blob);
+        assert_eq!(
+            sign_on(&mut s, &mut local, &key_blob, &data),
+            SSH_AGENT_FAILURE
+        );
+
+        // Bound to `host`: signs for alice, not for bob or another session.
+        let mut conn = ConnectionState::default();
+        assert_eq!(
+            bind(&mut s, &mut conn, &host, sid, false),
+            SSH_AGENT_SUCCESS
+        );
+        assert_eq!(
+            sign_on(&mut s, &mut conn, &key_blob, &data),
+            SSH_AGENT_SIGN_RESPONSE
+        );
+        let bob = userauth(sid, "bob", &key_blob, &host_blob);
+        assert_eq!(
+            sign_on(&mut s, &mut conn, &key_blob, &bob),
+            SSH_AGENT_FAILURE
+        );
+        let stale = userauth(b"other", "alice", &key_blob, &host_blob);
+        assert_eq!(
+            sign_on(&mut s, &mut conn, &key_blob, &stale),
+            SSH_AGENT_FAILURE
+        );
+        // A connection used for authentication is not rebound.
+        assert_eq!(
+            bind(&mut s, &mut conn, &host, b"session-id-2", false),
+            SSH_AGENT_EXTENSION_FAILURE
+        );
+
+        // Bound to another host: the key is hidden and refuses to sign.
+        let mut elsewhere = ConnectionState::default();
+        assert_eq!(
+            bind(&mut s, &mut elsewhere, &other_host, sid, false),
+            SSH_AGENT_SUCCESS
+        );
+        assert_eq!(listed(&mut s, &mut elsewhere), 0);
+        let data = userauth(
+            sid,
+            "alice",
+            &key_blob,
+            &other_host.public_key().wire_blob(),
+        );
+        assert_eq!(
+            sign_on(&mut s, &mut elsewhere, &key_blob, &data),
+            SSH_AGENT_FAILURE
+        );
+
+        // Forwarded to `host`: nothing beyond it is allowed, so hidden.
+        let mut fwd = ConnectionState::default();
+        assert_eq!(bind(&mut s, &mut fwd, &host, sid, true), SSH_AGENT_SUCCESS);
+        assert_eq!(listed(&mut s, &mut fwd), 0);
+
+        // A bad binding signature is refused, and then nothing signs.
+        let mut bad = ConnectionState::default();
+        let mut w = Writer::new();
+        w.write_string(b"session-bind@openssh.com");
+        w.write_string(&host_blob);
+        w.write_string(sid);
+        w.write_string(&other_host.agent_signer(0).unwrap().sign(sid).unwrap());
+        w.write_u8(0);
+        assert_eq!(
+            s.handle_on(&mut bad, &msg(SSH_AGENTC_EXTENSION, w.as_slice()))[0],
+            SSH_AGENT_EXTENSION_FAILURE
+        );
+        assert_eq!(listed(&mut s, &mut bad), 0);
+    }
+
+    #[test]
+    fn query_extension() {
+        let mut s = AgentState::new();
+        let mut w = Writer::new();
+        w.write_string(b"query");
+        let r = s.handle(&msg(SSH_AGENTC_EXTENSION, w.as_slice()));
+        assert_eq!(r[0], SSH_AGENT_EXTENSION_RESPONSE);
+        let mut r = Reader::new(&r[1..]);
+        assert_eq!(r.read_string().unwrap(), b"query");
+        assert_eq!(r.read_string().unwrap(), b"session-bind@openssh.com");
+        let mut w = Writer::new();
+        w.write_string(b"nope@example.com");
+        assert_eq!(
+            s.handle(&msg(SSH_AGENTC_EXTENSION, w.as_slice()))[0],
+            SSH_AGENT_FAILURE
+        );
+    }
+
     #[test]
     fn constraints_lock_and_remove() {
         let mut s = AgentState::new();
@@ -421,10 +1042,8 @@ mod tests {
             SSH_AGENT_SUCCESS
         );
         assert_eq!(count(&mut s), 0);
-        assert_eq!(
-            s.handle(&[SSH_AGENTC_EXTENSION])[0],
-            SSH_AGENT_EXTENSION_FAILURE
-        );
+        // An extension request without a name does not parse.
+        assert_eq!(s.handle(&[SSH_AGENTC_EXTENSION])[0], SSH_AGENT_FAILURE);
         assert_eq!(s.handle(&[99])[0], SSH_AGENT_FAILURE);
         assert_eq!(s.handle(&[])[0], SSH_AGENT_FAILURE);
     }

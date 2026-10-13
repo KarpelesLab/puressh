@@ -9,13 +9,84 @@ use std::time::Duration;
 use crate::error::{Error, Result};
 
 use super::protocol::{
-    IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_CONSTRAIN_LIFETIME, SSH_AGENT_FAILURE,
+    IdentityEntry, MAX_REPLY_LEN, SSH_AGENT_CONSTRAIN_CONFIRM, SSH_AGENT_CONSTRAIN_EXTENSION,
+    SSH_AGENT_CONSTRAIN_LIFETIME, SSH_AGENT_EXTENSION_RESPONSE, SSH_AGENT_FAILURE,
     SSH_AGENT_IDENTITIES_ANSWER, SSH_AGENT_SIGN_RESPONSE, SSH_AGENT_SUCCESS,
-    SSH_AGENTC_ADD_ID_CONSTRAINED, SSH_AGENTC_ADD_IDENTITY, SSH_AGENTC_LOCK,
+    SSH_AGENTC_ADD_ID_CONSTRAINED, SSH_AGENTC_ADD_IDENTITY, SSH_AGENTC_EXTENSION, SSH_AGENTC_LOCK,
     SSH_AGENTC_REMOVE_ALL_IDENTITIES, SSH_AGENTC_REMOVE_IDENTITY, SSH_AGENTC_UNLOCK,
     decode_identities_answer, decode_sign_response, encode_message, encode_request_identities,
     encode_sign_request,
 };
+
+/// Constraints on a key added with [`Agent::add_constrained`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct AddConstraints {
+    /// Forget the key after this many seconds.
+    pub lifetime: Option<u32>,
+    /// Ask the user before each use.
+    pub confirm: bool,
+    /// Where the key may be used (`ssh-add -h`); empty for anywhere.
+    pub destinations: Vec<DestinationConstraint>,
+}
+
+/// One hop of a [`DestinationConstraint`].
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DestinationHop {
+    /// User pattern (`to` hops only).
+    pub user: Option<String>,
+    /// Host name; `None` for the origin (a `from` hop) .
+    pub hostname: Option<String>,
+    /// The host's keys, as `(key blob, is a CA key)`.
+    pub keys: Vec<(Vec<u8>, bool)>,
+}
+
+impl DestinationHop {
+    /// A hop for `hostname` (`None`: the origin) with its keys.
+    pub fn new(user: Option<String>, hostname: Option<String>, keys: Vec<(Vec<u8>, bool)>) -> Self {
+        Self {
+            user,
+            hostname,
+            keys,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn encode_for_test(&self) -> Vec<u8> {
+        self.encode()
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(self.user.as_deref().unwrap_or("").as_bytes());
+        w.write_string(self.hostname.as_deref().unwrap_or("").as_bytes());
+        w.write_string(b"");
+        for (k, is_ca) in &self.keys {
+            w.write_string(k);
+            w.write_u8(u8::from(*is_ca));
+        }
+        w.into_vec()
+    }
+}
+
+/// A key may be used to go `from` one host `to` another
+/// (`restrict-destination-v00@openssh.com`).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct DestinationConstraint {
+    /// Where from (the origin when it has no host name).
+    pub from: DestinationHop,
+    /// Where to.
+    pub to: DestinationHop,
+}
+
+impl DestinationConstraint {
+    /// `from > to`.
+    pub fn new(from: DestinationHop, to: DestinationHop) -> Self {
+        Self { from, to }
+    }
+}
 
 /// Default per-call socket timeout. Agents are nearly always
 /// loopback / local-Unix-socket, so anything over a second indicates
@@ -180,17 +251,79 @@ impl Agent {
         cert_blob: &[u8],
         lifetime: Option<u32>,
     ) -> Result<()> {
-        let mut body = zeroize::Zeroizing::new(key.to_agent_add_cert_body(cert_blob));
-        let msg_type = match lifetime {
-            Some(t) => {
-                body.push(SSH_AGENT_CONSTRAIN_LIFETIME);
-                body.extend_from_slice(&t.to_be_bytes());
-                SSH_AGENTC_ADD_ID_CONSTRAINED
+        let c = AddConstraints {
+            lifetime,
+            ..AddConstraints::default()
+        };
+        self.add_constrained(key, Some(cert_blob), &c)
+    }
+
+    /// Add `key` (under the certificate `cert_blob` when given) with the
+    /// constraints `c` — `ssh-add -t`, `-c` and `-h`.
+    pub fn add_constrained(
+        &mut self,
+        key: &crate::key::PrivateKey,
+        cert_blob: Option<&[u8]>,
+        c: &AddConstraints,
+    ) -> Result<()> {
+        let mut body = zeroize::Zeroizing::new(match cert_blob {
+            Some(cert) => key.to_agent_add_cert_body(cert),
+            None => key.to_agent_add_body(),
+        });
+        let mut constrained = false;
+        if let Some(t) = c.lifetime {
+            body.push(SSH_AGENT_CONSTRAIN_LIFETIME);
+            body.extend_from_slice(&t.to_be_bytes());
+            constrained = true;
+        }
+        if c.confirm {
+            body.push(SSH_AGENT_CONSTRAIN_CONFIRM);
+            constrained = true;
+        }
+        if !c.destinations.is_empty() {
+            let mut list = crate::format::Writer::new();
+            for d in &c.destinations {
+                let mut w = crate::format::Writer::new();
+                w.write_string(&d.from.encode());
+                w.write_string(&d.to.encode());
+                w.write_string(b"");
+                list.write_string(w.as_slice());
             }
-            None => SSH_AGENTC_ADD_IDENTITY,
+            let mut w = crate::format::Writer::new();
+            w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+            w.write_string(b"restrict-destination-v00@openssh.com");
+            w.write_string(list.as_slice());
+            body.extend_from_slice(w.as_slice());
+            constrained = true;
+        }
+        let msg_type = if constrained {
+            SSH_AGENTC_ADD_ID_CONSTRAINED
+        } else {
+            SSH_AGENTC_ADD_IDENTITY
         };
         let frame = zeroize::Zeroizing::new(encode_message(msg_type, &body));
         self.simple_request(&frame, "add-identity")
+    }
+
+    /// The extensions the agent supports (the `query` extension,
+    /// `ssh-add -Q`).
+    pub fn query_extensions(&mut self) -> Result<Vec<String>> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(b"query");
+        self.write_frame(&encode_message(SSH_AGENTC_EXTENSION, w.as_slice()))?;
+        let (msg_type, body) = self.read_frame()?;
+        if msg_type != SSH_AGENT_EXTENSION_RESPONSE {
+            return Err(Error::Protocol("agent: query extension not supported"));
+        }
+        let mut r = crate::format::Reader::new(&body);
+        if r.read_string()? != b"query" {
+            return Err(Error::Protocol("agent: unexpected query reply"));
+        }
+        let mut exts = Vec::new();
+        while !r.is_empty() {
+            exts.push(String::from_utf8_lossy(r.read_string()?).into_owned());
+        }
+        Ok(exts)
     }
 
     /// Remove the identity whose public blob is `key_blob` (`ssh-add -d`).

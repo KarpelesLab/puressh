@@ -43,8 +43,8 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 - **`no_std` friendly.** The protocol core (packet codec, KEX, cipher/MAC
   adapters, key parsing) builds without `std`; only the convenience I/O and the
   client/server/CLI layers require it.
-- **Modern algorithms first**, including a post-quantum hybrid KEX
-  (`mlkem768x25519-sha256`). Legacy algorithms are present only where they
+- **Modern algorithms first**, including the post-quantum hybrid KEXes
+  (`mlkem768x25519-sha256`, `sntrup761x25519-sha512`). Legacy algorithms are present only where they
   remain useful for interop.
 - **Auditable surface.** Small modules, narrow public types, every algorithm
   identifier tracked back to its RFC.
@@ -53,7 +53,7 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 
 | Category    | Algorithm                                |
 |-------------|------------------------------------------|
-| KEX (PQ)    | `mlkem768x25519-sha256` (ML-KEM-768 + X25519 hybrid) |
+| KEX (PQ)    | `mlkem768x25519-sha256` (ML-KEM-768 + X25519 hybrid), `sntrup761x25519-sha512` (+ its `@openssh.com` name; Streamlined NTRU Prime + X25519) |
 | KEX         | `curve25519-sha256`, `curve25519-sha256@libssh.org` |
 | KEX         | `ecdh-sha2-nistp{256,384,521}`           |
 | KEX         | `diffie-hellman-group{14,16,18}-sha{256,512}` |
@@ -184,7 +184,7 @@ src/
 ├── hazmat/          low-level sans-I/O protocol layers (no stability promise)
 │   ├── format/      SSH wire format (Reader, Writer, mpint, name-list)
 │   ├── transport/   binary packet protocol, version exchange, KEX runner
-│   ├── kex/         curve25519, ecdh-nistp*, group-DH, GEX, mlkem768x25519
+│   ├── kex/         curve25519, ecdh-nistp*, group-DH, GEX, mlkem768x25519, sntrup761x25519
 │   ├── cipher/      aes-ctr, aes-gcm, chacha20-poly1305
 │   ├── mac/         hmac-sha2-* (incl. -etm)
 │   ├── channel/     RFC 4254 channels

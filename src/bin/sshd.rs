@@ -116,7 +116,8 @@ mod imp {
     use puressh::server::{
         AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult, ExecStreamHandler,
         HARD_BLOCKED_ENV_NAMES, PtySpec, SessionEnv, SessionOpenContext, ShellExitStatus,
-        ShellHandler, ShellSession, SubsystemHandler, handle_session_with_peer,
+        ShellHandler, ShellSession, SubsystemHandler, handle_session_with_addrs,
+        handle_session_with_peer,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -746,6 +747,9 @@ mod imp {
         connection_spec: Vec<String>,
         /// `-t`: check the configuration and host keys, then exit.
         test_only: bool,
+        /// `-i`: serve one connection on stdin / stdout (inetd mode, and
+        /// OpenSSH's `ProxyCommand sshd -i` testing setups).
+        inetd: bool,
         /// `-D`: stay in the foreground. Without it (and without `-d`), the
         /// daemon detaches once it is listening, as OpenSSH's does.
         no_detach: bool,
@@ -1364,6 +1368,9 @@ mod imp {
         if opts.subsystem_sftp != Some(false) && opts.sftp_enabled != Some(false) {
             line("subsystem", "sftp internal-sftp");
         }
+        for (name, command) in opts.subsystems.iter().flatten() {
+            line("subsystem", &format!("{name} {command}"));
+        }
         for (k, v) in [
             ("allowusers", &opts.allow_users),
             ("denyusers", &opts.deny_users),
@@ -1386,6 +1393,7 @@ mod imp {
         let mut dump_config = false;
         let mut connection_spec: Vec<String> = Vec::new();
         let mut test_only = false;
+        let mut inetd = false;
         let mut no_detach = false;
         let mut log_stderr = false;
         let mut quiet = false;
@@ -1411,6 +1419,44 @@ mod imp {
         let mut per_source_max: Option<u32> = None;
         let mut permit_root_login: Option<puressh::config::PermitRootLogin> = None;
 
+        // OpenSSH's getopt: flags may be grouped (`-De`) and a value may
+        // follow its option directly (`-E/path`, `-p2222`).
+        const VALUE_OPTS: &str = "CEbcfghkopuA";
+        const FLAG_OPTS: &str = "46DGQRTdeiqrtV";
+        let mut split: Vec<String> = Vec::with_capacity(args.len());
+        let mut j = 0;
+        while j < args.len() {
+            let a = &args[j];
+            j += 1;
+            let Some(rest) = a
+                .strip_prefix('-')
+                .filter(|r| !r.starts_with('-') && r.len() > 1)
+            else {
+                split.push(a.clone());
+                continue;
+            };
+            let chars: Vec<char> = rest.chars().collect();
+            let mut k = 0;
+            while k < chars.len() {
+                let c = chars[k];
+                split.push(format!("-{c}"));
+                if VALUE_OPTS.contains(c) {
+                    let tail: String = chars[k + 1..].iter().collect();
+                    if !tail.is_empty() {
+                        split.push(tail);
+                    }
+                    break;
+                }
+                if !FLAG_OPTS.contains(c) {
+                    // Not an OpenSSH option: report it as written.
+                    split.truncate(split.len() - 1);
+                    split.push(a.clone());
+                    break;
+                }
+                k += 1;
+            }
+        }
+        let args = &split[..];
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
@@ -1431,6 +1477,7 @@ mod imp {
                     config_options.push(v);
                 }
                 "-t" => test_only = true,
+                "-i" => inetd = true,
                 "-T" => dump_config = true,
                 "-C" => {
                     i += 1;
@@ -1574,6 +1621,7 @@ mod imp {
             dump_config,
             connection_spec,
             test_only,
+            inetd,
             no_detach,
             address_family,
             log_file,
@@ -4296,6 +4344,78 @@ mod imp {
         KNOCK_USER.lock().ok().and_then(|g| g.clone())
     }
 
+    /// `sshd -i`: the connection is stdin / stdout, not a socket.
+    static INETD: AtomicBool = AtomicBool::new(false);
+
+    /// `sshd -i`: serve one connection whose client is on stdin / stdout.
+    /// A TCP socket there (inetd, systemd `Accept=yes`) is served as an
+    /// accepted connection. Anything else (a pipe, as from a `ProxyCommand`)
+    /// is bridged to a loopback connection, served as one from an unknown
+    /// peer: like OpenSSH's, it matches no `from=` or `Match Address`.
+    fn serve_inetd(cfg: Arc<puressh::server::Config>) -> Result<i32, String> {
+        use std::io::{Read, Write};
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let io = |e: std::io::Error| format!("inetd: {e}");
+        // SAFETY: fd 0 is open for the process's lifetime; the stream is
+        // released again (not closed) unless it is used as the connection.
+        let stdin_sock = unsafe { std::net::TcpStream::from_raw_fd(0) };
+        if let Ok(peer) = stdin_sock.peer_addr() {
+            if let Ok(mut g) = CONN_ADDRS.lock() {
+                *g = Some((peer, stdin_sock.local_addr().ok()));
+            }
+            let result = handle_session_with_peer(stdin_sock, peer, cfg);
+            return Ok(if result.is_ok() { 0 } else { 255 });
+        }
+        let _ = stdin_sock.into_raw_fd();
+        INETD.store(true, Ordering::Relaxed);
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(io)?;
+        let outer = std::net::TcpStream::connect(l.local_addr().map_err(io)?).map_err(io)?;
+        let (inner, _) = l.accept().map_err(io)?;
+        drop(l);
+        let peer = std::net::SocketAddr::from(([0, 0, 0, 0], 65535));
+        let mut to_session = outer.try_clone().map_err(io)?;
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                match stdin.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if to_session.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+            let _ = to_session.shutdown(std::net::Shutdown::Write);
+        });
+        let mut from_session = outer;
+        let out = std::thread::spawn(move || {
+            let mut stdout = std::io::stdout().lock();
+            let mut buf = [0u8; 32 * 1024];
+            loop {
+                match from_session.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if stdout
+                            .write_all(&buf[..n])
+                            .and_then(|()| stdout.flush())
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        if let Ok(mut g) = CONN_ADDRS.lock() {
+            *g = Some((peer, None));
+        }
+        let result = handle_session_with_addrs(inner, peer, None, cfg);
+        let _ = out.join();
+        Ok(if result.is_ok() { 0 } else { 255 })
+    }
+
     fn conn_addrs() -> Option<(std::net::SocketAddr, Option<std::net::SocketAddr>)> {
         CONN_ADDRS.lock().ok().and_then(|g| *g)
     }
@@ -5316,7 +5436,11 @@ mod imp {
     /// the client's `env` requests, which cannot replace them.
     fn connection_env(tty: Option<&str>) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();
-        if let Some((peer, local)) = conn_addrs() {
+        if INETD.load(Ordering::Relaxed) {
+            // stdin is not a socket: OpenSSH's placeholders.
+            out.push(("SSH_CLIENT", "UNKNOWN 65535 65535".to_string()));
+            out.push(("SSH_CONNECTION", "UNKNOWN 65535 UNKNOWN 65535".to_string()));
+        } else if let Some((peer, local)) = conn_addrs() {
             let (lip, lport) = local.map_or((String::new(), 0), |l| {
                 (sshd_log::addr_str(l.ip()), l.port())
             });
@@ -5462,12 +5586,21 @@ mod imp {
     // -------------------------------------------------------------------------
 
     struct SftpSubsystemHandler {
+        /// `subsystem sftp` requests are served (a forced `internal-sftp`
+        /// is, regardless).
+        enabled: bool,
         read_only: bool,
         root: Option<std::path::PathBuf>,
+        /// The `Subsystem sftp` line's sftp-server arguments.
+        args: Vec<String>,
         debug: bool,
     }
 
     impl SubsystemHandler for SftpSubsystemHandler {
+        fn serves(&self, name: &str) -> bool {
+            self.enabled && name == "sftp"
+        }
+
         fn handle(
             &self,
             user: &str,
@@ -5475,7 +5608,7 @@ mod imp {
             name: &str,
             stream: ChannelStream,
         ) -> puressh::Result<()> {
-            if name != "sftp" {
+            if name != "sftp" || !self.enabled {
                 if self.debug {
                     eprintln!(
                         "sshd: refusing unknown subsystem '{}' for {user}",
@@ -5484,25 +5617,102 @@ mod imp {
                 }
                 return Ok(()); // dropping `stream` sends EOF + Close
             }
+            self.serve(user, &self.args, stream)
+        }
 
-            // Start the per-session virtual cwd at the user's home directory
-            // so relative paths behave like a freshly-logged-in shell. If
-            // the lookup fails (rare on a configured system), fall back to
-            // root: `SftpServerSession` will still operate, just less
-            // intuitively.
+        fn handle_with_args(
+            &self,
+            user: &str,
+            _env: &SessionEnv,
+            _name: &str,
+            args: &[String],
+            stream: ChannelStream,
+        ) -> puressh::Result<()> {
+            self.serve(user, args, stream)
+        }
+    }
+
+    impl SftpSubsystemHandler {
+        /// One SFTP session, configured by sftp-server's arguments: `-d`
+        /// (start directory, `%d` / `%u` expanded), `-u` (umask), `-R`
+        /// (read-only). Logging options follow sshd's own; any other option
+        /// (`-P` / `-p` request lists) refuses the session.
+        fn serve(
+            &self,
+            user: &str,
+            args: &[String],
+            mut stream: ChannelStream,
+        ) -> puressh::Result<()> {
+            let info = lookup_user(user).ok();
+            let mut read_only = self.read_only;
+            let mut start_dir = None;
+            let mut it = args.iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "-R" => read_only = true,
+                    "-d" => start_dir = it.next().cloned(),
+                    "-u" => {
+                        let mask = it.next().and_then(|m| u32::from_str_radix(m, 8).ok());
+                        match mask {
+                            // SAFETY: umask only swaps the process's mask.
+                            Some(m) if m <= 0o777 => unsafe {
+                                libc::umask(m as libc::mode_t);
+                            },
+                            _ => {
+                                eprintln!("sftp-server: Invalid umask");
+                                let _ = stream.send_exit_status(1);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    "-f" | "-l" => {
+                        it.next();
+                    }
+                    "-e" | "-h" => {}
+                    // Request allow / deny lists are not implemented: refuse
+                    // the session rather than serve it unrestricted.
+                    other => {
+                        eprintln!("sftp-server: option {other} is not supported");
+                        let _ = stream.send_exit_status(1);
+                        return Ok(());
+                    }
+                }
+            }
+
             // As OpenSSH: the home directory when it exists (inside a
-            // ChrootDirectory it usually does not), else the root.
-            let cwd = lookup_user(user)
-                .ok()
+            // ChrootDirectory it usually does not), else the root; `-d`
+            // names another.
+            let home = info
+                .as_ref()
                 .map(|i| std::path::PathBuf::from(&i.home_str))
-                .filter(|h| h.is_dir())
+                .filter(|h| h.is_dir());
+            let mut cwd = home
+                .clone()
                 .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            if let Some(dir) = start_dir {
+                let expanded = info.as_ref().map_or(Ok(dir.clone()), |i| {
+                    expand_command_arg(&dir, &[('d', i.home_str.clone()), ('u', i.name.clone())])
+                });
+                let dir = match expanded {
+                    Ok(d) => cwd.join(d),
+                    Err(e) => {
+                        eprintln!("sftp-server: -d: {e}");
+                        let _ = stream.send_exit_status(1);
+                        return Ok(());
+                    }
+                };
+                if dir.is_dir() {
+                    cwd = dir;
+                } else {
+                    eprintln!("sftp-server: chdir to \"{}\" failed", dir.display());
+                }
+            }
 
             let mut opts = SftpServerOptions::new(cwd);
             if let Some(root) = &self.root {
                 opts = opts.with_root(root.clone());
             }
-            if self.read_only {
+            if read_only {
                 opts = opts.read_only();
             }
 
@@ -5512,7 +5722,6 @@ mod imp {
             }
             // Report an exit status like OpenSSH's sftp-server process does:
             // scp and sftp treat a session without one as a failure.
-            let mut stream = stream;
             let res = session.run(&mut stream);
             let _ = stream.send_exit_status(if res.is_ok() { 0 } else { 1 });
             // Map SFTP-protocol errors into the generic puressh error type;
@@ -7233,6 +7442,8 @@ mod imp {
                     .unwrap_or(puressh::server::DEFAULT_MAX_AUTH_TRIES),
             );
         }
+        // `-d` itself (not LogLevel DEBUG) keeps the daemon in the foreground.
+        let debug_flag = cli.debug;
         let cli = {
             let mut c = cli;
             c.debug = c.debug || log_level >= 5;
@@ -7593,13 +7804,21 @@ mod imp {
             config.ca_signature_algorithms = ca;
         }
 
-        if sftp_enabled {
-            let sftp = SftpSubsystemHandler {
-                read_only: sftp_read_only,
-                root: sftp_root.clone(),
-                debug: cli.debug,
-            };
-            config = config.with_subsystem(Arc::new(sftp));
+        // Always installed: a forced `internal-sftp` runs it even without a
+        // `Subsystem sftp` line, as OpenSSH's does.
+        config = config.with_subsystem(Arc::new(SftpSubsystemHandler {
+            enabled: sftp_enabled,
+            read_only: sftp_read_only,
+            root: sftp_root.clone(),
+            args: sshd_cfg
+                .global
+                .subsystem_sftp_args
+                .clone()
+                .unwrap_or_default(),
+            debug: cli.debug,
+        }));
+        for (name, command) in sshd_cfg.global.subsystems.iter().flatten() {
+            config = config.with_subsystem_command(name, command);
         }
 
         // TCP and Unix-socket forwarding (`ssh -L/-R/-D/-W`), on by default
@@ -7799,6 +8018,11 @@ mod imp {
             return Ok(0);
         }
 
+        // `-i`: one connection, on stdin / stdout.
+        if cli.inetd {
+            return serve_inetd(cfg);
+        }
+
         // As OpenSSH does for its session processes: no ptrace attach and no
         // core dumps (host keys, session keys). Forked connection handlers
         // inherit it; the users' programs (exec) get the default back. Only
@@ -7863,7 +8087,7 @@ mod imp {
         // OpenSSH's daemon(0, 0): fork, the parent exits, a new session,
         // `/` as the working directory, stdio on /dev/null (except a `-E`
         // log, which is stderr). The parent is still single-threaded.
-        if !cli.no_detach && !cli.debug {
+        if !cli.no_detach && !debug_flag {
             detach(cli.log_file.is_some())?;
         }
 
@@ -8174,6 +8398,10 @@ mod imp {
                     }
                 }
             }
+        }
+        // As OpenSSH's daemon on SIGTERM: the PidFile goes with it.
+        if let Some(path) = pid_file.as_deref() {
+            let _ = std::fs::remove_file(path);
         }
         Ok(0)
     }

@@ -361,20 +361,34 @@ fn legacy_algorithms_interoperate_with_openssh() {
         }
     }
 
-    // Our sshd logs the client's offer, as OpenSSH does.
+    // Our sshd logs the client's offer, as OpenSSH does (its only host key
+    // is an Ed25519 one).
     let _ = s.run(
         false,
         s.ours_port,
         "user",
-        &o(&["KexAlgorithms=sntrup761x25519-sha512"]),
+        &o(&["HostKeyAlgorithms=ecdsa-sha2-nistp384"]),
     );
-    if kex.iter().any(|k| k == "sntrup761x25519-sha512") {
-        let log = std::fs::read_to_string(s.dir.join("ours.log")).unwrap_or_default();
-        if !log
-            .contains("no matching key exchange method found. Their offer: sntrup761x25519-sha512,")
-            || !log.contains("Unable to negotiate with 127.0.0.1 port ")
-        {
-            failures.push(format!("sshd negotiation log: {log}"));
+    let log = std::fs::read_to_string(s.dir.join("ours.log")).unwrap_or_default();
+    if !log.contains("no matching host key type found. Their offer: ecdsa-sha2-nistp384")
+        || !log.contains("Unable to negotiate with 127.0.0.1 port ")
+    {
+        failures.push(format!("sshd negotiation log: {log}"));
+    }
+
+    // The post-quantum hybrids, both names of sntrup761.
+    for k in [
+        "mlkem768x25519-sha256",
+        "sntrup761x25519-sha512",
+        "sntrup761x25519-sha512@openssh.com",
+    ] {
+        if kex.iter().any(|x| x == k) {
+            s.both_ways(
+                k,
+                "user",
+                &o(&[&format!("KexAlgorithms={k}")]),
+                &mut failures,
+            );
         }
     }
 

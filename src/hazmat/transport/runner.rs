@@ -31,6 +31,7 @@ use crate::kex::{
     },
     ecdh::{EcdhSha2Nistp256, EcdhSha2Nistp384, EcdhSha2Nistp521},
     mlkem768x25519::MlKem768X25519Sha256,
+    sntrup761x25519::Sntrup761X25519Sha512,
 };
 use crate::mac::{SshMac, mac_by_name};
 use purecrypto::dh::{DhGroup, group14, group16, group18};
@@ -136,6 +137,9 @@ enum KexBackend {
     GexSha1,
     /// `mlkem768x25519-sha256` — hybrid ML-KEM-768 + X25519 (OpenSSH 9.9+).
     MlKem768X25519,
+    /// `sntrup761x25519-sha512` (also `…@openssh.com`) — hybrid
+    /// Streamlined NTRU Prime + X25519 (OpenSSH 8.5+).
+    Sntrup761X25519,
 }
 
 impl KexBackend {
@@ -153,6 +157,9 @@ impl KexBackend {
             "diffie-hellman-group14-sha1" => Ok(Self::Dh14Sha1),
             "diffie-hellman-group-exchange-sha1" => Ok(Self::GexSha1),
             "mlkem768x25519-sha256" => Ok(Self::MlKem768X25519),
+            "sntrup761x25519-sha512" | "sntrup761x25519-sha512@openssh.com" => {
+                Ok(Self::Sntrup761X25519)
+            }
             _ => Err(Error::Unsupported("KEX algorithm")),
         }
     }
@@ -226,6 +233,7 @@ enum ClientStateInner {
     /// keeping the bare value inside this enum (and inside `Phase`) would
     /// blow up every state-machine slot by ~2.4 KB.
     MlKem768X25519(Box<crate::kex::mlkem768x25519::ClientState>),
+    Sntrup761X25519(Box<crate::kex::sntrup761x25519::ClientState>),
 }
 
 enum Phase {
@@ -820,6 +828,10 @@ impl KexRunner {
                 let (s, out) = MlKem768X25519Sha256::client_init(rng);
                 (ClientStateInner::MlKem768X25519(Box::new(s)), out.payload)
             }
+            KexBackend::Sntrup761X25519 => {
+                let (s, out) = Sntrup761X25519Sha512::client_init(rng);
+                (ClientStateInner::Sntrup761X25519(Box::new(s)), out.payload)
+            }
         })
     }
 
@@ -923,6 +935,14 @@ impl KexRunner {
             }
             KexBackend::MlKem768X25519 => {
                 let mut out = MlKem768X25519Sha256::server_reply(rng, payload, hk, &ctx)?;
+                (
+                    core::mem::take(&mut out.payload),
+                    core::mem::take(&mut out.kex.k),
+                    core::mem::take(&mut out.kex.h),
+                )
+            }
+            KexBackend::Sntrup761X25519 => {
+                let mut out = Sntrup761X25519Sha512::server_reply(rng, payload, hk, &ctx)?;
                 (
                     core::mem::take(&mut out.payload),
                     core::mem::take(&mut out.kex.k),
@@ -1048,6 +1068,15 @@ impl KexRunner {
                 };
                 let mut out =
                     MlKem768X25519Sha256::client_finish(*st, payload, verifier_ref, &ctx)?;
+                (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
+            }
+            KexBackend::Sntrup761X25519 => {
+                let st = match state {
+                    ClientStateInner::Sntrup761X25519(s) => s,
+                    _ => return Err(Error::Protocol("client state type mismatch")),
+                };
+                let mut out =
+                    Sntrup761X25519Sha512::client_finish(*st, payload, verifier_ref, &ctx)?;
                 (core::mem::take(&mut out.k), core::mem::take(&mut out.h))
             }
             // GEX uses handle_gex_reply, not this path.
@@ -1418,9 +1447,10 @@ fn kdf(
         KexBackend::Dh1Sha1 | KexBackend::Dh14Sha1 | KexBackend::GexSha1 => {
             derive_with::<purecrypto::hash::Sha1>(k, h, sid, letter, n)
         }
-        KexBackend::EcdhP521 | KexBackend::Dh16 | KexBackend::Dh18 => {
-            derive_with::<Sha512>(k, h, sid, letter, n)
-        }
+        KexBackend::EcdhP521
+        | KexBackend::Dh16
+        | KexBackend::Dh18
+        | KexBackend::Sntrup761X25519 => derive_with::<Sha512>(k, h, sid, letter, n),
     }
 }
 

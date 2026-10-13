@@ -13,6 +13,12 @@ use super::message::{
     UserauthInfoRequest, UserauthInfoResponse, UserauthPkOk, UserauthRequest, encode_success,
 };
 
+/// The account a userauth user name refers to: OpenSSH accepts
+/// `user:style` (a BSD authentication style) and authenticates `user`.
+fn account_name(user: &str) -> &str {
+    user.split_once(':').map_or(user, |(u, _)| u)
+}
+
 /// A single authentication attempt presented by the client.
 ///
 /// `Debug` is implemented manually so the cleartext `password` field is
@@ -586,7 +592,8 @@ impl ServerAuth {
     /// The method name carried by an inbound `USERAUTH_REQUEST` payload, or
     /// `None` if `payload` is not a well-formed request. Lets the caller learn
     /// the username/method *before* the attempt is evaluated, so a re-resolved
-    /// policy can be applied (see [`Self::set_accepted_methods`]).
+    /// policy can be applied (see [`Self::set_accepted_methods`]). The name
+    /// is the account's: a `user:style` suffix is dropped.
     pub fn peek_request(payload: &[u8]) -> Option<(String, &'static str)> {
         let req = UserauthRequest::decode(payload).ok()?;
         let method = match req.method {
@@ -594,9 +601,9 @@ impl ServerAuth {
             AuthMethodPayload::Password { .. } => "password",
             AuthMethodPayload::PublicKey { .. } => "publickey",
             AuthMethodPayload::KeyboardInteractive { .. } => "keyboard-interactive",
-            AuthMethodPayload::Other { .. } => return Some((req.user, "")),
+            AuthMethodPayload::Other { .. } => "",
         };
-        Some((req.user, method))
+        Some((String::from(account_name(&req.user)), method))
     }
 
     /// Reject an attempt whose method is no longer advertised (e.g. a
@@ -686,7 +693,7 @@ impl ServerAuth {
                 // Pin the username before *any* verdict on this request —
                 // including the service-name rejection below — so no
                 // rejected first request leaves the name unpinned.
-                if let Some(step) = self.pin_user(&req.user) {
+                if let Some(step) = self.pin_user(account_name(&req.user)) {
                     return Ok(step);
                 }
                 if req.service != self.service {
@@ -726,7 +733,10 @@ impl ServerAuth {
     }
 
     fn handle_request(&mut self, req: UserauthRequest) -> Result<ServerStep> {
-        let user = req.user.clone();
+        // `user:style` names the account `user` (OpenSSH's BSD auth style,
+        // ignored here); a signature covers the name as sent.
+        let wire_user = req.user.clone();
+        let user = String::from(account_name(&req.user));
         // The username was pinned by `on_packet` (see `pin_user`) before we
         // got here.
         match req.method {
@@ -758,7 +768,14 @@ impl ServerAuth {
                 algorithm,
                 public_blob,
                 signature,
-            } => self.handle_publickey(user, signature_present, algorithm, public_blob, signature),
+            } => self.handle_publickey(
+                user,
+                &wire_user,
+                signature_present,
+                algorithm,
+                public_blob,
+                signature,
+            ),
             AuthMethodPayload::KeyboardInteractive {
                 language_tag: _,
                 submethods: _,
@@ -772,9 +789,11 @@ impl ServerAuth {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn handle_publickey(
         &mut self,
         user: String,
+        wire_user: &str,
         signature_present: bool,
         algorithm: String,
         public_blob: Vec<u8>,
@@ -886,7 +905,7 @@ impl ServerAuth {
 
         let signed = super::message::publickey_signed_data(
             &self.session_id,
-            &user,
+            wire_user,
             self.service,
             &algorithm,
             &public_blob,

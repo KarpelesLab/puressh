@@ -495,6 +495,40 @@ pub trait SubsystemHandler: Send + Sync {
     /// running subsystem.
     fn handle(&self, user: &str, env: &SessionEnv, name: &str, stream: ChannelStream)
     -> Result<()>;
+
+    /// Whether a `subsystem` request for `name` is served; one that is not
+    /// is answered with a failure. The default serves every name.
+    fn serves(&self, name: &str) -> bool {
+        let _ = name;
+        true
+    }
+
+    /// Run the SFTP server for a forced `internal-sftp` command line
+    /// (`ForceCommand internal-sftp -d /srv`), with its arguments as
+    /// OpenSSH's in-process sftp-server takes them; `name` is `"sftp"`.
+    /// This is called instead of [`Self::handle`] (which serves `subsystem`
+    /// requests); the default ignores `args` and calls it.
+    fn handle_with_args(
+        &self,
+        user: &str,
+        env: &SessionEnv,
+        name: &str,
+        args: &[String],
+        stream: ChannelStream,
+    ) -> Result<()> {
+        let _ = args;
+        self.handle(user, env, name, stream)
+    }
+}
+
+/// The arguments of an `internal-sftp` command line (as `ForceCommand`
+/// gives it), or `None` when `command` runs something else.
+fn internal_sftp_args(command: &str) -> Option<Vec<String>> {
+    let mut words = command.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case("internal-sftp") {
+        return None;
+    }
+    Some(words.map(str::to_string).collect())
 }
 
 /// Server-side hook called when a client sends an `"exec"` channel request,
@@ -1143,6 +1177,10 @@ pub struct Config {
     /// A typical implementation dispatches by `name` (`"sftp"`, …) and
     /// runs the protocol on the supplied [`ChannelStream`].
     pub subsystem_handler: Option<Arc<dyn SubsystemHandler>>,
+    /// Subsystems served by running a command (`Subsystem name command` in
+    /// `sshd_config`): a request for `name` runs `command` as an `exec`
+    /// would. Consulted before [`Self::subsystem_handler`].
+    pub subsystem_commands: BTreeMap<String, String>,
     /// Optional `direct-tcpip` hook. When `None` (the default), every
     /// `direct-tcpip` channel open is rejected with
     /// `SSH_OPEN_ADMINISTRATIVELY_PROHIBITED`. Set this to
@@ -1254,7 +1292,7 @@ pub struct Config {
     pub host_key_algorithms: Option<Vec<String>>,
     /// Parsed `sshd_config` policy (global options + `Match` blocks). When
     /// set, it is resolved per-connection — twice — to gate capabilities:
-    /// once pre-auth with an address-only context (auth method set + banner),
+    /// once pre-auth with an address-only context (auth method set),
     /// once post-auth with the user/groups context (an [`EffectivePolicy`]).
     /// `None` ⇒ no policy gating beyond [`Self::allowed_auth_methods`] (the
     /// historical behaviour).
@@ -1595,6 +1633,7 @@ impl Config {
             exec_stream_handler: None,
             shell_handler: None,
             subsystem_handler: None,
+            subsystem_commands: BTreeMap::new(),
             direct_tcpip_handler: None,
             tcpip_forward_handler: None,
             direct_streamlocal_handler: None,
@@ -1728,6 +1767,14 @@ impl Config {
     /// [`ShellHandler::spawn`] when the client sends `"shell"`.
     pub fn with_shell(mut self, handler: Arc<dyn ShellHandler>) -> Self {
         self.shell_handler = Some(handler);
+        self
+    }
+
+    /// Serve subsystem `name` by running `command` (through the
+    /// [`CommandHandler`] / shell path an `exec` request takes).
+    pub fn with_subsystem_command(mut self, name: &str, command: &str) -> Self {
+        self.subsystem_commands
+            .insert(name.to_string(), command.to_string());
         self
     }
 
@@ -1976,6 +2023,19 @@ pub fn handle_session_with_peer(
     handle_connection_inner(stream, peer, local, cfg)
 }
 
+/// Like [`handle_session_with_peer`] with the local address given too:
+/// `None` when the stream is a stand-in for a connection whose own
+/// addresses are unknown (`sshd -i` on a pipe), so that `Match
+/// LocalAddress` / `LocalPort` match nothing.
+pub fn handle_session_with_addrs(
+    stream: TcpStream,
+    peer: SocketAddr,
+    local: Option<SocketAddr>,
+    cfg: Arc<Config>,
+) -> Result<()> {
+    handle_connection_inner(stream, peer, local, cfg)
+}
+
 /// Normalize a pre-auth I/O outcome into something the caller can treat
 /// as "clean disconnect" without conflating it with a true protocol
 /// error. Read-timeouts (the socket-level `LoginGraceTime` deadline) and
@@ -2028,9 +2088,8 @@ fn handle_connection_inner(
     let session_id = driver.session_id().to_vec();
 
     // Phase 1 (pre-auth): resolve the policy with an address-only context.
-    // This yields the auth method set advertised to the client and an
-    // address-matched banner. `None` policy ⇒ fall back to the static
-    // `allowed_auth_methods` and no banner.
+    // This yields the auth method set advertised to the client. `None`
+    // policy ⇒ fall back to the static `allowed_auth_methods`.
     let peer_ip = ip_string(&peer);
     let local_ip = local.and_then(|a| ip_string(&a));
     let local_port = local.map(|a| a.port());
@@ -2141,21 +2200,19 @@ fn fold_cert_caps(effective: &mut EffectivePolicy, caps: crate::auth::AuthCertCa
     effective.cert_caps = Some(caps);
 }
 
-/// Pre-auth (Phase 1) resolution result: the auth method set to advertise and
-/// the banner text (if any) to send before the userauth loop.
+/// Pre-auth (Phase 1) resolution result: the auth method set to advertise.
+/// (The banner waits for the first request: see [`ReResolvedUserPolicy`].)
 struct PreAuthPolicy {
     /// Auth methods to advertise. Empty ⇒ guaranteed lockout (every attempt
     /// fails) — this is how `PubkeyAuthentication no` is honoured.
     methods: Vec<&'static str>,
     /// Resolved `MaxAuthTries`, if the policy set one.
     max_auth_tries: Option<u32>,
-    /// Resolved (address-matched) banner text, if any.
-    banner: Option<String>,
 }
 
 /// Phase 1: resolve the policy with an address-only context. Without a policy
-/// this reproduces the historical behaviour (static `allowed_auth_methods`,
-/// no banner) with `MaxAuthTries` taken from [`Config::max_auth_tries`]; with a
+/// this reproduces the historical behaviour (static `allowed_auth_methods`)
+/// with `MaxAuthTries` taken from [`Config::max_auth_tries`]; with a
 /// policy, its `MaxAuthTries` (if set) wins over the config fallback.
 fn resolve_preauth_policy(
     cfg: &Config,
@@ -2167,7 +2224,6 @@ fn resolve_preauth_policy(
         return PreAuthPolicy {
             methods: cfg.allowed_auth_methods.clone(),
             max_auth_tries: cfg.max_auth_tries,
-            banner: None,
         };
     };
     let ctx = crate::config::MatchContext {
@@ -2179,14 +2235,9 @@ fn resolve_preauth_policy(
     };
     let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
     let methods = resolve_auth_methods(&cfg.allowed_auth_methods, &opts);
-    let banner = opts
-        .banner
-        .as_deref()
-        .and_then(|p| std::fs::read_to_string(p).ok());
     PreAuthPolicy {
         methods,
         max_auth_tries: opts.max_auth_tries.or(cfg.max_auth_tries),
-        banner,
     }
 }
 
@@ -2298,17 +2349,6 @@ fn do_server_auth(
     server_auth.set_now(unix_now());
     server_auth.set_ca_signature_algorithms(cfg.ca_signature_algorithms.clone());
 
-    // Address-matched banner (USERAUTH_BANNER), sent before the first
-    // USERAUTH_REQUEST per RFC 4252 §5.4. A `Match User` banner is deferred
-    // until the username is known (the first USERAUTH_REQUEST), below.
-    if let Some(text) = preauth.banner.as_deref() {
-        let banner = crate::auth::message::UserauthBanner {
-            message: text.to_string(),
-            language: String::new(),
-        };
-        srv_send(stream, driver, &banner.encode())?;
-    }
-
     // Phase 1.5 (mid-userauth): the first USERAUTH_REQUEST exposes the
     // username. We re-resolve the policy *once* with the user/groups context
     // so a `Match User`/`Match Group` block can change the advertised method
@@ -2337,6 +2377,10 @@ fn do_server_auth(
                 // (resolved from `AuthenticationMethods` in any matched block)
                 // before the first attempt is evaluated.
                 server_auth.notify_user_resolved(&user, &reres.auth_methods);
+                // The banner goes out here, as OpenSSH's does: once the first
+                // request shows the user (a `Match User` block may set it),
+                // and never before — OpenSSH's client refuses a banner that
+                // precedes its first USERAUTH_REQUEST.
                 if let Some(text) = reres.banner.as_deref() {
                     let banner = crate::auth::message::UserauthBanner {
                         message: text.to_string(),
@@ -2434,8 +2478,7 @@ fn reresolve_user_policy(
     };
     let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
     let methods = resolve_auth_methods(&cfg.allowed_auth_methods, &opts);
-    // Unreadable banner file → skip (never fail auth on a bad banner). This
-    // mirrors the address-matched banner path's `.ok()` policy.
+    // Unreadable banner file → skip (never fail auth on a bad banner).
     let banner = opts
         .banner
         .as_deref()
@@ -4119,9 +4162,10 @@ fn handle_channel_request(
                 envs.entry(channel)
                     .or_default()
                     .insert("SSH_ORIGINAL_COMMAND".to_string(), command.clone());
-                if forced.eq_ignore_ascii_case("internal-sftp") {
+                if let Some(args) = internal_sftp_args(forced) {
                     return route_internal_sftp(
                         stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
+                        args,
                     );
                 }
                 forced.to_string()
@@ -4182,9 +4226,10 @@ fn handle_channel_request(
                 envs.entry(channel)
                     .or_default()
                     .insert("SSH_ORIGINAL_COMMAND".to_string(), String::new());
-                if forced.eq_ignore_ascii_case("internal-sftp") {
+                if let Some(args) = internal_sftp_args(forced) {
                     return route_internal_sftp(
                         stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
+                        args,
                     );
                 }
                 // With a terminal requested, the forced command gets it.
@@ -4327,9 +4372,10 @@ fn handle_channel_request(
                 envs.entry(channel)
                     .or_default()
                     .insert("SSH_ORIGINAL_COMMAND".to_string(), name.clone());
-                if forced.eq_ignore_ascii_case("internal-sftp") {
+                if let Some(args) = internal_sftp_args(forced) {
                     return route_internal_sftp(
                         stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
+                        args,
                     );
                 }
                 let forced = forced.to_string();
@@ -4337,7 +4383,22 @@ fn handle_channel_request(
                     stream, driver, conn, cfg, user, channel, &forced, want_reply, subsystems, envs,
                 );
             }
-            if let Some(handler) = cfg.subsystem_handler.clone() {
+            if let Some(command) = cfg.subsystem_commands.get(&name) {
+                let command = command.clone();
+                // `pty-req` came first: the subsystem gets the terminal.
+                if let Some(handled) =
+                    spawn_command_on_pty(cfg, user, channel, &command, shells, envs, &empty_env)
+                {
+                    return reply_spawned(
+                        stream, driver, conn, channel, want_reply, shells, handled,
+                    );
+                }
+                return run_exec_command(
+                    stream, driver, conn, cfg, user, channel, &command, want_reply, subsystems,
+                    envs,
+                );
+            }
+            if let Some(handler) = cfg.subsystem_handler.clone().filter(|h| h.serves(&name)) {
                 // Ingress: unbounded — the dispatcher must never block on
                 // its own dispatch path. Egress: bounded — the handler
                 // thread self-throttles when the remote window is full.
@@ -4595,6 +4656,7 @@ fn route_internal_sftp(
     want_reply: bool,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
     envs: &mut BTreeMap<u32, SessionEnv>,
+    args: Vec<String>,
 ) -> Result<()> {
     if let Some(handler) = cfg.subsystem_handler.clone() {
         let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
@@ -4603,7 +4665,7 @@ fn route_internal_sftp(
         let user_owned = user.to_string();
         let env_snapshot = envs.get(&channel).cloned().unwrap_or_default();
         thread::spawn(move || {
-            let _ = handler.handle(&user_owned, &env_snapshot, "sftp", cs);
+            let _ = handler.handle_with_args(&user_owned, &env_snapshot, "sftp", &args, cs);
         });
         subsystems.insert(
             channel,
@@ -7360,7 +7422,6 @@ mod tests {
         );
         let pre = resolve_preauth_policy(&cfg, Some("1.2.3.4"), None, None);
         assert_eq!(pre.methods, vec!["publickey"]);
-        assert!(pre.banner.is_none());
         let eff = resolve_effective_policy(&cfg, "u", None, None, None, None);
         assert!(eff.agent_forwarding_allowed());
         assert!(eff.x11_forwarding_allowed());

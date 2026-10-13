@@ -287,8 +287,13 @@ pub struct ServerOptions {
     pub pid_file_set: bool,
     /// `Subsystem sftp internal-sftp` ⇒ enables the in-process SFTP handler
     /// (the standard `sshd_config` spelling; `SftpEnabled` remains a working
-    /// alias). External-command subsystems are rejected at parse time.
+    /// alias). Other subsystems are in [`Self::subsystems`].
     pub subsystem_sftp: Option<bool>,
+    /// The sftp-server arguments of that `Subsystem sftp` line (`-d`,
+    /// `-u`, `-R`, …), applied by the in-process server.
+    pub subsystem_sftp_args: Option<Vec<String>>,
+    /// Other `Subsystem` lines: name and command line, run as an `exec`.
+    pub subsystems: Option<Vec<(String, String)>>,
     /// `KnockListen` — UDP address(es) for the puressh knock rendezvous
     /// (`docs/knock.md`): `addr`, `addr:port` or `[v6]:port`. A missing port
     /// means the SSH `Port`. Cumulative; empty ⇒ knock disabled.
@@ -549,6 +554,16 @@ impl SshServerConfig {
         // drop-in or line cannot override an earlier one.
         let mut one = ServerOptions::default();
         apply_keyword(&mut one, line)?;
+        // A subsystem is defined once (OpenSSH refuses a second definition).
+        for (name, _) in one.subsystems.iter().flatten() {
+            if target.subsystems.iter().flatten().any(|(n, _)| n == name) {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: line.keyword.clone(),
+                    msg: format!("Subsystem '{name}' already defined"),
+                });
+            }
+        }
         target.warnings.append(&mut one.warnings);
         merge_server_options(target, &one);
         Ok(())
@@ -648,6 +663,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(rekey_limit);
     take_scalar!(address_family);
     take_scalar!(subsystem_sftp);
+    take_scalar!(subsystem_sftp_args);
     take_scalar!(use_pam);
     take_scalar!(permit_tty);
     take_scalar!(disable_forwarding);
@@ -687,6 +703,11 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     dst.set_env.extend(src.set_env.iter().cloned());
     if dst.permit_user_environment.is_none() {
         dst.permit_user_environment = src.permit_user_environment.clone();
+    }
+    if let Some(list) = &src.subsystems {
+        dst.subsystems
+            .get_or_insert_with(Vec::new)
+            .extend(list.iter().cloned());
     }
     dst.deny_users.extend(src.deny_users.iter().cloned());
     dst.allow_groups.extend(src.allow_groups.iter().cloned());
@@ -1209,9 +1230,10 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             }
         }
         "subsystem" => {
-            // Standard form: `Subsystem <name> <command> [args…]`. Only SFTP
-            // is served, in-process; OpenSSH's external `sftp-server` is
-            // mapped onto it (Debian/Ubuntu ship that line by default).
+            // Standard form: `Subsystem <name> <command> [args…]`. SFTP is
+            // served in-process, OpenSSH's external `sftp-server` mapped onto
+            // it (Debian/Ubuntu ship that line by default); other commands
+            // run as an `exec` would.
             if line.args.len() < 2 {
                 return Err(ConfigError::BadValue {
                     line: line.line_no,
@@ -1227,13 +1249,19 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             {
                 opts.subsystem_sftp = Some(true);
                 apply_sftp_server_args(opts, line, &line.args[2..])?;
+                opts.subsystem_sftp_args = Some(line.args[2..].to_vec());
             } else {
-                // Fail closed: the subsystem is simply not offered.
-                opts.warnings.push(format!(
-                    "{}: Subsystem {name}: external-command subsystems are not \
-                     supported; requests for it will be refused",
-                    line.location()
-                ));
+                // As written: the name is case-sensitive, and the command
+                // keeps its quoting for the shell.
+                let name = line.args[0].clone();
+                let command = line
+                    .rest
+                    .trim_start()
+                    .strip_prefix(name.as_str())
+                    .map_or_else(|| line.args[1..].join(" "), |c| c.trim().to_string());
+                opts.subsystems
+                    .get_or_insert_with(Vec::new)
+                    .push((name, command));
             }
         }
         "permittunnel" => {
@@ -1336,6 +1364,9 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("DebianBanner", &["*"], ""),
     ("FingerprintHash", &["*"], ""),
     ("ModuliFile", &["*"], ""),
+    // OpenSSH 10's helper binaries: this sshd is one program.
+    ("SshdSessionPath", &["*"], ""),
+    ("SshdAuthPath", &["*"], ""),
     ("X11DisplayOffset", &["*"], ""),
     ("X11UseLocalhost", &["*"], ""),
     ("StreamLocalBindMask", &["*"], ""),
@@ -1417,20 +1448,15 @@ fn apply_sftp_server_args(
         match args[i].as_str() {
             "-R" => opts.sftp_read_only = Some(true),
             "-e" | "-h" => {}
-            "-f" | "-l" => i += 1,
-            "-d" => {
-                opts.warnings.push(format!(
-                    "{}: Subsystem sftp -d: start directory ignored",
-                    line.location()
-                ));
-                i += 1;
-            }
+            // Start directory and umask: applied per session. Logging
+            // (`-f`, `-l`) follows sshd's own.
+            "-d" | "-u" | "-f" | "-l" => i += 1,
             other => {
                 return Err(ConfigError::Unsupported {
                     line: line.line_no,
                     msg: format!(
                         "Subsystem sftp: option {other:?} is not supported (only -R, -d, \
-                         -e, -f, -l are)"
+                         -u, -e, -f, -l are)"
                     ),
                 });
             }
@@ -2768,11 +2794,31 @@ UsePrivilegeSeparation sandbox
         assert_eq!(cfg.global.sftp_read_only, Some(true));
         // Restrictions we cannot honour are fatal, never silently dropped.
         assert!(SshServerConfig::parse("Subsystem sftp internal-sftp -P write\n").is_err());
-        assert!(SshServerConfig::parse("Subsystem sftp internal-sftp -u 077\n").is_err());
-        // Other external subsystems are refused at request time, with a warning.
-        let cfg = SshServerConfig::parse("Subsystem netconf /usr/bin/netconf\n").unwrap();
+        let cfg = SshServerConfig::parse("Subsystem sftp internal-sftp -u 077 -d %d/up\n").unwrap();
+        assert_eq!(
+            cfg.global.subsystem_sftp_args.as_deref(),
+            Some(&["-u".to_string(), "077".into(), "-d".into(), "%d/up".into()][..])
+        );
+        // Other subsystems run their command, written as it was.
+        let cfg = SshServerConfig::parse(
+            "Subsystem netconf /usr/bin/netconf --opt 'a b'\nSubsystem NetConf2 x\n",
+        )
+        .unwrap();
         assert_eq!(cfg.global.subsystem_sftp, None);
-        assert_eq!(cfg.warnings().count(), 1);
+        assert_eq!(
+            cfg.global.subsystems.as_deref(),
+            Some(
+                &[
+                    (
+                        "netconf".to_string(),
+                        "/usr/bin/netconf --opt 'a b'".to_string()
+                    ),
+                    ("NetConf2".into(), "x".into())
+                ][..]
+            )
+        );
+        assert_eq!(cfg.warnings().count(), 0);
+        assert!(SshServerConfig::parse("Subsystem x a\nSubsystem x b\n").is_err());
     }
 
     #[test]

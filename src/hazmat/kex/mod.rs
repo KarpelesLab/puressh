@@ -10,6 +10,8 @@ pub mod dh;
 pub mod ecdh;
 mod hash;
 pub mod mlkem768x25519;
+pub mod sntrup761;
+pub mod sntrup761x25519;
 
 pub use common::{KexContext, KexInitOut, KexOutput};
 pub use curve25519::Curve25519Sha256;
@@ -20,6 +22,7 @@ pub use dh::{
 pub use ecdh::{EcdhSha2Nistp256, EcdhSha2Nistp384, EcdhSha2Nistp521};
 pub use hash::{ExchangeHash, derive, mpint_bytes};
 pub use mlkem768x25519::MlKem768X25519Sha256;
+pub use sntrup761x25519::Sntrup761X25519Sha512;
 
 /// Trait implemented by each KEX algorithm module.
 pub trait Kex {

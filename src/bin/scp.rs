@@ -45,6 +45,8 @@ struct Cli {
     sink: bool,
     source: bool,
     target_dir: bool,
+    /// `-T`: no check that the files a server sends are those requested.
+    no_name_check: bool,
     operands: Vec<String>,
 }
 
@@ -59,11 +61,16 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         sftp_direct: None,
         quiet: false,
         verbose: false,
-        xfer: XferOpts::default(),
+        // scp writes in place, as OpenSSH's.
+        xfer: XferOpts {
+            inplace: true,
+            ..XferOpts::default()
+        },
         passthrough: Vec::new(),
         sink: false,
         source: false,
         target_dir: false,
+        no_name_check: false,
         operands: Vec::new(),
     };
     let mut i = 0;
@@ -172,7 +179,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     c.xfer.recursive = true;
                     c.passthrough.push("-r".into());
                 }
-                'T' => {}
+                'T' => c.no_name_check = true,
                 'v' => {
                     c.verbose = true;
                     c.ssh.push("-v", None);
@@ -318,13 +325,19 @@ fn download_sftp(cli: &Cli, from: &Remote, target: &Path, many: bool, errs: &mut
         Err(e) => return fail(errs, e),
     };
     let pattern = sftp_path(&from.path);
+    // GLOB_NOCHECK, as OpenSSH's scp: a pattern matching nothing is taken
+    // as a name (a file may be called `a[1]`).
     let matches = match transfer::remote_glob(&mut sess.sftp, b"", &pattern) {
-        Ok(m) => m,
-        Err(e) => return fail(errs, e),
+        Ok(m) if !m.is_empty() => m,
+        _ => vec![pattern.clone()],
     };
     let many = many || matches.len() > 1;
     for m in matches {
-        let name = String::from_utf8_lossy(transfer::remote_basename(&m)).into_owned();
+        let mut name = String::from_utf8_lossy(transfer::remote_basename(&m)).into_owned();
+        // `..` downloads into the target itself, as OpenSSH.
+        if name == ".." {
+            name = ".".into();
+        }
         if !transfer::safe_name(name.as_bytes()) && name != "." {
             fail(errs, format!("{name}: invalid file name"));
             continue;
@@ -356,6 +369,24 @@ fn crossload_sftp(cli: &Cli, from: &Remote, to: &Remote, errs: &mut u32) {
     }
     let before = *errs;
     download_sftp(cli, from, &tmp, true, errs);
+    // `dir/..` (or `.`) copies the directory's contents onto the target,
+    // which is made if missing, as OpenSSH's crossload of a directory.
+    let base = from
+        .path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    if *errs == before
+        && cli.xfer.recursive
+        && matches!(base, "." | "..")
+        && let Ok(mut sess) = open_sftp(cli, to)
+    {
+        let dst = sftp_path(&to.path);
+        if sess.sftp.stat(&dst).is_err() {
+            let _ = sess.sftp.mkdir(&dst, puressh::sftp::Attrs::default());
+        }
+    }
     if *errs == before {
         let mut staged: Vec<String> = std::fs::read_dir(&tmp)
             .map(|rd| {
@@ -430,7 +461,17 @@ fn download_legacy(cli: &Cli, from: &Remote, target: &Path, errs: &mut u32) {
     opts.recursive = cli.xfer.recursive;
     opts.preserve_times = cli.xfer.preserve;
     opts.target_is_file = !target.is_dir();
-    let res = Receiver::new(pipe, target, opts).and_then(|mut r| r.run());
+    // As OpenSSH's sink, without -r or -T a server may only send the file
+    // asked for (CVE-2019-6111). A glob or brace request is not checked.
+    let base = from.path.rsplit('/').next().unwrap_or(&from.path);
+    let expected = (!cli.xfer.recursive
+        && !cli.no_name_check
+        && !base.is_empty()
+        && !base.contains(['*', '?', '[', '{', '\\']))
+    .then_some(base);
+    let res = Receiver::new(pipe, target, opts)
+        .map(|r| r.with_expected_name(expected))
+        .and_then(|mut r| r.run());
     if let Err(e) = res {
         fail(errs, e);
     }
@@ -438,8 +479,10 @@ fn download_legacy(cli: &Cli, from: &Remote, target: &Path, errs: &mut u32) {
 
 /// Remote to remote through this host, legacy protocol: `scp -f` on the
 /// source piped into `scp -t` on the target.
-fn crossload_legacy(cli: &Cli, from: &Remote, to: &Remote, errs: &mut u32) {
-    let (src, dst) = match (legacy_pipe(cli, from, "-f"), legacy_pipe(cli, to, "-t")) {
+fn crossload_legacy(cli: &Cli, from: &Remote, to: &Remote, many: bool, errs: &mut u32) {
+    // Several sources: the target sink must be a directory (`-d`).
+    let sink = if many { "-dt" } else { "-t" };
+    let (src, dst) = match (legacy_pipe(cli, from, "-f"), legacy_pipe(cli, to, sink)) {
         (Ok(s), Ok(d)) => (s, d),
         (Err(e), _) | (_, Err(e)) => return fail(errs, e),
     };
@@ -582,12 +625,24 @@ fn run() -> Result<u32, String> {
                     upload_sftp(&cli, &locals, to, &mut errs);
                 }
             }
+            let many = sources.len() > 1;
+            // Several sources need a directory to go into.
+            if many && !cli.legacy && !cli.remote_to_remote_direct {
+                let is_dir = open_sftp(&cli, to).ok().is_some_and(|mut sess| {
+                    sess.sftp
+                        .stat(&sftp_path(&to.path))
+                        .is_ok_and(|a| transfer::is_dir(&a))
+                });
+                if !is_dir {
+                    return Err(format!("{}: Not a directory", to.path));
+                }
+            }
             for s in sources {
                 let Some(from) = remote(s) else { continue };
                 if cli.remote_to_remote_direct {
                     remote_to_remote_direct(&cli, &from, target_arg, &mut errs);
                 } else if cli.legacy {
-                    crossload_legacy(&cli, &from, to, &mut errs);
+                    crossload_legacy(&cli, &from, to, many, &mut errs);
                 } else {
                     crossload_sftp(&cli, &from, to, &mut errs);
                 }

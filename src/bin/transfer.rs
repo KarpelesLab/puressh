@@ -362,8 +362,35 @@ fn match_class(p: &[u8], c: u8) -> Option<usize> {
     (matched != negate).then_some(i + 1)
 }
 
+/// Whether `s` has an unescaped `*`, `?` or `[` (a `\` quotes the next
+/// character, as for `glob(3)`).
 pub fn has_glob(s: &[u8]) -> bool {
-    s.iter().any(|c| matches!(c, b'*' | b'?' | b'['))
+    let mut i = 0;
+    while i < s.len() {
+        match s[i] {
+            b'\\' => i += 2,
+            b'*' | b'?' | b'[' => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// A glob pattern's literal text: each `\x` becomes `x` (a trailing `\`
+/// stays), as `glob(3)` reads a pattern.
+pub fn unescape(s: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == b'\\' && i + 1 < s.len() {
+            out.push(s[i + 1]);
+            i += 2;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Remote path join: absolute `rel` wins; empty `rel` is `cwd`.
@@ -412,7 +439,7 @@ pub fn remote_glob<T: Read + Write>(
 ) -> Result<Vec<Vec<u8>>, String> {
     let full = remote_join(cwd, pattern);
     if !has_glob(&full) {
-        return Ok(vec![full]);
+        return Ok(vec![unescape(&full)]);
     }
     let absolute = full.first() == Some(&b'/');
     let mut current: Vec<Vec<u8>> = vec![if absolute { b"/".to_vec() } else { Vec::new() }];
@@ -428,7 +455,7 @@ pub fn remote_glob<T: Read + Write>(
                 p
             };
             if !has_glob(comp) {
-                next.push(join(comp));
+                next.push(join(&unescape(comp)));
                 continue;
             }
             let dir = if base.is_empty() {
@@ -464,7 +491,9 @@ pub fn remote_glob<T: Read + Write>(
 /// is; one matching nothing is an error.
 pub fn local_glob(pattern: &str) -> Result<Vec<PathBuf>, String> {
     if !has_glob(pattern.as_bytes()) {
-        return Ok(vec![PathBuf::from(pattern)]);
+        return Ok(vec![PathBuf::from(
+            String::from_utf8_lossy(&unescape(pattern.as_bytes())).into_owned(),
+        )]);
     }
     let absolute = pattern.starts_with('/');
     let mut current: Vec<PathBuf> = vec![if absolute {
@@ -476,7 +505,7 @@ pub fn local_glob(pattern: &str) -> Result<Vec<PathBuf>, String> {
         let mut next = Vec::new();
         for base in &current {
             if !has_glob(comp.as_bytes()) {
-                next.push(base.join(comp));
+                next.push(base.join(String::from_utf8_lossy(&unescape(comp.as_bytes())).as_ref()));
                 continue;
             }
             let dir = if base.as_os_str().is_empty() {
@@ -523,6 +552,9 @@ pub struct XferOpts {
     /// sftp: print `Entering dir` / `Retrieving dir` for each directory of
     /// a recursive transfer, as OpenSSH's sftp does.
     pub announce_dirs: bool,
+    /// Write targets in place: not truncated when opened, cut to size
+    /// after (scp does, so a file can be copied onto itself).
+    pub inplace: bool,
 }
 
 impl Default for XferOpts {
@@ -536,6 +568,7 @@ impl Default for XferOpts {
             depth: 64,
             resume: false,
             announce_dirs: false,
+            inplace: false,
         }
     }
 }
@@ -898,7 +931,7 @@ fn download_at<T: Read + Write>(
     let start = if opts.resume {
         local.metadata().map(|m| m.len()).unwrap_or(0)
     } else {
-        options.truncate(true);
+        options.truncate(!opts.inplace);
         0
     };
     let file = match options.open(local) {
@@ -930,6 +963,9 @@ fn download_at<T: Read + Write>(
     file.flush()
         .map_err(|e| format!("{}: {e}", local.display()))?;
     meter.finish(start + n);
+    if opts.inplace {
+        let _ = file.inner.get_ref().set_len(start + n);
+    }
     drop(file);
     apply_local_attrs(local, &attrs, opts.preserve);
     Ok(())
@@ -1017,7 +1053,7 @@ fn upload_at<T: Read + Write>(
             "{remote_shown}: remote file is larger than the local one"
         ));
     }
-    let flags = if opts.resume {
+    let flags = if opts.resume || opts.inplace {
         FXF_WRITE | FXF_CREAT
     } else {
         FXF_WRITE | FXF_CREAT | FXF_TRUNC
@@ -1041,6 +1077,13 @@ fn upload_at<T: Read + Write>(
     let res = sftp.write_from(&h, start, opts.chunk, opts.depth, &mut src, |n| {
         meter.update(start + n)
     });
+    if opts.inplace
+        && let Ok(n) = &res
+    {
+        let mut size = Attrs::default();
+        size.size = Some(start + n);
+        let _ = sftp.fsetstat(&h, size);
+    }
     let close = sftp.close(&h);
     let n = res.map_err(|e| format!("{remote_shown}: {}", sftp_err(e)))?;
     close.map_err(|e| format!("{remote_shown}: {}", sftp_err(e)))?;

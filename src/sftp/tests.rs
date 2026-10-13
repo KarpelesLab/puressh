@@ -1111,3 +1111,34 @@ fn pipelined_write_from_and_read_to() {
     drop(client);
     h.join().unwrap();
 }
+
+#[test]
+fn copy_data_and_limits() {
+    let tmp = TempDir::new("copy-data");
+    fs::write(tmp.path().join("src"), b"0123456789").unwrap();
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+    assert!(client.has_extension("copy-data"));
+    assert!(client.has_extension("limits@openssh.com"));
+
+    let rh = client.open(b"src", FXF_READ, Attrs::default()).unwrap();
+    let wh = client
+        .open(b"dst", FXF_WRITE | FXF_CREAT | FXF_TRUNC, Attrs::default())
+        .unwrap();
+    // Whole file, then a slice appended at offset 10.
+    client.copy_data(&rh, 0, 0, &wh, 0).unwrap();
+    client.copy_data(&rh, 2, 3, &wh, 10).unwrap();
+    // Not within one file.
+    assert!(client.copy_data(&rh, 0, 0, &rh, 0).is_err());
+    client.close(&rh).unwrap();
+    client.close(&wh).unwrap();
+    assert_eq!(fs::read(tmp.path().join("dst")).unwrap(), b"0123456789234");
+
+    let limits = client.extended("limits@openssh.com", &[]).unwrap().unwrap();
+    assert_eq!(limits.len(), 32);
+    assert!(u64::from_be_bytes(limits[8..16].try_into().unwrap()) > 0);
+
+    drop(client);
+    h.join().unwrap();
+}

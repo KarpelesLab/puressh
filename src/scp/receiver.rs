@@ -334,8 +334,10 @@ impl<S: Read + Write> Receiver<S> {
             // target_is_file with a deep relative path).
             let _ = fs::create_dir_all(parent);
         }
+        // Not truncated on open: as OpenSSH's sink, the file is cut to the
+        // new size after the payload, so copying a file onto itself works.
         let mut open_opts = OpenOptions::new();
-        open_opts.create(true).write(true).truncate(true);
+        open_opts.create(true).write(true).truncate(false);
         // On Unix, refuse to follow a symlink that races into existence
         // between the stat above and the open below. `O_NOFOLLOW` causes
         // `open(2)` to fail with `ELOOP` if the final component is a
@@ -357,6 +359,9 @@ impl<S: Read + Write> Receiver<S> {
             // Try to write fatal so the peer unblocks.
             let _ = write_fatal(&mut self.stream, &e.to_string());
             return Err(e);
+        }
+        if f.metadata().is_ok_and(|m| m.is_file()) {
+            let _ = f.set_len(size);
         }
         // Apply mode + times. Chmod the open fd, not the path — the
         // path-based variant would `chmod(2)` through any symlink

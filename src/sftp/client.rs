@@ -112,6 +112,26 @@ impl<T: Read + Write> SftpClient<T> {
         self.extended("posix-rename@openssh.com", &d).map(|_| ())
     }
 
+    /// `copy-data`: copy `len` bytes (0: to the end) from offset
+    /// `read_offset` of the open file `read_handle` into `write_handle` at
+    /// `write_offset`, on the server.
+    pub fn copy_data(
+        &mut self,
+        read_handle: &[u8],
+        read_offset: u64,
+        len: u64,
+        write_handle: &[u8],
+        write_offset: u64,
+    ) -> Result<(), SftpError> {
+        let mut d = Vec::new();
+        put_string(&mut d, read_handle);
+        d.extend_from_slice(&read_offset.to_be_bytes());
+        d.extend_from_slice(&len.to_be_bytes());
+        put_string(&mut d, write_handle);
+        d.extend_from_slice(&write_offset.to_be_bytes());
+        self.extended("copy-data", &d).map(|_| ())
+    }
+
     /// `hardlink@openssh.com`: make `newpath` a hard link to `oldpath`.
     pub fn hardlink(&mut self, oldpath: &[u8], newpath: &[u8]) -> Result<(), SftpError> {
         let mut d = Vec::new();

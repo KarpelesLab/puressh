@@ -232,48 +232,159 @@ fn safe_display(b: &[u8]) -> String {
     lossy(&scrubbed)
 }
 
-/// Split a command line like OpenSSH's sftp: whitespace separates words,
-/// `'…'` and `"…"` quote, `\` escapes the next character.
+/// Split a command line as OpenSSH's sftp (`makeargv`): whitespace
+/// separates words, `'…'` and `"…"` quote, `\` escapes, `#` starts a
+/// comment outside quotes. Glob characters stay escaped (`\*`) where they
+/// were quoted or escaped, for the glob to take literally; paths that are
+/// not globbed are unescaped by the command ([`undo_glob_escape`]).
 fn split_line(line: &str) -> Result<Vec<String>, String> {
-    let mut out = Vec::new();
+    #[derive(PartialEq, Clone, Copy)]
+    enum St {
+        Start,
+        Squote,
+        Dquote,
+        Unquoted,
+    }
+    let a: Vec<char> = line.chars().collect();
+    let at = |i: usize| a.get(i).copied().unwrap_or('\0');
+    let is_glob = |c: char| matches!(c, '?' | '[' | '*');
+    let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut in_word = false;
-    let mut quote: Option<char> = None;
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match (quote, c) {
-            (Some(q), c) if c == q => quote = None,
-            (Some('"'), '\\') | (None, '\\') => match chars.next() {
-                Some(n) => {
-                    cur.push(n);
-                    in_word = true;
-                }
-                None => return Err("Invalid escape at end of line".into()),
-            },
-            (Some(_), c) => cur.push(c),
-            (None, '\'' | '"') => {
-                quote = Some(c);
-                in_word = true;
-            }
-            (None, c) if c.is_whitespace() => {
-                if in_word {
-                    out.push(std::mem::take(&mut cur));
-                    in_word = false;
-                }
-            }
-            (None, c) => {
+    let mut st = St::Start;
+    let mut i = 0;
+    loop {
+        let c = at(i);
+        if c != '\0' && c.is_whitespace() {
+            if st == St::Unquoted {
+                out.push(std::mem::take(&mut cur));
+                st = St::Start;
+            } else if st != St::Start {
                 cur.push(c);
-                in_word = true;
             }
+        } else if c == '"' || c == '\'' {
+            let q = if c == '"' { St::Dquote } else { St::Squote };
+            match st {
+                St::Start | St::Unquoted => st = q,
+                s if s == q => st = St::Unquoted,
+                _ => cur.push(c),
+            }
+        } else if c == '\\' {
+            if st == St::Squote || st == St::Dquote {
+                let quot = if st == St::Squote { '\'' } else { '"' };
+                let n = at(i + 1);
+                if n == quot {
+                    i += 1;
+                    cur.push(n);
+                } else if is_glob(n) {
+                    // Double-escaped: the glob undoes one level.
+                    cur.push('\\');
+                    cur.push('\\');
+                    cur.push('\\');
+                    cur.push(n);
+                    i += 1;
+                } else {
+                    cur.push('\\');
+                    if n == '\0' {
+                        return Err("Unterminated quoted argument".into());
+                    }
+                    cur.push(n);
+                    i += 1;
+                }
+            } else {
+                st = St::Unquoted;
+                let n = at(i + 1);
+                if is_glob(n) || n == '\\' {
+                    cur.push('\\');
+                    cur.push(n);
+                    i += 1;
+                } else {
+                    i += 1;
+                    if n == '\0' {
+                        return Err("Unterminated quoted argument".into());
+                    }
+                    cur.push(n);
+                }
+            }
+        } else if c == '#' && !(st == St::Squote || st == St::Dquote) {
+            break;
+        } else if c == '\0' {
+            if st == St::Squote || st == St::Dquote {
+                return Err("Unterminated quoted argument".into());
+            }
+            break;
+        } else {
+            if st == St::Start {
+                st = St::Unquoted;
+            }
+            if (st == St::Squote || st == St::Dquote) && is_glob(c) {
+                cur.push('\\');
+            }
+            cur.push(c);
         }
+        i += 1;
     }
-    if quote.is_some() {
-        return Err("Unterminated quote".into());
-    }
-    if in_word {
+    if st == St::Unquoted {
         out.push(cur);
     }
     Ok(out)
+}
+
+/// OpenSSH's `undo_glob_escape`, for paths a command does not glob:
+/// `\?`, `\[`, `\*` and `\\` lose their backslash.
+fn undo_glob_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars().peekable();
+    while let Some(c) = it.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match it.peek() {
+            Some(&n) if matches!(n, '?' | '[' | '*' | '\\') => {
+                out.push(n);
+                it.next();
+            }
+            _ => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Unescape the operands of commands whose paths are not globbed, as
+/// OpenSSH's `parse_args` does: every path of `rename` / `ln` / `cp` /
+/// `mkdir` / `cd` …, the destination of `get` / `put`.
+fn unescape_operands(cmd: &str, rest: &[String]) -> Vec<String> {
+    let first_operand = rest
+        .iter()
+        .position(|a| !a.starts_with('-') || a.len() == 1)
+        .unwrap_or(rest.len());
+    let all = matches!(
+        cmd,
+        "rename"
+            | "ln"
+            | "symlink"
+            | "cp"
+            | "copy"
+            | "mkdir"
+            | "rmdir"
+            | "lmkdir"
+            | "cd"
+            | "chdir"
+            | "lcd"
+            | "lchdir"
+            | "df"
+    );
+    let second = matches!(cmd, "get" | "reget" | "put" | "reput" | "mget" | "mput");
+    rest.iter()
+        .enumerate()
+        .map(|(i, a)| {
+            if (all && i >= first_operand) || (second && i == first_operand + 1) {
+                undo_glob_escape(a)
+            } else {
+                a.clone()
+            }
+        })
+        .collect()
 }
 
 /// Split leading `-xyz` flags off a command's arguments.
@@ -440,6 +551,7 @@ impl Session {
         let Some((cmd, rest)) = args.split_first() else {
             return Ok(Flow::Continue);
         };
+        let rest = &unescape_operands(cmd, rest)[..];
         match cmd.as_str() {
             "bye" | "exit" | "quit" => return Ok(Flow::Quit),
             "help" | "?" => println!("{HELP}"),
@@ -542,11 +654,15 @@ impl Session {
                 }
             }
             "rename" => {
-                let [old, new] = rest else {
+                // `-l`: the protocol's own rename, not posix-rename.
+                let (flags, paths) = take_flags(rest, "l", cmd)?;
+                let [old, new] = paths.as_slice() else {
                     return Err("You must specify two paths after a rename command.".into());
                 };
                 let (o, n) = (self.resolve(old), self.resolve(new));
-                let res = if self.sftp.has_extension("posix-rename@openssh.com") {
+                let res = if !flags.contains('l')
+                    && self.sftp.has_extension("posix-rename@openssh.com")
+                {
                     self.sftp.posix_rename(&o, &n)
                 } else {
                     self.sftp.rename(&o, &n)
@@ -593,7 +709,11 @@ impl Session {
             "chmod" | "chown" | "chgrp" => self.chattr(cmd, rest)?,
             "df" => self.df(rest)?,
             "copy" | "cp" => {
-                return Err("Server does not support copy-data extension".into());
+                let [old, new] = rest else {
+                    return Err(format!("You must specify two paths after a {cmd} command."));
+                };
+                let (o, n) = (self.resolve(old), self.resolve(new));
+                self.copy(&o, &n)?;
             }
             other => return Err(format!("Invalid command \"{other}\".")),
         }
@@ -619,6 +739,54 @@ impl Session {
         Ok(())
     }
 
+    /// `cp`: a copy made by the server (`copy-data`), as OpenSSH's
+    /// sftp_copy: the new file gets the old one's permissions (without
+    /// set-id bits).
+    fn copy(&mut self, old: &[u8], new: &[u8]) -> Result<(), String> {
+        if !self.sftp.has_extension("copy-data") {
+            return Err("Server does not support copy-data extension".into());
+        }
+        let a = self
+            .sftp
+            .stat(old)
+            .map_err(|e| format!("stat remote: {}", fx(&e)))?;
+        let mode = match a.permissions {
+            Some(p) if p & 0o170000 != 0o100000 => {
+                return Err(format!("Cannot copy non-regular file: {}", lossy(old)));
+            }
+            Some(p) => p & 0o777,
+            None => 0o666,
+        };
+        let rh = self
+            .sftp
+            .open(old, puressh::sftp::FXF_READ, Attrs::default())
+            .map_err(|e| format!("remote open(\"{}\"): {}", lossy(old), fx(&e)))?;
+        let mut attrs = Attrs::default();
+        attrs.permissions = Some(mode);
+        let wh = match self.sftp.open(
+            new,
+            puressh::sftp::FXF_WRITE | puressh::sftp::FXF_CREAT | puressh::sftp::FXF_TRUNC,
+            attrs,
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = self.sftp.close(&rh);
+                return Err(format!("remote open(\"{}\"): {}", lossy(new), fx(&e)));
+            }
+        };
+        let res = self.sftp.copy_data(&rh, 0, 0, &wh, 0);
+        let _ = self.sftp.close(&rh);
+        let _ = self.sftp.close(&wh);
+        res.map_err(|e| {
+            format!(
+                "Couldn't copy file \"{}\" to \"{}\": {}",
+                lossy(old),
+                lossy(new),
+                fx(&e)
+            )
+        })
+    }
+
     fn ls(&mut self, args: &[String]) -> Result<(), String> {
         let (flags, paths) = take_flags(args, "1afhlnrSt", "ls")?;
         let long = flags.contains('l') || flags.contains('n');
@@ -634,15 +802,18 @@ impl Session {
                 self.glob(&t)
                     .map_err(|_| format!("Can't ls: \"{}\" not found", lossy(&abs)))?
             } else {
-                vec![abs.clone()]
+                vec![transfer::unescape(&abs)]
             };
             let mut entries: Vec<(Vec<u8>, Vec<u8>, Attrs)> = Vec::new();
+            // A glob matching just one directory lists its contents, as
+            // OpenSSH's do_globbed_ls.
+            let single_dir = matches.len() == 1;
             for m in matches {
                 let a = self
                     .sftp
                     .stat(&m)
                     .map_err(|_| format!("Can't ls: \"{}\" not found", lossy(&m)))?;
-                if transfer::is_dir(&a) && !transfer::has_glob(&abs) {
+                if transfer::is_dir(&a) && (!transfer::has_glob(&abs) || single_dir) {
                     let h = self
                         .sftp
                         .opendir(&m)
@@ -751,7 +922,12 @@ impl Session {
             self.glob(src)
                 .map_err(|_| format!("File \"{}\" not found.", lossy(&abs)))?
         } else {
-            vec![abs.clone()]
+            // A plain path must exist (lstat, as glob(3) checks it).
+            let literal = transfer::unescape(&abs);
+            if self.sftp.lstat(&literal).is_err() {
+                return Err(format!("File \"{}\" not found.", lossy(&abs)));
+            }
+            vec![literal]
         };
         let local_dir = dst
             .map(Path::new)
@@ -766,7 +942,11 @@ impl Session {
         let opts = self.opts(&flags, resume);
         let mut failed = false;
         for m in matches {
-            let name = lossy(remote_basename(&m));
+            // `..` downloads into the destination itself, as OpenSSH.
+            let mut name = lossy(remote_basename(&m));
+            if name == ".." {
+                name = ".".into();
+            }
             if self.sftp.stat(&m).is_err() {
                 eprintln!("File \"{}\" not found.", lossy(&m));
                 failed = true;

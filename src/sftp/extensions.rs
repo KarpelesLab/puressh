@@ -33,18 +33,34 @@ pub const SSH_FXE_STATVFS_ST_RDONLY: u64 = 0x1;
 #[cfg(unix)]
 pub const SSH_FXE_STATVFS_ST_NOSUID: u64 = 0x2;
 
-/// The `(name, version)` pairs we advertise in our `SSH_FXP_VERSION` reply.
 /// `users-groups-by-id@openssh.com`: user and group names for ids (what
 /// `ls -l` shows).
 pub const EXT_USERS_GROUPS_BY_ID: &str = "users-groups-by-id@openssh.com";
 
+/// `lsetstat@openssh.com` — `setstat` without following a final symlink.
+pub const EXT_LSETSTAT: &str = "lsetstat@openssh.com";
+/// `limits@openssh.com` — the server's packet, read, write and handle limits.
+pub const EXT_LIMITS: &str = "limits@openssh.com";
+/// `expand-path@openssh.com` — `realpath` with `~` / `~user` expansion.
+pub const EXT_EXPAND_PATH: &str = "expand-path@openssh.com";
+/// `copy-data` — copy between two open files on the server.
+pub const EXT_COPY_DATA: &str = "copy-data";
+/// `home-directory` — a user's home directory.
+pub const EXT_HOME_DIRECTORY: &str = "home-directory";
+
+/// The `(name, version)` pairs we advertise, in OpenSSH's order.
 pub const ADVERTISED_EXTENSIONS: &[(&str, &str)] = &[
-    (EXT_USERS_GROUPS_BY_ID, "1"),
     (EXT_POSIX_RENAME, "1"),
     (EXT_STATVFS, "2"),
     (EXT_FSTATVFS, "2"),
     (EXT_HARDLINK, "1"),
     (EXT_FSYNC, "1"),
+    (EXT_LSETSTAT, "1"),
+    (EXT_LIMITS, "1"),
+    (EXT_EXPAND_PATH, "1"),
+    (EXT_COPY_DATA, "1"),
+    (EXT_HOME_DIRECTORY, "1"),
+    (EXT_USERS_GROUPS_BY_ID, "1"),
 ];
 
 /// Wire-format payload for the `statvfs@openssh.com` / `fstatvfs@openssh.com`

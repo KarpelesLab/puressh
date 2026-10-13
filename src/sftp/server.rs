@@ -12,7 +12,8 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::extensions::{
-    ADVERTISED_EXTENSIONS, EXT_FSTATVFS, EXT_FSYNC, EXT_HARDLINK, EXT_POSIX_RENAME, EXT_STATVFS,
+    ADVERTISED_EXTENSIONS, EXT_COPY_DATA, EXT_EXPAND_PATH, EXT_FSTATVFS, EXT_FSYNC, EXT_HARDLINK,
+    EXT_HOME_DIRECTORY, EXT_LIMITS, EXT_LSETSTAT, EXT_POSIX_RENAME, EXT_STATVFS,
     EXT_USERS_GROUPS_BY_ID,
 };
 use super::packet::{self, Packet, read_packet, write_packet};
@@ -861,6 +862,11 @@ impl SftpServerSession {
             EXT_STATVFS => self.op_ext_statvfs(id, &data),
             EXT_FSTATVFS => self.op_ext_fstatvfs(id, &data),
             EXT_USERS_GROUPS_BY_ID => self.op_ext_users_groups_by_id(id, &data),
+            EXT_LSETSTAT => self.op_ext_lsetstat(id, &data),
+            EXT_LIMITS => self.op_ext_limits(id),
+            EXT_EXPAND_PATH => self.op_ext_expand_path(id, &data),
+            EXT_COPY_DATA => self.op_ext_copy_data(id, &data),
+            EXT_HOME_DIRECTORY => self.op_ext_home_directory(id, &data),
             _ => Ok(status_pkt(
                 id,
                 FxpStatus::OpUnsupported,
@@ -912,6 +918,193 @@ impl SftpServerSession {
         reply.extend_from_slice(&(groups.len() as u32).to_be_bytes());
         reply.extend_from_slice(&groups);
         Ok(Packet::ExtendedReply { id, data: reply })
+    }
+
+    /// `limits@openssh.com`: maximum packet, read and write lengths, and
+    /// open handles.
+    fn op_ext_limits(&mut self, id: u32) -> Result<Packet, SftpError> {
+        let max_packet = u64::from(packet::MAX_PACKET_SIZE);
+        let max_read = u64::from(packet::MAX_PACKET_SIZE / 2);
+        let mut reply = Vec::with_capacity(32);
+        reply.extend_from_slice(&max_packet.to_be_bytes());
+        reply.extend_from_slice(&max_read.to_be_bytes());
+        reply.extend_from_slice(&max_read.to_be_bytes());
+        reply.extend_from_slice(&(self.opts.max_handles as u64).to_be_bytes());
+        Ok(Packet::ExtendedReply { id, data: reply })
+    }
+
+    /// A user's home directory, from the password database (`None` for
+    /// an unknown user; the session user's own when `user` is empty).
+    fn home_of(user: &str) -> Option<PathBuf> {
+        #[cfg(unix)]
+        {
+            let u = if user.is_empty() {
+                nix::unistd::User::from_uid(nix::unistd::getuid())
+            } else {
+                nix::unistd::User::from_name(user)
+            };
+            u.ok().flatten().map(|u| u.dir)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = user;
+            std::env::var_os("USERPROFILE").map(PathBuf::from)
+        }
+    }
+
+    /// One name, as a `realpath` reply carries it.
+    fn name_reply(id: u32, p: &Path) -> Packet {
+        let bytes = p.to_string_lossy().into_owned().into_bytes();
+        Packet::Name {
+            id,
+            entries: vec![NameEntry {
+                filename: bytes.clone(),
+                longname: bytes,
+                attrs: Attrs::default(),
+            }],
+        }
+    }
+
+    /// `expand-path@openssh.com`: `~` and `~user` expanded, then as
+    /// `realpath`.
+    fn op_ext_expand_path(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        let mut r = Reader::new(data);
+        let path = r.read_string()?.to_vec();
+        let expanded = match path.strip_prefix(b"~") {
+            Some(rest) => {
+                let (user, tail) = match rest.iter().position(|c| *c == b'/') {
+                    Some(i) => (&rest[..i], &rest[i + 1..]),
+                    None => (rest, &b""[..]),
+                };
+                let home = Self::home_of(&String::from_utf8_lossy(user))
+                    .ok_or_else(|| SftpError::status_msg(FxpStatus::NoSuchFile, "no such user"))?;
+                let mut p = home.to_string_lossy().into_owned().into_bytes();
+                if !tail.is_empty() {
+                    p.push(b'/');
+                    p.extend_from_slice(tail);
+                }
+                p
+            }
+            None => path,
+        };
+        self.op_realpath(id, expanded)
+    }
+
+    /// `home-directory`: a user's home directory.
+    fn op_ext_home_directory(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        let mut r = Reader::new(data);
+        let user = String::from_utf8_lossy(r.read_string()?).into_owned();
+        match Self::home_of(&user) {
+            Some(home) => Ok(Self::name_reply(id, &home)),
+            None => Ok(status_pkt(id, FxpStatus::NoSuchFile, "no such user")),
+        }
+    }
+
+    /// `copy-data`: copy `len` bytes (0: to the end of file) from one open
+    /// file to another, as OpenSSH's sftp-server (not within one file).
+    fn op_ext_copy_data(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        self.require_writable()?;
+        let mut r = Reader::new(data);
+        let rh = parse_handle(r.read_string()?)?;
+        let mut roff = r.read_u64()?;
+        let len = r.read_u64()?;
+        let wh = parse_handle(r.read_string()?)?;
+        let mut woff = r.read_u64()?;
+        let file_of = |h: u64| match self.handles.get(&h) {
+            Some(FileHandle::File { file, path, .. }) => Some((file, path)),
+            _ => None,
+        };
+        let (Some((rf, rp)), Some((wf, wp))) = (file_of(rh), file_of(wh)) else {
+            return Ok(status_pkt(id, FxpStatus::Failure, "invalid handle"));
+        };
+        if rh == wh || rp == wp {
+            return Ok(status_pkt(id, FxpStatus::Failure, "same file"));
+        }
+        let (mut rf, mut wf) = (rf.try_clone()?, wf.try_clone()?);
+        let mut left = if len == 0 { u64::MAX } else { len };
+        let mut buf = vec![0u8; 64 * 1024];
+        while left > 0 {
+            let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            rf.seek(SeekFrom::Start(roff))?;
+            let n = rf.read(&mut buf[..want])?;
+            if n == 0 {
+                break;
+            }
+            wf.seek(SeekFrom::Start(woff))?;
+            wf.write_all(&buf[..n])?;
+            roff += n as u64;
+            woff += n as u64;
+            left -= n as u64;
+        }
+        Ok(status_ok(id))
+    }
+
+    /// `lsetstat@openssh.com`: `setstat` on the path itself, a symlink
+    /// included (whose mode cannot be changed on Linux).
+    fn op_ext_lsetstat(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
+        self.require_writable()?;
+        let mut r = Reader::new(data);
+        let path = r.read_string()?.to_vec();
+        let attrs = packet::decode_attrs(&mut r)?;
+        let p = self.resolve(&path)?;
+        let is_link = fs::symlink_metadata(&p)?.file_type().is_symlink();
+        if !is_link {
+            // No symlink to follow: setstat, refusing to follow one that
+            // appears meanwhile.
+            apply_attrs(
+                &p,
+                &attrs,
+                true,
+                self.opts.max_set_len,
+                self.opts.allow_special_bits,
+            )?;
+            return Ok(status_ok(id));
+        }
+        if attrs.size.is_some() || attrs.permissions.is_some() {
+            return Ok(status_pkt(
+                id,
+                FxpStatus::OpUnsupported,
+                "cannot set the size or mode of a symlink",
+            ));
+        }
+        #[cfg(unix)]
+        {
+            use nix::fcntl::AtFlags;
+            if let Some((uid, gid)) = attrs.uid_gid {
+                nix::unistd::fchownat(
+                    nix::fcntl::AT_FDCWD,
+                    &p,
+                    Some(nix::unistd::Uid::from_raw(uid)),
+                    Some(nix::unistd::Gid::from_raw(gid)),
+                    AtFlags::AT_SYMLINK_NOFOLLOW,
+                )
+                .map_err(|e| {
+                    SftpError::status_msg(
+                        super::extensions::fxp_status_from_errno(e),
+                        "lchown failed",
+                    )
+                })?;
+            }
+            if let Some((atime, mtime)) = attrs.atime_mtime {
+                use nix::sys::stat::{UtimensatFlags, utimensat};
+                use nix::sys::time::TimeSpec;
+                let ts = |t: u32| TimeSpec::new(i64::from(t) as _, 0);
+                utimensat(
+                    nix::fcntl::AT_FDCWD,
+                    &p,
+                    &ts(atime),
+                    &ts(mtime),
+                    UtimensatFlags::NoFollowSymlink,
+                )
+                .map_err(|e| {
+                    SftpError::status_msg(
+                        super::extensions::fxp_status_from_errno(e),
+                        "lutimes failed",
+                    )
+                })?;
+            }
+        }
+        Ok(status_ok(id))
     }
 
     fn op_ext_posix_rename(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {

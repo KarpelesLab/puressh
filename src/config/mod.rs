@@ -57,11 +57,13 @@ pub use glob::{HostPattern, host_matches};
 pub use host_port::{parse_host_port, parse_host_port_pattern};
 #[cfg(feature = "std")]
 pub use include::{glob_paths, tokenize_file_with_includes};
-pub use match_block::{AddressKind, AddressPattern, ExecPolicy, MatchCondition, MatchContext};
+pub use match_block::{
+    AddressKind, AddressPattern, ExecPolicy, MatchCondition, MatchContext, address_matches,
+};
 pub use parser::{ParsedLine, tokenize};
 pub use server::{
-    Compression, HostPort, PermitRootLogin, RekeyLimit, ServerMatchBlock, ServerOptions,
-    SshServerConfig, TcpForwarding,
+    Compression, HostPort, PerSourcePenalties, PermitRootLogin, RekeyLimit, ServerMatchBlock,
+    ServerOptions, SshServerConfig, TcpForwarding,
 };
 // `AddressFamily` and `GatewayPorts` already exist as client-config types in
 // this module's namespace; the server variants live behind `config::server::`

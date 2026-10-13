@@ -98,6 +98,7 @@ mod imp {
     use std::process::{Command, ExitCode};
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     use nix::errno::Errno;
     use nix::fcntl::{FcntlArg, FdFlag, OFlag, fcntl};
@@ -1174,6 +1175,51 @@ mod imp {
                 Some(n) => n.to_string(),
             },
         );
+        let (v4, v6) = opts.per_source_net_block_size.unwrap_or((32, 128));
+        line("persourcenetblocksize", &format!("{v4}:{v6}"));
+        let p = opts.per_source_penalties.clone().unwrap_or_default();
+        line(
+            "persourcepenalties",
+            &if p.enabled {
+                let f = |n: u32| format!("{n}.000000");
+                let o = |deny: bool| if deny { "deny-all" } else { "permissive" };
+                format!(
+                    "crash:{} authfail:{} noauth:{} invaliduser:{} grace-exceeded:{} \
+                     refuseconnection:{} max:{} min:{} max-sources4:{} max-sources6:{} \
+                     overflow:{} overflow6:{}",
+                    f(p.crash),
+                    f(p.authfail),
+                    f(p.noauth),
+                    f(p.invalid_user),
+                    f(p.grace_exceeded),
+                    f(p.refuse_connection),
+                    f(p.max),
+                    f(p.min),
+                    p.max_sources4,
+                    p.max_sources6,
+                    o(p.overflow_deny_all),
+                    o(p.overflow6_deny_all)
+                )
+            } else {
+                "no".to_string()
+            },
+        );
+        line(
+            "persourcepenaltyexemptlist",
+            opts.per_source_penalty_exempt.as_deref().unwrap_or("none"),
+        );
+        line(
+            "channeltimeout",
+            &match &opts.channel_timeouts {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|(t, secs)| format!("{t}={secs}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => "none".to_string(),
+            },
+        );
+        line("exposeauthinfo", yn(opts.expose_auth_info.unwrap_or(false)));
         line(
             "clientaliveinterval",
             &opts.client_alive_interval.unwrap_or(0).to_string(),
@@ -1387,7 +1433,6 @@ mod imp {
             ("ignorerhosts", "yes"),
             ("gssapiauthentication", "no"),
             ("permittunnel", "no"),
-            ("exposeauthinfo", "no"),
             ("usedns", "no"),
             ("fingerprinthash", "SHA256"),
         ] {
@@ -4132,6 +4177,9 @@ mod imp {
 
         fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
             let note = AttemptNote::of(&attempt);
+            if !matches!(attempt, AuthAttempt::None { .. }) {
+                AUTH_ATTEMPTED.store(true, Ordering::Relaxed);
+            }
             let decision = (|| {
                 if self.policy_broken {
                     return AuthDecision::Reject;
@@ -4430,7 +4478,11 @@ mod imp {
             // bind, but this fires first via the server's re-resolve hook).
             let bound = self.check_user_binding(user);
             if bound {
-                sshd_log::conn_user(user, lookup_user(user).is_ok());
+                let valid = lookup_user(user).is_ok();
+                if !valid {
+                    INVALID_USER.store(true, Ordering::Relaxed);
+                }
+                sshd_log::conn_user(user, valid);
             }
             // Match-block access policy for this (user, peer, local socket):
             // AllowUsers/DenyUsers/AllowGroups/DenyGroups, PermitRootLogin,
@@ -7222,8 +7274,12 @@ mod imp {
     /// pipe. Idempotent; a no-op when no pipe was set up (tests, or a
     /// pipe() failure at accept time).
     fn notify_parent_authenticated() {
+        AUTHENTICATED.store(true, Ordering::Relaxed);
         tell_parent(&[AUTH_OK_BYTE, b'\n']);
     }
+
+    /// This connection process authenticated its client.
+    static AUTHENTICATED: AtomicBool = AtomicBool::new(false);
 
     /// Send one message line to the daemon parent over this connection's
     /// pipe, which stays open for the connection's life: `A` (authenticated),
@@ -7377,6 +7433,218 @@ mod imp {
             && lookup_user(user).is_ok_and(|i| i.uid.as_raw() == uid)
     }
 
+    /// Why a connection that never authenticated is penalised
+    /// (`PerSourcePenalties`), from how its process ended.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PenaltyKind {
+        Crash,
+        AuthFail,
+        InvalidUser,
+        NoAuth,
+        GraceExceeded,
+    }
+
+    /// Exit codes a connection process ends with before authenticating,
+    /// telling the daemon what to penalise its source for (OpenSSH's).
+    const EXIT_LOGIN_GRACE: i32 = 3;
+    const EXIT_AUTH_ATTEMPTED: i32 = 5;
+    const EXIT_INVALID_USER: i32 = 7;
+
+    /// This connection attempted authentication (not just `none`).
+    static AUTH_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+    /// This connection asked for an account that does not exist.
+    static INVALID_USER: AtomicBool = AtomicBool::new(false);
+
+    /// The exit code of a connection process that ends before
+    /// authenticating: what its source is penalised for.
+    fn preauth_exit_code(timed_out: bool) -> i32 {
+        if timed_out {
+            EXIT_LOGIN_GRACE
+        } else if AUTH_ATTEMPTED.load(Ordering::Relaxed) {
+            EXIT_AUTH_ATTEMPTED
+        } else if INVALID_USER.load(Ordering::Relaxed) {
+            EXIT_INVALID_USER
+        } else {
+            255
+        }
+    }
+
+    /// The penalty for a connection process that ended so (OpenSSH's
+    /// child_reap): none once it authenticated.
+    fn penalty_for(status: &WaitStatus, authenticated: bool) -> Option<PenaltyKind> {
+        if authenticated {
+            return None;
+        }
+        match *status {
+            WaitStatus::Signaled(_, sig, _) => matches!(
+                sig,
+                Signal::SIGSEGV
+                    | Signal::SIGBUS
+                    | Signal::SIGILL
+                    | Signal::SIGFPE
+                    | Signal::SIGABRT
+                    | Signal::SIGSYS
+                    | Signal::SIGTRAP
+            )
+            .then_some(PenaltyKind::Crash),
+            WaitStatus::Exited(_, 0) => None,
+            WaitStatus::Exited(_, EXIT_LOGIN_GRACE) => Some(PenaltyKind::GraceExceeded),
+            WaitStatus::Exited(_, EXIT_AUTH_ATTEMPTED) => Some(PenaltyKind::AuthFail),
+            WaitStatus::Exited(_, EXIT_INVALID_USER) => Some(PenaltyKind::InvalidUser),
+            WaitStatus::Exited(..) => Some(PenaltyKind::NoAuth),
+            _ => None,
+        }
+    }
+
+    /// `PerSourcePenalties`: the daemon's table of penalised source net
+    /// blocks, as OpenSSH's (srclimit.c).
+    struct Penalties {
+        cfg: puressh::config::PerSourcePenalties,
+        exempt: Vec<puressh::config::AddressPattern>,
+        bits: (u8, u8),
+        /// Masked source → (expiry, active, reason).
+        table: HashMap<IpAddr, (Instant, bool, &'static str)>,
+    }
+
+    impl Penalties {
+        fn new(opts: &puressh::config::ServerOptions) -> Self {
+            Penalties {
+                cfg: opts.per_source_penalties.clone().unwrap_or_default(),
+                exempt: opts
+                    .per_source_penalty_exempt
+                    .as_deref()
+                    .map(|l| {
+                        l.split(',')
+                            .filter(|t| !t.is_empty())
+                            .map(puressh::config::AddressPattern::parse)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                bits: opts.per_source_net_block_size.unwrap_or((32, 128)),
+                table: HashMap::new(),
+            }
+        }
+
+        fn mask(&self, ip: IpAddr) -> IpAddr {
+            match ip {
+                IpAddr::V4(a) => {
+                    let bits = u32::from(self.bits.0.min(32));
+                    let m = u32::MAX.checked_shl(32 - bits).unwrap_or(0);
+                    IpAddr::V4((u32::from(a) & m).into())
+                }
+                IpAddr::V6(a) => {
+                    let bits = u32::from(self.bits.1.min(128));
+                    let m = u128::MAX.checked_shl(128 - bits).unwrap_or(0);
+                    IpAddr::V6((u128::from(a) & m).into())
+                }
+            }
+        }
+
+        fn exempt(&self, ip: IpAddr) -> bool {
+            puressh::config::address_matches(&self.exempt, &ip.to_string())
+        }
+
+        fn expire(&mut self, now: Instant) {
+            self.table.retain(|_, (expiry, _, _)| *expiry > now);
+        }
+
+        fn count(&self, v4: bool) -> usize {
+            self.table.keys().filter(|k| k.is_ipv4() == v4).count()
+        }
+
+        /// `Some(reason)` when connections from `ip` are refused.
+        fn refuses(&mut self, ip: IpAddr) -> Option<&'static str> {
+            if !self.cfg.enabled || self.exempt(ip) {
+                return None;
+            }
+            self.expire(Instant::now());
+            let (full, deny_all) = if ip.is_ipv4() {
+                (
+                    self.count(true) >= self.cfg.max_sources4 as usize,
+                    self.cfg.overflow_deny_all,
+                )
+            } else {
+                (
+                    self.count(false) >= self.cfg.max_sources6 as usize,
+                    self.cfg.overflow6_deny_all,
+                )
+            };
+            if full && deny_all {
+                return Some("too many penalised addresses");
+            }
+            match self.table.get(&self.mask(ip)) {
+                Some((_, true, reason)) => Some(reason),
+                _ => None,
+            }
+        }
+
+        /// Penalise `ip`'s net block for `kind`: a new penalty, or added to
+        /// the one it has (up to `max`), refusing once past `min`.
+        fn penalise(&mut self, ip: IpAddr, kind: PenaltyKind, debug: bool) {
+            if !self.cfg.enabled || self.exempt(ip) {
+                return;
+            }
+            let (secs, reason) = match kind {
+                PenaltyKind::Crash => (self.cfg.crash, "penalty: caused crash"),
+                PenaltyKind::AuthFail => (self.cfg.authfail, "penalty: failed authentication"),
+                PenaltyKind::InvalidUser => (
+                    self.cfg.invalid_user,
+                    "penalty: attempted authentication by invalid user",
+                ),
+                PenaltyKind::NoAuth => (
+                    self.cfg.noauth,
+                    "penalty: connections without attempting authentication",
+                ),
+                PenaltyKind::GraceExceeded => {
+                    (self.cfg.grace_exceeded, "penalty: exceeded LoginGraceTime")
+                }
+            };
+            if secs == 0 {
+                return;
+            }
+            let now = Instant::now();
+            self.expire(now);
+            let key = self.mask(ip);
+            let (max_sources, deny_all) = if key.is_ipv4() {
+                (self.cfg.max_sources4, self.cfg.overflow_deny_all)
+            } else {
+                (self.cfg.max_sources6, self.cfg.overflow6_deny_all)
+            };
+            let add = Duration::from_secs(u64::from(secs));
+            let cap = now + Duration::from_secs(u64::from(self.cfg.max));
+            let min = Duration::from_secs(u64::from(self.cfg.min));
+            match self.table.get_mut(&key) {
+                Some((expiry, active, why)) => {
+                    *expiry = (*expiry + add).min(cap);
+                    *active |= expiry.saturating_duration_since(now) > min;
+                    *why = reason;
+                }
+                None => {
+                    if self.count(key.is_ipv4()) >= max_sources as usize {
+                        if deny_all {
+                            return;
+                        }
+                        // Permissive: forget the penalty closest to expiry.
+                        if let Some(k) = self
+                            .table
+                            .iter()
+                            .filter(|(k, _)| k.is_ipv4() == key.is_ipv4())
+                            .min_by_key(|(_, v)| v.0)
+                            .map(|(k, _)| *k)
+                        {
+                            self.table.remove(&k);
+                        }
+                    }
+                    self.table
+                        .insert(key, ((now + add).min(cap), add > min, reason));
+                }
+            }
+            if debug {
+                eprintln!("sshd: {key}: {reason} ({secs}s)");
+            }
+        }
+    }
+
     /// The daemon parent's table of live connection children, keyed by pid.
     /// Owned by the accept loop; never touched from signal context.
     #[derive(Default)]
@@ -7416,7 +7684,10 @@ mod imp {
 
         /// Reap every exited child (`waitpid(WNOHANG)` loop) and drop its
         /// record — releasing its per-IP slot and closing its pipe.
-        fn reap(&mut self, debug: bool) {
+        fn reap(&mut self, debug: bool, penalties: &mut Penalties) {
+            // A child that authenticated just before it exited must not be
+            // taken for one that never did.
+            self.poll_auth();
             loop {
                 match waitpid(None, Some(WaitPidFlag::WNOHANG)) {
                     Ok(WaitStatus::StillAlive) | Err(_) => break,
@@ -7425,6 +7696,11 @@ mod imp {
                             && let Some(mut rec) = self.children.remove(&pid)
                         {
                             rec.close_logins();
+                            // PerSourcePenalties: how a connection that never
+                            // authenticated ended, as OpenSSH's child_reap.
+                            if let Some(kind) = penalty_for(&status, rec.authenticated) {
+                                penalties.penalise(rec.ip, kind, debug);
+                            }
                         } else {
                             continue;
                         }
@@ -8347,6 +8623,7 @@ mod imp {
         // only place the caps are consulted is right before a fork, so that
         // is exactly when the table must be current.
         let mut children = ChildTable::default();
+        let mut penalties = Penalties::new(&sshd_cfg.global);
         // How long `poll()` waits for a connection before the loop goes
         // around anyway to reap / check the shutdown flag. A signal (SIGCHLD,
         // SIGTERM) interrupts it earlier — `poll()` is not restarted on
@@ -8366,7 +8643,7 @@ mod imp {
                 reload(&cli, &args);
             }
             if SIGCHLD_PENDING.swap(false, Ordering::Relaxed) || children.len() > 0 {
-                children.reap(cli.debug);
+                children.reap(cli.debug, &mut penalties);
             }
             children.poll_auth();
 
@@ -8450,6 +8727,15 @@ mod imp {
             let mut incoming = incoming.into_iter();
             #[allow(clippy::while_let_on_iterator)] // the child drops `incoming` mid-loop
             while let Some((stream, peer, knock_user)) = incoming.next() {
+                // PerSourcePenalties: a penalised source is turned away at
+                // once, as OpenSSH's.
+                if let Some(reason) = penalties.refuses(peer.ip()) {
+                    if cli.debug {
+                        eprintln!("sshd: drop connection from {peer}: {reason}");
+                    }
+                    drop(stream);
+                    continue;
+                }
                 // Enforce both connection caps *before* fork so a flood
                 // can't OOM us via per-process accounting. On refusal we
                 // simply drop the socket — RST tells the client to retry.
@@ -8599,6 +8885,8 @@ mod imp {
                                 None => sshd_log::End::Error(e.to_string()),
                             },
                         });
+                        let timed_out = matches!(&result, Err(puressh::Error::Io(e))
+                            if e.kind() == std::io::ErrorKind::TimedOut);
                         let rc = match result {
                             Ok(()) => 0,
                             Err(e) => {
@@ -8607,6 +8895,13 @@ mod imp {
                                 }
                                 1
                             }
+                        };
+                        // Before authentication, the code says what the
+                        // source is penalised for (PerSourcePenalties).
+                        let rc = if AUTHENTICATED.load(Ordering::Relaxed) {
+                            rc
+                        } else {
+                            preauth_exit_code(timed_out)
                         };
                         // Skip atexit machinery — we've already cleanly
                         // returned from handle_session.
@@ -9948,11 +10243,58 @@ mod imp {
             // Now reap: the child has exited.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
             while t.len() == 1 && std::time::Instant::now() < deadline {
-                t.reap(false);
+                t.reap(false, &mut Penalties::new(&Default::default()));
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             assert_eq!(t.len(), 0, "exited child not reaped");
             assert_eq!(t.count_from_ip(ip), 0);
+        }
+
+        #[test]
+        fn penalties_accumulate_activate_and_exempt() {
+            let cfg = puressh::config::SshServerConfig::parse(
+                "PerSourcePenalties authfail:300s min:350s max:900s noauth:1\n\
+                 PerSourcePenaltyExemptList 10.0.0.0/8\nPerSourceNetBlockSize 24:64\n",
+            )
+            .unwrap();
+            let mut p = Penalties::new(&cfg.global);
+            let a: IpAddr = "192.0.2.7".parse().unwrap();
+            let neighbour: IpAddr = "192.0.2.99".parse().unwrap();
+            // Below `min`: recorded, not yet refusing.
+            p.penalise(a, PenaltyKind::AuthFail, false);
+            assert_eq!(p.refuses(a), None);
+            // Accumulated past it: the whole /24 is refused.
+            p.penalise(a, PenaltyKind::AuthFail, false);
+            assert_eq!(p.refuses(neighbour), Some("penalty: failed authentication"));
+            assert_eq!(p.refuses("192.0.3.1".parse().unwrap()), None);
+            // Exempt sources are never penalised.
+            let exempt: IpAddr = "10.1.2.3".parse().unwrap();
+            for _ in 0..5 {
+                p.penalise(exempt, PenaltyKind::AuthFail, false);
+            }
+            assert_eq!(p.refuses(exempt), None);
+            // Off: nothing is refused.
+            let off = puressh::config::SshServerConfig::parse("PerSourcePenalties no\n").unwrap();
+            let mut p = Penalties::new(&off.global);
+            for _ in 0..5 {
+                p.penalise(a, PenaltyKind::AuthFail, false);
+            }
+            assert_eq!(p.refuses(a), None);
+            // How a pre-auth process ended decides the penalty.
+            let pid = Pid::from_raw(1);
+            assert_eq!(
+                penalty_for(&WaitStatus::Exited(pid, EXIT_AUTH_ATTEMPTED), false),
+                Some(PenaltyKind::AuthFail)
+            );
+            assert_eq!(
+                penalty_for(&WaitStatus::Exited(pid, 255), false),
+                Some(PenaltyKind::NoAuth)
+            );
+            assert_eq!(penalty_for(&WaitStatus::Exited(pid, 255), true), None);
+            assert_eq!(
+                penalty_for(&WaitStatus::Signaled(pid, Signal::SIGSEGV, false), false),
+                Some(PenaltyKind::Crash)
+            );
         }
 
         #[test]

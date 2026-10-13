@@ -64,6 +64,62 @@ impl PermitRootLogin {
     }
 }
 
+/// `PerSourcePenalties`: seconds a source address is penalised for each
+/// kind of misbehaviour, accumulated (up to `max`); a source whose penalty
+/// exceeds `min` has its connections refused until it expires. OpenSSH's
+/// defaults.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PerSourcePenalties {
+    /// Penalties apply at all (`PerSourcePenalties no` turns them off).
+    pub enabled: bool,
+    /// A connection process crashed.
+    pub crash: u32,
+    /// Authentication was attempted and failed.
+    pub authfail: u32,
+    /// Authentication was attempted for an account that does not exist.
+    pub invalid_user: u32,
+    /// The connection ended without an authentication attempt.
+    pub noauth: u32,
+    /// `LoginGraceTime` ran out.
+    pub grace_exceeded: u32,
+    /// `RefuseConnection` refused the connection.
+    pub refuse_connection: u32,
+    /// A penalty becomes active (refusing) once it exceeds this.
+    pub min: u32,
+    /// The longest a penalty accumulates to.
+    pub max: u32,
+    /// Most penalised IPv4 / IPv6 sources tracked.
+    pub max_sources4: u32,
+    /// See [`Self::max_sources4`].
+    pub max_sources6: u32,
+    /// When the IPv4 table is full: refuse everyone (`deny-all`) rather
+    /// than forget the oldest penalties (`permissive`).
+    pub overflow_deny_all: bool,
+    /// The same for IPv6.
+    pub overflow6_deny_all: bool,
+}
+
+impl Default for PerSourcePenalties {
+    fn default() -> Self {
+        PerSourcePenalties {
+            enabled: true,
+            crash: 90,
+            authfail: 5,
+            invalid_user: 5,
+            noauth: 1,
+            grace_exceeded: 10,
+            refuse_connection: 10,
+            min: 15,
+            max: 600,
+            max_sources4: 65536,
+            max_sources6: 65536,
+            overflow_deny_all: false,
+            overflow6_deny_all: false,
+        }
+    }
+}
+
 /// One block of `sshd_config(5)` options.
 ///
 /// Every field is `Option`-typed (or an empty `Vec`) so the binary can apply
@@ -104,6 +160,18 @@ pub struct ServerOptions {
     /// `ExposeAuthInfo` — give sessions `SSH_USER_AUTH`, a file listing the
     /// authentication methods (and keys) that succeeded.
     pub expose_auth_info: Option<bool>,
+    /// `ChannelTimeout` — `(type pattern, seconds)` pairs: a channel idle
+    /// that long is closed; `global` applies to all channels together.
+    /// Empty for `none`.
+    pub channel_timeouts: Option<Vec<(String, u32)>>,
+    /// `PerSourcePenalties`.
+    pub per_source_penalties: Option<PerSourcePenalties>,
+    /// `PerSourcePenaltyExemptList` — addresses (CIDR patterns) never
+    /// penalised.
+    pub per_source_penalty_exempt: Option<String>,
+    /// `PerSourceNetBlockSize` — the IPv4 / IPv6 prefix lengths sources are
+    /// grouped by (`32:128` by default).
+    pub per_source_net_block_size: Option<(u8, u8)>,
     /// `TrustedUserCAKeys` — path to a file of CA public keys whose user
     /// certificates the server will accept (one key per line).
     pub trusted_user_ca_keys: Option<String>,
@@ -685,6 +753,10 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(address_family);
     take_scalar!(pam_service_name);
     take_scalar!(expose_auth_info);
+    take_scalar!(channel_timeouts);
+    take_scalar!(per_source_penalties);
+    take_scalar!(per_source_penalty_exempt);
+    take_scalar!(per_source_net_block_size);
     take_scalar!(host_key_agent);
     take_scalar!(subsystem_sftp);
     take_scalar!(subsystem_sftp_args);
@@ -800,6 +872,99 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "hostcertificate" => {
             opts.host_certificate_files.push(one_arg(line)?);
+        }
+        "persourcepenalties" => {
+            let mut p = PerSourcePenalties::default();
+            let bad = |msg: String| ConfigError::BadValue {
+                line: line.line_no,
+                keyword: kw.to_string(),
+                msg,
+            };
+            match line.args.as_slice() {
+                [] => return Err(bad("expected yes, no or penalty settings".into())),
+                [one] if one.eq_ignore_ascii_case("yes") => {}
+                [one] if one.eq_ignore_ascii_case("no") => p.enabled = false,
+                args => {
+                    for spec in args {
+                        let (k, v) = spec
+                            .split_once(':')
+                            .ok_or_else(|| bad(format!("expected name:value, got {spec:?}")))?;
+                        // OpenSSH also takes (and `sshd -T` prints)
+                        // fractional seconds: `crash:90.000000`.
+                        let secs = || match v.parse::<f64>() {
+                            Ok(f) if f.is_finite() && f >= 0.0 => Ok((f + 0.5) as u32),
+                            _ => parse_duration_str(v, line),
+                        };
+                        let count = || {
+                            v.parse::<u32>()
+                                .map_err(|_| bad(format!("bad number in {spec:?}")))
+                        };
+                        let overflow = || match v {
+                            "deny-all" => Ok(true),
+                            "permissive" => Ok(false),
+                            _ => Err(bad(format!("bad overflow mode {v:?}"))),
+                        };
+                        match k {
+                            "crash" => p.crash = secs()?,
+                            "authfail" => p.authfail = secs()?,
+                            "invaliduser" => p.invalid_user = secs()?,
+                            "noauth" => p.noauth = secs()?,
+                            "grace-exceeded" => p.grace_exceeded = secs()?,
+                            "refuseconnection" => p.refuse_connection = secs()?,
+                            "min" => p.min = secs()?,
+                            "max" => p.max = secs()?,
+                            "max-sources4" => p.max_sources4 = count()?,
+                            "max-sources6" => p.max_sources6 = count()?,
+                            "overflow" => p.overflow_deny_all = overflow()?,
+                            "overflow6" => p.overflow6_deny_all = overflow()?,
+                            _ => return Err(bad(format!("unknown penalty {k:?}"))),
+                        }
+                    }
+                }
+            }
+            opts.per_source_penalties = Some(p);
+        }
+        "persourcepenaltyexemptlist" => {
+            let v = one_arg(line)?;
+            opts.per_source_penalty_exempt = (!v.eq_ignore_ascii_case("none")).then_some(v);
+        }
+        "persourcenetblocksize" => {
+            let v = one_arg(line)?;
+            let bad = || ConfigError::BadValue {
+                line: line.line_no,
+                keyword: kw.to_string(),
+                msg: format!("expected v4[:v6] prefix lengths, got {v:?}"),
+            };
+            let (v4, v6) = v.split_once(':').unwrap_or((v.as_str(), "128"));
+            let v4: u8 = v4.parse().map_err(|_| bad())?;
+            let v6: u8 = v6.parse().map_err(|_| bad())?;
+            if v4 > 32 || v6 > 128 {
+                return Err(bad());
+            }
+            opts.per_source_net_block_size = Some((v4, v6));
+        }
+        "channeltimeout" => {
+            let mut list = Vec::new();
+            if !(line.args.len() == 1 && line.args[0].eq_ignore_ascii_case("none")) {
+                for spec in &line.args {
+                    let Some((ty, interval)) = spec.split_once('=') else {
+                        return Err(ConfigError::BadValue {
+                            line: line.line_no,
+                            keyword: kw.to_string(),
+                            msg: format!("expected type=interval, got {spec:?}"),
+                        });
+                    };
+                    if ty.is_empty() {
+                        return Err(ConfigError::BadValue {
+                            line: line.line_no,
+                            keyword: kw.to_string(),
+                            msg: format!("missing channel type in {spec:?}"),
+                        });
+                    }
+                    list.push((ty.to_string(), parse_duration_str(interval, line)?));
+                }
+            }
+            opts.channel_timeouts = Some(list);
         }
         "exposeauthinfo" => {
             opts.expose_auth_info = Some(parse_yes_no(line)?);
@@ -1419,10 +1584,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("X11UseLocalhost", &["*"], ""),
     ("StreamLocalBindMask", &["*"], ""),
     ("StreamLocalBindUnlink", &["*"], ""),
-    ("PerSourceNetBlockSize", &["*"], ""),
-    ("PerSourcePenalties", &["*"], ""),
-    ("PerSourcePenaltyExemptList", &["*"], ""),
-    ("ChannelTimeout", &["none"], "channels are not timed out"),
     // Features this server does not have: ignoring them fails closed.
     ("SecurityKeyProvider", &["*"], ""),
     ("PubkeyAuthOptions", &["*"], ""),

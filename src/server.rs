@@ -1424,6 +1424,9 @@ pub struct EffectivePolicy {
     pub expose_auth_info: Option<bool>,
     /// The `SSH_USER_AUTH` file written for this connection, if any.
     pub auth_info_file: Option<String>,
+    /// `ChannelTimeout`: `(type pattern, seconds)`, first match wins;
+    /// `global` covers all channels together.
+    pub channel_timeouts: Vec<(String, u32)>,
 }
 
 impl EffectivePolicy {
@@ -1453,6 +1456,7 @@ impl EffectivePolicy {
             subsystems: None,
             expose_auth_info: None,
             auth_info_file: None,
+            channel_timeouts: Vec::new(),
         }
     }
 
@@ -2415,6 +2419,7 @@ fn resolve_effective_policy(
         subsystems: opts.subsystems,
         expose_auth_info: opts.expose_auth_info,
         auth_info_file: None,
+        channel_timeouts: opts.channel_timeouts.unwrap_or_default(),
     }
 }
 
@@ -2949,6 +2954,11 @@ struct ConnExtras {
     /// Since when the connection has had no open channel (for
     /// `UnusedConnectionTimeout`).
     unused_since: Option<Instant>,
+    /// `ChannelTimeout`: each channel's activity count when last seen to
+    /// change, and since when it has not.
+    channel_idle: BTreeMap<u32, (u64, Instant)>,
+    /// The same for all channels together (the `global` timeout).
+    global_idle: (u64, Instant),
 }
 
 /// Poll interval while traffic flows (see [`ConnExtras::fast_until`]).
@@ -2967,6 +2977,8 @@ impl ConnExtras {
             fast_until: None,
             tick: IDLE_TICK,
             unused_since: Some(now),
+            channel_idle: BTreeMap::new(),
+            global_idle: (0, now),
             last_keepalive: now,
             missed_keepalives: 0,
         }
@@ -2991,6 +3003,95 @@ impl<K: Ord + Clone, V> DrainFilterCompat<K, V> for BTreeMap<K, V> {
         }
         out.into_iter()
     }
+}
+
+/// The type `ChannelTimeout` matches a channel by: what it became
+/// (`session:command`, …) or its type, OpenSSH's names for agent and X11
+/// channels.
+fn channel_timeout_type(ch: &crate::channel::ChannelState) -> &str {
+    match ch.xtype.as_deref() {
+        Some(x) => x,
+        None => match ch.kind.as_str() {
+            "auth-agent@openssh.com" => "agent-connection",
+            "x11" => "x11-connection",
+            other => other,
+        },
+    }
+}
+
+/// Close the channels idle for longer than their `ChannelTimeout` (or all
+/// of them, idle together past the `global` one), as OpenSSH's sshd.
+#[allow(clippy::too_many_arguments)]
+fn close_idle_channels(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    conn: &mut ConnectionState,
+    effective: &EffectivePolicy,
+    extras: &mut ConnExtras,
+    shells: &mut BTreeMap<u32, ShellRuntime>,
+    subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
+) -> Result<()> {
+    let now = Instant::now();
+    let limit_for = |ty: &str| {
+        effective
+            .channel_timeouts
+            .iter()
+            .find(|(pat, _)| pat != "global" && crate::config::glob::glob_match(pat, ty))
+            .map_or(0, |(_, secs)| *secs)
+    };
+    let global = effective
+        .channel_timeouts
+        .iter()
+        .find(|(pat, _)| pat == "global")
+        .map_or(0, |(_, secs)| *secs);
+    let mut expired: Vec<u32> = Vec::new();
+    let mut total = 0u64;
+    let mut open = Vec::new();
+    for ch in conn.channels().filter(|c| c.is_open()) {
+        open.push(ch.local_id);
+        total = total.wrapping_add(ch.activity);
+        let entry = extras
+            .channel_idle
+            .entry(ch.local_id)
+            .or_insert((ch.activity, now));
+        if entry.0 != ch.activity {
+            *entry = (ch.activity, now);
+        }
+        let limit = limit_for(channel_timeout_type(ch));
+        if limit > 0 && now.duration_since(entry.1) >= Duration::from_secs(u64::from(limit)) {
+            expired.push(ch.local_id);
+        }
+    }
+    extras.channel_idle.retain(|id, _| open.contains(id));
+    if extras.global_idle.0 != total || open.is_empty() {
+        extras.global_idle = (total, now);
+    } else if global > 0
+        && now.duration_since(extras.global_idle.1) >= Duration::from_secs(u64::from(global))
+    {
+        expired = open;
+    }
+    for id in expired {
+        // The runtime goes first, so nothing is sent on the channel after
+        // its close.
+        if let Some(mut rt) = shells.remove(&id) {
+            rt.session = None;
+        }
+        subsystems.remove(&id);
+        extras.channel_idle.remove(&id);
+        let (eof, close) = match conn.channel(id) {
+            Some(c) => (!c.local_eof && !c.local_closed, !c.local_closed),
+            None => (false, false),
+        };
+        if eof {
+            let p = conn.send_eof(id)?;
+            srv_send(stream, driver, &p)?;
+        }
+        if close {
+            let p = conn.send_close(id)?;
+            srv_send(stream, driver, &p)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3042,14 +3143,10 @@ fn do_connection_loop(
         // the 50 ms tick even when nothing else is draining, so it can notice
         // a silent peer and emit `keepalive@openssh.com`.
         let keepalive_enabled = effective.client_alive_interval.is_some_and(|i| i > 0);
-        // No channel open (nothing to forward either): the connection stays
-        // up until the client closes it, as with OpenSSH, unless
-        // UnusedConnectionTimeout says otherwise.
-        let unused = !conn.channels().any(|c| !c.is_fully_closed())
-            && !any_forward_alive
-            && !any_agent_fwd_alive
-            && !any_x11_fwd_alive
-            && !any_streamlocal_fwd_alive;
+        // No channel open: the connection stays up until the client closes
+        // it, as with OpenSSH, unless UnusedConnectionTimeout says otherwise.
+        // Forwarding listeners do not count (OpenSSH's), only channels.
+        let unused = !conn.channels().any(|c| !c.is_fully_closed());
         let unused_timeout = effective
             .unused_connection_timeout
             .filter(|t| *t > 0)
@@ -3064,7 +3161,11 @@ fn do_connection_loop(
                 return Ok(());
             }
         }
+        if !effective.channel_timeouts.is_empty() {
+            close_idle_channels(stream, driver, conn, effective, extras, shells, subsystems)?;
+        }
         let want_polling = (unused && unused_timeout.is_some())
+            || (!unused && !effective.channel_timeouts.is_empty())
             || any_shell_alive
             || any_subsystem_alive
             || any_forward_alive
@@ -4256,6 +4357,7 @@ fn handle_channel_request(
     }
     match request {
         ChannelRequest::Exec { command } => {
+            conn.set_xtype(channel, "session:command");
             // ForceCommand (capability ceiling): when set, the client's
             // command is replaced by the forced one and exposed verbatim via
             // SSH_ORIGINAL_COMMAND. `internal-sftp` routes the session into
@@ -4320,6 +4422,7 @@ fn handle_channel_request(
             }
         }
         ChannelRequest::Shell => {
+            conn.set_xtype(channel, "session:shell");
             // ForceCommand on an interactive shell: OpenSSH runs the forced
             // command instead of the login shell, with an empty
             // SSH_ORIGINAL_COMMAND. `internal-sftp` routes to SFTP; any other
@@ -4462,6 +4565,7 @@ fn handle_channel_request(
             }
         }
         ChannelRequest::Subsystem { name } => {
+            conn.set_xtype(channel, &alloc::format!("session:subsystem:{name}"));
             // ForceCommand applies to subsystems too (OpenSSH runs every
             // session — shell, exec *and* subsystem — through `do_exec`, where
             // the forced command replaces whatever was asked for). Without

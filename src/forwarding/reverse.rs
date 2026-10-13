@@ -31,8 +31,10 @@ use crate::error::{Error, Result};
 use crate::server::{ChannelEgress, ForwardContext, TcpipForwardHandler};
 
 /// How often the accept-loop polls the non-blocking listener while
-/// waiting for either a connection or the stop flag.
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// waiting for either a connection or the stop flag: often, so a dropped
+/// binding's port is free again at once (a client reconnecting right away
+/// may ask for the same port).
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// One live `tcpip-forward` binding. Dropping it signals the worker
 /// thread to stop and joins it. The thread observes the flag in between

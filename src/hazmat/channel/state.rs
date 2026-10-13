@@ -48,6 +48,13 @@ pub struct ChannelState {
     pub local_closed: bool,
     /// `CHANNEL_CLOSE` received from the peer.
     pub remote_closed: bool,
+    /// Data bytes carried so far, both ways: a channel whose count stops
+    /// changing is idle (`ChannelTimeout`).
+    pub activity: u64,
+    /// What the channel became, OpenSSH's "extended type": for a session,
+    /// `session:shell`, `session:command` or `session:subsystem:NAME` once
+    /// requested (see [`ConnectionState::set_xtype`]).
+    pub xtype: Option<String>,
 
     initial_local_window: u32,
     pending_replenish: u32,
@@ -465,6 +472,8 @@ impl ConnectionState {
             remote_eof: false,
             local_closed: false,
             remote_closed: false,
+            activity: 0,
+            xtype: None,
             initial_local_window: local_window,
             pending_replenish: 0,
             open_confirmed: false,
@@ -574,6 +583,14 @@ impl ConnectionState {
         Ok(w.into_vec())
     }
 
+    /// Record what channel `channel` became (OpenSSH's extended type, e.g.
+    /// `session:command`). Unknown channels are ignored.
+    pub fn set_xtype(&mut self, channel: u32, xtype: &str) {
+        if let Some(ch) = self.channels.get_mut(&channel) {
+            ch.xtype = Some(xtype.into());
+        }
+    }
+
     /// Send up to `data.len()` bytes via `CHANNEL_DATA`, capped by both the
     /// peer's advertised window and its `maximum_packet_size`. Returns the
     /// payload to transmit plus the number of `data` bytes actually included.
@@ -596,6 +613,7 @@ impl ConnectionState {
         w.write_string(chunk);
 
         ch.remote_window = ch.remote_window.saturating_sub(take as u32);
+        ch.activity = ch.activity.wrapping_add(take as u64);
         Ok((w.into_vec(), take))
     }
 
@@ -623,6 +641,7 @@ impl ConnectionState {
         w.write_string(chunk);
 
         ch.remote_window = ch.remote_window.saturating_sub(take as u32);
+        ch.activity = ch.activity.wrapping_add(take as u64);
         Ok((w.into_vec(), take))
     }
 
@@ -795,6 +814,8 @@ impl ConnectionState {
             remote_eof: false,
             local_closed: false,
             remote_closed: false,
+            activity: 0,
+            xtype: None,
             initial_local_window: local_window,
             pending_replenish: 0,
             open_confirmed: false,
@@ -882,6 +903,7 @@ impl ConnectionState {
             return Err(Error::Protocol("peer exceeded max packet"));
         }
         ch.local_window -= len;
+        ch.activity = ch.activity.wrapping_add(u64::from(len));
         Ok(ChannelEvent::Data {
             channel: local_id,
             data,
@@ -907,6 +929,7 @@ impl ConnectionState {
             return Err(Error::Protocol("peer exceeded max packet"));
         }
         ch.local_window -= len;
+        ch.activity = ch.activity.wrapping_add(u64::from(len));
         Ok(ChannelEvent::ExtendedData {
             channel: local_id,
             code,

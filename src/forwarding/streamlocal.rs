@@ -49,9 +49,11 @@ use crate::server::{StreamlocalForwardContext, StreamlocalForwardHandler};
 use crate::stream::{ChannelEgress, ChannelStream};
 
 /// How often the accept-loop polls the non-blocking listener while waiting
-/// for either a connection or the stop flag.
+/// for either a connection or the stop flag: often, so a dropped binding's
+/// socket is gone at once (a client reconnecting right away may ask for the
+/// same path).
 #[cfg(feature = "server")]
-const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// One live `streamlocal-forward` binding. Dropping it signals the worker
 /// thread to stop, joins it, and unlinks the on-disk socket.

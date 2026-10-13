@@ -74,7 +74,7 @@ fn unique_tmp_path(path: &str) -> String {
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "usage: ssh-keygen [-q] [-a rounds] [-b bits] [-C comment] [-f output_keyfile]\n                  \
-                     [-m format] [-N new_passphrase] [-t ecdsa | ed25519 | rsa]\n       \
+                     [-m format] [-N new_passphrase] [-t ecdsa | ed25519 | mldsa44-ed25519 | rsa]\n       \
                      ssh-keygen -l [-v] [-E fingerprint_hash] [-f input_keyfile]\n       \
                      ssh-keygen -B [-f input_keyfile]\n       \
                      ssh-keygen -e [-f input_keyfile] [-m key_format]\n       \
@@ -172,7 +172,52 @@ struct Args {
     port: u16,
 }
 
+/// Split getopt-style arguments as OpenSSH's ssh-keygen takes them: flags
+/// may be grouped (`-lf key`, `-qN ''`) and a value may follow its option
+/// directly (`-ted25519`).
+fn split_getopt(args: &[String]) -> Vec<String> {
+    const VALUE_OPTS: &str = "CDEFIMNOPRVYZabfmnrstwz";
+    const FLAG_OPTS: &str = "ABHKLQUXceghiklopquvy";
+    let mut split = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--" {
+            split.push(a.clone());
+            split.extend(it.cloned());
+            break;
+        }
+        let Some(rest) = a
+            .strip_prefix('-')
+            .filter(|r| !r.starts_with('-') && r.len() > 1)
+        else {
+            split.push(a.clone());
+            continue;
+        };
+        let chars: Vec<char> = rest.chars().collect();
+        let start = split.len();
+        for (k, &c) in chars.iter().enumerate() {
+            if VALUE_OPTS.contains(c) {
+                split.push(format!("-{c}"));
+                let tail: String = chars[k + 1..].iter().collect();
+                if !tail.is_empty() {
+                    split.push(tail);
+                }
+                break;
+            }
+            if !FLAG_OPTS.contains(c) {
+                // Not an option: report it as written.
+                split.truncate(start);
+                split.push(a.clone());
+                break;
+            }
+            split.push(format!("-{c}"));
+        }
+    }
+    split
+}
+
 fn parse_args(args: &[String]) -> Result<Args, String> {
+    let args = &split_getopt(args)[..];
     let mut out = Args {
         port: 22,
         ..Args::default()
@@ -509,6 +554,7 @@ fn algorithm_label(pk: &PublicKey) -> &'static str {
         PublicKey::EcdsaP384 { .. } => "ECDSA",
         PublicKey::EcdsaP521 { .. } => "ECDSA",
         PublicKey::Rsa { .. } => "RSA",
+        PublicKey::MlDsa44Ed25519 { .. } => "MLDSA44-ED25519",
         // A key family added to the library after this binary was written.
         _ => "UNKNOWN",
     }
@@ -553,7 +599,7 @@ fn run_generate(args: &Args) -> Result<i32, String> {
         Some(f) => f.clone(),
         None => {
             let home = std::env::var("HOME").map_err(|_| "$HOME is not set")?;
-            let default = format!("{home}/.ssh/id_{ty}");
+            let default = format!("{home}/.ssh/id_{}", ty.replace('-', "_"));
             let answer = ask(&format!(
                 "Enter file in which to save the key ({default}): "
             ))
@@ -589,6 +635,7 @@ fn run_generate(args: &Args) -> Result<i32, String> {
     let mut rng = OsRng;
     let sk = match ty.as_str() {
         "ed25519" => PrivateKey::generate_ed25519(&mut rng, comment),
+        "mldsa44-ed25519" => PrivateKey::generate_mldsa44_ed25519(&mut rng, comment),
         "ecdsa" => {
             let bits = args.bits.unwrap_or(256);
             let curve = match bits {
@@ -667,8 +714,13 @@ fn run_host_keys(args: &Args) -> Result<i32, String> {
     // the usual umask); only the private keys are 0600.
     fs::create_dir_all(&dir).map_err(|e| format!("mkdir {dir}: {e}"))?;
     let mut made = Vec::new();
-    for (ty, label) in [("rsa", "RSA"), ("ecdsa", "ECDSA"), ("ed25519", "ED25519")] {
-        let path = format!("{dir}/ssh_host_{ty}_key");
+    for (ty, label) in [
+        ("rsa", "RSA"),
+        ("ecdsa", "ECDSA"),
+        ("ed25519", "ED25519"),
+        ("mldsa44-ed25519", "MLDSA44-ED25519"),
+    ] {
+        let path = format!("{dir}/ssh_host_{}_key", ty.replace('-', "_"));
         if Path::new(&path).exists() {
             continue;
         }
@@ -680,6 +732,7 @@ fn run_host_keys(args: &Args) -> Result<i32, String> {
             "rsa" => PrivateKey::generate_rsa(&mut rng, 3072, comment.clone())
                 .map_err(|e| format!("rsa generation: {e}"))?,
             "ecdsa" => PrivateKey::generate_ecdsa(&mut rng, EcdsaCurve::P256, comment.clone()),
+            "mldsa44-ed25519" => PrivateKey::generate_mldsa44_ed25519(&mut rng, comment.clone()),
             _ => PrivateKey::generate_ed25519(&mut rng, comment.clone()),
         };
         let pem = sk
@@ -913,6 +966,9 @@ fn run_export(args: &Args) -> Result<i32, String> {
         .as_str()
     {
         "RFC4716" => pk.to_rfc4716(&user_at_host()),
+        "PKCS8" | "PEM" if matches!(pk, PublicKey::MlDsa44Ed25519 { .. }) => {
+            return Err("unsupported key type MLDSA44-ED25519".into());
+        }
         "PKCS8" => pk.to_spki_pem(),
         "PEM" => pk.to_pem(),
         other => return Err(format!("Unsupported conversion format \"{other}\"")),
@@ -1644,7 +1700,7 @@ mod sig {
 fn run_sshfp(args: &Args, host: &str) -> Result<i32, String> {
     let files: Vec<String> = match &args.file {
         Some(f) => vec![f.clone()],
-        None => ["rsa", "ecdsa", "ed25519"]
+        None => ["rsa", "ecdsa", "ed25519", "mldsa44_ed25519"]
             .iter()
             .map(|t| format!("/etc/ssh/ssh_host_{t}_key.pub"))
             .filter(|p| Path::new(p).exists())
@@ -1652,10 +1708,8 @@ fn run_sshfp(args: &Args, host: &str) -> Result<i32, String> {
     };
     for f in files {
         let pk = load_public(&f)?;
-        let alg = match pk {
-            PublicKey::Rsa { .. } => 1,
-            PublicKey::Ed25519 { .. } => 4,
-            _ => 3,
+        let Some(alg) = pk.sshfp_algorithm() else {
+            continue;
         };
         for (fptype, digest) in [(1u8, sha1(&pk.wire_blob())), (2, sha256(&pk.wire_blob()))] {
             let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();

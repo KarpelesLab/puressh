@@ -75,6 +75,11 @@ impl CertType {
     }
 }
 
+/// The ML-DSA-44 + Ed25519 composite (opt-in, as in OpenSSH: not among the
+/// defaults).
+const MLDSA: &str = "ssh-mldsa44-ed25519@openssh.com";
+const MLDSA_CERT: &str = "ssh-mldsa44-ed25519-cert-v01@openssh.com";
+
 /// The certificate key-type names this build understands.
 ///
 /// These are the names OpenSSH puts on the wire (KEX host-key list,
@@ -118,6 +123,7 @@ pub fn cert_name_to_plain(name: &str) -> Option<&'static str> {
         "rsa-sha2-512-cert-v01@openssh.com" => Some("rsa-sha2-512"),
         "rsa-sha2-256-cert-v01@openssh.com" => Some("rsa-sha2-256"),
         "ssh-rsa-cert-v01@openssh.com" => Some("ssh-rsa"),
+        MLDSA_CERT => Some(MLDSA),
         _ => None,
     }
 }
@@ -131,6 +137,7 @@ pub fn cert_name_for_key_type(key_type: &str) -> Option<&'static str> {
     match key_type {
         "ssh-rsa" | "rsa-sha2-512" => Some("rsa-sha2-512-cert-v01@openssh.com"),
         "rsa-sha2-256" => Some("rsa-sha2-256-cert-v01@openssh.com"),
+        MLDSA => Some(MLDSA_CERT),
         other => CERT_KEY_NAMES
             .iter()
             .copied()
@@ -149,6 +156,7 @@ fn blob_type_to_plain(name: &str) -> Option<&'static str> {
         "ecdsa-sha2-nistp384-cert-v01@openssh.com" => Some("ecdsa-sha2-nistp384"),
         "ecdsa-sha2-nistp521-cert-v01@openssh.com" => Some("ecdsa-sha2-nistp521"),
         "ssh-rsa-cert-v01@openssh.com" => Some("ssh-rsa"),
+        MLDSA_CERT => Some(MLDSA),
         _ => None,
     }
 }
@@ -292,6 +300,12 @@ fn read_embedded_pubkey(key_type: &str, r: &mut Reader<'_>) -> Result<Vec<u8>> {
             w.write_string(plain.as_bytes());
             w.write_string(curve);
             w.write_string(point);
+        }
+        MLDSA_CERT => {
+            let pk = r.read_string()?;
+            crate::hostkey::MlDsa44Ed25519HostKey::from_public(pk)?;
+            w.write_string(MLDSA.as_bytes());
+            w.write_string(pk);
         }
         "ssh-rsa-cert-v01@openssh.com" => {
             // RSA cert public fields are `mpint e, mpint n` — note the order
@@ -482,6 +496,7 @@ impl Certificate {
             "ssh-rsa" => {
                 matches!(sig_algo, "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512")
             }
+            MLDSA => sig_algo == MLDSA,
             _ => false,
         };
         if !compatible {
@@ -538,19 +553,15 @@ impl Certificate {
     /// Check that `name` is among the valid principals.
     ///
     /// For **host** certificates the principals are host names or patterns
-    /// (`*`, `?`), compared without regard to case, and an empty list is
-    /// refused (OpenSSH's sshkey_cert_check_host). For **user**
-    /// certificates the principals are login names, compared exactly, and an
-    /// empty list authorizes any principal.
+    /// (`*`, `?`), compared without regard to case (OpenSSH's
+    /// sshkey_cert_check_host). For **user** certificates the principals are
+    /// login names, compared exactly. Either way an empty list is refused,
+    /// as OpenSSH refuses it.
     pub fn check_principal(&self, name: &str) -> Result<()> {
-        // A host certificate must name its hosts, and may do so with
-        // patterns (OpenSSH's sshkey_cert_check_host); host names compare
-        // without regard to case.
+        // A certificate must name its hosts / users; a host certificate may
+        // do so with patterns, and host names compare without regard to case.
         if self.valid_principals.is_empty() {
-            return match self.cert_type {
-                CertType::Host => Err(Error::CertPrincipalMismatch),
-                CertType::User => Ok(()),
-            };
+            return Err(Error::CertPrincipalMismatch);
         }
         let matched = match self.cert_type {
             CertType::Host => {
@@ -752,6 +763,7 @@ impl CertificateBuilder {
             b"ecdsa-sha2-nistp384" => "ecdsa-sha2-nistp384-cert-v01@openssh.com",
             b"ecdsa-sha2-nistp521" => "ecdsa-sha2-nistp521-cert-v01@openssh.com",
             b"ssh-rsa" => "ssh-rsa-cert-v01@openssh.com",
+            b"ssh-mldsa44-ed25519@openssh.com" => MLDSA_CERT,
             _ => return Err(Error::Unsupported("cert: key type")),
         };
         if self.valid_after > self.valid_before {

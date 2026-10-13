@@ -66,6 +66,20 @@ impl PublicKey {
         out
     }
 
+    /// The DNS SSHFP algorithm number (RFC 4255, 6594, 7479): RSA 1,
+    /// ECDSA 3, Ed25519 4. `None` for a key type without one (the ML-DSA
+    /// composite), which gets no SSHFP record.
+    pub fn sshfp_algorithm(&self) -> Option<u8> {
+        match self {
+            PublicKey::Rsa { .. } => Some(1),
+            PublicKey::EcdsaP256 { .. }
+            | PublicKey::EcdsaP384 { .. }
+            | PublicKey::EcdsaP521 { .. } => Some(3),
+            PublicKey::Ed25519 { .. } => Some(4),
+            PublicKey::MlDsa44Ed25519 { .. } => None,
+        }
+    }
+
     /// Approximate "bit length" reported by `ssh-keygen -l`: the modulus bit
     /// length for RSA, the curve bit length for ECDSA, 256 for Ed25519.
     pub fn bit_length(&self) -> u32 {
@@ -75,6 +89,7 @@ impl PublicKey {
             PublicKey::EcdsaP384 { .. } => 384,
             PublicKey::EcdsaP521 { .. } => 521,
             PublicKey::Rsa { n, .. } => modulus_bit_len(n),
+            PublicKey::MlDsa44Ed25519 { .. } => 256,
         }
     }
 }
@@ -92,6 +107,18 @@ fn modulus_bit_len(n: &[u8]) -> u32 {
 }
 
 impl PrivateKey {
+    /// Generate a new `ssh-mldsa44-ed25519@openssh.com` keypair.
+    pub fn generate_mldsa44_ed25519<R: CryptoRng + RngCore>(rng: &mut R, comment: String) -> Self {
+        let mut seeds = [0u8; 64];
+        rng.fill_bytes(&mut seeds);
+        let public = crate::hostkey::mldsa44_ed25519_public(&seeds);
+        PrivateKey::MlDsa44Ed25519 {
+            seeds,
+            public,
+            comment,
+        }
+    }
+
     /// Generate a new ssh-ed25519 keypair.
     pub fn generate_ed25519<R: CryptoRng + RngCore>(rng: &mut R, comment: String) -> Self {
         let sk = Ed25519PrivateKey::generate(rng);
@@ -291,6 +318,16 @@ impl PrivateKey {
                 w.write_string(&sk[..]);
                 w.write_string(comment.as_bytes());
             }
+            PrivateKey::MlDsa44Ed25519 {
+                seeds,
+                public,
+                comment,
+            } => {
+                w.write_string(b"ssh-mldsa44-ed25519@openssh.com");
+                w.write_string(public);
+                w.write_string(seeds);
+                w.write_string(comment.as_bytes());
+            }
             PrivateKey::EcdsaP256 { d, point, comment } => {
                 w.write_string(b"ecdsa-sha2-nistp256");
                 w.write_string(b"nistp256");
@@ -362,6 +399,16 @@ fn encode_inner_block<R: CryptoRng + RngCore>(
             sk[..32].copy_from_slice(seed);
             sk[32..].copy_from_slice(public);
             w.write_string(&sk[..]);
+            w.write_string(comment.as_bytes());
+        }
+        PrivateKey::MlDsa44Ed25519 {
+            seeds,
+            public,
+            comment,
+        } => {
+            w.write_string(b"ssh-mldsa44-ed25519@openssh.com");
+            w.write_string(public);
+            w.write_string(seeds);
             w.write_string(comment.as_bytes());
         }
         PrivateKey::EcdsaP256 { d, point, comment } => {

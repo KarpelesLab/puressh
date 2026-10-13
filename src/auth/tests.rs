@@ -1710,3 +1710,70 @@ fn server_unadvertised_rejection_pins_username() {
         _ => panic!("expected Disconnect"),
     }
 }
+
+/// Two publickey factors (`AuthenticationMethods publickey,publickey`): the
+/// authenticator would take any verified key twice, but, as OpenSSH, the
+/// server refuses a key already accepted, so the second factor needs another.
+struct TwoKeys(u32);
+impl Authenticator for TwoKeys {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                verified: true,
+                probe_only: false,
+                ..
+            } => {
+                self.0 += 1;
+                if self.0 >= 2 {
+                    AuthDecision::Accept
+                } else {
+                    AuthDecision::PartialAccept {
+                        still_required: vec!["publickey".into()],
+                    }
+                }
+            }
+            AuthAttempt::PublicKey {
+                probe_only: true, ..
+            } => AuthDecision::Accept,
+            _ => AuthDecision::Reject,
+        }
+    }
+}
+
+#[test]
+fn server_refuses_a_key_already_used_as_a_factor() {
+    let k1 = Ed25519HostKey::from_seed(TEST_SEED);
+    let k2 = Ed25519HostKey::from_seed([9u8; 32]);
+    let mut s = ServerAuth::new(TEST_SID.to_vec(), vec!["publickey"], Box::new(TwoKeys(0)));
+    let _ = s.on_packet(
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    );
+    let first = signed_pubkey_request("alice", "ssh-ed25519", &k1.public_blob(), &k1);
+    match s.on_packet(&first).unwrap() {
+        ServerStep::Send(p) => assert!(UserauthFailure::decode(&p).unwrap().partial_success),
+        _ => panic!("expected partial success"),
+    }
+    // The same key again, signed or as a probe: refused.
+    assert_failure(s.on_packet(&first).unwrap());
+    let probe = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::PublicKey {
+            signature_present: false,
+            algorithm: "ssh-ed25519".into(),
+            public_blob: k1.public_blob(),
+            signature: None,
+        },
+    }
+    .encode();
+    assert_failure(s.on_packet(&probe).unwrap());
+    // Another key completes the chain.
+    let second = signed_pubkey_request("alice", "ssh-ed25519", &k2.public_blob(), &k2);
+    assert!(matches!(
+        s.on_packet(&second).unwrap(),
+        ServerStep::Authenticated { .. }
+    ));
+}

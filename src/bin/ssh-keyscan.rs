@@ -1,15 +1,19 @@
 //! `ssh-keyscan` — gather SSH host keys, in `known_hosts` format.
 //!
 //! ```text
-//! ssh-keyscan [-46Hv] [-f file] [-p port] [-T timeout] [-t type] [host | addrlist namelist] ...
+//! ssh-keyscan [-46cDHqv] [-f file] [-O option] [-p port] [-T timeout] [-t type]
+//!             [host | addrlist namelist] ...
 //! ```
 //!
 //! Like OpenSSH's: for every host and every requested key type
-//! (`rsa,ecdsa,ed25519` by default) it opens a connection offering only that
-//! type's host-key algorithms, completes the key exchange to learn the key,
-//! and prints `host keytype base64` on stdout (`[host]:port` for a
-//! non-default port; `-H` hashes the host names). Diagnostics go to stderr.
-//! Hosts that cannot be reached or offer no key of a type are skipped.
+//! (`rsa,ecdsa,ed25519,mldsa44-ed25519` by default) it opens a connection
+//! offering only that type's host-key algorithms, completes the key exchange
+//! to learn the key, and prints `host keytype base64` on stdout
+//! (`[host]:port` for a non-default port; `-H` hashes the host names), each
+//! host preceded by a `# host:port banner` comment (not with `-q`). `-c`
+//! asks for certificates instead, `-D` prints SSHFP records. Diagnostics go
+//! to stderr. Hosts that cannot be reached or offer no key of a type are
+//! skipped.
 
 use std::io::{BufRead, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -22,34 +26,51 @@ use puressh::client::{
 };
 use puressh::known_hosts::KnownHosts;
 
-const USAGE: &str = "usage: ssh-keyscan [-46Hv] [-f file] [-p port] [-T timeout] [-t type]\n\
-                     \t\t   [host | addrlist namelist] ...";
+const USAGE: &str = "usage: ssh-keyscan [-46cDHqv] [-f file] [-O option] [-p port] [-T timeout]\n\
+                     \t\t   [-t type] [host | addrlist namelist]";
 
 struct Opts {
     family: Option<bool>, // Some(true) = IPv4 only, Some(false) = IPv6 only
     hash: bool,
     verbose: bool,
+    quiet: bool,
+    /// `-c`: certificates.
+    certs: bool,
+    /// `-D`: SSHFP records, with `-O hashalg=` choosing one digest.
+    sshfp: bool,
+    sshfp_hash: Option<u8>,
     port: u16,
     timeout: Duration,
     types: Vec<&'static str>,
     hosts: Vec<String>,
 }
 
-/// Host-key algorithms offered when scanning for one key type.
-fn algorithms_for(ty: &str) -> Option<(&'static str, &'static [&'static str])> {
-    Some(match ty {
-        "rsa" => ("rsa", &["rsa-sha2-512", "rsa-sha2-256"][..]),
-        "ecdsa" => (
-            "ecdsa",
-            &[
-                "ecdsa-sha2-nistp256",
-                "ecdsa-sha2-nistp384",
-                "ecdsa-sha2-nistp521",
-            ][..],
-        ),
-        "ed25519" => ("ed25519", &["ssh-ed25519"][..]),
-        _ => return None,
-    })
+/// Host-key algorithms offered when scanning for one key type (`cert`:
+/// its certificates), as OpenSSH's.
+fn algorithms_for(ty: &str, cert: bool) -> &'static [&'static str] {
+    match (ty, cert) {
+        ("rsa", false) => &["rsa-sha2-512", "rsa-sha2-256", "ssh-rsa"],
+        ("rsa", true) => &[
+            "rsa-sha2-512-cert-v01@openssh.com",
+            "rsa-sha2-256-cert-v01@openssh.com",
+            "ssh-rsa-cert-v01@openssh.com",
+        ],
+        ("ecdsa", false) => &[
+            "ecdsa-sha2-nistp256",
+            "ecdsa-sha2-nistp384",
+            "ecdsa-sha2-nistp521",
+        ],
+        ("ecdsa", true) => &[
+            "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+            "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        ],
+        ("ed25519", false) => &["ssh-ed25519"],
+        ("ed25519", true) => &["ssh-ed25519-cert-v01@openssh.com"],
+        ("mldsa44-ed25519", false) => &["ssh-mldsa44-ed25519@openssh.com"],
+        ("mldsa44-ed25519", true) => &["ssh-mldsa44-ed25519-cert-v01@openssh.com"],
+        _ => &[],
+    }
 }
 
 fn parse_args(args: &[String]) -> Result<Opts, String> {
@@ -57,9 +78,13 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         family: None,
         hash: false,
         verbose: false,
+        quiet: false,
+        certs: false,
+        sshfp: false,
+        sshfp_hash: None,
         port: 22,
         timeout: Duration::from_secs(5),
-        types: vec!["rsa", "ecdsa", "ed25519"],
+        types: vec!["rsa", "ecdsa", "ed25519", "mldsa44-ed25519"],
         hosts: Vec::new(),
     };
     let mut files: Vec<String> = Vec::new();
@@ -79,7 +104,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         let mut j = 0;
         while j < chars.len() {
             let c = chars[j];
-            if "fpTt".contains(c) {
+            if "fOpTt".contains(c) {
                 let attached: String = chars[j + 1..].iter().collect();
                 let v = if !attached.is_empty() {
                     attached
@@ -91,6 +116,12 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 };
                 match c {
                     'f' => files.push(v),
+                    'O' => match v.strip_prefix("hashalg=") {
+                        Some("sha1") => o.sshfp_hash = Some(1),
+                        Some("sha256") => o.sshfp_hash = Some(2),
+                        Some(other) => return Err(format!("Unsupported hash algorithm {other}")),
+                        None => return Err("Unsupported -O option".into()),
+                    },
                     'p' => o.port = v.parse().map_err(|_| format!("bad port '{v}'"))?,
                     'T' => {
                         let secs: u64 = v.parse().map_err(|_| format!("bad timeout '{v}'"))?;
@@ -107,6 +138,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                                 | "ecdsa-sha2-nistp521"
                                 | "ecdsa" => "ecdsa",
                                 "ssh-ed25519" | "ed25519" => "ed25519",
+                                "ssh-mldsa44-ed25519@openssh.com" | "mldsa44-ed25519" => {
+                                    "mldsa44-ed25519"
+                                }
                                 // Not supported by this build: skipped like
                                 // a type the server does not offer.
                                 "dsa" | "ssh-dss" | "ecdsa-sk" | "ed25519-sk" => continue,
@@ -126,8 +160,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                 '6' => o.family = Some(false),
                 'H' => o.hash = true,
                 'v' => o.verbose = true,
-                'c' => return Err("-c (certificates) is not supported".into()),
-                'D' => return Err("-D (SSHFP records) is not supported".into()),
+                'q' => o.quiet = true,
+                'c' => o.certs = true,
+                'D' => o.sshfp = true,
                 _ => return Err(format!("unknown option -- {c}")),
             }
             j += 1;
@@ -168,12 +203,15 @@ fn scan_one(
     addrs: &[SocketAddr],
     algs: &[&str],
     timeout: Duration,
+    comment: Option<char>,
 ) -> Option<(String, Vec<u8>)> {
     let found: Arc<Mutex<Option<KeyFound>>> = Arc::new(Mutex::new(None));
     for addr in addrs {
         let sink = found.clone();
         let capture: Arc<TofuPromptFn> = Arc::new(move |_h, _p, key_type, blob| {
-            if let Ok(mut g) = sink.lock() {
+            if let Ok(mut g) = sink.lock()
+                && g.is_none()
+            {
                 *g = Some((key_type.to_string(), blob.to_vec()));
             }
             // Refuse: we only wanted the key, not a session.
@@ -181,6 +219,17 @@ fn scan_one(
         });
         let mut policy = KnownHostsPolicy::strict(Arc::new(Mutex::new(KnownHosts::new())));
         policy.on_unknown = TofuAction::Prompt(capture);
+        // The key as presented (a certificate, for `-c`), before a
+        // certificate is reduced to the key it certifies.
+        let first = found.clone();
+        policy.command = Some(Arc::new(move |key_type: &str, blob: &[u8]| {
+            if let Ok(mut g) = first.lock()
+                && g.is_none()
+            {
+                *g = Some((key_type.to_string(), blob.to_vec()));
+            }
+            None
+        }));
         let mut algorithms = AlgoOverrides::default();
         algorithms.host_key_algorithms = Some(algs.iter().map(|a| a.to_string()).collect());
         let mut cfg = Config::new(HostKeyPolicy::KnownHosts(policy)).with_algorithms(algorithms);
@@ -192,14 +241,18 @@ fn scan_one(
         let _ = stream.set_write_timeout(Some(timeout));
         // Like OpenSSH, note the server's banner as a comment (peeked, so
         // the handshake still reads it).
-        if let Some(banner) = peek_banner(&stream) {
-            println!("# {target_host}:{port} {banner}", target_host = addr.ip());
+        if let Some(c) = comment
+            && let Some(banner) = peek_banner(&stream)
+        {
+            println!("{c} {name}:{port} {banner}");
         }
         let _ = Client::connect_via(Box::new(stream), name, port, cfg);
         if let Some(k) = found.lock().ok().and_then(|mut g| g.take()) {
             // The algorithm name for RSA is the key type `ssh-rsa`.
-            let key_type = if k.0.starts_with("rsa-sha2-") {
+            let key_type = if k.0.starts_with("rsa-sha2-") && !k.0.contains("-cert-") {
                 "ssh-rsa".to_string()
+            } else if k.0.starts_with("rsa-sha2-") {
+                "ssh-rsa-cert-v01@openssh.com".to_string()
             } else {
                 k.0
             };
@@ -256,18 +309,11 @@ fn run() -> Result<i32, String> {
                 continue;
             }
         };
+        let comment = (!o.quiet).then_some(if o.sshfp { ';' } else { '#' });
         for ty in &o.types {
-            let Some((_, algs)) = algorithms_for(ty) else {
-                continue;
-            };
-            match scan_one(target, o.port, &addrs, algs, o.timeout) {
-                Some((key_type, blob)) => {
-                    let mut kh = KnownHosts::new();
-                    for name in &names {
-                        kh.add(name, o.port, &key_type, &blob, o.hash);
-                    }
-                    let _ = out.write_all(&kh.to_bytes());
-                }
+            let algs = algorithms_for(ty, o.certs);
+            match scan_one(target, o.port, &addrs, algs, o.timeout, comment) {
+                Some((key_type, blob)) => print_key(&o, &names, &key_type, &blob, &mut out),
                 None => {
                     if o.verbose {
                         eprintln!("# {target}:{} no {ty} host key", o.port);
@@ -277,6 +323,61 @@ fn run() -> Result<i32, String> {
         }
     }
     Ok(0)
+}
+
+/// Print a key found for `names`, as OpenSSH's `keyprint`: one line naming
+/// every host (port 22, unhashed, or a certificate), else one per host.
+fn print_key(o: &Opts, names: &[&str], key_type: &str, blob: &[u8], out: &mut impl Write) {
+    let joined = names.join(",");
+    let hosts: Vec<&str> = if o.certs || (!o.hash && o.port == 22) {
+        vec![joined.as_str()]
+    } else {
+        names.to_vec()
+    };
+    let b64 = purecrypto::der::base64_encode(blob);
+    for host in hosts {
+        let line = if o.sshfp {
+            sshfp_lines(host, blob, o.sshfp_hash)
+        } else if o.certs {
+            format!("{key_type} {b64}\n")
+        } else if o.hash {
+            let mut kh = KnownHosts::new();
+            kh.add(host, o.port, key_type, blob, true);
+            String::from_utf8_lossy(&kh.to_bytes()).into_owned()
+        } else {
+            let host = host.to_ascii_lowercase();
+            if o.port == 22 {
+                format!("{host} {key_type} {b64}\n")
+            } else {
+                format!("[{host}]:{} {key_type} {b64}\n", o.port)
+            }
+        };
+        let _ = out.write_all(line.as_bytes());
+    }
+}
+
+/// `host IN SSHFP alg fptype digest` lines (SHA-1 and SHA-256, or the one
+/// `-O hashalg=` names); none for a key type without an SSHFP number.
+fn sshfp_lines(host: &str, blob: &[u8], only: Option<u8>) -> String {
+    use purecrypto::hash::{Digest, Sha1, Sha256};
+    let Some(alg) = puressh::key::PublicKey::parse_wire_blob(blob)
+        .ok()
+        .and_then(|k| k.sshfp_algorithm())
+    else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for (fptype, digest) in [
+        (1u8, Sha1::digest(blob).as_ref().to_vec()),
+        (2, Sha256::digest(blob).as_ref().to_vec()),
+    ] {
+        if only.is_some_and(|o| o != fptype) {
+            continue;
+        }
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        out.push_str(&format!("{host} IN SSHFP {alg} {fptype} {hex}\n"));
+    }
+    out
 }
 
 fn main() -> ExitCode {

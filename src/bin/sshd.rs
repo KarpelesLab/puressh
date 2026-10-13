@@ -7,7 +7,7 @@
 //!
 //! Defaults follow OpenSSH so the binary can replace it: the configuration
 //! is `/etc/ssh/sshd_config` (when present; `-f` overrides, `-o` options win
-//! over the file), the host keys are `/etc/ssh/ssh_host_{rsa,ecdsa,ed25519}_key`
+//! over the file), the host keys are `/etc/ssh/ssh_host_{rsa,ecdsa,ed25519,mldsa44_ed25519}_key`
 //! (whichever load), the daemon listens on port 22 of every address (one
 //! `IPV6_V6ONLY` socket per family), and any user may log in subject to
 //! `AllowUsers` / `DenyUsers` and authentication. It always stays in the
@@ -942,6 +942,7 @@ mod imp {
         "/etc/ssh/ssh_host_rsa_key",
         "/etc/ssh/ssh_host_ecdsa_key",
         "/etc/ssh/ssh_host_ed25519_key",
+        "/etc/ssh/ssh_host_mldsa44_ed25519_key",
     ];
 
     /// The effective configuration: `-o` options first (so they win, since
@@ -1123,6 +1124,9 @@ mod imp {
         for c in &certs {
             line("hostcertificate", c);
         }
+        if let Some(a) = &opts.host_key_agent {
+            line("hostkeyagent", a);
+        }
         line(
             "usepam",
             yn(opts
@@ -1281,7 +1285,10 @@ mod imp {
             &none_or(&opts.authorized_principals_command_user),
         );
         line("trustedusercakeys", &none_or(&opts.trusted_user_ca_keys));
-        line("revokedkeys", &none_or(&opts.revoked_keys));
+        line(
+            "revokedkeys",
+            &none_or(&opts.revoked_keys.as_ref().map(|v| v.join(" "))),
+        );
         line("banner", &none_or(&opts.banner));
         line("forcecommand", &none_or(&opts.force_command));
         line("chrootdirectory", &none_or(&opts.chroot_directory));
@@ -1658,6 +1665,7 @@ mod imp {
         key_paths: &[String],
         cert_paths: &[String],
         strict_modes: bool,
+        agent: Option<&str>,
     ) -> Result<Vec<Box<dyn HostKey + Send + Sync>>, String> {
         use puressh::cert::Certificate;
         use puressh::hostkey::CertHostKey;
@@ -1687,18 +1695,27 @@ mod imp {
                     .into_host_key()
                     .map_err(|e| format!("convert {path}: {e}"))
             })();
-            let hk = match loaded_key {
-                Ok(hk) => hk,
-                Err(e) => {
-                    eprintln!("sshd: warning: unable to load host key: {e}");
-                    continue;
-                }
+            // No private key there: with `HostKeyAgent`, its public key (the
+            // file itself or `<path>.pub`) is signed for by the agent.
+            let key: Arc<dyn HostKey + Send + Sync> = match loaded_key {
+                // PrivateKey::into_host_key returns `Box<dyn HostKey + Send>` —
+                // upgrade to `Send + Sync` by wrapping. Our concrete signers
+                // (Ed25519, ECDSA, RSA) hold only `Sync`-safe types internally;
+                // we expose this via a small thunk that just defers to the boxed
+                // signer.
+                Ok(hk) => Arc::from(SyncHostKey::wrap(hk)),
+                Err(e) => match agent.map(|sock| AgentSocketHostKey::load(sock, path)) {
+                    Some(Ok(k)) => Arc::new(k),
+                    Some(Err(agent_err)) => {
+                        eprintln!("sshd: warning: unable to load host key {path}: {agent_err}");
+                        continue;
+                    }
+                    None => {
+                        eprintln!("sshd: warning: unable to load host key: {e}");
+                        continue;
+                    }
+                },
             };
-            // PrivateKey::into_host_key returns `Box<dyn HostKey + Send>` —
-            // upgrade to `Send + Sync` by wrapping. Our concrete signers (Ed25519,
-            // ECDSA, RSA) hold only `Sync`-safe types internally; we expose this
-            // via a small thunk that just defers to the boxed signer.
-            let key: Arc<dyn HostKey + Send + Sync> = Arc::from(SyncHostKey::wrap(hk));
             loaded.push(Loaded {
                 blob: key.public_blob(),
                 key,
@@ -1749,6 +1766,100 @@ mod imp {
         Ok(out)
     }
 
+    /// A host key whose private half is held by an `ssh-agent`
+    /// (`HostKeyAgent`): each signature is one request on a fresh connection
+    /// to the agent's socket (connections are never shared between the
+    /// per-connection processes).
+    struct AgentSocketHostKey {
+        socket: String,
+        blob: Vec<u8>,
+        algorithm: &'static str,
+        /// `SSH_AGENT_RSA_SHA2_*` for an RSA key (0: SHA-1).
+        flags: u32,
+        rsa: bool,
+    }
+
+    impl AgentSocketHostKey {
+        /// The public key of host key `path` (the file, or `<path>.pub`),
+        /// which the agent at `socket` must hold.
+        fn load(socket: &str, path: &str) -> Result<Self, String> {
+            let parse = |p: &str| {
+                std::fs::read_to_string(p).ok().and_then(|t| {
+                    t.lines()
+                        .find(|l| !l.trim().is_empty())
+                        .and_then(|l| PublicKey::parse_authorized_keys_line(l.trim()).ok())
+                })
+            };
+            let public = parse(path)
+                .or_else(|| parse(&format!("{path}.pub")))
+                .ok_or_else(|| format!("{path}: no private or public key"))?;
+            let blob = public.wire_blob();
+            let mut agent = puressh::agent::Agent::connect(socket)
+                .map_err(|e| format!("HostKeyAgent {socket}: {e}"))?;
+            let held = agent
+                .identities()
+                .map_err(|e| format!("HostKeyAgent {socket}: {e}"))?
+                .iter()
+                .any(|i| i.key_blob == blob);
+            if !held {
+                return Err(format!("{path}: the agent does not hold this key"));
+            }
+            let rsa = public.algorithm() == "ssh-rsa";
+            let (algorithm, flags) = if rsa {
+                ("rsa-sha2-512", AGENT_RSA_SHA2_512)
+            } else {
+                (public.algorithm(), 0)
+            };
+            Ok(AgentSocketHostKey {
+                socket: socket.to_string(),
+                blob,
+                algorithm,
+                flags,
+                rsa,
+            })
+        }
+    }
+
+    const AGENT_RSA_SHA2_256: u32 = 2;
+    const AGENT_RSA_SHA2_512: u32 = 4;
+
+    impl HostKey for AgentSocketHostKey {
+        fn algorithm(&self) -> &'static str {
+            self.algorithm
+        }
+        fn public_blob(&self) -> Vec<u8> {
+            self.blob.clone()
+        }
+        fn sign(&self, msg: &[u8]) -> puressh::Result<Vec<u8>> {
+            puressh::agent::Agent::connect(&self.socket)?.sign(&self.blob, msg, self.flags)
+        }
+        /// The same RSA key signing with the hash `algs` names.
+        fn upgraded_for(&self, algs: &str) -> Option<Box<dyn HostKey>> {
+            if !self.rsa {
+                return None;
+            }
+            let listed = |n: &str| algs.split(',').any(|a| a.trim() == n);
+            let (algorithm, flags) = if listed("rsa-sha2-512") {
+                ("rsa-sha2-512", AGENT_RSA_SHA2_512)
+            } else if listed("rsa-sha2-256") {
+                ("rsa-sha2-256", AGENT_RSA_SHA2_256)
+            } else if listed("ssh-rsa") && puressh::hostkey::allow_rsa_sha1() {
+                ("ssh-rsa", 0)
+            } else {
+                return None;
+            };
+            (algorithm != self.algorithm).then(|| {
+                Box::new(AgentSocketHostKey {
+                    socket: self.socket.clone(),
+                    blob: self.blob.clone(),
+                    algorithm,
+                    flags,
+                    rsa: true,
+                }) as Box<dyn HostKey>
+            })
+        }
+    }
+
     /// A `HostKey` backed by a shared `Arc` signer, so one loaded private key
     /// can stand behind both a plain host-key entry and its `CertHostKey`.
     struct SharedSigner(std::sync::Arc<dyn HostKey + Send + Sync>);
@@ -1762,6 +1873,9 @@ mod imp {
         }
         fn sign(&self, msg: &[u8]) -> puressh::Result<Vec<u8>> {
             self.0.sign(msg)
+        }
+        fn upgraded_for(&self, algs: &str) -> Option<Box<dyn HostKey>> {
+            self.0.upgraded_for(algs)
         }
     }
 
@@ -1904,6 +2018,9 @@ mod imp {
                 .lock()
                 .map_err(|_| puressh::Error::Crypto("host-key mutex poisoned"))?;
             g.sign(msg)
+        }
+        fn upgraded_for(&self, algs: &str) -> Option<Box<dyn HostKey>> {
+            self.inner.lock().ok()?.upgraded_for(algs)
         }
     }
 
@@ -2318,26 +2435,29 @@ mod imp {
                 };
                 format!("{}/{path}", home.trim_end_matches('/'))
             };
-            if !std::path::Path::new(&path).exists() {
-                if debug {
-                    eprintln!("sshd: AuthorizedKeysFile {path}: not present");
-                }
-                continue;
+            // A glob names every matching file, as in OpenSSH.
+            let paths = puressh::config::glob_paths(&path);
+            if paths.is_empty() && debug {
+                eprintln!("sshd: AuthorizedKeysFile {path}: not present");
             }
-            match load_authorized_keys_and_cas(&path, strict_modes, Some(info.uid)) {
-                Ok(set) => {
-                    if debug {
-                        eprintln!(
-                            "sshd: AuthorizedKeysFile {path}: {} key(s), {} cert-authority line(s)",
-                            set.blobs.len(),
-                            set.cas.len()
-                        );
+            for path in paths {
+                let path = path.to_string_lossy();
+                match load_authorized_keys_and_cas(&path, strict_modes, Some(info.uid)) {
+                    Ok(set) => {
+                        if debug {
+                            eprintln!(
+                                "sshd: AuthorizedKeysFile {path}: {} key(s), {} cert-authority \
+                                 line(s)",
+                                set.blobs.len(),
+                                set.cas.len()
+                            );
+                        }
+                        out.append(set);
                     }
-                    out.append(set);
-                }
-                Err(e) => {
-                    if debug {
-                        eprintln!("sshd: AuthorizedKeysFile {path}: {e}");
+                    Err(e) => {
+                        if debug {
+                            eprintln!("sshd: AuthorizedKeysFile {path}: {e}");
+                        }
                     }
                 }
             }
@@ -2617,10 +2737,39 @@ mod imp {
     /// Load and parse a binary KRL (`ssh-keygen -k`). A configured but
     /// unreadable / unparsable file is a hard error — failing closed beats
     /// silently running with no revocation.
+    /// Every `RevokedKeys` file, combined.
+    fn load_krls(paths: &[String], debug: bool) -> Result<puressh::krl::Krl, String> {
+        let mut all = puressh::krl::Krl::new();
+        for path in paths {
+            all.merge(load_krl(path, debug)?);
+        }
+        Ok(all)
+    }
+
+    /// One `RevokedKeys` file: a binary KRL, or a list of public keys (a
+    /// certificate's line revokes its key), as OpenSSH reads either.
     fn load_krl(path: &str, debug: bool) -> Result<puressh::krl::Krl, String> {
         let bytes = std::fs::read(path).map_err(|e| format!("RevokedKeys {path}: {e}"))?;
-        let krl = puressh::krl::Krl::parse(&bytes)
-            .map_err(|e| format!("RevokedKeys {path}: parse failed: {e}"))?;
+        let krl = if bytes.starts_with(b"SSHKRL\n\0") {
+            puressh::krl::Krl::parse(&bytes)
+                .map_err(|e| format!("RevokedKeys {path}: parse failed: {e}"))?
+        } else {
+            let text = String::from_utf8_lossy(&bytes);
+            let mut krl = puressh::krl::Krl::new();
+            for line in text.lines().map(str::trim) {
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                if let Ok(k) = PublicKey::parse_authorized_keys_line(line) {
+                    krl.revoke_key(&k.wire_blob());
+                } else if let Ok(c) = puressh::cert::Certificate::parse_openssh_line(line) {
+                    krl.revoke_key(c.embedded_pubkey_blob());
+                } else {
+                    return Err(format!("RevokedKeys {path}: unreadable key line"));
+                }
+            }
+            krl
+        };
         if debug {
             eprintln!(
                 "sshd: loaded RevokedKeys from {path} ({} bytes, empty={})",
@@ -3159,10 +3308,9 @@ mod imp {
                         .is_none_or(|o| key_line_applies(o, peer.as_deref(), debug))
                     && match principals {
                         Some(list) => principals_match_option(list, &ci.valid_principals),
-                        None => {
-                            ci.valid_principals.is_empty()
-                                || ci.valid_principals.iter().any(|p| p == user)
-                        }
+                        // A certificate without principals is refused, as
+                        // OpenSSH refuses it.
+                        None => ci.valid_principals.iter().any(|p| p == user),
                     }
             });
             let ca_opts = ca_line.map(|(i, _)| set.ca_options.get(i).cloned().unwrap_or_default());
@@ -3456,10 +3604,11 @@ mod imp {
             };
             self.revoked_keys = match &opts.revoked_keys {
                 None => None,
+                Some(paths) if paths.is_empty() => None,
                 Some(path) => match pol.krls.get(path) {
                     Some(k) => Some(k.clone()),
                     None => {
-                        eprintln!("sshd: RevokedKeys {path}: not preloaded; refusing auth");
+                        eprintln!("sshd: RevokedKeys {path:?}: not preloaded; refusing auth");
                         self.policy_broken = true;
                         None
                     }
@@ -3514,15 +3663,25 @@ mod imp {
                     return Vec::new();
                 }
             };
-            match load_principals_file(&path, self.strict_modes, Some(info.uid)) {
-                Ok(list) => list,
-                Err(e) => {
-                    if self.debug {
-                        eprintln!("sshd: AuthorizedPrincipalsFile {path}: {e}");
+            let path = if path.starts_with('/') {
+                path
+            } else {
+                format!("{}/{path}", info.home_str.trim_end_matches('/'))
+            };
+            // A glob names every matching file, read in order, as in OpenSSH.
+            let mut out = Vec::new();
+            for file in puressh::config::glob_paths(&path) {
+                let file = file.to_string_lossy();
+                match load_principals_file(&file, self.strict_modes, Some(info.uid)) {
+                    Ok(list) => out.extend(list),
+                    Err(e) => {
+                        if self.debug {
+                            eprintln!("sshd: AuthorizedPrincipalsFile {file}: {e}");
+                        }
                     }
-                    Vec::new()
                 }
             }
+            out
         }
 
         /// Bind / verify the connection username. Returns `false` if the client
@@ -3895,6 +4054,7 @@ mod imp {
                 k if k.starts_with("ecdsa-sha2-") => "ECDSA",
                 k if k.starts_with("sk-ssh-ed25519") => "ED25519-SK",
                 k if k.starts_with("sk-ecdsa") => "ECDSA-SK",
+                k if k.starts_with("ssh-mldsa44-ed25519") => "MLDSA44-ED25519",
                 _ => "UNKNOWN",
             }
         }
@@ -4323,7 +4483,7 @@ mod imp {
         ca_files: HashMap<String, Arc<Vec<Vec<u8>>>>,
         /// Every `RevokedKeys` KRL named anywhere in the config, parsed at
         /// startup, keyed by path.
-        krls: HashMap<String, Arc<puressh::krl::Krl>>,
+        krls: HashMap<Vec<String>, Arc<puressh::krl::Krl>>,
     }
 
     /// Per-connection socket addresses `(peer, local)`, recorded by the forked
@@ -7393,7 +7553,16 @@ mod imp {
                     .any(|a| a == "ssh-rsa" || a == "ssh-rsa-cert-v01@openssh.com")
             })
         };
-        if names_ssh_rsa(&sshd_cfg.global)
+        let host_key_ssh_rsa = sshd_cfg
+            .global
+            .host_key_algorithms
+            .as_ref()
+            .is_some_and(|l| {
+                l.iter()
+                    .any(|a| a == "ssh-rsa" || a == "ssh-rsa-cert-v01@openssh.com")
+            });
+        if host_key_ssh_rsa
+            || names_ssh_rsa(&sshd_cfg.global)
             || sshd_cfg.match_blocks.iter().any(|b| names_ssh_rsa(&b.opts))
         {
             puressh::hostkey::set_allow_rsa_sha1(true);
@@ -7543,8 +7712,22 @@ mod imp {
 
         let mut host_certificate_files = cli.host_certificate_files.clone();
         host_certificate_files.extend(sshd_cfg.global.host_certificate_files.iter().cloned());
-        let host_keys =
-            load_host_keys_with_certs(&host_key_files, &host_certificate_files, strict_modes)?;
+        // `HostKeyAgent SSH_AUTH_SOCK` names the environment's agent.
+        let host_key_agent = sshd_cfg.global.host_key_agent.as_deref().and_then(|a| {
+            if a == "SSH_AUTH_SOCK" {
+                std::env::var("SSH_AUTH_SOCK")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+            } else {
+                Some(a.to_string())
+            }
+        });
+        let host_keys = load_host_keys_with_certs(
+            &host_key_files,
+            &host_certificate_files,
+            strict_modes,
+            host_key_agent.as_deref(),
+        )?;
         // Authorized keys come in two mutually exclusive modes:
         //
         //  * Per-user (the default, OpenSSH semantics): `AuthorizedKeysFile`
@@ -7623,7 +7806,7 @@ mod imp {
         // (failing closed beats silently running with no revocation), and each
         // connection just picks the set its matched blocks name.
         let mut ca_files: HashMap<String, Arc<Vec<Vec<u8>>>> = HashMap::new();
-        let mut krls: HashMap<String, Arc<puressh::krl::Krl>> = HashMap::new();
+        let mut krls: HashMap<Vec<String>, Arc<puressh::krl::Krl>> = HashMap::new();
         for block in sshd_cfg.all_blocks() {
             if let Some(path) = &block.trusted_user_ca_keys
                 && !ca_files.contains_key(path)
@@ -7635,7 +7818,7 @@ mod imp {
             if let Some(path) = &block.revoked_keys
                 && !krls.contains_key(path)
             {
-                krls.insert(path.clone(), Arc::new(load_krl(path, cli.debug)?));
+                krls.insert(path.clone(), Arc::new(load_krls(path, cli.debug)?));
             }
         }
         let trusted_user_ca_blobs: Vec<Vec<u8>> = sshd_cfg
@@ -7709,11 +7892,14 @@ mod imp {
 
         // OpenSSH defaults both to yes (Ubuntu's stock file turns
         // keyboard-interactive off).
-        let cfg_password = sshd_cfg.global.password_authentication != Some(false);
-        let cfg_kbdint = sshd_cfg.global.kbd_interactive_authentication != Some(false);
-        let pubkey_enabled = sshd_cfg.global.pubkey_authentication != Some(false);
-        let password_enabled = cfg_password && pam_available;
-        let kbd_interactive_enabled = cfg_kbdint && pam_available;
+        // What this build can offer. Whether a method is on for a connection
+        // (`PubkeyAuthentication`, `PasswordAuthentication`,
+        // `KbdInteractiveAuthentication`, globally or in a `Match` block, which
+        // may turn one back on) is resolved per connection by the server, which
+        // refuses an attempt at any other method before the authenticator sees
+        // it.
+        let password_enabled = pam_available;
+        let kbd_interactive_enabled = pam_available;
         let permit_empty_passwords = sshd_cfg.global.permit_empty_passwords == Some(true);
 
         let asked_password = sshd_cfg.global.password_authentication == Some(true)
@@ -7726,21 +7912,13 @@ mod imp {
             );
         }
 
-        // Compute the advertised method set from config: start with publickey
-        // (unless disabled), add password / keyboard-interactive when enabled
-        // and backed by PAM.
-        let mut advertised: Vec<&'static str> = Vec::new();
-        if pubkey_enabled {
-            advertised.push("publickey");
-        }
-        if password_enabled {
-            advertised.push("password");
-        }
-        if kbd_interactive_enabled {
-            advertised.push("keyboard-interactive");
+        let mut advertised: Vec<&'static str> =
+            vec!["publickey", "password", "keyboard-interactive"];
+        if !pam_available {
+            advertised.retain(|m| *m == "publickey");
         }
         if cli.debug {
-            eprintln!("sshd: advertised auth methods: {advertised:?}");
+            eprintln!("sshd: auth methods available: {advertised:?}");
         }
 
         // Connection-wide AuthenticationMethods default (multi-factor chains),
@@ -7965,6 +8143,7 @@ mod imp {
             sshd_cfg.global.kex_algorithms.clone(),
             sshd_cfg.global.host_key_algorithms.clone(),
         );
+        config.pubkey_accepted_algorithms = sshd_cfg.global.pubkey_accepted_algorithms.clone();
 
         // RekeyLimit (startup-only): map the parsed thresholds onto the
         // server's RekeyPolicy. `default`/unset bytes keep the built-in cap;
@@ -9604,7 +9783,7 @@ mod imp {
             let krl = puressh::krl::Krl::parse(&unhex(KRL_EXPLICIT_HEX)).expect("krl");
             pol_inner
                 .krls
-                .insert("/krl/alice".into(), std::sync::Arc::new(krl));
+                .insert(vec!["/krl/alice".into()], std::sync::Arc::new(krl));
             let pol = std::sync::Arc::new(pol_inner);
 
             let mut a = auth_with(&["*"], &[], &[], &[], Default::default());

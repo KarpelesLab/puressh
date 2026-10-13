@@ -262,6 +262,30 @@ fn resolve_relative(path: &Path, base_dir: &Path) -> PathBuf {
 /// continue". No-match (the directory exists but nothing inside it matches)
 /// is returned as `Ok(vec![])`.
 fn expand_glob(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    expand_glob_inner(path)
+}
+
+/// The existing paths a glob(3)-style pattern names, sorted; a pattern
+/// without `*`, `?` or `[` names itself when it exists. Unreadable
+/// directories are skipped. As OpenSSH expands `AuthorizedKeysFile` and
+/// `AuthorizedPrincipalsFile`.
+pub fn glob_paths(pattern: &str) -> Vec<PathBuf> {
+    let path = Path::new(pattern);
+    if !contains_glob_meta(pattern) {
+        return if path.exists() {
+            alloc::vec![path.to_path_buf()]
+        } else {
+            Vec::new()
+        };
+    }
+    expand_glob_inner(path)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect()
+}
+
+fn expand_glob_inner(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let segments: Vec<String> = path
         .iter()
         .map(|s| s.to_string_lossy().into_owned())

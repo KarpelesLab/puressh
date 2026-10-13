@@ -56,7 +56,7 @@ pub use client::{
 pub use glob::{HostPattern, host_matches};
 pub use host_port::{parse_host_port, parse_host_port_pattern};
 #[cfg(feature = "std")]
-pub use include::tokenize_file_with_includes;
+pub use include::{glob_paths, tokenize_file_with_includes};
 pub use match_block::{AddressKind, AddressPattern, ExecPolicy, MatchCondition, MatchContext};
 pub use parser::{ParsedLine, tokenize};
 pub use server::{

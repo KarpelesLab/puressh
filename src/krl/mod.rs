@@ -333,6 +333,21 @@ impl Krl {
         Self::default()
     }
 
+    /// Add everything `other` revokes (`RevokedKeys` naming several files
+    /// revokes what any of them does).
+    pub fn merge(&mut self, other: Krl) {
+        self.cert_revocations.extend(other.cert_revocations);
+        for k in other.explicit_keys {
+            self.revoke_key(&k);
+        }
+        for h in other.fp_sha1 {
+            self.revoke_sha1(h);
+        }
+        for h in other.fp_sha256 {
+            self.revoke_sha256(h);
+        }
+    }
+
     /// The `krl_version` field.
     pub fn version(&self) -> u64 {
         self.version

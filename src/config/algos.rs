@@ -116,16 +116,22 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
             v
         }
         // The defaults (certificate types included), plus legacy `ssh-rsa`
-        // (SHA-1): namable, never a default, as in OpenSSH
-        // (`HostKeyAlgorithms +ssh-rsa`, `PubkeyAcceptedAlgorithms +ssh-rsa`
-        // for old peers).
+        // (SHA-1) and the ML-DSA composite: namable, never a default, as in
+        // OpenSSH (`HostKeyAlgorithms +ssh-rsa`, `PubkeyAcceptedAlgorithms
+        // +ssh-rsa` for old peers).
         AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted => {
             let mut names = default_list(cat);
+            names.push("ssh-mldsa44-ed25519-cert-v01@openssh.com");
+            names.push("ssh-mldsa44-ed25519@openssh.com");
             names.push("ssh-rsa-cert-v01@openssh.com");
             names.push("ssh-rsa");
             names
         }
-        AlgoCategory::CaSignature => CA_SIGNATURE_DEFAULTS.to_vec(),
+        AlgoCategory::CaSignature => {
+            let mut names = CA_SIGNATURE_DEFAULTS.to_vec();
+            names.push("ssh-mldsa44-ed25519@openssh.com");
+            names
+        }
     }
 }
 
@@ -194,6 +200,8 @@ fn openssh_only(cat: AlgoCategory) -> &'static [&'static str] {
         "ssh-ed25519-cert-v01@openssh.com",
         "sk-ssh-ed25519@openssh.com",
         "sk-ssh-ed25519-cert-v01@openssh.com",
+        "ssh-mldsa44-ed25519@openssh.com",
+        "ssh-mldsa44-ed25519-cert-v01@openssh.com",
         "ecdsa-sha2-nistp256",
         "ecdsa-sha2-nistp256-cert-v01@openssh.com",
         "ecdsa-sha2-nistp384",
@@ -203,6 +211,7 @@ fn openssh_only(cat: AlgoCategory) -> &'static [&'static str] {
         "sk-ecdsa-sha2-nistp256@openssh.com",
         "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
         "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
+        "webauthn-sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
         "ssh-dss",
         "ssh-dss-cert-v01@openssh.com",
         "ssh-rsa",

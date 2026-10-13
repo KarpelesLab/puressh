@@ -43,6 +43,8 @@ mod imp {
         unlock: bool,
         quiet: bool,
         lifetime: Option<u32>,
+        /// `-E md5`: MD5 fingerprints (else SHA-256).
+        md5: bool,
         files: Vec<String>,
     }
 
@@ -106,7 +108,11 @@ mod imp {
                                     .ok_or_else(|| format!("Invalid lifetime {v}"))?,
                             )
                         }
-                        'E' => {}
+                        'E' => match v.as_str() {
+                            "md5" => o.md5 = true,
+                            "sha256" => o.md5 = false,
+                            other => return Err(format!("Invalid hash algorithm \"{other}\"")),
+                        },
                         'h' | 'H' => {
                             return Err("destination constraints (-h/-H) are not supported".into());
                         }
@@ -142,6 +148,7 @@ mod imp {
         match pk {
             PublicKey::Ed25519 { .. } => "ED25519",
             PublicKey::Rsa { .. } => "RSA",
+            PublicKey::MlDsa44Ed25519 { .. } => "MLDSA44-ED25519",
             _ => "ECDSA",
         }
     }
@@ -244,7 +251,15 @@ mod imp {
                     println!(
                         "{} {} {} ({})",
                         pk.bit_length(),
-                        pk.sha256_fingerprint(),
+                        if o.md5 {
+                            use purecrypto::hash::{Digest, Md5};
+                            let d = Md5::digest(&pk.wire_blob());
+                            let hex: Vec<String> =
+                                d.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+                            format!("MD5:{}", hex.join(":"))
+                        } else {
+                            pk.sha256_fingerprint()
+                        },
                         if id.comment().is_empty() {
                             "no comment"
                         } else {

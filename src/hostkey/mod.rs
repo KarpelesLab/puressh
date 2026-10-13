@@ -18,6 +18,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 mod cert;
 mod ecdsa;
 mod ed25519;
+#[cfg(feature = "alloc")]
+mod mldsa;
 pub(crate) mod rsa;
 
 /// Process-wide opt-in for the legacy `ssh-rsa` (SHA-1) signature algorithm.
@@ -54,6 +56,10 @@ pub use cert::CertHostKey;
 pub use ecdsa::{EcdsaP256HostKey, EcdsaP384HostKey, EcdsaP521HostKey};
 #[cfg(feature = "alloc")]
 pub use ed25519::Ed25519HostKey;
+#[cfg(feature = "alloc")]
+pub use mldsa::MlDsa44Ed25519HostKey;
+#[cfg(feature = "alloc")]
+pub(crate) use mldsa::public_from_seeds as mldsa44_ed25519_public;
 #[cfg(feature = "alloc")]
 pub use rsa::{RsaSha1HostKey, RsaSha2_256HostKey, RsaSha2_512HostKey};
 
@@ -148,6 +154,9 @@ pub(crate) fn host_key_verify_by_name(
 ) -> crate::Result<Box<dyn HostKeyVerify>> {
     match name {
         "ssh-ed25519" => Ok(Box::new(Ed25519HostKey::from_public_blob(blob)?)),
+        "ssh-mldsa44-ed25519@openssh.com" => {
+            Ok(Box::new(MlDsa44Ed25519HostKey::from_public_blob(blob)?))
+        }
         "ecdsa-sha2-nistp256" => Ok(Box::new(EcdsaP256HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp384" => Ok(Box::new(EcdsaP384HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp521" => Ok(Box::new(EcdsaP521HostKey::from_public_blob(blob)?)),

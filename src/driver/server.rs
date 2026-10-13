@@ -151,7 +151,8 @@ impl ServerDriver {
         self.runner = KexRunner::new(Role::Server, advert);
         // Queue our outbound EXT_INFO; the runner emits it after NEWKEYS iff
         // the client also advertised the marker.
-        self.runner.set_outbound_ext_info(server_ext_info());
+        self.runner
+            .set_outbound_ext_info(server_ext_info(&self.cfg));
         let initial = self.runner.start(&mut self.rng)?;
         for p in initial.outbound {
             self.enqueue_payload(&p)?;
@@ -417,7 +418,15 @@ impl ServerDriver {
             }
             None => None,
         };
-        let hk_ref: Option<&dyn HostKey> = hk_owned.map(|k| k as &dyn HostKey);
+        // An RSA key signs with the hash the negotiated name pins.
+        let variant: Option<Box<dyn HostKey>> = match (hk_owned, self.runner.negotiated()) {
+            (Some(k), Some(neg)) if k.algorithm() != neg.host_key => k.upgraded_for(&neg.host_key),
+            _ => None,
+        };
+        let hk_ref: Option<&dyn HostKey> = match &variant {
+            Some(v) => Some(v.as_ref()),
+            None => hk_owned.map(|k| k as &dyn HostKey),
+        };
         let v_c = self.v_c.clone();
         let v_s = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
         let adv = self.runner.on_packet(

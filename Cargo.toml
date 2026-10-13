@@ -83,7 +83,7 @@ pam = ["dep:pam-client2"]
 # 0.9's breaking changes are confined to TLS, QUIC, X.509 and LMS/HSS, none of
 # which this crate enables; the MSRV stays at Rust 1.89.
 purecrypto = { version = "0.9", default-features = false, features = [
-    "hash", "cipher", "mac", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem",
+    "hash", "cipher", "mac", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem", "mldsa",
 ] }
 # 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting
 # `StreamEnd` instead of stalling on trailing bytes, and 0.6.10 extended that to

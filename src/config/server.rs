@@ -94,15 +94,19 @@ pub struct ServerOptions {
     /// host certificate (`*-cert.pub`), paired at load time with the preceding
     /// `HostKey` whose embedded key it certifies.
     pub host_certificate_files: Vec<String>,
+    /// `HostKeyAgent` — the agent socket that signs for host keys whose
+    /// `HostKey` file holds only the public key; `SSH_AUTH_SOCK` names the
+    /// environment's agent. `None` for `none` or unset.
+    pub host_key_agent: Option<String>,
     /// `TrustedUserCAKeys` — path to a file of CA public keys whose user
     /// certificates the server will accept (one key per line).
     pub trusted_user_ca_keys: Option<String>,
     /// `RevokedKeys` — path to a key-revocation list. OpenSSH accepts either a
     /// list of plain public keys (`authorized_keys` format) or a binary KRL
-    /// blob (`ssh-keygen -k`); puressh loads the binary KRL form. A
-    /// publickey / certificate the KRL covers is refused regardless of any
-    /// other trust.
-    pub revoked_keys: Option<String>,
+    /// blob (`ssh-keygen -k`); several files may be named, and a key any of
+    /// them revokes is refused. A publickey / certificate a file covers is
+    /// refused regardless of any other trust. `none` names no file.
+    pub revoked_keys: Option<Vec<String>>,
     /// `AuthorizedPrincipalsFile` — path (with `%u`/`%h` tokens) to a file
     /// listing the certificate principals a connecting user is allowed to
     /// authenticate as. When unset, the login user must itself appear in the
@@ -662,6 +666,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(compression);
     take_scalar!(rekey_limit);
     take_scalar!(address_family);
+    take_scalar!(host_key_agent);
     take_scalar!(subsystem_sftp);
     take_scalar!(subsystem_sftp_args);
     take_scalar!(use_pam);
@@ -723,6 +728,7 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "listenaddress",
         "hostkey",
         "hostcertificate",
+        "hostkeyagent",
         "addressfamily",
         "pidfile",
         "loglevel",
@@ -771,6 +777,10 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "hostcertificate" => {
             opts.host_certificate_files.push(one_arg(line)?);
+        }
+        "hostkeyagent" => {
+            let v = one_arg(line)?;
+            opts.host_key_agent = (!v.eq_ignore_ascii_case("none")).then_some(v);
         }
         "knocklisten" => {
             opts.knock_listen.push(one_arg(line)?);
@@ -827,7 +837,18 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             opts.trusted_user_ca_keys = Some(one_arg(line)?);
         }
         "revokedkeys" => {
-            opts.revoked_keys = Some(one_arg(line)?);
+            if line.args.is_empty() {
+                return Err(ConfigError::BadValue {
+                    line: line.line_no,
+                    keyword: kw.to_string(),
+                    msg: "expected at least one file".into(),
+                });
+            }
+            opts.revoked_keys = Some(if line.args.len() == 1 && line.args[0] == "none" {
+                Vec::new()
+            } else {
+                line.args.clone()
+            });
         }
         "syslogfacility" => {
             let f = one_arg(line)?.to_ascii_uppercase();
@@ -1379,11 +1400,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("SecurityKeyProvider", &["*"], ""),
     ("PubkeyAuthOptions", &["*"], ""),
     ("ExposeAuthInfo", &["no"], "SSH_USER_AUTH is not set"),
-    (
-        "HostKeyAgent",
-        &["none"],
-        "host keys held by an agent are not used",
-    ),
     (
         "GSSAPIAuthentication",
         &["no"],
@@ -2001,7 +2017,10 @@ Match Group ops
             eff.trusted_user_ca_keys.as_deref(),
             Some("/etc/ssh/ca_lan.pub")
         );
-        assert_eq!(eff.revoked_keys.as_deref(), Some("/etc/ssh/lan.krl"));
+        assert_eq!(
+            eff.revoked_keys.as_deref(),
+            Some(&["/etc/ssh/lan.krl".to_string()][..])
+        );
         assert_eq!(eff.permit_empty_passwords, Some(true));
         assert_eq!(eff.allow_groups, vec!["ops".to_string()]);
         assert_eq!(eff.deny_groups, vec!["contractors".to_string()]);
@@ -2337,7 +2356,16 @@ HostKeyAlgorithms ssh-ed25519,rsa-sha2-512
     fn server_revoked_keys_accepted() {
         let src = "Port 22\nRevokedKeys /etc/ssh/revoked\n";
         let cfg = SshServerConfig::parse(src).unwrap().global;
-        assert_eq!(cfg.revoked_keys.as_deref(), Some("/etc/ssh/revoked"));
+        assert_eq!(
+            cfg.revoked_keys.as_deref(),
+            Some(&["/etc/ssh/revoked".to_string()][..])
+        );
+        let cfg = SshServerConfig::parse("RevokedKeys /dev/null /etc/ssh/krl\n")
+            .unwrap()
+            .global;
+        assert_eq!(cfg.revoked_keys.map(|v| v.len()), Some(2));
+        let cfg = SshServerConfig::parse("RevokedKeys none\n").unwrap().global;
+        assert_eq!(cfg.revoked_keys, Some(Vec::new()));
     }
 
     #[test]

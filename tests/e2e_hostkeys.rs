@@ -181,7 +181,124 @@ fn update_host_keys_both_ways() {
         if !std::fs::read_to_string(&kh).unwrap().contains(rsa_b64) {
             failures.push(format!("{what}: the RSA key was not recorded"));
         }
-        let rsa_only = Command::new(&bin)
+        for hash in ["rsa-sha2-512", "rsa-sha2-256"] {
+            let rsa_only = Command::new(&bin)
+                .args(["-F", "/dev/null", "-p", &port.to_string(), "-i"])
+                .arg(p("user"))
+                .args([
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "IdentityAgent=none",
+                    "-o",
+                    "StrictHostKeyChecking=yes",
+                    "-o",
+                    "UpdateHostKeys=no",
+                    "-o",
+                ])
+                .arg(format!("HostKeyAlgorithms={hash}"))
+                .arg("-o")
+                .arg(format!("UserKnownHostsFile={}", kh.display()))
+                .arg(format!("{user}@127.0.0.1"))
+                .arg("true")
+                .stdin(Stdio::null())
+                .output()
+                .expect("run ssh");
+            if !rsa_only.status.success() {
+                failures.push(format!(
+                    "{what}: RSA host key not accepted as {hash}: {}",
+                    String::from_utf8_lossy(&rsa_only.stderr)
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// `ssh-mldsa44-ed25519@openssh.com` (OpenSSH 10.3+), opt-in on both sides:
+/// as host key and as user key, each way between the real binaries. Skipped
+/// when the local OpenSSH predates it.
+#[test]
+#[ignore]
+fn mldsa_keys_both_ways() {
+    let Some(sshd) = find("sshd", &["/usr/sbin", "/usr/local/sbin"]) else {
+        eprintln!("e2e_hostkeys: skipping (no sshd)");
+        return;
+    };
+    const ALG: &str = "ssh-mldsa44-ed25519@openssh.com";
+    let knows = Command::new("ssh")
+        .args(["-Q", "key"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).lines().any(|l| l == ALG))
+        .unwrap_or(false);
+    if !knows {
+        eprintln!("e2e_hostkeys: skipping (OpenSSH without ML-DSA keys)");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("puressh-mldsa-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = |n: &str| dir.join(n);
+    // Host key made by OpenSSH, user key made by ours: each side reads the
+    // other's files too.
+    keygen(&p("hk"), "mldsa44-ed25519");
+    assert!(
+        Command::new(env!("CARGO_BIN_EXE_ssh-keygen"))
+            .args(["-q", "-t", "mldsa44-ed25519", "-N", "", "-f"])
+            .arg(p("user"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::copy(p("user.pub"), p("ak")).unwrap();
+    let user = String::from_utf8(Command::new("id").arg("-un").output().unwrap().stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    let cfg = |port: u16, pid: &str| {
+        format!(
+            "Port {port}\nListenAddress 127.0.0.1\nHostKey {}\nAuthorizedKeysFile {}\n\
+             StrictModes no\nUsePAM no\nPidFile {}\nHostKeyAlgorithms {ALG}\n\
+             PubkeyAcceptedAlgorithms {ALG}\n",
+            p("hk").display(),
+            p("ak").display(),
+            p(pid).display()
+        )
+    };
+    let (openssh_port, ours_port) = (free_port(), free_port());
+    std::fs::write(p("openssh.cfg"), cfg(openssh_port, "o.pid")).unwrap();
+    std::fs::write(p("ours.cfg"), cfg(ours_port, "p.pid")).unwrap();
+    let spawn = |bin: &Path, cfg: &str| {
+        Daemon(
+            Command::new(bin)
+                .args(["-D", "-f"])
+                .arg(p(cfg))
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn sshd"),
+        )
+    };
+    let _daemons = [
+        spawn(&sshd, "openssh.cfg"),
+        spawn(Path::new(env!("CARGO_BIN_EXE_sshd")), "ours.cfg"),
+    ];
+    wait_port(openssh_port);
+    wait_port(ours_port);
+    let hk_pub = std::fs::read_to_string(p("hk.pub")).unwrap();
+    let mut failures = Vec::new();
+    for (client, port) in [
+        ("ssh", openssh_port),
+        ("ssh", ours_port),
+        (env!("CARGO_BIN_EXE_ssh"), openssh_port),
+        (env!("CARGO_BIN_EXE_ssh"), ours_port),
+    ] {
+        let kh = p(&format!("kh-{port}"));
+        std::fs::write(&kh, format!("[127.0.0.1]:{port} {hk_pub}")).unwrap();
+        let out = Command::new(client)
             .args(["-F", "/dev/null", "-p", &port.to_string(), "-i"])
             .arg(p("user"))
             .args([
@@ -194,23 +311,25 @@ fn update_host_keys_both_ways() {
                 "-o",
                 "StrictHostKeyChecking=yes",
                 "-o",
-                "UpdateHostKeys=no",
-                "-o",
-                "HostKeyAlgorithms=rsa-sha2-512",
-                "-o",
             ])
+            .arg(format!("HostKeyAlgorithms={ALG}"))
+            .arg("-o")
+            .arg(format!("PubkeyAcceptedAlgorithms={ALG}"))
+            .arg("-o")
             .arg(format!("UserKnownHostsFile={}", kh.display()))
             .arg(format!("{user}@127.0.0.1"))
-            .arg("true")
+            .arg("echo ok")
             .stdin(Stdio::null())
             .output()
             .expect("run ssh");
-        if !rsa_only.status.success() {
+        if String::from_utf8_lossy(&out.stdout).trim() != "ok" {
             failures.push(format!(
-                "{what}: RSA host key not accepted: {}",
-                String::from_utf8_lossy(&rsa_only.stderr)
+                "{client} -> {}: {}",
+                if port == ours_port { "ours" } else { "OpenSSH" },
+                String::from_utf8_lossy(&out.stderr)
             ));
         }
     }
+    let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -592,12 +592,12 @@ fn host_principals_are_patterns_and_must_be_present() {
     cert.check_principal("host.example.com").unwrap();
     cert.check_principal("LOCALHOST").unwrap();
     assert!(cert.check_principal("example.org").is_err());
-    // A host certificate naming no host is refused (a user one is not).
+    // A certificate naming no host / user is refused, as OpenSSH 10 does.
     cert.valid_principals.clear();
     assert!(matches!(
         cert.check_principal("host.example.com"),
         Err(Error::CertPrincipalMismatch)
     ));
     cert.cert_type = CertType::User;
-    cert.check_principal("anyone").unwrap();
+    assert!(cert.check_principal("anyone").is_err());
 }

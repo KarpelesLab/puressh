@@ -325,6 +325,13 @@ pub enum PublicKey {
         /// Trailing comment.
         comment: String,
     },
+    /// `ssh-mldsa44-ed25519@openssh.com` — ML-DSA-44 + Ed25519 composite.
+    MlDsa44Ed25519 {
+        /// ML-DSA-44 public key (1312 bytes) || Ed25519 public key (32).
+        raw: Vec<u8>,
+        /// Trailing comment.
+        comment: String,
+    },
 }
 
 /// SSH private key, tagged by algorithm.
@@ -389,6 +396,15 @@ pub enum PrivateKey {
         /// Trailing comment.
         comment: String,
     },
+    /// `ssh-mldsa44-ed25519@openssh.com`.
+    MlDsa44Ed25519 {
+        /// ML-DSA-44 seed (32 bytes) || Ed25519 seed (32 bytes).
+        seeds: [u8; 64],
+        /// The composite public key.
+        public: Vec<u8>,
+        /// Trailing comment.
+        comment: String,
+    },
 }
 
 impl core::fmt::Debug for PrivateKey {
@@ -407,6 +423,7 @@ const ECDSA_P256: &str = "ecdsa-sha2-nistp256";
 const ECDSA_P384: &str = "ecdsa-sha2-nistp384";
 const ECDSA_P521: &str = "ecdsa-sha2-nistp521";
 const RSA: &str = "ssh-rsa";
+const MLDSA44_ED25519: &str = "ssh-mldsa44-ed25519@openssh.com";
 
 const NISTP256: &str = "nistp256";
 const NISTP384: &str = "nistp384";
@@ -421,7 +438,14 @@ const MAGIC: &[u8] = b"openssh-key-v1\0";
 fn is_known_algorithm_name(s: &str) -> bool {
     matches!(
         s,
-        ED25519 | ECDSA_P256 | ECDSA_P384 | ECDSA_P521 | RSA | "rsa-sha2-256" | "rsa-sha2-512"
+        ED25519
+            | ECDSA_P256
+            | ECDSA_P384
+            | ECDSA_P521
+            | RSA
+            | "rsa-sha2-256"
+            | "rsa-sha2-512"
+            | MLDSA44_ED25519
     )
 }
 
@@ -434,6 +458,7 @@ impl PublicKey {
             PublicKey::EcdsaP384 { .. } => ECDSA_P384,
             PublicKey::EcdsaP521 { .. } => ECDSA_P521,
             PublicKey::Rsa { .. } => RSA,
+            PublicKey::MlDsa44Ed25519 { .. } => MLDSA44_ED25519,
         }
     }
 
@@ -444,7 +469,8 @@ impl PublicKey {
             | PublicKey::EcdsaP256 { comment, .. }
             | PublicKey::EcdsaP384 { comment, .. }
             | PublicKey::EcdsaP521 { comment, .. }
-            | PublicKey::Rsa { comment, .. } => comment,
+            | PublicKey::Rsa { comment, .. }
+            | PublicKey::MlDsa44Ed25519 { comment, .. } => comment,
         }
     }
 
@@ -456,6 +482,10 @@ impl PublicKey {
         match self {
             PublicKey::Ed25519 { raw, .. } => {
                 w.write_string(ED25519.as_bytes());
+                w.write_string(raw);
+            }
+            PublicKey::MlDsa44Ed25519 { raw, .. } => {
+                w.write_string(MLDSA44_ED25519.as_bytes());
                 w.write_string(raw);
             }
             PublicKey::EcdsaP256 { point, .. } => {
@@ -527,7 +557,8 @@ impl PublicKey {
             | PublicKey::EcdsaP256 { comment: c, .. }
             | PublicKey::EcdsaP384 { comment: c, .. }
             | PublicKey::EcdsaP521 { comment: c, .. }
-            | PublicKey::Rsa { comment: c, .. } => *c = comment,
+            | PublicKey::Rsa { comment: c, .. }
+            | PublicKey::MlDsa44Ed25519 { comment: c, .. } => *c = comment,
         }
         if pk.algorithm() != algo {
             return Err(Error::Format("authorized_keys: algorithm tag mismatch"));
@@ -625,6 +656,14 @@ impl PublicKey {
                     comment: String::new(),
                 }
             }
+            b if b == MLDSA44_ED25519.as_bytes() => {
+                let raw = r.read_string()?;
+                crate::hostkey::MlDsa44Ed25519HostKey::from_public(raw)?;
+                PublicKey::MlDsa44Ed25519 {
+                    raw: raw.to_vec(),
+                    comment: String::new(),
+                }
+            }
             b if b == ECDSA_P256.as_bytes() => {
                 parse_ecdsa_public(&mut r, NISTP256, CurveId::P256, |p, c| {
                     PublicKey::EcdsaP256 {
@@ -701,6 +740,7 @@ impl PrivateKey {
             PrivateKey::EcdsaP384 { .. } => ECDSA_P384,
             PrivateKey::EcdsaP521 { .. } => ECDSA_P521,
             PrivateKey::Rsa { .. } => RSA,
+            PrivateKey::MlDsa44Ed25519 { .. } => MLDSA44_ED25519,
         }
     }
 
@@ -711,7 +751,8 @@ impl PrivateKey {
             | PrivateKey::EcdsaP256 { comment, .. }
             | PrivateKey::EcdsaP384 { comment, .. }
             | PrivateKey::EcdsaP521 { comment, .. }
-            | PrivateKey::Rsa { comment, .. } => comment,
+            | PrivateKey::Rsa { comment, .. }
+            | PrivateKey::MlDsa44Ed25519 { comment, .. } => comment,
         }
     }
 
@@ -735,6 +776,9 @@ impl PrivateKey {
             PrivateKey::Rsa { n, e, d, p, q, .. } => {
                 Ok(alloc::boxed::Box::new(rsa_host_key(&n, &e, &d, &p, &q)?))
             }
+            PrivateKey::MlDsa44Ed25519 { seeds, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::MlDsa44Ed25519HostKey::from_seeds(seeds),
+            )),
         }
     }
 
@@ -762,6 +806,9 @@ impl PrivateKey {
             PrivateKey::Rsa { n, e, d, p, q, .. } => {
                 Ok(alloc::boxed::Box::new(rsa_host_key(&n, &e, &d, &p, &q)?))
             }
+            PrivateKey::MlDsa44Ed25519 { seeds, .. } => Ok(alloc::boxed::Box::new(
+                crate::hostkey::MlDsa44Ed25519HostKey::from_seeds(seeds),
+            )),
         }
     }
 
@@ -791,6 +838,13 @@ impl PrivateKey {
             PrivateKey::EcdsaP384 { d, point, .. } => check_ecdsa(CurveId::P384, d, point)?,
             PrivateKey::EcdsaP521 { d, point, .. } => check_ecdsa(CurveId::P521, d, point)?,
             PrivateKey::Rsa { n, e, d, p, q, .. } => check_rsa_private(n, e, d, p, q)?,
+            PrivateKey::MlDsa44Ed25519 { seeds, public, .. } => {
+                if crate::hostkey::mldsa44_ed25519_public(seeds) != *public {
+                    return Err(Error::Format(
+                        "mldsa44-ed25519: public key does not match private seeds",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -819,6 +873,12 @@ impl PrivateKey {
             PrivateKey::Rsa { e, n, comment, .. } => PublicKey::Rsa {
                 e: e.clone(),
                 n: n.clone(),
+                comment: comment.clone(),
+            },
+            PrivateKey::MlDsa44Ed25519 {
+                public, comment, ..
+            } => PublicKey::MlDsa44Ed25519 {
+                raw: public.clone(),
                 comment: comment.clone(),
             },
         }
@@ -1025,7 +1085,8 @@ fn attach_comment(mut pk: PrivateKey, comment: String) -> PrivateKey {
         | PrivateKey::EcdsaP256 { comment: c, .. }
         | PrivateKey::EcdsaP384 { comment: c, .. }
         | PrivateKey::EcdsaP521 { comment: c, .. }
-        | PrivateKey::Rsa { comment: c, .. } => *c = comment,
+        | PrivateKey::Rsa { comment: c, .. }
+        | PrivateKey::MlDsa44Ed25519 { comment: c, .. } => *c = comment,
     }
     pk
 }
@@ -1033,6 +1094,9 @@ fn attach_comment(mut pk: PrivateKey, comment: String) -> PrivateKey {
 fn public_parts_match(a: &PublicKey, b: &PublicKey) -> bool {
     match (a, b) {
         (PublicKey::Ed25519 { raw: x, .. }, PublicKey::Ed25519 { raw: y, .. }) => x == y,
+        (PublicKey::MlDsa44Ed25519 { raw: x, .. }, PublicKey::MlDsa44Ed25519 { raw: y, .. }) => {
+            x == y
+        }
         (PublicKey::EcdsaP256 { point: x, .. }, PublicKey::EcdsaP256 { point: y, .. })
         | (PublicKey::EcdsaP384 { point: x, .. }, PublicKey::EcdsaP384 { point: y, .. })
         | (PublicKey::EcdsaP521 { point: x, .. }, PublicKey::EcdsaP521 { point: y, .. }) => x == y,
@@ -1091,6 +1155,21 @@ fn parse_private_fields(r: &mut Reader<'_>) -> Result<PrivateKey> {
             Ok(PrivateKey::Ed25519 {
                 seed,
                 public: pubk,
+                comment: String::new(),
+            })
+        }
+        b if b == MLDSA44_ED25519.as_bytes() => {
+            let public = r.read_string()?;
+            crate::hostkey::MlDsa44Ed25519HostKey::from_public(public)?;
+            let sk = r.read_string()?;
+            if sk.len() != 64 {
+                return Err(Error::Format("mldsa44-ed25519: secret length"));
+            }
+            let mut seeds = [0u8; 64];
+            seeds.copy_from_slice(sk);
+            Ok(PrivateKey::MlDsa44Ed25519 {
+                seeds,
+                public: public.to_vec(),
                 comment: String::new(),
             })
         }

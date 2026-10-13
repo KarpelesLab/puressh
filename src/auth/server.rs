@@ -139,7 +139,8 @@ pub struct CertInfo {
     pub key_id: String,
     /// Monotonic serial number assigned by the CA.
     pub serial: u64,
-    /// The principals the certificate authorizes (empty ⇒ any).
+    /// The principals the certificate authorizes (never empty for a
+    /// certificate that can authenticate: an empty list is refused).
     pub valid_principals: Vec<String>,
     /// Critical options as ordered `(name, data)` pairs — MUST be understood.
     pub critical_options: Vec<(String, Vec<u8>)>,
@@ -471,6 +472,10 @@ pub struct ServerAuth {
     auth: Box<dyn Authenticator>,
     state: State,
     pending_user: Option<String>,
+    /// The keys (a certificate's embedded key) already accepted as a factor
+    /// of a multi-factor chain: OpenSSH refuses one offered again, so
+    /// `publickey,publickey` takes two different keys.
+    used_keys: Vec<Vec<u8>>,
     /// Number of prompts issued in the in-flight keyboard-interactive
     /// `InteractiveRequest`, retained so the matching INFO_RESPONSE can be
     /// rejected when its response count does not equal the prompt count
@@ -528,6 +533,7 @@ impl ServerAuth {
             auth,
             state: State::AwaitingServiceRequest,
             pending_user: None,
+            used_keys: Vec::new(),
             pending_prompt_count: None,
             first_user: None,
             allow_none: false,
@@ -800,6 +806,18 @@ impl ServerAuth {
         signature: Option<Vec<u8>>,
     ) -> Result<ServerStep> {
         let is_cert = crate::cert::is_cert_name(&algorithm);
+        // The key itself, whether offered plain or as a certificate.
+        let key_blob = if is_cert {
+            match crate::cert::Certificate::parse(&public_blob) {
+                Ok(c) => c.embedded_pubkey_blob().to_vec(),
+                Err(_) => return self.emit_failure(),
+            }
+        } else {
+            public_blob.clone()
+        };
+        if self.used_keys.contains(&key_blob) {
+            return self.emit_failure();
+        }
 
         if !signature_present {
             // Probe (no signature). For a certificate, parse it so the
@@ -956,6 +974,9 @@ impl ServerAuth {
             }
             other => other,
         };
+        if matches!(decision, AuthDecision::PartialAccept { .. }) {
+            self.used_keys.push(key_blob);
+        }
         self.apply_decision(decision, &user)
     }
 

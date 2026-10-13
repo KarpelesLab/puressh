@@ -3513,6 +3513,8 @@ pub fn host_key_type_label(key_blob: &[u8]) -> String {
         "RSA"
     } else if name.starts_with("ssh-dss") {
         "DSA"
+    } else if name.starts_with("ssh-mldsa44-ed25519") {
+        "MLDSA44-ED25519"
     } else {
         return name.to_string();
     };
@@ -3648,6 +3650,7 @@ fn pinned_host_key_algorithms(pin: &[u8], over: Option<&[String]>) -> Result<Vec
         b"ecdsa-sha2-nistp256" => &["ecdsa-sha2-nistp256"],
         b"ecdsa-sha2-nistp384" => &["ecdsa-sha2-nistp384"],
         b"ecdsa-sha2-nistp521" => &["ecdsa-sha2-nistp521"],
+        b"ssh-mldsa44-ed25519@openssh.com" => &["ssh-mldsa44-ed25519@openssh.com"],
         _ => return Err(Error::Unsupported("pinned host key type")),
     };
     let out: Vec<String> = match over {

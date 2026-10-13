@@ -829,6 +829,7 @@ fn pem_with_swapped_public(sk: &PrivateKey, evil_pub: &PublicKey) -> String {
         PrivateKey::EcdsaP256 { point, .. }
         | PrivateKey::EcdsaP384 { point, .. }
         | PrivateKey::EcdsaP521 { point, .. } => point.clone(),
+        PrivateKey::MlDsa44Ed25519 { public, .. } => public.clone(),
         PrivateKey::Rsa { .. } => panic!("RSA handled separately"),
     };
     let evil_field: Vec<u8> = match evil_pub {
@@ -836,6 +837,7 @@ fn pem_with_swapped_public(sk: &PrivateKey, evil_pub: &PublicKey) -> String {
         PublicKey::EcdsaP256 { point, .. }
         | PublicKey::EcdsaP384 { point, .. }
         | PublicKey::EcdsaP521 { point, .. } => point.clone(),
+        PublicKey::MlDsa44Ed25519 { raw, .. } => raw.clone(),
         PublicKey::Rsa { .. } => panic!("RSA handled separately"),
     };
     assert_eq!(inner_field.len(), evil_field.len());
@@ -891,8 +893,39 @@ fn parse_rejects_public_key_not_derived_from_secret() {
         matches!(err, Error::Format(m) if m.contains("does not match")),
         "got {err:?}"
     );
+    // The ML-DSA composite likewise.
+    let sk = PrivateKey::generate_mldsa44_ed25519(&mut rng, "victim".to_string());
+    let other = PrivateKey::generate_mldsa44_ed25519(&mut rng, "other".to_string()).public_key();
+    let pem = pem_with_swapped_public(&sk, &other);
+    let err = PrivateKey::parse_openssh_pem(&pem, None).unwrap_err();
+    assert!(
+        matches!(err, Error::Format(m) if m.contains("does not match")),
+        "got {err:?}"
+    );
     // The untouched keys still parse.
     PrivateKey::parse_openssh_pem(&sk.to_openssh_pem(None).unwrap(), None).unwrap();
+}
+
+#[test]
+fn mldsa44_ed25519_key_roundtrip_and_signatures() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_mldsa44_ed25519(&mut rng, "pq".to_string());
+    let pem = sk.to_openssh_pem(None).unwrap();
+    let back = PrivateKey::parse_openssh_pem(&pem, None).unwrap();
+    assert_eq!(back.public_key(), sk.public_key());
+    let line = sk.public_key().to_authorized_keys_line();
+    assert!(line.starts_with("ssh-mldsa44-ed25519@openssh.com "));
+    let pk = PublicKey::parse_authorized_keys_line(&line).unwrap();
+    assert_eq!(pk.comment(), "pq");
+    let signer = back.into_host_key().unwrap();
+    let sig = signer.sign(b"data").unwrap();
+    crate::hostkey::verify_signature(
+        "ssh-mldsa44-ed25519@openssh.com",
+        &pk.wire_blob(),
+        b"data",
+        &sig,
+    )
+    .unwrap();
 }
 
 #[test]

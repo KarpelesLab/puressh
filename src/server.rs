@@ -1290,6 +1290,11 @@ pub struct Config {
     /// keys can actually produce, so naming an algorithm we have no key for
     /// is a no-op rather than an error.
     pub host_key_algorithms: Option<Vec<String>>,
+    /// `PubkeyAcceptedAlgorithms`, as far as `server-sig-algs` reflects it:
+    /// an opt-in algorithm (the ML-DSA composite) named here is advertised
+    /// there, as OpenSSH's sshd does. Acceptance itself is the
+    /// [`Authenticator`]'s.
+    pub pubkey_accepted_algorithms: Option<Vec<String>>,
     /// Parsed `sshd_config` policy (global options + `Match` blocks). When
     /// set, it is resolved per-connection — twice — to gate capabilities:
     /// once pre-auth with an address-only context (auth method set),
@@ -1651,6 +1656,7 @@ impl Config {
             macs: None,
             kex_algorithms: None,
             host_key_algorithms: None,
+            pubkey_accepted_algorithms: None,
             policy: None,
             group_resolver: None,
             compression: None,
@@ -4742,22 +4748,30 @@ pub(crate) fn pick_host_key<'a>(
     }
     // RSA: a single private key can sign with rsa-sha2-256 / rsa-sha2-512 /
     // ssh-rsa, but our HostKey trait pins one algorithm per instance. Treat
-    // the rsa-* family as a single equivalence class on the public-blob side.
-    for k in keys {
-        let a = k.algorithm();
-        if (a == "ssh-rsa" || a == "rsa-sha2-256" || a == "rsa-sha2-512")
-            && (name == "ssh-rsa" || name == "rsa-sha2-256" || name == "rsa-sha2-512")
-        {
-            return Some(k.as_ref());
-        }
+    // the rsa-* family (plain, and certificates) as a single equivalence
+    // class; the caller signs with the variant for `name`
+    // ([`HostKey::upgraded_for`]).
+    let family = rsa_family(name)?;
+    keys.iter()
+        .find(|k| rsa_family(k.algorithm()) == Some(family))
+        .map(|k| k.as_ref())
+}
+
+/// For an RSA signature algorithm name: whether it is a certificate one.
+fn rsa_family(name: &str) -> Option<bool> {
+    match name {
+        "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => Some(false),
+        "ssh-rsa-cert-v01@openssh.com"
+        | "rsa-sha2-256-cert-v01@openssh.com"
+        | "rsa-sha2-512-cert-v01@openssh.com" => Some(true),
+        _ => None,
     }
-    None
 }
 
 /// Build the `SSH_MSG_EXT_INFO` we send to the client on the first KEX.
 /// Carries `server-sig-algs` (RFC 8308 §3.1) so the client can pick
 /// rsa-sha2-{256,512} instead of legacy `ssh-rsa` for publickey signatures.
-pub(crate) fn server_ext_info() -> ExtInfo {
+pub(crate) fn server_ext_info(cfg: &Config) -> ExtInfo {
     // Algorithms we are willing to verify a client publickey signature with.
     // Order is the same priority as our host-key KEX list — strongest first.
     // Legacy `ssh-rsa` (SHA-1) is listed only with the opt-in
@@ -4778,6 +4792,23 @@ pub(crate) fn server_ext_info() -> ExtInfo {
     );
     if crate::hostkey::allow_rsa_sha1() {
         algs.push_str(",ssh-rsa");
+    }
+    let named = |n: &str| {
+        cfg.pubkey_accepted_algorithms
+            .as_ref()
+            .is_some_and(|l| l.iter().any(|a| a == n))
+    };
+    let (cert, plain) = (
+        "ssh-mldsa44-ed25519-cert-v01@openssh.com",
+        "ssh-mldsa44-ed25519@openssh.com",
+    );
+    if named(cert) {
+        algs.push(',');
+        algs.push_str(cert);
+    }
+    if named(plain) || named(cert) {
+        algs.push(',');
+        algs.push_str(plain);
     }
     ExtInfo::new().with_server_sig_algs(algs)
 }
@@ -4809,7 +4840,10 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
     // Certificate host keys first (matching OpenSSH), so a client that supports
     // certs negotiates the cert algorithm ahead of the plain key it wraps.
     for n in crate::cert::CERT_KEY_NAMES {
-        if host_keys.iter().any(|k| k.algorithm() == *n) {
+        if host_keys.iter().any(|k| {
+            k.algorithm() == *n
+                || (rsa_family(n) == Some(true) && rsa_family(k.algorithm()) == Some(true))
+        }) {
             have.push(*n);
         }
     }
@@ -4834,10 +4868,30 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
     // algorithms we can produce (intersection) — naming one we have no key
     // for is a silent no-op, and the override CAN intentionally exclude an
     // algorithm we hold a key for.
+    // Algorithms that are never advertised by default, only when the
+    // override names them: OpenSSH's ML-DSA composite, and SHA-1 `ssh-rsa`
+    // (for an RSA key, with the process-wide SHA-1 opt-in).
+    let mut opt_in: Vec<&'static str> = [
+        "ssh-mldsa44-ed25519-cert-v01@openssh.com",
+        "ssh-mldsa44-ed25519@openssh.com",
+    ]
+    .into_iter()
+    .filter(|n| host_keys.iter().any(|k| k.algorithm() == *n))
+    .collect();
+    if crate::hostkey::allow_rsa_sha1() {
+        for (name, cert) in [("ssh-rsa-cert-v01@openssh.com", true), ("ssh-rsa", false)] {
+            if host_keys
+                .iter()
+                .any(|k| rsa_family(k.algorithm()) == Some(cert))
+            {
+                opt_in.push(name);
+            }
+        }
+    }
     let host_key: Vec<String> = match &cfg.host_key_algorithms {
         Some(pref) => pref
             .iter()
-            .filter(|p| have.contains(&p.as_str()))
+            .filter(|p| have.contains(&p.as_str()) || opt_in.contains(&p.as_str()))
             .cloned()
             .collect(),
         None => have.iter().map(|s| s.to_string()).collect(),

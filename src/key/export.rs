@@ -192,6 +192,7 @@ fn type_label(pk: &PublicKey) -> &'static str {
     match pk {
         PublicKey::Ed25519 { .. } => "ED25519",
         PublicKey::Rsa { .. } => "RSA",
+        PublicKey::MlDsa44Ed25519 { .. } => "MLDSA44-ED25519",
         _ => "ECDSA",
     }
 }
@@ -215,7 +216,7 @@ impl PublicKey {
         out
     }
 
-    fn spki_der(&self) -> Vec<u8> {
+    fn spki_der(&self) -> Option<Vec<u8>> {
         let (alg, key) = match self {
             PublicKey::Rsa { n, e, .. } => (
                 seq(&[&oid(OID_RSA), &encode_null()]),
@@ -234,13 +235,17 @@ impl PublicKey {
                 seq(&[&oid(OID_EC_PUBLIC_KEY), &oid(OID_P521)]),
                 point.clone(),
             ),
+            PublicKey::MlDsa44Ed25519 { .. } => return None,
         };
-        seq(&[&alg, &encode_bit_string(&key)])
+        Some(seq(&[&alg, &encode_bit_string(&key)]))
     }
 
-    /// SubjectPublicKeyInfo `PUBLIC KEY` (`-e -m PKCS8`).
+    /// SubjectPublicKeyInfo `PUBLIC KEY` (`-e -m PKCS8`). Empty for a key
+    /// type without one (the ML-DSA composite).
     pub fn to_spki_pem(&self) -> String {
-        pem_encode("PUBLIC KEY", &self.spki_der())
+        self.spki_der()
+            .map(|der| pem_encode("PUBLIC KEY", &der))
+            .unwrap_or_default()
     }
 
     /// `-e -m PEM`: PKCS#1 `RSA PUBLIC KEY` for RSA; other keys have no

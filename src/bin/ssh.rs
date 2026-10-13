@@ -2116,6 +2116,29 @@ fn print_config(
 }
 
 /// `ssh -Q KIND`: list the algorithms this build supports, one per line.
+/// The key types this build implements, each with its certificate type, in
+/// OpenSSH's `-Q key` order (which also lists the FIDO `sk-` types we lack).
+const KEY_TYPES: &[(&str, &str)] = &[
+    ("ssh-ed25519", "ssh-ed25519-cert-v01@openssh.com"),
+    (
+        "ssh-mldsa44-ed25519@openssh.com",
+        "ssh-mldsa44-ed25519-cert-v01@openssh.com",
+    ),
+    (
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+    ),
+    (
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+    ),
+    (
+        "ecdsa-sha2-nistp521",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+    ),
+    ("ssh-rsa", "ssh-rsa-cert-v01@openssh.com"),
+];
+
 fn run_query(kind: &str) -> Result<i32, String> {
     use puressh::config::{AlgoCategory, supported_algorithms};
     // The configuration keywords name their lists too (any case), as in
@@ -2145,43 +2168,23 @@ fn run_query(kind: &str) -> Result<i32, String> {
         "kex" => supported_algorithms(AlgoCategory::Kex),
         // As OpenSSH's: key types (`ssh-rsa` for RSA keys), then with their
         // certificate types; signature algorithms; the default lists.
-        "key-plain" => vec![
+        "key-plain" => KEY_TYPES.iter().map(|(plain, _)| *plain).collect(),
+        "key" => KEY_TYPES
+            .iter()
+            .flat_map(|(plain, cert)| [*plain, *cert])
+            .collect(),
+        "key-cert" => KEY_TYPES.iter().map(|(_, cert)| *cert).collect(),
+        "key-sig" => supported_algorithms(AlgoCategory::HostKey),
+        "sig" | "key-ca-sign" => vec![
             "ssh-ed25519",
+            "ssh-mldsa44-ed25519@openssh.com",
             "ecdsa-sha2-nistp256",
             "ecdsa-sha2-nistp384",
             "ecdsa-sha2-nistp521",
             "ssh-rsa",
+            "rsa-sha2-256",
+            "rsa-sha2-512",
         ],
-        "key" => {
-            let mut v: Vec<&str> = Vec::new();
-            for (plain, cert) in [
-                ("ssh-ed25519", "ssh-ed25519-cert-v01@openssh.com"),
-                (
-                    "ecdsa-sha2-nistp256",
-                    "ecdsa-sha2-nistp256-cert-v01@openssh.com",
-                ),
-                (
-                    "ecdsa-sha2-nistp384",
-                    "ecdsa-sha2-nistp384-cert-v01@openssh.com",
-                ),
-                (
-                    "ecdsa-sha2-nistp521",
-                    "ecdsa-sha2-nistp521-cert-v01@openssh.com",
-                ),
-                ("ssh-rsa", "ssh-rsa-cert-v01@openssh.com"),
-            ] {
-                v.push(plain);
-                v.push(cert);
-            }
-            v
-        }
-        "key-cert" => puressh::hostkey::HOST_KEY_CERT_VERIFY_NAMES.to_vec(),
-        "key-sig" => supported_algorithms(AlgoCategory::HostKey),
-        "sig" | "key-ca-sign" => {
-            let mut v = puressh::hostkey::HOST_KEY_VERIFY_NAMES.to_vec();
-            v.push("ssh-rsa");
-            v
-        }
         "compression" => vec!["none", "zlib@openssh.com"],
         "protocol-version" => vec!["2"],
         "help" => vec![

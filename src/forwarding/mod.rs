@@ -81,6 +81,7 @@ pub mod streamlocal;
 // is gated on the `client` feature and stays portable across platforms.
 #[cfg(feature = "client")]
 pub mod socks;
+pub mod tun;
 #[cfg(unix)]
 pub mod x11;
 

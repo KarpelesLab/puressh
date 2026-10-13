@@ -320,6 +320,9 @@ pub struct AuthCertCaps {
     /// `permitlisten=` (authorized_keys): allowed `tcpip-forward` binds, on
     /// top of `PermitListen`. `None` ⇒ no extra restriction.
     pub permit_listen: Option<Vec<crate::config::HostPort>>,
+    /// `tunnel="n"` (authorized_keys): the only tun device unit a client may
+    /// forward (`0x7fffffff` for any). `None` ⇒ the client's choice.
+    pub force_tun_device: Option<u32>,
 }
 
 #[cfg(feature = "alloc")]
@@ -348,6 +351,7 @@ impl AuthCertCaps {
             force_command,
             permit_open: None,
             permit_listen: None,
+            force_tun_device: None,
         }
     }
 
@@ -364,6 +368,7 @@ impl AuthCertCaps {
             force_command: None,
             permit_open: None,
             permit_listen: None,
+            force_tun_device: None,
         }
     }
 
@@ -383,6 +388,13 @@ impl AuthCertCaps {
             force_command: o.command.clone(),
             permit_open: list(&o.permit_open),
             permit_listen: list(&o.permit_listen),
+            force_tun_device: o.tunnel.as_deref().and_then(|t| {
+                if t.eq_ignore_ascii_case("any") {
+                    Some(0x7fff_ffff)
+                } else {
+                    t.parse().ok()
+                }
+            }),
         }
     }
 
@@ -410,6 +422,7 @@ impl AuthCertCaps {
             force_command,
             permit_open: both(self.permit_open, other.permit_open),
             permit_listen: both(self.permit_listen, other.permit_listen),
+            force_tun_device: self.force_tun_device.or(other.force_tun_device),
         })
     }
 }

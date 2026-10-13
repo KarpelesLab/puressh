@@ -131,6 +131,16 @@ pub enum ChannelOpen {
         /// Path that was being listened on (echoed back per the extension).
         socket_path: String,
     },
+    /// `"tun@openssh.com"` — client asks the server to forward a tun/tap
+    /// device (OpenSSH extension, `ssh -w`). Each `CHANNEL_DATA` carries
+    /// one packet: in point-to-point mode an IP packet behind a 4-byte
+    /// address family (OpenBSD's numbers), in Ethernet mode a frame.
+    Tun {
+        /// `1`: point-to-point (layer 3), `2`: Ethernet (layer 2).
+        mode: u32,
+        /// Device unit the peer should use (`0x7fffffff`: any).
+        unit: u32,
+    },
     /// `"auth-agent@openssh.com"` — server-initiated channel that proxies a
     /// connection on the per-session forwarded agent socket back to the
     /// client's local `$SSH_AUTH_SOCK`. RFC pseudo-extension as deployed by
@@ -163,6 +173,7 @@ impl ChannelOpen {
             ChannelOpen::ForwardedTcpip { .. } => "forwarded-tcpip",
             ChannelOpen::DirectStreamlocal { .. } => "direct-streamlocal@openssh.com",
             ChannelOpen::ForwardedStreamlocal { .. } => "forwarded-streamlocal@openssh.com",
+            ChannelOpen::Tun { .. } => "tun@openssh.com",
             ChannelOpen::AuthAgent => "auth-agent@openssh.com",
             ChannelOpen::X11 { .. } => "x11",
             ChannelOpen::Other { kind, .. } => kind.as_str(),
@@ -199,6 +210,10 @@ impl ChannelOpen {
                 // `string socket_path, string reserved`.
                 w.write_string(socket_path.as_bytes());
                 w.write_string(&[]);
+            }
+            ChannelOpen::Tun { mode, unit } => {
+                w.write_u32(*mode);
+                w.write_u32(*unit);
             }
             ChannelOpen::AuthAgent => {}
             ChannelOpen::X11 {
@@ -254,6 +269,11 @@ impl ChannelOpen {
                 // `string reserved` — currently unused.
                 let _reserved = r.read_string()?;
                 Ok(ChannelOpen::ForwardedStreamlocal { socket_path })
+            }
+            "tun@openssh.com" => {
+                let mode = r.read_u32()?;
+                let unit = r.read_u32()?;
+                Ok(ChannelOpen::Tun { mode, unit })
             }
             "auth-agent@openssh.com" => Ok(ChannelOpen::AuthAgent),
             "x11" => {
@@ -615,6 +635,23 @@ impl ConnectionState {
         ch.remote_window = ch.remote_window.saturating_sub(take as u32);
         ch.activity = ch.activity.wrapping_add(take as u64);
         Ok((w.into_vec(), take))
+    }
+
+    /// Send `data` as one `CHANNEL_DATA` message, or not at all: `None`
+    /// when it does not fit the peer's window or maximum packet (a
+    /// datagram channel, such as `tun@openssh.com`, drops it then rather
+    /// than splitting it or waiting, as OpenSSH does).
+    pub fn send_datagram(&mut self, channel: u32, data: &[u8]) -> Result<Option<Vec<u8>>> {
+        let ch = self.get_mut(channel)?;
+        Self::ensure_sendable(ch)?;
+        if ch.local_eof {
+            return Err(Error::BadChannelState);
+        }
+        if data.len() > data_capacity(ch) {
+            return Ok(None);
+        }
+        self.send_data(channel, data)
+            .map(|(payload, _)| Some(payload))
     }
 
     /// Same as [`Self::send_data`] for `CHANNEL_EXTENDED_DATA`.

@@ -212,6 +212,11 @@ struct ChannelQueue {
     /// `SSH_MSG_CHANNEL_EOF` on this channel — used to make
     /// [`OwnedChannelStream::send_eof`] idempotent.
     local_eof_sent: bool,
+    /// A datagram channel (`tun@openssh.com`): each `CHANNEL_DATA` is kept
+    /// whole in [`Self::packets`] instead of joining the byte stream.
+    datagram: bool,
+    /// Inbound messages of a datagram channel, oldest first.
+    packets: VecDeque<Vec<u8>>,
 }
 
 /// Shared state: the underlying [`Client`], a per-channel mailbox map,
@@ -1088,6 +1093,98 @@ impl SharedClient {
         })
     }
 
+    /// Open a `tun@openssh.com` channel (OpenSSH extension, `ssh -w`):
+    /// the server forwards its tun (`mode` 1, point-to-point) or tap
+    /// (`mode` 2, Ethernet) device `unit` (`0x7fffffff`: any). Packets are
+    /// exchanged whole with [`Self::recv_datagram`] and
+    /// [`Self::send_datagram`] on the returned stream's channel id; the
+    /// stream closes the channel when dropped.
+    pub fn open_tun(&self, mode: u32, unit: u32) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = lock_or_poison(&self.inner)?;
+            let (local_id, open_payload) = g.client.conn.open(ChannelOpen::Tun { mode, unit })?;
+            g.client.write_payload(&open_payload)?;
+            await_open_under_lock(&mut g, local_id, "tun")?;
+            g.queues.entry(local_id).or_default().datagram = true;
+            local_id
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+            pty_denied: false,
+        })
+    }
+
+    /// Send `data` as one `CHANNEL_DATA` message on the datagram channel
+    /// `channel`; `Ok(false)` when it does not fit the peer's window and
+    /// was dropped.
+    pub fn send_datagram(&self, channel: u32, data: &[u8]) -> std::io::Result<bool> {
+        let _ticket = LockTicket::new(&self.lock_waiters);
+        let mut g = lock_or_poison_io(&self.inner)?;
+        match g.client.conn.send_datagram(channel, data).map_err(io_err)? {
+            Some(payload) => {
+                g.client.write_payload(&payload).map_err(io_err)?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// The next message on the datagram channel `channel` (opened with
+    /// [`Self::open_tun`]), waiting for one; `None` once the peer has sent
+    /// EOF or closed it.
+    pub fn recv_datagram(&self, channel: u32) -> std::io::Result<Option<Vec<u8>>> {
+        let _ticket = LockTicket::new(&self.lock_waiters);
+        loop {
+            let mut g = lock_or_poison_io(&self.inner)?;
+            let queue = g.queues.entry(channel).or_default();
+            if let Some(p) = queue.packets.pop_front() {
+                let n = p.len() as u32;
+                replenish_under_lock(&mut g, channel, n)?;
+                return Ok(Some(p));
+            }
+            if queue.remote_eof || queue.remote_close {
+                return Ok(None);
+            }
+            self.pump_or_wait(g, channel)?;
+        }
+    }
+
+    /// Pump one packet off the wire if no other thread is, else wait for
+    /// `channel`'s notifier (the waiting half of a blocking read).
+    fn pump_or_wait(
+        &self,
+        mut g: std::sync::MutexGuard<'_, Inner>,
+        channel: u32,
+    ) -> std::io::Result<()> {
+        if !g.pumping {
+            g.pumping = true;
+            let (mut g, res) = self.pump_step(g)?;
+            g.pumping = false;
+            for cv in g.notifiers.values() {
+                cv.notify_one();
+            }
+            drop(g);
+            res?;
+            if self.lock_waiters.load(core::sync::atomic::Ordering::SeqCst) > 1 {
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+        } else {
+            let cv = notifier_for(&mut g, channel);
+            let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "SharedClient mutex poisoned",
+                )
+            })?;
+            drop(waited.0);
+        }
+        Ok(())
+    }
+
     /// Lock the inner client for one synchronous operation. Internal helper
     /// for the FFI layer's `pcssh_client_exec` and friends, which run a
     /// single self-contained method on `Client` while holding the mutex.
@@ -1282,6 +1379,7 @@ fn open_loop_msg(what: &'static str) -> &'static str {
         "shell" => "shell: open loop did not converge",
         "direct-tcpip" => "direct-tcpip: open loop did not converge",
         "direct-streamlocal" => "direct-streamlocal: open loop did not converge",
+        "tun" => "tun: open loop did not converge",
         _ => "channel: open loop did not converge",
     }
 }
@@ -1293,6 +1391,7 @@ fn open_failed_msg(what: &'static str) -> &'static str {
         "shell" => "shell: channel open failed",
         "direct-tcpip" => "direct-tcpip: open failed",
         "direct-streamlocal" => "direct-streamlocal: open failed",
+        "tun" => "tun: open failed",
         _ => "channel: open failed",
     }
 }
@@ -1553,7 +1652,11 @@ fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
     match ev {
         ChannelEvent::Data { channel, data } => {
             if let Some(q) = queues.get_mut(&channel) {
-                q.data.extend(data);
+                if q.datagram {
+                    q.packets.push_back(data);
+                } else {
+                    q.data.extend(data);
+                }
             }
         }
         ChannelEvent::ExtendedData { channel, data, .. } => {

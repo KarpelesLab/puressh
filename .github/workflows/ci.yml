@@ -131,7 +131,7 @@ jobs:
       # certificate against any sshd that sends `server-sig-algs`.
       - name: Run SCP and certificate interop
         run: >
-          cargo test --test e2e_scp --test e2e_cert --test e2e_keygen --test e2e_transfer --test e2e_auth_command --test e2e_mux --test e2e_sshd_log --test e2e_legacy_algos --test e2e_forwarding --test e2e_hostkeys --test e2e_sshd_inetd --
+          cargo test --test e2e_scp --test e2e_cert --test e2e_keygen --test e2e_transfer --test e2e_auth_command --test e2e_mux --test e2e_sshd_log --test e2e_legacy_algos --test e2e_forwarding --test e2e_hostkeys --test e2e_sshd_inetd --test e2e_tunnel --
           --ignored --test-threads=1 --nocapture
 
       # Knock rendezvous (puressh ssh ↔ puressh sshd): the TCP port is closed,

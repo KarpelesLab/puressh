@@ -175,7 +175,16 @@ impl AuthorizedKeyOptions {
                 "permitopen" => out.permit_open.push(need(value)?),
                 "permitlisten" => out.permit_listen.push(need(value)?),
                 "expiry-time" => out.expiry_time = Some(need(value)?),
-                "tunnel" => out.tunnel = Some(need(value)?),
+                "tunnel" => {
+                    // A device number or `any`, as OpenSSH's a2tun.
+                    let v = need(value)?;
+                    if !v.eq_ignore_ascii_case("any")
+                        && v.parse::<u32>().ok().filter(|u| *u < 0x7fff_ffff).is_none()
+                    {
+                        return Err(Error::Format("authorized_keys: invalid tun device"));
+                    }
+                    out.tunnel = Some(v);
+                }
                 "restrict" => {
                     flag(&value)?;
                     out.restrict = true;

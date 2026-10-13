@@ -42,6 +42,10 @@ pub enum ChannelEgress {
     /// An `exit-status` request, sent after the queued output and before
     /// EOF / close. Honoured by the server dispatcher for session channels.
     ExitStatus(u32),
+    /// One `CHANNEL_DATA` message carrying exactly these bytes, or nothing
+    /// if they do not fit the peer's window (a datagram channel such as
+    /// `tun@openssh.com`). Honoured by the server dispatcher.
+    Datagram(Vec<u8>),
 }
 
 /// Bidirectional view of an SSH channel.

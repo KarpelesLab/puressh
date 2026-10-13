@@ -398,6 +398,9 @@ pub struct ServerOptions {
     /// `DisableForwarding` (yes/no) — `yes` refuses every kind of forwarding
     /// (TCP, StreamLocal, agent, X11), overriding the individual keywords.
     pub disable_forwarding: Option<bool>,
+    /// `PermitTunnel` — the tun device modes a client may forward, as a
+    /// mask: `1` point-to-point, `2` Ethernet (`yes` is both, `no` none).
+    pub permit_tunnel: Option<u32>,
     /// `AllowStreamLocalForwarding` — which Unix-socket forwarding directions
     /// are permitted (in addition to the `AllowTcpForwarding` ceiling).
     pub allow_stream_local_forwarding: Option<TcpForwarding>,
@@ -763,6 +766,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(use_pam);
     take_scalar!(permit_tty);
     take_scalar!(disable_forwarding);
+    take_scalar!(permit_tunnel);
     take_scalar!(allow_stream_local_forwarding);
     take_scalar!(pubkey_accepted_algorithms);
     take_scalar!(required_rsa_size);
@@ -834,7 +838,6 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "maxstartups",
         "strictmodes",
         "include",
-        "permittunnel",
         // `AcceptEnv` is valid in a Match block in OpenSSH, but this server
         // applies the env allow-list once, connection-wide, from the global
         // section; a per-block list would be silently ignored, so refuse it.
@@ -1478,14 +1481,20 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 .push((name, command));
         }
         "permittunnel" => {
-            if !one_arg(line)?.eq_ignore_ascii_case("no") {
-                return Err(ConfigError::Unsupported {
-                    line: line.line_no,
-                    msg: "PermitTunnel: tun/tap device forwarding is not supported; \
-                          only `PermitTunnel no` is accepted"
-                        .into(),
-                });
-            }
+            let v = one_arg(line)?;
+            opts.permit_tunnel = Some(match v.to_ascii_lowercase().as_str() {
+                "yes" => 3,
+                "point-to-point" => 1,
+                "ethernet" => 2,
+                "no" => 0,
+                _ => {
+                    return Err(ConfigError::BadValue {
+                        line: line.line_no,
+                        keyword: kw.to_string(),
+                        msg: format!("expected yes, point-to-point, ethernet or no, got \"{v}\""),
+                    });
+                }
+            });
         }
         "usepam" => {
             opts.use_pam = Some(parse_yes_no(line)?);
@@ -2768,12 +2777,30 @@ Subsystem sftp internal-sftp
     }
 
     #[test]
-    fn permit_tunnel_unsupported() {
-        let err = SshServerConfig::parse("PermitTunnel yes\n").unwrap_err();
+    fn permit_tunnel_modes() {
+        for (v, mask) in [
+            ("yes", 3),
+            ("point-to-point", 1),
+            ("ethernet", 2),
+            ("no", 0),
+        ] {
+            let cfg = SshServerConfig::parse(&format!("PermitTunnel {v}\n")).unwrap();
+            let r = cfg.resolve(&MatchContext::default(), ExecPolicy::Deny);
+            assert_eq!(r.permit_tunnel, Some(mask), "{v}");
+        }
+        let err = SshServerConfig::parse("PermitTunnel maybe\n").unwrap_err();
         assert!(
-            matches!(err, ConfigError::Unsupported { line: 1, .. }),
+            matches!(err, ConfigError::BadValue { line: 1, .. }),
             "{err:?}"
         );
+        // Valid in a Match block, as in OpenSSH.
+        let cfg = SshServerConfig::parse("Match User alice\n  PermitTunnel yes\n").unwrap();
+        let ctx = MatchContext {
+            user: Some("alice"),
+            ..Default::default()
+        };
+        let r = cfg.resolve(&ctx, ExecPolicy::Deny);
+        assert_eq!(r.permit_tunnel, Some(3));
     }
 
     #[test]
@@ -3073,8 +3100,6 @@ UsePrivilegeSeparation sandbox
         let r = cfg.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
         assert_eq!(r.permit_tty, Some(false));
         assert_eq!(r.disable_forwarding, Some(true));
-        // Keywords OpenSSH rejects unless they are no-ops stay strict.
-        assert!(SshServerConfig::parse("PermitTunnel yes\n").is_err());
         assert!(SshServerConfig::parse("PermitTunnel no\n").is_ok());
         // DSA keys are an OpenSSH algorithm this server lacks: the line loads
         // (OpenSSH's own configs carry it) and enables nothing.
@@ -3096,7 +3121,6 @@ UsePrivilegeSeparation sandbox
             "PidFile /x",
             "Compression no",
             "RekeyLimit 1G",
-            "PermitTunnel yes",
         ] {
             let src = format!("Match User alice\n  {kw}\n");
             let err = SshServerConfig::parse(&src).unwrap_err();

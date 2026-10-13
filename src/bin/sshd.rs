@@ -80,6 +80,10 @@ fn main() -> std::process::ExitCode {
 #[path = "sshd_log.rs"]
 mod sshd_log;
 
+#[cfg(unix)]
+#[path = "tundev.rs"]
+mod tundev;
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[path = "sshd_login.rs"]
 mod sshd_login;
@@ -386,6 +390,8 @@ mod imp {
             envs: Mutex<Vec<(CString, CString)>>,
             inner: Mutex<Option<PamHolder>>,
             debug: bool,
+            /// `UsePAM no`: no PAM account check or session.
+            disabled: std::sync::atomic::AtomicBool,
         }
 
         impl PamGate {
@@ -398,7 +404,14 @@ mod imp {
                     envs: Mutex::new(Vec::new()),
                     inner: Mutex::new(None),
                     debug,
+                    disabled: std::sync::atomic::AtomicBool::new(false),
                 })
+            }
+
+            /// `UsePAM no`: [`Self::ensure`] then opens nothing.
+            pub fn disable(&self) {
+                self.disabled
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
             }
 
             /// Stash the peer address (used as `PAM_RHOST`). Should be
@@ -418,6 +431,9 @@ mod imp {
                 user: &str,
                 tty: &str,
             ) -> puressh::Result<Vec<(CString, CString)>> {
+                if self.disabled.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Ok(Vec::new());
+                }
                 let mut guard = self.inner.lock().unwrap();
                 if guard.is_some() {
                     return Ok(self.envs.lock().unwrap().clone());
@@ -698,6 +714,7 @@ mod imp {
                 Arc::new(PamGate)
             }
             pub fn set_peer(&self, _peer: String) {}
+            pub fn disable(&self) {}
             pub fn ensure(
                 &self,
                 _user: &str,
@@ -1024,6 +1041,36 @@ mod imp {
     /// `-T [-C spec]`: print the effective configuration like OpenSSH's
     /// `sshd -T`: lowercase keywords, every setting with its default, and
     /// the `Match` blocks selected by `-C` applied.
+    /// Opens the tun / tap devices clients forward (`ssh -w`).
+    struct TunDevices;
+
+    impl puressh::server::TunHandler for TunDevices {
+        fn open(
+            &self,
+            _user: &str,
+            mode: u32,
+            unit: u32,
+        ) -> std::io::Result<(std::fs::File, String)> {
+            use sshd_log::{Level, log};
+            match crate::tundev::open(unit, mode) {
+                Ok((dev, ifname)) => {
+                    log(
+                        Level::Debug1,
+                        &format!("Tunnel forwarding using interface {ifname}"),
+                    );
+                    Ok((dev, ifname))
+                }
+                Err(e) => {
+                    log(
+                        Level::Debug1,
+                        &format!("sys_tun_open: failed to configure tunnel (mode {mode}): {e}"),
+                    );
+                    Err(e)
+                }
+            }
+        }
+    }
+
     fn dump_config(cli: &Cli, cfg: &puressh::config::SshServerConfig) -> Result<i32, String> {
         use puressh::config::{
             Compression, ExecPolicy, MatchContext, PermitRootLogin, ServerAddressFamily as Af,
@@ -1298,6 +1345,15 @@ mod imp {
             "disableforwarding",
             yn(opts.disable_forwarding == Some(true)),
         );
+        line(
+            "permittunnel",
+            match opts.permit_tunnel.unwrap_or(0) {
+                3 => "yes",
+                1 => "point-to-point",
+                2 => "ethernet",
+                _ => "no",
+            },
+        );
         line("permittty", yn(opts.permit_tty != Some(false)));
         line("printmotd", yn(opts.print_motd.unwrap_or(true)));
         line("printlastlog", yn(opts.print_last_log.unwrap_or(true)));
@@ -1432,7 +1488,6 @@ mod imp {
             ("hostbasedauthentication", "no"),
             ("ignorerhosts", "yes"),
             ("gssapiauthentication", "no"),
-            ("permittunnel", "no"),
             ("usedns", "no"),
             ("fingerprinthash", "SHA256"),
         ] {
@@ -3097,6 +3152,8 @@ mod imp {
     }
 
     struct LocalAuthenticator {
+        /// No PAM: refuse locked or expired accounts ([`account_refusal`]).
+        native_account_checks: bool,
         /// `AllowUsers` patterns (`user[@host]`, OpenSSH `Host`-style globs).
         /// Empty ⇒ the historical "current user only" default applied by the
         /// caller (it seeds this with the single resolved current user as a
@@ -3223,6 +3280,80 @@ mod imp {
         debug: bool,
     }
 
+    /// Why OpenSSH's non-PAM checks (`allowed_user`) refuse an account.
+    #[derive(Debug, PartialEq, Eq)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // checked on Linux only
+    enum AccountRefusal {
+        /// The shadow entry's account expiry date has passed.
+        Expired,
+        /// The password is locked (starts with `!`).
+        Locked,
+    }
+
+    /// OpenSSH's account checks without PAM: an expired account (shadow
+    /// `sp_expire`) or a locked password (`!` prefix, in the shadow entry
+    /// when readable, else in the passwd entry).
+    #[cfg(target_os = "linux")]
+    fn account_refusal(user: &str) -> Option<AccountRefusal> {
+        let name = std::ffi::CString::new(user).ok()?;
+        let mut buf = vec![0 as libc::c_char; 16384];
+        // SAFETY: getspnam_r fills `sp` with pointers into `buf`, which
+        // outlives every use below; a null result means no (readable) entry.
+        let shadow = unsafe {
+            let mut sp: libc::spwd = std::mem::zeroed();
+            let mut res: *mut libc::spwd = std::ptr::null_mut();
+            libc::getspnam_r(
+                name.as_ptr(),
+                &mut sp,
+                buf.as_mut_ptr(),
+                buf.len(),
+                &mut res,
+            );
+            (!res.is_null()).then(|| {
+                let pwd = (!sp.sp_pwdp.is_null())
+                    .then(|| std::ffi::CStr::from_ptr(sp.sp_pwdp).to_bytes().to_vec());
+                (sp.sp_expire, pwd)
+            })
+        };
+        if let Some((expire, _)) = &shadow {
+            let today = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() / 86400) as i64;
+            #[allow(clippy::unnecessary_cast)] // `c_long` is `i32` on some targets
+            if *expire != -1 && (*expire as i64) < today {
+                return Some(AccountRefusal::Expired);
+            }
+        }
+        let passwd = match shadow.and_then(|(_, p)| p) {
+            Some(p) => p,
+            None => {
+                let mut pbuf = vec![0 as libc::c_char; 16384];
+                // SAFETY: as above, for getpwnam_r and `pbuf`.
+                unsafe {
+                    let mut pw: libc::passwd = std::mem::zeroed();
+                    let mut res: *mut libc::passwd = std::ptr::null_mut();
+                    libc::getpwnam_r(
+                        name.as_ptr(),
+                        &mut pw,
+                        pbuf.as_mut_ptr(),
+                        pbuf.len(),
+                        &mut res,
+                    );
+                    if res.is_null() || pw.pw_passwd.is_null() {
+                        return None;
+                    }
+                    std::ffi::CStr::from_ptr(pw.pw_passwd).to_bytes().to_vec()
+                }
+            }
+        };
+        passwd.starts_with(b"!").then_some(AccountRefusal::Locked)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn account_refusal(_user: &str) -> Option<AccountRefusal> {
+        None
+    }
+
     impl LocalAuthenticator {
         /// Apply the OpenSSH access precedence — DenyUsers → AllowUsers →
         /// DenyGroups → AllowGroups — returning `true` iff `user` is allowed.
@@ -3269,6 +3400,21 @@ mod imp {
                 });
                 false
             };
+            // Without PAM, OpenSSH's own account checks come first.
+            if self.native_account_checks {
+                match account_refusal(user) {
+                    Some(AccountRefusal::Expired) => {
+                        sshd_log::with_conn(|c| {
+                            if c.first("account expired") {
+                                sshd_log::info(&format!("Account {user} has expired"));
+                            }
+                        });
+                        return false;
+                    }
+                    Some(AccountRefusal::Locked) => return refuse("account is locked"),
+                    None => {}
+                }
+            }
             // 1. DenyUsers wins outright.
             if !self.deny_users.is_empty() && user_host_list_matches(&self.deny_users, user, peer) {
                 return refuse("listed in DenyUsers");
@@ -4609,6 +4755,8 @@ mod imp {
         let outer = std::net::TcpStream::connect(l.local_addr().map_err(io)?).map_err(io)?;
         let (inner, _) = l.accept().map_err(io)?;
         drop(l);
+        // The bridge relays packets as they come: no Nagle delay.
+        let _ = outer.set_nodelay(true);
         let peer = std::net::SocketAddr::from(([0, 0, 0, 0], 65535));
         let mut to_session = outer.try_clone().map_err(io)?;
         std::thread::spawn(move || {
@@ -4702,6 +4850,9 @@ mod imp {
 
     #[derive(Clone)]
     struct LocalAuthFactory {
+        /// No PAM: OpenSSH's own account checks apply (see
+        /// [`account_refusal`]).
+        native_account_checks: bool,
         allow_users: Arc<Vec<UserHostPattern>>,
         deny_users: Arc<Vec<UserHostPattern>>,
         allow_groups: Arc<Vec<puressh::config::HostPattern>>,
@@ -4736,6 +4887,7 @@ mod imp {
     impl LocalAuthFactory {
         fn build_inner(&self, peer: Option<&str>) -> Box<dyn Authenticator> {
             Box::new(LocalAuthenticator {
+                native_account_checks: self.native_account_checks,
                 allow_users: (*self.allow_users).clone(),
                 deny_users: (*self.deny_users).clone(),
                 allow_groups: (*self.allow_groups).clone(),
@@ -8206,12 +8358,16 @@ mod imp {
         // enables them AND this is a PAM build — otherwise we'd offer a method
         // we cannot satisfy. `pam_check_password` on a non-PAM build always
         // fails, so this is the authoritative gate.
-        let pam_available = cfg!(all(feature = "pam", target_os = "linux"));
-        if pam_available && sshd_cfg.global.use_pam == Some(false) {
-            eprintln!(
-                "sshd: warning: UsePAM no: PAM account and session checks still run (this \
-                 build has no non-PAM account checks to fall back on)"
-            );
+        //
+        // `UsePAM no` turns PAM off altogether, as in OpenSSH: no PAM
+        // account check or session, OpenSSH's own account checks instead
+        // (locked or expired accounts), and no password or
+        // keyboard-interactive authentication, which this build only does
+        // through PAM. Unset, a PAM build uses PAM.
+        let pam_available = cfg!(all(feature = "pam", target_os = "linux"))
+            && sshd_cfg.global.use_pam != Some(false);
+        if !pam_available {
+            pam_gate.disable();
         }
 
         // OpenSSH defaults both to yes (Ubuntu's stock file turns
@@ -8263,6 +8419,7 @@ mod imp {
         });
 
         let factory = Arc::new(LocalAuthFactory {
+            native_account_checks: !pam_available,
             allow_users: Arc::new(allow_users),
             deny_users: Arc::new(deny_users),
             allow_groups: Arc::new(allow_groups),
@@ -8341,7 +8498,10 @@ mod imp {
             ))
             .with_streamlocal_forward(Arc::new(
                 puressh::forwarding::streamlocal::DefaultStreamlocalForwardHandler::permit_all(),
-            ));
+            ))
+            // PermitTunnel (default no) gates it; the device is opened as
+            // the logged-in user, as OpenSSH's sshd does.
+            .with_tun(Arc::new(TunDevices));
 
         // `exec` requests stream (stdin, stdout, stderr, exit status);
         // `scp` is served in-process when enabled.
@@ -9061,6 +9221,7 @@ mod imp {
             let lookup: GroupLookup =
                 std::sync::Arc::new(move |u: &str| groups.get(u).cloned().unwrap_or_default());
             LocalAuthenticator {
+                native_account_checks: false,
                 allow_users: to_uh(allow_users),
                 deny_users: to_uh(deny_users),
                 allow_groups: to_pats(allow_groups),

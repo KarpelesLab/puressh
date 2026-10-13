@@ -28,6 +28,9 @@ use puressh::client::{
 #[path = "common.rs"]
 mod common;
 
+#[path = "tundev.rs"]
+mod tundev;
+
 /// A warning: printed unless `-q`.
 macro_rules! warn {
     ($($t:tt)*) => {
@@ -426,7 +429,16 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         forward_specs.push((b'R', v));
                     }
                     'S' => extra_o.push(format!("ControlPath {v}")),
-                    'w' => return Err("-w: tun device forwarding is not supported".into()),
+                    'w' => {
+                        // As OpenSSH: enables tunnelling (point-to-point
+                        // unless set already) with these devices.
+                        if parse_tun_units(&v).is_none() {
+                            eprintln!("Bad tun device '{v}'");
+                            std::process::exit(255);
+                        }
+                        extra_o.push("Tunnel yes".to_string());
+                        extra_o.push(format!("TunnelDevice {v}"));
+                    }
                     'W' => stdio_forward = Some(v),
                     _ => unreachable!(),
                 }
@@ -892,9 +904,12 @@ fn collect_credentials(
                     Err(e) => warn!("warning: CertificateFile {cert_path}: {e}"),
                 }
             }
+            // OpenSSH says nothing of a certificate it has no key for
+            // (unless debugging).
             if !paired {
-                eprintln!(
-                    "warning: CertificateFile {cert_path}: no matching IdentityFile private key"
+                vlog(
+                    1,
+                    &format!("CertificateFile {cert_path}: no matching private key"),
                 );
             }
         }
@@ -1986,6 +2001,10 @@ fn print_config(
             .iter()
             .find(|(k, _)| k == key)
             .map_or(default, |(_, v)| v.as_str());
+        if key == "tunnel" || key == "tunneldevice" {
+            out.push(format!("{key} {}", tunnel_dump(key, value)));
+            continue;
+        }
         out.push(format!("{key} {value}"));
     }
     out.extend(identities.into_iter().map(|p| format!("identityfile {p}")));
@@ -3010,12 +3029,23 @@ fn run() -> Result<i32, String> {
         let _ = CONNINFO.set(Box::new(move || connection_info(&s, connected_at)));
     }
     let listeners = bind_local_forwards(&cli, &dynamics, gateway, exit_on_forward_failure)?;
+    // `-w` / `Tunnel`: the tunnel device forwarding.
+    let (tunnel, tun_ifname) = match tunnel_request(&cfg_block)? {
+        Some(req) => match open_tunnel(&shared, req, exit_on_forward_failure) {
+            Some((link, ifname)) => (Some(link), Some(ifname)),
+            None => (None, None),
+        },
+        None => (None, None),
+    };
     // The threads serving the connection — forward listeners, keepalive —
     // start in the process that keeps it (a ControlPersist master forks).
     let alive_count = cfg_block.server_alive_count_max.unwrap_or(3);
     let alive_host = connect_host.clone();
     let start_serving = move |shared: &puressh::shared::SharedClient| {
         serve_local_listeners(listeners, shared);
+        if let Some(link) = tunnel {
+            serve_tunnel(shared, link);
+        }
         if let Some(interval) = server_alive {
             spawn_keepalive(shared, interval, alive_count, alive_host);
         }
@@ -3043,7 +3073,9 @@ fn run() -> Result<i32, String> {
             .as_deref()
             .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none"))
     {
-        run_local_command(&tokens.expand(&cmd.replace("%T", "NONE")));
+        run_local_command(
+            &tokens.expand(&cmd.replace("%T", tun_ifname.as_deref().unwrap_or("NONE"))),
+        );
     }
 
     // `-N`: no session; keep the connection (and its forwards) alive.
@@ -3066,7 +3098,7 @@ fn run() -> Result<i32, String> {
         // With forwards or remote channels to serve, keep pumping the
         // connection when the session is not reading.
         let what = session_request(command.as_deref(), subsystem);
-        run_session(s, what, use_pty, pty_required, okt, escape).unwrap_or_else(|e| {
+        let code = run_session(s, what, use_pty, pty_required, okt, escape).unwrap_or_else(|e| {
             // Empty: already reported in OpenSSH's words.
             if let Some(m) = transport_fatal(&e, &peer) {
                 eprintln!("{m}");
@@ -3074,7 +3106,12 @@ fn run() -> Result<i32, String> {
                 eprintln!("ssh: {e}");
             }
             255
-        })
+        });
+        // A forwarded tunnel keeps the connection, as with OpenSSH.
+        if TUNNEL_ALIVE.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = s.pump_while(|| TUNNEL_ALIVE.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        code
     };
     // `~C` adds and cancels forwards on this connection.
     #[cfg(unix)]
@@ -3394,6 +3431,130 @@ fn key_blob_type(blob: &[u8]) -> Option<String> {
 
 /// Run a `LocalCommand` with the user's shell (`$SHELL`, else `/bin/sh`;
 /// `cmd` on Windows) and wait for it; its output goes to ssh's own stdout and stderr.
+/// OpenSSH's `a2tun`: `local[:remote]` tun units, each a number or `any`
+/// (the remote one defaults to any).
+fn parse_tun_units(s: &str) -> Option<(u32, u32)> {
+    const ANY: u32 = 0x7fff_ffff;
+    let unit = |u: &str| {
+        if u.eq_ignore_ascii_case("any") {
+            Some(ANY)
+        } else {
+            u.parse::<u32>().ok().filter(|n| *n < ANY)
+        }
+    };
+    match s.split_once(':') {
+        Some((l, r)) => Some((unit(l)?, unit(r)?)),
+        None => Some((unit(s)?, ANY)),
+    }
+}
+
+/// The tunnel `Tunnel` / `TunnelDevice` (or `-w`) ask for: `(mode, local
+/// unit, remote unit)`, `None` when tunnelling is off.
+fn tunnel_request(cfg: &puressh::config::ClientOptions) -> Result<Option<(u32, u32, u32)>, String> {
+    let get = |k: &str| {
+        cfg.unimplemented
+            .iter()
+            .find(|(n, _)| n == k)
+            .map(|(_, v)| v.as_str())
+    };
+    let mode = match get("tunnel").map(str::to_ascii_lowercase).as_deref() {
+        Some("yes" | "true" | "point-to-point") => 1,
+        Some("ethernet") => 2,
+        _ => return Ok(None),
+    };
+    let device = get("tunneldevice").unwrap_or("any:any");
+    let (local, remote) =
+        parse_tun_units(device).ok_or_else(|| format!("Bad tun device '{device}'"))?;
+    Ok(Some((mode, local, remote)))
+}
+
+/// OpenSSH's `-G` spelling of `Tunnel` and `TunnelDevice`.
+fn tunnel_dump(key: &str, value: &str) -> String {
+    match key {
+        "tunnel" => match value.to_ascii_lowercase().as_str() {
+            "yes" | "true" | "point-to-point" => "point-to-point".into(),
+            "ethernet" => "ethernet".into(),
+            _ => "false".into(),
+        },
+        _ => match parse_tun_units(value) {
+            Some((l, r)) => {
+                let u = |n: u32| {
+                    if n == 0x7fff_ffff {
+                        "any".to_string()
+                    } else {
+                        n.to_string()
+                    }
+                };
+                format!("{}:{}", u(l), u(r))
+            }
+            None => value.to_string(),
+        },
+    }
+}
+
+/// A forwarded tunnel: the local device, the channel and its mode.
+type TunLink = (std::fs::File, puressh::shared::OwnedChannelStream, u32);
+
+/// Open the local device and the `tun@openssh.com` channel, as OpenSSH's
+/// `ssh_init_forwarding`: a failure is reported (and fatal with
+/// `ExitOnForwardFailure`). Returns the link and the interface name.
+fn open_tunnel(
+    shared: &puressh::shared::SharedClient,
+    (mode, local, remote): (u32, u32, u32),
+    exit_on_forward_failure: bool,
+) -> Option<(TunLink, String)> {
+    let fail = |m: &str| {
+        eprintln!("{m}");
+        if exit_on_forward_failure {
+            std::process::exit(255);
+        }
+    };
+    let (dev, ifname) = match tundev::open(local, mode) {
+        Ok(d) => d,
+        Err(e) => {
+            vlog(1, &format!("tun open: {e}"));
+            eprintln!("Tunnel device open failed.");
+            fail("Could not request tunnel forwarding.");
+            return None;
+        }
+    };
+    vlog(1, &format!("Tunnel forwarding using interface {ifname}"));
+    match shared.open_tun(mode, remote) {
+        Ok(ch) => Some(((dev, ch, mode), ifname)),
+        Err(_) => {
+            fail("Tunnel forwarding failed");
+            None
+        }
+    }
+}
+
+/// Whether a forwarded tunnel is still up: like OpenSSH's, the client
+/// stays connected after its session ends until the tunnel closes.
+static TUNNEL_ALIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Move packets between the local device and the channel until either
+/// ends.
+#[cfg(unix)]
+fn serve_tunnel(shared: &puressh::shared::SharedClient, (dev, ch, mode): TunLink) {
+    use std::sync::atomic::Ordering;
+    let (rx, tx) = (shared.clone(), shared.clone());
+    TUNNEL_ALIVE.store(true, Ordering::Relaxed);
+    std::thread::spawn(move || {
+        let id = ch.channel_id();
+        let _ = puressh::forwarding::tun::splice(
+            dev,
+            mode,
+            || rx.recv_datagram(id).ok().flatten(),
+            move |m| tx.send_datagram(id, &m).is_ok(),
+        );
+        drop(ch);
+        TUNNEL_ALIVE.store(false, Ordering::Relaxed);
+    });
+}
+
+#[cfg(not(unix))]
+fn serve_tunnel(_shared: &puressh::shared::SharedClient, _link: TunLink) {}
+
 fn run_local_command(cmd: &str) {
     #[cfg(unix)]
     let (shell, flag) = (

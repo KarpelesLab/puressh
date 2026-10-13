@@ -1547,8 +1547,8 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("SyslogFacility", &["*"], ""),
     (
         "Tunnel",
-        &["no", "false"],
-        "tun/tap forwarding is not supported",
+        &["yes", "true", "no", "false", "point-to-point", "ethernet"],
+        "expected yes, no, point-to-point or ethernet",
     ),
     ("TunnelDevice", &["*"], ""),
     ("UseKeychain", &["*"], ""),
@@ -2575,7 +2575,7 @@ Host *.example.com !secret.example.com
     #[test]
     fn unsupported_values_refused() {
         for src in [
-            "Tunnel yes\n",
+            "Tunnel maybe\n",
             "ProxyUseFdpass yes\n",
             "PKCS11Provider /usr/lib/opensc-pkcs11.so\n",
             "RequiredRSASize 4096\n",

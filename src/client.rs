@@ -4241,6 +4241,11 @@ fn serve_drain_runtimes(
                 Ok(ChannelEgress::Data(bytes)) => {
                     emit_serve_data(client, ch, &bytes, rt)?;
                 }
+                Ok(ChannelEgress::Datagram(bytes)) => {
+                    if let Some(p) = client.conn.send_datagram(ch, &bytes)? {
+                        client.write_payload(&p)?;
+                    }
+                }
                 // Session-only egress (stderr, exit status) has no meaning
                 // on the forwarded channels a client serves.
                 Ok(ChannelEgress::Stderr(_) | ChannelEgress::ExitStatus(_)) => {}

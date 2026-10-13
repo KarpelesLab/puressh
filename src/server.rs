@@ -674,6 +674,19 @@ pub trait DirectStreamlocalHandler: Send + Sync {
     ) -> Result<()>;
 }
 
+/// Server-side hook opening the tun / tap device a client forwards
+/// (`tun@openssh.com`, `ssh -w`).
+///
+/// Without a handler attached to [`Config::tun_handler`] every tunnel open
+/// is rejected. Once the device is open, the dispatcher moves packets
+/// between it and the channel (see [`crate::forwarding::tun`]).
+pub trait TunHandler: Send + Sync {
+    /// Open the device for `mode` (`1` point-to-point / tun, `2` Ethernet /
+    /// tap) and unit `unit` (`0x7fffffff`: any) on behalf of `user`,
+    /// returning it and its interface name. An error refuses the channel.
+    fn open(&self, user: &str, mode: u32, unit: u32) -> std::io::Result<(std::fs::File, String)>;
+}
+
 /// Per-binding handle a [`TcpipForwardHandler`] uses to ask the per-connection
 /// server loop to open a `forwarded-tcpip` channel back to the client
 /// (RFC 4254 §7.2; the wire side of `ssh -R`).
@@ -1216,6 +1229,9 @@ pub struct Config {
     /// to [`crate::forwarding::direct_streamlocal::DefaultDirectStreamlocalHandler`]
     /// (or your own filter) to enable it.
     pub direct_streamlocal_handler: Option<Arc<dyn DirectStreamlocalHandler>>,
+    /// Optional `tun@openssh.com` hook (`ssh -w`). When `None` (the
+    /// default), every tunnel open is rejected.
+    pub tun_handler: Option<Arc<dyn TunHandler>>,
     /// Optional `streamlocal-forward@openssh.com` /
     /// `cancel-streamlocal-forward@openssh.com` global-request hook (the
     /// Unix-socket analog of [`Self::tcpip_forward_handler`]; the server side
@@ -1427,6 +1443,10 @@ pub struct EffectivePolicy {
     /// `ChannelTimeout`: `(type pattern, seconds)`, first match wins;
     /// `global` covers all channels together.
     pub channel_timeouts: Vec<(String, u32)>,
+    /// `PermitTunnel`: the tun device modes that may be forwarded, as a
+    /// mask (`1` point-to-point, `2` Ethernet). `None` ⇒ any, subject to a
+    /// [`TunHandler`] being attached.
+    pub permit_tunnel: Option<u32>,
 }
 
 impl EffectivePolicy {
@@ -1457,6 +1477,7 @@ impl EffectivePolicy {
             expose_auth_info: None,
             auth_info_file: None,
             channel_timeouts: Vec::new(),
+            permit_tunnel: None,
         }
     }
 
@@ -1669,6 +1690,7 @@ impl Config {
             direct_tcpip_handler: None,
             tcpip_forward_handler: None,
             direct_streamlocal_handler: None,
+            tun_handler: None,
             streamlocal_forward_handler: None,
             agent_forward_handler: None,
             x11_forward_handler: None,
@@ -1840,6 +1862,13 @@ impl Config {
     /// `ssh -R`) is answered with `REQUEST_FAILURE`.
     pub fn with_tcpip_forward(mut self, handler: Arc<dyn TcpipForwardHandler>) -> Self {
         self.tcpip_forward_handler = Some(handler);
+        self
+    }
+
+    /// Attach a [`TunHandler`]: tunnel forwarding (`ssh -w`) is then
+    /// allowed where `PermitTunnel` allows it.
+    pub fn with_tun(mut self, handler: Arc<dyn TunHandler>) -> Self {
+        self.tun_handler = Some(handler);
         self
     }
 
@@ -2420,6 +2449,8 @@ fn resolve_effective_policy(
         expose_auth_info: opts.expose_auth_info,
         auth_info_file: None,
         channel_timeouts: opts.channel_timeouts.unwrap_or_default(),
+        // `PermitTunnel no` is sshd's default.
+        permit_tunnel: Some(opts.permit_tunnel.unwrap_or(0)),
     }
 }
 
@@ -2966,6 +2997,9 @@ struct ConnExtras {
     channel_idle: BTreeMap<u32, (u64, Instant)>,
     /// The same for all channels together (the `global` timeout).
     global_idle: (u64, Instant),
+    /// Interfaces of the tunnels opened so far, for sessions'
+    /// `SSH_TUNNEL`.
+    tun_ifnames: Vec<String>,
 }
 
 /// Poll interval while traffic flows (see [`ConnExtras::fast_until`]).
@@ -2988,6 +3022,7 @@ impl ConnExtras {
             global_idle: (0, now),
             last_keepalive: now,
             missed_keepalives: 0,
+            tun_ifnames: Vec::new(),
         }
     }
 }
@@ -3244,7 +3279,7 @@ fn do_connection_loop(
         // The client ending the connection (EOF, SSH_MSG_DISCONNECT, reset)
         // is the normal way a session finishes.
         let read = if *polling_active {
-            srv_read_maybe_timeout(stream, driver)
+            srv_read_maybe_timeout(stream, driver, extras.tick)
         } else {
             srv_read(stream, driver, None).map(Some)
         };
@@ -3465,6 +3500,12 @@ fn drain_subsystems(
                 }
                 Ok(ChannelEgress::ExitStatus(code)) => {
                     rt.pending_exit = Some(code);
+                }
+                Ok(ChannelEgress::Datagram(bytes)) => {
+                    // Sent whole or dropped, never split or held back.
+                    if let Some(p) = conn.send_datagram(ch, &bytes)? {
+                        srv_send(stream, driver, &p)?;
+                    }
                 }
                 Ok(ChannelEgress::Eof) => {
                     rt.pending_eof = true;
@@ -3862,6 +3903,74 @@ fn dispatch_app_packet(
                     srv_send(stream, driver, &p)?;
                 }
             }
+            ChannelOpen::Tun { mode, unit } => {
+                // PermitTunnel (and DisableForwarding), then a `tunnel="n"`
+                // key option pinning the unit, as OpenSSH's
+                // server_request_tun.
+                let mode_ok = mode == crate::forwarding::tun::MODE_POINTOPOINT
+                    || mode == crate::forwarding::tun::MODE_ETHERNET;
+                let permitted = mode_ok
+                    && effective.permit_tunnel.is_none_or(|m| m & mode != 0)
+                    && !effective.forwarding_disabled();
+                let forced = effective
+                    .cert_caps
+                    .as_ref()
+                    .and_then(|c| c.force_tun_device);
+                let unit = match forced {
+                    Some(f) if unit != crate::forwarding::tun::UNIT_ANY && unit != f => None,
+                    Some(f) => Some(f),
+                    None => Some(unit),
+                };
+                let opened = match (permitted, unit, cfg.tun_handler.as_ref()) {
+                    (true, Some(unit), Some(h)) if unit <= i32::MAX as u32 => {
+                        h.open(user, mode, unit).ok()
+                    }
+                    _ => None,
+                };
+                match opened {
+                    Some((dev, ifname)) => {
+                        let p = conn.accept_open(channel)?;
+                        srv_send(stream, driver, &p)?;
+                        extras.tun_ifnames.push(ifname);
+                        let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                        let (egress_tx, egress_rx) =
+                            mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
+                        thread::spawn(move || {
+                            let send_tx = egress_tx.clone();
+                            let _ = crate::forwarding::tun::splice(
+                                dev,
+                                mode,
+                                || ingress_rx.recv().ok().flatten(),
+                                move |msg| send_tx.send(ChannelEgress::Datagram(msg)).is_ok(),
+                            );
+                            let _ = egress_tx.send(ChannelEgress::Close);
+                        });
+                        subsystems.insert(
+                            channel,
+                            SubsystemRuntime {
+                                ingress_tx,
+                                egress_rx,
+                                pending_data: Vec::new(),
+                                pending_eof: false,
+                                pending_close: false,
+                                pending_stderr: Vec::new(),
+                                pending_exit: None,
+                                eof_sent: false,
+                                close_sent: false,
+                            },
+                        );
+                    }
+                    None => {
+                        let p = conn.reject_open(
+                            channel,
+                            SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
+                            "open failed",
+                            "",
+                        )?;
+                        srv_send(stream, driver, &p)?;
+                    }
+                }
+            }
             _ => {
                 let p = conn.reject_open(
                     channel,
@@ -3883,6 +3992,7 @@ fn dispatch_app_packet(
                 conn,
                 cfg,
                 effective,
+                &extras.tun_ifnames,
                 user,
                 channel,
                 request,
@@ -4322,6 +4432,7 @@ fn handle_channel_request(
     conn: &mut ConnectionState,
     cfg: &Config,
     effective: &EffectivePolicy,
+    tun_ifnames: &[String],
     user: &str,
     channel: u32,
     request: ChannelRequest,
@@ -4343,10 +4454,14 @@ fn handle_channel_request(
             .auth_info_file
             .as_ref()
             .map(|p| alloc::format!("SSH_USER_AUTH={p}"));
+        // The tunnels forwarded on this connection (OpenSSH's SSH_TUNNEL).
+        let tunnels = (!tun_ifnames.is_empty())
+            .then(|| alloc::format!("SSH_TUNNEL={}", tun_ifnames.join(",")));
         env.set_admin_env(
             auth_info
                 .as_deref()
                 .into_iter()
+                .chain(tunnels.as_deref())
                 .chain(effective.set_env.iter().map(String::as_str)),
         );
         env.set_user_environment(effective.permit_user_environment.as_deref());
@@ -5307,7 +5422,31 @@ fn srv_read(
 fn srv_read_maybe_timeout(
     stream: &mut TcpStream,
     driver: &mut ServerDriver,
+    tick: Duration,
 ) -> Result<Option<Vec<u8>>> {
+    driver.handle_timeout(Instant::now())?;
+    srv_pump_out(stream, driver)?;
+    while let Some(ev) = driver.poll_event() {
+        if let Event::AppData(payload) = ev {
+            srv_pump_out(stream, driver)?;
+            return Ok(Some(payload));
+        }
+    }
+    // Nothing buffered: wait for the socket with poll(2), whose timeout is
+    // precise, where a socket read timeout is rounded up to the kernel
+    // tick (4 ms or more), delaying output handler threads produce.
+    #[cfg(unix)]
+    {
+        use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+        use std::os::fd::AsFd;
+        let mut fds = [PollFd::new(stream.as_fd(), PollFlags::POLLIN)];
+        let ms = u16::try_from(tick.as_millis()).unwrap_or(u16::MAX);
+        if matches!(poll(&mut fds, PollTimeout::from(ms)), Ok(0)) {
+            return Ok(None);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tick;
     match srv_read(stream, driver, None) {
         Ok(p) => Ok(Some(p)),
         Err(Error::Io(e))
@@ -7816,6 +7955,7 @@ mod tests {
             force_command: None,
             permit_open: None,
             permit_listen: None,
+            force_tun_device: None,
         }
     }
 
@@ -7832,6 +7972,7 @@ mod tests {
             force_command: None,
             permit_open: None,
             permit_listen: None,
+            force_tun_device: None,
         }
     }
 
@@ -7912,6 +8053,7 @@ mod tests {
             force_command: None,
             permit_open: None,
             permit_listen: None,
+            force_tun_device: None,
         });
         assert!(eff.pty_allowed());
         assert!(!eff.agent_forwarding_allowed());

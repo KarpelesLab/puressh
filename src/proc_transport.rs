@@ -278,6 +278,13 @@ impl Transport for ProcTransport {
         self.read_timeout = t;
         Ok(())
     }
+
+    /// The helper's stdout, so a shared connection waits for it without
+    /// holding its lock.
+    fn poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::AsFd;
+        self.stdout.as_fd().try_clone_to_owned().ok()
+    }
 }
 
 impl Drop for ProcTransport {

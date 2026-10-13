@@ -171,6 +171,28 @@ impl Agent {
         self.simple_request(&frame, "add-identity")
     }
 
+    /// Add `key` under the certificate `cert_blob` it is the key of (what
+    /// `ssh-add` does with a `-cert.pub` next to a key), forgotten after
+    /// `lifetime` seconds when given.
+    pub fn add_certificate(
+        &mut self,
+        key: &crate::key::PrivateKey,
+        cert_blob: &[u8],
+        lifetime: Option<u32>,
+    ) -> Result<()> {
+        let mut body = zeroize::Zeroizing::new(key.to_agent_add_cert_body(cert_blob));
+        let msg_type = match lifetime {
+            Some(t) => {
+                body.push(SSH_AGENT_CONSTRAIN_LIFETIME);
+                body.extend_from_slice(&t.to_be_bytes());
+                SSH_AGENTC_ADD_ID_CONSTRAINED
+            }
+            None => SSH_AGENTC_ADD_IDENTITY,
+        };
+        let frame = zeroize::Zeroizing::new(encode_message(msg_type, &body));
+        self.simple_request(&frame, "add-identity")
+    }
+
     /// Remove the identity whose public blob is `key_blob` (`ssh-add -d`).
     pub fn remove_identity(&mut self, key_blob: &[u8]) -> Result<()> {
         let mut w = crate::format::Writer::new();

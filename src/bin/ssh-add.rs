@@ -7,7 +7,8 @@
 //! Works with any agent speaking the standard protocol (puressh's
 //! `ssh-agent` or OpenSSH's), found through `$SSH_AUTH_SOCK`. Without files
 //! it adds the default identities (`~/.ssh/id_rsa`, `id_ecdsa`,
-//! `id_ed25519`) that exist. Exit status: 0 on success, 1 on failure, 2 if
+//! `id_ed25519`) that exist; a key's certificate (`<file>-cert.pub`) is
+//! added and removed along with it. Exit status: 0 on success, 1 on failure, 2 if
 //! the agent cannot be reached.
 
 #[cfg(not(unix))]
@@ -29,6 +30,7 @@ fn main() -> std::process::ExitCode {
 mod imp {
     use super::common;
     use puressh::agent::Agent;
+    use puressh::cert::Certificate;
     use puressh::key::{PrivateKey, PublicKey};
 
     const USAGE: &str = "usage: ssh-add [-cDdKkLlqvXx] [-E fingerprint_hash] [-H hostkey_file]\n               [-h destination_constraint] [-S provider] [-t life]\n               [file ...]\n       ssh-add -s pkcs11 [-Cv] [certificate ...]\n       ssh-add -e pkcs11\n       ssh-add -T pubkey ...";
@@ -153,6 +155,20 @@ mod imp {
         }
     }
 
+    /// The certificate next to the key at `path` (`path-cert.pub`), if
+    /// there is one.
+    fn load_cert(path: &str) -> Option<(String, Certificate)> {
+        let certpath = format!("{}-cert.pub", path.strip_suffix(".pub").unwrap_or(path));
+        let line = std::fs::read_to_string(&certpath).ok()?;
+        match Certificate::parse_openssh_line(line.trim()) {
+            Ok(c) => Some((certpath, c)),
+            Err(e) => {
+                eprintln!("Failed to load certificate \"{certpath}\": {e}");
+                None
+            }
+        }
+    }
+
     fn default_files() -> Vec<String> {
         let home = std::env::var("HOME").unwrap_or_default();
         ["id_rsa", "id_ecdsa", "id_ed25519"]
@@ -238,18 +254,26 @@ mod imp {
                 return 1;
             }
             for id in ids {
-                let Ok(pk) = PublicKey::parse_wire_blob(id.key_blob()) else {
+                // A certificate is listed by its key, labelled `-CERT`.
+                let cert = Certificate::parse(id.key_blob()).ok();
+                let blob = cert
+                    .as_ref()
+                    .map_or(id.key_blob(), |c| c.embedded_pubkey_blob());
+                let Ok(pk) = PublicKey::parse_wire_blob(blob) else {
                     continue;
                 };
                 if o.list_full {
-                    let mut line = pk.to_authorized_keys_line();
+                    let mut line = match &cert {
+                        Some(c) => c.to_openssh_line(""),
+                        None => pk.to_authorized_keys_line(),
+                    };
                     if !id.comment().is_empty() {
                         line = format!("{} {}", line.trim_end(), id.comment());
                     }
                     println!("{line}");
                 } else {
                     println!(
-                        "{} {} {} ({})",
+                        "{} {} {} ({}{})",
                         pk.bit_length(),
                         if o.md5 {
                             use purecrypto::hash::{Digest, Md5};
@@ -265,7 +289,8 @@ mod imp {
                         } else {
                             id.comment()
                         },
-                        label(&pk)
+                        label(&pk),
+                        if cert.is_some() { "-CERT" } else { "" }
                     );
                 }
             }
@@ -357,6 +382,16 @@ mod imp {
                         status = 1;
                     }
                 }
+                if let Some((certpath, cert)) = load_cert(path)
+                    && agent.remove_identity(&cert.raw).is_ok()
+                    && !o.quiet
+                {
+                    eprintln!(
+                        "Identity removed: {certpath} {}-CERT ({})",
+                        label(&pk),
+                        pk.comment()
+                    );
+                }
                 continue;
             }
             let key = match load_private(path) {
@@ -382,6 +417,32 @@ mod imp {
                 }
                 Err(_) => {
                     eprintln!("Could not add identity \"{path}\": agent refused operation");
+                    status = 1;
+                    continue;
+                }
+            }
+            // Like OpenSSH's, the certificate next to the key goes in too.
+            let Some((certpath, cert)) = load_cert(path) else {
+                continue;
+            };
+            if cert.embedded_pubkey_blob() != key.public_key().wire_blob() {
+                eprintln!("Certificate {certpath} does not match private key {path}");
+                continue;
+            }
+            match agent.add_certificate(&key, &cert.raw, o.lifetime) {
+                Ok(()) => {
+                    if !o.quiet {
+                        eprintln!("Certificate added: {certpath} ({})", cert.key_id);
+                        if let Some(t) = o.lifetime {
+                            eprintln!("Lifetime set to {t} seconds");
+                        }
+                    }
+                }
+                Err(_) => {
+                    eprintln!(
+                        "Certificate {certpath} ({}) add failed: agent refused operation",
+                        cert.key_id
+                    );
                     status = 1;
                 }
             }

@@ -370,6 +370,61 @@ impl PrivateKey {
         }
         w.into_vec()
     }
+
+    /// Encode the body of an `SSH_AGENTC_ADD_IDENTITY` request adding this
+    /// key under the certificate `cert_blob` (whose embedded key it must
+    /// be): `string cert-type`, `string certificate`, then the key's
+    /// private fields without those the certificate already carries
+    /// (OpenSSH's `sshkey_private_serialize` for a certificate key), and
+    /// the `string comment`.
+    pub fn to_agent_add_cert_body(&self, cert_blob: &[u8]) -> Vec<u8> {
+        let cert_type = crate::format::Reader::new(cert_blob)
+            .read_string()
+            .unwrap_or_default();
+        let mut w = Writer::new();
+        w.write_string(cert_type);
+        w.write_string(cert_blob);
+        let comment = match self {
+            PrivateKey::Ed25519 {
+                seed,
+                public,
+                comment,
+            } => {
+                w.write_string(public);
+                let mut sk: Zeroizing<[u8; 64]> = Zeroizing::new([0u8; 64]);
+                sk[..32].copy_from_slice(seed);
+                sk[32..].copy_from_slice(public);
+                w.write_string(&sk[..]);
+                comment
+            }
+            PrivateKey::MlDsa44Ed25519 { seeds, comment, .. } => {
+                w.write_string(seeds);
+                comment
+            }
+            PrivateKey::EcdsaP256 { d, comment, .. }
+            | PrivateKey::EcdsaP384 { d, comment, .. }
+            | PrivateKey::EcdsaP521 { d, comment, .. } => {
+                write_mpint(&mut w, d);
+                comment
+            }
+            PrivateKey::Rsa {
+                d,
+                p,
+                q,
+                iqmp,
+                comment,
+                ..
+            } => {
+                write_mpint(&mut w, d);
+                write_mpint(&mut w, iqmp);
+                write_mpint(&mut w, p);
+                write_mpint(&mut w, q);
+                comment
+            }
+        };
+        w.write_string(comment.as_bytes());
+        w.into_vec()
+    }
 }
 
 /// Encode the cleartext inner block (check-ints, private fields, comment,

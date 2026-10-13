@@ -189,7 +189,19 @@ impl AgentState {
 
     fn add(&mut self, body: &[u8], constrained: bool) -> Option<Vec<u8>> {
         let mut r = Reader::new(body);
-        let key = PrivateKey::from_agent_add_body(&mut r).ok()?;
+        let is_cert = Reader::new(body)
+            .read_string()
+            .ok()
+            .and_then(|t| core::str::from_utf8(t).ok())
+            .is_some_and(crate::cert::is_cert_name);
+        // A certificate is held as its own identity: listed and signed
+        // for under the certificate blob, with the key it certifies.
+        let (key, cert) = if is_cert {
+            let (key, cert) = PrivateKey::from_agent_add_cert_body(&mut r).ok()?;
+            (key, Some(cert))
+        } else {
+            (PrivateKey::from_agent_add_body(&mut r).ok()?, None)
+        };
         let mut lifetime = self.default_lifetime;
         if constrained {
             while !r.is_empty() {
@@ -207,7 +219,7 @@ impl AgentState {
         } else if !r.is_empty() {
             return None;
         }
-        let blob = key.public_key().wire_blob();
+        let blob = cert.unwrap_or_else(|| key.public_key().wire_blob());
         let comment = key.comment().to_string();
         let expires = lifetime.map(|d| Instant::now() + d);
         // Re-adding a key replaces it (new comment / lifetime).
@@ -296,6 +308,61 @@ mod tests {
         );
         // Unknown key.
         assert!(sign(&mut s, b"nope", b"data", 0).is_none());
+    }
+
+    #[test]
+    fn certificates_are_held_as_identities() {
+        let mut s = AgentState::new();
+        for (name, alg) in [
+            ("u_ed25519", "ssh-ed25519"),
+            ("u_ecdsa", "ecdsa-sha2-nistp256"),
+            ("u_ecdsa384", "ecdsa-sha2-nistp384"),
+            ("u_ecdsa521", "ecdsa-sha2-nistp521"),
+            ("u_rsa", "rsa-sha2-512"),
+        ] {
+            let key = fixture(name);
+            let path = format!(
+                "{}/tests/fixtures/cert/{name}-cert.pub",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let cert = crate::cert::Certificate::parse_openssh_line(
+                std::fs::read_to_string(path).unwrap().trim(),
+            )
+            .unwrap();
+            let body = key.to_agent_add_cert_body(&cert.raw);
+            assert_eq!(
+                s.handle(&msg(SSH_AGENTC_ADD_IDENTITY, &body))[0],
+                SSH_AGENT_SUCCESS,
+                "{name}"
+            );
+            // Signed for under the certificate, with its key.
+            let sig = sign(&mut s, &cert.raw, b"data", 4).unwrap();
+            crate::hostkey::host_key_verify_by_name(alg, cert.embedded_pubkey_blob())
+                .unwrap()
+                .verify(b"data", &sig)
+                .unwrap();
+        }
+        assert_eq!(count(&mut s), 5);
+        // A certificate sent with another key's private half is refused.
+        let cert_line = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/cert/u_ed25519-cert.pub",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let cert = crate::cert::Certificate::parse_openssh_line(cert_line.trim()).unwrap();
+        let PrivateKey::Ed25519 { public, .. } = fixture("u_ed25519") else {
+            unreachable!()
+        };
+        let other = PrivateKey::Ed25519 {
+            seed: [7; 32],
+            public,
+            comment: String::new(),
+        };
+        let body = other.to_agent_add_cert_body(&cert.raw);
+        assert_eq!(
+            s.handle(&msg(SSH_AGENTC_ADD_IDENTITY, &body))[0],
+            SSH_AGENT_FAILURE
+        );
     }
 
     #[test]

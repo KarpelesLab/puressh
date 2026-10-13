@@ -49,6 +49,23 @@ impl AgentHostKey {
             "ssh-rsa" => ("rsa-sha2-256", SSH_AGENT_RSA_SHA2_256),
             "rsa-sha2-256" => ("rsa-sha2-256", SSH_AGENT_RSA_SHA2_256),
             "rsa-sha2-512" => ("rsa-sha2-512", SSH_AGENT_RSA_SHA2_512),
+            // A certificate (`ssh-add` adds a key's next to it): offered
+            // under its own name, signed by the agent with its key.
+            "ssh-rsa-cert-v01@openssh.com" => {
+                ("rsa-sha2-256-cert-v01@openssh.com", SSH_AGENT_RSA_SHA2_256)
+            }
+            other if crate::cert::is_cert_name(other) => {
+                match crate::cert::cert_name_to_plain(other)
+                    .and_then(crate::cert::cert_name_for_key_type)
+                {
+                    Some(name) => (name, 0),
+                    None => {
+                        return Err(crate::error::Error::Format(
+                            "agent identity blob: unsupported certificate",
+                        ));
+                    }
+                }
+            }
             other => {
                 return Err(crate::error::Error::Format({
                     let _ = other;
@@ -109,10 +126,12 @@ impl HostKey for AgentHostKey {
             agent.sign(&self.key_blob, msg, self.flags)?
         };
         // Sanity-check that the agent returned a signature blob whose
-        // inner algorithm matches what we advertised; otherwise the
-        // userauth verifier on the far side will reject the signature.
+        // inner algorithm matches what we advertised (a certificate's
+        // signature is its key's); otherwise the userauth verifier on the
+        // far side will reject the signature.
+        let expected = crate::cert::cert_name_to_plain(self.algorithm).unwrap_or(self.algorithm);
         if let Some(algo) = first_string(&sig_blob)
-            && algo != self.algorithm
+            && algo != expected
         {
             return Err(crate::error::Error::Protocol(
                 "agent: signature algorithm mismatch",
@@ -132,9 +151,11 @@ impl HostKey for AgentHostKey {
     /// * `rsa-sha2-512` stays put — it's already the strongest variant.
     /// * Ed25519 / ECDSA agent identities have nothing to upgrade to.
     fn upgraded_for(&self, server_sig_algs: &str) -> Option<Box<dyn HostKey>> {
-        if self.algorithm != "rsa-sha2-256" {
-            return None;
-        }
+        let upgraded = match self.algorithm {
+            "rsa-sha2-256" => "rsa-sha2-512",
+            "rsa-sha2-256-cert-v01@openssh.com" => "rsa-sha2-512-cert-v01@openssh.com",
+            _ => return None,
+        };
         let advertises_512 = server_sig_algs
             .split(',')
             .any(|a| a.trim() == "rsa-sha2-512");
@@ -144,7 +165,7 @@ impl HostKey for AgentHostKey {
         Some(Box::new(AgentHostKey {
             agent: Arc::clone(&self.agent),
             key_blob: self.key_blob.clone(),
-            algorithm: "rsa-sha2-512",
+            algorithm: upgraded,
             flags: SSH_AGENT_RSA_SHA2_512,
         }))
     }

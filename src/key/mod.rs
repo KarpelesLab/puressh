@@ -1129,6 +1129,87 @@ impl PrivateKey {
         pk.check_consistency()?;
         Ok(pk)
     }
+
+    /// Decode the key of an agent `SSH_AGENTC_ADD_IDENTITY` request adding
+    /// a certificate (the layout [`Self::to_agent_add_cert_body`]
+    /// produces), returning the key and the certificate blob. The private
+    /// fields are checked against the certificate's embedded key.
+    #[cfg(all(feature = "std", unix))]
+    pub(crate) fn from_agent_add_cert_body(r: &mut Reader<'_>) -> Result<(Self, Vec<u8>)> {
+        let cert_type = r.read_string()?;
+        let cert_blob = r.read_string()?.to_vec();
+        let cert = crate::cert::Certificate::parse(&cert_blob)?;
+        if cert.key_type.as_bytes() != cert_type {
+            return Err(Error::Format("agent certificate: type mismatch"));
+        }
+        let embedded = cert.embedded_pubkey_blob().to_vec();
+        let pk = match PublicKey::parse_wire_blob(&embedded)? {
+            PublicKey::Ed25519 { raw, .. } => {
+                let pub_raw = r.read_string()?;
+                let sk = r.read_string()?;
+                if pub_raw != raw || sk.len() != 64 || sk[32..] != raw {
+                    return Err(Error::Format("ed25519: certificate key mismatch"));
+                }
+                let mut seed = [0u8; 32];
+                seed.copy_from_slice(&sk[..32]);
+                PrivateKey::Ed25519 {
+                    seed,
+                    public: raw,
+                    comment: String::new(),
+                }
+            }
+            PublicKey::MlDsa44Ed25519 { raw, .. } => {
+                let sk = r.read_string()?;
+                if sk.len() != 64 {
+                    return Err(Error::Format("mldsa44-ed25519: secret length"));
+                }
+                let mut seeds = [0u8; 64];
+                seeds.copy_from_slice(sk);
+                PrivateKey::MlDsa44Ed25519 {
+                    seeds,
+                    public: raw,
+                    comment: String::new(),
+                }
+            }
+            PublicKey::EcdsaP256 { point, .. } => PrivateKey::EcdsaP256 {
+                d: read_mpint(r)?.to_vec(),
+                point,
+                comment: String::new(),
+            },
+            PublicKey::EcdsaP384 { point, .. } => PrivateKey::EcdsaP384 {
+                d: read_mpint(r)?.to_vec(),
+                point,
+                comment: String::new(),
+            },
+            PublicKey::EcdsaP521 { point, .. } => PrivateKey::EcdsaP521 {
+                d: read_mpint(r)?.to_vec(),
+                point,
+                comment: String::new(),
+            },
+            PublicKey::Rsa { n, e, .. } => {
+                let d = read_mpint(r)?.to_vec();
+                let iqmp = read_mpint(r)?.to_vec();
+                let p = read_mpint(r)?.to_vec();
+                let q = read_mpint(r)?.to_vec();
+                PrivateKey::Rsa {
+                    n,
+                    e,
+                    d,
+                    p,
+                    q,
+                    iqmp,
+                    comment: String::new(),
+                }
+            }
+        };
+        let comment = String::from_utf8_lossy(r.read_string()?).into_owned();
+        let pk = attach_comment(pk, comment);
+        pk.check_consistency()?;
+        if pk.public_key().wire_blob() != embedded {
+            return Err(Error::Format("agent certificate: key mismatch"));
+        }
+        Ok((pk, cert_blob))
+    }
 }
 
 fn parse_private_fields(r: &mut Reader<'_>) -> Result<PrivateKey> {

@@ -211,6 +211,15 @@ impl Signature {
         Self::from_blob(&crate::key::base64_decode(b64.as_bytes())?)
     }
 
+    /// Whether the signing key is a certificate.
+    pub fn is_certificate(&self) -> bool {
+        Reader::new(&self.public_key)
+            .read_string()
+            .ok()
+            .and_then(|t| core::str::from_utf8(t).ok())
+            .is_some_and(crate::cert::is_cert_name)
+    }
+
     /// Check the signature over a message digest (made with [`Self::hash`])
     /// for `namespace`, against the embedded public key. Deciding whether
     /// that key is *trusted* is the caller's job (`allowed_signers`).
@@ -218,7 +227,15 @@ impl Signature {
         if namespace != self.namespace {
             return Err(Error::BadSignature);
         }
-        let key_alg = Reader::new(&self.public_key).read_string()?;
+        // A certificate signs with the key it certifies.
+        let cert;
+        let key_blob = if self.is_certificate() {
+            cert = crate::cert::Certificate::parse(&self.public_key)?;
+            cert.embedded_pubkey_blob()
+        } else {
+            &self.public_key[..]
+        };
+        let key_alg = Reader::new(key_blob).read_string()?;
         let sig_alg = Reader::new(&self.signature).read_string()?;
         let sig_alg = core::str::from_utf8(sig_alg).map_err(|_| Error::BadSignature)?;
         // OpenSSH refuses SHA-1 RSA signatures here.
@@ -229,7 +246,7 @@ impl Signature {
         if !family_ok {
             return Err(Error::BadSignature);
         }
-        let verifier = crate::hostkey::host_key_verify_by_name(sig_alg, &self.public_key)?;
+        let verifier = crate::hostkey::host_key_verify_by_name(sig_alg, key_blob)?;
         verifier.verify(
             &signed_data(namespace, self.hash, message_digest),
             &self.signature,
@@ -430,6 +447,44 @@ impl AllowedSigner {
     /// Whether this (plain, non-CA) entry is `public_key`, valid at `now`.
     pub fn is_key(&self, public_key: &[u8], now: i64) -> bool {
         !self.cert_authority && self.public_key == public_key && self.valid_at(now)
+    }
+
+    /// For a `cert-authority` entry: the principals of the user
+    /// certificate `public_key` that this CA vouches for at `now` — the
+    /// certificate is signed by the entry's key, valid then, and its
+    /// principals that match the entry's patterns are returned (OpenSSH's
+    /// `cert_filter_principals`). `None` when the entry does not apply.
+    pub fn certified_principals(&self, public_key: &[u8], now: i64) -> Option<Vec<String>> {
+        if !self.cert_authority || !self.valid_at(now) {
+            return None;
+        }
+        let cert = crate::cert::Certificate::parse(public_key).ok()?;
+        if cert.signature_key_blob != self.public_key
+            || cert.check_type(crate::cert::CertType::User).is_err()
+            || cert.check_validity(u64::try_from(now).ok()?).is_err()
+            || cert
+                .verify_ca_signature(crate::config::algos::CA_SIGNATURE_DEFAULTS)
+                .is_err()
+        {
+            return None;
+        }
+        let principals: Vec<String> = cert
+            .valid_principals
+            .iter()
+            .filter(|p| pattern_list_matches(&self.principals, p))
+            .cloned()
+            .collect();
+        (!principals.is_empty()).then_some(principals)
+    }
+
+    /// Whether this entry lets `principal` sign with `public_key` at `now`:
+    /// the key itself, or a user certificate for `principal` from this CA.
+    pub fn accepts(&self, public_key: &[u8], principal: &str, now: i64) -> bool {
+        self.matches_principal(principal)
+            && (self.is_key(public_key, now)
+                || self
+                    .certified_principals(public_key, now)
+                    .is_some_and(|ps| ps.iter().any(|p| p == principal)))
     }
 }
 

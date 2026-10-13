@@ -370,26 +370,23 @@ fn crossload_sftp(cli: &Cli, from: &Remote, to: &Remote, errs: &mut u32) {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// The remote command for the legacy protocol.
+/// The remote command for the legacy protocol, as OpenSSH sends it: one
+/// argument (`scp [-v] [-r] [-p] -t [-- ]path`), the path left for the
+/// remote shell to expand, `--` only before a path starting with `-`.
 fn legacy_cmd(cli: &Cli, mode: &str, path: &str) -> Vec<String> {
-    let mut cmd = vec!["scp".to_string()];
+    let mut cmd = String::from("scp");
     if cli.verbose {
-        cmd.push("-v".into());
+        cmd.push_str(" -v");
     }
     if cli.xfer.recursive {
-        cmd.push("-r".into());
+        cmd.push_str(" -r");
     }
     if cli.xfer.preserve {
-        cmd.push("-p".into());
+        cmd.push_str(" -p");
     }
-    cmd.push(mode.into());
-    cmd.push("--".into());
-    cmd.push(if path.is_empty() {
-        ".".into()
-    } else {
-        path.into()
-    });
-    cmd
+    let path = if path.is_empty() { "." } else { path };
+    let dashes = if path.starts_with('-') { "-- " } else { "" };
+    vec![format!("{cmd} {mode} {dashes}{path}")]
 }
 
 fn legacy_pipe(cli: &Cli, r: &Remote, mode: &str) -> Result<SshPipe, String> {

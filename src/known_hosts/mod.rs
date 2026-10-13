@@ -31,7 +31,7 @@
 #![cfg(feature = "std")]
 
 pub(crate) mod format;
-mod hash;
+pub mod hash;
 mod revoked;
 mod store;
 

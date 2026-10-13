@@ -30,7 +30,6 @@ use std::process::ExitCode;
 
 use purecrypto::rng::{OsRng, RngCore};
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
-use puressh::known_hosts::KnownHosts;
 use zeroize::Zeroizing;
 
 /// Open a file with `create_new` semantics, applying the requested Unix mode
@@ -166,10 +165,8 @@ struct Args {
     /// `-r host`: print SSHFP records (`-g`: generic format).
     sshfp: Option<String>,
     sshfp_generic: bool,
-    /// `-p` (in known_hosts mode means port — but ssh-keygen historically
-    /// uses `host` directly; we accept `[host]:port` syntax via the
-    /// pattern matcher instead and don't reuse `-p`).
-    port: u16,
+    /// `-M generate|screen`: moduli generation / screening.
+    moduli: Option<String>,
 }
 
 /// Split getopt-style arguments as OpenSSH's ssh-keygen takes them: flags
@@ -218,10 +215,7 @@ fn split_getopt(args: &[String]) -> Vec<String> {
 
 fn parse_args(args: &[String]) -> Result<Args, String> {
     let args = &split_getopt(args)[..];
-    let mut out = Args {
-        port: 22,
-        ..Args::default()
-    };
+    let mut out = Args { ..Args::default() };
     let mut i = 0;
     let max = args.len() + 1;
     let mut guard = 0;
@@ -301,6 +295,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             "-C" => {
                 i += 1;
                 out.comment = Some(args.get(i).ok_or("-C requires a value")?.clone());
+            }
+            "-M" => {
+                i += 1;
+                out.moduli = Some(args.get(i).ok_or("-M requires a value")?.clone());
             }
             "-f" => {
                 i += 1;
@@ -421,14 +419,81 @@ fn write_private(path: &str, contents: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Write a public key file, replacing one already there (OpenSSH's
+/// `sshkey_save_public`: only the private key is asked about).
 fn write_public(path: &str, contents: &str) -> Result<(), String> {
-    if Path::new(path).exists() {
-        return Err(format!("{path} already exists"));
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o644);
     }
-    let mut f = open_create_new(path, 0o644).map_err(|e| format!("open {path}: {e}"))?;
+    let mut f = opts.open(path).map_err(|e| format!("open {path}: {e}"))?;
     f.write_all(contents.as_bytes())
         .map_err(|e| format!("write {path}: {e}"))?;
     Ok(())
+}
+
+/// OpenSSH's `sshkey_load_public`: `path` as a public key, else
+/// `path.pub`, else the public half of the private key at `path`.
+fn load_public_any(path: &str) -> Result<PublicKey, String> {
+    let text = read_to_string(path)?;
+    if let Ok(pk) = PublicKey::parse_authorized_keys_line(text.trim()) {
+        return Ok(pk);
+    }
+    if let Ok(pubtext) = fs::read_to_string(format!("{path}.pub"))
+        && let Ok(pk) = PublicKey::parse_authorized_keys_line(pubtext.trim())
+    {
+        return Ok(pk);
+    }
+    PrivateKey::public_key_from_pem(&text).map_err(|e| format!("{path}: {e}"))
+}
+
+/// OpenSSH's `read_passphrase(prompt, RP_ALLOW_STDIN)` askpass rules: the
+/// helper (`$SSH_ASKPASS`, else `/usr/bin/ssh-askpass`) is used with
+/// `SSH_ASKPASS_REQUIRE=force`, or when a display is available and either
+/// `SSH_ASKPASS_REQUIRE=prefer` or stdin is not a terminal; `never` rules
+/// it out. A helper that fails answers with an empty passphrase.
+fn askpass(prompt: &str) -> Option<Zeroizing<String>> {
+    use std::io::IsTerminal;
+    let set = |v: &str| std::env::var_os(v).is_some_and(|s| !s.is_empty());
+    let mut allow = set("DISPLAY") || set("WAYLAND_DISPLAY");
+    let mut use_it = false;
+    match std::env::var("SSH_ASKPASS_REQUIRE")
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "force" => {
+            use_it = true;
+            allow = true;
+        }
+        "prefer" => use_it = allow,
+        "never" => allow = false,
+        _ => {}
+    }
+    if !std::io::stdin().is_terminal() {
+        use_it = true;
+    }
+    if !(use_it && allow) {
+        return None;
+    }
+    let helper = std::env::var_os("SSH_ASKPASS")
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/usr/bin/ssh-askpass".into());
+    let out = std::process::Command::new(helper)
+        .arg(prompt)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .output();
+    let answer = match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            text.split(['\r', '\n']).next().unwrap_or("").to_string()
+        }
+        _ => String::new(),
+    };
+    Some(Zeroizing::new(answer))
 }
 
 /// Prompt the user for a passphrase. Returns a [`Zeroizing<String>`] so
@@ -436,6 +501,9 @@ fn write_public(path: &str, contents: &str) -> Result<(), String> {
 /// bit is cleared via `tcsetattr` and restored via a `Drop` guard,
 /// matching OpenSSH ssh-keygen behaviour.
 fn read_passphrase_interactive(prompt: &str) -> Result<Zeroizing<String>, String> {
+    if let Some(answer) = askpass(prompt) {
+        return Ok(answer);
+    }
     eprint!("{prompt}");
     let _ = std::io::stderr().flush();
 
@@ -573,6 +641,41 @@ fn load_public(path: &str) -> Result<PublicKey, String> {
     Ok(pk.public_key())
 }
 
+/// The key `-l` fingerprints, as OpenSSH's `fingerprint_private`: a public
+/// key file, else the private key's `.pub` (with its comment), else its
+/// public half; the comment then comes from the private key when it can
+/// be read without a passphrase.
+fn fingerprint_key(path: &str) -> Result<PublicKey, String> {
+    let text = read_to_string(path)?;
+    if let Ok(pk) = PublicKey::parse_authorized_keys_line(text.trim()) {
+        return Ok(pk);
+    }
+    let from_pub = fs::read_to_string(format!("{path}.pub"))
+        .ok()
+        .and_then(|t| PublicKey::parse_authorized_keys_line(t.trim()).ok());
+    if let Some(pk) = &from_pub
+        && !pk.comment().is_empty()
+    {
+        return Ok(pk.clone());
+    }
+    match PrivateKey::parse_pem(&text, None) {
+        Ok(sk) => {
+            let pk = from_pub.unwrap_or_else(|| sk.public_key());
+            if sk.comment().is_empty() {
+                return Ok(pk);
+            }
+            let full = pk.to_authorized_keys_line();
+            let bare: Vec<&str> = full.split_whitespace().take(2).collect();
+            let line = format!("{} {}", bare.join(" "), sk.comment());
+            Ok(PublicKey::parse_authorized_keys_line(&line).unwrap_or(pk))
+        }
+        Err(_) => from_pub
+            .map(Ok)
+            .unwrap_or_else(|| PrivateKey::public_key_from_pem(&text))
+            .map_err(|_| format!("{path} is not a key file.")),
+    }
+}
+
 fn ensure_file_in(file: &Option<String>) -> Result<String, String> {
     file.clone().ok_or_else(|| "-f is required".into())
 }
@@ -591,7 +694,19 @@ fn ask(prompt: &str) -> Option<String> {
 
 fn run_generate(args: &Args) -> Result<i32, String> {
     // OpenSSH's default type is Ed25519.
-    let ty = args.type_.as_deref().unwrap_or("ed25519").to_lowercase();
+    // A short name (any case) or a key algorithm name, as OpenSSH's
+    // `sshkey_type_from_shortname`; an ECDSA algorithm name also picks the
+    // curve when `-b` does not.
+    let named = args.type_.as_deref().unwrap_or("ed25519");
+    let (ty, curve_bits) = match named {
+        "ssh-ed25519" => ("ed25519".to_string(), None),
+        "ssh-mldsa44-ed25519@openssh.com" => ("mldsa44-ed25519".to_string(), None),
+        "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => ("rsa".to_string(), None),
+        "ecdsa-sha2-nistp256" => ("ecdsa".to_string(), Some(256)),
+        "ecdsa-sha2-nistp384" => ("ecdsa".to_string(), Some(384)),
+        "ecdsa-sha2-nistp521" => ("ecdsa".to_string(), Some(521)),
+        other => (other.to_lowercase(), None),
+    };
     if !args.quiet {
         println!("Generating public/private {ty} key pair.");
     }
@@ -637,7 +752,7 @@ fn run_generate(args: &Args) -> Result<i32, String> {
         "ed25519" => PrivateKey::generate_ed25519(&mut rng, comment),
         "mldsa44-ed25519" => PrivateKey::generate_mldsa44_ed25519(&mut rng, comment),
         "ecdsa" => {
-            let bits = args.bits.unwrap_or(256);
+            let bits = args.bits.or(curve_bits).unwrap_or(256);
             let curve = match bits {
                 256 => EcdsaCurve::P256,
                 384 => EcdsaCurve::P384,
@@ -876,7 +991,7 @@ fn run_fingerprint(args: &Args) -> Result<i32, String> {
     // A key file, or every key line of an authorized_keys / known_hosts
     // style file.
     // (key, the comment to show: a known_hosts line's host field).
-    let keys: Vec<(PublicKey, Option<String>)> = match load_public(&file) {
+    let keys: Vec<(PublicKey, Option<String>)> = match fingerprint_key(&file) {
         Ok(pk) => vec![(pk, None)],
         Err(e) => {
             let text = read_to_string(&file)?;
@@ -1125,94 +1240,326 @@ fn resolve_known_hosts_path(args: &Args) -> Result<String, String> {
     Ok(format!("{home}/.ssh/known_hosts"))
 }
 
-/// `[host]:port` → (`host`, port); anything else is a host on `port`.
-fn split_host_port(spec: &str, port: u16) -> (&str, u16) {
-    if let Some(rest) = spec.strip_prefix('[')
-        && let Some((h, p)) = rest.split_once("]:")
-        && let Ok(p) = p.parse()
-    {
-        return (h, p);
-    }
-    (spec, port)
+/// What OpenSSH's `hostkeys_foreach` makes of a known_hosts line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum KhStatus {
+    Comment,
+    Ok,
+    Matched,
+    Invalid,
 }
 
-/// The lines of a known_hosts file that are entries for `host`: (1-based
-/// line number, marker: `CA` / `REVOKED` / ``).
-fn known_hosts_matches(text: &str, host: &str, port: u16) -> Vec<(usize, &'static str)> {
-    use puressh::known_hosts::Marker;
-    let (host, port) = split_host_port(host, port);
+/// One known_hosts line, as OpenSSH's `hostkeys_foreach` hands it on.
+struct KhLine<'a> {
+    num: usize,
+    line: &'a str,
+    status: KhStatus,
+    /// `CA` / `REVOKED`, or empty.
+    marker: &'static str,
+    hosts: &'a str,
+    /// The key and what follows it.
+    rawkey: &'a str,
+    /// Parsed when asked for (fingerprints).
+    key: Option<PublicKey>,
+}
+
+/// Key type names OpenSSH knows (`sshkey_type_from_name`), for lines whose
+/// key is not parsed.
+fn known_key_type(name: &str) -> bool {
+    name.starts_with("ssh-ed25519")
+        || name.starts_with("ecdsa-sha2-nistp")
+        || name.starts_with("ssh-rsa")
+        || name.starts_with("rsa-sha2-")
+        || name.starts_with("sk-ecdsa-sha2-nistp256")
+        || name.starts_with("sk-ssh-ed25519")
+        || name.starts_with("ssh-mldsa44-ed25519")
+        || name.starts_with("webauthn-sk-")
+}
+
+/// `*` / `?` glob, ASCII case-insensitive.
+fn kh_glob(pat: &[u8], s: &[u8]) -> bool {
+    let (mut p, mut i, mut star, mut mark) = (0usize, 0usize, None, 0usize);
+    while i < s.len() {
+        if p < pat.len() && (pat[p] == b'?' || pat[p].eq_ignore_ascii_case(&s[i])) {
+            p += 1;
+            i += 1;
+        } else if p < pat.len() && pat[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            mark = i;
+        } else if let Some(sp) = star {
+            p = sp + 1;
+            mark += 1;
+            i = mark;
+        } else {
+            return false;
+        }
+    }
+    while p < pat.len() && pat[p] == b'*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// OpenSSH's `match_maybe_hashed`: `Some(true)` when `host` is one of
+/// `hosts` (a `|1|salt|hash` token, or a pattern list where a negated
+/// match wins), `None` for a malformed hash.
+fn kh_match(host: &str, hosts: &str) -> Option<bool> {
+    use puressh::known_hosts::hash::{check_hashed, parse_hashed};
+    if hosts.starts_with('|') {
+        let (salt, tag) = parse_hashed(hosts)?;
+        return Some(check_hashed(&salt, &tag, host, 22));
+    }
+    let host = host.to_ascii_lowercase();
+    let mut matched = false;
+    for pat in hosts.split(',') {
+        let (neg, pat) = match pat.strip_prefix('!') {
+            Some(p) => (true, p),
+            None => (false, pat),
+        };
+        if kh_glob(pat.as_bytes(), host.as_bytes()) {
+            if neg {
+                return Some(false);
+            }
+            matched = true;
+        }
+    }
+    Some(matched)
+}
+
+/// OpenSSH's `hostkeys_foreach` over `text`: with `host`, lines are
+/// matched against it, and with `want_match` only matching ones are
+/// returned; `parse_key` parses each line's key.
+fn kh_scan<'a>(
+    text: &'a str,
+    host: Option<&str>,
+    want_match: bool,
+    parse_key: bool,
+) -> Vec<KhLine<'a>> {
+    let ws = |c: char| c == ' ' || c == '\t';
     let mut out = Vec::new();
     for (i, line) in text.lines().enumerate() {
-        let t = line.trim_start();
-        if t.is_empty() || t.starts_with('#') {
+        let mut l = KhLine {
+            num: i + 1,
+            line,
+            status: KhStatus::Ok,
+            marker: "",
+            hosts: "",
+            rawkey: "",
+            key: None,
+        };
+        let mut cp = line.trim_start_matches(ws);
+        if cp.is_empty() || cp.starts_with('#') {
+            if !want_match {
+                l.status = KhStatus::Comment;
+                out.push(l);
+            }
             continue;
         }
-        let one = KnownHosts::from_bytes(line.as_bytes());
-        if let Some(e) = one.find(host, port).first() {
-            let marker = match e.marker {
-                Some(Marker::CertAuthority) => "CA",
-                Some(Marker::Revoked) => "REVOKED",
-                _ => "",
-            };
-            out.push((i + 1, marker));
+        let bad = |mut l: KhLine<'a>, out: &mut Vec<KhLine<'a>>| {
+            l.status = KhStatus::Invalid;
+            out.push(l);
+        };
+        if cp.starts_with('@') {
+            let (m, rest) = cp.split_at(cp.find(ws).unwrap_or(cp.len()));
+            match m {
+                "@cert-authority" if !rest.is_empty() => l.marker = "CA",
+                "@revoked" if !rest.is_empty() => l.marker = "REVOKED",
+                _ => {
+                    if !want_match {
+                        bad(l, &mut out);
+                    }
+                    continue;
+                }
+            }
+            cp = rest.trim_start_matches(ws);
         }
+        let Some(end) = cp.find(ws) else {
+            if !want_match {
+                bad(l, &mut out);
+            }
+            continue;
+        };
+        l.hosts = &cp[..end];
+        if let Some(h) = host {
+            match kh_match(h, l.hosts) {
+                None => {
+                    bad(l, &mut out);
+                    continue;
+                }
+                Some(true) => l.status = KhStatus::Matched,
+                Some(false) => {}
+            }
+            if want_match && l.status != KhStatus::Matched {
+                continue;
+            }
+        }
+        let rest = cp[end..].trim_start_matches(ws);
+        if rest.is_empty() || rest.starts_with('#') {
+            bad(l, &mut out);
+            continue;
+        }
+        l.rawkey = rest;
+        if parse_key {
+            match PublicKey::parse_authorized_keys_line(rest) {
+                Ok(k) => l.key = Some(k),
+                Err(_) => {
+                    bad(l, &mut out);
+                    continue;
+                }
+            }
+        } else {
+            let tl = rest.find(ws).unwrap_or(rest.len());
+            let ktype = &rest[..tl];
+            let after = rest[tl..].trim_start_matches(ws);
+            if tl <= 1 || tl >= 128 || tl == rest.len() {
+                bad(l, &mut out);
+                continue;
+            }
+            if !known_key_type(ktype) || after.is_empty() || after.starts_with('#') {
+                bad(l, &mut out);
+                continue;
+            }
+        }
+        out.push(l);
     }
     out
 }
 
-/// `-R host`: remove the host's lines, as OpenSSH: each found line is
-/// reported, the original is kept as `<file>.old`.
+/// A fresh `|1|salt|hash` for `host`.
+fn kh_hash(host: &str) -> String {
+    let mut salt = [0u8; 20];
+    OsRng.fill_bytes(&mut salt);
+    puressh::known_hosts::hash::encode_hashed(&salt, host)
+}
+
+/// OpenSSH's `known_hosts_hash` for one line: hashed lines, ones with
+/// wildcards or a marker are kept; otherwise each of its names becomes a
+/// hashed line of its own. Returns the lines to write and whether any
+/// names were hashed.
+fn kh_hash_line(l: &KhLine<'_>, path: &str, find: bool) -> (Vec<String>, bool) {
+    let has_wild = l.hosts.contains(['*', '?', '!']);
+    let was_hashed = l.hosts.starts_with('|');
+    match l.status {
+        KhStatus::Ok | KhStatus::Matched => {
+            if was_hashed || has_wild || !l.marker.is_empty() {
+                if has_wild && !find {
+                    let shown: String = l.hosts.chars().take(64).collect();
+                    eprintln!(
+                        "{path}:{}: ignoring host name with wildcard: {shown}",
+                        l.num
+                    );
+                }
+                return (vec![l.line.to_string()], false);
+            }
+            let lines: Vec<String> = l
+                .hosts
+                .split(',')
+                .take_while(|h| !h.is_empty())
+                .map(|h| format!("{} {}", kh_hash(&h.to_ascii_lowercase()), l.rawkey))
+                .collect();
+            let any = !lines.is_empty();
+            (lines, any)
+        }
+        _ => (vec![l.line.to_string()], false),
+    }
+}
+
+/// Replace `path` with `contents`, keeping the original as `path.old`, and
+/// say so, as OpenSSH's `do_known_hosts`.
+fn kh_replace(path: &str, contents: &str) -> Result<(), String> {
+    let old = format!("{path}.old");
+    let tmp = format!("{path}.{:010}", OsRng.next_u32());
+    std::fs::write(&tmp, contents).map_err(|e| format!("{tmp}: {}", io_reason(&e)))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    let _ = std::fs::remove_file(&old);
+    if let Err(e) = std::fs::hard_link(path, &old) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("link {path} to {old}: {}", io_reason(&e)));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        let _ = std::fs::remove_file(&old);
+        return Err(format!("rename\"{tmp}\" to \"{path}\": {}", io_reason(&e)));
+    }
+    println!("{path} updated.");
+    println!("Original contents retained as {old}");
+    Ok(())
+}
+
+/// The refusal for a known_hosts file with invalid lines.
+fn kh_invalid(path: &str, inplace: bool) -> i32 {
+    eprintln!("{path} is not a valid known_hosts file.");
+    if inplace {
+        eprintln!("Not replacing existing known_hosts file because of errors");
+    }
+    1
+}
+
+/// `-R host`: remove the host's lines (not `@cert-authority` /
+/// `@revoked` ones), as OpenSSH: the original is kept as `<file>.old`.
 fn run_known_hosts_remove(args: &Args, host: &str) -> Result<i32, String> {
     let path = resolve_known_hosts_path(args)?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
-    let matches = known_hosts_matches(&text, host, args.port);
-    if matches.is_empty() {
-        eprintln!("Host {host} not found in {path}\r");
+    let mut kept = String::with_capacity(text.len());
+    let (mut found, mut invalid) = (false, false);
+    for l in kh_scan(&text, Some(host), false, false) {
+        if l.status == KhStatus::Matched && l.marker.is_empty() {
+            found = true;
+            if !args.quiet {
+                println!("# Host {host} found: line {}", l.num);
+            }
+            continue;
+        }
+        if l.status == KhStatus::Invalid {
+            invalid = true;
+            eprintln!("{path}:{}: invalid line", l.num);
+        }
+        kept.push_str(l.line);
+        kept.push('\n');
+    }
+    if invalid {
+        return Ok(kh_invalid(&path, true));
+    }
+    if !found {
+        eprintln!("Host {host} not found in {path}");
         return Ok(0);
     }
-    let gone: Vec<usize> = matches.iter().map(|(n, _)| *n).collect();
-    let mut kept = String::with_capacity(text.len());
-    for (i, line) in text.lines().enumerate() {
-        if !gone.contains(&(i + 1)) {
-            kept.push_str(line);
-            kept.push('\n');
-        }
-    }
-    let old = format!("{path}.old");
-    std::fs::copy(&path, &old).map_err(|e| format!("{old}: {}", io_reason(&e)))?;
-    let tmp = format!("{path}.XXXXXXXXXX");
-    std::fs::write(&tmp, kept).map_err(|e| format!("{tmp}: {}", io_reason(&e)))?;
-    if let Ok(meta) = std::fs::metadata(&old) {
-        let _ = std::fs::set_permissions(&tmp, meta.permissions());
-    }
-    std::fs::rename(&tmp, &path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
-    if !args.quiet {
-        for n in gone {
-            println!("# Host {host} found: line {n}");
-        }
-        println!("{path} updated.");
-        println!("Original contents retained as {old}");
-    }
+    kh_replace(&path, &kept)?;
     Ok(0)
 }
 
-/// `-F host`: print the host's lines as written, each after OpenSSH's
-/// `# Host … found: line N` header (`-q`: lines only). Exit 1 if none.
+/// `-F host`: print the host's lines, each after OpenSSH's `# Host …
+/// found: line N` header (`-q`: lines only); `-H` prints them hashed and
+/// `-l` as fingerprints. Exit 1 if none.
 fn run_known_hosts_find(args: &Args, host: &str) -> Result<i32, String> {
     let path = resolve_known_hosts_path(args)?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
-    let matches = known_hosts_matches(&text, host, args.port);
-    if matches.is_empty() {
-        return Ok(1);
-    }
-    let lines: Vec<&str> = text.lines().collect();
-    for (n, marker) in matches {
-        if !args.quiet {
-            println!("# Host {host} found: line {n} {marker}");
+    let mut found = false;
+    for l in kh_scan(&text, Some(host), true, args.fingerprint) {
+        if l.status != KhStatus::Matched {
+            continue;
         }
-        println!("{}", lines[n - 1]);
+        found = true;
+        if !args.quiet {
+            println!("# Host {host} found: line {} {}", l.num, l.marker);
+        }
+        if args.hash_all {
+            for line in kh_hash_line(&l, &path, true).0 {
+                println!("{line}");
+            }
+        } else if let Some(pk) = l.key.as_ref().filter(|_| args.fingerprint) {
+            let fp = fingerprint_text(pk, args)?;
+            let comment = pk.comment();
+            let sep = if comment.is_empty() { "" } else { " " };
+            println!("{host} {} {fp}{sep}{comment}", algorithm_label(pk));
+        } else {
+            println!("{}", l.line);
+        }
     }
-    Ok(0)
+    Ok(if found { 0 } else { 1 })
 }
 
 /// An I/O error as OpenSSH words it (`No such file or directory`).
@@ -1224,12 +1571,34 @@ fn io_reason(e: &std::io::Error) -> String {
     }
 }
 
+/// `-H`: hash every name in the file, as OpenSSH: lines already hashed,
+/// with wildcards or a marker are kept as they are; the original is kept
+/// as `<file>.old`.
 fn run_known_hosts_hash(args: &Args) -> Result<i32, String> {
     let path = resolve_known_hosts_path(args)?;
-    let mut kh = KnownHosts::load(&path).map_err(|e| format!("load {path}: {e}"))?;
-    kh.hash_in_place();
-    kh.save(&path).map_err(|e| format!("save {path}: {e}"))?;
-    println!("# Hashed {path}");
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {}", io_reason(&e)))?;
+    let mut out = String::with_capacity(text.len() * 2);
+    let (mut invalid, mut unhashed) = (false, false);
+    for l in kh_scan(&text, None, false, false) {
+        if l.status == KhStatus::Invalid {
+            invalid = true;
+            eprintln!("{path}:{}: invalid line", l.num);
+        }
+        let (lines, any) = kh_hash_line(&l, &path, false);
+        unhashed |= any;
+        for line in lines {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+    if invalid {
+        return Ok(kh_invalid(&path, true));
+    }
+    kh_replace(&path, &out)?;
+    if unhashed {
+        eprintln!("WARNING: {path}.old contains unhashed entries");
+        eprintln!("Delete this file to ensure privacy of hostnames");
+    }
     Ok(0)
 }
 
@@ -1253,6 +1622,15 @@ fn run() -> Result<i32, i32> {
             return Err(2);
         }
     };
+    if let Some(mode) = &parsed.moduli {
+        return match moduli::run(mode, &parsed) {
+            Ok(code) => Ok(code),
+            Err(msg) => {
+                eprintln!("{msg}");
+                Err(255)
+            }
+        };
+    }
     if let Some(op) = &parsed.sig_op {
         return match sig::run(op, &parsed) {
             Ok(code) => Ok(code),
@@ -1293,8 +1671,10 @@ fn run() -> Result<i32, i32> {
     if parsed.bubble {
         parsed.fingerprint = true;
     }
+    // `-H` and `-l` modify `-F` (hashed / fingerprinted output).
+    let finding = parsed.find_host.is_some();
     let mode_count = [
-        parsed.fingerprint as u8,
+        (parsed.fingerprint && !finding) as u8,
         parsed.export as u8,
         parsed.import as u8,
         parsed.derive_pub as u8,
@@ -1302,7 +1682,7 @@ fn run() -> Result<i32, i32> {
         parsed.type_.is_some() as u8,
         parsed.remove_host.is_some() as u8,
         parsed.find_host.is_some() as u8,
-        parsed.hash_all as u8,
+        (parsed.hash_all && !finding) as u8,
         parsed.host_keys as u8,
         parsed.sig_file.is_some() as u8,
         parsed.list_cert as u8,
@@ -1317,7 +1697,7 @@ fn run() -> Result<i32, i32> {
         return Err(2);
     }
 
-    let res = if parsed.fingerprint {
+    let res = if parsed.fingerprint && !finding {
         run_fingerprint(&parsed)
     } else if parsed.export {
         run_export(&parsed)
@@ -1473,8 +1853,10 @@ mod sig {
     /// A signer: the private key from `-f`, or the agent holding it.
     pub(super) enum Signer {
         Key(Box<dyn puressh::hostkey::HostKey + Send>),
+        /// The agent, its signature flags, and the identity to sign with
+        /// when not the key itself (a certificate).
         #[cfg(unix)]
-        Agent(puressh::agent::Agent, u32),
+        Agent(puressh::agent::Agent, u32, Option<Vec<u8>>),
     }
 
     impl Signer {
@@ -1485,7 +1867,10 @@ mod sig {
             match self {
                 Signer::Key(k) => k.sign(data),
                 #[cfg(unix)]
-                Signer::Agent(a, flags) => a.sign(&pk.wire_blob(), data, *flags),
+                Signer::Agent(a, flags, ident) => match ident {
+                    Some(blob) => a.sign(blob, data, *flags),
+                    None => a.sign(&pk.wire_blob(), data, *flags),
+                },
             }
         }
     }
@@ -1514,15 +1899,20 @@ mod sig {
                 } else {
                     0
                 };
-                return Ok((Signer::Agent(agent, flags), pk));
+                return Ok((Signer::Agent(agent, flags, None), pk));
             }
         }
-        let sk = match PrivateKey::parse_pem(&text, None) {
+        load_private_signer(path, &text)
+    }
+
+    /// The private key at `path` (`text`), asking for its passphrase.
+    fn load_private_signer(path: &str, text: &str) -> Result<(Signer, PublicKey), String> {
+        let sk = match PrivateKey::parse_pem(text, None) {
             Ok(k) => k,
             Err(_) => {
                 let pp =
                     read_passphrase_interactive(&format!("Enter passphrase for \"{path}\": "))?;
-                PrivateKey::parse_pem(&text, Some(pp.as_bytes()))
+                PrivateKey::parse_pem(text, Some(pp.as_bytes()))
                     .map_err(|e| format!("Couldn't load key {path}: {e}"))?
             }
         };
@@ -1531,14 +1921,99 @@ mod sig {
         Ok((Signer::Key(key), pk))
     }
 
+    /// The public half `-Y sign -f path` names, as `sshkey_load_public`:
+    /// the file as a key or certificate, else `path.pub`, else derived
+    /// from the private key. Returns the key and the identity signatures
+    /// carry (the certificate, when it is one).
+    fn load_signing_public(path: &str) -> Result<(PublicKey, Vec<u8>), String> {
+        let parse = |text: &str| -> Option<(PublicKey, Vec<u8>)> {
+            let line = text.trim();
+            if let Ok(c) = puressh::cert::Certificate::parse_openssh_line(line) {
+                let pk = PublicKey::parse_wire_blob(c.embedded_pubkey_blob()).ok()?;
+                return Some((pk, c.raw));
+            }
+            let pk = PublicKey::parse_authorized_keys_line(line).ok()?;
+            let blob = pk.wire_blob();
+            Some((pk, blob))
+        };
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("Couldn't load public key {path}: {e}"))?;
+        if let Some(v) = parse(&text) {
+            return Ok(v);
+        }
+        if let Some(v) = std::fs::read_to_string(format!("{path}.pub"))
+            .ok()
+            .and_then(|t| parse(&t))
+        {
+            return Ok(v);
+        }
+        let pk = PrivateKey::public_key_from_pem(&text)
+            .map_err(|e| format!("Couldn't load public key {path}: {e}"))?;
+        let blob = pk.wire_blob();
+        Ok((pk, blob))
+    }
+
+    /// OpenSSH's `sig_sign` key choice: the agent when it holds the key
+    /// (required with `-U`), else the private key at `path` without its
+    /// `-cert.pub` / `.pub` suffix. Returns the signer, the key and the
+    /// identity the signature carries (a certificate signs as itself).
+    fn load_sign_key(
+        path: &str,
+        require_agent: bool,
+    ) -> Result<(Signer, PublicKey, Vec<u8>), String> {
+        let (pk, ident) = load_signing_public(path)?;
+        #[cfg(unix)]
+        match puressh::agent::Agent::connect_env() {
+            Ok(Some(mut agent)) => {
+                let has = agent
+                    .identities()
+                    .is_ok_and(|ids| ids.iter().any(|i| i.key_blob() == ident.as_slice()));
+                if has {
+                    // SSH_AGENT_RSA_SHA2_512: OpenSSH signs with rsa-sha2-512.
+                    let flags = if matches!(pk, PublicKey::Rsa { .. }) {
+                        4
+                    } else {
+                        0
+                    };
+                    let id = (ident != pk.wire_blob()).then(|| ident.clone());
+                    return Ok((Signer::Agent(agent, flags, id), pk, ident));
+                }
+                if require_agent {
+                    return Err("Couldn't find key in agent".into());
+                }
+            }
+            _ if require_agent => return Err("Couldn't get agent socket".into()),
+            _ => {}
+        }
+        #[cfg(not(unix))]
+        if require_agent {
+            return Err("signing with an agent is not supported on this platform".into());
+        }
+        let mut privpath = path;
+        for suffix in ["-cert.pub", ".pub"] {
+            if let Some(p) = privpath.strip_suffix(suffix).filter(|p| !p.is_empty()) {
+                privpath = p;
+            }
+        }
+        let text = std::fs::read_to_string(privpath)
+            .map_err(|e| format!("Couldn't load key {privpath}: {e}"))?;
+        let (signer, sk_pk) = load_private_signer(privpath, &text)?;
+        if sk_pk.wire_blob() != pk.wire_blob() {
+            return Err(format!(
+                "Public key {path} doesn't match private {privpath}"
+            ));
+        }
+        Ok((signer, pk, ident))
+    }
+
     fn sign_digest(
         signer: &mut Signer,
-        pk: &PublicKey,
+        (pk, ident): (&PublicKey, &[u8]),
         namespace: &str,
         hash: HashAlg,
         digest: &[u8],
     ) -> Result<String, String> {
-        let sig = Signature::create(pk.wire_blob(), namespace, hash, digest, |data| {
+        let sig = Signature::create(ident.to_vec(), namespace, hash, digest, |data| {
             signer.sign(pk, data)
         })
         .map_err(|e| format!("Signing failed: {e}"))?;
@@ -1548,7 +2023,7 @@ mod sig {
     fn sign(args: &Args, hash: HashAlg) -> Result<i32, String> {
         let key_path = require(&args.file, "key file (-f)")?;
         let namespace = require(&args.namespace, "namespace (-n)")?;
-        let (mut signer, pk) = load_signer(key_path, args.use_agent)?;
+        let (mut signer, pk, ident) = load_sign_key(key_path, args.use_agent)?;
         let files: Vec<&str> = if args.rest.is_empty() {
             vec!["-"]
         } else {
@@ -1556,10 +2031,13 @@ mod sig {
         };
         for f in files {
             if f == "-" {
+                if !args.quiet {
+                    eprintln!("Signing data on standard input");
+                }
                 let digest = hash
                     .digest_reader(std::io::stdin().lock())
                     .map_err(|e| format!("read stdin: {e}"))?;
-                let armored = sign_digest(&mut signer, &pk, namespace, hash, &digest)?;
+                let armored = sign_digest(&mut signer, (&pk, &ident), namespace, hash, &digest)?;
                 std::io::stdout()
                     .write_all(armored.as_bytes())
                     .map_err(|e| format!("write: {e}"))?;
@@ -1572,7 +2050,7 @@ mod sig {
             let digest = hash
                 .digest_reader(std::io::BufReader::new(file))
                 .map_err(|e| format!("read {f}: {e}"))?;
-            let armored = sign_digest(&mut signer, &pk, namespace, hash, &digest)?;
+            let armored = sign_digest(&mut signer, (&pk, &ident), namespace, hash, &digest)?;
             let out = format!("{f}.sig");
             if std::path::Path::new(&out).exists() && !confirm_overwrite(&out) {
                 return Err(format!("{out} exists, not overwriting"));
@@ -1609,20 +2087,29 @@ mod sig {
             .hash
             .digest_reader(std::io::stdin().lock())
             .map_err(|e| format!("read stdin: {e}"))?;
-        let pk = PublicKey::parse_wire_blob(&sig.public_key);
+        // A certificate is shown as the key it certifies.
+        let pk = match puressh::cert::Certificate::parse(&sig.public_key) {
+            Ok(c) => PublicKey::parse_wire_blob(c.embedded_pubkey_blob()),
+            Err(_) => PublicKey::parse_wire_blob(&sig.public_key),
+        };
         let mut result = sig
             .verify(namespace, &digest)
             .map_err(|e| format!("Signature verification failed: {e}"));
+        // `-r`: a revoked key (or certificate CA) fails the check.
+        if result.is_ok()
+            && let Some(rev) = &args.sshfp
+            && revoked(rev, &sig.public_key)?
+        {
+            result = Err("Signature key is revoked".into());
+        }
         let mut principal = None;
         if validate && result.is_ok() {
             let allowed =
                 read_allowed_signers(require(&args.file, "allowed signers file (-f)")?, now)?;
             let id = require(&args.identity, "signer identity (-I)")?;
-            let found = allowed.iter().any(|s| {
-                s.is_key(&sig.public_key, now)
-                    && s.matches_principal(id)
-                    && s.allows_namespace(namespace)
-            });
+            let found = allowed
+                .iter()
+                .any(|s| s.accepts(&sig.public_key, id, now) && s.allows_namespace(namespace));
             result = if found {
                 principal = Some(id);
                 Ok(())
@@ -1637,7 +2124,8 @@ mod sig {
             (Ok(()), Ok(pk)) => {
                 if !args.quiet {
                     let fp = pk.sha256_fingerprint();
-                    let ty = algorithm_label(&pk);
+                    let cert = if sig.is_certificate() { "-CERT" } else { "" };
+                    let ty = format!("{}{cert}", algorithm_label(&pk));
                     match principal {
                         Some(p) => {
                             println!("Good \"{namespace}\" signature for {p} with {ty} key {fp}")
@@ -1646,7 +2134,15 @@ mod sig {
                     }
                 }
                 if print_pubkey {
-                    println!("{}", pk.to_authorized_keys_line());
+                    // The key the signature carries (a certificate as is).
+                    match puressh::cert::Certificate::parse(&sig.public_key) {
+                        Ok(c) => println!("{}", c.to_openssh_line("")),
+                        Err(_) => {
+                            let line = pk.to_authorized_keys_line();
+                            let bare: Vec<&str> = line.split_whitespace().take(2).collect();
+                            println!("{}", bare.join(" "));
+                        }
+                    }
                 }
                 Ok(0)
             }
@@ -1662,15 +2158,57 @@ mod sig {
         }
     }
 
+    /// OpenSSH's `sshkey_check_revoked`: whether the revocation file
+    /// (a KRL, or a list of keys) revokes `key`, or for a certificate, its
+    /// key or its CA.
+    fn revoked(path: &str, key: &[u8]) -> Result<bool, String> {
+        let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let cert = puressh::cert::Certificate::parse(key).ok();
+        let plain = cert.as_ref().map_or(key, |c| c.embedded_pubkey_blob());
+        if let Ok(krl) = puressh::krl::Krl::parse(&data) {
+            return Ok(krl.is_revoked_key(plain)
+                || cert.as_ref().is_some_and(|c| {
+                    krl.is_revoked_cert(&c.signature_key_blob, c.serial, &c.key_id)
+                        || krl.is_revoked_key(&c.signature_key_blob)
+                }));
+        }
+        let text = String::from_utf8_lossy(&data);
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let listed = match puressh::cert::Certificate::parse_openssh_line(line) {
+                Ok(c) => c.embedded_pubkey_blob().to_vec(),
+                Err(_) => match PublicKey::parse_authorized_keys_line(line) {
+                    Ok(pk) => pk.wire_blob(),
+                    Err(_) => continue,
+                },
+            };
+            if listed == plain
+                || cert
+                    .as_ref()
+                    .is_some_and(|c| listed == c.signature_key_blob)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     fn find_principals(args: &Args, now: i64) -> Result<i32, String> {
         let sig = read_signature(require(&args.sig_file, "signature file (-s)")?)?;
         let allowed = read_allowed_signers(require(&args.file, "allowed signers file (-f)")?, now)?;
         let mut found = false;
-        for s in allowed.iter().filter(|s| s.is_key(&sig.public_key, now)) {
-            for p in s.principals.split(',') {
-                println!("{p}");
+        for s in &allowed {
+            if s.is_key(&sig.public_key, now) {
+                for p in s.principals.split(',') {
+                    println!("{p}");
+                }
+                found = true;
+            } else if let Some(ps) = s.certified_principals(&sig.public_key, now) {
+                println!("{}", ps.join(","));
+                found = true;
             }
-            found = true;
         }
         if found {
             Ok(0)
@@ -1698,6 +2236,16 @@ mod sig {
 
 /// `-r host`: DNS SSHFP records for a key (`-f`) or every host key.
 fn run_sshfp(args: &Args, host: &str) -> Result<i32, String> {
+    // `-O hashalg=sha1|sha256`: that digest only.
+    let mut only: Option<u8> = None;
+    for o in &args.sig_options {
+        match o.strip_prefix("hashalg=") {
+            Some(a) if a.eq_ignore_ascii_case("sha1") => only = Some(1),
+            Some(a) if a.eq_ignore_ascii_case("sha256") => only = Some(2),
+            Some(a) => return Err(format!("Unsupported hash algorithm \"{a}\"")),
+            None => return Err(format!("Invalid option \"{o}\"")),
+        }
+    }
     let files: Vec<String> = match &args.file {
         Some(f) => vec![f.clone()],
         None => ["rsa", "ecdsa", "ed25519", "mldsa44_ed25519"]
@@ -1712,6 +2260,9 @@ fn run_sshfp(args: &Args, host: &str) -> Result<i32, String> {
             continue;
         };
         for (fptype, digest) in [(1u8, sha1(&pk.wire_blob())), (2, sha256(&pk.wire_blob()))] {
+            if only.is_some_and(|t| t != fptype) {
+                continue;
+            }
             let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
             if args.sshfp_generic {
                 println!(
@@ -1836,7 +2387,9 @@ mod krl {
         } else {
             Krl::new()
         };
+        // `-s none`: serial and key id revocations for any CA.
         let ca = match &args.sig_file {
+            Some(f) if f.eq_ignore_ascii_case("none") => Some(Vec::new()),
             Some(f) => Some(load_public(f)?.wire_blob()),
             None => None,
         };
@@ -2114,9 +2667,7 @@ mod certs {
             CertType::User
         };
         for path in &args.rest {
-            let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
-            let pk = PublicKey::parse_authorized_keys_line(text.trim())
-                .map_err(|e| format!("{path}: {e}"))?;
+            let pk = super::load_public_any(path)?;
             let mut nonce = vec![0u8; 32];
             OsRng.fill_bytes(&mut nonce);
             let mut b = CertificateBuilder::new(pk.wire_blob(), cert_type, nonce);
@@ -2125,14 +2676,17 @@ mod certs {
             b.valid_principals = principals.clone();
             b.valid_after = valid_after;
             b.valid_before = valid_before;
-            // Host certificates carry no options, as with OpenSSH.
+            // Host certificates start without the default user
+            // extensions; options given with -O apply to both, as with
+            // OpenSSH (a host certificate with critical options is then
+            // refused by clients).
             if cert_type == CertType::User {
                 b.extensions = DEFAULT_USER_EXTENSIONS
                     .iter()
                     .map(|e| (e.to_string(), Vec::new()))
                     .collect();
-                apply_options(&mut b, &args.sig_options)?;
             }
+            apply_options(&mut b, &args.sig_options)?;
             let cert = b
                 .sign(&ca_pk.wire_blob(), |data| signer.sign(&ca_pk, data))
                 .map_err(|e| format!("Couldn't certify key {path}: {e}"))?;
@@ -2287,5 +2841,643 @@ mod tests {
         };
         let err = run_generate(&args).unwrap_err();
         assert!(err.contains("at least 2048 bits"), "got: {err}");
+    }
+}
+
+/// `-M generate` / `-M screen`: Diffie-Hellman group moduli, a port of
+/// OpenSSH's `moduli.c`. Generation sieves candidate Sophie Germain
+/// primes `q` (with `p = 2q + 1`) from a random start; screening runs
+/// Miller-Rabin over candidates and keeps the safe primes, in the
+/// `/etc/ssh/moduli` format.
+mod moduli {
+    use super::{Args, local_offset, now};
+    use purecrypto::bignum::{BoxedMontModulus, BoxedUint};
+    use purecrypto::rng::{OsRng, RngCore};
+    use std::io::{BufRead, Write};
+
+    const MODULI_TYPE_UNKNOWN: u32 = 0;
+    const MODULI_TYPE_UNSTRUCTURED: u32 = 1;
+    const MODULI_TYPE_SAFE: u32 = 2;
+    const MODULI_TYPE_SCHNORR: u32 = 3;
+    const MODULI_TYPE_SOPHIE_GERMAIN: u32 = 4;
+    const MODULI_TYPE_STRONG: u32 = 5;
+    const MODULI_TESTS_COMPOSITE: u32 = 0x01;
+    const MODULI_TESTS_SIEVE: u32 = 0x02;
+    const MODULI_TESTS_MILLER_RABIN: u32 = 0x04;
+
+    const QSIZE_MINIMUM: u32 = 511;
+    const TEST_MAXIMUM: u32 = 1 << 16;
+    const TEST_MINIMUM: u32 = QSIZE_MINIMUM + 1;
+    const TRIAL_MINIMUM: u32 = 4;
+    const TINY_NUMBER: u32 = 1 << 16;
+    const SMALL_MAXIMUM: u64 = 0xffff_ffff;
+    /// Megabytes of sieve, as OpenSSH (its `LARGE_MAXIMUM`).
+    const LARGE_MAXIMUM: u32 = 127;
+    const DEFAULT_BITS: u32 = 3072;
+
+    /// A big-endian unsigned number as bytes, minimal length.
+    type Num = Vec<u8>;
+
+    fn trim(mut n: Num) -> Num {
+        let z = n.iter().take_while(|b| **b == 0).count();
+        n.drain(..z.min(n.len().saturating_sub(1)));
+        n
+    }
+
+    fn from_hex(s: &str) -> Option<Num> {
+        let s = s.trim();
+        if s.is_empty() || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let padded = if s.len() % 2 == 1 {
+            format!("0{s}")
+        } else {
+            s.to_string()
+        };
+        let bytes = (0..padded.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&padded[i..i + 2], 16).ok())
+            .collect::<Option<Vec<u8>>>()?;
+        Some(trim(bytes))
+    }
+
+    /// Upper-case hex without leading zeros (`BN_print_fp`).
+    fn to_hex(n: &[u8]) -> String {
+        let s: String = n.iter().map(|b| format!("{b:02X}")).collect();
+        let t = s.trim_start_matches('0');
+        if t.is_empty() { "0".into() } else { t.into() }
+    }
+
+    fn bits(n: &[u8]) -> u32 {
+        match n.iter().position(|b| *b != 0) {
+            Some(i) => (n.len() - i) as u32 * 8 - n[i].leading_zeros(),
+            None => 0,
+        }
+    }
+
+    fn mod_word(n: &[u8], w: u64) -> u64 {
+        n.iter().fold(0u64, |r, b| (r * 256 + u64::from(*b)) % w)
+    }
+
+    /// `n` as big-endian 64-bit limbs, for repeated [`mod_limbs`].
+    fn limbs(n: &[u8]) -> Vec<u64> {
+        let pad = (8 - n.len() % 8) % 8;
+        let mut padded = vec![0u8; pad];
+        padded.extend_from_slice(n);
+        padded
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c))
+            .collect()
+    }
+
+    /// `n mod w` over 64-bit limbs (the sieve's hot path).
+    fn mod_limbs(n: &[u64], w: u64) -> u64 {
+        let w = u128::from(w);
+        n.iter()
+            .fold(0u128, |r, l| ((r << 64) | u128::from(*l)) % w) as u64
+    }
+
+    fn add_small(n: &[u8], k: u64) -> Num {
+        let mut out = n.to_vec();
+        let mut carry = k;
+        for b in out.iter_mut().rev() {
+            if carry == 0 {
+                break;
+            }
+            let v = u64::from(*b) + (carry & 0xff);
+            *b = v as u8;
+            carry = (carry >> 8) + (v >> 8);
+        }
+        while carry > 0 {
+            out.insert(0, carry as u8);
+            carry >>= 8;
+        }
+        trim(out)
+    }
+
+    fn shl1(n: &[u8]) -> Num {
+        let mut out = vec![0u8; n.len() + 1];
+        for (i, b) in n.iter().enumerate() {
+            out[i] |= b >> 7;
+            out[i + 1] = b << 1;
+        }
+        trim(out)
+    }
+
+    fn shr1(n: &[u8]) -> Num {
+        let mut out = vec![0u8; n.len()];
+        let mut carry = 0u8;
+        for (i, b) in n.iter().enumerate() {
+            out[i] = (b >> 1) | carry;
+            carry = b << 7;
+        }
+        trim(out)
+    }
+
+    /// Odd primes below 2000, for trial division ahead of Miller-Rabin.
+    fn small_primes() -> Vec<u64> {
+        (3u64..2000)
+            .step_by(2)
+            .filter(|n| {
+                (3..)
+                    .step_by(2)
+                    .take_while(|d| d * d <= *n)
+                    .all(|d| n % d != 0)
+            })
+            .collect()
+    }
+
+    /// Miller-Rabin with `rounds` random bases (after trial division by
+    /// small primes, as OpenSSL's `BN_is_prime_ex`).
+    fn is_probable_prime(n: &[u8], rounds: u32, primes: &[u64]) -> bool {
+        if bits(n) < 3 || n[n.len() - 1] & 1 == 0 {
+            return false;
+        }
+        for &p in primes {
+            if mod_word(n, p) == 0 {
+                return bits(n) <= 11 && n.iter().fold(0u64, |a, b| a * 256 + u64::from(*b)) == p;
+            }
+        }
+        let len = n.len();
+        let nn = BoxedUint::from_be_bytes(n);
+        let mont = BoxedMontModulus::new(&nn);
+        let mut n1 = n.to_vec();
+        n1[len - 1] &= 0xfe; // n - 1 (n is odd)
+        let n_minus_1 = BoxedUint::from_be_bytes(&n1);
+        let s = n1
+            .iter()
+            .rev()
+            .position(|b| *b != 0)
+            .map_or(0, |i| i * 8 + n1[len - 1 - i].trailing_zeros() as usize);
+        let d = n_minus_1.shr_bits(s);
+        let n_minus_3 = BoxedUint::from_be_bytes(&{
+            let mut v = n1.clone();
+            // n - 3 = (n - 1) - 2; n - 1 is even and > 2 here.
+            let mut borrow = 2u16;
+            for b in v.iter_mut().rev() {
+                let cur = u16::from(*b);
+                if cur >= borrow {
+                    *b = (cur - borrow) as u8;
+                    break;
+                }
+                *b = (cur + 256 - borrow) as u8;
+                borrow = 1;
+            }
+            v
+        });
+        let eq = |a: &BoxedUint, b: &BoxedUint| a.to_be_bytes(len) == b.to_be_bytes(len);
+        let one = BoxedUint::from_u64(1);
+        let mut rng = OsRng;
+        'rounds: for _ in 0..rounds {
+            let mut r = vec![0u8; len + 8];
+            rng.fill_bytes(&mut r);
+            let a = BoxedUint::from_be_bytes(&r)
+                .reduce(&n_minus_3)
+                .add(&BoxedUint::from_u64(2));
+            let mut x = mont.pow_public(&a, &d);
+            if eq(&x, &one) || eq(&x, &n_minus_1) {
+                continue;
+            }
+            for _ in 1..s {
+                x = mont.mul_mod(&x, &x);
+                if eq(&x, &n_minus_1) {
+                    continue 'rounds;
+                }
+                if eq(&x, &one) {
+                    return false;
+                }
+            }
+            return false;
+        }
+        true
+    }
+
+    /// `ctime()`'s first 24 characters, local time.
+    fn ctime(t: i64) -> String {
+        let local = t + local_offset(t);
+        let days = local.div_euclid(86_400);
+        let secs = local.rem_euclid(86_400);
+        let (y, m, d) = civil(days);
+        const WD: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MON: [&str; 12] = [
+            "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+        ];
+        format!(
+            "{} {} {d:2} {:02}:{:02}:{:02} {y}",
+            WD[days.rem_euclid(7) as usize],
+            MON[(m - 1) as usize],
+            secs / 3600,
+            secs / 60 % 60,
+            secs % 60
+        )
+    }
+
+    /// Howard Hinnant's `civil_from_days`.
+    fn civil(z: i64) -> (i64, i64, i64) {
+        let z = z + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        (yoe + era * 400 + i64::from(m <= 2), m, d)
+    }
+
+    /// One `moduli` line, timestamped in UTC (`qfileout`).
+    fn line(
+        otype: u32,
+        tests: u32,
+        tries: u32,
+        size: u32,
+        generator: u32,
+        modulus: &[u8],
+    ) -> String {
+        let t = now();
+        let (y, m, d) = civil(t.div_euclid(86_400));
+        let s = t.rem_euclid(86_400);
+        format!(
+            "{y:04}{m:02}{d:02}{:02}{:02}{:02} {otype} {tests} {tries} {size} {generator:x} {}\n",
+            s / 3600,
+            s / 60 % 60,
+            s % 60,
+            to_hex(modulus)
+        )
+    }
+
+    fn open_out(path: &str, append: bool) -> Result<Box<dyn Write>, String> {
+        if path == "-" {
+            return Ok(Box::new(std::io::stdout()));
+        }
+        let f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .append(append)
+            .truncate(!append)
+            .open(path)
+            .map_err(|e| {
+                if append {
+                    format!("Couldn't open moduli file \"{path}\": {e}")
+                } else {
+                    format!("Couldn't open modulus candidate file \"{path}\": {e}")
+                }
+            })?;
+        Ok(Box::new(f))
+    }
+
+    pub(super) fn run(mode: &str, args: &Args) -> Result<i32, String> {
+        let out = args.rest.first().ok_or("Moduli output file is required")?;
+        match mode {
+            "generate" => generate(args, out),
+            "screen" => screen(args, out),
+            other => Err(format!("Unsupported moduli option {other}")),
+        }
+    }
+
+    fn generate(args: &Args, out_path: &str) -> Result<i32, String> {
+        let mut start = None;
+        let mut power = 0u32;
+        for o in &args.sig_options {
+            if let Some(v) = o.strip_prefix("start=") {
+                start = Some(from_hex(v).ok_or("Invalid start point.")?);
+            } else if let Some(v) = o.strip_prefix("bits=") {
+                power = v
+                    .parse()
+                    .ok()
+                    .filter(|b| *b >= 1)
+                    .ok_or_else(|| format!("Invalid number: {v}"))?;
+            } else {
+                return Err(format!(
+                    "Option \"{o}\" is unsupported for moduli generation"
+                ));
+            }
+        }
+        if power == 0 {
+            power = DEFAULT_BITS;
+        }
+        if power > TEST_MAXIMUM {
+            return Err(format!("Too many bits: {power} > {TEST_MAXIMUM}"));
+        }
+        if power < TEST_MINIMUM {
+            return Err(format!("Too few bits: {power} < {TEST_MINIMUM}"));
+        }
+        let mut out = open_out(out_path, false)?;
+        let power = power - 1;
+        let largewords = (LARGE_MAXIMUM as usize) << 18;
+        let largebits = (largewords * 32) as u64;
+        let mut large = vec![0u32; largewords];
+        let mut largetries = 0u32;
+        let set = |sieve: &mut [u32], n: u64| sieve[(n >> 5) as usize] |= 1 << (n & 31);
+        let test = |sieve: &[u32], n: u64| sieve[(n >> 5) as usize] & (1 << (n & 31)) != 0;
+
+        // The random (or given) odd start point, `power` bits.
+        let mut base = match start {
+            Some(s) => s,
+            None => {
+                let nbytes = power.div_ceil(8) as usize;
+                let mut b = vec![0u8; nbytes];
+                OsRng.fill_bytes(&mut b);
+                let extra = nbytes as u32 * 8 - power;
+                b[0] &= 0xff >> extra;
+                // BN_rand(top=1): the two most significant bits set.
+                let top = power - 1 - (nbytes as u32 - 1) * 8;
+                b[0] |= 1 << top;
+                if top > 0 {
+                    b[0] |= 1 << (top - 1);
+                } else if nbytes > 1 {
+                    b[1] |= 0x80;
+                }
+                b
+            }
+        };
+        let last = base.len() - 1;
+        base[last] |= 1;
+        let t0 = now();
+        eprintln!(
+            "{} Sieve next {} plus {power}-bit",
+            ctime(t0),
+            (largebits * 2) as u32
+        );
+
+        let base_limbs = limbs(&base);
+        let mut sieve_large = |s: u64, large: &mut [u32]| {
+            largetries += 1;
+            let r = mod_limbs(&base_limbs, s);
+            let mut u = if r == 0 { 0 } else { s - r };
+            if u < largebits * 2 {
+                if u & 1 == 1 {
+                    u += s;
+                }
+                u /= 2;
+                while u < largebits {
+                    set(large, u);
+                    u += s;
+                }
+            }
+            let r = (2 * r + 1) % s;
+            let mut u = if r == 0 { 0 } else { s - r };
+            if u < largebits * 4 {
+                while u & 3 != 0 {
+                    if SMALL_MAXIMUM - u < s {
+                        return;
+                    }
+                    u += s;
+                }
+                u /= 4;
+                while u < largebits {
+                    set(large, u);
+                    u += s;
+                }
+            }
+        };
+
+        let tinywords = (TINY_NUMBER >> 6) as usize;
+        let tinybits = (tinywords * 32) as u64;
+        let mut tiny = vec![0u32; tinywords];
+        let mut small = vec![0u32; tinywords];
+        let smallbits = tinybits;
+        for i in 0..tinybits {
+            if test(&tiny, i) {
+                continue;
+            }
+            let t = 2 * i + 3;
+            let mut j = i + t;
+            while j < tinybits {
+                set(&mut tiny, j);
+                j += t;
+            }
+            sieve_large(t, &mut large);
+        }
+        let mut smallbase = u64::from(TINY_NUMBER) + 3;
+        while smallbase < SMALL_MAXIMUM - u64::from(TINY_NUMBER) {
+            for i in 0..tinybits {
+                if test(&tiny, i) {
+                    continue;
+                }
+                let t = 2 * i + 3;
+                let r = smallbase % t;
+                let mut s = if r == 0 { 0 } else { t - r };
+                if s & 1 == 1 {
+                    s += t;
+                }
+                s /= 2;
+                while s < smallbits {
+                    set(&mut small, s);
+                    s += t;
+                }
+            }
+            for i in 0..smallbits {
+                if !test(&small, i) {
+                    sieve_large(2 * i + smallbase, &mut large);
+                }
+            }
+            small.iter_mut().for_each(|w| *w = 0);
+            smallbase += u64::from(TINY_NUMBER);
+        }
+        let t1 = now();
+        eprintln!(
+            "{} Sieved with {largetries} small primes in {} seconds",
+            ctime(t1),
+            t1 - t0
+        );
+        let mut found = 0u32;
+        for j in 0..largebits {
+            if test(&large, j) {
+                continue;
+            }
+            let q = add_small(&base, 2 * j);
+            out.write_all(
+                line(
+                    MODULI_TYPE_SOPHIE_GERMAIN,
+                    MODULI_TESTS_SIEVE,
+                    largetries,
+                    power - 1,
+                    0,
+                    &q,
+                )
+                .as_bytes(),
+            )
+            .map_err(|e| format!("write: {e}"))?;
+            found += 1;
+        }
+        let _ = out.flush();
+        eprintln!("{} Found {found} candidates", ctime(now()));
+        Ok(0)
+    }
+
+    fn screen(args: &Args, out_path: &str) -> Result<i32, String> {
+        let mut checkpoint: Option<String> = None;
+        let mut generator_wanted = 0u32;
+        let mut start_lineno = 0u64;
+        let mut lines = 0u64;
+        let mut trials = 0u32;
+        for o in &args.sig_options {
+            if let Some(v) = o.strip_prefix("lines=") {
+                lines = v.parse().unwrap_or(0);
+            } else if let Some(v) = o.strip_prefix("start-line=") {
+                start_lineno = v.parse().unwrap_or(0);
+            } else if let Some(v) = o.strip_prefix("checkpoint=") {
+                checkpoint = Some(v.to_string());
+            } else if let Some(v) = o.strip_prefix("generator=") {
+                generator_wanted = v
+                    .parse()
+                    .ok()
+                    .filter(|g| *g >= 1)
+                    .ok_or_else(|| format!("Generator invalid: {v}"))?;
+            } else if let Some(v) = o.strip_prefix("prime-tests=") {
+                trials = v
+                    .parse()
+                    .ok()
+                    .filter(|t| *t >= 1)
+                    .ok_or_else(|| format!("Invalid number: {v}"))?;
+            } else {
+                return Err(format!(
+                    "Option \"{o}\" is unsupported for moduli screening"
+                ));
+            }
+        }
+        let trials = if trials == 0 { 100 } else { trials };
+        if trials < TRIAL_MINIMUM {
+            return Err(format!("Minimum primality trials is {TRIAL_MINIMUM}"));
+        }
+        let input: Box<dyn BufRead> = match args.file.as_deref() {
+            Some(f) if f != "-" => Box::new(std::io::BufReader::new(
+                std::fs::File::open(f)
+                    .map_err(|e| format!("Couldn't open modulus candidate file \"{f}\": {e}"))?,
+            )),
+            _ => Box::new(std::io::BufReader::new(std::io::stdin())),
+        };
+        let mut out = open_out(out_path, true)?;
+        let end_lineno = if lines == 0 {
+            u64::MAX
+        } else {
+            start_lineno + lines
+        };
+        let mut last_processed = 0u64;
+        if let Some(cp) = &checkpoint
+            && let Ok(text) = std::fs::read_to_string(cp)
+        {
+            match text.trim().parse::<u64>() {
+                Ok(n) => {
+                    eprintln!("Loaded checkpoint from '{cp}' line {n}");
+                    last_processed = n;
+                }
+                Err(_) => eprintln!("Failed to load checkpoint from '{cp}'"),
+            }
+        }
+        let last_processed = last_processed.max(start_lineno);
+        let primes = small_primes();
+        let t0 = now();
+        let (mut count_in, mut count_out, mut count_possible) = (0u64, 0u32, 0u32);
+        for l in input.lines() {
+            let Ok(lp) = l else { break };
+            if count_in >= end_lineno {
+                break;
+            }
+            count_in += 1;
+            if count_in <= last_processed {
+                continue;
+            }
+            if let Some(cp) = &checkpoint {
+                let tmp = format!("{cp}.{:010}", OsRng.next_u32());
+                if std::fs::write(&tmp, format!("{count_in}\n")).is_err()
+                    || std::fs::rename(&tmp, cp).is_err()
+                {
+                    let _ = std::fs::remove_file(&tmp);
+                    eprintln!("failed to write to checkpoint file '{cp}'");
+                }
+            }
+            if lp.len() < 14 || lp.starts_with('!') || lp.starts_with('#') {
+                continue;
+            }
+            let mut f = lp[14..].split_whitespace();
+            let mut num = |radix: u32| {
+                f.next()
+                    .and_then(|v| u32::from_str_radix(v, radix).ok())
+                    .unwrap_or(0)
+            };
+            let in_type = num(10);
+            let in_tests = num(10);
+            let mut in_tries = num(10);
+            let mut in_size = num(10);
+            let mut generator = num(16);
+            let Some(modulus) = f.next().and_then(from_hex) else {
+                continue;
+            };
+            if in_tests & MODULI_TESTS_COMPOSITE != 0 {
+                continue;
+            }
+            let (p, q) = match in_type {
+                MODULI_TYPE_SOPHIE_GERMAIN => {
+                    in_size += 1;
+                    generator = 0;
+                    (add_small(&shl1(&modulus), 1), modulus)
+                }
+                MODULI_TYPE_UNSTRUCTURED
+                | MODULI_TYPE_SAFE
+                | MODULI_TYPE_SCHNORR
+                | MODULI_TYPE_STRONG
+                | MODULI_TYPE_UNKNOWN => {
+                    let q = shr1(&modulus);
+                    (modulus, q)
+                }
+                _ => continue,
+            };
+            if bits(&p) != in_size + 1 || in_size < QSIZE_MINIMUM {
+                continue;
+            }
+            in_tries = if in_tests & MODULI_TESTS_MILLER_RABIN != 0 {
+                in_tries + trials
+            } else {
+                trials
+            };
+            if generator == 0 {
+                if mod_word(&p, 24) == 11 {
+                    generator = 2;
+                } else if matches!(mod_word(&p, 10), 3 | 7) {
+                    generator = 5;
+                }
+            }
+            if generator_wanted > 0 && generator_wanted != generator {
+                continue;
+            }
+            if generator == 0 {
+                continue;
+            }
+            count_possible += 1;
+            // One quick round on q first; p in full; then q in full.
+            if !is_probable_prime(&q, 1, &primes)
+                || !is_probable_prime(&p, trials, &primes)
+                || !is_probable_prime(&q, trials - 1, &primes)
+            {
+                continue;
+            }
+            out.write_all(
+                line(
+                    MODULI_TYPE_SAFE,
+                    in_tests | MODULI_TESTS_MILLER_RABIN,
+                    in_tries,
+                    in_size,
+                    generator,
+                    &p,
+                )
+                .as_bytes(),
+            )
+            .map_err(|e| format!("write: {e}"))?;
+            count_out += 1;
+        }
+        let _ = out.flush();
+        if let Some(cp) = &checkpoint {
+            let _ = std::fs::remove_file(cp);
+        }
+        eprintln!(
+            "{} Found {count_out} safe primes of {count_possible} candidates in {} seconds",
+            ctime(now()),
+            now() - t0
+        );
+        Ok(0)
     }
 }

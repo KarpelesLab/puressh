@@ -76,6 +76,8 @@ struct Cli {
     subsystem: Option<String>,
     sftp_direct: Option<String>,
     destination: String,
+    /// `sftp host:file localpath`: where the fetched file goes.
+    local: Option<String>,
 }
 
 fn parse_args(args: &[String]) -> Result<Cli, String> {
@@ -90,6 +92,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         subsystem: None,
         sftp_direct: None,
         destination: String::new(),
+        local: None,
     };
     let mut operands = Vec::new();
     let mut i = 0;
@@ -184,6 +187,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     }
     match operands.as_slice() {
         [d] => c.destination = d.clone(),
+        [d, l] => {
+            c.destination = d.clone();
+            c.local = Some(l.clone());
+        }
+        // `-D server`: no host to connect to, as with OpenSSH.
+        [] if c.sftp_direct.is_some() => {}
         _ => return Err(USAGE.into()),
     }
     Ok(c)
@@ -1152,7 +1161,9 @@ fn run() -> Result<u8, String> {
         if is_dir {
             sess.cd(Some(&remote.path))?;
         } else {
-            let res = sess.get(std::slice::from_ref(&remote.path), cli.xfer.resume);
+            let mut args = vec![remote.path.clone()];
+            args.extend(cli.local.iter().cloned());
+            let res = sess.get(&args, cli.xfer.resume);
             if let Err(e) = &res
                 && !e.is_empty()
             {

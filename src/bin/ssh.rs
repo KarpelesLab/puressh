@@ -2977,6 +2977,14 @@ fn run() -> Result<i32, String> {
     );
     // EscapeChar: `-e`, else `~`.
     let escape: Option<u8> = cli.escape_char.unwrap_or(Some(b'~'));
+    // EnableEscapeCommandline (default no, as in OpenSSH 9.2+): `~C`.
+    ESCAPE_CMDLINE.store(
+        cfg_block.unimplemented.iter().any(|(k, v)| {
+            k == "enableescapecommandline"
+                && (v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true"))
+        }),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms); only used
     // for interactive terminal sessions.
     let okt = cfg_block
@@ -3059,6 +3067,14 @@ fn run() -> Result<i32, String> {
             255
         })
     };
+    // `~C` adds and cancels forwards on this connection.
+    #[cfg(unix)]
+    let _ = ESCAPE_FORWARDS.set(MuxForwards {
+        shared: shared.clone(),
+        routes: remote_routes.clone(),
+        gateway,
+        listeners: Arc::default(),
+    });
     // Master role: serve the control socket while running this session as
     // the foreground one.
     #[cfg(unix)]
@@ -4894,6 +4910,26 @@ enum MuxWake {
 
 #[cfg(unix)]
 impl MuxForwards {
+    /// Cancel the `kind` forward listening as `listen` (`[bind:]port`, or the
+    /// whole spec it was added with), as `~C -KL port` names it.
+    fn cancel_listen(&self, kind: u8, listen: &str) -> Result<(), String> {
+        if kind == b'R' {
+            return self.handle(kind, listen, true).map(|_| ());
+        }
+        let prefix = format!("{}{listen}", kind as char);
+        let key = self
+            .listeners
+            .lock()
+            .ok()
+            .and_then(|l| {
+                l.keys()
+                    .find(|k| **k == prefix || k.starts_with(&format!("{prefix}:")))
+                    .cloned()
+            })
+            .ok_or("port not forwarded")?;
+        self.handle(kind, &key[1..], true).map(|_| ())
+    }
+
     fn handle(&self, kind: u8, spec: &str, cancel: bool) -> Result<u16, String> {
         let failed = |_: puressh::Error| "Port forwarding failed".to_string();
         let io_failed = |_: std::io::Error| "Port forwarding failed".to_string();
@@ -5402,7 +5438,16 @@ enum EscapeAction {
     Break,
     /// `~R`: re-key the connection.
     Rekey,
+    /// `~C`: the `ssh>` command line (`EnableEscapeCommandline yes`).
+    CommandLine,
 }
+
+/// `EnableEscapeCommandline`: `~C` opens the command line.
+static ESCAPE_CMDLINE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What `~C` adds forwards to and cancels them from (set once connected).
+#[cfg(unix)]
+static ESCAPE_FORWARDS: std::sync::OnceLock<MuxForwards> = std::sync::OnceLock::new();
 
 /// What `~I` prints (set once the connection is up).
 #[allow(clippy::type_complexity)]
@@ -5436,6 +5481,7 @@ impl EscapeFilter {
                     b'I' => Some(EscapeAction::ConnInfo),
                     b'B' => Some(EscapeAction::Break),
                     b'R' => Some(EscapeAction::Rekey),
+                    b'C' => Some(EscapeAction::CommandLine),
                     _ => None,
                 };
                 match action {
@@ -5497,21 +5543,37 @@ fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClie
             std::process::exit(255);
         }
         EscapeAction::Help => {
-            let lines = [
+            // OpenSSH's table (as a session that is not a mux client).
+            let mut lines = vec![
+                format!("{e}?"),
                 "Supported escape sequences:".to_string(),
-                format!(" {e}.   - terminate connection"),
+                format!(" {e}.   - terminate connection (and any multiplexed sessions)"),
                 format!(" {e}B   - send a BREAK to the remote system"),
+            ];
+            if ESCAPE_CMDLINE.load(std::sync::atomic::Ordering::Relaxed) {
+                lines.push(format!(" {e}C   - open a command line"));
+            }
+            lines.extend([
+                format!(" {e}I   - show connection information"),
                 format!(" {e}R   - request rekey"),
+                format!(" {e}V/v - decrease/increase verbosity (LogLevel)"),
                 format!(" {e}^Z  - suspend ssh"),
                 format!(" {e}#   - list forwarded connections"),
-                format!(" {e}V/v - increase/decrease verbosity"),
-                format!(" {e}I   - show connection information"),
+                format!(" {e}&   - background ssh (when waiting for connections to terminate)"),
                 format!(" {e}?   - this message"),
                 format!(" {e}{e}   - send the escape character by typing it twice"),
                 "(Note that escapes are only recognized immediately after newline.)".to_string(),
-            ];
+            ]);
             for l in lines {
                 eprint!("{l}\r\n");
+            }
+        }
+        EscapeAction::CommandLine => {
+            if !ESCAPE_CMDLINE.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("commandline disabled\r\n");
+            } else {
+                #[cfg(unix)]
+                escape_command_line();
             }
         }
         EscapeAction::Break => {
@@ -5559,6 +5621,91 @@ fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClie
                     }
                 }
             }
+        }
+    }
+}
+
+/// `~C`: read an `ssh>` command line from the terminal (cooked mode, as
+/// OpenSSH's) and add or cancel a forward on the connection.
+#[cfg(unix)]
+fn escape_command_line() {
+    use std::io::BufRead;
+    let original = ORIGINAL_TERMIOS.lock().ok().and_then(|g| *g);
+    // SAFETY: plain termios calls on fd 0; the raw settings are read back
+    // first so they can be re-applied afterwards.
+    let mut raw: nix::libc::termios = unsafe { core::mem::zeroed() };
+    let have_raw = unsafe { nix::libc::tcgetattr(0, &mut raw) } == 0;
+    if let Some(t) = original {
+        unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &t) };
+    }
+    eprint!("\r\nssh> ");
+    let mut line = String::new();
+    let read = std::fs::File::open("/dev/tty")
+        .map(|f| std::io::BufReader::new(f).read_line(&mut line))
+        .is_ok();
+    if have_raw {
+        unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &raw) };
+    }
+    if read {
+        for msg in run_command_line(line.trim()) {
+            eprint!("{msg}\r\n");
+        }
+    }
+}
+
+/// Carry out one `~C` command (OpenSSH's process_cmdline); what to print.
+#[cfg(unix)]
+fn run_command_line(line: &str) -> Vec<String> {
+    let s = line.trim_start();
+    let s = s.strip_prefix('-').unwrap_or(s);
+    let Some(first) = s.chars().next() else {
+        return Vec::new();
+    };
+    if matches!(first, 'h' | 'H' | '?') {
+        return [
+            "Commands:",
+            "      -L[bind_address:]port:host:hostport    Request local forward",
+            "      -R[bind_address:]port:host:hostport    Request remote forward",
+            "      -D[bind_address:]port                  Request dynamic forward",
+            "      -KL[bind_address:]port                 Cancel local forward",
+            "      -KR[bind_address:]port                 Cancel remote forward",
+            "      -KD[bind_address:]port                 Cancel dynamic forward",
+        ]
+        .map(String::from)
+        .to_vec();
+    }
+    let (cancel, s) = match s.strip_prefix('K') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    };
+    let kind = match s.chars().next() {
+        Some('L') => b'L',
+        Some('R') => b'R',
+        Some('D') => b'D',
+        _ => return vec!["Invalid command.".into()],
+    };
+    let spec = s[1..].trim();
+    let Some(forwards) = ESCAPE_FORWARDS.get() else {
+        return vec!["Port forwarding failed.".into()];
+    };
+    if cancel {
+        match forwards.cancel_listen(kind, spec) {
+            Ok(()) => vec!["Canceled forwarding.".into()],
+            Err(_) => vec!["Unknown port forwarding.".into()],
+        }
+    } else {
+        let parses = match kind {
+            b'L' => parse_local_forward(spec).is_ok(),
+            b'D' => parse_dynamic_forward(spec).is_ok(),
+            _ => parse_remote_forward(spec).is_ok(),
+        };
+        if !parses {
+            let what = if kind == b'R' { "remote" } else { "local" };
+            return vec![format!("Bad {what} forwarding specification.")];
+        }
+        match forwards.handle(kind, spec, false) {
+            Ok(_) => vec!["Forwarding port.".into()],
+            Err(_) => vec!["Port forwarding failed.".into()],
         }
     }
 }

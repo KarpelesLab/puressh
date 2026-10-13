@@ -223,6 +223,16 @@ pub enum MatchCondition {
     /// `Match !criterion …` — **client-side**: the criterion does not
     /// match.
     Not(alloc::boxed::Box<MatchCondition>),
+    /// `Match version <list>` — this implementation's version
+    /// (`puressh_X.Y.Z`, as in its identification string).
+    Version(Vec<HostPattern>),
+    /// `Match rdomain <list>` (server): the connection's routing domain.
+    /// Connections here have none, so it only matches a context that names
+    /// one (`sshd -T -C rdomain=…`), as OpenSSH's on a system without
+    /// routing domains.
+    RDomain(Vec<HostPattern>),
+    /// `Match invalid-user` (server): the login name names no account.
+    InvalidUser,
 }
 
 /// Inputs the resolver supplies to evaluate `Match` criteria.
@@ -267,6 +277,11 @@ pub struct MatchContext<'a> {
     pub final_pass: bool,
     /// **Client-side**: the tag `Match tagged` compares (`ssh -P`).
     pub tag: Option<&'a str>,
+    /// **Server-side**: whether the login name names no account (`Match
+    /// invalid-user`); `None` when not known, which matches nothing.
+    pub invalid_user: Option<bool>,
+    /// **Server-side**: the routing domain (`Match rdomain`), if any.
+    pub rdomain: Option<&'a str>,
 }
 
 impl MatchContext<'_> {
@@ -381,23 +396,33 @@ fn parse_match_line_impl(
                 out.push(MatchCondition::Final);
                 i += 1;
             }
-            // Server-invalid criteria — `Host`/`OriginalHost`/`LocalUser` are
-            // meaningless on the daemon side (the server is the host); reject
-            // them rather than silently never-matching so a misplaced client
-            // directive in sshd_config is loud.
-            "host" | "originalhost" | "localuser" if server => {
+            // Server-invalid criteria — `OriginalHost`/`LocalUser` are
+            // meaningless on the daemon side; reject them rather than silently
+            // never-matching so a misplaced client directive in sshd_config is
+            // loud. (`Host` there is the client's host.)
+            "originalhost" | "localuser" if server => {
                 return Err(ConfigError::Unsupported {
                     line: line_no,
                     msg: alloc::format!("Match {kw} is not valid in sshd_config"),
                 });
             }
-            // sshd accepts these criteria but puressh has no notion of routing
-            // domains or a generic connection tuple.
-            "rdomain" | "connection" => {
+            "connection" => {
                 return Err(ConfigError::Unsupported {
                     line: line_no,
                     msg: alloc::format!("Match {kw} is not supported"),
                 });
+            }
+            "version" => {
+                let patterns = take_pattern_list(args, &mut i, &kw, line_no)?;
+                out.push(MatchCondition::Version(patterns));
+            }
+            "rdomain" if server => {
+                let patterns = take_pattern_list(args, &mut i, &kw, line_no)?;
+                out.push(MatchCondition::RDomain(patterns));
+            }
+            "invalid-user" if server => {
+                out.push(MatchCondition::InvalidUser);
+                i += 1;
             }
             "host" | "originalhost" | "user" | "localuser" => {
                 let patterns = take_pattern_list(args, &mut i, &kw, line_no)?;
@@ -578,6 +603,14 @@ pub fn evaluate(cond: &MatchCondition, ctx: &MatchContext<'_>, policy: ExecPolic
         },
         MatchCondition::Tagged(patterns) => host_matches(patterns, ctx.tag.unwrap_or("")),
         MatchCondition::Not(c) => !evaluate(c, ctx, policy),
+        MatchCondition::Version(patterns) => host_matches(
+            patterns,
+            crate::transport::version::LOCAL_VERSION
+                .strip_prefix("SSH-2.0-")
+                .unwrap_or(crate::transport::version::LOCAL_VERSION),
+        ),
+        MatchCondition::RDomain(patterns) => ctx.rdomain.is_some_and(|r| host_matches(patterns, r)),
+        MatchCondition::InvalidUser => ctx.invalid_user == Some(true),
     }
 }
 
@@ -740,7 +773,7 @@ mod tests {
 
     #[test]
     fn server_rejects_client_only_criteria() {
-        for kw in ["host", "originalhost", "localuser"] {
+        for kw in ["originalhost", "localuser"] {
             let args = vec![kw.to_string(), "x".to_string()];
             let err = parse_match_line_server(&args, 3).unwrap_err();
             assert!(
@@ -751,12 +784,41 @@ mod tests {
     }
 
     #[test]
-    fn server_rejects_rdomain_connection() {
-        for kw in ["rdomain", "connection"] {
-            let args = vec![kw.to_string(), "x".to_string()];
-            let err = parse_match_line_server(&args, 5).unwrap_err();
-            assert!(matches!(err, ConfigError::Unsupported { line: 5, .. }));
-        }
+    fn server_rejects_connection() {
+        let args = vec!["connection".to_string(), "x".to_string()];
+        let err = parse_match_line_server(&args, 5).unwrap_err();
+        assert!(matches!(err, ConfigError::Unsupported { line: 5, .. }));
+    }
+
+    #[test]
+    fn version_rdomain_invalid_user() {
+        let ctx = MatchContext {
+            host: "h",
+            invalid_user: Some(true),
+            ..MatchContext::default()
+        };
+        let parse = |s: &str| {
+            let args: Vec<String> = s.split(' ').map(String::from).collect();
+            parse_match_line_server(&args, 1).unwrap()
+        };
+        assert!(all_match(
+            &parse("version puressh_*"),
+            &ctx,
+            ExecPolicy::Deny
+        ));
+        assert!(!all_match(
+            &parse("version OpenSSH_*"),
+            &ctx,
+            ExecPolicy::Deny
+        ));
+        assert!(!all_match(&parse("rdomain *"), &ctx, ExecPolicy::Deny));
+        assert!(all_match(&parse("invalid-user"), &ctx, ExecPolicy::Deny));
+        assert!(all_match(&parse("host h"), &ctx, ExecPolicy::Deny));
+        let known = MatchContext {
+            invalid_user: Some(false),
+            ..ctx
+        };
+        assert!(!all_match(&parse("invalid-user"), &known, ExecPolicy::Deny));
     }
 
     #[test]

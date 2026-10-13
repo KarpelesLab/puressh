@@ -451,6 +451,10 @@ pub enum ServerStep {
         /// (default-deny extensions + `force-command`). `None` for plain-key /
         /// password / keyboard-interactive auth (all capabilities allowed).
         cert_caps: Option<AuthCertCaps>,
+        /// The methods that succeeded, one per line as OpenSSH's sshd
+        /// records them for `ExposeAuthInfo` (`publickey ssh-ed25519
+        /// AAAA…`, `password`, `keyboard-interactive/pam`).
+        auth_info: String,
     },
     /// Disconnect the peer with the given (static) reason.
     Disconnect(&'static str),
@@ -476,6 +480,8 @@ pub struct ServerAuth {
     /// of a multi-factor chain: OpenSSH refuses one offered again, so
     /// `publickey,publickey` takes two different keys.
     used_keys: Vec<Vec<u8>>,
+    /// One line per method that succeeded (see `ServerStep::Authenticated`).
+    auth_info: String,
     /// Number of prompts issued in the in-flight keyboard-interactive
     /// `InteractiveRequest`, retained so the matching INFO_RESPONSE can be
     /// rejected when its response count does not equal the prompt count
@@ -534,6 +540,7 @@ impl ServerAuth {
             state: State::AwaitingServiceRequest,
             pending_user: None,
             used_keys: Vec::new(),
+            auth_info: String::new(),
             pending_prompt_count: None,
             first_user: None,
             allow_none: false,
@@ -732,6 +739,7 @@ impl ServerAuth {
                     return self.emit_failure();
                 }
                 let decision = self.auth.evaluate_interactive(&user, responses);
+                self.record_success(&decision, "keyboard-interactive/pam".into());
                 self.apply_decision(decision, &user)
             }
             State::Done => Ok(ServerStep::Disconnect("auth: already finished")),
@@ -767,6 +775,7 @@ impl ServerAuth {
                     user: user.clone(),
                     password,
                 });
+                self.record_success(&decision, "password".into());
                 self.apply_decision(decision, &user)
             }
             AuthMethodPayload::PublicKey {
@@ -977,7 +986,28 @@ impl ServerAuth {
         if matches!(decision, AuthDecision::PartialAccept { .. }) {
             self.used_keys.push(key_blob);
         }
+        let key_type = crate::format::Reader::new(&public_blob)
+            .read_string()
+            .ok()
+            .and_then(|t| core::str::from_utf8(t).ok())
+            .unwrap_or("");
+        let line = alloc::format!(
+            "publickey {key_type} {}",
+            crate::key::base64::encode(&public_blob)
+        );
+        self.record_success(&decision, line);
         self.apply_decision(decision, &user)
+    }
+
+    /// Note a method that succeeded (fully or as one factor).
+    fn record_success(&mut self, decision: &AuthDecision, line: String) {
+        if matches!(
+            decision,
+            AuthDecision::Accept | AuthDecision::PartialAccept { .. }
+        ) {
+            self.auth_info.push_str(&line);
+            self.auth_info.push('\n');
+        }
     }
 
     fn apply_decision(&mut self, decision: AuthDecision, user: &str) -> Result<ServerStep> {
@@ -988,6 +1018,7 @@ impl ServerAuth {
                     payload: encode_success(),
                     user: user.into(),
                     cert_caps: self.pending_cert_caps.take(),
+                    auth_info: core::mem::take(&mut self.auth_info),
                 })
             }
             AuthDecision::PartialAccept { still_required } => {

@@ -98,6 +98,12 @@ pub struct ServerOptions {
     /// `HostKey` file holds only the public key; `SSH_AUTH_SOCK` names the
     /// environment's agent. `None` for `none` or unset.
     pub host_key_agent: Option<String>,
+    /// `PAMServiceName` — the PAM service sshd authenticates with
+    /// (`sshd` when unset).
+    pub pam_service_name: Option<String>,
+    /// `ExposeAuthInfo` — give sessions `SSH_USER_AUTH`, a file listing the
+    /// authentication methods (and keys) that succeeded.
+    pub expose_auth_info: Option<bool>,
     /// `TrustedUserCAKeys` — path to a file of CA public keys whose user
     /// certificates the server will accept (one key per line).
     pub trusted_user_ca_keys: Option<String>,
@@ -296,7 +302,9 @@ pub struct ServerOptions {
     /// The sftp-server arguments of that `Subsystem sftp` line (`-d`,
     /// `-u`, `-R`, …), applied by the in-process server.
     pub subsystem_sftp_args: Option<Vec<String>>,
-    /// Other `Subsystem` lines: name and command line, run as an `exec`.
+    /// Every `Subsystem` line, as written: name and command line (an
+    /// `internal-sftp` / `sftp-server` command is served in-process, any
+    /// other runs as an `exec` would). Valid in a `Match` block.
     pub subsystems: Option<Vec<(String, String)>>,
     /// `KnockListen` — UDP address(es) for the puressh knock rendezvous
     /// (`docs/knock.md`): `addr`, `addr:port` or `[v6]:port`. A missing port
@@ -488,10 +496,19 @@ impl SshServerConfig {
         // enclosing `Include`, restored when its file ends (OpenSSH).
         let mut current: Option<usize> = None;
         let mut at_include: Vec<Option<usize>> = Vec::new();
+        // The criteria of the `Match` block each enclosing `Include` sits in:
+        // a `Match` in the included file applies only where they hold too.
+        let mut guards: Vec<Vec<MatchCondition>> = Vec::new();
         for line in lines {
             match line.keyword.as_str() {
-                super::parser::INCLUDE_BEGIN => at_include.push(current),
+                super::parser::INCLUDE_BEGIN => {
+                    at_include.push(current);
+                    guards.push(
+                        current.map_or_else(Vec::new, |i| match_blocks[i].conditions.clone()),
+                    );
+                }
                 super::parser::INCLUDE_END => {
+                    guards.pop();
                     let saved = at_include.pop().flatten();
                     if saved != current {
                         // Lines after the Include belong to the block open
@@ -505,8 +522,18 @@ impl SshServerConfig {
                         });
                     }
                 }
-                _ => Self::apply_line(&mut global, &mut match_blocks, &mut current, &line)
-                    .map_err(|e| e.in_file(line.file.as_deref()))?,
+                _ => {
+                    Self::apply_line(&mut global, &mut match_blocks, &mut current, &line)
+                        .map_err(|e| e.in_file(line.file.as_deref()))?;
+                    if line.keyword == "match"
+                        && let Some(block) = match_blocks.last_mut()
+                    {
+                        let mut conditions: Vec<MatchCondition> =
+                            guards.iter().flatten().cloned().collect();
+                        conditions.append(&mut block.conditions);
+                        block.conditions = conditions;
+                    }
+                }
             }
         }
         Ok(SshServerConfig {
@@ -558,16 +585,6 @@ impl SshServerConfig {
         // drop-in or line cannot override an earlier one.
         let mut one = ServerOptions::default();
         apply_keyword(&mut one, line)?;
-        // A subsystem is defined once (OpenSSH refuses a second definition).
-        for (name, _) in one.subsystems.iter().flatten() {
-            if target.subsystems.iter().flatten().any(|(n, _)| n == name) {
-                return Err(ConfigError::BadValue {
-                    line: line.line_no,
-                    keyword: line.keyword.clone(),
-                    msg: format!("Subsystem '{name}' already defined"),
-                });
-            }
-        }
         target.warnings.append(&mut one.warnings);
         merge_server_options(target, &one);
         Ok(())
@@ -666,6 +683,8 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(compression);
     take_scalar!(rekey_limit);
     take_scalar!(address_family);
+    take_scalar!(pam_service_name);
+    take_scalar!(expose_auth_info);
     take_scalar!(host_key_agent);
     take_scalar!(subsystem_sftp);
     take_scalar!(subsystem_sftp_args);
@@ -709,10 +728,15 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     if dst.permit_user_environment.is_none() {
         dst.permit_user_environment = src.permit_user_environment.clone();
     }
+    // Subsystems: the first definition of a name wins (a `Match` block's
+    // over the global one, an earlier line's over a later one).
     if let Some(list) = &src.subsystems {
-        dst.subsystems
-            .get_or_insert_with(Vec::new)
-            .extend(list.iter().cloned());
+        let have = dst.subsystems.get_or_insert_with(Vec::new);
+        for (name, command) in list {
+            if !have.iter().any(|(n, _)| n == name) {
+                have.push((name.clone(), command.clone()));
+            }
+        }
     }
     dst.deny_users.extend(src.deny_users.iter().cloned());
     dst.allow_groups.extend(src.allow_groups.iter().cloned());
@@ -738,7 +762,6 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "maxstartups",
         "strictmodes",
         "include",
-        "subsystem",
         "permittunnel",
         // `AcceptEnv` is valid in a Match block in OpenSSH, but this server
         // applies the env allow-list once, connection-wide, from the global
@@ -777,6 +800,12 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "hostcertificate" => {
             opts.host_certificate_files.push(one_arg(line)?);
+        }
+        "exposeauthinfo" => {
+            opts.expose_auth_info = Some(parse_yes_no(line)?);
+        }
+        "pamservicename" => {
+            opts.pam_service_name = Some(one_arg(line)?);
         }
         "hostkeyagent" => {
             let v = one_arg(line)?;
@@ -1262,28 +1291,26 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                     msg: "expected `Subsystem <name> <command>`".into(),
                 });
             }
-            let name = line.args[0].to_ascii_lowercase();
             let command = &line.args[1];
             let base = command.rsplit('/').next().unwrap_or(command);
-            if name == "sftp"
+            if line.args[0].eq_ignore_ascii_case("sftp")
                 && (command.eq_ignore_ascii_case("internal-sftp") || base == "sftp-server")
             {
                 opts.subsystem_sftp = Some(true);
                 apply_sftp_server_args(opts, line, &line.args[2..])?;
                 opts.subsystem_sftp_args = Some(line.args[2..].to_vec());
-            } else {
-                // As written: the name is case-sensitive, and the command
-                // keeps its quoting for the shell.
-                let name = line.args[0].clone();
-                let command = line
-                    .rest
-                    .trim_start()
-                    .strip_prefix(name.as_str())
-                    .map_or_else(|| line.args[1..].join(" "), |c| c.trim().to_string());
-                opts.subsystems
-                    .get_or_insert_with(Vec::new)
-                    .push((name, command));
             }
+            // As written: the name is case-sensitive, and the command keeps
+            // its quoting for the shell.
+            let name = line.args[0].clone();
+            let command = line
+                .rest
+                .trim_start()
+                .strip_prefix(name.as_str())
+                .map_or_else(|| line.args[1..].join(" "), |c| c.trim().to_string());
+            opts.subsystems
+                .get_or_insert_with(Vec::new)
+                .push((name, command));
         }
         "permittunnel" => {
             if !one_arg(line)?.eq_ignore_ascii_case("no") {
@@ -1399,7 +1426,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     // Features this server does not have: ignoring them fails closed.
     ("SecurityKeyProvider", &["*"], ""),
     ("PubkeyAuthOptions", &["*"], ""),
-    ("ExposeAuthInfo", &["no"], "SSH_USER_AUTH is not set"),
     (
         "GSSAPIAuthentication",
         &["no"],
@@ -2153,13 +2179,18 @@ Match LocalPort 2222
     }
 
     #[test]
-    fn match_host_on_server_unsupported() {
-        let src = "Match Host example.com\n  X11Forwarding no\n";
-        let err = SshServerConfig::parse(src).unwrap_err();
-        assert!(
-            matches!(err, ConfigError::Unsupported { line: 1, .. }),
-            "{err:?}"
+    fn match_host_on_server_is_the_client_host() {
+        let src = "Match Host 192.0.2.*\n  X11Forwarding no\n";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        let ctx = MatchContext {
+            host: "192.0.2.7",
+            ..MatchContext::default()
+        };
+        assert_eq!(
+            cfg.resolve(&ctx, ExecPolicy::Deny).x11_forwarding,
+            Some(false)
         );
+        assert!(SshServerConfig::parse("Match OriginalHost x\n").is_err());
     }
 
     #[test]
@@ -2827,9 +2858,11 @@ UsePrivilegeSeparation sandbox
             cfg.global.subsystem_sftp_args.as_deref(),
             Some(&["-u".to_string(), "077".into(), "-d".into(), "%d/up".into()][..])
         );
-        // Other subsystems run their command, written as it was.
+        // Other subsystems run their command, written as it was; the first
+        // definition of a name wins.
         let cfg = SshServerConfig::parse(
-            "Subsystem netconf /usr/bin/netconf --opt 'a b'\nSubsystem NetConf2 x\n",
+            "Subsystem netconf /usr/bin/netconf --opt 'a b'\nSubsystem NetConf2 x\n\
+             Subsystem netconf other\n",
         )
         .unwrap();
         assert_eq!(cfg.global.subsystem_sftp, None);
@@ -2846,7 +2879,13 @@ UsePrivilegeSeparation sandbox
             )
         );
         assert_eq!(cfg.warnings().count(), 0);
-        assert!(SshServerConfig::parse("Subsystem x a\nSubsystem x b\n").is_err());
+        // A Match block's definition wins over the global one.
+        let cfg = SshServerConfig::parse("Subsystem x a\nMatch all\n  Subsystem x b\n").unwrap();
+        let opts = cfg.resolve(
+            &crate::config::MatchContext::default(),
+            crate::config::ExecPolicy::Deny,
+        );
+        assert_eq!(opts.subsystems.unwrap()[0], ("x".into(), "b".into()));
     }
 
     #[test]
@@ -2896,7 +2935,6 @@ UsePrivilegeSeparation sandbox
             "PidFile /x",
             "Compression no",
             "RekeyLimit 1G",
-            "Subsystem sftp internal-sftp",
             "PermitTunnel yes",
         ] {
             let src = format!("Match User alice\n  {kw}\n");

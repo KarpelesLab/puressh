@@ -521,6 +521,19 @@ pub trait SubsystemHandler: Send + Sync {
     }
 }
 
+/// The arguments of a `Subsystem` command that is an sftp server
+/// (`internal-sftp`, or OpenSSH's `sftp-server` binary, served in-process),
+/// or `None` for any other command.
+fn sftp_server_args(command: &str) -> Option<Vec<String>> {
+    let mut words = command.split_whitespace();
+    let first = words.next()?;
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if !first.eq_ignore_ascii_case("internal-sftp") && base != "sftp-server" {
+        return None;
+    }
+    Some(words.map(str::to_string).collect())
+}
+
 /// The arguments of an `internal-sftp` command line (as `ForceCommand`
 /// gives it), or `None` when `command` runs something else.
 fn internal_sftp_args(command: &str) -> Option<Vec<String>> {
@@ -1404,6 +1417,13 @@ pub struct EffectivePolicy {
     /// with) the `sshd_config` gates above. `None` ⇒ plain-key / password /
     /// keyboard-interactive auth: certificates impose no extra restriction.
     pub cert_caps: Option<crate::auth::AuthCertCaps>,
+    /// This connection's `Subsystem` lines (name, command): a `Match`
+    /// block's ahead of the global ones.
+    pub subsystems: Option<Vec<(String, String)>>,
+    /// `ExposeAuthInfo`: sessions get `SSH_USER_AUTH`.
+    pub expose_auth_info: Option<bool>,
+    /// The `SSH_USER_AUTH` file written for this connection, if any.
+    pub auth_info_file: Option<String>,
 }
 
 impl EffectivePolicy {
@@ -1430,6 +1450,9 @@ impl EffectivePolicy {
             disable_forwarding: None,
             allow_stream_local_forwarding: None,
             cert_caps: None,
+            subsystems: None,
+            expose_auth_info: None,
+            auth_info_file: None,
         }
     }
 
@@ -2101,7 +2124,7 @@ fn handle_connection_inner(
     let local_port = local.map(|a| a.port());
     let preauth = resolve_preauth_policy(&cfg, peer_ip.as_deref(), local_ip.as_deref(), local_port);
 
-    let (user, cert_caps) = map_preauth_timeout(do_server_auth(
+    let (user, cert_caps, auth_info) = map_preauth_timeout(do_server_auth(
         &mut stream,
         &mut driver,
         &cfg,
@@ -2158,6 +2181,13 @@ fn handle_connection_inner(
         hook(&ctx)?;
     }
 
+    // `ExposeAuthInfo`: the methods that succeeded, in a file of the user's
+    // own (written after the privilege drop), removed with the connection.
+    if effective.expose_auth_info == Some(true) && !auth_info.is_empty() {
+        effective.auth_info_file = write_auth_info_file(&auth_info);
+    }
+    let _remove_auth_info = RemoveOnDrop(effective.auth_info_file.clone());
+
     // RFC 4253 §6.2: zlib@openssh.com starts compressing here.
     driver.notify_auth_success();
 
@@ -2171,6 +2201,53 @@ fn handle_connection_inner(
         "closing session",
     );
     r
+}
+
+/// Write `info` to a new `/tmp/sshauth.XXXXXXXXXXXXXXX` file readable by
+/// its owner only (OpenSSH's `prepare_auth_info_file`); its path, or `None`
+/// when it could not be written.
+fn write_auth_info_file(info: &str) -> Option<String> {
+    use purecrypto::rng::{OsRng, RngCore};
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    for _ in 0..8 {
+        let mut raw = [0u8; 15];
+        OsRng.fill_bytes(&mut raw);
+        let name: String = raw
+            .iter()
+            .map(|b| CHARS[*b as usize % CHARS.len()] as char)
+            .collect();
+        let path = alloc::format!("/tmp/sshauth.{name}");
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        match options.open(&path) {
+            Ok(mut f) => {
+                if f.write_all(info.as_bytes()).is_ok() {
+                    return Some(path);
+                }
+                let _ = std::fs::remove_file(&path);
+                return None;
+            }
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+/// Removes a file when dropped.
+struct RemoveOnDrop(Option<String>);
+
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = std::fs::remove_file(p);
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2233,7 +2310,9 @@ fn resolve_preauth_policy(
         };
     };
     let ctx = crate::config::MatchContext {
-        host: "",
+        // `Match host`: the client's host — its address, as OpenSSH's with
+        // `UseDNS no` (its default).
+        host: address.unwrap_or("UNKNOWN"),
         address,
         local_address,
         local_port,
@@ -2299,7 +2378,9 @@ fn resolve_effective_policy(
         return EffectivePolicy::unrestricted();
     };
     let ctx = crate::config::MatchContext {
-        host: "",
+        // `Match host`: the client's host — its address, as OpenSSH's with
+        // `UseDNS no` (its default).
+        host: address.unwrap_or("UNKNOWN"),
         user: Some(user),
         groups,
         address,
@@ -2331,6 +2412,9 @@ fn resolve_effective_policy(
         // Certificate caps are not a `sshd_config` concept; they are folded in
         // post-auth by the caller from the authenticating user certificate.
         cert_caps: None,
+        subsystems: opts.subsystems,
+        expose_auth_info: opts.expose_auth_info,
+        auth_info_file: None,
     }
 }
 
@@ -2345,7 +2429,7 @@ fn do_server_auth(
     local_ip: Option<&str>,
     local_port: Option<u16>,
     deadline: Option<Instant>,
-) -> Result<(String, Option<crate::auth::AuthCertCaps>)> {
+) -> Result<(String, Option<crate::auth::AuthCertCaps>, String)> {
     let methods = preauth.methods.clone();
     let auth_impl = cfg.authenticator.build_with_peer(peer_ip);
     let mut server_auth = ServerAuth::new(session_id, methods, auth_impl);
@@ -2428,9 +2512,10 @@ fn do_server_auth(
                 payload,
                 user,
                 cert_caps,
+                auth_info,
             } => {
                 srv_send(stream, driver, &payload)?;
-                return Ok((user, cert_caps));
+                return Ok((user, cert_caps, auth_info));
             }
             ServerStep::Disconnect(reason) => {
                 let _ =
@@ -2474,7 +2559,9 @@ fn reresolve_user_policy(
     };
     let groups = resolve_user_groups(cfg, user);
     let ctx = crate::config::MatchContext {
-        host: "",
+        // `Match host`: the client's host — its address, as OpenSSH's with
+        // `UseDNS no` (its default).
+        host: address.unwrap_or("UNKNOWN"),
         user: Some(user),
         groups: groups.as_deref(),
         address,
@@ -4144,7 +4231,16 @@ fn handle_channel_request(
     {
         let env = envs.entry(channel).or_default();
         env.set_user_rc_allowed(effective.user_rc_allowed());
-        env.set_admin_env(effective.set_env.iter().map(String::as_str));
+        let auth_info = effective
+            .auth_info_file
+            .as_ref()
+            .map(|p| alloc::format!("SSH_USER_AUTH={p}"));
+        env.set_admin_env(
+            auth_info
+                .as_deref()
+                .into_iter()
+                .chain(effective.set_env.iter().map(String::as_str)),
+        );
         env.set_user_environment(effective.permit_user_environment.as_deref());
         // `environment=` key options, where PermitUserEnvironment allows.
         if let Some(caps) = &effective.cert_caps {
@@ -4389,8 +4485,26 @@ fn handle_channel_request(
                     stream, driver, conn, cfg, user, channel, &forced, want_reply, subsystems, envs,
                 );
             }
-            if let Some(command) = cfg.subsystem_commands.get(&name) {
-                let command = command.clone();
+            // This connection's `Subsystem` lines (a `Match` block's first),
+            // else the configured commands.
+            let command = effective
+                .subsystems
+                .iter()
+                .flatten()
+                .find(|(n, _)| *n == name)
+                .map(|(_, c)| c.clone())
+                .or_else(|| cfg.subsystem_commands.get(&name).cloned());
+            if let Some(command) = command {
+                // OpenSSH's in-process sftp-server (or its external one,
+                // served the same way).
+                if let Some(args) = sftp_server_args(&command)
+                    && cfg.subsystem_handler.is_some()
+                {
+                    return route_internal_sftp(
+                        stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,
+                        args,
+                    );
+                }
                 // `pty-req` came first: the subsystem gets the terminal.
                 if let Some(handled) =
                     spawn_command_on_pty(cfg, user, channel, &command, shells, envs, &empty_env)
@@ -5042,7 +5156,12 @@ fn srv_read_into(
     if n == 0 {
         return Err(Error::Protocol("connection closed"));
     }
-    driver.handle_input(&tmp[..n], Instant::now())?;
+    if let Err(e) = driver.handle_input(&tmp[..n], Instant::now()) {
+        // Say why, when the driver has something to say (a refused
+        // identification string), before the connection closes.
+        let _ = srv_pump_out(stream, driver);
+        return Err(e);
+    }
     Ok(())
 }
 

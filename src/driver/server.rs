@@ -34,9 +34,8 @@ use crate::transport::rekey::{RekeyPolicy, is_kex_msg, may_send_during_kex};
 use crate::transport::{ExtInfo, KexRunner, PacketCodec, Role, VersionExchange};
 
 use super::{
-    Event, MAX_BANNER_LINE, MAX_BANNER_LINES, MAX_BANNER_TOTAL_BYTES, MAX_DEFERRED_OUT_BYTES,
-    MAX_INBOX_BYTES, SSH_MSG_EXT_INFO, SSH_MSG_KEXINIT, defer_inbound,
-    generic_msg_during_initial_kex, keepalive_request,
+    Event, MAX_BANNER_LINE, MAX_DEFERRED_OUT_BYTES, MAX_INBOX_BYTES, SSH_MSG_EXT_INFO,
+    SSH_MSG_KEXINIT, defer_inbound, generic_msg_during_initial_kex, keepalive_request,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,9 +88,6 @@ pub struct ServerDriver {
     keepalive: Option<(Duration, u32)>,
     last_activity: Instant,
     missed_keepalives: u32,
-
-    banner_lines: usize,
-    banner_total: usize,
 }
 
 impl ServerDriver {
@@ -122,8 +118,6 @@ impl ServerDriver {
             keepalive: None,
             last_activity: Instant::now(),
             missed_keepalives: 0,
-            banner_lines: 0,
-            banner_total: 0,
         }
     }
 
@@ -306,29 +300,27 @@ impl ServerDriver {
     // --- internal routing ---
 
     fn scan_peer_version(&mut self) -> Result<bool> {
-        loop {
-            let Some(pos) = self.inbox.iter().position(|&b| b == b'\n') else {
-                if self.inbox.len() > MAX_BANNER_LINE {
-                    return Err(Error::Protocol("banner line too long"));
-                }
-                return Ok(false);
-            };
-            let line: Vec<u8> = self.inbox.drain(..=pos).collect();
-            self.banner_total = self.banner_total.saturating_add(line.len());
-            if self.banner_total > MAX_BANNER_TOTAL_BYTES {
-                return Err(Error::Protocol("banner too large"));
+        let Some(pos) = self.inbox.iter().position(|&b| b == b'\n') else {
+            if self.inbox.len() > MAX_BANNER_LINE {
+                return Err(Error::Protocol("banner line too long"));
             }
-            if line.starts_with(b"SSH-") {
-                let parsed = VersionExchange::parse_remote(&line)?;
-                self.v_c = parsed.into_bytes();
-                self.phase = Phase::Kex;
-                return Ok(true);
-            }
-            self.banner_lines += 1;
-            if self.banner_lines > MAX_BANNER_LINES {
-                return Err(Error::Protocol("peer banner too long"));
-            }
-        }
+            return Ok(false);
+        };
+        let line: Vec<u8> = self.inbox.drain(..=pos).collect();
+        // Unlike a server, a client may send nothing before its
+        // identification: anything else is refused, with OpenSSH's message.
+        let parsed = line
+            .starts_with(b"SSH-")
+            .then(|| VersionExchange::parse_remote(&line).ok())
+            .flatten();
+        let Some(parsed) = parsed else {
+            self.outbox
+                .push_back(b"Invalid SSH identification string.\r\n".to_vec());
+            return Err(Error::Protocol("invalid SSH identification string"));
+        };
+        self.v_c = parsed.into_bytes();
+        self.phase = Phase::Kex;
+        Ok(true)
     }
 
     fn route_packet(&mut self, payload: &[u8], now: Instant) -> Result<()> {

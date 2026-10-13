@@ -388,9 +388,11 @@ mod imp {
         }
 
         impl PamGate {
-            pub fn new(debug: bool) -> Arc<Self> {
+            /// `service`: the PAM service (`PAMServiceName`, `sshd` by
+            /// default).
+            pub fn new(debug: bool, service: &'static str) -> Arc<Self> {
                 Arc::new(Self {
-                    service: "sshd",
+                    service,
                     peer: Mutex::new(None),
                     envs: Mutex::new(Vec::new()),
                     inner: Mutex::new(None),
@@ -691,7 +693,7 @@ mod imp {
         }
 
         impl PamGate {
-            pub fn new(_debug: bool) -> Arc<Self> {
+            pub fn new(_debug: bool, _service: &'static str) -> Arc<Self> {
                 Arc::new(PamGate)
             }
             pub fn set_peer(&self, _peer: String) {}
@@ -1029,8 +1031,14 @@ mod imp {
 
         // `-C user=…,addr=…` (any order, repeatable).
         let (mut user, mut host, mut addr, mut laddr, mut lport) = (None, None, None, None, None);
+        let mut invalid_user = false;
+        let mut rdomain = None;
         for spec in &cli.connection_spec {
             for kv in spec.split(',').filter(|kv| !kv.is_empty()) {
+                if kv == "invalid-user" {
+                    invalid_user = true;
+                    continue;
+                }
                 let (k, v) = kv
                     .split_once('=')
                     .ok_or_else(|| format!("Invalid test mode specification {kv}"))?;
@@ -1042,7 +1050,7 @@ mod imp {
                     "lport" => {
                         lport = Some(v.parse::<u16>().map_err(|_| format!("Invalid port {v}"))?)
                     }
-                    "rdomain" => {}
+                    "rdomain" => rdomain = Some(v.to_string()),
                     _ => return Err(format!("Invalid test mode specification {kv}")),
                 }
             }
@@ -1053,6 +1061,8 @@ mod imp {
             let groups = user.as_deref().map(lookup_user_groups);
             let mut ctx = MatchContext::default();
             ctx.host = host.as_deref().unwrap_or("");
+            ctx.invalid_user = Some(invalid_user);
+            ctx.rdomain = rdomain.as_deref();
             ctx.user = user.as_deref();
             ctx.groups = groups.as_deref();
             ctx.address = addr.as_deref();
@@ -1127,6 +1137,10 @@ mod imp {
         if let Some(a) = &opts.host_key_agent {
             line("hostkeyagent", a);
         }
+        line(
+            "pamservicename",
+            opts.pam_service_name.as_deref().unwrap_or("sshd"),
+        );
         line(
             "usepam",
             yn(opts
@@ -1287,7 +1301,13 @@ mod imp {
         line("trustedusercakeys", &none_or(&opts.trusted_user_ca_keys));
         line(
             "revokedkeys",
-            &none_or(&opts.revoked_keys.as_ref().map(|v| v.join(" "))),
+            &none_or(
+                &opts
+                    .revoked_keys
+                    .as_ref()
+                    .filter(|v| !v.is_empty())
+                    .map(|v| v.join(" ")),
+            ),
         );
         line("banner", &none_or(&opts.banner));
         line("forcecommand", &none_or(&opts.force_command));
@@ -1320,6 +1340,8 @@ mod imp {
         let hostport = |hp: &Option<Vec<puressh::config::HostPort>>| match hp {
             None => "any".to_string(),
             Some(v) if v.is_empty() => "none".to_string(),
+            // What `any` parses to.
+            Some(v) if v.len() == 1 && v[0].host == "*" && v[0].port.is_none() => "any".to_string(),
             Some(v) => v
                 .iter()
                 .map(|h| match h.port {
@@ -1368,14 +1390,17 @@ mod imp {
             ("exposeauthinfo", "no"),
             ("usedns", "no"),
             ("fingerprinthash", "SHA256"),
-            ("pamservicename", "sshd"),
         ] {
             line(k, v);
         }
-        if opts.subsystem_sftp != Some(false) && opts.sftp_enabled != Some(false) {
+        let subsystems = opts.subsystems.clone().unwrap_or_default();
+        if !subsystems.iter().any(|(n, _)| n == "sftp")
+            && opts.subsystem_sftp != Some(false)
+            && opts.sftp_enabled != Some(false)
+        {
             line("subsystem", "sftp internal-sftp");
         }
-        for (name, command) in opts.subsystems.iter().flatten() {
+        for (name, command) in &subsystems {
             line("subsystem", &format!("{name} {command}"));
         }
         for (k, v) in [
@@ -4604,6 +4629,9 @@ mod imp {
         ctx.user = Some(user);
         ctx.groups = Some(groups);
         ctx.address = peer_ip;
+        // `Match host`: the client's address (OpenSSH's `UseDNS no`).
+        ctx.host = peer_ip.unwrap_or("UNKNOWN");
+        ctx.invalid_user = Some(lookup_user(user).is_err());
         ctx.local_address = local_ip.as_deref();
         ctx.local_port = local.map(|a| a.port());
         config.resolve(&ctx, puressh::config::ExecPolicy::Deny)
@@ -6025,6 +6053,16 @@ mod imp {
 
             let mut stream = stream;
             let res = match parsed.role {
+                // Several sources (`-d`) need a directory to land in: refuse
+                // before the transfer starts, as OpenSSH's sink does.
+                ScpRole::To if parsed.target_dir && !abs_path.is_dir() => {
+                    let msg = format!("\x01scp: {}: Not a directory\n", abs_path.display());
+                    let _ = std::io::Write::write_all(&mut stream, msg.as_bytes());
+                    Err(puressh::scp::ScpError::Remote(format!(
+                        "{}: Not a directory",
+                        abs_path.display()
+                    )))
+                }
                 ScpRole::To => {
                     // `scp -t` — the peer is the sender, we receive.
                     let mut opts = ScpRecvOptions::default();
@@ -6060,6 +6098,8 @@ mod imp {
         role: ScpRole,
         recursive: bool,
         preserve_times: bool,
+        /// `-d`: the target must be a directory (several sources).
+        target_dir: bool,
         path: std::path::PathBuf,
     }
 
@@ -6152,6 +6192,7 @@ mod imp {
         let mut role: Option<ScpRole> = None;
         let mut recursive = false;
         let mut preserve_times = false;
+        let mut target_dir = false;
         let mut positional: Vec<&str> = Vec::new();
         let mut i = 1;
         while i < argv.len() {
@@ -6161,8 +6202,9 @@ mod imp {
                 "-f" => role = Some(ScpRole::From),
                 "-r" => recursive = true,
                 "-p" => preserve_times = true,
+                "-d" => target_dir = true,
                 // Innocent flags scp(1) sometimes adds — accept and ignore.
-                "-d" | "-v" | "-q" | "-B" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
+                "-v" | "-q" | "-B" | "-C" | "-1" | "-2" | "-3" | "-4" | "-6" => {}
                 "--" => {
                     i += 1;
                     while i < argv.len() {
@@ -6188,6 +6230,7 @@ mod imp {
             role,
             recursive,
             preserve_times,
+            target_dir,
             path,
         })
     }
@@ -7875,7 +7918,12 @@ mod imp {
         // holds a clone too, but fork's COW gives each connection its
         // own copy — no cross-connection state bleed. The authenticator
         // borrows a clone for password verification.
-        let pam_gate = pam_gate::PamGate::new(cli.debug);
+        // `PAMServiceName`: kept for the daemon's lifetime.
+        let pam_service: &'static str = match &sshd_cfg.global.pam_service_name {
+            Some(s) => Box::leak(s.clone().into_boxed_str()),
+            None => "sshd",
+        };
+        let pam_gate = pam_gate::PamGate::new(cli.debug, pam_service);
 
         // Whether a real PAM backend is compiled in. Password and
         // keyboard-interactive auth are *only* advertised when both the config
@@ -8735,7 +8783,7 @@ mod imp {
                 auth_commands: AuthCommands::default(),
                 command_cache: Default::default(),
                 permit_root_login: puressh::config::PermitRootLogin::ProhibitPassword,
-                pam: pam_gate::PamGate::new(false),
+                pam: pam_gate::PamGate::new(false, "sshd"),
                 password_enabled: false,
                 kbd_interactive_enabled: false,
                 kbd_conv: None,

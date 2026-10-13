@@ -181,6 +181,65 @@ fn openssh_client_through_sshd_inetd() {
         failures.push(format!("unknown subsystem accepted: {}", text(&out)));
     }
 
+    // A `Match` block's Subsystem wins over the global one; a second
+    // definition of a name is ignored.
+    let out = s.ssh(
+        "Subsystem x echo global\nSubsystem x echo second\nMatch all\n  Subsystem x echo matched\n",
+        &["-s", &target, "x"],
+        b"",
+    );
+    if out.stdout != b"matched\n" {
+        failures.push(format!("Subsystem in Match: {}", text(&out)));
+    }
+
+    // ExposeAuthInfo: the methods that succeeded, in $SSH_USER_AUTH.
+    let out = s.ssh(
+        "ExposeAuthInfo yes\n",
+        &[&target, "cat \"$SSH_USER_AUTH\""],
+        b"",
+    );
+    let want = format!(
+        "publickey {}",
+        user_pub
+            .split_whitespace()
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    if String::from_utf8_lossy(&out.stdout).trim() != want {
+        failures.push(format!("ExposeAuthInfo: {}", text(&out)));
+    }
+    let out = s.ssh("", &[&target, "echo \"[$SSH_USER_AUTH]\""], b"");
+    if String::from_utf8_lossy(&out.stdout).trim() != "[]" {
+        failures.push(format!(
+            "SSH_USER_AUTH without ExposeAuthInfo: {}",
+            text(&out)
+        ));
+    }
+
+    // scp (original protocol) of two files onto a plain file: refused, the
+    // file left alone.
+    let (a, b, dest) = (s.path("a"), s.path("b"), s.path("dest"));
+    std::fs::write(&a, "a").unwrap();
+    std::fs::write(&b, "b").unwrap();
+    std::fs::write(&dest, "keep").unwrap();
+    let mut scp_args = vec!["-O".to_string()];
+    scp_args.extend(s.client_args(""));
+    let out = Command::new("scp")
+        .args(&scp_args)
+        .arg(&a)
+        .arg(&b)
+        .arg(format!("{}:{}", target, dest.display()))
+        .stdin(Stdio::null())
+        .output()
+        .expect("run scp");
+    if out.status.success()
+        || std::fs::read_to_string(&dest).unwrap() != "keep"
+        || !String::from_utf8_lossy(&out.stderr).contains("Not a directory")
+    {
+        failures.push(format!("scp onto a non-directory: {}", text(&out)));
+    }
+
     // A forced `internal-sftp` with a start directory.
     let start = s.path("start");
     std::fs::create_dir_all(&start).unwrap();

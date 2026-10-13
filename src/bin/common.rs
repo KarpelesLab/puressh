@@ -972,6 +972,34 @@ pub fn identity_signer(
     }
 }
 
+/// The agent connections authentication signs through, bound to the session
+/// once it is up (`session-bind@openssh.com`, see [`bind_auth_agents`]).
+#[cfg(unix)]
+static AUTH_AGENTS: Mutex<Vec<Arc<Mutex<Agent>>>> = Mutex::new(Vec::new());
+
+/// Bind every agent connection authentication uses to the session, as
+/// OpenSSH does before it signs with an agent key: an agent that holds keys
+/// with destination constraints only lets them sign for the hosts named.
+#[cfg(unix)]
+#[allow(dead_code)] // ssh only
+pub fn bind_auth_agents(binding: &puressh::client::SessionBinding) {
+    let agents = AUTH_AGENTS.lock().map(|g| g.clone()).unwrap_or_default();
+    for agent in agents {
+        if let Ok(mut a) = agent.lock() {
+            match a.bind_session(
+                &binding.host_key,
+                &binding.session_id,
+                &binding.signature,
+                false,
+            ) {
+                Ok(true) => vlog(1, "bound agent to hostkey"),
+                Ok(false) => vlog(1, "agent does not support session binding"),
+                Err(e) => vlog(1, &format!("agent session binding: {e}")),
+            }
+        }
+    }
+}
+
 /// The agent's signer for the public key `blob`, if the agent holds it
 /// (to pair a `CertificateFile` with an agent key, as OpenSSH does).
 #[cfg(unix)]
@@ -979,6 +1007,9 @@ pub fn identity_signer(
 pub fn agent_signer_for(blob: &[u8]) -> Option<AgentHostKey> {
     let agent = Agent::connect_env().ok()??;
     let agent = Arc::new(Mutex::new(agent));
+    if let Ok(mut g) = AUTH_AGENTS.lock() {
+        g.push(agent.clone());
+    }
     let held = agent
         .lock()
         .ok()?
@@ -1014,6 +1045,9 @@ pub fn connect_agent_credentials() -> Result<Vec<ClientCredential>, String> {
         }
     };
     let agent = Arc::new(Mutex::new(agent));
+    if let Ok(mut g) = AUTH_AGENTS.lock() {
+        g.push(agent.clone());
+    }
     let identities = {
         let mut a = agent
             .lock()

@@ -998,6 +998,11 @@ impl SharedClient {
         Ok(lock_or_poison(&self.inner)?.client.session_id().to_vec())
     }
 
+    /// See [`crate::client::Client::session_binding`].
+    pub fn session_binding(&self) -> Result<Option<crate::client::SessionBinding>> {
+        Ok(lock_or_poison(&self.inner)?.client.session_binding())
+    }
+
     /// Undo a [`Self::request_streamlocal_forward`].
     pub fn cancel_streamlocal_forward(&self, socket_path: &str) -> Result<()> {
         let mut g = lock_or_poison(&self.inner)?;

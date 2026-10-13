@@ -25,6 +25,6 @@ pub mod server;
 #[cfg(test)]
 mod tests;
 
-pub use client::{Agent, AgentIdentity};
+pub use client::{Agent, AgentIdentity, validate_auth_sock};
 pub use host_key::{AgentHostKey, RsaHash};
 pub use server::AgentState;

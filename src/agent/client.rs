@@ -202,6 +202,38 @@ impl Agent {
         self.simple_request(&frame, "unlock")
     }
 
+    /// Bind this agent connection to an SSH session
+    /// (`session-bind@openssh.com`): the host key, the session id, the
+    /// host's signature over it, and whether the connection forwards the
+    /// agent (rather than authenticating). An agent then lets keys added with
+    /// destination constraints sign only for the hosts they name. `false`
+    /// when the agent does not support it.
+    pub fn bind_session(
+        &mut self,
+        host_key: &[u8],
+        session_id: &[u8],
+        signature: &[u8],
+        forwarding: bool,
+    ) -> Result<bool> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(b"session-bind@openssh.com");
+        w.write_string(host_key);
+        w.write_string(session_id);
+        w.write_string(signature);
+        w.write_u8(u8::from(forwarding));
+        self.write_frame(&encode_message(
+            super::protocol::SSH_AGENTC_EXTENSION,
+            w.as_slice(),
+        ))?;
+        let (msg_type, _) = self.read_frame()?;
+        Ok(msg_type == SSH_AGENT_SUCCESS)
+    }
+
+    /// The connection, to hand on (e.g. spliced to a forwarded channel).
+    pub fn into_stream(self) -> UnixStream {
+        self.stream
+    }
+
     fn simple_request(&mut self, frame: &[u8], what: &'static str) -> Result<()> {
         self.write_frame(frame)?;
         let (msg_type, _) = self.read_frame()?;
@@ -243,9 +275,9 @@ impl Agent {
 
 /// Whether `path` is a Unix-domain socket (following symlinks, as
 /// OpenSSH's `connect(2)` does). The reason when not: `No such file or
-/// directory` for a stale path. Crate-visible so agent *forwarding*
-/// (`forwarding::agent`) skips a missing agent the same way.
-pub(crate) fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
+/// directory` for a stale path. Agent *forwarding* (`forwarding::agent`, and
+/// `ssh -A`) skips a missing agent the same way.
+pub fn validate_auth_sock(path: &Path) -> core::result::Result<(), String> {
     use std::os::unix::fs::FileTypeExt;
     let md = std::fs::metadata(path).map_err(|e| {
         let s = e.to_string();

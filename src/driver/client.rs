@@ -199,6 +199,12 @@ impl ClientDriver {
         &self.session_id
     }
 
+    /// The first key exchange's host key and its signature over the
+    /// session id (see [`crate::client::SessionBinding`]).
+    pub fn initial_host_key_sig(&self) -> Option<(&[u8], &[u8])> {
+        self.runner.initial_host_key_sig()
+    }
+
     /// The peer's negotiated EXT_INFO (e.g. server-sig-algs), if any.
     pub fn peer_ext_info(&self) -> Option<&ExtInfo> {
         self.runner.peer_ext_info()

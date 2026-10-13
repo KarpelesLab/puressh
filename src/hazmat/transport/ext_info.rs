@@ -86,6 +86,21 @@ impl ExtInfo {
         self
     }
 
+    /// Insert (or replace) any extension by name (`publickey-hostbound@openssh.com`,
+    /// `ping@openssh.com`, …).
+    pub fn with_extension(mut self, name: &str, value: &str) -> Self {
+        self.set_raw(name, value);
+        self
+    }
+
+    /// The value of extension `name`, if present.
+    pub fn extension(&self, name: &str) -> Option<&str> {
+        self.raw
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+
     fn set_raw(&mut self, name: &str, value: &str) {
         if let Some(pair) = self.raw.iter_mut().find(|(n, _)| n == name) {
             pair.1 = value.to_string();

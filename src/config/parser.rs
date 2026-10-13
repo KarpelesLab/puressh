@@ -119,77 +119,83 @@ pub fn tokenize(src: &str) -> Result<Vec<ParsedLine>, ConfigError> {
     Ok(out)
 }
 
-/// Cut everything from the first unquoted `#` on. Quoted spans are skipped
-/// over so `Host "weird#name"` parses correctly.
+/// Cut the line at its comment: a `#` that starts a token (outside quotes),
+/// as OpenSSH's argv_split ends a line there. A `#` inside a token
+/// (`Host foo#bar`) or quotes is kept.
 fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
+    let b = line.as_bytes();
     let mut i = 0;
-    let mut in_quotes = false;
-    let mut escape = false;
-    while i < bytes.len() {
-        let c = bytes[i];
-        if escape {
-            escape = false;
-        } else if c == b'\\' && in_quotes {
-            escape = true;
-        } else if c == b'"' {
-            in_quotes = !in_quotes;
-        } else if c == b'#' && !in_quotes {
+    while i < b.len() {
+        // Between tokens.
+        if b[i] == b' ' || b[i] == b'\t' {
+            i += 1;
+            continue;
+        }
+        if b[i] == b'#' {
             return &line[..i];
         }
-        i += 1;
+        // A token: to its end, honouring quotes and escapes.
+        let mut quote = 0u8;
+        while i < b.len() {
+            match b[i] {
+                b'\\'
+                    if i + 1 < b.len()
+                        && (matches!(b[i + 1], b'\'' | b'"' | b'\\')
+                            || (quote == 0 && b[i + 1] == b' ')) =>
+                {
+                    i += 1;
+                }
+                b' ' | b'\t' if quote == 0 => break,
+                b'"' | b'\'' if quote == 0 => quote = b[i],
+                c if quote != 0 && c == quote => quote = 0,
+                _ => {}
+            }
+            i += 1;
+        }
     }
     line
 }
 
-/// Split a trimmed, comment-free line into whitespace-separated tokens with
-/// quoting and escape handling.
+/// Split a trimmed, comment-free line into tokens as OpenSSH's argv_split:
+/// whitespace separates them; `"…"` and `'…'` quote; a backslash escapes a
+/// quote, a backslash, or (outside quotes) a space, and is kept before
+/// anything else.
 fn tokenize_line(line: &str, line_no: usize) -> Result<Vec<String>, ConfigError> {
+    let chars: Vec<char> = line.chars().collect();
     let mut out = Vec::new();
-    let mut cur = String::new();
-    let mut in_token = false;
-    let mut in_quotes = false;
-    let mut escape = false;
-
-    for ch in line.chars() {
-        if escape {
-            cur.push(ch);
-            escape = false;
-            in_token = true;
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ' ' || chars[i] == '\t' {
+            i += 1;
             continue;
         }
-        if in_quotes {
-            match ch {
-                '\\' => escape = true,
-                '"' => in_quotes = false,
-                _ => cur.push(ch),
+        let mut cur = String::new();
+        let mut quote: Option<char> = None;
+        while i < chars.len() {
+            let c = chars[i];
+            match c {
+                '\\' => match chars.get(i + 1) {
+                    Some(&n)
+                        if n == '\'' || n == '"' || n == '\\' || (quote.is_none() && n == ' ') =>
+                    {
+                        cur.push(n);
+                        i += 1;
+                    }
+                    _ => cur.push(c),
+                },
+                ' ' | '\t' if quote.is_none() => break,
+                '"' | '\'' if quote.is_none() => quote = Some(c),
+                _ if quote == Some(c) => quote = None,
+                _ => cur.push(c),
             }
-            continue;
+            i += 1;
         }
-        match ch {
-            '"' => {
-                in_quotes = true;
-                in_token = true;
-            }
-            c if c.is_whitespace() => {
-                if in_token {
-                    out.push(core::mem::take(&mut cur));
-                    in_token = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                in_token = true;
-            }
+        if quote.is_some() {
+            return Err(ConfigError::Syntax {
+                line: line_no,
+                msg: "unterminated quoted string".into(),
+            });
         }
-    }
-    if in_quotes {
-        return Err(ConfigError::Syntax {
-            line: line_no,
-            msg: "unterminated quoted string".into(),
-        });
-    }
-    if in_token {
         out.push(cur);
     }
     Ok(out)
@@ -211,6 +217,22 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].keyword, "hostname");
         assert_eq!(p[0].args, vec!["example.com"]);
+    }
+
+    #[test]
+    fn tokenizes_like_openssh_argv_split() {
+        // Escaped quotes (the regress suite's `SSH_SK_HELPER=\"\"`), single
+        // quotes, an escaped space, and a `#` inside a token.
+        let p = tokenize(
+            r#"ProxyCommand env X=\"\" 'a b' c\ d e#f # comment
+Host foo#bar
+"#,
+        )
+        .unwrap();
+        assert_eq!(p[0].args, vec!["env", r#"X="""#, "a b", "c d", "e#f"]);
+        assert_eq!(p[0].rest, r#"env X=\"\" 'a b' c\ d e#f"#);
+        assert_eq!(p[1].args, vec!["foo#bar"]);
+        assert!(tokenize("Host 'unterminated\n").is_err());
     }
 
     #[test]

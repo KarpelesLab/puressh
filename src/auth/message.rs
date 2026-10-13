@@ -230,6 +230,10 @@ pub enum AuthMethodPayload {
         algorithm: String,
         public_blob: Vec<u8>,
         signature: Option<Vec<u8>>,
+        /// `publickey-hostbound-v00@openssh.com`: the server's host key,
+        /// which the signature also covers (an agent can then tell which
+        /// host it signs for). `None` for plain `publickey`.
+        host_key: Option<Vec<u8>>,
     },
     KeyboardInteractive {
         language_tag: String,
@@ -258,6 +262,7 @@ impl core::fmt::Debug for AuthMethodPayload {
                 algorithm,
                 public_blob,
                 signature,
+                host_key: _,
             } => f
                 .debug_struct("PublicKey")
                 .field("signature_present", signature_present)
@@ -287,7 +292,8 @@ impl AuthMethodPayload {
         match self {
             AuthMethodPayload::None => "none",
             AuthMethodPayload::Password { .. } => "password",
-            AuthMethodPayload::PublicKey { .. } => "publickey",
+            AuthMethodPayload::PublicKey { host_key: None, .. } => "publickey",
+            AuthMethodPayload::PublicKey { .. } => PUBLICKEY_HOSTBOUND,
             AuthMethodPayload::KeyboardInteractive { .. } => "keyboard-interactive",
             AuthMethodPayload::Other { method, .. } => method,
         }
@@ -311,10 +317,14 @@ impl AuthMethodPayload {
                 algorithm,
                 public_blob,
                 signature,
+                host_key,
             } => {
                 w.write_bool(*signature_present);
                 w.write_string(algorithm.as_bytes());
                 w.write_string(public_blob);
+                if let Some(hk) = host_key {
+                    w.write_string(hk);
+                }
                 if *signature_present {
                     if let Some(sig) = signature {
                         w.write_string(sig);
@@ -385,10 +395,15 @@ impl UserauthRequest {
                     password,
                 }
             }
-            "publickey" => {
+            "publickey" | PUBLICKEY_HOSTBOUND => {
                 let signature_present = r.read_bool()?;
                 let algorithm = read_utf8(&mut r)?;
                 let public_blob = read_bytes_capped(&mut r)?.to_vec();
+                let host_key = if method_name == PUBLICKEY_HOSTBOUND {
+                    Some(read_bytes_capped(&mut r)?.to_vec())
+                } else {
+                    None
+                };
                 let signature = if signature_present {
                     Some(read_bytes_capped(&mut r)?.to_vec())
                 } else {
@@ -400,6 +415,7 @@ impl UserauthRequest {
                     algorithm,
                     public_blob,
                     signature,
+                    host_key,
                 }
             }
             "keyboard-interactive" => {
@@ -657,15 +673,38 @@ pub fn publickey_signed_data(
     algorithm: &str,
     public_blob: &[u8],
 ) -> Vec<u8> {
+    publickey_signed_data_bound(session_id, user, service, algorithm, public_blob, None)
+}
+
+/// The `publickey-hostbound-v00@openssh.com` method name.
+pub const PUBLICKEY_HOSTBOUND: &str = "publickey-hostbound-v00@openssh.com";
+
+/// [`publickey_signed_data`], for `publickey-hostbound-v00@openssh.com`
+/// when `host_key` is given: the method is named so and the server's host
+/// key follows the user's key.
+pub fn publickey_signed_data_bound(
+    session_id: &[u8],
+    user: &str,
+    service: &str,
+    algorithm: &str,
+    public_blob: &[u8],
+    host_key: Option<&[u8]>,
+) -> Vec<u8> {
     let mut w = Writer::with_capacity(64 + session_id.len() + public_blob.len());
     w.write_string(session_id);
     w.write_u8(SSH_MSG_USERAUTH_REQUEST);
     w.write_string(user.as_bytes());
     w.write_string(service.as_bytes());
-    w.write_string(b"publickey");
+    w.write_string(match host_key {
+        Some(_) => PUBLICKEY_HOSTBOUND.as_bytes(),
+        None => b"publickey",
+    });
     w.write_bool(true);
     w.write_string(algorithm.as_bytes());
     w.write_string(public_blob);
+    if let Some(hk) = host_key {
+        w.write_string(hk);
+    }
     w.into_vec()
 }
 
@@ -729,6 +768,7 @@ mod tests {
                 algorithm: "ssh-ed25519".into(),
                 public_blob: vec![1, 2, 3, 4],
                 signature: None,
+                host_key: None,
             },
         };
         let dec = UserauthRequest::decode(&msg.encode()).unwrap();
@@ -745,6 +785,7 @@ mod tests {
                 algorithm: "ssh-ed25519".into(),
                 public_blob: vec![1, 2, 3, 4],
                 signature: Some(vec![9, 8, 7, 6]),
+                host_key: None,
             },
         };
         let dec = UserauthRequest::decode(&msg.encode()).unwrap();

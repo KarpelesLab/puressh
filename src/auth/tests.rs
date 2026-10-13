@@ -380,6 +380,7 @@ fn server_publickey_bad_signature_emits_failure() {
             algorithm: "ssh-ed25519".into(),
             public_blob,
             signature: Some(bad_sig),
+            host_key: None,
         },
     }
     .encode();
@@ -424,6 +425,7 @@ fn server_publickey_good_signature_emits_success() {
             algorithm: "ssh-ed25519".into(),
             public_blob,
             signature: Some(sig),
+            host_key: None,
         },
     }
     .encode();
@@ -458,6 +460,7 @@ fn server_publickey_probe_replies_pk_ok() {
             algorithm: "ssh-ed25519".into(),
             public_blob: public_blob.clone(),
             signature: None,
+            host_key: None,
         },
     }
     .encode();
@@ -1345,6 +1348,7 @@ fn signed_pubkey_request(
             algorithm: algorithm.into(),
             public_blob: blob.to_vec(),
             signature: Some(sig),
+            host_key: None,
         },
     }
     .encode()
@@ -1509,6 +1513,7 @@ fn probe_pubkey_request(user: &str, algorithm: &str, blob: &[u8]) -> Vec<u8> {
             algorithm: algorithm.into(),
             public_blob: blob.to_vec(),
             signature: None,
+            host_key: None,
         },
     }
     .encode()
@@ -1766,6 +1771,7 @@ fn server_refuses_a_key_already_used_as_a_factor() {
             algorithm: "ssh-ed25519".into(),
             public_blob: k1.public_blob(),
             signature: None,
+            host_key: None,
         },
     }
     .encode();
@@ -1776,4 +1782,62 @@ fn server_refuses_a_key_already_used_as_a_factor() {
         s.on_packet(&second).unwrap(),
         ServerStep::Authenticated { .. }
     ));
+}
+
+#[test]
+fn server_publickey_hostbound_must_name_our_host_key() {
+    let user_key = Ed25519HostKey::from_seed(TEST_SEED);
+    let ours = Ed25519HostKey::from_seed([3u8; 32]).public_blob();
+    let other = Ed25519HostKey::from_seed([4u8; 32]).public_blob();
+    let request = |host_key: &[u8]| {
+        let blob = user_key.public_blob();
+        let signed = super::message::publickey_signed_data_bound(
+            TEST_SID,
+            "alice",
+            "ssh-connection",
+            "ssh-ed25519",
+            &blob,
+            Some(host_key),
+        );
+        UserauthRequest {
+            user: "alice".into(),
+            service: "ssh-connection".into(),
+            method: AuthMethodPayload::PublicKey {
+                signature_present: true,
+                algorithm: "ssh-ed25519".into(),
+                public_blob: blob,
+                signature: Some(user_key.sign(&signed).unwrap()),
+                host_key: Some(host_key.to_vec()),
+            },
+        }
+        .encode()
+    };
+    let server = || {
+        let mut s = ServerAuth::new(
+            TEST_SID.to_vec(),
+            vec!["publickey"],
+            Box::new(OnlyPublicKey),
+        );
+        s.set_host_key(ours.clone());
+        let _ = s.on_packet(
+            &super::message::ServiceRequest {
+                service: "ssh-userauth".into(),
+            }
+            .encode(),
+        );
+        s
+    };
+    // Naming another host's key: refused.
+    assert_failure(server().on_packet(&request(&other)).unwrap());
+    // Naming ours, signed over it: accepted.
+    assert!(matches!(
+        server().on_packet(&request(&ours)).unwrap(),
+        ServerStep::Authenticated { .. }
+    ));
+    // The method round-trips on the wire.
+    let decoded = UserauthRequest::decode(&request(&ours)).unwrap();
+    assert_eq!(
+        decoded.method.method_name(),
+        "publickey-hostbound-v00@openssh.com"
+    );
 }

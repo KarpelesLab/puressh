@@ -116,6 +116,8 @@ pub struct ClientAuth {
     /// *before* the server `server-sig-algs` filter — the client's own
     /// policy takes precedence over what the server is willing to verify.
     pubkey_accepted: Option<Vec<String>>,
+    /// See [`Self::set_hostbound`].
+    hostbound: Option<Vec<u8>>,
 }
 
 /// The signature algorithm a public-key algorithm actually signs with.
@@ -126,7 +128,10 @@ pub struct ClientAuth {
 /// `server-sig-algs` lists signature algorithms, so the certificate names
 /// never appear there and must be reduced before matching.
 fn signature_algorithm(algo: &str) -> &str {
-    algo.strip_suffix("-cert-v01@openssh.com").unwrap_or(algo)
+    // The certificate table knows names whose plain form is not a suffix
+    // strip (`ssh-mldsa44-ed25519-cert-v01@openssh.com`).
+    crate::cert::cert_name_to_plain(algo)
+        .unwrap_or_else(|| algo.strip_suffix("-cert-v01@openssh.com").unwrap_or(algo))
 }
 
 impl ClientAuth {
@@ -145,7 +150,16 @@ impl ClientAuth {
             state: State::Initial,
             server_sig_algs: None,
             pubkey_accepted: None,
+            hostbound: None,
         }
+    }
+
+    /// Sign as `publickey-hostbound-v00@openssh.com`, binding each signature
+    /// to the server's `host_key` (what an OpenSSH agent checks keys added
+    /// with destination constraints against). For a server that announces
+    /// `publickey-hostbound@openssh.com` in its EXT_INFO, as OpenSSH does.
+    pub fn set_hostbound(&mut self, host_key: Option<Vec<u8>>) {
+        self.hostbound = host_key;
     }
 
     /// Queue a credential to try; tried in FIFO order.
@@ -402,6 +416,8 @@ impl ClientAuth {
                     algorithm: hk.algorithm().into(),
                     public_blob: hk.public_blob(),
                     signature: None,
+                    // The query goes as plain `publickey`, as OpenSSH's.
+                    host_key: None,
                 },
                 State::AwaitingPkOk,
             ),
@@ -456,12 +472,13 @@ impl ClientAuth {
         if public_blob != pk_ok.public_blob {
             return Err(Error::Protocol("auth: pk-ok public-key mismatch"));
         }
-        let signed = super::message::publickey_signed_data(
+        let signed = super::message::publickey_signed_data_bound(
             &self.session_id,
             &self.user,
             self.service,
             hk.algorithm(),
             &public_blob,
+            self.hostbound.as_deref(),
         );
         let signature = match hk.sign(&signed) {
             Ok(s) => s,
@@ -478,6 +495,7 @@ impl ClientAuth {
                 algorithm: hk.algorithm().into(),
                 public_blob,
                 signature: Some(signature),
+                host_key: self.hostbound.clone(),
             },
         };
         self.state = State::AwaitingPkResult;
@@ -568,6 +586,10 @@ mod tests {
         // `server-sig-algs` carries signature algorithms, so a certificate
         // credential has to be matched on the algorithm it actually signs
         // with, not on its certificate name.
+        assert_eq!(
+            signature_algorithm("ssh-mldsa44-ed25519-cert-v01@openssh.com"),
+            "ssh-mldsa44-ed25519@openssh.com"
+        );
         assert_eq!(
             signature_algorithm("ssh-ed25519-cert-v01@openssh.com"),
             "ssh-ed25519"

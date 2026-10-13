@@ -269,6 +269,10 @@ pub struct KexRunner {
     backend: Option<KexBackend>,
     /// `H` of the first KEX on this connection.
     session_id: Option<Vec<u8>>,
+    /// Client side: the first key exchange's host key and its signature over
+    /// the session id, for binding an agent to the session
+    /// (`session-bind@openssh.com`).
+    initial_host_key_sig: Option<(Vec<u8>, Vec<u8>)>,
     current_h: Option<Vec<u8>>,
     /// Shared secret `K` for the most recent KEX. Wrapped in `Zeroizing`
     /// so the bytes are wiped from memory when this field is replaced or
@@ -340,6 +344,7 @@ impl KexRunner {
             negotiated: None,
             backend: None,
             session_id: None,
+            initial_host_key_sig: None,
             current_h: None,
             current_k: None,
             installed_keys: None,
@@ -588,6 +593,14 @@ impl KexRunner {
     /// `None` until the first KEX has completed.
     pub fn session_id(&self) -> Option<&[u8]> {
         self.session_id.as_deref()
+    }
+
+    /// Client side: the host key the first key exchange presented and its
+    /// signature over the session id.
+    pub fn initial_host_key_sig(&self) -> Option<(&[u8], &[u8])> {
+        self.initial_host_key_sig
+            .as_ref()
+            .map(|(k, s)| (k.as_slice(), s.as_slice()))
     }
 
     /// The negotiated algorithms once both KEXINITs have been exchanged.
@@ -1089,6 +1102,7 @@ impl KexRunner {
         self.current_h = Some(h);
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
+            self.initial_host_key_sig = host_key_and_sig(payload);
         }
         self.derive_keys()?;
 
@@ -1225,6 +1239,7 @@ impl KexRunner {
         self.current_h = Some(core::mem::take(&mut out.h));
         if self.session_id.is_none() {
             self.session_id = self.current_h.clone();
+            self.initial_host_key_sig = host_key_and_sig(payload);
         }
         self.derive_keys()?;
 
@@ -1462,6 +1477,17 @@ fn derive_with<D: Digest>(
     n: usize,
 ) -> Zeroizing<Vec<u8>> {
     crate::kex::derive::<D>(k, h, sid, letter, n)
+}
+
+/// The host key and signature of a key-exchange reply: every method's reply
+/// is `byte type, string K_S, string-or-mpint value, string signature`.
+fn host_key_and_sig(reply: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut r = crate::format::Reader::new(reply);
+    r.read_u8().ok()?;
+    let k_s = r.read_string().ok()?.to_vec();
+    r.read_string().ok()?;
+    let sig = r.read_string().ok()?.to_vec();
+    Some((k_s, sig))
 }
 
 #[cfg(test)]

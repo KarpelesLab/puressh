@@ -297,6 +297,12 @@ impl AgentForwardHandler for DefaultAgentForwardHandler {
 /// Bridge a Unix-socket connection against a server-side `ChannelStream`.
 /// Mirrors `spawn_splice` in `reverse.rs` but for `UnixStream` instead of
 /// `TcpStream`.
+/// Splice a channel to a connected Unix-domain stream (an agent's) in both
+/// directions, on background threads.
+pub fn splice_unix_stream(uds: UnixStream, stream: ChannelStream) {
+    spawn_unix_splice(uds, stream)
+}
+
 fn spawn_unix_splice(uds: UnixStream, stream: ChannelStream) {
     let (chan_rx, chan_tx) = stream.into_raw();
     let Ok(uds_in) = uds.try_clone() else {

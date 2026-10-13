@@ -314,6 +314,18 @@ impl KnownHostsPolicy {
     }
 }
 
+/// See [`Client::session_binding`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SessionBinding {
+    /// The server's host-key blob from the first key exchange.
+    pub host_key: Vec<u8>,
+    /// The session identifier.
+    pub session_id: Vec<u8>,
+    /// The host's signature blob over the session identifier.
+    pub signature: Vec<u8>,
+}
+
 /// Callback type for [`TofuAction::Prompt`] — `(host, port, key_type,
 /// key_blob) → accept?`.
 pub type TofuPromptFn = dyn Fn(&str, u16, &str, &[u8]) -> bool + Send + Sync;
@@ -1283,6 +1295,16 @@ impl Client {
     /// responder) build the driver themselves and hand it here — there is
     /// exactly one driver, and thus exactly one SERVICE_REQUEST, per connection.
     pub fn run_auth(&mut self, mut auth: ClientAuth) -> Result<()> {
+        // A server that announces it takes `publickey-hostbound-v00`: bind
+        // each signature to its host key (as OpenSSH's client does).
+        let hostbound = self
+            .driver
+            .peer_ext_info()
+            .and_then(|e| e.extension("publickey-hostbound@openssh.com"))
+            == Some("0");
+        if hostbound && let Some(b) = self.session_binding() {
+            auth.set_hostbound(Some(b.host_key));
+        }
         let first = auth.start();
         self.write_payload(&first)?;
 
@@ -1402,6 +1424,19 @@ impl Client {
     /// *first* key exchange (RFC 4253 §7.2). Stable across re-keys.
     pub fn session_id(&self) -> &[u8] {
         self.driver.session_id()
+    }
+
+    /// What binds an `ssh-agent` connection to this session
+    /// (`session-bind@openssh.com`, for keys added with destination
+    /// constraints): the server's host key, the session id and the host's
+    /// signature over it. `None` before the key exchange.
+    pub fn session_binding(&self) -> Option<SessionBinding> {
+        let (host_key, signature) = self.driver.initial_host_key_sig()?;
+        Some(SessionBinding {
+            host_key: host_key.to_vec(),
+            session_id: self.driver.session_id().to_vec(),
+            signature: signature.to_vec(),
+        })
     }
 
     /// Most recent `SSH_MSG_EXT_INFO` (RFC 8308) received from the server,

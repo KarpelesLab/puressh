@@ -2443,6 +2443,13 @@ fn do_server_auth(
     // CASignatureAlgorithms. `now` is read from the wall clock at the std edge.
     server_auth.set_now(unix_now());
     server_auth.set_ca_signature_algorithms(cfg.ca_signature_algorithms.clone());
+    // The host key the key exchange presented, which a hostbound publickey
+    // request must name.
+    if let Some(neg) = driver.negotiated()
+        && let Some(hk) = pick_host_key(&cfg.host_keys, &neg.host_key)
+    {
+        server_auth.set_host_key(hk.public_blob());
+    }
 
     // Phase 1.5 (mid-userauth): the first USERAUTH_REQUEST exposes the
     // username. We re-resolve the policy *once* with the user/groups context
@@ -5028,7 +5035,10 @@ pub(crate) fn server_ext_info(cfg: &Config) -> ExtInfo {
         algs.push(',');
         algs.push_str(plain);
     }
-    ExtInfo::new().with_server_sig_algs(algs)
+    // `publickey-hostbound-v00@openssh.com` is accepted (OpenSSH 8.9+).
+    ExtInfo::new()
+        .with_server_sig_algs(algs)
+        .with_extension("publickey-hostbound@openssh.com", "0")
 }
 
 /// Current wall-clock time as Unix seconds, for certificate validity checks.

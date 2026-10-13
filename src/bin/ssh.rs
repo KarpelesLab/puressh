@@ -1054,6 +1054,12 @@ fn authenticate_client(
     if let Some(n) = client.negotiated() {
         log_kex(&n);
     }
+    // Agent keys sign for this session only (destination constraints).
+    #[cfg(unix)]
+    if let Some(b) = client.session_binding() {
+        common::bind_auth_agents(&b);
+        let _ = SESSION_BINDING.set(b);
+    }
     client.set_kex_observer(log_kex);
 
     // Whether password auth is permitted: BatchMode disables it outright;
@@ -2905,10 +2911,13 @@ fn run() -> Result<i32, String> {
                 };
                 PathBuf::from(expand_tilde(&s))
             });
-            let cb = match named {
-                Some(path) => puressh::forwarding::agent::splice_to_unix_socket_callback(path),
-                None => puressh::forwarding::agent::splice_to_local_agent_callback(),
-            };
+            let path = named.or_else(|| {
+                std::env::var_os("SSH_AUTH_SOCK")
+                    .filter(|s| !s.is_empty())
+                    .map(PathBuf::from)
+                    .filter(|p| puressh::agent::validate_auth_sock(p).is_ok())
+            });
+            let cb = path.filter(|p| p.exists()).map(forwarded_agent_callback);
             match cb {
                 Some(cb) => {
                     handlers = handlers.with_auth_agent(cb);
@@ -5623,6 +5632,30 @@ fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClie
             }
         }
     }
+}
+
+/// This connection's binding for agent connections (set once connected).
+#[cfg(unix)]
+static SESSION_BINDING: std::sync::OnceLock<puressh::client::SessionBinding> =
+    std::sync::OnceLock::new();
+
+/// Each `auth-agent@openssh.com` channel the server opens: a new connection
+/// to the agent at `path`, bound to the session as a forwarding one (as
+/// OpenSSH's), spliced to the channel.
+#[cfg(unix)]
+fn forwarded_agent_callback(
+    path: PathBuf,
+) -> Arc<dyn Fn(puressh::server::ChannelStream) + Send + Sync + 'static> {
+    Arc::new(move |stream| match puressh::agent::Agent::connect(&path) {
+        Ok(mut agent) => {
+            if let Some(b) = SESSION_BINDING.get() {
+                let _ = agent.bind_session(&b.host_key, &b.session_id, &b.signature, true);
+            }
+            puressh::forwarding::agent::splice_unix_stream(agent.into_stream(), stream);
+        }
+        // The agent went away: dropping the channel closes it.
+        Err(_) => drop(stream),
+    })
 }
 
 /// `~C`: read an `ssh>` command line from the terminal (cooked mode, as

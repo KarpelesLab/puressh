@@ -480,6 +480,9 @@ pub struct ServerAuth {
     /// of a multi-factor chain: OpenSSH refuses one offered again, so
     /// `publickey,publickey` takes two different keys.
     used_keys: Vec<Vec<u8>>,
+    /// The host key this server presented in the key exchange, which a
+    /// `publickey-hostbound-v00@openssh.com` request must name.
+    host_key: Option<Vec<u8>>,
     /// One line per method that succeeded (see `ServerStep::Authenticated`).
     auth_info: String,
     /// Number of prompts issued in the in-flight keyboard-interactive
@@ -540,6 +543,7 @@ impl ServerAuth {
             state: State::AwaitingServiceRequest,
             pending_user: None,
             used_keys: Vec::new(),
+            host_key: None,
             auth_info: String::new(),
             pending_prompt_count: None,
             first_user: None,
@@ -657,6 +661,12 @@ impl ServerAuth {
             }
             _ => None,
         }
+    }
+
+    /// The host key this server presented in the key exchange: a client's
+    /// `publickey-hostbound-v00@openssh.com` request must name it.
+    pub fn set_host_key(&mut self, host_key: Vec<u8>) {
+        self.host_key = Some(host_key);
     }
 
     /// Opt in to letting the [`Authenticator`] see `AuthAttempt::None`.
@@ -783,14 +793,25 @@ impl ServerAuth {
                 algorithm,
                 public_blob,
                 signature,
-            } => self.handle_publickey(
-                user,
-                &wire_user,
-                signature_present,
-                algorithm,
-                public_blob,
-                signature,
-            ),
+                host_key,
+            } => {
+                // `publickey-hostbound-v00@openssh.com` names this server's
+                // host key, or the request is refused (OpenSSH's check).
+                if let Some(named) = &host_key
+                    && self.host_key.as_ref() != Some(named)
+                {
+                    return self.emit_failure();
+                }
+                self.handle_publickey(
+                    user,
+                    &wire_user,
+                    signature_present,
+                    algorithm,
+                    public_blob,
+                    signature,
+                    host_key,
+                )
+            }
             AuthMethodPayload::KeyboardInteractive {
                 language_tag: _,
                 submethods: _,
@@ -813,6 +834,7 @@ impl ServerAuth {
         algorithm: String,
         public_blob: Vec<u8>,
         signature: Option<Vec<u8>>,
+        host_key: Option<Vec<u8>>,
     ) -> Result<ServerStep> {
         let is_cert = crate::cert::is_cert_name(&algorithm);
         // The key itself, whether offered plain or as a certificate.
@@ -930,12 +952,13 @@ impl ServerAuth {
             (host_key_verify_by_name(&algorithm, &public_blob)?, None)
         };
 
-        let signed = super::message::publickey_signed_data(
+        let signed = super::message::publickey_signed_data_bound(
             &self.session_id,
             wire_user,
             self.service,
             &algorithm,
             &public_blob,
+            host_key.as_deref(),
         );
         if verifier.verify(&signed, &sig).is_err() {
             return self.emit_failure();

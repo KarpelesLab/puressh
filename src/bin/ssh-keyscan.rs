@@ -287,6 +287,7 @@ fn run() -> Result<i32, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let o = parse_args(&args)?;
     let mut out = std::io::stdout();
+    let mut found_one = false;
     for spec in &o.hosts {
         // `addrlist namelist`: connect to the first list, print the second.
         let mut words = spec.split_whitespace();
@@ -313,7 +314,10 @@ fn run() -> Result<i32, String> {
         for ty in &o.types {
             let algs = algorithms_for(ty, o.certs);
             match scan_one(target, o.port, &addrs, algs, o.timeout, comment) {
-                Some((key_type, blob)) => print_key(&o, &names, &key_type, &blob, &mut out),
+                Some((key_type, blob)) => {
+                    found_one = true;
+                    print_key(&o, &names, &key_type, &blob, &mut out)
+                }
                 None => {
                     if o.verbose {
                         eprintln!("# {target}:{} no {ty} host key", o.port);
@@ -322,7 +326,8 @@ fn run() -> Result<i32, String> {
             }
         }
     }
-    Ok(0)
+    // As OpenSSH: failure when no key was found at all.
+    Ok(if found_one { 0 } else { 1 })
 }
 
 /// Print a key found for `names`, as OpenSSH's `keyprint`: one line naming

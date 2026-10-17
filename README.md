@@ -213,7 +213,7 @@ src/
 
 ## MSRV
 
-`puressh`'s MSRV is **Rust 1.89**, declared as `rust-version` in `Cargo.toml`
+`puressh`'s MSRV is **Rust 1.95**, declared as `rust-version` in `Cargo.toml`
 and enforced by a dedicated CI job. Older toolchains are not supported.
 
 ## Non-goals

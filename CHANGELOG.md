@@ -7,6 +7,117 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/KarpelesLab/puressh/compare/v0.1.8...v0.1.9) - 2026-10-13
+
+### Added
+
+- tunnel device forwarding (ssh -w, Tunnel/TunnelDevice, PermitTunnel, tunnel="n", SSH_TUNNEL); UsePAM no
+- *(agent)* destination constraints, session-bind, confirm; ssh-add -h/-H/-c/-k/-C/-N/-T/-Q and -d -
+- *(agent)* certificates in the agent: ssh uses agent-held certs, ssh-agent holds them, ssh-add adds/removes/lists -cert.pub
+- agent session binding and publickey-hostbound-v00; config tokenizing as OpenSSH's argv_split
+- *(ssh)* ~C command line (EnableEscapeCommandline), OpenSSH's escape help
+- *(ssh)* ~B (BREAK) and ~R (rekey) escapes; escapes work on any session with a terminal
+- *(sshd)* ChannelTimeout, PerSourcePenalties; UnusedConnectionTimeout counts channels only
+- ML-DSA-44+Ed25519 keys, sshd HostKeyAgent; RSA host keys sign with the negotiated hash
+- *(sshd, kex)* sntrup761x25519-sha512, inetd mode, command subsystems; OpenSSH banner timing
+- *(ssh)* ssh -O forward/cancel/conninfo/proxy, ~I, -R through a master; OpenSSH wording for a corrupted connection
+- *(sshd)* announce host keys and prove them (OpenSSH UpdateHostKeys)
+- *(sshd)* SetEnv and PermitUserEnvironment, as OpenSSH
+- SHA-1 key exchanges and ssh-rsa userauth as opt-ins; OpenSSH's failure messages
+- OpenSSH's MACs (umac-64/128, hmac-sha1, -96, md5) and CBC ciphers
+- *(sshd)* utmp, wtmp and lastlog for pty logins; PrintLastLog; quiet logins
+- *(sshd)* OpenSSH's logging — syslog, LogLevel, SyslogFacility, and its auth.log lines
+- *(ssh-keygen)* passphrase-protected PEM and PKCS8 keys, as OpenSSH writes them
+- *(sshd)* AuthorizedKeysCommand, AuthorizedPrincipalsCommand; OpenSSH's principal rules
+- *(sshd)* every authorized_keys option, as OpenSSH
+- *(deb)* puressh-client package, diverting OpenSSH's client programs
+- *(ssh-keygen)* key formats, fingerprint forms, KRLs and SSHFP; load -a 100 keys
+- *(scp, sftp)* OpenSSH drop-ins that run over ssh
+- *(ssh)* read any OpenSSH ssh_config; HostKeyAlias, RevokedHostKeys, GlobalKnownHostsFile
+- *(sshd)* -T and -C print the effective configuration
+- *(ssh-keygen)* certificate signing (-s) and listing (-L)
+- *(ssh-keygen)* -Y sign/verify/find-principals/match-principals/check-novalidate
+- ssh-agent, ssh-add, ssh-keyscan and ssh-copy-id
+- *(ssh)* forwarding alongside sessions (-A/-X/-L/-R/-D with a shell or command)
+- *(ssh)* OpenSSH command line and streaming sessions
+- *(sshd)* stream exec requests; enable TCP/Unix-socket forwarding
+- *(lib)* session_stream, stderr/exit-status egress, lenient known_hosts save
+- *(server)* run exec requests on a pty when one was requested
+- *(deb)* puressh-server package replacing openssh-server; ssh-keygen -A
+- *(sshd)* OpenSSH defaults and command line, multi-listener, SIGHUP reload
+- *(sshd)* parse stock Ubuntu sshd_config and the rest of OpenSSH's keywords
+- *(knock)* load knock keys lazily; KnockUsers becomes optional
+- *(knock)* ssh/sshd integration, e2e suite, docs
+- *(knock)* stealth UDP knock rendezvous (library)
+
+### Fixed
+
+- *(ssh-keyscan)* exit 1 when no key was found, as OpenSSH
+- *(sftp,scp)* OpenSSH's quoting, globbing and transfer semantics; SFTP server extensions
+- *(ssh-keygen,scp,sftp)* OpenSSH compatibility found running the regress suite with all our tools
+- *(sshd)* Match host/version/rdomain/invalid-user, Subsystem in Match, ExposeAuthInfo, PAMServiceName
+- *(ssh)* UpdateHostKeys, Match/Include syntax, KnownHostsCommand, ProxyJump and mux details
+- *(ssh)* host certificates, RSA known_hosts and certificates, algorithm patterns, ControlPersist forwards
+- *(ssh, sshd)* forwarding as OpenSSH's — Unix sockets, -R SOCKS, half-close; LocalCommand, Match exec, banners
+- *(ssh)* ssh:// destinations; -E keeps the remote stderr on the terminal; -o User quoting
+- *(ssh)* configuration handled as OpenSSH's own regression suite expects (sshcfgparse)
+- *(ssh)* exit status of a command that prints nothing (was 255 against OpenSSH)
+- *(ssh, scp)* ssh -O check/exit/stop and scp errors worded as OpenSSH's
+- *(ssh)* a refused terminal or request is handled and reported as OpenSSH's
+- *(agent)* use $SSH_AUTH_SOCK as OpenSSH does (symlinks, sudo, quiet when stale)
+- *(ssh-keygen)* -F / -R / -l on known_hosts as OpenSSH's, which Ansible parses
+- *(ssh)* host keys judged and reported as OpenSSH does
+- *(ssh)* UserKnownHostsFile is a list, known_hosts2 is read; local user on Windows
+- *(ssh)* user@host beats the config's User; CanonicalizeHostname, Match final/canonical, Match user
+- *(sshd)* TCPKeepAlive (default yes) sets SO_KEEPALIVE, as OpenSSH
+- *(sshd)* X11 forwarding works (xauth), shells without a terminal, ~/.ssh/rc, SIGPIPE
+- *(sshd)* detach into the background unless -D or -d, as OpenSSH; default PidFile
+- *(config)* a Match or Host block in an included file ends with it, as in OpenSSH
+- *(sshd)* a client's EOF is not typed into a pty session as ^D, as with OpenSSH
+- *(sshd)* start in / when the home directory is missing (chroot jails), as OpenSSH
+- *(sshd, ssh)* pty sessions get the client's terminal modes and TERM; root parent records logins
+- *(sshd)* sessions get SSH_CLIENT, SSH_CONNECTION and SSH_TTY
+- *(sshd)* with AuthenticationMethods, a failure lists only methods that can continue
+- *(config)* OpenSSH algorithm names puressh lacks load and are dropped; ssh -K accepted
+- *(ssh)* brackets around any host, as OpenSSH; Ansible interop in CI
+- *(mux)* a master exits on -O exit / ControlPersist even when its socket is gone
+- *(ssh_config)* PreferredAuthentications takes any method name, as OpenSSH
+- *(ssh)* ssh_config tokens, -o for every option, and connection sharing that works for sftp/scp/-A
+- *(config)* errors and warnings from an Include'd file name that file
+- *(server)* a client gone while we write ends the connection cleanly
+- *(sshd)* non-dumpable only as root; PAM sessions of a user-run sshd work again
+- *(transport)* EXT_INFO directions are independent (RFC 8308 §2.1)
+- *(client)* accept the server's EXT_INFO sent before USERAUTH_SUCCESS
+- *(ssh)* report a server's SSH_MSG_DISCONNECT like OpenSSH
+- *(sshd)* keep the connection until the client closes it; UnusedConnectionTimeout
+- *(ssh)* ServerAliveCountMax, with keepalive requests every server answers
+- *(ssh)* passphrase-protected identities, legacy encrypted keys, $USER-less hosts
+- *(ssh-agent, sshd)* no ptrace attach or core dumps, as with OpenSSH
+- *(sshd)* exit status for sftp/scp sessions, setstat times and owners
+- *(deb)* Type=notify unit and stop the old daemon before reloading units
+- *(ssh)* use the default identities only when no -i/IdentityFile is given
+- certificate and known_hosts drop-in gaps found against OpenSSH
+- *(deb)* stop an OpenSSH listener left running after its package is removed
+- *(deb)* drop 24.04's ssh.service.requires/ssh.socket link
+- *(deb)* fall back to systemctl enable when SSH was enabled before
+- *(ffi)* portable c_char -> u8 pointer cast
+- *(knock)* keep ssh/sshd building without the knock feature
+- *(knock)* treat WSAECONNRESET as port-unreachable on Windows
+
+### Other
+
+- *(agent)* unique socket names on macOS (microsecond clock collided)
+- *(deb)* the interactive login's exit status is .bash_logout's; only a timeout fails it
+- *(deb)* time out hung ssh calls in the lifecycle and show the daemons' fds and stacks
+- *(deb)* the installed sshd logs logins to the journal as OpenSSH does
+- *(config)* match included-file messages by name (Windows paths use \)
+- *(e2e_server_compression)* debug logs from both ends when the exec fails
+- *(e2e_keygen)* skip Ed25519 PKCS8 loading on OpenSSH that cannot do it
+- no per-round-trip latency in ssh and sshd
+- *(deb)* dump systemd, journal and process state when the lifecycle test fails
+- native arm64 builds with PAM; build Linux releases on 22.04
+- draft spec for stealth UDP knock rendezvous
+
 ## [0.1.8](https://github.com/KarpelesLab/puressh/compare/v0.1.7...v0.1.8) - 2026-09-17
 
 ### Other

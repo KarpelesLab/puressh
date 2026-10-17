@@ -82,7 +82,13 @@ pam = ["dep:pam-client2"]
 #
 # 0.9's breaking changes are confined to TLS, QUIC, X.509 and LMS/HSS, none of
 # which this crate enables; the MSRV stays at Rust 1.89.
-purecrypto = { version = "0.9", default-features = false, features = [
+#
+# 0.10's only break is TLS's `Readiness::from_raw_fd` becoming `unsafe`, which
+# we don't enable. Its non-TLS fixes include rejecting partial blocks in
+# `BlockCipher::{encrypt,decrypt}_blocks` (our CBC path goes through the `Cbc`
+# mode, which already errors on misaligned input) and keeping secret bignum
+# limbs off the heap in RSA blinding; the MSRV stays at Rust 1.89.
+purecrypto = { version = "0.10", default-features = false, features = [
     "hash", "cipher", "mac", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem", "mldsa",
 ] }
 # 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting

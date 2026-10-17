@@ -97,7 +97,11 @@ purecrypto = { version = "0.10", default-features = false, features = [
 # terminal status once per SSH packet, so a stall there is a hang, not a slow
 # path. The 0.6 break (`EncoderConfig`/`DecoderConfig` became `non_exhaustive`)
 # doesn't reach us: we construct both codecs with `new()` and no config literal.
-compcol = { version = "0.6.10", default-features = false, features = ["alloc", "zlib"], optional = true }
+#
+# 0.7 only adds the allocation-free `embed` deflate family behind its own
+# feature, which we don't enable; the `zlib` streaming codecs are unchanged and
+# its MSRV (Rust 1.88) stays below ours.
+compcol = { version = "0.7", default-features = false, features = ["alloc", "zlib"], optional = true }
 # `zeroize` provides `Zeroizing<T>` (drop wipes the inner value) and a derive
 # for compound secrets. Kept default-on so `no_std + alloc` builds still get
 # secret-wiping for derived KDF output, password buffers carried across FFI,

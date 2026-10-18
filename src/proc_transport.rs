@@ -3,7 +3,7 @@
 //!
 //! `ssh_config(5)`'s `ProxyCommand` names a shell command whose stdin/stdout
 //! become the byte transport to the server (e.g. `nc -X connect -x
-//! proxy:3128 %h %p`). puressh spawns it under `/bin/sh -c` with piped
+//! proxy:3128 %h %p`). puressh spawns it as `/bin/sh -c "exec …"` with piped
 //! stdin/stdout and inherited stderr, then drives a [`Client`] over the
 //! pipes via [`Client::connect_via`].
 //!
@@ -162,15 +162,23 @@ pub struct ProcTransport {
 }
 
 impl ProcTransport {
-    /// Spawn `command` under `/bin/sh -c` with piped stdin/stdout and
-    /// inherited stderr. `command` should already have its `%`-tokens
+    /// Spawn `command` as `/bin/sh -c "exec <command>"` with piped
+    /// stdin/stdout and inherited stderr, the way OpenSSH runs a
+    /// `ProxyCommand`. `command` should already have its `%`-tokens
     /// expanded (see [`expand_tokens`]). Returns an error if the helper
     /// cannot be spawned — there is intentionally **no** fallback to a
     /// direct connection.
+    ///
+    /// The `exec` makes the helper itself the child we kill on drop. Without
+    /// it a shell that forks for `-c` (dash, Debian/Ubuntu's `/bin/sh`)
+    /// would be killed in its place, orphaning the helper — and since the
+    /// stdout reader thread keeps the pipe open, a helper like `nc` would
+    /// then hold its connection open forever. As with OpenSSH, only the
+    /// first command of a list runs; wrap one in `sh -c '…'` instead.
     pub fn spawn(command: &str) -> io::Result<Self> {
         let mut child = Command::new("/bin/sh")
             .arg("-c")
-            .arg(command)
+            .arg(format!("exec {command}"))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -437,7 +445,7 @@ mod tests {
         // (e.g. /bin/sh missing) is exercised by the binary's error
         // propagation; here we just confirm the transport surfaces the
         // child's premature exit as a clean EOF.
-        let mut t = ProcTransport::spawn("exit 0").expect("sh -c spawns");
+        let mut t = ProcTransport::spawn("true").expect("sh -c spawns");
         let mut buf = [0u8; 16];
         let n = t.read(&mut buf).expect("read after child exit");
         assert_eq!(n, 0, "closed child stdout should read as EOF");
@@ -476,7 +484,7 @@ mod tests {
     #[test]
     fn read_timeout_still_delivers_data() {
         // With a timeout armed, data that *does* arrive must still be read.
-        let mut t = ProcTransport::spawn("printf abc; sleep 5").expect("spawn");
+        let mut t = ProcTransport::spawn("sh -c 'printf abc; sleep 5'").expect("spawn");
         t.set_read_timeout(Some(Duration::from_millis(500)))
             .expect("set timeout");
         let mut buf = [0u8; 3];
@@ -488,7 +496,7 @@ mod tests {
     fn blocking_read_after_clearing_timeout() {
         // `set_read_timeout(None)` reverts to a blocking read: a delayed
         // write is still delivered (no premature WouldBlock).
-        let mut t = ProcTransport::spawn("sleep 0.1; printf ok").expect("spawn");
+        let mut t = ProcTransport::spawn("sh -c 'sleep 0.1; printf ok'").expect("spawn");
         t.set_read_timeout(None).expect("clear timeout");
         let mut buf = [0u8; 2];
         t.read_exact(&mut buf)

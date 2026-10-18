@@ -295,7 +295,7 @@ fn proxy_command_dead_helper_aborts() {
 
     // Helper that exits at once → its stdout is EOF, so the SSH version
     // exchange can't complete and connect_via must error out (strict).
-    let proc = ProcTransport::spawn("exit 0").expect("/bin/sh -c spawns");
+    let proc = ProcTransport::spawn("true").expect("/bin/sh -c spawns");
     let res = Client::connect_via(
         Box::new(proc),
         "127.0.0.1",

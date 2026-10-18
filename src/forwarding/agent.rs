@@ -162,9 +162,7 @@ impl DefaultAgentForwardHandler {
 /// lands. On any such mismatch we refuse rather than silently trusting it.
 #[cfg(feature = "server")]
 fn ensure_private_tmp_dir() -> Result<PathBuf> {
-    // `nix::unistd::geteuid` wraps the syscall safely, avoiding an `unsafe`
-    // block that `forbid(unsafe_code)` (outside the `ffi` feature) would reject.
-    let euid = nix::unistd::geteuid().as_raw();
+    let euid = crate::sys::effective_uid()?;
     let dir = PathBuf::from(format!("/tmp/puressh-agent-{euid}"));
     ensure_private_dir(&dir, euid)?;
     Ok(dir)
@@ -519,7 +517,7 @@ mod tests {
     fn ensure_private_dir_creates_0700() {
         use std::os::unix::fs::MetadataExt;
         let scratch = TestTempDir::new("epd-create");
-        let euid = unsafe { libc::geteuid() };
+        let euid = crate::sys::effective_uid().unwrap();
         let target = scratch.path().join("priv");
         ensure_private_dir(&target, euid).expect("should create");
         let meta = std::fs::symlink_metadata(&target).expect("stat");
@@ -535,7 +533,7 @@ mod tests {
     #[test]
     fn ensure_private_dir_rejects_loose_mode() {
         let scratch = TestTempDir::new("epd-loose");
-        let euid = unsafe { libc::geteuid() };
+        let euid = crate::sys::effective_uid().unwrap();
         let target = scratch.path().join("loose");
         std::fs::create_dir(&target).expect("mkdir");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).expect("chmod");
@@ -553,7 +551,7 @@ mod tests {
     #[test]
     fn ensure_private_dir_rejects_symlink() {
         let scratch = TestTempDir::new("epd-symlink");
-        let euid = unsafe { libc::geteuid() };
+        let euid = crate::sys::effective_uid().unwrap();
         let real = scratch.path().join("real");
         std::fs::create_dir(&real).expect("mkdir real");
         std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o700)).expect("chmod");
@@ -577,7 +575,7 @@ mod tests {
         std::fs::create_dir(&target).expect("mkdir");
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).expect("chmod");
         // Pretend we expect a different owner than the one that created it.
-        let real_euid = unsafe { libc::geteuid() };
+        let real_euid = crate::sys::effective_uid().unwrap();
         let bogus = real_euid.wrapping_add(1);
         let err = ensure_private_dir(&target, bogus).expect_err("wrong owner must be rejected");
         match err {

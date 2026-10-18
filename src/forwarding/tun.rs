@@ -84,7 +84,9 @@ pub fn from_wire(mode: u32, msg: &[u8]) -> Option<&[u8]> {
 /// returns the next `CHANNEL_DATA` message (`None` once the channel is
 /// done) and `send` sends one (`false` once the channel is gone). Device
 /// reads run on a thread of their own; this returns when the channel side
-/// ends, after stopping it.
+/// ends, after stopping it. Without the `server` feature, which can wait
+/// for the device with a timeout, that thread is left to notice on the
+/// next packet it reads, holding the device open until then.
 pub fn splice<R, S>(dev: File, mode: u32, mut recv: R, mut send: S) -> io::Result<()>
 where
     R: FnMut() -> Option<Vec<u8>>,
@@ -125,12 +127,18 @@ where
         }
     }
     stop.store(true, Ordering::Relaxed);
-    let _ = device_to_channel.join();
+    if READS_TIME_OUT {
+        let _ = device_to_channel.join();
+    }
     Ok(())
 }
 
+/// Whether [`readable`] waits at most its timeout, so the reading thread
+/// sees `stop` in time to be joined.
+const READS_TIME_OUT: bool = cfg!(all(unix, feature = "server"));
+
 /// Whether `f` becomes readable within `timeout_ms`.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "server"))]
 fn readable(f: &File, timeout_ms: u16) -> bool {
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use std::os::fd::AsFd;
@@ -139,7 +147,7 @@ fn readable(f: &File, timeout_ms: u16) -> bool {
 }
 
 /// Elsewhere reads simply block.
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "server")))]
 fn readable(_f: &File, _timeout_ms: u16) -> bool {
     true
 }

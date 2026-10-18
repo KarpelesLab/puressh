@@ -243,22 +243,21 @@ impl<S: Read + Write> Receiver<S> {
         }
         #[cfg(unix)]
         {
-            use nix::sys::stat::{FchmodatFlags, Mode, fchmodat};
-            // Use `fchmodat(AT_SYMLINK_NOFOLLOW)` instead of
-            // `fs::set_permissions`, which under the hood does a
-            // path-based `chmod(2)` that *follows* symlinks. The
-            // symlink_metadata check above narrows the race but
-            // doesn't close it — a swap between the stat and the
-            // chmod would still let an attacker redirect the chmod
-            // onto an arbitrary file. fchmodat handles both checks
-            // in one syscall.
-            let mode_bits = Mode::from_bits_truncate((mode & 0o7777) as nix::libc::mode_t);
-            let _ = fchmodat(
-                nix::fcntl::AT_FDCWD,
-                &target,
-                mode_bits,
-                FchmodatFlags::NoFollowSymlink,
-            );
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            // Chmod a descriptor opened with `O_NOFOLLOW` instead of the
+            // path: `fs::set_permissions` does a path-based `chmod(2)` that
+            // *follows* symlinks. The symlink_metadata check above narrows
+            // the race but doesn't close it — a swap between the stat and
+            // the chmod would still let an attacker redirect the chmod onto
+            // an arbitrary file. Opening refuses a symlink, and `fchmod`
+            // then acts on the directory we opened.
+            if let Ok(dir) = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+                .open(&target)
+            {
+                let _ = dir.set_permissions(fs::Permissions::from_mode(mode & 0o7777));
+            }
         }
         #[cfg(not(unix))]
         {
@@ -345,7 +344,7 @@ impl<S: Read + Write> Receiver<S> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            open_opts.custom_flags(nix::libc::O_NOFOLLOW);
+            open_opts.custom_flags(libc::O_NOFOLLOW);
         }
         let f = match open_opts.open(&target) {
             Ok(f) => f,
@@ -370,9 +369,8 @@ impl<S: Read + Write> Receiver<S> {
         // closing the window entirely.
         #[cfg(unix)]
         {
-            use nix::sys::stat::{Mode, fchmod};
-            let mode_bits = Mode::from_bits_truncate((mode & 0o7777) as nix::libc::mode_t);
-            let _ = fchmod(&f, mode_bits);
+            use std::os::unix::fs::PermissionsExt;
+            let _ = f.set_permissions(fs::Permissions::from_mode(mode & 0o7777));
         }
         #[cfg(not(unix))]
         let _ = mode;
@@ -470,7 +468,7 @@ fn set_times(path: &Path, mtime: i64, atime: i64) -> std::io::Result<()> {
     // redirect `set_modified` onto an arbitrary file.
     let f = std::fs::File::options()
         .write(true)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
     f.set_modified(m)?;
     // set_times is on FileTimes since 1.75; for now we set modified

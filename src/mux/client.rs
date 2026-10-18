@@ -66,7 +66,7 @@ pub fn validate_control_socket(path: &Path) -> io::Result<()> {
     if !md.file_type().is_socket() {
         return Err(reject("is not a Unix-domain socket".into()));
     }
-    let euid = nix::unistd::geteuid().as_raw();
+    let euid = crate::sys::effective_uid()?;
     if md.uid() != euid {
         return Err(reject(format!(
             "is owned by uid {} but we are euid {euid}; refusing to trust another user's master",

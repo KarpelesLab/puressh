@@ -14,11 +14,11 @@
 
 use core::ffi::{c_char, c_int};
 use core::ptr;
+use purecrypto::zeroize::Zeroizing;
 use std::ffi::CStr;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::slice;
 use std::time::Duration;
-use zeroize::Zeroizing;
 
 use super::common::{
     PCSSH_ERR_BUFFER_TOO_SMALL, PCSSH_ERR_CONNECT, PCSSH_ERR_INVALID_ARGUMENT, PCSSH_OK, catch,

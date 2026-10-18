@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use purecrypto::hash::Digest;
-use zeroize::{Zeroize, Zeroizing};
+use purecrypto::zeroize::{Zeroize, Zeroizing};
 
 /// Builder for the SSH key-exchange "exchange hash" `H`.
 ///
@@ -208,6 +208,6 @@ mod tests {
         let sid = h;
         let a = derive::<Sha256>(&k, &h, &sid, b'A', 32);
         let b = derive::<Sha256>(&k, &h, &sid, b'B', 32);
-        assert_ne!(a, b);
+        assert_ne!(*a, *b);
     }
 }

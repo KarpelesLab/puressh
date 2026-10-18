@@ -10,7 +10,7 @@
 
 use purecrypto::cipher::{ChaCha20, Poly1305};
 use purecrypto::ct::ConstantTimeEq;
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 

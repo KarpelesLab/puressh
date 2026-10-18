@@ -17,7 +17,7 @@ use purecrypto::kdf::bcrypt_pbkdf;
 use purecrypto::rng::OsRng;
 use purecrypto::rng::{CryptoRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::{MAGIC, PrivateKey, PublicKey, base64};
 use crate::error::{Error, Result};
@@ -300,7 +300,7 @@ impl PrivateKey {
     /// bytes in an agent message frame (`encode_message`).
     ///
     /// The returned `Vec` contains the cleartext private key; callers
-    /// should wrap it in [`zeroize::Zeroizing`] (as the agent client does)
+    /// should wrap it in [`purecrypto::zeroize::Zeroizing`] (as the agent client does)
     /// so it is wiped once the request has been written.
     pub fn to_agent_add_body(&self) -> Vec<u8> {
         let mut w = Writer::new();

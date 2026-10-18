@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use purecrypto::ec::x25519::X25519PrivateKey;
 use purecrypto::rng::OsRng;
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::wire::{self, Knock};
 use crate::error::{Error, Result};

@@ -34,10 +34,10 @@ fn main() -> std::process::ExitCode {
 #[cfg(unix)]
 mod imp {
     use super::common;
+    use purecrypto::zeroize::Zeroizing;
     use puressh::agent::{AddConstraints, Agent, DestinationConstraint, DestinationHop};
     use puressh::cert::Certificate;
     use puressh::key::{PrivateKey, PublicKey};
-    use zeroize::Zeroizing;
 
     const USAGE: &str = "usage: ssh-add [-CcDdKkLlNqvXx] [-E fingerprint_hash] [-H hostkey_file]\n               [-h destination_constraint] [-S provider] [-t life]\n               [file ...]\n       ssh-add -s pkcs11 [-Cv] [certificate ...]\n       ssh-add -e pkcs11\n       ssh-add -T pubkey ...";
 

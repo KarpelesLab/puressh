@@ -33,8 +33,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use purecrypto::rng::{OsRng, RngCore};
+use purecrypto::zeroize::Zeroizing;
 use puressh::key::{EcdsaCurve, PrivateKey, PublicKey};
-use zeroize::Zeroizing;
 
 /// Open a file with `create_new` semantics, applying the requested Unix mode
 /// when available. On non-Unix targets the mode is silently ignored (the
@@ -561,7 +561,7 @@ fn read_new_passphrase_confirmed(prompt: &str) -> Result<Zeroizing<String>, Stri
     loop {
         let first = read_passphrase_interactive(prompt)?;
         let second = read_passphrase_interactive("Enter same passphrase again: ")?;
-        if first == second {
+        if *first == *second {
             return Ok(first);
         }
         eprintln!("Passphrases do not match.  Try again.");

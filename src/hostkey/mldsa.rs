@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use purecrypto::ec::{Ed25519PrivateKey, Ed25519PublicKey, Ed25519Signature};
 use purecrypto::hash::{Digest, Sha512};
 use purecrypto::mldsa::{MlDsa44PrivateKey, MlDsa44PublicKey};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::{HostKey, HostKeyAlgorithm, HostKeyVerify};
 use crate::error::{Error, Result};

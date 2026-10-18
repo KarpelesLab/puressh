@@ -45,13 +45,12 @@ pub struct KexInitOut {
 
 /// Final agreed values shared by both ends after a successful exchange.
 ///
-/// `Drop` is synthesised by `ZeroizeOnDrop` so the shared secret `K`
-/// is wiped from memory when the struct is dropped. Because the type
-/// now carries a `Drop` impl, you cannot move individual fields out
+/// `Drop` wipes the shared secret `K` from memory when the struct is
+/// dropped. Because the type carries a `Drop` impl, you cannot move individual fields out
 /// via a partial destructure (E0509) — use `core::mem::take(&mut out.k)`
 /// / `core::mem::take(&mut out.h)` instead, which leaves an empty
 /// `Vec` behind that the drop glue can safely wipe.
-#[derive(Clone, zeroize::ZeroizeOnDrop)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct KexOutput {
     /// The shared secret `K` as an SSH `mpint` byte string (length-prefixed,
@@ -59,11 +58,18 @@ pub struct KexOutput {
     pub k: Vec<u8>,
     /// The exchange hash `H` — public material (becomes the session id,
     /// is signed by the host key, and is referenced in transcript hashing).
-    /// Skipped from the zeroize derive: there's no value in wiping it and
-    /// callers expect to be able to publish it.
-    #[zeroize(skip)]
+    /// Not wiped on drop: there's no value in wiping it and callers expect
+    /// to be able to publish it.
     pub h: Vec<u8>,
 }
+
+impl Drop for KexOutput {
+    fn drop(&mut self) {
+        purecrypto::zeroize::Zeroize::zeroize(&mut self.k);
+    }
+}
+
+impl purecrypto::zeroize::ZeroizeOnDrop for KexOutput {}
 
 impl core::fmt::Debug for KexOutput {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

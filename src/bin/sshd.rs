@@ -169,7 +169,7 @@ mod imp {
 
         use pam_client2::conv_null::Conversation;
         use pam_client2::{Context, ConversationHandler, ErrorCode, Flag, SessionToken};
-        use zeroize::Zeroizing;
+        use purecrypto::zeroize::Zeroizing;
 
         /// One step of a live keyboard-interactive PAM conversation, returned
         /// by [`KbdConversation::next`].
@@ -703,7 +703,7 @@ mod imp {
                 self.done = true;
                 KbdStep::Done(false)
             }
-            pub fn answer(&mut self, _response: zeroize::Zeroizing<Vec<u8>>) -> bool {
+            pub fn answer(&mut self, _response: purecrypto::zeroize::Zeroizing<Vec<u8>>) -> bool {
                 let _ = self.done;
                 false
             }
@@ -731,7 +731,7 @@ mod imp {
             pub fn pam_check_password(
                 &self,
                 _user: &str,
-                _password: zeroize::Zeroizing<Vec<u8>>,
+                _password: purecrypto::zeroize::Zeroizing<Vec<u8>>,
                 _rhost: Option<&str>,
             ) -> puressh::Result<()> {
                 Err(puressh::Error::Io(std::io::Error::other(
@@ -3957,7 +3957,7 @@ mod imp {
             &mut self,
             user: &str,
             method: &'static str,
-            password: zeroize::Zeroizing<Vec<u8>>,
+            password: purecrypto::zeroize::Zeroizing<Vec<u8>>,
         ) -> AuthDecision {
             // Mid-userauth username change ⇒ reject (don't leak which half
             // failed).
@@ -4517,7 +4517,7 @@ mod imp {
                         // Copy the secret bytes into a zeroize-on-drop buffer; the
                         // source `SecretString` is itself zeroizing and drops at the
                         // end of this arm.
-                        let pw = zeroize::Zeroizing::new(password.as_bytes().to_vec());
+                        let pw = purecrypto::zeroize::Zeroizing::new(password.as_bytes().to_vec());
                         self.verify_password(&user, "password", pw)
                     }
                     AuthAttempt::KeyboardInteractive { user } => {
@@ -4584,7 +4584,7 @@ mod imp {
                 // the answer into a zeroizing buffer first.
                 let answer = responses
                     .first()
-                    .map(|s| zeroize::Zeroizing::new(s.as_bytes().to_vec()))
+                    .map(|s| purecrypto::zeroize::Zeroizing::new(s.as_bytes().to_vec()))
                     .unwrap_or_default();
 
                 // Empty-password policy: refuse an empty answer to the first prompt

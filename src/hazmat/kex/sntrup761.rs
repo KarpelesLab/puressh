@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 
 use purecrypto::hash::{Digest, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
-use zeroize::{Zeroize, Zeroizing};
+use purecrypto::zeroize::{Zeroize, Zeroizing};
 
 const P: usize = 761;
 const Q: i32 = 4591;

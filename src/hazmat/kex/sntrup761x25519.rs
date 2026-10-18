@@ -16,7 +16,7 @@ use alloc::vec::Vec;
 use purecrypto::ec::x25519::X25519PrivateKey;
 use purecrypto::hash::{Digest, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::Kex;
 use super::common::{

@@ -13,7 +13,7 @@ use purecrypto::bignum::BoxedUint;
 use purecrypto::dh::{DhGroup, DhPrivateKey, DhPublicKey, group14, group16, group18};
 use purecrypto::hash::{Digest, Sha1, Sha256, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::Kex;
 use super::common::{

@@ -15,7 +15,7 @@ use purecrypto::cipher::{Aes128, Aes192, Aes256, Cbc, Cbc64, Des, TdesEde3};
 use purecrypto::der::{self, Reader as DerReader};
 use purecrypto::hash::{Digest, Md5, Sha1, Sha256};
 use purecrypto::rng::{CryptoRng, RngCore};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 

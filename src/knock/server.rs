@@ -11,7 +11,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use purecrypto::ct::ConstantTimeEq;
 use purecrypto::rng::{OsRng, RngCore};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::state::{DropReason, KnockState, Verdict};
 use super::wire::MAX_DATAGRAM;

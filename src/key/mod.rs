@@ -21,7 +21,7 @@ use purecrypto::bignum::BoxedUint;
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey};
 use purecrypto::kdf::bcrypt_pbkdf;
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};

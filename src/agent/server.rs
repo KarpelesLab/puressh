@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use purecrypto::ct::ConstantTimeEq;
 use purecrypto::hash::{Digest, Sha512};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::protocol::*;
 use crate::format::{Reader, Writer};

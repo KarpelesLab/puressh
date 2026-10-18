@@ -111,11 +111,6 @@ purecrypto = { version = "0.10", default-features = false, features = [
 # feature, which we don't enable; the `zlib` streaming codecs are unchanged and
 # its MSRV (Rust 1.88) stays below ours.
 compcol = { version = "0.7", default-features = false, features = ["alloc", "zlib"], optional = true }
-# `zeroize` provides `Zeroizing<T>` (drop wipes the inner value) and a derive
-# for compound secrets. Kept default-on so `no_std + alloc` builds still get
-# secret-wiping for derived KDF output, password buffers carried across FFI,
-# and similar transient secrets. The crate itself is `no_std`-friendly.
-zeroize = { version = "1", default-features = false, features = ["alloc", "derive"] }
 # Runtime-agnostic async I/O traits (`AsyncRead`/`AsyncWrite`) plus their
 # `read`/`write_all` combinators, used only by the optional `async` frontend.
 futures-util = { version = "0.3", default-features = false, features = ["io"], optional = true }

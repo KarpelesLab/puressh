@@ -10,7 +10,7 @@ use purecrypto::ec::boxed::{BoxedEcdhPrivateKey, BoxedEcdsaPublicKey};
 use purecrypto::ec::curves::CurveId;
 use purecrypto::hash::{Digest, Sha256, Sha384, Sha512};
 use purecrypto::rng::{CryptoRng, RngCore};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::Kex;
 use super::common::{

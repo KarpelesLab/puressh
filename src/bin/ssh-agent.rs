@@ -271,7 +271,7 @@ mod imp {
             if n == 0 || n > MAX_REQUEST {
                 return;
             }
-            let mut req = zeroize::Zeroizing::new(vec![0u8; n]);
+            let mut req = purecrypto::zeroize::Zeroizing::new(vec![0u8; n]);
             if stream.read_exact(&mut req).is_err() {
                 return;
             }

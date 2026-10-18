@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use purecrypto::ec::x25519::X25519PrivateKey;
 use purecrypto::rng::OsRng;
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::server::unix_ms;
 use super::wire::{self, Accept, KnockFields, MAX_DATAGRAM};

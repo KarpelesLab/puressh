@@ -48,7 +48,7 @@ use purecrypto::mlkem::{
     MlKem768Ciphertext, MlKem768DecapsKey, MlKem768EncapsKey, SHARED_SECRET_BYTES,
 };
 use purecrypto::rng::{CryptoRng, RngCore};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use super::Kex;
 use super::common::{

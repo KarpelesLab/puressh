@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 
 use purecrypto::hash::{Digest, Sha256, Sha512};
 use purecrypto::kdf::{hkdf_expand, hkdf_extract};
-use zeroize::Zeroizing;
+use purecrypto::zeroize::Zeroizing;
 
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer};

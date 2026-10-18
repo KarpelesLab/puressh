@@ -35,7 +35,7 @@ use crate::kex::{
 };
 use crate::mac::{SshMac, mac_by_name};
 use purecrypto::dh::{DhGroup, group14, group16, group18};
-use zeroize::{ZeroizeOnDrop, Zeroizing};
+use purecrypto::zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use super::ext_info::ExtInfo;
 use super::kex::{GexSizes, Negotiated};
@@ -69,25 +69,32 @@ pub struct KexAdvance {
 /// completion flag from [`KexRunner::on_packet`].
 ///
 /// Holds live cipher/IV/MAC key material: [`Debug`] is redacted so keys never
-/// reach logs, and the secret `Vec` fields are wiped on drop via
-/// [`ZeroizeOnDrop`]. Not `Clone` — duplicating live keys is never needed and
+/// reach logs, and the secret `Vec` fields are wiped on drop
+/// ([`ZeroizeOnDrop`]). Not `Clone` — duplicating live keys is never needed and
 /// would multiply the copies that must be wiped.
-#[derive(ZeroizeOnDrop)]
 #[non_exhaustive]
 pub struct DirKeys {
     /// Negotiated cipher name (e.g. `aes256-ctr`).
-    #[zeroize(skip)]
     pub cipher: String,
     /// IV / nonce bytes; length matches `CipherSpec::iv_len`.
     pub iv: Vec<u8>,
     /// Cipher key bytes; length matches `CipherSpec::key_len`.
     pub key: Vec<u8>,
     /// Negotiated MAC name, empty when the cipher is AEAD.
-    #[zeroize(skip)]
     pub mac: String,
     /// MAC key bytes; empty when the cipher is AEAD.
     pub mac_key: Vec<u8>,
 }
+
+impl Drop for DirKeys {
+    fn drop(&mut self) {
+        self.iv.zeroize();
+        self.key.zeroize();
+        self.mac_key.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for DirKeys {}
 
 impl core::fmt::Debug for DirKeys {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {

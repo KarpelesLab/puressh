@@ -29,6 +29,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use purecrypto::zeroize::Zeroizing;
 use puressh::Error;
 #[cfg(unix)]
 use puressh::agent::{Agent, AgentHostKey};
@@ -36,7 +37,6 @@ use puressh::auth::ClientCredential;
 use puressh::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
 use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
-use zeroize::Zeroizing;
 
 #[cfg(unix)]
 #[path = "unix_sys.rs"]

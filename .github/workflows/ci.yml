@@ -120,7 +120,7 @@ jobs:
       # advertises, activates, and drives `zlib@openssh.com` compression.
       - name: Run server-mode compression interop against real ssh client
         run: >
-          cargo test --test e2e_server_compression --
+          cargo test --features server,pam,agent --test e2e_server_compression --
           --ignored --test-threads=1 --nocapture
 
       # SCP (puressh client ↔ puressh sshd), OpenSSH certificate auth
@@ -131,14 +131,14 @@ jobs:
       # certificate against any sshd that sends `server-sig-algs`.
       - name: Run SCP and certificate interop
         run: >
-          cargo test --test e2e_scp --test e2e_cert --test e2e_keygen --test e2e_transfer --test e2e_auth_command --test e2e_mux --test e2e_sshd_log --test e2e_legacy_algos --test e2e_forwarding --test e2e_hostkeys --test e2e_sshd_inetd --test e2e_tunnel --
+          cargo test --features server,pam,agent --test e2e_scp --test e2e_cert --test e2e_keygen --test e2e_transfer --test e2e_auth_command --test e2e_mux --test e2e_sshd_log --test e2e_legacy_algos --test e2e_forwarding --test e2e_hostkeys --test e2e_sshd_inetd --test e2e_tunnel --
           --ignored --test-threads=1 --nocapture
 
       # Knock rendezvous (puressh ssh ↔ puressh sshd): the TCP port is closed,
       # so the session only comes up through the UDP knock (docs/knock.md).
       - name: Run knock rendezvous end-to-end
         run: >
-          cargo test --test e2e_knock --
+          cargo test --features server,pam,agent --test e2e_knock --
           --ignored --test-threads=1 --nocapture
 
       # Ansible (ansible-core from PyPI) through our ssh/scp/sftp to our sshd,
@@ -146,7 +146,7 @@ jobs:
       # ControlMaster connection per run.
       - name: Run Ansible against puressh
         run: |
-          cargo build --bins
+          cargo build --bins --features server,pam,agent
           python3 -m venv /tmp/ansible-venv
           /tmp/ansible-venv/bin/pip install -q ansible-core
           sh tests/interop/ansible.sh target/debug /tmp/ansible-venv/bin
@@ -177,7 +177,7 @@ jobs:
 
       - name: Build the server and client programs
         run: >
-          cargo build --release --bin sshd --bin ssh-keygen --bin ssh --bin scp
+          cargo build --release --features server,pam,agent --bin sshd --bin ssh-keygen --bin ssh --bin scp
           --bin sftp --bin ssh-add --bin ssh-agent --bin ssh-keyscan
 
       - name: Build the packages
@@ -222,7 +222,7 @@ jobs:
 
       - name: Build the server and client programs
         run: >
-          cargo build --release --bin sshd --bin ssh-keygen --bin ssh --bin scp
+          cargo build --release --features server,pam,agent --bin sshd --bin ssh-keygen --bin ssh --bin scp
           --bin sftp --bin ssh-add --bin ssh-agent --bin ssh-keyscan
 
       - name: Build the packages
@@ -347,14 +347,13 @@ jobs:
       - name: Build with all module features but no std
         run: cargo build --no-default-features --features "alloc,client,server"
 
-      # `nix` comes with the `server` and `agent` features only: a client
-      # build (and the client binaries) must not pull it in.
-      - name: Client-only build stays free of nix
+      # `nix` comes with the `server` and `agent` features only: the default
+      # (client) build, binaries included, must not pull it in.
+      - name: Default build stays free of nix
         run: |
-          features="client,multichannel,compress,knock"
-          cargo build --no-default-features --features "$features"
-          if cargo tree --no-default-features --features "$features" -e normal | grep -q ' nix v'; then
-            echo "::error::nix is in the dependency graph of a client-only build"
+          cargo build
+          if cargo tree -e normal | grep -q ' nix v'; then
+            echo "::error::nix is in the dependency graph of the default build"
             exit 1
           fi
 

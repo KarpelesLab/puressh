@@ -18,7 +18,10 @@ categories = ["cryptography", "network-programming"]
 autobins = false
 
 [features]
-default = ["std", "client", "server", "compress", "pam", "multichannel", "knock", "agent"]
+# The defaults are what a client-library consumer needs. The server side
+# (`server`, `pam`) and the agent daemon (`agent`) are opt-in; the release
+# builds of the binaries enable all three.
+default = ["std", "client", "compress", "multichannel", "knock"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -42,7 +45,7 @@ multichannel = ["client"]
 knock = ["std"]
 # The agent daemon side (`agent::AgentState`, the `ssh-agent` binary), which
 # needs `nix` for peer credentials and daemonising. The agent *client* (keys
-# in an agent for authentication, `ssh-add`) is always there. Default on.
+# in an agent for authentication, `ssh-add`) is always there.
 agent = ["std", "dep:nix"]
 # C ABI surface. Requires `std`, the `client` module, and the multi-channel
 # layer (the FFI's PcSshSftp / PcSshAgent depend on `SharedClient`). Produces
@@ -64,11 +67,10 @@ tokio = ["async", "dep:tokio", "dep:tokio-util"]
 # signals readiness — which `mio::net::TcpStream` is — so the library needs no
 # dependency on `mio` itself; callers register the stream in their own `Poll`.
 mio = ["client"]
-# PAM session integration for the `sshd` binary. Default-on but opt-out:
-# building with `--no-default-features` (or `--features ...` without `pam`)
-# drops the libpam runtime dep entirely. The dep itself is also gated to
-# `cfg(unix)`, so Windows builds stay clean.
-pam = ["dep:pam-client2"]
+# PAM session integration for the `sshd` binary; implies `server`. Opt-in:
+# without it there is no libpam runtime dep. The dep itself is also gated to
+# Linux, so other builds stay clean.
+pam = ["server", "dep:pam-client2"]
 
 [dependencies]
 # 0.7 made `ec` stop implying `alloc`, so the boxed multi-curve path, `CurveId`
@@ -227,3 +229,58 @@ required-features = ["std", "client"]
 name = "scp"
 path = "src/bin/scp.rs"
 required-features = ["std", "client"]
+
+# Integration tests that spawn the in-tree `sshd` need the `server` feature
+# to have it built (it is off by default); without it they are skipped.
+
+[[test]]
+name = "e2e_auth_command"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_forwarding"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_hostkeys"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_knock"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_legacy_algos"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_mux"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_scp"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_server_compression"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_sshd_inetd"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_sshd_log"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_transfer"
+required-features = ["server"]
+
+[[test]]
+name = "e2e_tunnel"
+required-features = ["server"]
+
+[[test]]
+name = "sshd_dump"
+required-features = ["server"]

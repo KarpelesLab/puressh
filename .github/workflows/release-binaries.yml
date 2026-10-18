@@ -59,8 +59,8 @@ jobs:
       - name: Build CLI binaries and C library
         shell: bash
         run: |
-          cargo build --release --bin ssh  --target ${{ matrix.target }}
-          cargo build --release --bin sshd --target ${{ matrix.target }}
+          cargo build --release --features server,pam,agent --bin ssh  --target ${{ matrix.target }}
+          cargo build --release --features server,pam,agent --bin sshd --target ${{ matrix.target }}
           cargo rustc --lib --release --features ffi --crate-type staticlib --target ${{ matrix.target }}
           cargo rustc --lib --release --features ffi --crate-type cdylib    --target ${{ matrix.target }}
 
@@ -136,7 +136,7 @@ jobs:
       - name: Build CLI binaries and C library
         run: |
           for bin in ssh sshd ssh-keygen sftp scp ssh-add ssh-agent ssh-keyscan; do
-            cargo build --release --bin "$bin"
+            cargo build --release --features server,pam,agent --bin "$bin"
           done
           cargo rustc --lib --release --features ffi --crate-type staticlib
           cargo rustc --lib --release --features ffi --crate-type cdylib
@@ -208,8 +208,8 @@ jobs:
       - name: Build both Apple slices (CLI + C library)
         run: |
           for t in x86_64-apple-darwin aarch64-apple-darwin; do
-            cargo build --release --bin ssh  --target "$t"
-            cargo build --release --bin sshd --target "$t"
+            cargo build --release --features server,pam,agent --bin ssh  --target "$t"
+            cargo build --release --features server,pam,agent --bin sshd --target "$t"
             cargo rustc --lib --release --features ffi --crate-type staticlib --target "$t"
             cargo rustc --lib --release --features ffi --crate-type cdylib    --target "$t"
           done

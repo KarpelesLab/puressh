@@ -72,14 +72,23 @@ pub trait Transport: Read + Write + Send {
         Ok(())
     }
 
-    /// A duplicate of the descriptor reads come from, which
-    /// [`crate::shared::SharedClient`] polls for readability *without*
-    /// holding its connection lock, so writers are never stuck behind a
-    /// blocking read. `None` (the default) falls back to timed reads.
-    #[cfg(unix)]
-    fn poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
+    /// A second, independent handle on the read side of the transport,
+    /// which [`crate::shared::SharedClient`] reads from *without* holding
+    /// its connection lock, so writers are never stuck behind a blocking
+    /// read. Once it is taken, every read goes through it and the transport
+    /// itself is only written to. `None` (the default) falls back to timed
+    /// reads under the lock.
+    fn split_reader(&self) -> Option<Box<dyn TransportReader>> {
         None
     }
+}
+
+/// The read half handed out by [`Transport::split_reader`].
+pub trait TransportReader: Send {
+    /// Read what is available into `buf`, waiting at most `timeout` for it
+    /// (`None`: until data or EOF). An expired wait is
+    /// [`ErrorKind::WouldBlock`] or [`ErrorKind::TimedOut`]; `Ok(0)` is EOF.
+    fn read_within(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> std::io::Result<usize>;
 }
 
 impl Transport for TcpStream {
@@ -89,10 +98,102 @@ impl Transport for TcpStream {
     fn set_write_timeout(&mut self, t: Option<Duration>) -> std::io::Result<()> {
         TcpStream::set_write_timeout(self, t)
     }
-    #[cfg(unix)]
-    fn poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
-        self.try_clone().ok().map(std::os::fd::OwnedFd::from)
+    fn split_reader(&self) -> Option<Box<dyn TransportReader>> {
+        let stream = self.try_clone().ok()?;
+        let applied = stream.read_timeout().ok();
+        Some(Box::new(TcpReader { stream, applied }))
     }
+}
+
+/// [`TransportReader`] over a clone of a [`TcpStream`]. The read timeout is
+/// a property of the socket, shared with the original, which is why the
+/// owner stops setting it once the reader is split off.
+struct TcpReader {
+    stream: TcpStream,
+    /// The timeout last applied to the socket, to skip redundant
+    /// `setsockopt` calls; `None` when unknown.
+    applied: Option<Option<Duration>>,
+}
+
+impl TransportReader for TcpReader {
+    fn read_within(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> std::io::Result<usize> {
+        if self.applied != Some(timeout) {
+            self.applied = None;
+            self.stream.set_read_timeout(timeout)?;
+            self.applied = Some(timeout);
+        }
+        self.stream.read(buf)
+    }
+}
+
+/// The reader [`crate::shared::SharedClient`] splits off its transport,
+/// shared between the pumper — which waits for input on it with the
+/// connection lock released ([`Self::fill`]) — and the [`Client`], which
+/// reads through it under the lock. Input the pumper read is stashed until
+/// the client consumes it, so bytes always reach the driver in wire order.
+#[cfg(feature = "multichannel")]
+pub(crate) struct SplitReader {
+    state: Mutex<SplitState>,
+}
+
+#[cfg(feature = "multichannel")]
+struct SplitState {
+    src: Box<dyn TransportReader>,
+    pending: Vec<u8>,
+    eof: bool,
+}
+
+#[cfg(feature = "multichannel")]
+impl SplitReader {
+    /// Unless input is already stashed, wait up to `timeout` for some and
+    /// stash it. A timeout is not an error.
+    pub(crate) fn fill(&self, timeout: Duration) -> std::io::Result<()> {
+        let mut s = self.state.lock().map_err(|_| poisoned_reader())?;
+        if !s.pending.is_empty() || s.eof {
+            return Ok(());
+        }
+        let mut tmp = [0u8; 16 * 1024];
+        match s.src.read_within(&mut tmp, Some(timeout)) {
+            Ok(0) => s.eof = true,
+            Ok(n) => s.pending.extend_from_slice(&tmp[..n]),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(e),
+        }
+        Ok(())
+    }
+
+    /// Stashed input, else (unless `stashed_only`, which reports
+    /// [`ErrorKind::WouldBlock`] instead) a read waiting up to `timeout`.
+    fn read(
+        &self,
+        buf: &mut [u8],
+        timeout: Option<Duration>,
+        stashed_only: bool,
+    ) -> std::io::Result<usize> {
+        let mut s = self.state.lock().map_err(|_| poisoned_reader())?;
+        if !s.pending.is_empty() {
+            let n = s.pending.len().min(buf.len());
+            buf[..n].copy_from_slice(&s.pending[..n]);
+            s.pending.drain(..n);
+            return Ok(n);
+        }
+        if s.eof {
+            return Ok(0);
+        }
+        if stashed_only {
+            return Err(ErrorKind::WouldBlock.into());
+        }
+        s.src.read_within(buf, timeout)
+    }
+}
+
+#[cfg(feature = "multichannel")]
+fn poisoned_reader() -> std::io::Error {
+    std::io::Error::new(ErrorKind::BrokenPipe, "transport reader mutex poisoned")
 }
 
 /// Number of banner lines the handshake will skim through before giving up
@@ -965,6 +1066,14 @@ impl ServeRuntime {
 /// A blocking SSH client.
 pub struct Client {
     stream: Box<dyn Transport>,
+    /// Set once a [`crate::shared::SharedClient`] split the read side off
+    /// `stream` ([`Self::split_reader`]); all reads then go through it.
+    #[cfg(feature = "multichannel")]
+    split_reader: Option<Arc<SplitReader>>,
+    /// The read timeout last asked for, which reads through
+    /// [`Self::split_reader`] apply themselves.
+    #[cfg(feature = "multichannel")]
+    read_timeout: Option<Duration>,
     /// Encoded transport bytes the driver has produced but the socket has not
     /// yet accepted. Normally drained to empty inside [`Self::pump_out`]; only
     /// holds bytes across calls when the socket's send buffer is full and a
@@ -1087,7 +1196,15 @@ impl Client {
             stream.set_write_timeout(Some(t))?;
         }
         stream.set_nodelay(true)?;
-        Self::from_transport(Box::new(stream), "", 0, cfg)
+        #[cfg(feature = "multichannel")]
+        let read_timeout = cfg.timeout;
+        #[allow(unused_mut)]
+        let mut me = Self::from_transport(Box::new(stream), "", 0, cfg)?;
+        #[cfg(feature = "multichannel")]
+        {
+            me.read_timeout = read_timeout;
+        }
+        Ok(me)
     }
 
     /// Like [`Self::connect`], but threads the user-supplied host name and
@@ -1102,7 +1219,15 @@ impl Client {
             stream.set_write_timeout(Some(t))?;
         }
         stream.set_nodelay(true)?;
-        Self::from_transport(Box::new(stream), host, port, cfg)
+        #[cfg(feature = "multichannel")]
+        let read_timeout = cfg.timeout;
+        #[allow(unused_mut)]
+        let mut me = Self::from_transport(Box::new(stream), host, port, cfg)?;
+        #[cfg(feature = "multichannel")]
+        {
+            me.read_timeout = read_timeout;
+        }
+        Ok(me)
     }
 
     /// Run a client over an arbitrary [`Transport`] (rather than a fresh
@@ -1169,6 +1294,10 @@ impl Client {
         let driver = ClientDriver::new(algorithms.clone(), verifier_factory);
         let mut me = Self {
             stream,
+            #[cfg(feature = "multichannel")]
+            split_reader: None,
+            #[cfg(feature = "multichannel")]
+            read_timeout: None,
             out_buf: VecDeque::new(),
             conn: ConnectionState::new(),
             driver,
@@ -1576,7 +1705,19 @@ impl Client {
     /// `ErrorKind::WouldBlock` / `ErrorKind::TimedOut` on subsequent
     /// reads (or only use code paths that fold those into a no-op).
     pub fn set_read_timeout(&mut self, t: Option<core::time::Duration>) -> std::io::Result<()> {
-        self.stream.set_read_timeout(t)?;
+        #[cfg(feature = "multichannel")]
+        {
+            self.read_timeout = t;
+        }
+        // A split-off reader applies the timeout on each read (the socket
+        // option is shared between the two handles).
+        #[cfg(feature = "multichannel")]
+        let split = self.split_reader.is_some();
+        #[cfg(not(feature = "multichannel"))]
+        let split = false;
+        if !split {
+            self.stream.set_read_timeout(t)?;
+        }
         // Bound blocking writes by the same interval. A consumer that asks for
         // a read timeout is, by construction, the concurrent-pump case: it
         // releases and re-acquires the shared transport lock between pumps so
@@ -2842,12 +2983,6 @@ impl Client {
         result
     }
 
-    /// Like [`Self::read_one_packet`] but returns `Ok(None)` on a read
-    /// timeout (the socket's `set_read_timeout` having elapsed) instead of
-    /// erroring. Used by [`Self::serve`] to interleave wire reads with
-    /// per-channel egress draining, and by the `SharedClient` pump in
-    /// short-timeout (interactive) mode to release its inner mutex
-    /// between reads so siblings can write.
     /// Whether a packet is already decoded and waiting (so there is no need
     /// to wait for the transport).
     #[cfg(feature = "multichannel")]
@@ -2855,29 +2990,39 @@ impl Client {
         self.driver.has_pending_events()
     }
 
-    /// See [`Transport::poll_fd`].
-    #[cfg(all(unix, feature = "multichannel"))]
-    pub(crate) fn transport_poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
-        self.stream.poll_fd()
-    }
-
-    /// Advance re-key / keepalive timers while the wire is idle.
+    /// Split the read side off the transport ([`Transport::split_reader`]),
+    /// from then on reading through it; `None` when the transport cannot.
     #[cfg(feature = "multichannel")]
-    pub(crate) fn tick_idle(&mut self) -> Result<()> {
-        self.driver.handle_timeout(Instant::now())?;
-        self.pump_out()
+    pub(crate) fn split_reader(&mut self) -> Option<Arc<SplitReader>> {
+        if self.split_reader.is_none() {
+            let src = self.stream.split_reader()?;
+            self.split_reader = Some(Arc::new(SplitReader {
+                state: Mutex::new(SplitState {
+                    src,
+                    pending: Vec::new(),
+                    eof: false,
+                }),
+            }));
+        }
+        self.split_reader.clone()
     }
 
+    /// Like [`Self::read_one_packet`] but returns `Ok(None)` on a read
+    /// timeout (the socket's `set_read_timeout` having elapsed) instead of
+    /// erroring. Used by [`Self::serve`] to interleave wire reads with
+    /// per-channel egress draining, and by the `SharedClient` pump in
+    /// short-timeout (interactive) mode to release its inner mutex
+    /// between reads so siblings can write.
     pub(crate) fn read_one_packet_maybe_timeout(&mut self) -> Result<Option<Vec<u8>>> {
-        match self.read_one_packet() {
-            Ok(p) => Ok(Some(p)),
-            Err(Error::Io(e))
-                if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(e),
-        }
+        timeout_as_none(self.read_one_packet())
+    }
+
+    /// Like [`Self::read_one_packet_maybe_timeout`], but only consumes input
+    /// the split-off reader already stashed ([`SplitReader::fill`]): never
+    /// waits on the transport, so it is safe under the `SharedClient` lock.
+    #[cfg(feature = "multichannel")]
+    pub(crate) fn read_stashed_packet(&mut self) -> Result<Option<Vec<u8>>> {
+        timeout_as_none(self.next_packet(true))
     }
 
     /// Block until the server answers a `GLOBAL_REQUEST` with
@@ -2974,9 +3119,18 @@ impl Client {
     /// Read one chunk off the transport and feed it to the driver. Propagates
     /// the socket's `WouldBlock`/`TimedOut` error so timeout-aware callers can
     /// convert it to `Ok(None)`.
-    fn read_into_driver(&mut self) -> Result<()> {
+    fn read_into_driver(&mut self, stashed_only: bool) -> Result<()> {
         let mut tmp = [0u8; 16 * 1024];
-        let n = self.stream.read(&mut tmp)?;
+        #[cfg(feature = "multichannel")]
+        let n = match &self.split_reader {
+            Some(r) => r.read(&mut tmp, self.read_timeout, stashed_only)?,
+            None => self.stream.read(&mut tmp)?,
+        };
+        #[cfg(not(feature = "multichannel"))]
+        let n = {
+            let _ = stashed_only;
+            self.stream.read(&mut tmp)?
+        };
         if n == 0 {
             return Err(Error::Protocol("connection closed"));
         }
@@ -2995,7 +3149,7 @@ impl Client {
                     return Ok(());
                 }
             }
-            self.read_into_driver()?;
+            self.read_into_driver(false)?;
         }
         Err(Error::Protocol("kex: too many steps"))
     }
@@ -3005,6 +3159,11 @@ impl Client {
     /// PING/PONG) are handled inside the driver and never surface here. The
     /// returned bytes are fed to `self.conn` by the caller, exactly as before.
     pub(crate) fn read_one_packet(&mut self) -> Result<Vec<u8>> {
+        self.next_packet(false)
+    }
+
+    /// [`Self::read_one_packet`]; `stashed_only` as for [`Self::read_stashed_packet`].
+    fn next_packet(&mut self, stashed_only: bool) -> Result<Vec<u8>> {
         loop {
             // Tick re-key / keepalive timers before each (possibly blocking or
             // timing-out) read so they advance even when the wire is idle.
@@ -3017,7 +3176,7 @@ impl Client {
                 }
                 // HandshakeComplete doesn't occur on this (post-handshake) path.
             }
-            self.read_into_driver()?;
+            self.read_into_driver(stashed_only)?;
         }
     }
 
@@ -3650,6 +3809,19 @@ pub(crate) fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverride
 /// validity checks at the std edge. Falls back to 0 (which fails every
 /// not-yet-valid check and is harmless for already-valid certs) on the
 /// impossible pre-epoch case.
+/// Fold a read timeout (`WouldBlock` / `TimedOut`) into `Ok(None)`.
+fn timeout_as_none(r: Result<Vec<u8>>) -> Result<Option<Vec<u8>>> {
+    match r {
+        Ok(p) => Ok(Some(p)),
+        Err(Error::Io(e))
+            if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn unix_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()

@@ -13,14 +13,12 @@
 #![cfg(all(unix, feature = "client"))]
 
 use std::io::{self, Read, Write};
-use std::os::fd::AsFd;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::time::{Duration, Instant};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-use nix::fcntl::{FcntlArg, OFlag, fcntl};
-use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-
-use crate::client::Transport;
+use crate::client::{Transport, TransportReader};
 use crate::error::{Error, Result};
 
 /// Is `host` safe to substitute into a shell command line?
@@ -147,21 +145,19 @@ pub fn expand_tokens(s: &str, host: &str, port: u16, user: &str) -> String {
 /// A plain anonymous pipe has no `SO_RCVTIMEO`-style knob, so the serve /
 /// forwarding poll loops (which expect [`Transport::set_read_timeout`] to
 /// produce a periodic [`io::ErrorKind::WouldBlock`] tick) historically could
-/// not run over a `ProxyCommand`. We give them one anyway: the child's stdout
-/// fd is switched to `O_NONBLOCK`, and [`Transport::set_read_timeout`] records
-/// a deadline. With a timeout set, [`Read::read`] uses `poll(2)` to wait up to
-/// the deadline for readability and translates the empty-poll case into
-/// `WouldBlock` — exactly the signal the serve loop already handles for a
-/// `TcpStream` read timeout. With no timeout the read blocks (via an infinite
-/// `poll`) so the blocking KEX / userauth phases behave as before.
+/// not run over a `ProxyCommand`. We give them one anyway: a thread reads
+/// the child's stdout and hands the chunks over a channel, and
+/// [`Read::read`] waits on that channel for at most the timeout
+/// [`Transport::set_read_timeout`] recorded, translating an expired wait
+/// into `WouldBlock` — exactly the signal the serve loop already handles for
+/// a `TcpStream` read timeout. With no timeout the read blocks, so the
+/// blocking KEX / userauth phases behave as before.
 pub struct ProcTransport {
     child: Child,
     stdin: ChildStdin,
-    stdout: ChildStdout,
+    stdout: Arc<Mutex<PipeReader>>,
     /// Current read timeout. `None` ⇒ block until data (or EOF). `Some(d)` ⇒
-    /// each `read` waits at most `d` for readability, then returns
-    /// `WouldBlock`. The stdout fd is always `O_NONBLOCK`; this field only
-    /// decides how long `poll(2)` waits before giving up.
+    /// each `read` waits at most `d` for data, then returns `WouldBlock`.
     read_timeout: Option<Duration>,
 }
 
@@ -187,74 +183,104 @@ impl ProcTransport {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("ProxyCommand: child stdout not captured"))?;
-        // Put the read side into non-blocking mode up front: every read goes
-        // through `poll(2)` + a non-blocking `read`, regardless of whether a
-        // timeout is currently armed (a `None` timeout polls with no deadline).
-        set_nonblocking(&stdout)?;
         Ok(Self {
             child,
             stdin,
-            stdout,
+            stdout: Arc::new(Mutex::new(PipeReader::spawn(stdout)?)),
             read_timeout: None,
         })
     }
 }
 
-/// Flip `O_NONBLOCK` on for `fd` via `fcntl(F_GETFL)` + `fcntl(F_SETFL)`.
-fn set_nonblocking<F: AsFd>(fd: &F) -> io::Result<()> {
-    let borrowed = fd.as_fd();
-    let cur = fcntl(borrowed, FcntlArg::F_GETFL).map_err(io::Error::from)?;
-    let flags = OFlag::from_bits_truncate(cur) | OFlag::O_NONBLOCK;
-    fcntl(borrowed, FcntlArg::F_SETFL(flags)).map_err(io::Error::from)?;
-    Ok(())
+/// The child's stdout, read by a thread of its own so a read can give up
+/// after a timeout. The thread ends at EOF (the child exiting or being
+/// killed on drop) or once the receiving side is gone.
+struct PipeReader {
+    rx: Receiver<io::Result<Vec<u8>>>,
+    /// The part of the last chunk not yet returned.
+    chunk: Vec<u8>,
+    pos: usize,
+    eof: bool,
+}
+
+impl PipeReader {
+    fn spawn(mut stdout: ChildStdout) -> io::Result<Self> {
+        let (tx, rx) = channel();
+        std::thread::Builder::new()
+            .name("proxycommand-stdout".into())
+            .spawn(move || {
+                let mut buf = vec![0u8; 16 * 1024];
+                loop {
+                    let r = match stdout.read(&mut buf) {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        r => r.map(|n| buf[..n].to_vec()),
+                    };
+                    let last = !matches!(&r, Ok(chunk) if !chunk.is_empty());
+                    if tx.send(r).is_err() || last {
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            rx,
+            chunk: Vec::new(),
+            pos: 0,
+            eof: false,
+        })
+    }
+
+    fn read_within(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+        if self.pos == self.chunk.len() {
+            if self.eof {
+                return Ok(0);
+            }
+            let next = match timeout {
+                None => self.rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                Some(t) => self.rx.recv_timeout(t),
+            };
+            match next {
+                Ok(Ok(chunk)) if !chunk.is_empty() => {
+                    self.chunk = chunk;
+                    self.pos = 0;
+                }
+                Ok(Ok(_)) | Err(RecvTimeoutError::Disconnected) => {
+                    self.eof = true;
+                    return Ok(0);
+                }
+                Ok(Err(e)) => {
+                    self.eof = true;
+                    return Err(e);
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+            }
+        }
+        let n = (self.chunk.len() - self.pos).min(buf.len());
+        buf[..n].copy_from_slice(&self.chunk[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// A second handle on [`ProcTransport`]'s stdout, for
+/// [`Transport::split_reader`].
+struct ProcReader(Arc<Mutex<PipeReader>>);
+
+impl TransportReader for ProcReader {
+    fn read_within(&mut self, buf: &mut [u8], timeout: Option<Duration>) -> io::Result<usize> {
+        lock_pipe(&self.0)?.read_within(buf, timeout)
+    }
+}
+
+fn lock_pipe(p: &Mutex<PipeReader>) -> io::Result<std::sync::MutexGuard<'_, PipeReader>> {
+    p.lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ProxyCommand reader poisoned"))
 }
 
 impl Read for ProcTransport {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        // The fd is O_NONBLOCK, so a bare `read` returns `WouldBlock` instead
-        // of parking. We wrap it in `poll(2)` to get the wait semantics the
-        // serve loop expects:
-        //   * `read_timeout = None`  → poll with no deadline (block for data).
-        //   * `read_timeout = Some`  → poll up to the deadline, surfacing
-        //     `WouldBlock` if nothing arrives so the caller can tick.
-        let deadline = self.read_timeout.map(|d| Instant::now() + d);
-        loop {
-            // Compute the remaining poll budget for this iteration.
-            let timeout: PollTimeout = match deadline {
-                None => PollTimeout::NONE,
-                Some(end) => {
-                    let now = Instant::now();
-                    if now >= end {
-                        return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                    }
-                    let remaining = end - now;
-                    // Clamp to u16 ms (PollTimeout's largest finite value is
-                    // ~65s; our timeouts are tens of ms, so saturation is fine).
-                    let ms = remaining.as_millis().min(u16::MAX as u128) as u16;
-                    PollTimeout::from(ms)
-                }
-            };
-
-            let mut fds = [PollFd::new(self.stdout.as_fd(), PollFlags::POLLIN)];
-            match poll(&mut fds, timeout) {
-                Ok(0) => {
-                    // poll timed out without readiness → no data yet.
-                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
-                }
-                Ok(_) => {
-                    // Readable (or hangup): attempt the read. On a real pipe a
-                    // POLLHUP fd reads as EOF (0), which we surface as Ok(0).
-                    match self.stdout.read(buf) {
-                        // Spurious wakeup (poll said readable but the read
-                        // raced to empty) — loop and re-poll within budget.
-                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                        other => return other,
-                    }
-                }
-                Err(nix::errno::Errno::EINTR) => continue,
-                Err(e) => return Err(io::Error::from(e)),
-            }
-        }
+        lock_pipe(&self.stdout)?.read_within(buf, self.read_timeout)
     }
 }
 
@@ -269,9 +295,8 @@ impl Write for ProcTransport {
 }
 
 impl Transport for ProcTransport {
-    /// Arm (or clear) a read timeout. The child stdout fd is already
-    /// `O_NONBLOCK`; this just records the deadline [`Read::read`] enforces
-    /// via `poll(2)`. `Some(d)` makes reads return [`io::ErrorKind::WouldBlock`]
+    /// Arm (or clear) a read timeout: how long [`Read::read`] waits for
+    /// data. `Some(d)` makes reads return [`io::ErrorKind::WouldBlock`]
     /// after `d` of no data (the periodic tick the serve / forwarding loops
     /// rely on); `None` reverts to a blocking read.
     fn set_read_timeout(&mut self, t: Option<Duration>) -> io::Result<()> {
@@ -281,9 +306,8 @@ impl Transport for ProcTransport {
 
     /// The helper's stdout, so a shared connection waits for it without
     /// holding its lock.
-    fn poll_fd(&self) -> Option<std::os::fd::OwnedFd> {
-        use std::os::fd::AsFd;
-        self.stdout.as_fd().try_clone_to_owned().ok()
+    fn split_reader(&self) -> Option<Box<dyn TransportReader>> {
+        Some(Box::new(ProcReader(self.stdout.clone())))
     }
 }
 
@@ -299,6 +323,7 @@ impl Drop for ProcTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn expand_basic_tokens() {
@@ -443,7 +468,7 @@ mod tests {
         // It should have actually waited ~the timeout, not busy-returned.
         assert!(
             start.elapsed() >= Duration::from_millis(40),
-            "poll should have waited out the deadline, took {:?}",
+            "the read should have waited out the deadline, took {:?}",
             start.elapsed()
         );
     }
@@ -461,7 +486,7 @@ mod tests {
 
     #[test]
     fn blocking_read_after_clearing_timeout() {
-        // `set_read_timeout(None)` reverts to a blocking poll: a delayed
+        // `set_read_timeout(None)` reverts to a blocking read: a delayed
         // write is still delivered (no premature WouldBlock).
         let mut t = ProcTransport::spawn("sleep 0.1; printf ok").expect("spawn");
         t.set_read_timeout(None).expect("clear timeout");

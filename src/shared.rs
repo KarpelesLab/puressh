@@ -72,16 +72,12 @@
 //! window naturally cap the in-memory mailbox at the initial window
 //! size, which in turn stops the peer from sending more.
 //!
-//! ### Limitations
-//!
-//! `Client::read_one_packet` is a blocking socket read on a bare
-//! `TcpStream`. While the pumper is parked there no
-//! other thread can grab the mutex — including a thread whose data is
-//! already in its mailbox. In practice this only matters when one
-//! channel is genuinely quiet for long stretches; the typical
-//! request/response SFTP workload doesn't trigger it. Lifting this
-//! fully needs either a dedicated reader thread or splitting the
-//! read-half of the `TcpStream` — both deferred.
+//! The pumper waits for input with the mutex *released*: the transport's
+//! read side is split off ([`crate::client::Transport::split_reader`]) and
+//! read without the lock, the bytes stashed, then fed to the driver under
+//! it. A transport that cannot split (a channel of another connection, as
+//! with ProxyJump) is read under the lock with its read timeout instead,
+//! which delays writers by up to that timeout while the wire is quiet.
 
 #![cfg(feature = "std")]
 
@@ -91,7 +87,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use crate::channel::{ChannelEvent, ChannelOpen, ChannelRequest};
-use crate::client::{Client, Transport, io_err};
+use crate::client::{Client, SplitReader, Transport, io_err};
 use crate::error::{Error, Result};
 use crate::sftp::{SftpClient, SftpError};
 
@@ -103,51 +99,10 @@ use crate::sftp::{SftpClient, SftpError};
 const WAIT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long a pumper waits for input with the lock released before it
-/// ticks timers and lets waiters re-check their mailboxes.
+/// ticks timers and lets waiters re-check their mailboxes. Reading with the
+/// lock held would delay every writer by up to the read timeout, one
+/// request/response round trip at a time (sftp, git).
 const PUMP_POLL: Duration = Duration::from_millis(50);
-
-/// A duplicate of the transport's descriptor, polled for readability
-/// without holding the connection lock: a pumper blocked in a read would
-/// otherwise hold the lock and delay every writer by up to the read
-/// timeout, one request/response round trip at a time (sftp, git).
-struct PollHandle {
-    #[cfg(unix)]
-    fd: std::os::fd::OwnedFd,
-}
-
-impl PollHandle {
-    fn from_client(client: &Client) -> Option<Arc<Self>> {
-        #[cfg(unix)]
-        {
-            client
-                .transport_poll_fd()
-                .map(|fd| Arc::new(PollHandle { fd }))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = client;
-            None
-        }
-    }
-
-    /// Whether the transport became readable within `timeout`.
-    fn wait_readable(&self, timeout: Duration) -> bool {
-        #[cfg(unix)]
-        {
-            use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-            use std::os::fd::AsFd;
-            let mut fds = [PollFd::new(self.fd.as_fd(), PollFlags::POLLIN)];
-            let ms = u16::try_from(timeout.as_millis()).unwrap_or(u16::MAX);
-            // Errors (EINTR included) mean "go and look".
-            !matches!(poll(&mut fds, PollTimeout::from(ms)), Ok(0))
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = timeout;
-            true
-        }
-    }
-}
 
 /// Lock the shared mutex, mapping poison to `Error::Protocol`. Used by
 /// fallible API paths whose return type is `Result<_, crate::Error>` —
@@ -260,7 +215,7 @@ struct Inner {
 struct SelfRef {
     inner: std::sync::Weak<Mutex<Inner>>,
     lock_waiters: Arc<core::sync::atomic::AtomicUsize>,
-    poll: Option<Arc<PollHandle>>,
+    reader: Option<Arc<SplitReader>>,
 }
 
 /// Server-opened channel callbacks installed with
@@ -298,16 +253,18 @@ pub struct SharedClient {
     /// lock, starving the data-reader thread that would otherwise
     /// drain SHELL prompt bytes.
     lock_waiters: Arc<core::sync::atomic::AtomicUsize>,
-    /// See [`PollHandle`]; `None` when the transport has no descriptor.
-    poll: Option<Arc<PollHandle>>,
+    /// The transport's read side, which the pumper waits on with the lock
+    /// released; `None` when the transport cannot split one off
+    /// ([`Transport::split_reader`]), so pumps read under the lock.
+    reader: Option<Arc<SplitReader>>,
 }
 
 impl From<Client> for SharedClient {
-    fn from(client: Client) -> Self {
+    fn from(mut client: Client) -> Self {
         let lock_waiters = Arc::new(core::sync::atomic::AtomicUsize::new(0));
         let waiters = lock_waiters.clone();
-        let poll = PollHandle::from_client(&client);
-        let poll_ref = poll.clone();
+        let reader = client.split_reader();
+        let reader_ref = reader.clone();
         let inner = Arc::new_cyclic(|weak| {
             Mutex::new(Inner {
                 client,
@@ -321,14 +278,14 @@ impl From<Client> for SharedClient {
                 self_ref: Some(SelfRef {
                     inner: weak.clone(),
                     lock_waiters: waiters,
-                    poll: poll_ref,
+                    reader: reader_ref,
                 }),
             })
         });
         Self {
             inner,
             lock_waiters,
-            poll,
+            reader,
         }
     }
 }
@@ -358,37 +315,28 @@ impl Drop for LockTicket<'_> {
 }
 
 impl SharedClient {
-    /// Called by the pumper (with `g.pumping` set) before reading: unless a
-    /// packet is already decoded, release the lock and wait for the
-    /// transport to become readable, so writers get through meanwhile.
-    /// Returns the re-acquired guard and whether there is input to pump.
-    fn await_input<'a>(
-        &'a self,
-        g: std::sync::MutexGuard<'a, Inner>,
-    ) -> std::io::Result<(std::sync::MutexGuard<'a, Inner>, bool)> {
-        let Some(poll) = &self.poll else {
-            return Ok((g, true));
-        };
-        if g.client.has_buffered_input() {
-            return Ok((g, true));
-        }
-        drop(g);
-        let ready = poll.wait_readable(PUMP_POLL);
-        Ok((lock_or_poison_io(&self.inner)?, ready))
-    }
-
-    /// One pump step for a pumper holding `g`: wait for input without the
-    /// lock, then read and dispatch a packet (or tick the timers).
+    /// One pump step for a pumper holding `g` (with `g.pumping` set): unless
+    /// a packet is already decoded, release the lock and wait for input on
+    /// the split-off reader, so writers get through meanwhile; then dispatch
+    /// a packet, or tick the timers if none came.
     fn pump_step<'a>(
         &'a self,
         g: std::sync::MutexGuard<'a, Inner>,
     ) -> std::io::Result<(std::sync::MutexGuard<'a, Inner>, std::io::Result<()>)> {
-        let (mut g, ready) = self.await_input(g)?;
-        let res = if ready {
-            OwnedChannelStream::pump_one_step(&mut g)
-        } else {
-            g.client.tick_idle().map_err(io_err)
+        let mut g = g;
+        let Some(reader) = &self.reader else {
+            let res = OwnedChannelStream::pump_one_step(&mut g, false);
+            return Ok((g, res));
         };
+        if !g.client.has_buffered_input() {
+            drop(g);
+            let filled = reader.fill(PUMP_POLL);
+            g = lock_or_poison_io(&self.inner)?;
+            if let Err(e) = filled {
+                return Ok((g, Err(e)));
+            }
+        }
+        let res = OwnedChannelStream::pump_one_step(&mut g, true);
         Ok((g, res))
     }
 
@@ -1512,7 +1460,7 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
     let shared = SharedClient {
         inner: arc,
         lock_waiters: self_ref.lock_waiters.clone(),
-        poll: self_ref.poll.clone(),
+        reader: self_ref.reader.clone(),
     };
     match g.client.conn.accept_open(channel) {
         Ok(p) => {
@@ -2021,14 +1969,21 @@ impl OwnedChannelStream {
     /// [`OwnedChannelStream`]'s [`Drop`] only, which keeps the wire
     /// emission rule trivially safe (one CLOSE per stream, period) and
     /// avoids a double-close race between the pumper and Drop.
-    fn pump_one_step(g: &mut Inner) -> std::io::Result<()> {
+    ///
+    /// `stashed` only consumes input the split-off reader already holds
+    /// (see [`SharedClient::pump_step`]), never waiting on the transport.
+    fn pump_one_step(g: &mut Inner, stashed: bool) -> std::io::Result<()> {
         // Use the timeout-tolerant variant so a `Client::set_read_timeout`
         // configuration (used by the interactive shell to keep the inner
         // mutex from being held across long quiescent reads) returns
         // `Ok(None)` instead of `WouldBlock` / `TimedOut`. Either way the
         // pumper releases the lock immediately after this call and the
         // outer `read_stream` loop re-acquires it.
-        let read = g.client.read_one_packet_maybe_timeout();
+        let read = if stashed {
+            g.client.read_stashed_packet()
+        } else {
+            g.client.read_one_packet_maybe_timeout()
+        };
         if let Err(Error::Disconnected {
             reason,
             description,
@@ -2151,7 +2106,7 @@ impl Drop for OwnedChannelStream {
             if already_closed {
                 break;
             }
-            if Self::pump_one_step(&mut g).is_err() {
+            if Self::pump_one_step(&mut g, false).is_err() {
                 break;
             }
         }

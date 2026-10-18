@@ -38,6 +38,10 @@ use puressh::key::PrivateKey;
 use puressh::known_hosts::KnownHosts;
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+#[path = "unix_sys.rs"]
+pub mod unix_sys;
+
 // `StrictMode` lives in the lib so the config parser and the binaries share
 // one definition. Re-exported here so existing `use common::StrictMode;`
 // sites keep compiling unchanged.
@@ -86,8 +90,8 @@ pub fn resolve_user(cli_user: Option<&str>, user_in_host: Option<&str>) -> Resul
 /// `$USER` / `$LOGNAME` (`%USERNAME%` on Windows).
 pub fn local_user_name() -> Option<String> {
     #[cfg(unix)]
-    if let Ok(Some(u)) = nix::unistd::User::from_uid(nix::unistd::getuid()) {
-        return Some(u.name);
+    if let Some((name, _)) = unix_sys::passwd_entry(unix_sys::getuid()) {
+        return Some(name);
     }
     std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
@@ -822,7 +826,7 @@ pub fn check_identity_perms(path: &Path) -> Result<(), String> {
     {
         use std::os::unix::fs::MetadataExt;
         let md = std::fs::metadata(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let euid = nix::unistd::geteuid().as_raw();
+        let euid = unix_sys::geteuid();
         let mode = md.mode() & 0o777;
         if md.uid() == euid && (mode & 0o077) != 0 {
             return Err(format!(
@@ -1455,9 +1459,13 @@ pub fn log_to_file(path: &str) -> Result<(), String> {
         .append(true)
         .open(path)
         .map_err(|e| format!("-E {path}: {e}"))?;
-    let saved = nix::unistd::dup(std::io::stderr()).map_err(|e| format!("-E {path}: {e}"))?;
+    use std::os::fd::AsFd;
+    let saved = std::io::stderr()
+        .as_fd()
+        .try_clone_to_owned()
+        .map_err(|e| format!("-E {path}: {e}"))?;
     let _ = ORIGINAL_STDERR.set(std::fs::File::from(saved));
-    nix::unistd::dup2_stderr(&f).map_err(|e| format!("-E {path}: {e}"))?;
+    unix_sys::dup2(&f, 2).map_err(|e| format!("-E {path}: {e}"))?;
     Ok(())
 }
 
@@ -1478,7 +1486,7 @@ pub fn remote_stderr() -> Box<dyn std::io::Write + Send> {
 pub fn restore_stderr() {
     #[cfg(unix)]
     if let Some(f) = ORIGINAL_STDERR.get() {
-        let _ = nix::unistd::dup2_stderr(f);
+        let _ = unix_sys::dup2(f, 2);
     }
 }
 
@@ -1627,7 +1635,7 @@ fn check_user_config_perms(path: &Path) -> Result<(), String> {
     {
         use std::os::unix::fs::MetadataExt;
         let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let euid = nix::unistd::geteuid().as_raw();
+        let euid = unix_sys::geteuid();
         if (md.uid() != 0 && md.uid() != euid) || (md.mode() & 0o022) != 0 {
             return Err(format!("Bad owner or permissions on {}", path.display()));
         }

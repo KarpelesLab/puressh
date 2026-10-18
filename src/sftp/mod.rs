@@ -15,16 +15,20 @@
 //! extension tables are crate-private implementation details.
 
 mod client;
+#[cfg(feature = "server")]
 pub(crate) mod extensions;
 pub(crate) mod packet;
+#[cfg(feature = "server")]
 pub(crate) mod path;
+#[cfg(feature = "server")]
 mod server;
 mod types;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "server"))]
 mod tests;
 
 pub use client::SftpClient;
+#[cfg(feature = "server")]
 pub use server::{SftpServerOptions, SftpServerSession};
 pub use types::{
     ATTR_ACMODTIME, ATTR_EXTENDED, ATTR_PERMISSIONS, ATTR_SIZE, ATTR_UIDGID, Attrs, FXF_APPEND,

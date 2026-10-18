@@ -347,6 +347,17 @@ jobs:
       - name: Build with all module features but no std
         run: cargo build --no-default-features --features "alloc,client,server"
 
+      # `nix` comes with the `server` and `agent` features only: a client
+      # build (and the client binaries) must not pull it in.
+      - name: Client-only build stays free of nix
+        run: |
+          features="client,multichannel,compress,knock"
+          cargo build --no-default-features --features "$features"
+          if cargo tree --no-default-features --features "$features" -e normal | grep -q ' nix v'; then
+            echo "::error::nix is in the dependency graph of a client-only build"
+            exit 1
+          fi
+
   c_abi:
     name: C ABI smoke test
     runs-on: ubuntu-latest

@@ -18,13 +18,16 @@ categories = ["cryptography", "network-programming"]
 autobins = false
 
 [features]
-default = ["std", "client", "server", "compress", "pam", "multichannel", "knock"]
+default = ["std", "client", "server", "compress", "pam", "multichannel", "knock", "agent"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
 # `std::thread`, so they require the `std` feature.
 client = ["std"]
-server = ["std"]
+# The server is the one part of the library that needs `nix` (fork, ptys,
+# setuid, signals, ...). The client stays sans-IO underneath and leaves the
+# I/O model to its caller.
+server = ["std", "dep:nix"]
 compress = ["dep:compcol"]
 # Concurrent multi-channel client layer (SharedClient, OwnedChannelStream,
 # SftpSession). Enables several SFTP / exec / shell / direct-tcpip handles
@@ -37,6 +40,10 @@ multichannel = ["client"]
 # opens a one-shot TCP listener in front of a regular SSH session. puressh
 # only; not understood by other SSH implementations. Default on.
 knock = ["std"]
+# The agent daemon side (`agent::AgentState`, the `ssh-agent` binary), which
+# needs `nix` for peer credentials and daemonising. The agent *client* (keys
+# in an agent for authentication, `ssh-add`) is always there. Default on.
+agent = ["std", "dep:nix"]
 # C ABI surface. Requires `std`, the `client` module, and the multi-channel
 # layer (the FFI's PcSshSftp / PcSshAgent depend on `SharedClient`). Produces
 # additional `staticlib` / `cdylib` artefacts (see `[lib].crate-type`).
@@ -118,33 +125,33 @@ futures-util = { version = "0.3", default-features = false, features = ["io"], o
 tokio = { version = "1", default-features = false, optional = true }
 tokio-util = { version = "0.7", default-features = false, features = ["compat"], optional = true }
 
-# Unix-only deps for the `sshd` binary: fork(), forkpty(), waitpid(),
-# set_winsize(), SIGCHLD plumbing. Library code never touches `nix` — it
-# stays no-std-friendly. Confined to `cfg(unix)` so Windows builds keep a
-# clean dependency graph.
+# Unix-only deps for the server side (the `server` library code and the
+# `sshd` binary: fork(), forkpty(), waitpid(), set_winsize(), SIGCHLD
+# plumbing, ...) and the `ssh-agent` binary (the `agent` feature). Optional,
+# so a client-only build never pulls it in, and confined to `cfg(unix)` so
+# Windows builds keep a clean dependency graph.
 #
 # Feature map in nix 0.30:
 #   process — waitpid, fork, execvp
 #   signal  — signal handlers, kill
 #   term    — pty / forkpty / Winsize (the pty module is gated by `term`)
-#   fs      — fcntl flags / O_NONBLOCK
+#   fs      — fcntl flags / O_NONBLOCK, statvfs (SFTP server)
 #   ioctl   — TIOCSWINSZ
 #   user    — User::from_name, setuid/setgid/initgroups, geteuid/getegid
-#   poll    — poll(2) for the ProxyCommand non-blocking read-with-deadline
+#   poll    — poll(2) for the tunnel-device reader and the server's waits
 #   socket, net — sshd listeners (IPV6_V6ONLY so `[::]` and `0.0.0.0` bind
-#             side by side, as OpenSSH does)
+#             side by side, as OpenSSH does), ssh-agent peer credentials
 #
 # 0.31's breaking changes (removal of `PartialEq` on `SigHandler` and of a
 # NetBSD `IFF_NOTRAILERS` flag; libc floor 0.2.181) touch nothing we use.
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", default-features = false, features = [
+nix = { version = "0.31", default-features = false, optional = true, features = [
     "process", "signal", "term", "fs", "ioctl", "user", "poll", "socket", "net",
 ] }
-# `libc` for the few low-level POSIX bits the binaries need (terminal
-# echo control in the password reader; geteuid + Unix-socket stat() for
-# the SSH_AUTH_SOCK trust check in the agent client). The library
-# proper continues to stay no-std-friendly; only the cfg(unix)-gated
-# bin/agent paths reach for libc.
+# `libc` for the few low-level POSIX bits: constants the library passes to
+# std (`O_NOFOLLOW`, termios mode numbers), and the binaries' own calls
+# (terminal control, fork, peer credentials) where they don't use `nix`. The
+# library itself stays `forbid(unsafe_code)` and never calls into it.
 libc = { version = "0.2", default-features = false }
 
 # `pam-client2` is gated to **Linux only**, not all of `cfg(unix)`.
@@ -204,7 +211,7 @@ required-features = ["std", "client"]
 [[bin]]
 name = "ssh-agent"
 path = "src/bin/ssh-agent.rs"
-required-features = ["std"]
+required-features = ["std", "agent"]
 
 [[bin]]
 name = "ssh-keyscan"

@@ -9,10 +9,10 @@
 //! `SSH_FXP_EXTENDED` packet arrives; unknown extension names collapse to
 //! `SSH_FX_OP_UNSUPPORTED`.
 
-// `FxpStatus` is only consumed by the `#[cfg(unix)]` errno-translation
-// helper below. On Windows the helper isn't compiled in, so importing
-// the type unconditionally trips `-D warnings` with "unused import".
-#[cfg(unix)]
+// `FxpStatus` is only consumed by the server's errno-translation helper
+// below. Where that isn't compiled in, importing the type unconditionally
+// trips `-D warnings` with "unused import".
+#[cfg(all(unix, feature = "server"))]
 use super::types::FxpStatus;
 
 /// `posix-rename@openssh.com` — atomic `rename(2)`, overwriting destination.
@@ -98,6 +98,7 @@ impl StatvfsReply {
     /// Build from a `nix::sys::statvfs::Statvfs` and map the OS-specific
     /// flag bits to the wire-level `SSH_FXE_STATVFS_*` values OpenSSH
     /// expects.
+    #[cfg(feature = "server")]
     pub fn from_nix(s: &nix::sys::statvfs::Statvfs) -> Self {
         let nix_flags = s.flags();
         let mut flag: u64 = 0;
@@ -152,7 +153,7 @@ impl StatvfsReply {
 }
 
 /// Translate a `nix::errno::Errno` into the closest SFTP status code.
-#[cfg(unix)]
+#[cfg(all(unix, feature = "server"))]
 pub fn fxp_status_from_errno(e: nix::errno::Errno) -> FxpStatus {
     use nix::errno::Errno;
     match e {

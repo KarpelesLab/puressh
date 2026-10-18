@@ -1047,7 +1047,7 @@ impl PrivateKey {
     /// RSA, `SSH_AGENT_RSA_SHA2_512` (4) selects `rsa-sha2-512`,
     /// `SSH_AGENT_RSA_SHA2_256` (2) `rsa-sha2-256`, and no flag the legacy
     /// SHA-1 `ssh-rsa`; other key types ignore the flags.
-    #[cfg(all(feature = "std", unix))]
+    #[cfg(all(feature = "agent", unix))]
     pub(crate) fn agent_signer(
         &self,
         flags: u32,
@@ -1142,7 +1142,7 @@ impl PrivateKey {
     /// layout [`Self::to_agent_add_body`] produces: key type, private
     /// fields, comment), consuming it from `r`. The key is checked for
     /// internal consistency before it is returned.
-    #[cfg(all(feature = "std", unix))]
+    #[cfg(all(feature = "agent", unix))]
     pub(crate) fn from_agent_add_body(r: &mut Reader<'_>) -> Result<Self> {
         let pk = parse_private_fields(r)?;
         let comment = String::from_utf8_lossy(r.read_string()?).into_owned();
@@ -1155,7 +1155,7 @@ impl PrivateKey {
     /// a certificate (the layout [`Self::to_agent_add_cert_body`]
     /// produces), returning the key and the certificate blob. The private
     /// fields are checked against the certificate's embedded key.
-    #[cfg(all(feature = "std", unix))]
+    #[cfg(all(feature = "agent", unix))]
     pub(crate) fn from_agent_add_cert_body(r: &mut Reader<'_>) -> Result<(Self, Vec<u8>)> {
         let cert_type = r.read_string()?;
         let cert_blob = r.read_string()?.to_vec();

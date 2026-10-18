@@ -77,15 +77,22 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 | `std`          | yes     | I/O helpers, OS RNG, `std::error::Error`               |
 | `alloc`        | yes     | Heap-backed types (implied by `std`)                   |
 | `client`       | yes     | High-level client API                                  |
-| `server`       | yes     | High-level server API                                  |
+| `server`       | yes     | High-level server API (incl. the SFTP server); pulls in `nix` on Unix |
 | `compress`     | yes     | `zlib` compression via `compcol`                       |
 | `pam`          | yes     | PAM session integration for `sshd` (Linux only)        |
 | `multichannel` | yes     | Concurrent multi-channel client (`SharedClient`, `SftpSession`) |
 | `knock`        | yes     | Stealth UDP knock rendezvous in front of SSH (puressh-only, see [`docs/knock.md`](docs/knock.md)) |
+| `agent`        | yes     | Agent daemon side (`agent::AgentState`, the `ssh-agent` binary); pulls in `nix` on Unix. The agent client is always available |
 | `async`        | no      | Runtime-agnostic async frontends (`AsyncClient`, `AsyncServerConnection`) over `futures_io` |
 | `tokio`        | no      | Native tokio entry points (`connect_tokio` / `accept_tokio`) accepting `tokio::io` streams; builds on `async` |
 | `mio`          | no      | Native readiness frontend (`MioClient`) for a `mio`-style `Poll` loop; no `mio` dependency in the library |
 | `ffi`          | no      | C ABI surface (`pcssh_*`); implies `client` + `multichannel` |
+
+A client-only build (`default-features = false`, `features = ["client",
+"multichannel"]`) does not depend on `nix`: the client is sans-IO underneath,
+and the blocking frontend sticks to `std`. A custom transport can let
+`SharedClient` wait for input without holding its lock by implementing
+`Transport::split_reader`.
 
 Disable defaults for `no_std`:
 

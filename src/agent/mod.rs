@@ -20,6 +20,7 @@
 pub(crate) mod client;
 mod host_key;
 mod protocol;
+#[cfg(feature = "agent")]
 pub mod server;
 
 #[cfg(test)]
@@ -29,4 +30,5 @@ pub use client::{
     AddConstraints, Agent, AgentIdentity, DestinationConstraint, DestinationHop, validate_auth_sock,
 };
 pub use host_key::{AgentHostKey, RsaHash};
+#[cfg(feature = "agent")]
 pub use server::{AgentState, ConfirmFn, ConnectionState};

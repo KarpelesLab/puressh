@@ -2268,7 +2268,7 @@ fn run() -> Result<i32, String> {
     #[cfg(unix)]
     if cli.stdin_null {
         let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
-        nix::unistd::dup2_stdin(&null).map_err(|e| format!("-n: {e}"))?;
+        common::unix_sys::dup2(&null, 0).map_err(|e| format!("-n: {e}"))?;
     }
 
     // Resolve the ssh_config block matching the user-typed host name. CLI
@@ -2383,7 +2383,7 @@ fn run() -> Result<i32, String> {
         #[cfg(unix)]
         {
             let null = std::fs::File::open("/dev/null").map_err(|e| format!("/dev/null: {e}"))?;
-            nix::unistd::dup2_stdin(&null).map_err(|e| format!("StdinNull: {e}"))?;
+            common::unix_sys::dup2(&null, 0).map_err(|e| format!("StdinNull: {e}"))?;
         }
     }
 
@@ -4110,19 +4110,19 @@ fn fork_to_background() -> Result<(), String> {
     use std::os::fd::{FromRawFd, OwnedFd};
     let mut fds = [0; 2];
     // SAFETY: pipe() fills the two-element array.
-    if unsafe { nix::libc::pipe(fds.as_mut_ptr()) } != 0 {
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
         return Err(format!("pipe: {}", std::io::Error::last_os_error()));
     }
     // SAFETY: both descriptors were just created and are owned here.
     let (rd, wr) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
     // SAFETY: called while single-threaded (no session or forwarding threads
     // have been started); the child continues with ordinary Rust code.
-    match unsafe { nix::libc::fork() } {
+    match unsafe { libc::fork() } {
         -1 => Err(format!("fork: {}", std::io::Error::last_os_error())),
         0 => {
             drop(rd);
             // SAFETY: setsid() in the child; failure is harmless.
-            unsafe { nix::libc::setsid() };
+            unsafe { libc::setsid() };
             if let Ok(mut g) = BACKGROUND_READY.lock() {
                 *g = Some(std::fs::File::from(wr));
             }
@@ -4137,9 +4137,9 @@ fn fork_to_background() -> Result<(), String> {
             // The child ended before it was ready: its status is ours.
             let mut status = 0;
             // SAFETY: waiting for our own child.
-            unsafe { nix::libc::waitpid(child, &mut status, 0) };
-            let code = if nix::libc::WIFEXITED(status) {
-                nix::libc::WEXITSTATUS(status)
+            unsafe { libc::waitpid(child, &mut status, 0) };
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
             } else {
                 255
             };
@@ -4272,12 +4272,9 @@ impl Tokens {
     ) -> Self {
         #[cfg(unix)]
         let (uid, pw_home) = {
-            let uid = nix::unistd::getuid();
-            let home = nix::unistd::User::from_uid(uid)
-                .ok()
-                .flatten()
-                .map(|u| u.dir.to_string_lossy().into_owned());
-            (uid.as_raw().to_string(), home)
+            let uid = common::unix_sys::getuid();
+            let home = common::unix_sys::passwd_entry(uid).map(|(_, dir)| dir);
+            (uid.to_string(), home)
         };
         #[cfg(not(unix))]
         let (uid, pw_home) = (String::new(), None::<String>);
@@ -4752,19 +4749,44 @@ fn run_control_command(cmd: &str, path: &std::path::Path, cli: &Cli) -> Result<i
 fn master_pid(sock: &std::os::unix::net::UnixStream) -> Option<i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        nix::sys::socket::getsockopt(sock, nix::sys::socket::sockopt::PeerCredentials)
-            .ok()
-            .map(|c| c.pid())
+        let mut cred: libc::ucred = unsafe { core::mem::zeroed() };
+        peer_sockopt(sock, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred).map(|()| cred.pid)
     }
     #[cfg(target_vendor = "apple")]
     {
-        nix::sys::socket::getsockopt(sock, nix::sys::socket::sockopt::LocalPeerPid).ok()
+        let mut pid: libc::pid_t = 0;
+        peer_sockopt(sock, libc::SOL_LOCAL, libc::LOCAL_PEERPID, &mut pid).map(|()| pid)
     }
     #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     {
         let _ = sock;
         None
     }
+}
+
+/// `getsockopt(level, name)` on `sock` into `out`, which must be the type
+/// the option fills in, whole.
+#[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+fn peer_sockopt<T>(
+    sock: &std::os::unix::net::UnixStream,
+    level: libc::c_int,
+    name: libc::c_int,
+    out: &mut T,
+) -> Option<()> {
+    use std::os::fd::AsRawFd;
+    let mut len = core::mem::size_of::<T>() as libc::socklen_t;
+    // SAFETY: `out` is a valid, writable `T` of `len` bytes for the call;
+    // the caller passes the type the option is defined to fill in.
+    let rc = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            (out as *mut T).cast(),
+            &mut len,
+        )
+    };
+    (rc == 0 && len as usize == core::mem::size_of::<T>()).then_some(())
 }
 
 /// Serve `-L` / `-D` listeners over a live ControlMaster: bind every local
@@ -4937,8 +4959,8 @@ fn run_mux_client(
     // Put the local terminal in raw mode for an interactive PTY session so
     // keystrokes reach the remote unprocessed (mirrors the direct path).
     let _raw_guard = if want_pty {
-        let mut t: nix::libc::termios = unsafe { core::mem::zeroed() };
-        if unsafe { nix::libc::tcgetattr(0, &mut t) } == 0 {
+        let mut t: libc::termios = unsafe { core::mem::zeroed() };
+        if unsafe { libc::tcgetattr(0, &mut t) } == 0 {
             Some(common::TermiosRawGuard::install(&t))
         } else {
             None
@@ -5003,7 +5025,7 @@ where
             && let Some(t) = g.as_ref()
         {
             // SAFETY: restoring a termios captured from fd 0.
-            unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, t) };
+            unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
         }
         std::process::exit(255);
     });
@@ -5338,18 +5360,21 @@ fn daemonize_master(
     cfg: puressh::mux::MasterConfig,
     start_serving: impl FnOnce(&puressh::shared::SharedClient),
 ) -> Result<i32, String> {
-    use nix::unistd::{ForkResult, fork, setsid};
-
     // SAFETY: the binary is outside the library's `forbid(unsafe_code)`. At
     // this point we are still single-threaded (no serve / I/O threads have
     // been spawned yet — `start_serving` and run_master_daemon start them in
     // the child), so fork() does not orphan any locks.
-    match unsafe { fork() }.map_err(|e| format!("ControlPersist: fork failed: {e}"))? {
-        ForkResult::Child => {
+    match unsafe { libc::fork() } {
+        -1 => Err(format!(
+            "ControlPersist: fork failed: {}",
+            std::io::Error::last_os_error()
+        )),
+        0 => {
             // --- Daemon master process ---
             // New session: detach from the controlling terminal so the master
             // is not killed when the launching shell / terminal goes away.
-            let _ = setsid();
+            // SAFETY: setsid(2) has no preconditions.
+            let _ = unsafe { libc::setsid() };
             // An `ssh -f` parent waits on the launcher, not on this daemon.
             if let Ok(mut g) = BACKGROUND_READY.lock() {
                 g.take();
@@ -5370,7 +5395,7 @@ fn daemonize_master(
             };
             std::process::exit(code);
         }
-        ForkResult::Parent { .. } => {
+        _ => {
             // --- Foreground (launcher) process ---
             // We must NOT run Drop on our copy of the connection: the daemon
             // owns the SSH socket now. Leak the handle deliberately. Our
@@ -5418,9 +5443,9 @@ fn detach_stdio() {
         // dup2 over 0/1/2. SAFETY: bin is outside the lib's forbid(unsafe);
         // these are plain POSIX dup2 calls on a valid fd.
         unsafe {
-            nix::libc::dup2(fd, 0);
-            nix::libc::dup2(fd, 1);
-            nix::libc::dup2(fd, 2);
+            libc::dup2(fd, 0);
+            libc::dup2(fd, 1);
+            libc::dup2(fd, 2);
         }
         // `devnull` (and its fd) drops here; the dup'd 0/1/2 stay open.
     }
@@ -5687,7 +5712,7 @@ impl EscapeFilter {
 /// The local terminal settings to restore when ssh exits or suspends from
 /// an escape sequence (set while a raw-mode session runs).
 #[cfg(unix)]
-static ORIGINAL_TERMIOS: std::sync::Mutex<Option<nix::libc::termios>> = std::sync::Mutex::new(None);
+static ORIGINAL_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
 
 /// Carry out an escape action on behalf of the stdin thread, for the
 /// session `channel` of `shared`.
@@ -5707,7 +5732,7 @@ fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClie
                 && let Some(t) = g.as_ref()
             {
                 // SAFETY: restoring a termios captured from fd 0.
-                unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, t) };
+                unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
             }
             eprintln!("{e}.");
             std::process::exit(255);
@@ -5779,15 +5804,15 @@ fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClie
                 // stop signal; the raw settings are read back first so they
                 // can be re-applied on resume.
                 unsafe {
-                    let mut raw: nix::libc::termios = core::mem::zeroed();
-                    let have_raw = nix::libc::tcgetattr(0, &mut raw) == 0;
+                    let mut raw: libc::termios = core::mem::zeroed();
+                    let have_raw = libc::tcgetattr(0, &mut raw) == 0;
                     if let Some(t) = original {
-                        nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &t);
+                        libc::tcsetattr(0, libc::TCSADRAIN, &t);
                     }
                     eprintln!("{e}^Z [suspend ssh]");
-                    nix::libc::raise(nix::libc::SIGTSTP);
+                    libc::raise(libc::SIGTSTP);
                     if have_raw {
-                        nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &raw);
+                        libc::tcsetattr(0, libc::TCSADRAIN, &raw);
                     }
                 }
             }
@@ -5806,7 +5831,7 @@ static SESSION_BINDING: std::sync::OnceLock<puressh::client::SessionBinding> =
 #[cfg(unix)]
 fn forwarded_agent_callback(
     path: PathBuf,
-) -> Arc<dyn Fn(puressh::server::ChannelStream) + Send + Sync + 'static> {
+) -> Arc<dyn Fn(puressh::stream::ChannelStream) + Send + Sync + 'static> {
     Arc::new(move |stream| match puressh::agent::Agent::connect(&path) {
         Ok(mut agent) => {
             if let Some(b) = SESSION_BINDING.get() {
@@ -5827,10 +5852,10 @@ fn escape_command_line() {
     let original = ORIGINAL_TERMIOS.lock().ok().and_then(|g| *g);
     // SAFETY: plain termios calls on fd 0; the raw settings are read back
     // first so they can be re-applied afterwards.
-    let mut raw: nix::libc::termios = unsafe { core::mem::zeroed() };
-    let have_raw = unsafe { nix::libc::tcgetattr(0, &mut raw) } == 0;
+    let mut raw: libc::termios = unsafe { core::mem::zeroed() };
+    let have_raw = unsafe { libc::tcgetattr(0, &mut raw) } == 0;
     if let Some(t) = original {
-        unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &t) };
+        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &t) };
     }
     eprint!("\r\nssh> ");
     let mut line = String::new();
@@ -5838,7 +5863,7 @@ fn escape_command_line() {
         .map(|f| std::io::BufReader::new(f).read_line(&mut line))
         .is_ok();
     if have_raw {
-        unsafe { nix::libc::tcsetattr(0, nix::libc::TCSADRAIN, &raw) };
+        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, &raw) };
     }
     if read {
         for msg in run_command_line(line.trim()) {
@@ -5947,8 +5972,8 @@ fn run_session(
             let (cols, rows, px_w, px_h) = query_window_size();
             let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
             // SAFETY: zero-initialised termios filled by tcgetattr on fd 0.
-            let mut original: nix::libc::termios = unsafe { core::mem::zeroed() };
-            let have = stdin_tty && unsafe { nix::libc::tcgetattr(0, &mut original) } == 0;
+            let mut original: libc::termios = unsafe { core::mem::zeroed() };
+            let have = stdin_tty && unsafe { libc::tcgetattr(0, &mut original) } == 0;
             let mut req = puressh::shared::PtyRequest::new(term, cols, rows);
             req.px_w = px_w;
             req.px_h = px_h;
@@ -6103,15 +6128,12 @@ fn run_session(
     #[cfg(unix)]
     let _t_winch = interactive.then(|| {
         static RESIZED: AtomicBool = AtomicBool::new(false);
-        extern "C" fn on_winch(_sig: nix::libc::c_int) {
+        extern "C" fn on_winch(_sig: libc::c_int) {
             RESIZED.store(true, Ordering::Relaxed);
         }
         // SAFETY: the handler only stores into an AtomicBool.
         unsafe {
-            nix::libc::signal(
-                nix::libc::SIGWINCH,
-                on_winch as *const () as nix::libc::sighandler_t,
-            );
+            libc::signal(libc::SIGWINCH, on_winch as *const () as libc::sighandler_t);
         }
         let s = shared.clone();
         let stop = done.clone();
@@ -6142,8 +6164,8 @@ fn run_session(
 /// ioctl fails.
 #[cfg(unix)]
 fn query_window_size() -> (u32, u32, u32, u32) {
-    let mut ws: nix::libc::winsize = unsafe { core::mem::zeroed() };
-    let ok = unsafe { nix::libc::ioctl(0, nix::libc::TIOCGWINSZ, &mut ws) } == 0;
+    let mut ws: libc::winsize = unsafe { core::mem::zeroed() };
+    let ok = unsafe { libc::ioctl(0, libc::TIOCGWINSZ, &mut ws) } == 0;
     if ok {
         (
             ws.ws_col as u32,
@@ -6386,13 +6408,13 @@ fn connect_bound(
         })?;
 
     let domain = if addr.is_ipv4() {
-        nix::libc::AF_INET
+        libc::AF_INET
     } else {
-        nix::libc::AF_INET6
+        libc::AF_INET6
     };
     // SAFETY: standard socket(2) call; fd ownership transferred to TcpStream
     // via from_raw_fd below (or closed on the error paths).
-    let fd = unsafe { nix::libc::socket(domain, nix::libc::SOCK_STREAM, 0) };
+    let fd = unsafe { libc::socket(domain, libc::SOCK_STREAM, 0) };
     if fd < 0 {
         return Err(IoError::last_os_error());
     }
@@ -6401,13 +6423,7 @@ fn connect_bound(
 
     let (bind_storage, bind_len) = sockaddr_bytes(&bind_addr);
     // SAFETY: bind_storage/len describe a valid sockaddr for this fd's family.
-    let rc = unsafe {
-        nix::libc::bind(
-            fd,
-            bind_storage.as_ptr() as *const nix::libc::sockaddr,
-            bind_len,
-        )
-    };
+    let rc = unsafe { libc::bind(fd, bind_storage.as_ptr() as *const libc::sockaddr, bind_len) };
     if rc != 0 {
         let e = IoError::last_os_error();
         return Err(IoError::new(e.kind(), format!("bind {bind_addr}: {e}")));
@@ -6416,9 +6432,9 @@ fn connect_bound(
     let (target_storage, target_len) = sockaddr_bytes(&addr);
     // SAFETY: same contract as bind; connect blocks (no timeout fd dance).
     let rc = unsafe {
-        nix::libc::connect(
+        libc::connect(
             fd,
-            target_storage.as_ptr() as *const nix::libc::sockaddr,
+            target_storage.as_ptr() as *const libc::sockaddr,
             target_len,
         )
     };
@@ -6449,33 +6465,33 @@ fn connect_bound(
 /// Encode a `SocketAddr` into a `sockaddr_storage` byte buffer + length for
 /// the raw libc `bind`/`connect` calls.
 #[cfg(unix)]
-fn sockaddr_bytes(addr: &std::net::SocketAddr) -> (Vec<u8>, nix::libc::socklen_t) {
+fn sockaddr_bytes(addr: &std::net::SocketAddr) -> (Vec<u8>, libc::socklen_t) {
     match addr {
         std::net::SocketAddr::V4(v4) => {
-            let mut sa: nix::libc::sockaddr_in = unsafe { core::mem::zeroed() };
-            sa.sin_family = nix::libc::AF_INET as nix::libc::sa_family_t;
+            let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
             sa.sin_port = v4.port().to_be();
             sa.sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
-            let len = core::mem::size_of::<nix::libc::sockaddr_in>() as nix::libc::socklen_t;
+            let len = core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     &sa as *const _ as *const u8,
-                    core::mem::size_of::<nix::libc::sockaddr_in>(),
+                    core::mem::size_of::<libc::sockaddr_in>(),
                 )
                 .to_vec()
             };
             (bytes, len)
         }
         std::net::SocketAddr::V6(v6) => {
-            let mut sa: nix::libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
-            sa.sin6_family = nix::libc::AF_INET6 as nix::libc::sa_family_t;
+            let mut sa: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sa.sin6_port = v6.port().to_be();
             sa.sin6_addr.s6_addr = v6.ip().octets();
-            let len = core::mem::size_of::<nix::libc::sockaddr_in6>() as nix::libc::socklen_t;
+            let len = core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t;
             let bytes = unsafe {
                 core::slice::from_raw_parts(
                     &sa as *const _ as *const u8,
-                    core::mem::size_of::<nix::libc::sockaddr_in6>(),
+                    core::mem::size_of::<libc::sockaddr_in6>(),
                 )
                 .to_vec()
             };
@@ -6489,15 +6505,15 @@ fn sockaddr_bytes(addr: &std::net::SocketAddr) -> (Vec<u8>, nix::libc::socklen_t
 #[cfg(unix)]
 fn set_so_keepalive(sock: &TcpStream, on: bool) -> Result<(), String> {
     use std::os::unix::io::AsRawFd;
-    let val: nix::libc::c_int = if on { 1 } else { 0 };
+    let val: libc::c_int = if on { 1 } else { 0 };
     // SAFETY: standard setsockopt on a valid fd with a correctly-sized int.
     let rc = unsafe {
-        nix::libc::setsockopt(
+        libc::setsockopt(
             sock.as_raw_fd(),
-            nix::libc::SOL_SOCKET,
-            nix::libc::SO_KEEPALIVE,
-            &val as *const _ as *const nix::libc::c_void,
-            core::mem::size_of::<nix::libc::c_int>() as nix::libc::socklen_t,
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            &val as *const _ as *const libc::c_void,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
         )
     };
     if rc != 0 {

@@ -27,7 +27,9 @@
 //! `$DISPLAY` (see [`crate::client::ClientHandlers::on_x11`]).
 
 use std::io::{ErrorKind, Read};
-use std::net::{Shutdown, TcpStream};
+#[cfg(feature = "server")]
+use std::net::Shutdown;
+use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;

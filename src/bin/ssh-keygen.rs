@@ -25,6 +25,10 @@ use std::fs;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
+
+#[cfg(unix)]
+#[path = "unix_sys.rs"]
+mod unix_sys;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -1048,10 +1052,7 @@ fn run_fingerprint(args: &Args) -> Result<i32, String> {
 /// `user@host`, the default key comment and RFC 4716 "converted by".
 fn user_at_host() -> String {
     #[cfg(unix)]
-    let pw = nix::unistd::User::from_uid(nix::unistd::getuid())
-        .ok()
-        .flatten()
-        .map(|u| u.name);
+    let pw = unix_sys::passwd_entry(unix_sys::getuid()).map(|(name, _)| name);
     #[cfg(not(unix))]
     let pw: Option<String> = None;
     let user = pw

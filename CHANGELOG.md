@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/KarpelesLab/puressh/compare/v0.1.11...v0.2.0) - 2026-10-18
+
+### Added
+
+- [**breaking**] `server`, `pam` and `agent` are no longer default features
+- [**breaking**] nix only with the `server` and new `agent` features
+- *(shared)* read outside the connection lock through a split-off transport reader
+
+### Other
+
+- *(deps)* drop zeroize, use purecrypto::zeroize
+- client-side library code no longer calls nix
+
 ## [0.1.11](https://github.com/KarpelesLab/puressh/compare/v0.1.10...v0.1.11) - 2026-10-17
 
 ### Other

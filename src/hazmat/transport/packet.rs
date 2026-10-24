@@ -603,15 +603,31 @@ fn decode_stream(
         first_block[2],
         first_block[3],
     ]);
-    if packet_length > MAX_PACKET_LEN {
-        return Err(Error::Protocol("packet length exceeds limit"));
-    }
     let body_len = packet_length as usize;
-    if !(4 + body_len).is_multiple_of(block_size) {
-        return Err(Error::Protocol("packet not block-aligned"));
-    }
-    if 4 + body_len < MIN_TOTAL_LEN {
-        return Err(Error::Protocol("packet too short"));
+    let length_err = if packet_length > MAX_PACKET_LEN {
+        Some("packet length exceeds limit")
+    } else if !(4 + body_len).is_multiple_of(block_size) {
+        Some("packet not block-aligned")
+    } else if 4 + body_len < MIN_TOTAL_LEN {
+        Some("packet too short")
+    } else {
+        None
+    };
+    if let Some(msg) = length_err {
+        // CBC with encrypt-and-MAC: failing at once on a bad decrypted
+        // length is a plaintext-recovery oracle (CVE-2008-5161). Like
+        // OpenSSH, keep reading until MAX_PACKET_LEN bytes have arrived and
+        // only then fail, as a MAC error, so the bad length looks like any
+        // other forged packet. The first block stays cached, so each call
+        // lands here again without touching the CBC state.
+        if matches!(cipher, SshCipher::Cbc(_)) {
+            if buf.len() < MAX_PACKET_LEN as usize {
+                *pending = Some(first_block);
+                return Ok(None);
+            }
+            return Err(Error::BadMac);
+        }
+        return Err(Error::Protocol(msg));
     }
     let total = 4 + body_len + tag_len;
     if buf.len() < total {
@@ -1029,6 +1045,24 @@ mod tests {
         frame.extend_from_slice(&[0u8; 8]);
         let mut codec = PacketCodec::new();
         assert!(matches!(codec.decode(&frame), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn cbc_eam_bad_length_is_not_an_early_oracle() {
+        // CVE-2008-5161: a forged CBC block whose decrypted length is bad
+        // must not fail any sooner than MAX_PACKET_LEN bytes, and then only
+        // as a MAC failure.
+        let cipher = cipher_by_name("aes256-cbc", &[0x11u8; 32], &[0x22u8; 16])
+            .unwrap()
+            .unwrap();
+        let mac = mac_by_name("hmac-sha2-256", &[0x55u8; 32]).unwrap();
+        let mut b = PacketCodec::new();
+        b.install_inbound(cipher, Some(mac)).unwrap();
+        let wire = vec![0u8; MAX_PACKET_LEN as usize];
+        for cut in [16usize, 17, 4096, MAX_PACKET_LEN as usize - 1] {
+            assert!(b.decode(&wire[..cut]).unwrap().is_none(), "cut={cut}");
+        }
+        assert!(matches!(b.decode(&wire), Err(Error::BadMac)));
     }
 
     #[test]

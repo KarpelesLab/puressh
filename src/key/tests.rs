@@ -1047,3 +1047,21 @@ fn encrypted_pem_and_pkcs8_roundtrip() {
         ));
     }
 }
+
+#[test]
+fn wipe_clears_the_secret_half() {
+    let mut rsa = PrivateKey::parse_openssh_pem(RSA_PEM_UNENCRYPTED, None).unwrap();
+    let public = rsa.public_key();
+    rsa.wipe();
+    let PrivateKey::Rsa { d, p, q, iqmp, .. } = &rsa else {
+        panic!("not RSA");
+    };
+    assert!(d.is_empty() && p.is_empty() && q.is_empty() && iqmp.is_empty());
+    assert_eq!(rsa.public_key(), public);
+    let mut ed = PrivateKey::parse_openssh_pem(ED25519_PEM_UNENCRYPTED, None).unwrap();
+    ed.wipe();
+    let PrivateKey::Ed25519 { seed, .. } = &ed else {
+        panic!("not ed25519");
+    };
+    assert_eq!(seed, &[0u8; 32]);
+}

@@ -39,6 +39,13 @@ struct Held {
     dest: Vec<DestConstraint>,
 }
 
+impl Drop for Held {
+    /// Removed, expired or dropped with the agent: wipe the key.
+    fn drop(&mut self) {
+        self.key.wipe();
+    }
+}
+
 /// One hop of a destination constraint: a user pattern, a host name and
 /// its host (or CA) keys.
 #[derive(Debug, Default)]

@@ -16,6 +16,7 @@ use purecrypto::der::{
 };
 
 use purecrypto::rng::{CryptoRng, RngCore};
+use purecrypto::zeroize::Zeroizing;
 
 use super::{PrivateKey, PublicKey};
 use crate::error::{Error, Result};
@@ -40,6 +41,21 @@ fn seq(parts: &[&[u8]]) -> Vec<u8> {
     encode_sequence(&parts.concat())
 }
 
+/// [`seq`] over secret parts: the parts (taken as encoded), their
+/// concatenation and the result are all wiped on drop.
+fn secret_seq(parts: &[Zeroizing<Vec<u8>>]) -> Zeroizing<Vec<u8>> {
+    let mut body = Zeroizing::new(Vec::with_capacity(parts.iter().map(|p| p.len()).sum()));
+    for part in parts {
+        body.extend_from_slice(part);
+    }
+    Zeroizing::new(encode_sequence(&body))
+}
+
+/// A secret-bearing DER encoding, wiped on drop.
+fn secret(der: Vec<u8>) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(der)
+}
+
 fn curve_oid(pk: &PrivateKey) -> Option<(&'static [u64], usize)> {
     match pk {
         PrivateKey::EcdsaP256 { .. } => Some((OID_P256, 32)),
@@ -50,18 +66,18 @@ fn curve_oid(pk: &PrivateKey) -> Option<(&'static [u64], usize)> {
 }
 
 /// `d mod (p - 1)` and `d mod (q - 1)`, the PKCS#1 CRT exponents.
-fn crt_exponents(d: &[u8], p: &[u8], q: &[u8]) -> (Vec<u8>, Vec<u8>) {
+fn crt_exponents(d: &[u8], p: &[u8], q: &[u8]) -> (Zeroizing<Vec<u8>>, Zeroizing<Vec<u8>>) {
     let d = BoxedUint::from_be_bytes(trim(d));
     let one = BoxedUint::from_be_bytes(&[1]);
     let reduce = |prime: &[u8]| {
         let m = BoxedUint::from_be_bytes(trim(prime)).sub(&one);
-        d.reduce(&m).to_be_bytes(prime.len())
+        Zeroizing::new(d.reduce(&m).to_be_bytes(prime.len()))
     };
     (reduce(p), reduce(q))
 }
 
 impl PrivateKey {
-    fn pkcs1_der(&self) -> Result<Vec<u8>> {
+    fn pkcs1_der(&self) -> Result<Zeroizing<Vec<u8>>> {
         let PrivateKey::Rsa {
             n,
             e,
@@ -78,22 +94,22 @@ impl PrivateKey {
             return Err(Error::Unsupported("RSA key without its primes"));
         }
         let (dp, dq) = crt_exponents(d, p, q);
-        Ok(seq(&[
-            &encode_integer(&[0]),
-            &encode_integer(n),
-            &encode_integer(e),
-            &encode_integer(d),
-            &encode_integer(p),
-            &encode_integer(q),
-            &encode_integer(&dp),
-            &encode_integer(&dq),
-            &encode_integer(iqmp),
+        Ok(secret_seq(&[
+            secret(encode_integer(&[0])),
+            secret(encode_integer(n)),
+            secret(encode_integer(e)),
+            secret(encode_integer(d)),
+            secret(encode_integer(p)),
+            secret(encode_integer(q)),
+            secret(encode_integer(&dp)),
+            secret(encode_integer(&dq)),
+            secret(encode_integer(iqmp)),
         ]))
     }
 
     /// SEC1 `ECPrivateKey`; `with_params` adds the curve (the standalone
     /// form does, the PKCS#8-wrapped one does not).
-    fn sec1_der(&self, with_params: bool) -> Result<Vec<u8>> {
+    fn sec1_der(&self, with_params: bool) -> Result<Zeroizing<Vec<u8>>> {
         let (d, point) = match self {
             PrivateKey::EcdsaP256 { d, point, .. }
             | PrivateKey::EcdsaP384 { d, point, .. }
@@ -105,14 +121,18 @@ impl PrivateKey {
         if d.len() > len {
             return Err(Error::Format("ECDSA scalar too long"));
         }
-        let mut scalar = alloc::vec![0u8; len - d.len()];
+        let mut scalar = Zeroizing::new(Vec::with_capacity(len));
+        scalar.resize(len - d.len(), 0);
         scalar.extend_from_slice(d);
-        let mut body = [encode_integer(&[1]), encode_octet_string(&scalar)].concat();
+        let mut parts = alloc::vec![
+            secret(encode_integer(&[1])),
+            secret(encode_octet_string(&scalar)),
+        ];
         if with_params {
-            body.extend(encode_context(0, &oid(curve)));
+            parts.push(secret(encode_context(0, &oid(curve))));
         }
-        body.extend(encode_context(1, &encode_bit_string(point)));
-        Ok(encode_sequence(&body))
+        parts.push(secret(encode_context(1, &encode_bit_string(point))));
+        Ok(secret_seq(&parts))
     }
 
     /// OpenSSH's `-m PEM`: PKCS#1 `RSA PRIVATE KEY` or SEC1 `EC PRIVATE
@@ -165,11 +185,11 @@ impl PrivateKey {
     }
 
     /// The PKCS#8 `PrivateKeyInfo` DER.
-    fn pkcs8_der(&self) -> Result<Vec<u8>> {
+    fn pkcs8_der(&self) -> Result<Zeroizing<Vec<u8>>> {
         let (alg, inner) = match self {
             PrivateKey::Rsa { .. } => (seq(&[&oid(OID_RSA), &encode_null()]), self.pkcs1_der()?),
             PrivateKey::Ed25519 { seed, .. } => {
-                (seq(&[&oid(OID_ED25519)]), encode_octet_string(seed))
+                (seq(&[&oid(OID_ED25519)]), secret(encode_octet_string(seed)))
             }
             _ => {
                 let (curve, _) = curve_oid(self).expect("ECDSA");
@@ -179,10 +199,10 @@ impl PrivateKey {
                 )
             }
         };
-        Ok(seq(&[
-            &encode_integer(&[0]),
-            &alg,
-            &encode_octet_string(&inner),
+        Ok(secret_seq(&[
+            secret(encode_integer(&[0])),
+            secret(alg),
+            secret(encode_octet_string(&inner)),
         ]))
     }
 }

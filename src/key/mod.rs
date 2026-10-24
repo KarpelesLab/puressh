@@ -21,7 +21,7 @@ use purecrypto::bignum::BoxedUint;
 use purecrypto::cipher::{Aes128, Aes256, Ctr};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey};
 use purecrypto::kdf::bcrypt_pbkdf;
-use purecrypto::zeroize::Zeroizing;
+use purecrypto::zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
@@ -781,26 +781,7 @@ impl PrivateKey {
     ///
     /// For RSA keys, defaults to `rsa-sha2-512` (modern OpenSSH preference).
     pub fn into_host_key(self) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send>> {
-        match self {
-            PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::Ed25519HostKey::from_seed(seed),
-            )),
-            PrivateKey::EcdsaP256 { d, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::EcdsaP256HostKey::from_scalar(&d)?,
-            )),
-            PrivateKey::EcdsaP384 { d, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::EcdsaP384HostKey::from_scalar(&d)?,
-            )),
-            PrivateKey::EcdsaP521 { d, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::EcdsaP521HostKey::from_scalar(&d)?,
-            )),
-            PrivateKey::Rsa { n, e, d, p, q, .. } => {
-                Ok(alloc::boxed::Box::new(rsa_host_key(&n, &e, &d, &p, &q)?))
-            }
-            PrivateKey::MlDsa44Ed25519 { seeds, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::MlDsa44Ed25519HostKey::from_seeds(seeds),
-            )),
-        }
+        Ok(self.into_host_key_sync()?)
     }
 
     /// Like [`Self::into_host_key`], but returns a `Send + Sync` signer. The
@@ -809,27 +790,58 @@ impl PrivateKey {
     /// it exists for callers (the server's `Config.host_keys`, a `CertHostKey`
     /// inner) that require `Sync`.
     pub fn into_host_key_sync(
-        self,
+        mut self,
     ) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send + Sync>> {
+        let signer = self.host_key();
+        // The signer holds its own copy; wipe this one rather than leave it
+        // in freed memory.
+        self.wipe();
+        signer
+    }
+
+    /// The signer for this key (`rsa-sha2-512` for RSA), built from a
+    /// borrow so the key need not be cloned.
+    fn host_key(&self) -> Result<alloc::boxed::Box<dyn crate::hostkey::HostKey + Send + Sync>> {
         match self {
             PrivateKey::Ed25519 { seed, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::Ed25519HostKey::from_seed(seed),
+                crate::hostkey::Ed25519HostKey::from_seed(*seed),
             )),
             PrivateKey::EcdsaP256 { d, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::EcdsaP256HostKey::from_scalar(&d)?,
+                crate::hostkey::EcdsaP256HostKey::from_scalar(d)?,
             )),
             PrivateKey::EcdsaP384 { d, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::EcdsaP384HostKey::from_scalar(&d)?,
+                crate::hostkey::EcdsaP384HostKey::from_scalar(d)?,
             )),
             PrivateKey::EcdsaP521 { d, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::EcdsaP521HostKey::from_scalar(&d)?,
+                crate::hostkey::EcdsaP521HostKey::from_scalar(d)?,
             )),
             PrivateKey::Rsa { n, e, d, p, q, .. } => {
-                Ok(alloc::boxed::Box::new(rsa_host_key(&n, &e, &d, &p, &q)?))
+                Ok(alloc::boxed::Box::new(rsa_host_key(n, e, d, p, q)?))
             }
             PrivateKey::MlDsa44Ed25519 { seeds, .. } => Ok(alloc::boxed::Box::new(
-                crate::hostkey::MlDsa44Ed25519HostKey::from_seeds(seeds),
+                crate::hostkey::MlDsa44Ed25519HostKey::from_seeds(*seeds),
             )),
+        }
+    }
+
+    /// Overwrite the secret half (seed, scalar, RSA private components)
+    /// with zeros, for a key about to be dropped. The key is unusable after.
+    /// `PrivateKey` has no zeroizing `Drop` (it would forbid moving its
+    /// fields out, which its public variants allow), so holders that
+    /// outlive a short scope call this.
+    pub(crate) fn wipe(&mut self) {
+        match self {
+            PrivateKey::Ed25519 { seed, .. } => seed.zeroize(),
+            PrivateKey::EcdsaP256 { d, .. }
+            | PrivateKey::EcdsaP384 { d, .. }
+            | PrivateKey::EcdsaP521 { d, .. } => d.zeroize(),
+            PrivateKey::Rsa { d, p, q, iqmp, .. } => {
+                d.zeroize();
+                p.zeroize();
+                q.zeroize();
+                iqmp.zeroize();
+            }
+            PrivateKey::MlDsa44Ed25519 { seeds, .. } => seeds.zeroize(),
         }
     }
 
@@ -1053,7 +1065,7 @@ impl PrivateKey {
         flags: u32,
     ) -> Result<Box<dyn crate::hostkey::HostKey + Send>> {
         let PrivateKey::Rsa { n, e, d, p, q, .. } = self else {
-            return self.clone().into_host_key();
+            return Ok(self.host_key()?);
         };
         let num = |b: &[u8]| BoxedUint::from_be_bytes(trim_leading_zeros(b));
         let primes = rsa_has_primes(p, q);

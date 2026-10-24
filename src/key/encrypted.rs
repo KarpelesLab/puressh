@@ -88,13 +88,13 @@ fn key_len(cipher: &str) -> Option<usize> {
 /// OpenSSL's `EVP_BytesToKey` with MD5 and one iteration (traditional PEM).
 fn bytes_to_key(pass: &[u8], salt: &[u8], len: usize) -> Zeroizing<Vec<u8>> {
     let mut out = Zeroizing::new(Vec::with_capacity(len + 16));
-    let mut prev: Vec<u8> = Vec::new();
+    let mut prev: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     while out.len() < len {
         let mut h = Md5::new();
         h.update(&prev);
         h.update(pass);
         h.update(salt);
-        prev = h.finalize().as_ref().to_vec();
+        prev = Zeroizing::new(h.finalize().as_ref().to_vec());
         out.extend_from_slice(&prev);
     }
     out.truncate(len);

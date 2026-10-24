@@ -18,6 +18,46 @@ no `unsafe` in the library itself (the optional `ffi` feature is the only place
 > tokio, and mio frontends share one sans-I/O core. The crate is `0.0.x`; the
 > public API may still change before 1.0.
 
+## Install
+
+### Ubuntu (apt)
+
+A signed apt repository is published for 20.04, 22.04 and 24.04 (amd64 and
+arm64). `puressh-server` is a drop-in replacement for `openssh-server`;
+`puressh-client` installs the client programs alongside OpenSSH's.
+
+```sh
+curl -fsSL https://karpeleslab.github.io/puressh/puressh-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/puressh.gpg
+echo "deb [signed-by=/usr/share/keyrings/puressh.gpg] https://karpeleslab.github.io/puressh $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/puressh.list
+sudo apt update
+sudo apt install puressh-server   # or: puressh-client
+```
+
+Installing `puressh-server` removes `openssh-server` but keeps
+`/etc/ssh/sshd_config` and the host keys; `sudo apt install openssh-server`
+switches back. See [`packaging/apt/README.md`](packaging/apt/README.md) for how
+the repository is built.
+
+### Other platforms
+
+Prebuilt `ssh` / `sshd` (and the C library) for Linux, macOS and Windows are
+attached to each [GitHub release](https://github.com/KarpelesLab/puressh/releases).
+
+### From source
+
+```sh
+cargo install puressh --features server,agent   # CLI binaries
+```
+
+Or add the library to a project:
+
+```sh
+cargo add puressh                 # client library (default)
+cargo add puressh --features server
+```
+
 ## What's in the box
 
 - **Library** — a sans-I/O protocol core (the `driver` state machines) plus

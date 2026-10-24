@@ -4279,7 +4279,8 @@ mod imp {
             };
             AttemptNote {
                 method,
-                user: user.clone(),
+                // Peer-controlled and only ever logged: cap it.
+                user: sanitize_log(user),
                 probe,
                 key,
             }
@@ -4313,7 +4314,7 @@ mod imp {
                 format!(
                     ": {}-CERT {fp} ID {} (serial {}) CA {} {ca_fp}",
                     label(&kind),
-                    ci.key_id,
+                    sanitize_log(&ci.key_id),
                     ci.serial,
                     label(&ca_kind)
                 )
@@ -4589,7 +4590,7 @@ mod imp {
         fn evaluate_interactive(&mut self, user: &str, responses: Vec<String>) -> AuthDecision {
             let note = AttemptNote {
                 method: "keyboard-interactive/pam",
-                user: user.to_string(),
+                user: sanitize_log(user),
                 probe: false,
                 key: String::new(),
             };
@@ -4656,7 +4657,9 @@ mod imp {
                 if !valid {
                     INVALID_USER.store(true, Ordering::Relaxed);
                 }
-                sshd_log::conn_user(user, valid);
+                // Log-only copy: capped and control-free (the name is the
+                // peer's, possibly over USERNAME_MAX and already refused).
+                sshd_log::conn_user(&sanitize_log(user), valid);
             }
             // Match-block access policy for this (user, peer, local socket):
             // AllowUsers/DenyUsers/AllowGroups/DenyGroups, PermitRootLogin,

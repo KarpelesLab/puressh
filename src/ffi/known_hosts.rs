@@ -333,6 +333,10 @@ pub unsafe extern "C" fn pcssh_known_hosts_lookup(
 /// Append a new entry. If `hash_host != 0`, the host pattern is stored
 /// as an HMAC-SHA1 hash (OpenSSH's `HashKnownHosts yes`).
 ///
+/// A `host` or `algorithm` that cannot be written as one well-formed line
+/// (whitespace / control characters, `,`, or a leading `@`, `|` or `#`) is
+/// refused with `PCSSH_ERR_INVALID_ARGUMENT`; nothing is added.
+///
 /// # Safety
 ///
 /// - `kh` must be a valid handle.
@@ -370,8 +374,10 @@ pub unsafe extern "C" fn pcssh_known_hosts_add(
                 Ok(g) => g,
                 Err(_) => return PCSSH_ERR_GENERIC,
             };
-            g.add(host_s, port, alg_s, blob, hash_host != 0);
-            PCSSH_OK
+            match g.try_add(host_s, port, alg_s, blob, hash_host != 0) {
+                Ok(()) => PCSSH_OK,
+                Err(_) => PCSSH_ERR_INVALID_ARGUMENT,
+            }
         })
         .unwrap_or(PCSSH_ERR_INVALID_ARGUMENT)
     })
@@ -690,6 +696,33 @@ mod tests {
         };
         assert_eq!(rc, PCSSH_OK);
         assert_eq!(r, PCSSH_KH_MATCH);
+        // SAFETY: handle valid.
+        unsafe { pcssh_known_hosts_free(h) };
+    }
+
+    #[test]
+    fn add_refuses_line_injection() {
+        let mut h: *mut PcSshKnownHosts = ptr::null_mut();
+        // SAFETY: well-formed inputs.
+        unsafe { pcssh_known_hosts_new(&mut h) };
+        let host = CString::new("example.com").unwrap();
+        let alg = CString::new("ssh-ed25519\n* ssh-ed25519 AAAA").unwrap();
+        let blob = [9u8, 8, 7, 6];
+        // SAFETY: handle valid, strings NUL-terminated.
+        let rc = unsafe {
+            pcssh_known_hosts_add(
+                h,
+                host.as_ptr(),
+                22,
+                alg.as_ptr(),
+                blob.as_ptr(),
+                blob.len(),
+                0,
+            )
+        };
+        assert_eq!(rc, PCSSH_ERR_INVALID_ARGUMENT);
+        // SAFETY: handle valid.
+        assert!(unsafe { &*h }.inner.lock().unwrap().to_bytes().is_empty());
         // SAFETY: handle valid.
         unsafe { pcssh_known_hosts_free(h) };
     }

@@ -682,6 +682,48 @@ fn host_keys_update_plans_new_and_obsolete_keys() {
     assert!(kh.host_keys_update("h", 22, &[c]).blocked.is_some());
 }
 
+/// `add` / `try_add` refuse a key type or host that would not stay a single
+/// well-formed field: a `\n` in a server-chosen key type used to inject a
+/// wildcard line trusting an attacker key for every host.
+#[test]
+fn add_refuses_fields_that_would_inject_lines() {
+    let mut kh = KnownHosts::new();
+    kh.add("victim.example", 22, "ssh-ed25519", &ed25519_blob(1), false);
+    let evil = "ssh-ed25519 AAAA\n* ssh-ed25519 YXR0YWNrZXJrZXk=\n#";
+    kh.add("malicious.example", 22, evil, b"whatever", false);
+    for (host, key_type) in [
+        ("h", "ssh-ed25519\r"),
+        ("h", "ssh-ed25519 x"),
+        ("h", "ssh-ed25519,ssh-rsa"),
+        ("h", "@cert-authority"),
+        ("h", "#c"),
+        ("h", ""),
+        ("a\nb", "ssh-ed25519"),
+        ("a b", "ssh-ed25519"),
+        ("a,*", "ssh-ed25519"),
+        ("@revoked", "ssh-ed25519"),
+        ("|1|x", "ssh-ed25519"),
+        ("#x", "ssh-ed25519"),
+        ("", "ssh-ed25519"),
+    ] {
+        assert!(
+            kh.try_add(host, 22, key_type, &ed25519_blob(2), false)
+                .is_err(),
+            "{host:?} {key_type:?}"
+        );
+    }
+    let out = kh.to_bytes();
+    assert_eq!(out.iter().filter(|&&b| b == b'\n').count(), 1);
+    let reloaded = KnownHosts::from_bytes(&out);
+    assert!(matches!(
+        reloaded.lookup("victim.example", 22, "ssh-ed25519", b"attackerkey"),
+        LookupResult::Mismatch { .. }
+    ));
+    // IPv6 / non-default port and hashing still work.
+    kh.try_add("2001:db8::1", 2222, "ssh-ed25519", &ed25519_blob(3), true)
+        .unwrap();
+}
+
 /// A non-UTF-8 line (e.g. a Latin-1 comment) survives load → save
 /// byte-for-byte, and an `@revoked` one keeps revoking its key.
 #[test]

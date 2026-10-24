@@ -375,7 +375,37 @@ impl KnownHosts {
     /// If `hashed` is true, the host field is HMAC-SHA1-hashed (with a
     /// freshly generated salt) before storage — matching OpenSSH's
     /// `HashKnownHosts yes` behaviour.
+    ///
+    /// A `host` or `key_type` that could not be written as a single,
+    /// well-formed line (see [`Self::try_add`]) is refused: nothing is
+    /// added.
     pub fn add(&mut self, host: &str, port: u16, key_type: &str, key_blob: &[u8], hashed: bool) {
+        let _ = self.try_add(host, port, key_type, key_blob, hashed);
+    }
+
+    /// [`Self::add`], reporting a refused entry as an error.
+    ///
+    /// Both strings land verbatim in a whitespace-separated line, so a
+    /// `key_type` or `host` holding whitespace or control characters (a
+    /// `\n` would inject whole extra lines, e.g. a wildcard key or an
+    /// `@cert-authority` marker), a `key_type` holding `,`, a `host`
+    /// holding `,` (which would widen the pattern list), or either one
+    /// starting with `@`, `|` or `#` (a marker, hashed host or comment) is
+    /// rejected with [`crate::Error::Format`] and nothing is added.
+    pub fn try_add(
+        &mut self,
+        host: &str,
+        port: u16,
+        key_type: &str,
+        key_blob: &[u8],
+        hashed: bool,
+    ) -> crate::Result<()> {
+        if !safe_field(key_type) {
+            return Err(crate::Error::Format("known_hosts: invalid key type"));
+        }
+        if !safe_field(host) {
+            return Err(crate::Error::Format("known_hosts: invalid host name"));
+        }
         let host_spec = if hashed {
             let mut rng = OsRng;
             let (_salt, token) = hash_new(&mut rng, host, port);
@@ -390,6 +420,7 @@ impl KnownHosts {
             key_blob: key_blob.to_vec(),
             comment: String::new(),
         }));
+        Ok(())
     }
 
     /// Remove only the plain entries that name **exactly** `host[:port]`:
@@ -609,6 +640,18 @@ impl KnownHosts {
             self.add(host, port, key_type, blob, hashed);
         }
     }
+}
+
+/// Whether `s` can be written as one field of a `known_hosts` line by
+/// [`KnownHosts::try_add`]: non-empty, no whitespace, control characters or
+/// `,`, and not starting with `@` (marker), `|` (hashed host) or `#`
+/// (comment).
+fn safe_field(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with(['@', '|', '#'])
+        && !s
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == ',')
 }
 
 /// Write `data` to `path` with permissions `0o600` on Unix. The file is

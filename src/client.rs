@@ -4028,6 +4028,13 @@ pub(crate) fn build_verifier(
         .negotiated()
         .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;
 
+    // Parse `K_S` as a key (or certificate) of the negotiated host-key
+    // algorithm *before* any known_hosts lookup, prompt or save. Everything
+    // below — and above all the type string written to known_hosts on a
+    // TOFU / accepted-change add — then describes a well-formed key of the
+    // family the KEX agreed on, never raw attacker-chosen bytes.
+    let verifier = host_key_verify_by_name(&neg.host_key, k_s)?;
+
     // Certificate host keys: `k_s` is an OpenSSH certificate, not a plain key.
     // Parse it, enforce type/validity/critical-options, then make the trust
     // decision per policy. The signature over `H` is verified against the
@@ -4131,12 +4138,11 @@ pub(crate) fn build_verifier(
         // Build the exchange-hash verifier from the cert's embedded key, keyed
         // on the negotiated cert name (which pins the RSA hash).
         if plain_from_cert.is_none() {
-            return host_key_verify_by_name(&neg.host_key, k_s);
+            return Ok(verifier);
         }
     }
     // The key known_hosts is checked for: the host key, or the key a
     // certificate from an unlisted CA certifies.
-    let host_k_s = k_s;
     let k_s: &[u8] = plain_from_cert.as_deref().unwrap_or(k_s);
 
     match policy {
@@ -4150,12 +4156,13 @@ pub(crate) fn build_verifier(
         HostKeyPolicy::KnownHosts(kh) => {
             let from_command = command_hosts(k_s);
             // known_hosts records the key's type (`ssh-rsa`), not the
-            // signature algorithm negotiated for it (`rsa-sha2-512`).
-            let key_type: String = crate::format::Reader::new(k_s)
-                .read_string()
-                .ok()
-                .and_then(|t| core::str::from_utf8(t).ok())
-                .map_or_else(|| neg.host_key.clone(), str::to_string);
+            // signature algorithm negotiated for it (`rsa-sha2-512`). Derive
+            // it from the negotiated name — the blob was already parsed as
+            // that family above — and insist the blob agrees.
+            let key_type = known_hosts_key_type(&neg.host_key).to_string();
+            if crate::format::Reader::new(k_s).read_string().ok() != Some(key_type.as_bytes()) {
+                return Err(Error::HostKeyRejected);
+            }
             // Host-empty / port-zero already rejected above. Past this
             // point we have a real (host, port) pair, so the lookup can
             // proceed. `HostKeyAlias` replaces both for the lookup.
@@ -4278,7 +4285,9 @@ pub(crate) fn build_verifier(
                         // single host's key rotation — the broad
                         // `remove` would silently delete them.
                         let _ = store.remove_exact(target_host, target_port);
-                        store.add(target_host, target_port, &key_type, k_s, kh.hash_new);
+                        store
+                            .try_add(target_host, target_port, &key_type, k_s, kh.hash_new)
+                            .map_err(|_| Error::HostKeyRejected)?;
                         if let Some(path) = &kh.save_path {
                             save_known_hosts(&store, path);
                         }
@@ -4318,7 +4327,9 @@ pub(crate) fn build_verifier(
                     if !accept {
                         return Err(Error::HostKeyRejected);
                     }
-                    store.add(target_host, target_port, &key_type, k_s, kh.hash_new);
+                    store
+                        .try_add(target_host, target_port, &key_type, k_s, kh.hash_new)
+                        .map_err(|_| Error::HostKeyRejected)?;
                     if let Some(path) = &kh.save_path {
                         save_known_hosts(&store, path);
                     }
@@ -4327,7 +4338,17 @@ pub(crate) fn build_verifier(
         }
     }
 
-    host_key_verify_by_name(&neg.host_key, host_k_s)
+    Ok(verifier)
+}
+
+/// The key type a `known_hosts` line records for a host key negotiated as
+/// `alg`: the plain key name, with certificate names mapped to the key they
+/// embed and RSA signature algorithms (`rsa-sha2-*`) to `ssh-rsa`.
+fn known_hosts_key_type(alg: &str) -> &str {
+    match crate::cert::cert_name_to_plain(alg).unwrap_or(alg) {
+        "rsa-sha2-256" | "rsa-sha2-512" => "ssh-rsa",
+        plain => plain,
+    }
 }
 
 /// OpenSSH's banner for a revoked host key.
@@ -5019,6 +5040,93 @@ mod tests {
         assert!(matches!(err, Err(Error::Config(_))));
         let err = build_verifier(&reply, &policy, &runner, "host", 0, None, 0, &flag);
         assert!(matches!(err, Err(Error::Config(_))));
+    }
+
+    /// A client-side `KexRunner` that has seen an ed25519-only server
+    /// KEXINIT, so `negotiated()` reports `ssh-ed25519`.
+    fn negotiated_ed25519_runner() -> KexRunner {
+        let mut rng = OsRng;
+        let over = AlgoOverrides {
+            host_key_algorithms: Some(vec!["ssh-ed25519".to_string()]),
+            ..Default::default()
+        };
+        let mut server = KexRunner::new(Role::Server, build_default_kexinit(&mut rng, &over));
+        let server_kexinit = server.start(&mut rng).unwrap().outbound.remove(0);
+        let mut client = KexRunner::new(Role::Client, build_default_kexinit(&mut rng, &over));
+        client.start(&mut rng).unwrap();
+        let mut codec = PacketCodec::new();
+        client
+            .on_packet(
+                &mut rng,
+                &mut codec,
+                &server_kexinit,
+                None,
+                None,
+                LOCAL_VERSION.as_bytes(),
+                LOCAL_VERSION.as_bytes(),
+            )
+            .unwrap();
+        assert_eq!(client.negotiated().unwrap().host_key, "ssh-ed25519");
+        client
+    }
+
+    fn reply_with_k_s(k_s: &[u8]) -> Vec<u8> {
+        let mut reply = vec![SSH_MSG_KEX_ECDH_REPLY];
+        reply.extend_from_slice(&(k_s.len() as u32).to_be_bytes());
+        reply.extend_from_slice(k_s);
+        reply
+    }
+
+    /// CLI-1: the key type written to known_hosts on a TOFU add comes from
+    /// the negotiated algorithm, and a `K_S` whose type string is not a
+    /// well-formed key of that algorithm (here one smuggling a newline and
+    /// a wildcard line) is rejected before anything is saved.
+    #[test]
+    fn build_verifier_rejects_injected_key_type_before_saving() {
+        let runner = negotiated_ed25519_runner();
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let mut kh = KnownHostsPolicy::strict(store.clone());
+        kh.on_unknown = TofuAction::Accept;
+        let policy = HostKeyPolicy::KnownHosts(kh);
+        let flag = AtomicBool::new(false);
+
+        let mut evil = Vec::new();
+        for part in [
+            b"ssh-ed25519 AAAA\n* ssh-ed25519 YXR0YWNrZXJrZXk=\n#".as_slice(),
+            &[7u8; 32],
+        ] {
+            evil.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            evil.extend_from_slice(part);
+        }
+        let r = build_verifier(
+            &reply_with_k_s(&evil),
+            &policy,
+            &runner,
+            "victim.example",
+            22,
+            None,
+            0,
+            &flag,
+        );
+        assert!(r.is_err());
+        assert!(store.lock().unwrap().to_bytes().is_empty(), "nothing saved");
+
+        // A real ed25519 key is TOFU-added under its plain type.
+        let good = Ed25519HostKey::from_seed([3u8; 32]).public_blob();
+        build_verifier(
+            &reply_with_k_s(&good),
+            &policy,
+            &runner,
+            "victim.example",
+            22,
+            None,
+            0,
+            &flag,
+        )
+        .unwrap();
+        let saved = String::from_utf8(store.lock().unwrap().to_bytes()).unwrap();
+        assert!(saved.starts_with("victim.example ssh-ed25519 "), "{saved}");
+        assert_eq!(saved.lines().count(), 1);
     }
 
     /// The serve-loop ingress path is bounded: chunks beyond the handler

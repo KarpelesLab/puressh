@@ -1229,3 +1229,35 @@ fn copy_data_refuses_aliased_and_unbounded_sources() {
     drop(client);
     h.join().unwrap();
 }
+
+#[test]
+fn jailed_home_lookups_hide_outside_homes() {
+    // XFER-5: a home outside the jail must look exactly like an unknown
+    // user, and must never be echoed as a host path.
+    let tmp = TempDir::new("home-jail");
+    let jail = tmp.path().to_path_buf();
+    let (a, mut b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail);
+    let h = spawn_server(opts, a);
+    let _ = handshake(&mut b);
+    let expect_nsf = |reply: Packet| match reply {
+        Packet::Status { code, .. } => assert_eq!(code, FxpStatus::NoSuchFile),
+        other => panic!("expected NoSuchFile, got {other:?}"),
+    };
+    for user in [&b""[..], b"root", b"no-such-user-puressh-xfer5"] {
+        expect_nsf(ext_request(
+            &mut b,
+            b"home-directory",
+            &ext_strings(&[user]),
+        ));
+        let mut p = b"~".to_vec();
+        p.extend_from_slice(user);
+        expect_nsf(ext_request(
+            &mut b,
+            b"expand-path@openssh.com",
+            &ext_strings(&[&p]),
+        ));
+    }
+    drop(b);
+    h.join().unwrap();
+}

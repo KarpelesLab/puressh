@@ -951,16 +951,14 @@ impl SftpServerSession {
         }
     }
 
-    /// One name, as a `realpath` reply carries it.
-    fn name_reply(id: u32, p: &Path) -> Packet {
-        let bytes = p.to_string_lossy().into_owned().into_bytes();
-        Packet::Name {
-            id,
-            entries: vec![NameEntry {
-                filename: bytes.clone(),
-                longname: bytes,
-                attrs: Attrs::default(),
-            }],
+    /// [`Self::home_of`], except that under a jail a home outside it is
+    /// reported exactly like an unknown user, so a jailed client can
+    /// neither learn host paths nor probe which accounts exist.
+    fn home_in_jail(&self, user: &str) -> Option<PathBuf> {
+        let home = lexically_clean(&Self::home_of(user)?);
+        match self.opts.root.as_deref() {
+            Some(root) if !is_inside(&home, &lexically_clean(root)) => None,
+            _ => Some(home),
         }
     }
 
@@ -975,7 +973,8 @@ impl SftpServerSession {
                     Some(i) => (&rest[..i], &rest[i + 1..]),
                     None => (rest, &b""[..]),
                 };
-                let home = Self::home_of(&String::from_utf8_lossy(user))
+                let home = self
+                    .home_in_jail(&String::from_utf8_lossy(user))
                     .ok_or_else(|| SftpError::status_msg(FxpStatus::NoSuchFile, "no such user"))?;
                 let mut p = home.to_string_lossy().into_owned().into_bytes();
                 if !tail.is_empty() {
@@ -993,8 +992,10 @@ impl SftpServerSession {
     fn op_ext_home_directory(&mut self, id: u32, data: &[u8]) -> Result<Packet, SftpError> {
         let mut r = Reader::new(data);
         let user = String::from_utf8_lossy(r.read_string()?).into_owned();
-        match Self::home_of(&user) {
-            Some(home) => Ok(Self::name_reply(id, &home)),
+        match self.home_in_jail(&user) {
+            // Through `realpath`, so a jailed client sees the home relative
+            // to the jail root (under `hide_jail_in_realpath`).
+            Some(home) => self.op_realpath(id, home.to_string_lossy().into_owned().into_bytes()),
             None => Ok(status_pkt(id, FxpStatus::NoSuchFile, "no such user")),
         }
     }

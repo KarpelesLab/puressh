@@ -1477,7 +1477,12 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
         local_close_sent: false,
         pty_denied: false,
     };
-    let (ingress_tx, ingress_rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+    // Bounded, like `Client::serve`'s ingress: when the handler falls
+    // behind, the relay below blocks, stops draining the channel and so
+    // stops crediting window, instead of buffering whatever the peer (or
+    // whoever connects to a `-R` listener) pushes without limit.
+    let (ingress_tx, ingress_rx) =
+        std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(INCOMING_INGRESS_BACKLOG);
     let (egress_tx, egress_rx) =
         std::sync::mpsc::sync_channel::<crate::stream::ChannelEgress>(INCOMING_EGRESS_BACKLOG);
     let cs = crate::stream::ChannelStream::new(ingress_rx, egress_tx);
@@ -1539,6 +1544,11 @@ fn accept_incoming(g: &mut Inner, channel: u32, kind: IncomingKind) {
 /// Queue depth between a server-opened channel's handler and the thread
 /// that sends its output.
 const INCOMING_EGRESS_BACKLOG: usize = 64;
+
+/// Queue depth (in reads of up to 32 KiB) between a server-opened
+/// channel's relay thread and its handler: the relay blocks once it is
+/// full, which holds back the channel's window.
+const INCOMING_INGRESS_BACKLOG: usize = 32;
 
 fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
     if let ChannelEvent::OpenRequest { channel, kind } = &ev

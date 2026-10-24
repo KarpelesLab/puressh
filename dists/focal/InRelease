@@ -5,35 +5,35 @@ Origin: puressh
 Label: puressh
 Suite: focal
 Codename: focal
-Date: Sat, 24 Oct 2026 10:11:16 UTC
+Date: Sat, 24 Oct 2026 10:30:19 UTC
 Architectures: amd64 arm64
 Components: main
 Description: puressh apt repository (Ubuntu 20.04 LTS)
 MD5Sum:
- 8b2186c88cf221aa7f7e498fa5cb395f 2080 main/binary-amd64/Packages
- 84ed6f778f837fe16fb958d56d53f859 981 main/binary-amd64/Packages.gz
+ 1253fdf48613eb00ad532422944edaca 2080 main/binary-amd64/Packages
+ 2629c062c63f4b4173e582d4de4664b1 978 main/binary-amd64/Packages.gz
  298ef956a237dfa6b42c0a3762c8222d 137 main/binary-amd64/Release
- 6aaa3d91acbe0ae8b8c1c1dc3de57e0a 2080 main/binary-arm64/Packages
- 9e2a4e5953dc285733f978474bf2d4c2 979 main/binary-arm64/Packages.gz
+ 58997cf76dad356ab2397bac577b3761 2080 main/binary-arm64/Packages
+ 71ce720e2b1c61158ee810a707f7edf2 977 main/binary-arm64/Packages.gz
  94a0ca6d0e545af1ce80e4fe01bf942c 137 main/binary-arm64/Release
 SHA1:
- 3a2c147c714dc3c352966ab7f2c0246147c0c648 2080 main/binary-amd64/Packages
- 8c699f259e05a483a8e9101e82c6f3f1c5ede2a2 981 main/binary-amd64/Packages.gz
+ 3905f9f6efef00ac4f7b26e46cec4d80f98f2ae8 2080 main/binary-amd64/Packages
+ fd6310ed37e06fd20de83122c22ee4cbe6f99748 978 main/binary-amd64/Packages.gz
  ec52b0e3bda23da5a31fdf5197b387ae8dbab39d 137 main/binary-amd64/Release
- 1fc8dc60ee0f2d9b43a14bc8f0e5f9f50b03ae90 2080 main/binary-arm64/Packages
- bee9954ccf4bd977a289c57e803c8bdecb7ad87e 979 main/binary-arm64/Packages.gz
+ da35dec1fe973e5ac821939748798ce47f4ebffa 2080 main/binary-arm64/Packages
+ d81ba7f5f1acd825eb6cd82baebb1036e636fc6d 977 main/binary-arm64/Packages.gz
  21b6fae3214495b75d6a470afb053e62db8c1e9a 137 main/binary-arm64/Release
 SHA256:
- 4dad52e936a54084ec85185c5f2b66f51f3735ead396c0c50e1ac26fc4c7ffed 2080 main/binary-amd64/Packages
- ac8182d2e3f178b9c0933cb33f232180086b4bd6d6e7f509b3d7dc3e3c6c864c 981 main/binary-amd64/Packages.gz
+ 9257cad41e596c24534f5fbf9abdd732663a9b9c5a39916a0d0988b9df720a44 2080 main/binary-amd64/Packages
+ 1e96691e4e43fc3d365aa1f9b34c4b706ae16e430962420f234282f1a89a9f6d 978 main/binary-amd64/Packages.gz
  945c044384fc5b8c19eb17d44d2e6a922019cfa9eb2b7577d811b634c67e3c70 137 main/binary-amd64/Release
- d1bdef755c1b0f4a8716cf8fda82300b8233c3193033739d7f6094725274ec56 2080 main/binary-arm64/Packages
- 63541b6e8d0698918aaafb2559afd7da9a88b3ad7023c49c62fa2cd9fe55fe9b 979 main/binary-arm64/Packages.gz
+ 0277b319fbc4f46a101ad0e6f9cf3f55c999d73f8670631cbc9669df185c9ce5 2080 main/binary-arm64/Packages
+ e89caca66c27cf597e63b2acdf615823b1c553428d2d60d56b799768767afb8b 977 main/binary-arm64/Packages.gz
  7292213733e530f0db0d8b7fa19c001add151e9215c17ab6f80811df0fa62906 137 main/binary-arm64/Release
 -----BEGIN PGP SIGNATURE-----
 
-iHUEARYKAB0WIQSz0DNWsael9pJF2V+SnvtLRY41WgUCatyERAAKCRCSnvtLRY41
-WjxcAQDN38H5OsOkWLuJXC8Jt+DWa1kzwobZWDxEcZw6lpppkgEAtV00uvZW54F6
-AsOEch4UFtvTUXDonnvygNzkyNiUKQw=
-=/5Oh
+iHUEARYKAB0WIQSz0DNWsael9pJF2V+SnvtLRY41WgUCatyIuwAKCRCSnvtLRY41
+WjHGAP455eyiqkzZo7ErNQL58MzBEjgKAVwm97ocxBvyPTJbuAD/dqAfEPpM6KzT
+66kbcBEmR4LIUexArNjZWtaC6Jq+gQw=
+=AlAp
 -----END PGP SIGNATURE-----

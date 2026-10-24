@@ -225,11 +225,20 @@ jobs:
         run: |
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          # Allow a loopback passphrase for the CLI priming sign below, but do
+          # NOT set `pinentry-mode loopback` in gpg.conf: reprepro signs via
+          # gpgme, which in loopback mode expects the caller to supply the
+          # passphrase (reprepro does not), so a global loopback breaks it even
+          # for a passphrase-less key. gpgme uses the agent normally instead.
           echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
-          echo "pinentry-mode loopback"  > "$GNUPGHOME/gpg.conf"
+          gpgconf --kill gpg-agent || true
           printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
           keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
           if [ -z "$keyid" ]; then echo "no key imported" >&2; exit 1; fi
+          # Verify the key signs without prompting (the repo signing key must be
+          # passphrase-less for non-interactive CI) and prime the agent.
+          echo priming | gpg --batch --yes --pinentry-mode loopback --passphrase '' \
+            --local-user "$keyid" --sign -o /dev/null
           echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
           echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
 
@@ -276,10 +285,12 @@ jobs:
           shopt -s nullglob
           # Server packages are suite-specific (~ubuntuNN in the version).
           for deb in debs/puressh-server_*.deb; do
+            # GitHub rewrites the `~` in the version to `.` when it stores the
+            # release asset, so match on the release token alone.
             case "$deb" in
-              *~ubuntu20.04_*) suite=focal ;;
-              *~ubuntu22.04_*) suite=jammy ;;
-              *~ubuntu24.04_*) suite=noble ;;
+              *ubuntu20.04_*) suite=focal ;;
+              *ubuntu22.04_*) suite=jammy ;;
+              *ubuntu24.04_*) suite=noble ;;
               *) echo "skipping unrecognised server package: $deb" >&2; continue ;;
             esac
             reprepro -b "$repo" includedeb "$suite" "$deb"

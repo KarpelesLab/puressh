@@ -681,3 +681,24 @@ fn host_keys_update_plans_new_and_obsolete_keys() {
     // A key the server offers that is recorded under another name: hands off.
     assert!(kh.host_keys_update("h", 22, &[c]).blocked.is_some());
 }
+
+/// A non-UTF-8 line (e.g. a Latin-1 comment) survives load → save
+/// byte-for-byte, and an `@revoked` one keeps revoking its key.
+#[test]
+fn non_utf8_lines_preserved_and_revoked_still_revokes() {
+    let key = ed25519_blob(9);
+    let b64 = crate::key::base64::encode(&key);
+    let mut data = Vec::new();
+    data.extend_from_slice(format!("@revoked * ssh-ed25519 {b64} caf").as_bytes());
+    data.push(0xE9); // Latin-1 'é'
+    data.push(b'\n');
+    data.extend_from_slice(b"junk \xff\xfe\n");
+    data.extend_from_slice(format!("host.example ssh-ed25519 {b64}\n").as_bytes());
+
+    let kh = KnownHosts::from_bytes(&data);
+    assert_eq!(kh.to_bytes(), data, "raw lines kept verbatim");
+    assert!(matches!(
+        kh.lookup("host.example", 22, "ssh-ed25519", &key),
+        LookupResult::Revoked
+    ));
+}

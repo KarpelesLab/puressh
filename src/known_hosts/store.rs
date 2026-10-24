@@ -48,6 +48,12 @@ pub struct KnownHosts {
 
 enum Slot {
     Verbatim(String),
+    /// A line that is not valid UTF-8, kept as raw bytes so a save writes
+    /// it back unchanged instead of dropping it. When the line (decoded
+    /// lossily) is an `@revoked` entry, that entry is kept alongside and
+    /// still revokes its key: an undecodable comment must not silently
+    /// un-revoke a key.
+    Raw(Vec<u8>, Option<Entry>),
     Entry(Entry),
     /// Tombstoned slot — skipped on save. Lets `remove` keep indices
     /// stable for callers that hold references during a mutation pass.
@@ -93,11 +99,19 @@ impl KnownHosts {
                 Some((b'\r', rest)) => rest,
                 _ => line,
             };
-            // Skip only this line if it isn't valid UTF-8; do not abort
-            // parsing and do not empty the store.
+            // A line that isn't valid UTF-8 is not parsed as an entry (do
+            // not abort parsing and do not empty the store), but it is kept
+            // verbatim for save — and an `@revoked` one still revokes.
             let raw = match std::str::from_utf8(line) {
                 Ok(s) => s,
-                Err(_) => continue,
+                Err(_) => {
+                    let revoked = match parse_line(&String::from_utf8_lossy(line)) {
+                        ParsedLine::Entry(e) if e.marker == Some(Marker::Revoked) => Some(e),
+                        _ => None,
+                    };
+                    out.lines.push(Slot::Raw(line.to_vec(), revoked));
+                    continue;
+                }
             };
             match parse_line(raw) {
                 ParsedLine::Entry(e) => out.lines.push(Slot::Entry(e)),
@@ -128,6 +142,10 @@ impl KnownHosts {
                 }
                 Slot::Entry(e) => {
                     out.extend_from_slice(format_entry(e).as_bytes());
+                    out.push(b'\n');
+                }
+                Slot::Raw(b, _) => {
+                    out.extend_from_slice(b);
                     out.push(b'\n');
                 }
                 Slot::Removed => {}
@@ -205,10 +223,8 @@ impl KnownHosts {
     pub fn lookup(&self, host: &str, port: u16, key_type: &str, key_blob: &[u8]) -> LookupResult {
         // Pass 1: any `@revoked` line whose host AND key matches refuses
         // the candidate unconditionally.
-        for slot in &self.lines {
-            if let Slot::Entry(e) = slot
-                && e.marker == Some(Marker::Revoked)
-                && host_field_matches(&e.host_spec, host, port)
+        for e in self.revoked_entries() {
+            if host_field_matches(&e.host_spec, host, port)
                 && e.key_type == key_type
                 && e.key_blob == key_blob
             {
@@ -337,12 +353,19 @@ impl KnownHosts {
     /// Whether an `@revoked` line for `host[:port]` names the certificate's
     /// CA key or its embedded key (revoking either kills the cert).
     pub fn revokes_cert(&self, host: &str, port: u16, cert: &crate::cert::Certificate) -> bool {
-        self.lines.iter().any(|slot| {
-            matches!(slot, Slot::Entry(e)
-                if e.marker == Some(Marker::Revoked)
-                    && host_field_matches(&e.host_spec, host, port)
-                    && (e.key_blob == cert.signature_key_blob
-                        || e.key_blob == cert.embedded_pubkey_blob))
+        self.revoked_entries().any(|e| {
+            host_field_matches(&e.host_spec, host, port)
+                && (e.key_blob == cert.signature_key_blob
+                    || e.key_blob == cert.embedded_pubkey_blob)
+        })
+    }
+
+    /// Every `@revoked` entry, including those on lines kept raw because
+    /// they are not valid UTF-8.
+    fn revoked_entries(&self) -> impl Iterator<Item = &Entry> {
+        self.lines.iter().filter_map(|slot| match slot {
+            Slot::Entry(e) | Slot::Raw(_, Some(e)) if e.marker == Some(Marker::Revoked) => Some(e),
+            _ => None,
         })
     }
 

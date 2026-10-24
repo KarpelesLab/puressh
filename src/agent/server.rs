@@ -198,6 +198,16 @@ impl AgentState {
         };
         let locked = self.locked.is_some();
         if locked && msg_type != SSH_AGENTC_UNLOCK {
+            // A session bind refused here still marks the connection, so
+            // it is not taken as a local one once the agent is unlocked.
+            if msg_type == SSH_AGENTC_EXTENSION
+                && matches!(
+                    Reader::new(body).read_string(),
+                    Ok(b"session-bind@openssh.com")
+                )
+            {
+                conn.bind_attempted = true;
+            }
             // A locked agent lists nothing and refuses everything else.
             return if msg_type == SSH_AGENTC_REQUEST_IDENTITIES {
                 reply(SSH_AGENT_IDENTITIES_ANSWER, &0u32.to_be_bytes())
@@ -1046,6 +1056,34 @@ mod tests {
         assert_eq!(s.handle(&[SSH_AGENTC_EXTENSION])[0], SSH_AGENT_FAILURE);
         assert_eq!(s.handle(&[99])[0], SSH_AGENT_FAILURE);
         assert_eq!(s.handle(&[])[0], SSH_AGENT_FAILURE);
+    }
+
+    /// A session bind sent while locked still marks the connection as
+    /// bound-attempted, so it is not treated as local after the unlock.
+    #[test]
+    fn session_bind_while_locked_marks_connection() {
+        let mut s = AgentState::new();
+        let mut conn = ConnectionState::default();
+        let mut w = Writer::new();
+        w.write_string(b"pw");
+        let pw = w.as_slice().to_vec();
+        s.handle_on(&mut conn, &msg(SSH_AGENTC_LOCK, &pw));
+        let mut b = Writer::new();
+        b.write_string(b"session-bind@openssh.com");
+        b.write_string(b"key");
+        b.write_string(b"sid");
+        b.write_string(b"sig");
+        b.write_u8(1);
+        assert_eq!(
+            s.handle_on(&mut conn, &msg(SSH_AGENTC_EXTENSION, b.as_slice()))[0],
+            SSH_AGENT_FAILURE
+        );
+        assert!(conn.bind_attempted);
+        assert_eq!(
+            s.handle_on(&mut conn, &msg(SSH_AGENTC_UNLOCK, &pw))[0],
+            SSH_AGENT_SUCCESS
+        );
+        assert!(conn.binds.is_empty() && conn.bind_attempted);
     }
 
     /// The client's new requests against this agent, over a real socket.

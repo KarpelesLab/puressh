@@ -6,7 +6,8 @@
 //!
 //! - On `setup`, picks the next free X display number `N` (starting at
 //!   `min_display`, default 10) by attempting to bind
-//!   `127.0.0.1:6000+N`. The display number is returned to the dispatcher
+//!   `127.0.0.1:6000+N` and `[::1]:6000+N` (both, since `localhost` may
+//!   resolve to either). The display number is returned to the dispatcher
 //!   via [`crate::server::X11ForwardHandle::display_env`] as
 //!   `"localhost:<N>.<screen>"`, which the dispatcher injects as the
 //!   `DISPLAY` env var on the session.
@@ -131,9 +132,9 @@ impl Drop for X11Binding {
 /// binds its own TCP listener, and starts its own worker thread.
 ///
 /// Display numbers are allocated by trial bind: starting at `min_display`
-/// (default 10), the handler tries `127.0.0.1:6000+N` until one succeeds.
-/// Returns `Err(Error::Io(_))` if no port in `[min_display, max_display]`
-/// is free.
+/// (default 10), the handler tries `127.0.0.1:6000+N` and `[::1]:6000+N`
+/// until a display where both are free. Returns `Err(Error::Io(_))` if no
+/// port in `[min_display, max_display]` is free.
 #[cfg(feature = "server")]
 pub struct DefaultX11ForwardHandler {
     min_display: u16,
@@ -192,12 +193,29 @@ impl DefaultX11ForwardHandler {
         self
     }
 
-    fn bind_first_free(&self) -> Result<(TcpListener, u16)> {
+    /// Bind the first display `N` whose port is free on *every* loopback
+    /// address `localhost` may resolve to — `127.0.0.1` and `::1`, as
+    /// OpenSSH's `X11UseLocalhost` does.
+    ///
+    /// `DISPLAY` is `localhost:N`, and resolvers commonly try `::1` first:
+    /// listening on IPv4 only would let a local user pre-bind `[::1]:6000+N`,
+    /// receive the session's X clients (and their `MIT-MAGIC-COOKIE-1`), and
+    /// replay the cookie to our IPv4 listener. So a display where `::1` is
+    /// taken is skipped like one where `127.0.0.1` is. A `::1` bind that
+    /// fails for any other reason (no IPv6 on the host) is tolerated: there
+    /// is then nothing for anyone to bind on `::1`.
+    fn bind_first_free(&self) -> Result<(Vec<TcpListener>, u16)> {
         for n in self.min_display..=self.max_display {
             let port = X_BASE_PORT.saturating_add(n);
-            let addr: SocketAddr = ([127u8, 0, 0, 1], port).into();
-            if let Ok(listener) = TcpListener::bind(addr) {
-                return Ok((listener, n));
+            let v4: SocketAddr = ([127u8, 0, 0, 1], port).into();
+            let Ok(v4_listener) = TcpListener::bind(v4) else {
+                continue;
+            };
+            let v6: SocketAddr = (std::net::Ipv6Addr::LOCALHOST, port).into();
+            match TcpListener::bind(v6) {
+                Ok(v6_listener) => return Ok((vec![v4_listener, v6_listener], n)),
+                Err(e) if e.kind() == ErrorKind::AddrInUse => continue,
+                Err(_) => return Ok((vec![v4_listener], n)),
             }
         }
         Err(Error::Io(std::io::Error::new(
@@ -264,77 +282,88 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
             CookiePolicy::RequireCookie(Arc::new(cookie))
         };
 
-        let (listener, display_number) = self.bind_first_free()?;
-        listener.set_nonblocking(true)?;
+        let (listeners, display_number) = self.bind_first_free()?;
+        for listener in &listeners {
+            listener.set_nonblocking(true)?;
+        }
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            while !stop_thread.load(Ordering::SeqCst) {
-                match listener.accept() {
-                    Ok((mut conn, peer)) => {
-                        // BSD-family kernels (macOS, the BSDs) hand out accepted
-                        // sockets that inherit the listener's O_NONBLOCK; Linux
-                        // does not. The splice threads below do blocking I/O, so
-                        // put the connection back into blocking mode explicitly.
-                        // A failure here leaves a socket we cannot use; drop it.
-                        if conn.set_nonblocking(false).is_err() {
-                            continue;
-                        }
-                        // Validate the X11 authorisation cookie on the first
-                        // setup packet before doing anything else. On any
-                        // failure, drop the connection without opening a
-                        // channel back to the client.
-                        let prelude = match &policy {
-                            CookiePolicy::PermitUnauthenticated => Vec::new(),
-                            CookiePolicy::RequireCookie(cookie) => {
-                                match read_and_check_cookie(&mut conn, cookie) {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => {
-                                        // A rejected (bad-cookie) connection must
-                                        // NOT consume the `single_connection`
-                                        // allowance: otherwise a local attacker
-                                        // who races in first with a bogus cookie
-                                        // could tear down the listener before the
-                                        // legitimate client connects. Keep
-                                        // looping; only a *validated* connection
-                                        // (below) honours `single_connection`.
-                                        let _ = conn.shutdown(Shutdown::Both);
-                                        continue;
+            // One thread serves both loopback listeners (IPv4 and, when
+            // available, IPv6) of the display: poll each in turn and sleep
+            // only once none had a connection waiting.
+            let mut idle = false;
+            'accept: while !stop_thread.load(Ordering::SeqCst) {
+                if idle {
+                    thread::sleep(ACCEPT_POLL_INTERVAL);
+                }
+                idle = true;
+                for listener in &listeners {
+                    match listener.accept() {
+                        Ok((mut conn, peer)) => {
+                            idle = false;
+                            // BSD-family kernels (macOS, the BSDs) hand out accepted
+                            // sockets that inherit the listener's O_NONBLOCK; Linux
+                            // does not. The splice threads below do blocking I/O, so
+                            // put the connection back into blocking mode explicitly.
+                            // A failure here leaves a socket we cannot use; drop it.
+                            if conn.set_nonblocking(false).is_err() {
+                                continue;
+                            }
+                            // Validate the X11 authorisation cookie on the first
+                            // setup packet before doing anything else. On any
+                            // failure, drop the connection without opening a
+                            // channel back to the client.
+                            let prelude = match &policy {
+                                CookiePolicy::PermitUnauthenticated => Vec::new(),
+                                CookiePolicy::RequireCookie(cookie) => {
+                                    match read_and_check_cookie(&mut conn, cookie) {
+                                        Ok(bytes) => bytes,
+                                        Err(_) => {
+                                            // A rejected (bad-cookie) connection must
+                                            // NOT consume the `single_connection`
+                                            // allowance: otherwise a local attacker
+                                            // who races in first with a bogus cookie
+                                            // could tear down the listener before the
+                                            // legitimate client connects. Keep
+                                            // looping; only a *validated* connection
+                                            // (below) honours `single_connection`.
+                                            let _ = conn.shutdown(Shutdown::Both);
+                                            continue;
+                                        }
                                     }
                                 }
+                            };
+                            let orig_host = match peer.ip() {
+                                std::net::IpAddr::V4(v4) => v4.to_string(),
+                                std::net::IpAddr::V6(v6) => v6.to_string(),
+                            };
+                            let orig_port = peer.port() as u32;
+                            match ctx.open_x11(orig_host, orig_port) {
+                                Ok(channel_stream) => {
+                                    // Replay the setup packet bytes we consumed
+                                    // during validation, then splice the rest.
+                                    spawn_tcp_splice_with_prelude(conn, channel_stream, prelude);
+                                }
+                                Err(_) => {
+                                    let _ = conn.shutdown(Shutdown::Both);
+                                }
                             }
-                        };
-                        let orig_host = match peer.ip() {
-                            std::net::IpAddr::V4(v4) => v4.to_string(),
-                            std::net::IpAddr::V6(v6) => v6.to_string(),
-                        };
-                        let orig_port = peer.port() as u32;
-                        match ctx.open_x11(orig_host, orig_port) {
-                            Ok(channel_stream) => {
-                                // Replay the setup packet bytes we consumed
-                                // during validation, then splice the rest.
-                                spawn_tcp_splice_with_prelude(conn, channel_stream, prelude);
-                            }
-                            Err(_) => {
-                                let _ = conn.shutdown(Shutdown::Both);
+                            // RFC 4254 §6.3.1: when the client set
+                            // `single_connection`, the server MUST refuse any
+                            // further forwarded X11 connections after the first
+                            // is accepted. Drop the listener (by exiting the
+                            // loop, which lets `listener` go out of scope) so
+                            // subsequent connects to `localhost:6000+N` see a
+                            // `ECONNREFUSED`.
+                            if single_connection {
+                                break 'accept;
                             }
                         }
-                        // RFC 4254 §6.3.1: when the client set
-                        // `single_connection`, the server MUST refuse any
-                        // further forwarded X11 connections after the first
-                        // is accepted. Drop the listener (by exiting the
-                        // loop, which lets `listener` go out of scope) so
-                        // subsequent connects to `localhost:6000+N` see a
-                        // `ECONNREFUSED`.
-                        if single_connection {
-                            break;
-                        }
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => {}
+                        Err(_) => break 'accept,
                     }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                        thread::sleep(ACCEPT_POLL_INTERVAL);
-                    }
-                    Err(_) => break,
                 }
             }
         });
@@ -779,6 +808,49 @@ mod tests {
             TcpListener::bind(addr).is_ok(),
             "port should be free after the handle is dropped"
         );
+    }
+
+    /// FWD-2: the display is held on `::1` too, so nobody else can listen
+    /// there and catch X clients that resolve `localhost` to IPv6 first.
+    #[test]
+    fn setup_also_binds_ipv6_loopback() {
+        let v6_available = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).is_ok();
+        let h = DefaultX11ForwardHandler::with_display_range(560, 579);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", false, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        if v6_available {
+            let addr: SocketAddr =
+                (std::net::Ipv6Addr::LOCALHOST, 6000 + handle.display_number).into();
+            assert!(
+                TcpListener::bind(addr).is_err(),
+                "[::1] display port should be held while the handle is alive"
+            );
+        }
+        drop(handle);
+    }
+
+    /// FWD-2: a display whose `[::1]` port someone else already holds is
+    /// skipped rather than served on IPv4 alone.
+    #[test]
+    fn display_with_ipv6_port_taken_is_skipped() {
+        let first = 540u16;
+        let squatter = match TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, X_BASE_PORT + first))
+        {
+            Ok(l) => l,
+            // No IPv6 on this host, or the port is busy anyway: nothing
+            // to assert.
+            Err(_) => return,
+        };
+        let h = DefaultX11ForwardHandler::with_display_range(first, first + 19);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", false, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        assert_ne!(handle.display_number, first);
+        drop(handle);
+        drop(squatter);
     }
 
     /// Connecting to the display (with a VALID cookie so we pass the gate)

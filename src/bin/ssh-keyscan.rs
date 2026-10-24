@@ -262,6 +262,17 @@ fn scan_one(
     None
 }
 
+/// The server's identification line as printed: the trailing CR dropped
+/// and every control character (C0, DEL, C1 — e.g. ESC sequences a hostile
+/// server embeds) replaced with `?` so it cannot drive the terminal.
+fn banner_comment(line: &[u8]) -> String {
+    let line = String::from_utf8_lossy(line);
+    line.trim_end_matches('\r')
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// The server's identification line, read without consuming it.
 fn peek_banner(stream: &TcpStream) -> Option<String> {
     let mut buf = [0u8; 256];
@@ -272,8 +283,7 @@ fn peek_banner(stream: &TcpStream) -> Option<String> {
             return None;
         }
         if let Some(end) = buf[..n].iter().position(|b| *b == b'\n') {
-            let line = String::from_utf8_lossy(&buf[..end]);
-            return Some(line.trim_end_matches('\r').to_string());
+            return Some(banner_comment(&buf[..end]));
         }
         if n == buf.len() {
             return None;
@@ -392,5 +402,22 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::banner_comment;
+
+    #[test]
+    fn banner_comment_scrubs_controls() {
+        assert_eq!(
+            banner_comment(b"SSH-2.0-OpenSSH_9.9\r"),
+            "SSH-2.0-OpenSSH_9.9"
+        );
+        assert_eq!(
+            banner_comment("SSH-2.0-x\x1b]0;pwn\x07\u{9b}2J\x7f".as_bytes()),
+            "SSH-2.0-x?]0;pwn??2J?"
+        );
     }
 }

@@ -4750,7 +4750,10 @@ mod imp {
     /// accepted connection. Anything else (a pipe, as from a `ProxyCommand`)
     /// is bridged to a loopback connection, served as one from an unknown
     /// peer: like OpenSSH's, it matches no `from=` or `Match Address`.
-    fn serve_inetd(cfg: Arc<puressh::server::Config>) -> Result<i32, String> {
+    fn serve_inetd(
+        cfg: Arc<puressh::server::Config>,
+        pam_gate: &pam_gate::PamGate,
+    ) -> Result<i32, String> {
         use std::io::{Read, Write};
         use std::os::fd::{FromRawFd, IntoRawFd};
         let io = |e: std::io::Error| format!("inetd: {e}");
@@ -4758,10 +4761,20 @@ mod imp {
         // released again (not closed) unless it is used as the connection.
         let stdin_sock = unsafe { std::net::TcpStream::from_raw_fd(0) };
         if let Ok(peer) = stdin_sock.peer_addr() {
+            // An inetd / systemd socket may be dual-stack: present an
+            // IPv4-mapped peer (`::ffff:a.b.c.d`) as plain IPv4, as the
+            // `IPV6_V6ONLY` listeners do, so `Match Address`, `from=` and
+            // `user@host` rules written for IPv4 apply.
+            let canon = |a: std::net::SocketAddr| {
+                std::net::SocketAddr::new(a.ip().to_canonical(), a.port())
+            };
+            let peer = canon(peer);
+            let local = stdin_sock.local_addr().ok().map(canon);
             if let Ok(mut g) = CONN_ADDRS.lock() {
-                *g = Some((peer, stdin_sock.local_addr().ok()));
+                *g = Some((peer, local));
             }
-            let result = handle_session_with_peer(stdin_sock, peer, cfg);
+            pam_gate.set_peer(sshd_log::addr_str(peer.ip()));
+            let result = handle_session_with_addrs(stdin_sock, peer, local, cfg);
             return Ok(if result.is_ok() { 0 } else { 255 });
         }
         let _ = stdin_sock.into_raw_fd();
@@ -4824,7 +4837,7 @@ mod imp {
     /// `None` when unknown / unspecified (then `Match Address` never matches).
     fn conn_peer_ip() -> Option<String> {
         conn_addrs()
-            .map(|(peer, _)| peer.ip())
+            .map(|(peer, _)| peer.ip().to_canonical())
             .filter(|ip| !ip.is_unspecified())
             .map(|ip| ip.to_string())
     }
@@ -8698,7 +8711,7 @@ mod imp {
 
         // `-i`: one connection, on stdin / stdout.
         if cli.inetd {
-            return serve_inetd(cfg);
+            return serve_inetd(cfg, &pam_gate);
         }
 
         // As OpenSSH does for its session processes: no ptrace attach and no
@@ -9015,7 +9028,9 @@ mod imp {
                         // Stash the peer address on *this child's* PamGate
                         // copy — set_peer mutates state behind a Mutex but
                         // post-fork COW means only this child sees it.
-                        pam_gate.set_peer(peer.to_string());
+                        // PAM_RHOST is the bare address (as OpenSSH sets it):
+                        // `ip:port` would match no pam_access / sssd host rule.
+                        pam_gate.set_peer(sshd_log::addr_str(peer.ip()));
                         // Likewise record this connection's socket addresses for
                         // the `Match LocalAddress`/`LocalPort` context and the
                         // session-open hook (COW-isolated per child).

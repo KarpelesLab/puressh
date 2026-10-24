@@ -166,12 +166,15 @@ host key).
 The *key table* maps `user → { key_fp → entry }`. It is filled **lazily**: a
 user's authorized keys are read only when a well-formed, in-time KNOCK names
 that user, then cached for 60 s (an empty answer too, so a user without keys
-costs one lookup per minute at most). Nothing is read at startup. Lookups
-are rate limited globally (default 50/s), so a flood of made-up user names
-cannot turn into unbounded disk or passwd work. The cache holds a bounded
-number of users, and when it is full, users without keys are evicted before
-real ones. Users excluded by configuration are refused without reading
-anything, and unknown users and keys never allocate state.
+costs one lookup per minute at most). Nothing is read at startup. Before a
+lookup, a cheap pre-check refuses names that can never knock (excluded by
+configuration, or not an existing user); those cost no lookup token and are
+not cached, so made-up names neither use up the lookup budget nor fill the
+cache. Lookups are rate limited per source prefix (default burst 10,
++1 / 200 ms) and globally (default 50/s), so a flood of names cannot turn
+into unbounded disk or passwd work. The cache holds a bounded number of
+users, and when it is full, users without keys are evicted before real ones.
+Unknown users and keys never allocate per-key state.
 
 Per entry (user, key):
 
@@ -180,13 +183,14 @@ Per entry (user, key):
 | `pubkey` | for verification |
 | `sig1_cache` | accepted sig1 values (LRU, max 4) |
 | `newsig1_bucket` | token bucket for verifying a sig1 that is not cached |
+| `newprefix_bucket` | token bucket for verifying sig2 from a source prefix that never sent a valid knock for this key |
 | `last_nonce` | highest accepted nonce |
 | `last_knock_hash`, `last_accept`, `accept_expiry` | used to resend for retransmitted knocks |
-| `knock_buckets` | per source prefix (/32 IPv4, /64 IPv6), LRU max 64 |
+| `knock_buckets` | per source prefix (/32 IPv4, /64 IPv6), LRU max 64; each marked *good* once a knock from it passes sig2 |
 | `pending` | listeners currently open |
 
-Global: `verify_bucket` (all public-key verifications) and `nonce_floor`
-(§5.3).
+Global: `verify_bucket` (all public-key verifications), the key-lookup
+buckets (§5.1) and `nonce_floor` (§5.3).
 
 ### 5.2 Processing order
 
@@ -205,9 +209,13 @@ Every *drop* is silent. Every step is cheaper than the next one.
    and the stored accept has not expired, take one token from the source
    prefix's knock bucket and resend `last_accept` unchanged. Stop here.
 6. If `nonce ≤ last_nonce` or `nonce < nonce_floor`, drop.
-7. Take one token from the source prefix's knock bucket and one from
-   `verify_bucket`. If either is empty, drop.
-8. Verify sig2. On failure, drop.
+7. Take one token from the source prefix's knock bucket, one from
+   `newprefix_bucket` unless the prefix is *good*, and one from
+   `verify_bucket`. If any is empty, drop. When the prefix table is full, a
+   new prefix evicts the least recently used non-*good* one (if any) and
+   starts with only 2 tokens, so rotating source addresses earns no fresh
+   bursts.
+8. Verify sig2. On failure, drop. On success, mark the prefix *good*.
 9. Set `last_nonce = nonce`.
 10. If `pending ≥ MaxPending`, drop.
 11. Choose the host key: the one matching `host_fp`, or with `NEED_HOSTKEY`
@@ -328,6 +336,8 @@ has an invalid `sig_host`. Then:
 | `MaxPending` | 2 per (user, key) |
 | knock bucket | burst 5, +1 / 10 s, per (user, key, source prefix) |
 | `newsig1_bucket` | burst 3, +1 / 60 s, per (user, key) |
+| `newprefix_bucket` | burst 10, +1 / s, per (user, key) |
+| key lookups | 50 / s global; burst 10, +1 / 200 ms per source prefix |
 | `verify_bucket` | 1000 / s, global |
 | client `KnockFallbackDelay` | 1500 ms |
 | client retransmits | +500 ms, +1500 ms, give up at +3000 ms |
@@ -337,11 +347,18 @@ has an invalid `sig_host`. Then:
 - **Leaked sig1.** sig1 is a bearer token visible on the wire, and it is valid
   on every server where the key is authorized for that user. Anyone who has it
   passes the cheap filter, but each further attempt costs a rate-limited
-  verification, and they still cannot forge sig2. To keep the token from
-  locking out the real user, rate limits are per source prefix. An attacker
-  who can spoof the victim's exact prefix can still exhaust that prefix's
-  bucket, but such an attacker is effectively on-path and could drop the
-  victim's packets anyway.
+  verification, and they still cannot forge sig2. Verifications from source
+  prefixes that never sent a valid knock for the key share one small
+  per-key budget (`newprefix_bucket`), whatever addresses they are spoofed
+  from, so a leaked sig1 can take only a small share of the global
+  `verify_bucket`, and other users are unaffected. Prefixes the real user
+  has knocked from successfully keep their own bucket, are exempt from
+  that budget, and are evicted last, so the user keeps knocking from them.
+  From a new prefix, while a leaked sig1 is being flooded, the real user
+  may be rate limited until the flood stops. An attacker who can spoof the
+  victim's exact prefix can still exhaust that prefix's bucket, but such an
+  attacker is effectively on-path and could drop the victim's packets
+  anyway.
 - **Address binding.** The client cannot sign its own address because of NAT.
   The listener therefore relies on the source-IP check plus the DH token. An
   on-path observer can read the port but cannot complete the token step, and
@@ -357,7 +374,8 @@ has an invalid `sig_host`. Then:
   host key checking are unchanged and mandatory.
 - **Resource bounds.** All per-key state is bounded by the key table.
   Per-prefix buckets are LRU-capped, and listeners are capped per key and
-  short-lived.
+  short-lived. The key cache holds only names that pass the pre-check
+  (§5.1).
 
 ## 9. Open questions
 
@@ -409,10 +427,15 @@ knock. Who may log in is still decided by `AllowUsers` / `DenyUsers` /
 `AuthorizedKeysFile` (or, in `-A` mode, the global file for its single user).
 They are read on demand, as in §5.1: nothing at startup, a user's files only
 when a valid-looking knock for that user arrives, cached 60 s, and never for
-users outside `KnockUsers` when it is set. The read happens in the daemon
+users outside `KnockUsers` when it is set. Names outside `KnockUsers` (or,
+in `-A` mode, other than its user) and names unknown to the passwd database
+are refused before the lookup budget is charged, so they cannot use it up;
+this pre-check is a passwd lookup without reading any file, done for every
+in-time knock naming an uncached user. The read happens in the daemon
 parent (as root), so a slow passwd lookup (NSS/LDAP) can delay the accept
-loop. That happens at most once per user per minute, and within the global
-lookup rate. A knocked connection may only authenticate as the knock's user
+loop; setting `KnockUsers` avoids passwd lookups for other names entirely.
+Reading a user's files happens at most once per user per minute, and within
+the lookup rate limits. A knocked connection may only authenticate as the knock's user
 (`KnockBindUser` is always on). It goes through the same `MaxStartups` /
 per-source limits and the same forked-child path as any other connection.
 

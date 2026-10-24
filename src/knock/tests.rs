@@ -396,9 +396,15 @@ fn key_source_swap_keeps_and_drops_state() {
 struct CountingSource {
     keys: Vec<(String, Vec<u8>)>,
     calls: Arc<std::sync::Mutex<Vec<String>>>,
+    /// `may_knock` admits only users with keys.
+    gate: bool,
 }
 
 impl KnockKeySource for CountingSource {
+    fn may_knock(&self, user: &str) -> bool {
+        !self.gate || self.keys.iter().any(|(u, _)| u == user)
+    }
+
     fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>> {
         self.calls.lock().unwrap().push(user.to_string());
         self.keys
@@ -416,6 +422,7 @@ fn counting_setup() -> (Fixture, Arc<std::sync::Mutex<Vec<String>>>) {
     let source = CountingSource {
         keys: vec![(USER.to_string(), user_key.public_blob())],
         calls: calls.clone(),
+        gate: false,
     };
     let host_blob = host.public_blob();
     let f = Fixture {
@@ -490,6 +497,7 @@ fn key_cache_is_bounded() {
     let source = CountingSource {
         keys: Vec::new(),
         calls: calls.clone(),
+        gate: false,
     };
     f.state = KnockState::new(cfg, source, Vec::new(), NOW - 60_000);
     let fp = wire::key_fp(&f.host_blob);
@@ -513,6 +521,7 @@ fn key_lookups_are_rate_limited_and_real_users_survive_eviction() {
     let source = CountingSource {
         keys: vec![(USER.to_string(), f.user_key.public_blob())],
         calls: calls.clone(),
+        gate: false,
     };
     let host: KnockHostKey = Arc::new(ed25519());
     f.host_blob = host.public_blob();
@@ -540,6 +549,139 @@ fn key_lookups_are_rate_limited_and_real_users_survive_eviction() {
     let p = expect_accept(f.state.handle(NOW + 2, ip(1), &f.knock(NOW + 2)));
     f.state.release_pending(&p.user, &p.key_fp);
     assert_eq!(calls.lock().unwrap().len(), 4);
+}
+
+#[test]
+fn may_knock_refusals_cost_no_lookup_and_no_cache() {
+    let (mut f, calls) = counting_setup();
+    let cfg = KnockServerConfig {
+        key_lookups_per_sec: 2,
+        ..Default::default()
+    };
+    let source = CountingSource {
+        keys: vec![(USER.to_string(), f.user_key.public_blob())],
+        calls: calls.clone(),
+        gate: true,
+    };
+    let host: KnockHostKey = Arc::new(ed25519());
+    f.host_blob = host.public_blob();
+    f.state = KnockState::new(cfg, source, vec![host], NOW - 60_000);
+    let fp = wire::key_fp(&f.host_blob);
+    // Made-up names from many sources: refused before any lookup.
+    for i in 0..100u64 {
+        let (d, _) = make_knock(
+            f.user_key.as_ref(),
+            &format!("fake{i}"),
+            NOW + i,
+            Some(fp),
+            0,
+        );
+        let src = IpAddr::V4(Ipv4Addr::new(198, 51, 100, i as u8));
+        expect_drop(f.state.handle(NOW, src, &d), DropReason::UnknownKey);
+    }
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(format!("{:?}", f.state).contains("cached_users: 0"));
+    // The global lookup budget is intact for the real (uncached) user.
+    expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+    assert_eq!(*calls.lock().unwrap(), vec![USER.to_string()]);
+}
+
+#[test]
+fn key_lookups_are_rate_limited_per_source_prefix() {
+    let (mut f, calls) = counting_setup();
+    let cfg = KnockServerConfig {
+        key_lookups_prefix_burst: 2,
+        ..Default::default()
+    };
+    let source = CountingSource {
+        keys: vec![(USER.to_string(), f.user_key.public_blob())],
+        calls: calls.clone(),
+        gate: false,
+    };
+    let host: KnockHostKey = Arc::new(ed25519());
+    f.host_blob = host.public_blob();
+    f.state = KnockState::new(cfg, source, vec![host], NOW - 60_000);
+    let fp = wire::key_fp(&f.host_blob);
+    for i in 0..5u64 {
+        let (d, _) = make_knock(
+            f.user_key.as_ref(),
+            &format!("fake{i}"),
+            NOW + i,
+            Some(fp),
+            0,
+        );
+        let want = if i < 2 {
+            DropReason::UnknownKey
+        } else {
+            DropReason::RateLimited
+        };
+        expect_drop(f.state.handle(NOW, ip(9), &d), want);
+    }
+    assert_eq!(calls.lock().unwrap().len(), 2);
+    // Another source still gets its lookup.
+    expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+}
+
+/// A leaked sig1 replayed with forged sig2s from ever-new source prefixes
+/// costs at most the key's new-prefix budget of verifications: the global
+/// verify bucket survives, and so does the real user's known prefix.
+#[test]
+fn leaked_sig1_from_rotating_prefixes_cannot_starve_verify() {
+    let cfg = KnockServerConfig {
+        verify_per_sec: 20,
+        ..Default::default()
+    };
+    let mut f = setup_with(cfg, Box::new(ed25519()), Arc::new(ed25519()));
+    let p = expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+    f.state.release_pending(&p.user, &p.key_fp);
+
+    let attacker = ed25519();
+    let leaked = sig1(f.user_key.as_ref(), USER);
+    let fp = wire::key_fp(&f.host_blob);
+    let mut bad_sig2 = 0;
+    for i in 0..500u64 {
+        let eph = X25519PrivateKey::generate(&mut OsRng);
+        let d = KnockFields {
+            user: USER,
+            key_fp: wire::key_fp(&f.user_key.public_blob()),
+            sig1: &leaked,
+            nonce: NOW + 1 + i,
+            eph_c: eph.public_key(),
+            host_fp: Some(fp),
+        }
+        .build(&attacker, 0)
+        .unwrap();
+        let src = IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, i as u8, 1));
+        match f.state.handle(NOW, src, &d) {
+            Verdict::Drop(DropReason::BadSig2) => bad_sig2 += 1,
+            Verdict::Drop(DropReason::RateLimited) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // The real knock from ip(1) took one new-prefix token.
+    assert_eq!(bad_sig2, KnockServerConfig::default().newprefix_burst - 1);
+    // The real user's known prefix is neither evicted nor starved.
+    expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW + 1000)));
+}
+
+#[test]
+fn evicting_a_prefix_gives_no_fresh_burst() {
+    let cfg = KnockServerConfig {
+        max_prefixes_per_key: 1,
+        ..Default::default()
+    };
+    let mut f = setup_with(cfg, Box::new(ed25519()), Arc::new(ed25519()));
+    let p = expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+    f.state.release_pending(&p.user, &p.key_fp);
+    // ip(2) evicts ip(1) and starts with two tokens, not knock_burst.
+    for i in 1..=2 {
+        let p = expect_accept(f.state.handle(NOW, ip(2), &f.knock(NOW + i)));
+        f.state.release_pending(&p.user, &p.key_fp);
+    }
+    expect_drop(
+        f.state.handle(NOW, ip(2), &f.knock(NOW + 3)),
+        DropReason::RateLimited,
+    );
 }
 
 /// Full loopback: UDP knock → ACCEPT → rendezvous connect → token check.

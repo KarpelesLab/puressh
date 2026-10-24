@@ -2355,6 +2355,21 @@ mod imp {
             }
             keys
         }
+
+        /// Asked before a lookup is charged to the knock lookup budget, so
+        /// made-up names cannot use it up: `KnockUsers` / `-A` membership,
+        /// then a passwd lookup (no file reads), as `keys_for` would.
+        fn may_knock(&self, user: &str) -> bool {
+            if let Some(users) = &self.users
+                && !users.iter().any(|u| u == user)
+            {
+                return false;
+            }
+            match &self.global {
+                Some((only, _)) => only == user,
+                None => lookup_user(user).is_ok(),
+            }
+        }
     }
 
     /// `KnockListen` value → `host:port`, defaulting the port to the SSH one.

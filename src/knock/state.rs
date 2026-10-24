@@ -42,8 +42,18 @@ pub struct KnockServerConfig {
     pub newsig1_refill_ms: u64,
     /// Global public-key verifications per second.
     pub verify_per_sec: u32,
-    /// Source prefixes tracked per (user, key) before LRU eviction.
+    /// Source prefixes tracked per (user, key) before LRU eviction. Once
+    /// full, a new prefix evicts the least recently used one that never sent
+    /// a valid knock (if any) and starts with a near-empty bucket, so
+    /// rotating (spoofed) source addresses earns no fresh bursts.
     pub max_prefixes_per_key: usize,
+    /// sig2 verifications per (user, key) for knocks from source prefixes
+    /// that have not yet sent a valid knock for it: burst size. Bounds the
+    /// share of [`Self::verify_per_sec`] one leaked sig1 can consume,
+    /// whatever source addresses it is sent from.
+    pub newprefix_burst: u32,
+    /// New-prefix sig2 bucket: ms per refilled token.
+    pub newprefix_refill_ms: u64,
     /// Accepted sig1 values cached per (user, key).
     pub sig1_cache_size: usize,
     /// How long a user's keys from the [`KnockKeySource`] are reused before
@@ -58,6 +68,14 @@ pub struct KnockServerConfig {
     /// cache entry if there is one. Bounds the disk / passwd work a flood of
     /// made-up user names can cause.
     pub key_lookups_per_sec: u32,
+    /// Key-source lookups per source prefix (/32 IPv4, /64 IPv6): burst
+    /// size. Checked before the global limit, so one source cannot drain it.
+    pub key_lookups_prefix_burst: u32,
+    /// Per-prefix lookup bucket: ms per refilled token.
+    pub key_lookups_prefix_refill_ms: u64,
+    /// Source prefixes tracked for the per-prefix lookup limit before LRU
+    /// eviction (a new prefix then starts with a single token).
+    pub key_lookup_prefixes: usize,
 }
 
 impl Default for KnockServerConfig {
@@ -73,10 +91,15 @@ impl Default for KnockServerConfig {
             newsig1_refill_ms: 60_000,
             verify_per_sec: 1000,
             max_prefixes_per_key: 64,
+            newprefix_burst: 10,
+            newprefix_refill_ms: 1000,
             sig1_cache_size: 4,
             key_cache_ttl_ms: 60_000,
             key_cache_users: 4096,
             key_lookups_per_sec: 50,
+            key_lookups_prefix_burst: 10,
+            key_lookups_prefix_refill_ms: 200,
+            key_lookup_prefixes: 1024,
         }
     }
 }
@@ -93,6 +116,17 @@ pub trait KnockKeySource: Send {
     /// SSH wire blobs of the plain public keys `user` may knock with.
     /// Unsupported key types and certificates are ignored.
     fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>>;
+
+    /// Cheap pre-check, asked before a lookup is charged to the lookup rate
+    /// limits: `false` means `user` can never knock (not a configured or
+    /// existing user), so the knock is dropped without calling
+    /// [`Self::keys_for`] and without caching anything. It is called for
+    /// every knock naming a user whose keys are not cached, so it should be
+    /// much cheaper than `keys_for`. The default admits everyone.
+    fn may_knock(&self, user: &str) -> bool {
+        let _ = user;
+        true
+    }
 }
 
 /// The users and public keys allowed to knock: `user → {key_fp → key blob}`.
@@ -143,6 +177,10 @@ impl KnockKeySource for KnockKeyTable {
             .map(|k| k.values().cloned().collect())
             .unwrap_or_default()
     }
+
+    fn may_knock(&self, user: &str) -> bool {
+        self.users.contains_key(user)
+    }
 }
 
 /// One user's keys as last returned by the [`KnockKeySource`].
@@ -168,6 +206,13 @@ impl Bucket {
             refill_ms: refill_ms.max(1),
             last_ms: now_ms,
         }
+    }
+
+    /// Like [`Self::new`] but starting with at most `tokens` tokens.
+    fn with_tokens(burst: u32, refill_ms: u64, now_ms: u64, tokens: u32) -> Self {
+        let mut b = Self::new(burst, refill_ms, now_ms);
+        b.tokens = tokens.min(burst);
+        b
     }
 
     fn take(&mut self, now_ms: u64) -> bool {
@@ -205,15 +250,28 @@ fn source_prefix(ip: IpAddr) -> [u8; 8] {
     }
 }
 
+/// Knock bucket of one source prefix of a (user, key).
+#[derive(Debug)]
+struct PrefixSlot {
+    prefix: [u8; 8],
+    bucket: Bucket,
+    last_used: u64,
+    /// A knock from this prefix passed sig2: exempt from the new-prefix
+    /// bucket, and evicted last.
+    good: bool,
+}
+
 #[derive(Debug)]
 struct Entry {
     sig1_cache: Vec<Vec<u8>>,
     newsig1: Bucket,
+    /// sig2 verifications for knocks from prefixes that are not `good`.
+    newprefix: Bucket,
     last_nonce: u64,
     last_knock_hash: [u8; 32],
     last_accept: Option<(Vec<u8>, u64)>,
-    /// (prefix, bucket, last use) — LRU by last use.
-    knock_buckets: Vec<([u8; 8], Bucket, u64)>,
+    /// LRU by last use, slots that are not `good` evicted first.
+    knock_buckets: Vec<PrefixSlot>,
     pending: u32,
 }
 
@@ -300,6 +358,8 @@ pub struct KnockState {
     host_keys: Vec<(KnockHostKey, Vec<u8>, [u8; 32])>,
     verify: Bucket,
     lookups: Bucket,
+    /// Per-source-prefix lookup buckets: prefix → (bucket, last use).
+    prefix_lookups: HashMap<[u8; 8], (Bucket, u64)>,
     nonce_floor: u64,
 }
 
@@ -349,6 +409,7 @@ impl KnockState {
             host_keys: hk,
             verify,
             lookups,
+            prefix_lookups: HashMap::new(),
             nonce_floor: now_ms,
         }
     }
@@ -379,21 +440,30 @@ impl KnockState {
 
     /// Make sure `user`'s keys are cached and fresh, asking the source if
     /// not. Drops per-key state of keys the source no longer returns.
-    /// Returns `false` when a lookup was needed but the lookup rate limit
-    /// refused it and no expired entry is left to fall back on.
-    fn load_user_keys(&mut self, user: &str, now_ms: u64) -> bool {
+    /// Returns `false` when a lookup was needed but a lookup rate limit (per
+    /// source prefix, then global) refused it and no expired entry is left
+    /// to fall back on. A user the source's
+    /// [`may_knock`](KnockKeySource::may_knock) refuses costs no lookup
+    /// token and is not cached.
+    fn load_user_keys(&mut self, user: &str, src: IpAddr, now_ms: u64) -> bool {
         let ttl = self.cfg.key_cache_ttl_ms;
-        let cached = self.key_cache.get(user);
-        if let Some(c) = cached
+        if let Some(c) = self.key_cache.get(user)
             && now_ms >= c.loaded_ms
             && now_ms - c.loaded_ms < ttl
         {
             return true;
         }
-        if !self.lookups.take(now_ms) {
-            return cached.is_some();
+        if !self.source.may_knock(user) {
+            if self.key_cache.remove(user).is_some() {
+                self.entries.retain(|(u, _), _| u != user);
+            }
+            return true;
         }
-        if cached.is_none() && self.key_cache.len() >= self.cfg.key_cache_users.max(1) {
+        let cached = self.key_cache.contains_key(user);
+        if !self.take_prefix_lookup(src, now_ms) || !self.lookups.take(now_ms) {
+            return cached;
+        }
+        if !cached && self.key_cache.len() >= self.cfg.key_cache_users.max(1) {
             // Made-up names cost an entry each; evict those before real users.
             let victim = self
                 .key_cache
@@ -423,6 +493,39 @@ impl KnockState {
         true
     }
 
+    /// One token from the lookup bucket of `src`'s prefix.
+    fn take_prefix_lookup(&mut self, src: IpAddr, now_ms: u64) -> bool {
+        let prefix = source_prefix(src);
+        let cfg = &self.cfg;
+        let (bucket, used) = match self.prefix_lookups.get_mut(&prefix) {
+            Some(slot) => slot,
+            None => {
+                let mut tokens = cfg.key_lookups_prefix_burst;
+                if self.prefix_lookups.len() >= cfg.key_lookup_prefixes.max(1) {
+                    let lru = self
+                        .prefix_lookups
+                        .iter()
+                        .min_by_key(|(_, (_, used))| *used)
+                        .map(|(p, _)| *p);
+                    if let Some(p) = lru {
+                        self.prefix_lookups.remove(&p);
+                    }
+                    // A full table means many sources: no fresh burst each.
+                    tokens = 1;
+                }
+                let b = Bucket::with_tokens(
+                    cfg.key_lookups_prefix_burst,
+                    cfg.key_lookups_prefix_refill_ms,
+                    now_ms,
+                    tokens,
+                );
+                self.prefix_lookups.entry(prefix).or_insert((b, now_ms))
+            }
+        };
+        *used = now_ms;
+        bucket.take(now_ms)
+    }
+
     /// A rendezvous listener of (user, key) closed, by use or expiry — or a
     /// [`Verdict::Accept`] was abandoned before [`Self::complete`].
     pub fn release_pending(&mut self, user: &str, key_fp: &[u8; 32]) {
@@ -442,7 +545,7 @@ impl KnockState {
             return Verdict::Drop(DropReason::Clock);
         }
         // 3. user's keys, loaded lazily and cached
-        if !self.load_user_keys(k.user, now_ms) {
+        if !self.load_user_keys(k.user, src, now_ms) {
             return Verdict::Drop(DropReason::RateLimited);
         }
         let Some(key_blob) = self
@@ -459,6 +562,7 @@ impl KnockState {
             .or_insert_with(|| Entry {
                 sig1_cache: Vec::new(),
                 newsig1: Bucket::new(cfg.newsig1_burst, cfg.newsig1_refill_ms, now_ms),
+                newprefix: Bucket::new(cfg.newprefix_burst, cfg.newprefix_refill_ms, now_ms),
                 last_nonce: 0,
                 last_knock_hash: [0u8; 32],
                 last_accept: None,
@@ -487,7 +591,7 @@ impl KnockState {
                 && now_ms < *expiry
             {
                 let accept = accept.clone();
-                if !Self::take_knock_bucket(&self.cfg, entry, src, now_ms) {
+                if !Self::take_knock_bucket(&self.cfg, entry, src, now_ms).0 {
                     return Verdict::Drop(DropReason::RateLimited);
                 }
                 return Verdict::Resend(accept);
@@ -498,14 +602,18 @@ impl KnockState {
         if k.nonce <= entry.last_nonce || k.nonce < self.nonce_floor {
             return Verdict::Drop(DropReason::Replay);
         }
-        // 7. rate limits
-        if !Self::take_knock_bucket(&self.cfg, entry, src, now_ms) || !self.verify.take(now_ms) {
+        // 7. rate limits: the prefix's bucket, then the key's new-prefix
+        // bucket unless this prefix already sent a valid knock, then global
+        let (ok, slot) = Self::take_knock_bucket(&self.cfg, entry, src, now_ms);
+        let good = entry.knock_buckets[slot].good;
+        if !ok || (!good && !entry.newprefix.take(now_ms)) || !self.verify.take(now_ms) {
             return Verdict::Drop(DropReason::RateLimited);
         }
         // 8. sig2
         if wire::verify(key_blob, wire::NS_KNOCK, k.signed, k.sig2).is_err() {
             return Verdict::Drop(DropReason::BadSig2);
         }
+        entry.knock_buckets[slot].good = true;
         // 9. consume the nonce
         entry.last_nonce = k.nonce;
         entry.last_knock_hash = hash;
@@ -541,32 +649,49 @@ impl KnockState {
         })
     }
 
-    fn take_knock_bucket(cfg: &KnockServerConfig, e: &mut Entry, src: IpAddr, now_ms: u64) -> bool {
+    /// One token from the knock bucket of `src`'s prefix, and the index of
+    /// that prefix's slot.
+    fn take_knock_bucket(
+        cfg: &KnockServerConfig,
+        e: &mut Entry,
+        src: IpAddr,
+        now_ms: u64,
+    ) -> (bool, usize) {
         let prefix = source_prefix(src);
-        let idx = match e.knock_buckets.iter().position(|(p, _, _)| *p == prefix) {
+        let idx = match e.knock_buckets.iter().position(|s| s.prefix == prefix) {
             Some(i) => i,
             None => {
+                let mut tokens = cfg.knock_burst;
                 if e.knock_buckets.len() >= cfg.max_prefixes_per_key.max(1) {
                     let lru = e
                         .knock_buckets
                         .iter()
                         .enumerate()
-                        .min_by_key(|(_, (_, _, used))| *used)
+                        .min_by_key(|(_, s)| (s.good, s.last_used))
                         .map(|(i, _)| i)
                         .unwrap_or(0);
                     e.knock_buckets.swap_remove(lru);
+                    // A full table means many sources: no fresh burst each,
+                    // just enough for one knock and a retransmit.
+                    tokens = 2;
                 }
-                e.knock_buckets.push((
+                e.knock_buckets.push(PrefixSlot {
                     prefix,
-                    Bucket::new(cfg.knock_burst, cfg.knock_refill_ms, now_ms),
-                    now_ms,
-                ));
+                    bucket: Bucket::with_tokens(
+                        cfg.knock_burst,
+                        cfg.knock_refill_ms,
+                        now_ms,
+                        tokens,
+                    ),
+                    last_used: now_ms,
+                    good: false,
+                });
                 e.knock_buckets.len() - 1
             }
         };
         let slot = &mut e.knock_buckets[idx];
-        slot.2 = now_ms;
-        slot.1.take(now_ms)
+        slot.last_used = now_ms;
+        (slot.bucket.take(now_ms), idx)
     }
 
     /// Finish an [`Verdict::Accept`]: the caller has bound a listener on

@@ -1016,11 +1016,39 @@ impl SftpServerSession {
         let (Some((rf, rp)), Some((wf, wp))) = (file_of(rh), file_of(wh)) else {
             return Ok(status_pkt(id, FxpStatus::Failure, "invalid handle"));
         };
-        if rh == wh || rp == wp {
+        // Compare the open files themselves, not the path text: a hard link
+        // or a symlinked directory names the same inode under another path,
+        // and copying a file onto itself ahead of the read offset never
+        // reaches EOF.
+        let (rmd, wmd) = (rf.metadata()?, wf.metadata()?);
+        #[cfg(unix)]
+        let same = {
+            use std::os::unix::fs::MetadataExt;
+            let _ = (rp, wp);
+            (rmd.dev(), rmd.ino()) == (wmd.dev(), wmd.ino())
+        };
+        #[cfg(not(unix))]
+        let same = {
+            let _ = &wmd;
+            rp == wp
+        };
+        if rh == wh || same {
             return Ok(status_pkt(id, FxpStatus::Failure, "same file"));
         }
+        // Only a regular file has a size to stop at (`/dev/zero` or a FIFO
+        // would keep the session copying forever).
+        if !rmd.is_file() {
+            return Ok(status_pkt(
+                id,
+                FxpStatus::Failure,
+                "copy source is not a regular file",
+            ));
+        }
         let (mut rf, mut wf) = (rf.try_clone()?, wf.try_clone()?);
-        let mut left = if len == 0 { u64::MAX } else { len };
+        // Never copy past the source's size as of now, so a source that
+        // grows meanwhile cannot keep the copy going.
+        let avail = rmd.len().saturating_sub(roff);
+        let mut left = if len == 0 { avail } else { len.min(avail) };
         let mut buf = vec![0u8; 64 * 1024];
         while left > 0 {
             let want = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));

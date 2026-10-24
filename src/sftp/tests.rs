@@ -1201,3 +1201,31 @@ fn copy_data_and_limits() {
     drop(client);
     h.join().unwrap();
 }
+
+#[test]
+fn copy_data_refuses_aliased_and_unbounded_sources() {
+    // XFER-3: the same inode under another name (hard link), or a source
+    // with no end (`/dev/zero`), would otherwise copy forever.
+    let tmp = TempDir::new("copy-data-alias");
+    fs::write(tmp.path().join("src"), b"0123456789").unwrap();
+    fs::hard_link(tmp.path().join("src"), tmp.path().join("alias")).unwrap();
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+
+    let rh = client.open(b"src", FXF_READ, Attrs::default()).unwrap();
+    let wh = client.open(b"alias", FXF_WRITE, Attrs::default()).unwrap();
+    assert!(client.copy_data(&rh, 0, 0, &wh, 1).is_err());
+    client.close(&rh).unwrap();
+
+    let zero = client
+        .open(b"/dev/zero", FXF_READ, Attrs::default())
+        .unwrap();
+    assert!(client.copy_data(&zero, 0, 0, &wh, 0).is_err());
+    client.close(&zero).unwrap();
+    client.close(&wh).unwrap();
+    assert_eq!(fs::read(tmp.path().join("src")).unwrap(), b"0123456789");
+
+    drop(client);
+    h.join().unwrap();
+}

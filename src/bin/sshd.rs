@@ -2052,13 +2052,25 @@ mod imp {
         kind: &str,
         allowed_uid: Option<nix::unistd::Uid>,
     ) -> Result<(), String> {
-        use std::os::unix::fs::MetadataExt;
         let md = std::fs::metadata(path).map_err(|e| format!("stat {path}: {e}"))?;
+        check_md_strict(path, &md, forbidden_mask, kind, allowed_uid)
+    }
+
+    /// [`check_mode_strict`] on already-obtained metadata — for a file that
+    /// is open, its `fstat`, so the checks cover the very file that is read.
+    fn check_md_strict(
+        path: &str,
+        md: &std::fs::Metadata,
+        forbidden_mask: u32,
+        kind: &str,
+        allowed_uid: Option<nix::unistd::Uid>,
+    ) -> Result<(), String> {
+        use std::os::unix::fs::MetadataExt;
         if !md.is_file() {
             return Err(format!("{kind} {path}: not a regular file"));
         }
         let mode = md.mode() & 0o777;
-        if (mode as u32) & forbidden_mask != 0 {
+        if mode & forbidden_mask != 0 {
             return Err(format!(
                 "{kind} {path}: insecure mode 0o{mode:o} (must not have any of 0o{forbidden_mask:o}); \
                  fix with `chmod 0{:o} {path}` or override with --no-strict-modes",
@@ -2273,11 +2285,59 @@ mod imp {
         strict_modes: bool,
         owner_uid: Option<nix::unistd::Uid>,
     ) -> Result<AuthorizedKeys, String> {
-        if strict_modes {
-            check_mode_strict(path, 0o022, "authorized_keys file", owner_uid)?;
-        }
-        let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+        let body = read_user_auth_file(path, strict_modes, "authorized_keys file", owner_uid)?;
         Ok(parse_authorized_keys(&body, path))
+    }
+
+    /// Largest per-user auth file (`authorized_keys`, principals) read.
+    const USER_AUTH_FILE_MAX: u64 = 1024 * 1024;
+
+    /// Read a user-controlled auth file (`authorized_keys`,
+    /// `AuthorizedPrincipalsFile`) as root without trusting the path between
+    /// check and use: open it once non-blocking (a FIFO cannot hang the
+    /// daemon), `fstat` the open descriptor and require a regular file, run
+    /// the StrictModes owner/mode checks on that same descriptor's metadata
+    /// (plus the path's ancestor walk), cap the size at
+    /// [`USER_AUTH_FILE_MAX`], and read from the descriptor. Symlinks are
+    /// followed, as OpenSSH does (e.g. a home-manager / dotfiles-managed
+    /// `authorized_keys`); the checks apply to the file actually opened.
+    fn read_user_auth_file(
+        path: &str,
+        strict_modes: bool,
+        kind: &str,
+        owner_uid: Option<nix::unistd::Uid>,
+    ) -> Result<String, String> {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+            .open(path)
+            .map_err(|e| format!("open {path}: {e}"))?;
+        let md = file.metadata().map_err(|e| format!("stat {path}: {e}"))?;
+        if strict_modes {
+            // Owner/mode on the open file; the ancestor walk is path-based
+            // (as OpenSSH's secure_filename).
+            check_md_strict(path, &md, 0o022, kind, owner_uid)?;
+        } else if !md.is_file() {
+            return Err(format!("{kind} {path}: not a regular file"));
+        }
+        if md.len() > USER_AUTH_FILE_MAX {
+            return Err(format!(
+                "{kind} {path}: too large ({} bytes, limit {USER_AUTH_FILE_MAX})",
+                md.len()
+            ));
+        }
+        let mut body = String::new();
+        file.take(USER_AUTH_FILE_MAX + 1)
+            .read_to_string(&mut body)
+            .map_err(|e| format!("read {path}: {e}"))?;
+        if body.len() as u64 > USER_AUTH_FILE_MAX {
+            return Err(format!(
+                "{kind} {path}: too large (limit {USER_AUTH_FILE_MAX} bytes)"
+            ));
+        }
+        Ok(body)
     }
 
     /// Parse `authorized_keys` lines (a file's or an `AuthorizedKeysCommand`'s
@@ -2947,10 +3007,7 @@ mod imp {
         strict_modes: bool,
         owner_uid: Option<nix::unistd::Uid>,
     ) -> Result<Vec<AuthorizedPrincipal>, String> {
-        if strict_modes {
-            check_mode_strict(path, 0o022, "AuthorizedPrincipalsFile", owner_uid)?;
-        }
-        let body = std::fs::read_to_string(path).map_err(|e| format!("read {path}: {e}"))?;
+        let body = read_user_auth_file(path, strict_modes, "AuthorizedPrincipalsFile", owner_uid)?;
         Ok(parse_principals(&body, path))
     }
 
@@ -10117,6 +10174,35 @@ mod imp {
             assert!(!principals_match_option(&list, &["dev".to_string()]));
             assert!(!principals_match_option(&list, &[]));
             assert!(!principals_match_option(&[], &["ops".to_string()]));
+        }
+
+        #[test]
+        fn user_auth_file_refuses_fifo_and_oversize() {
+            let dir = tempdir_for_test("ak-fifo");
+            // A FIFO is refused at once (open is non-blocking), not read.
+            let fifo = dir.join("authorized_keys");
+            let _ = std::fs::remove_file(&fifo);
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::from_bits_truncate(0o600))
+                .expect("mkfifo");
+            let err = load_authorized_keys_and_cas(fifo.to_str().unwrap(), false, None)
+                .expect_err("fifo refused");
+            assert!(err.contains("not a regular file"), "{err}");
+            // Oversized: refused rather than read into memory.
+            let big = dir.join("principals");
+            let f = std::fs::File::create(&big).expect("create");
+            f.set_len(USER_AUTH_FILE_MAX + 1).expect("set_len");
+            let err = load_principals_file(big.to_str().unwrap(), false, None)
+                .expect_err("oversize refused");
+            assert!(err.contains("too large"), "{err}");
+            // A symlink to a regular file is still followed (as OpenSSH).
+            let real = dir.join("real_keys");
+            std::fs::write(&real, format!("{USERKEY_LINE}\n")).expect("write");
+            let link = dir.join("linked_keys");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            let set = load_authorized_keys_and_cas(link.to_str().unwrap(), false, None)
+                .expect("load via symlink");
+            assert_eq!(set.blobs.len(), 1);
         }
 
         #[test]

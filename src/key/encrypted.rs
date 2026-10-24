@@ -101,13 +101,17 @@ fn bytes_to_key(pass: &[u8], salt: &[u8], len: usize) -> Zeroizing<Vec<u8>> {
     out
 }
 
+/// Decode hex digits, byte by byte: a non-ASCII character (which slicing
+/// the string would split) or a sign is not a digit.
 fn hex(s: &str) -> Option<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
+    let digit = |b: u8| char::from(b).to_digit(16);
+    let (pairs, rest) = s.as_bytes().as_chunks::<2>();
+    if !rest.is_empty() {
         return None;
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+    pairs
+        .iter()
+        .map(|&[hi, lo]| Some((digit(hi)? << 4 | digit(lo)?) as u8))
         .collect()
 }
 
@@ -315,4 +319,35 @@ pub(crate) fn encrypt_pkcs8<R: CryptoRng + RngCore>(
         &seq(&[&kdf, &cipher]),
     ]);
     seq(&[&alg, &der::encode_octet_string(&data)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_rejects_non_ascii_and_signs() {
+        assert_eq!(hex("00ff7A"), Some(vec![0x00, 0xff, 0x7a]));
+        assert_eq!(hex(""), Some(vec![]));
+        assert_eq!(hex("0"), None);
+        // Four bytes, but "é" straddles the second pair: no panic.
+        assert_eq!(hex("0é0"), None);
+        assert_eq!(hex("+f"), None);
+        assert_eq!(hex("zz"), None);
+    }
+
+    /// A non-ASCII IV in `DEK-Info` is a format error, not a panic.
+    #[test]
+    fn non_ascii_dek_info_iv_is_rejected() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\n\
+                   Proc-Type: 4,ENCRYPTED\n\
+                   DEK-Info: AES-128-CBC,0é0\n\
+                   \n\
+                   AAAA\n\
+                   -----END RSA PRIVATE KEY-----\n";
+        assert!(matches!(
+            decrypt_traditional(pem, Some(b"pw")),
+            Err(Error::Format("encrypted PEM: bad IV"))
+        ));
+    }
 }

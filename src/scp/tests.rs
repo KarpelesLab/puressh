@@ -379,3 +379,56 @@ fn receiver_accepts_a_destination_file_that_does_not_exist_yet() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Send `src` (recursively) to a receiver whose top-level filter accepts
+/// only `allowed`; returns the receiver's result.
+fn send_with_top_level_filter(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    allowed: &'static str,
+) -> Result<(), super::ScpError> {
+    let (a, b) = UnixStream::pair().expect("socketpair");
+    let dst = dst.to_path_buf();
+    let recv = thread::spawn(move || {
+        let opts = ScpRecvOptions {
+            recursive: true,
+            ..Default::default()
+        };
+        Receiver::new(b, &dst, opts)
+            .expect("recv new")
+            .with_top_level_filter(move |n| n == allowed)
+            .run()
+    });
+    let mut sender = Sender::new(a).expect("send new");
+    let opts = ScpSendOptions {
+        recursive: true,
+        ..Default::default()
+    };
+    let _ = sender.send_path(src, &opts);
+    drop(sender);
+    recv.join().expect("recv join")
+}
+
+/// CVE-2019-6111 (XFER-2): with a top-level filter, a server cannot push a
+/// file or directory under a name the client did not ask for, while the
+/// contents of a requested directory are not constrained.
+#[test]
+fn receiver_top_level_filter_rejects_unrequested_names() {
+    let src_dir = fresh_tmp("send-filter");
+    let _g1 = DirGuard(src_dir.clone());
+    let dst_dir = fresh_tmp("recv-filter");
+    let _g2 = DirGuard(dst_dir.clone());
+
+    std::fs::write(src_dir.join(".bashrc"), b"evil").unwrap();
+    std::fs::create_dir(src_dir.join("evil")).unwrap();
+    std::fs::create_dir(src_dir.join("want")).unwrap();
+    std::fs::write(src_dir.join("want/anything"), b"ok").unwrap();
+
+    assert!(send_with_top_level_filter(&src_dir.join(".bashrc"), &dst_dir, "want").is_err());
+    assert!(!dst_dir.join(".bashrc").exists());
+    assert!(send_with_top_level_filter(&src_dir.join("evil"), &dst_dir, "want").is_err());
+    assert!(!dst_dir.join("evil").exists());
+
+    send_with_top_level_filter(&src_dir.join("want"), &dst_dir, "want").expect("requested dir");
+    assert_eq!(std::fs::read(dst_dir.join("want/anything")).unwrap(), b"ok");
+}

@@ -461,20 +461,116 @@ fn download_legacy(cli: &Cli, from: &Remote, target: &Path, errs: &mut u32) {
     opts.recursive = cli.xfer.recursive;
     opts.preserve_times = cli.xfer.preserve;
     opts.target_is_file = !target.is_dir();
-    // As OpenSSH's sink, without -r or -T a server may only send the file
-    // asked for (CVE-2019-6111). A glob or brace request is not checked.
+    // As OpenSSH's sink, unless -T a server may only send what was asked
+    // for (CVE-2019-6111): exactly the named file for a plain non-recursive
+    // request, otherwise top-level names matching the requested basename
+    // pattern(s), braces expanded. Unlike OpenSSH this also holds with -r.
     let base = from.path.rsplit('/').next().unwrap_or(&from.path);
     let expected = (!cli.xfer.recursive
         && !cli.no_name_check
         && !base.is_empty()
         && !base.contains(['*', '?', '[', '{', '\\']))
     .then_some(base);
+    let patterns = if cli.no_name_check || expected.is_some() {
+        None
+    } else {
+        requested_patterns(&from.path)
+    };
     let res = Receiver::new(pipe, target, opts)
-        .map(|r| r.with_expected_name(expected))
+        .map(|r| {
+            let r = r.with_expected_name(expected);
+            match patterns {
+                Some(p) => r.with_top_level_filter(move |name| {
+                    p.iter()
+                        .any(|pat| transfer::glob_match(pat.as_bytes(), name.as_bytes()))
+                }),
+                None => r,
+            }
+        })
         .and_then(|mut r| r.run());
     if let Err(e) = res {
         fail(errs, e);
     }
+}
+
+/// Most alternatives one brace expression may expand to before the name
+/// check gives up (the request is the user's own, so this only bounds work).
+const MAX_BRACE_EXPANSIONS: usize = 1024;
+
+/// The basename patterns a legacy `scp -f` request for `path` may answer
+/// with, braces expanded, or `None` when they cannot be predicted: an
+/// empty, `.` or `..` basename, or one the remote shell rewrites
+/// (`~`, `$`, backquotes, quotes).
+fn requested_patterns(path: &str) -> Option<Vec<String>> {
+    if path.contains(['~', '$', '`', '\'', '"']) {
+        return None;
+    }
+    let mut expanded = Vec::new();
+    if !brace_expand(path, 0, &mut expanded) {
+        return None;
+    }
+    expanded
+        .into_iter()
+        .map(|p| {
+            let p = p.trim_end_matches('/');
+            let base = p.rsplit('/').next().unwrap_or(p);
+            (!matches!(base, "" | "." | "..")).then(|| base.to_string())
+        })
+        .collect()
+}
+
+/// Expand `{a,b}` alternatives in `s` (from byte `from` on) into `out`,
+/// as the remote shell would; a brace without a top-level comma, or an
+/// unmatched one, is literal. `false` past [`MAX_BRACE_EXPANSIONS`].
+fn brace_expand(s: &str, from: usize, out: &mut Vec<String>) -> bool {
+    let b = s.as_bytes();
+    let mut i = from;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            b'{' => {
+                if let Some((close, commas)) = brace_group(b, i)
+                    && !commas.is_empty()
+                {
+                    let mut start = i + 1;
+                    for end in commas.into_iter().chain([close]) {
+                        let alt = format!("{}{}{}", &s[..i], &s[start..end], &s[close + 1..]);
+                        if !brace_expand(&alt, i, out) {
+                            return false;
+                        }
+                        start = end + 1;
+                    }
+                    return true;
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push(s.to_string());
+    out.len() <= MAX_BRACE_EXPANSIONS
+}
+
+/// The `}` matching the `{` at `open`, and the positions of the commas
+/// directly inside it.
+fn brace_group(b: &[u8], open: usize) -> Option<(usize, Vec<usize>)> {
+    let (mut depth, mut commas, mut i) = (0usize, Vec::new(), open);
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 1,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((i, commas));
+                }
+            }
+            b',' if depth == 1 => commas.push(i),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Remote to remote through this host, legacy protocol: `scp -f` on the
@@ -684,5 +780,31 @@ fn main() -> ExitCode {
             eprintln!("{msg}");
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::requested_patterns;
+
+    fn pats(p: &str) -> Option<Vec<String>> {
+        requested_patterns(p)
+    }
+
+    #[test]
+    fn requested_patterns_expand_braces_to_basenames() {
+        assert_eq!(pats("dir/*.txt").unwrap(), ["*.txt"]);
+        assert_eq!(pats("d/{a,b{1,2}}.c").unwrap(), ["a.c", "b1.c", "b2.c"]);
+        assert_eq!(pats("{x/one,y/two/}").unwrap(), ["one", "two"]);
+        assert_eq!(pats("lit{eral}").unwrap(), ["lit{eral}"]);
+        assert_eq!(pats("tree/").unwrap(), ["tree"]);
+    }
+
+    #[test]
+    fn requested_patterns_unpredictable_requests_are_not_checked() {
+        for p in ["", ".", "a/..", "~", "~/x", "$HOME", "`f`", "'q'", "{a,.}"] {
+            assert!(pats(p).is_none(), "{p}");
+        }
+        assert!(pats(&"{a,b}".repeat(11)).is_none());
     }
 }

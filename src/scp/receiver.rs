@@ -75,13 +75,21 @@ pub struct Receiver<S: Read + Write> {
     /// basename differs from `name`, refuses any `D`/`E`, and refuses more
     /// than one file in the whole transfer. `None` (recursive / glob /
     /// multi-file fetches, where the client legitimately cannot predict the
-    /// names) keeps the prior behaviour — confinement is via
-    /// `validate_name` + `guard_path`.
+    /// names) leaves confinement to `validate_name` + `guard_path`, plus
+    /// `top_level_filter` when the caller sets one.
     expected_name: Option<String>,
     /// Set once the first file has been received in `expected_name` mode,
     /// so a second `C` can be rejected.
     received_one: bool,
+    /// CVE-2019-6111 countermeasure for glob and recursive requests: when
+    /// set, every top-level `C`/`D` name (outside any `D` the receiver has
+    /// entered) must satisfy this predicate, typically "matches one of the
+    /// requested basename patterns", as OpenSSH's sink does.
+    top_level_filter: Option<NameFilter>,
 }
+
+/// Predicate on a top-level entry name, see [`Receiver::with_top_level_filter`].
+type NameFilter = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 impl<S: Read + Write> Receiver<S> {
     /// Wrap a transport. Sends the initial `0x00` ack to tell the peer
@@ -126,6 +134,7 @@ impl<S: Read + Write> Receiver<S> {
             max_file_size: Some(DEFAULT_MAX_FILE_SIZE),
             expected_name: None,
             received_one: false,
+            top_level_filter: None,
         })
     }
 
@@ -148,6 +157,37 @@ impl<S: Read + Write> Receiver<S> {
     pub fn with_expected_name(mut self, name: Option<&str>) -> Self {
         self.expected_name = name.map(|s| s.to_string());
         self
+    }
+
+    /// Only accept top-level `C`/`D` records (those not inside a `D` the
+    /// receiver has entered) whose name satisfies `filter`.
+    ///
+    /// Use this when the client cannot know the exact name it will get
+    /// (a glob, brace or recursive request) but does know which names it
+    /// asked for: `filter` typically matches the name against the
+    /// requested basename pattern(s), so a malicious server cannot push
+    /// arbitrary extra entries (e.g. `.bashrc`) into the destination
+    /// directory. Entries below a top-level directory are not checked.
+    pub fn with_top_level_filter(
+        mut self,
+        filter: impl Fn(&str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.top_level_filter = Some(Box::new(filter));
+        self
+    }
+
+    /// Refuse a top-level name the [`Self::with_top_level_filter`]
+    /// predicate rejects, before acking or touching the filesystem.
+    fn check_top_level_name(&mut self, name: &str) -> Result<(), ScpError> {
+        if self.stack.is_empty()
+            && let Some(filter) = self.top_level_filter.as_ref()
+            && !filter(name)
+        {
+            let msg = "filename does not match request";
+            let _ = write_fatal(&mut self.stream, msg);
+            return Err(ScpError::Unexpected("filename does not match request"));
+        }
+        Ok(())
     }
 
     /// Run the receive loop to completion. Reads headers in a loop and
@@ -176,6 +216,7 @@ impl<S: Read + Write> Receiver<S> {
                         let _ = write_fatal(&mut self.stream, msg);
                         return Err(ScpError::Unexpected("directory entry but -r not set"));
                     }
+                    self.check_top_level_name(&name)?;
                     self.recv_dir(mode, &name)?;
                 }
                 Header::EndDir => {
@@ -188,6 +229,7 @@ impl<S: Read + Write> Receiver<S> {
                     write_ok(&mut self.stream)?;
                 }
                 Header::File { mode, size, name } => {
+                    self.check_top_level_name(&name)?;
                     self.recv_file(mode, size, &name)?;
                 }
             }

@@ -44,7 +44,7 @@ cat >"$ROOT/DEBIAN/control" <<CTRL
 Package: $PKG
 Version: $DEBVER
 Architecture: $ARCH
-Maintainer: Mark Karpeles <magicaltux@gmail.com>
+Maintainer: Mark Karpeles <mark@klb.jp>
 Installed-Size: $SIZE
 Depends: libc6 (>= 2.31)
 Recommends: openssh-client

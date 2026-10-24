@@ -71,7 +71,7 @@ cat >"$ROOT/DEBIAN/control" <<CTRL
 Package: $PKG
 Version: $DEBVER
 Architecture: $ARCH
-Maintainer: Mark Karpeles <magicaltux@gmail.com>
+Maintainer: Mark Karpeles <mark@klb.jp>
 Installed-Size: $SIZE
 Depends: libc6 (>= 2.31), libpam0g (>= 0.99.7.1), libpam-modules, libpam-runtime
 Recommends: libpam-systemd, ncurses-term, xauth

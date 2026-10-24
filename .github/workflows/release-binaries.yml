@@ -190,6 +190,130 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${TAG}" out/* --clobber
 
+  # Rebuild the GitHub Pages apt repository from the .deb assets publish-linux
+  # just uploaded, so `apt install puressh-server` works on Ubuntu. Skips
+  # itself (no failure) until the APT_GPG_PRIVATE_KEY signing secret is set;
+  # see packaging/apt/README.md for the one-time setup.
+  publish-apt:
+    name: publish apt repository
+    needs: publish-linux
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Check for signing key
+        id: check
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "$APT_GPG_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "APT_GPG_PRIVATE_KEY is not set; skipping apt repository publish." >&2
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install reprepro
+        if: steps.check.outputs.enabled == 'true'
+        run: sudo apt-get update && sudo apt-get install -y reprepro
+
+      - name: Import signing key
+        if: steps.check.outputs.enabled == 'true'
+        id: gpg
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+        run: |
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          echo "pinentry-mode loopback"  > "$GNUPGHOME/gpg.conf"
+          printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
+          keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+          if [ -z "$keyid" ]; then echo "no key imported" >&2; exit 1; fi
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
+
+      - name: Download .deb assets from the release
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p debs
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.deb' --dir debs
+          ls -l debs
+
+      - name: Check out existing gh-pages (or start it)
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          url="https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}.git"
+          if git clone --depth 1 --branch gh-pages "$url" site 2>/dev/null; then
+            echo "cloned existing gh-pages"
+          else
+            echo "gh-pages does not exist yet; creating it"
+            mkdir -p site
+            git -C site init -q
+            git -C site remote add origin "$url"
+            git -C site checkout -q --orphan gh-pages
+          fi
+
+      - name: Build the repository with reprepro
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          KEYID: ${{ steps.gpg.outputs.keyid }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          repo="$PWD/site"
+
+          mkdir -p "$repo/conf"
+          sed "s/@KEYID@/$KEYID/g" packaging/apt/distributions.in > "$repo/conf/distributions"
+
+          # Idempotent: drop any prior entries, then add this release's.
+          for suite in focal jammy noble; do
+            reprepro -b "$repo" remove "$suite" puressh-server puressh-client >/dev/null 2>&1 || true
+          done
+
+          shopt -s nullglob
+          # Server packages are suite-specific (~ubuntuNN in the version).
+          for deb in debs/puressh-server_*.deb; do
+            case "$deb" in
+              *~ubuntu20.04_*) suite=focal ;;
+              *~ubuntu22.04_*) suite=jammy ;;
+              *~ubuntu24.04_*) suite=noble ;;
+              *) echo "skipping unrecognised server package: $deb" >&2; continue ;;
+            esac
+            reprepro -b "$repo" includedeb "$suite" "$deb"
+          done
+          # The client package is suite-agnostic: publish it into every suite.
+          for deb in debs/puressh-client_*.deb; do
+            for suite in focal jammy noble; do
+              reprepro -b "$repo" includedeb "$suite" "$deb"
+            done
+          done
+
+          # Publish the public key and a landing page.
+          gpg --armor --export "$KEYID" > "$repo/puressh-archive-keyring.asc"
+          owner_lc=$(echo "${GITHUB_REPOSITORY%%/*}" | tr '[:upper:]' '[:lower:]')
+          pages_url="https://${owner_lc}.github.io/${GITHUB_REPOSITORY#*/}"
+          sed "s#@PAGES_URL@#${pages_url}#g" packaging/apt/index.html.in > "$repo/index.html"
+          # GitHub Pages skips files under directories starting with "_"; none
+          # here, but disable Jekyll processing to be safe.
+          touch "$repo/.nojekyll"
+
+      - name: Commit and push gh-pages
+        if: steps.check.outputs.enabled == 'true'
+        run: |
+          cd site
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "apt repository unchanged for ${TAG}"
+          else
+            git commit -m "apt: publish ${TAG}"
+            git push origin gh-pages
+          fi
+
   build-macos-universal:
     name: build macos universal
     runs-on: macos-latest

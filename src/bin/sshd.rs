@@ -3010,9 +3010,14 @@ mod imp {
     /// Parse a peer descriptor (`"ip:port"`, `"[v6]:port"`, or a bare IP) into
     /// an `IpAddr`. Returns `None` if no IP can be recovered.
     fn parse_peer_ip(peer: &str) -> Option<std::net::IpAddr> {
-        // Try the full socket-addr form first, then a bracketed v6, then bare.
+        // Try the full socket-addr form first, then a bare address (before
+        // the `host:port` split, which would misread a bare IPv6 such as
+        // `2001:db8::1:5` as `2001:db8::1` port 5), then a bracketed v6.
         if let Ok(sa) = peer.parse::<std::net::SocketAddr>() {
             return Some(sa.ip());
+        }
+        if let Ok(ip) = peer.parse() {
+            return Some(ip);
         }
         if let Some(inner) = peer.strip_prefix('[').and_then(|s| s.split(']').next())
             && let Ok(ip) = inner.parse()
@@ -3024,7 +3029,7 @@ mod imp {
         {
             return Some(ip);
         }
-        peer.parse().ok()
+        None
     }
 
     /// Does `ip` fall within `cidr` (e.g. `"10.0.0.0/8"`, `"192.168.1.5"`,
@@ -3093,6 +3098,9 @@ mod imp {
         user: puressh::config::HostPattern,
         /// Host glob (the part after `@`), or `None` for a bare-user token.
         host: Option<puressh::config::HostPattern>,
+        /// The host half verbatim when it is an address/prefix (`10.0.0.0/8`):
+        /// matched as a CIDR, not a glob, as OpenSSH's `addr_match_list` does.
+        host_cidr: Option<String>,
     }
 
     impl UserHostPattern {
@@ -3109,11 +3117,13 @@ mod imp {
                     // globs are always positive patterns.
                     user: puressh::config::HostPattern::parse(user),
                     host: Some(puressh::config::HostPattern::parse(host)),
+                    host_cidr: host.contains('/').then(|| host.to_string()),
                 },
                 None => UserHostPattern {
                     negated,
                     user: puressh::config::HostPattern::parse(body),
                     host: None,
+                    host_cidr: None,
                 },
             }
         }
@@ -3130,9 +3140,12 @@ mod imp {
             if !user_ok {
                 return false;
             }
-            match &self.host {
-                None => true,
-                Some(h) => match peer {
+            match (&self.host, &self.host_cidr) {
+                (None, _) => true,
+                (Some(_), Some(cidr)) => peer
+                    .and_then(parse_peer_ip)
+                    .is_some_and(|ip| cidr_matches(cidr, ip.to_canonical())),
+                (Some(h), None) => match peer {
                     Some(p) => puressh::config::host_matches(core::slice::from_ref(h), p),
                     None => false,
                 },
@@ -9589,6 +9602,24 @@ mod imp {
             let bare = UserHostPattern::parse("dev-*");
             assert!(bare.host.is_none());
             assert!(bare.positive_match("dev-1", None));
+        }
+
+        #[test]
+        fn user_host_pattern_cidr() {
+            // `user@net/len` is a CIDR match on the peer, not a glob.
+            let p = UserHostPattern::parse("alice@10.0.0.0/8");
+            assert!(p.positive_match("alice", Some("10.1.2.3")));
+            assert!(p.positive_match("alice", Some("::ffff:10.1.2.3")));
+            assert!(!p.positive_match("alice", Some("192.0.2.1")));
+            assert!(!p.positive_match("bob", Some("10.1.2.3")));
+            assert!(!p.positive_match("alice", None));
+            let v6 = UserHostPattern::parse("*@2001:db8::/32");
+            assert!(v6.positive_match("eve", Some("2001:db8::5")));
+            assert!(!v6.positive_match("eve", Some("2001:db9::5")));
+            // A CIDR DenyUsers entry actually refuses.
+            let deny = UserHostPattern::parse_all(&["*@10.0.0.0/8".to_string()]);
+            assert!(user_host_list_matches(&deny, "mallory", Some("10.9.9.9")));
+            assert!(!user_host_list_matches(&deny, "mallory", Some("192.0.2.9")));
         }
 
         // ---- F7: ChrootDirectory path resolution + ownership check ----------

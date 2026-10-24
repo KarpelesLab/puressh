@@ -259,8 +259,17 @@ impl<T: Read + Write> SftpClient<T> {
             this.drain(n);
             Err(e)
         };
+        // Never run more than `depth` chunks ahead of what reached `sink`:
+        // a server answering the lowest range a byte at a time while
+        // completing later ones would otherwise grow `received` without
+        // bound. The range at `written` is always outstanding (or past
+        // EOF), so this cannot stall.
+        let window = depth as u64 * u64::from(chunk);
         loop {
-            while outstanding.len() < depth && eof.is_none_or(|e| next < e) {
+            while outstanding.len() < depth
+                && next - written < window
+                && eof.is_none_or(|e| next < e)
+            {
                 let id = self.send(Packet::Read {
                     id: 0,
                     handle: handle.to_vec(),

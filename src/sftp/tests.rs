@@ -1261,3 +1261,72 @@ fn jailed_home_lookups_hide_outside_homes() {
     drop(b);
     h.join().unwrap();
 }
+
+#[test]
+fn read_to_bounds_readahead_when_first_range_trickles() {
+    // XFER-4: a server that answers the lowest range one byte at a time
+    // while answering every later range in full must not make the client
+    // run (and buffer) arbitrarily far ahead of what reached the sink.
+    const CHUNK: u32 = 64;
+    const DEPTH: usize = 4;
+    const SIZE: u64 = 64 * 1000;
+    let (a, mut b) = pair();
+    let server = thread::spawn(move || {
+        let _ = read_packet(&mut b).unwrap();
+        write_packet(
+            &mut b,
+            &Packet::Version {
+                version: 3,
+                extensions: Vec::new(),
+            },
+        )
+        .unwrap();
+        // Highest offset requested before the first chunk was complete.
+        let mut first_done = false;
+        let mut max_ahead = 0u64;
+        while let Ok(body) = read_packet(&mut b) {
+            let Packet::Read {
+                id, offset, len, ..
+            } = Packet::decode(&body).unwrap()
+            else {
+                panic!("expected READ");
+            };
+            if !first_done {
+                max_ahead = max_ahead.max(offset);
+            }
+            let reply = if offset >= SIZE {
+                Packet::Status {
+                    id,
+                    code: FxpStatus::Eof,
+                    message: Vec::new(),
+                    lang: Vec::new(),
+                }
+            } else {
+                let n = if offset < u64::from(CHUNK) {
+                    first_done |= offset + 1 == u64::from(CHUNK);
+                    1
+                } else {
+                    len as usize
+                };
+                Packet::Data {
+                    id,
+                    data: vec![b'x'; n],
+                }
+            };
+            write_packet(&mut b, &reply).unwrap();
+        }
+        max_ahead
+    });
+    let mut client = SftpClient::new(a).unwrap();
+    let mut sink = Vec::new();
+    let n = client
+        .read_to(b"h", 0, CHUNK, DEPTH, &mut sink, |_| {})
+        .unwrap();
+    assert_eq!(n, SIZE);
+    drop(client);
+    let max_ahead = server.join().unwrap();
+    assert!(
+        max_ahead <= (DEPTH as u64 + 1) * u64::from(CHUNK),
+        "client read {max_ahead} bytes ahead of the sink"
+    );
+}

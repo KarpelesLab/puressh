@@ -14,7 +14,7 @@
 
 use std::io::{self, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -211,9 +211,14 @@ struct PipeReader {
     eof: bool,
 }
 
+/// Chunks (of up to 16 KiB) the stdout thread may read ahead of the client.
+const PIPE_READ_AHEAD: usize = 8;
+
 impl PipeReader {
     fn spawn(mut stdout: ChildStdout) -> io::Result<Self> {
-        let (tx, rx) = channel();
+        // Bounded: the thread reads ahead at most a few chunks, so a
+        // command that outpaces the client cannot grow memory without limit.
+        let (tx, rx) = sync_channel(PIPE_READ_AHEAD);
         std::thread::Builder::new()
             .name("proxycommand-stdout".into())
             .spawn(move || {

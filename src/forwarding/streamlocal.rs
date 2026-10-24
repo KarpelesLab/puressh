@@ -59,20 +59,81 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// thread to stop, joins it, and unlinks the on-disk socket.
 #[cfg(feature = "server")]
 struct Binding {
+    /// The authenticated user that created the binding; only they may
+    /// cancel it.
+    owner: String,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     socket_path: PathBuf,
+    /// `(st_dev, st_ino)` of the socket file this binding created, so the
+    /// drop only unlinks *our* socket, never one somebody else has since put
+    /// at the same path.
+    socket_id: (u64, u64),
 }
 
 #[cfg(feature = "server")]
 impl Drop for Binding {
     fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
         self.stop.store(true, Ordering::SeqCst);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        // Best-effort cleanup of the socket file.
-        let _ = std::fs::remove_file(&self.socket_path);
+        // Best-effort cleanup of the socket file — only if it is still the
+        // very socket we bound.
+        if let Ok(meta) = std::fs::symlink_metadata(&self.socket_path)
+            && (meta.dev(), meta.ino()) == self.socket_id
+        {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+}
+
+/// Whether the file at `path` is a stale socket left behind by an earlier
+/// listener of ours: a socket, owned by our effective uid, that nobody is
+/// listening on any more (connecting is refused). Only such a socket is
+/// unlinked to make room for a new binding; a live one, or another user's,
+/// is left alone and the bind fails with `EADDRINUSE`.
+#[cfg(feature = "server")]
+fn is_stale_own_socket(path: &std::path::Path, meta: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    if !meta.file_type().is_socket() {
+        return false;
+    }
+    if crate::sys::effective_uid().ok() != Some(meta.uid()) {
+        return false;
+    }
+    matches!(
+        UnixStream::connect(path),
+        Err(e) if e.kind() == ErrorKind::ConnectionRefused
+    )
+}
+
+/// Bind a listening socket at `path`, owner-only (OpenSSH's default
+/// `StreamLocalBindMask 0177`), and return it with the `(st_dev, st_ino)` of
+/// the socket file.
+///
+/// The umask is process-wide (and the server is multi-threaded), so the
+/// socket is created under it and immediately `chmod`ed to `0600`, before
+/// the accept loop starts. Any connection that slipped in during that window
+/// is drained from the backlog and dropped unserved.
+#[cfg(feature = "server")]
+fn bind_owner_only(path: &std::path::Path) -> Result<(UnixListener, (u64, u64))> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let listener = UnixListener::bind(path)?;
+    let finish = || -> Result<(u64, u64)> {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        let meta = std::fs::symlink_metadata(path)?;
+        listener.set_nonblocking(true)?;
+        while listener.accept().is_ok() {}
+        Ok((meta.dev(), meta.ino()))
+    };
+    match finish() {
+        Ok(id) => Ok((listener, id)),
+        Err(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(e)
+        }
     }
 }
 
@@ -178,28 +239,38 @@ impl StreamlocalForwardHandler for DefaultStreamlocalForwardHandler {
         }
         let path = PathBuf::from(socket_path);
 
-        // Refuse to bind over a symlink: following it could plant our socket
-        // (and redirect connections) into a directory an attacker controls.
-        if let Ok(meta) = std::fs::symlink_metadata(&path)
-            && meta.file_type().is_symlink()
-        {
-            return Err(Error::Protocol(
-                "streamlocal-forward: refusing to bind over a symlink",
-            ));
+        // The map is shared by every connection: a path somebody already
+        // forwards is refused, never replaced (replacing would unlink their
+        // live socket, and the evicted binding's drop would then delete
+        // ours). The lock is held until the new entry is inserted so two
+        // concurrent binds of one path cannot both pass this check.
+        let mut map = self
+            .bindings
+            .lock()
+            .map_err(|_| Error::Protocol("streamlocal-forward: lock poisoned"))?;
+        if map.contains_key(socket_path) {
+            return Err(Error::Protocol("streamlocal-forward: path already bound"));
         }
-        // Unlink a stale regular socket so the bind can succeed (matches
-        // OpenSSH, which removes an existing socket at the bind path). Only
-        // remove it when it is actually a socket — never a regular file or
-        // anything else the client happened to name.
+
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            use std::os::unix::fs::FileTypeExt;
-            if meta.file_type().is_socket() {
+            // Refuse to bind over a symlink: following it could plant our
+            // socket (and redirect connections) into a directory an attacker
+            // controls.
+            if meta.file_type().is_symlink() {
+                return Err(Error::Protocol(
+                    "streamlocal-forward: refusing to bind over a symlink",
+                ));
+            }
+            // OpenSSH's default (`StreamLocalBindUnlink no`) never unlinks an
+            // existing file. We unlink only a stale socket of our own uid, so
+            // a reconnecting client can reuse its path; a live socket, or
+            // anything else, makes the bind fail.
+            if is_stale_own_socket(&path, &meta) {
                 let _ = std::fs::remove_file(&path);
             }
         }
 
-        let listener = UnixListener::bind(&path)?;
-        listener.set_nonblocking(true)?;
+        let (listener, socket_id) = bind_owner_only(&path)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
@@ -235,29 +306,30 @@ impl StreamlocalForwardHandler for DefaultStreamlocalForwardHandler {
             }
         });
 
-        let mut map = self
-            .bindings
-            .lock()
-            .map_err(|_| Error::Protocol("streamlocal-forward: lock poisoned"))?;
-        if let Some(existing) = map.remove(socket_path) {
-            drop(existing);
-        }
         map.insert(
             socket_path.to_string(),
             Binding {
+                owner: user.to_string(),
                 stop,
                 handle: Some(handle),
                 socket_path: path,
+                socket_id,
             },
         );
         Ok(())
     }
 
-    fn unbind(&self, _user: &str, socket_path: &str) -> Result<()> {
+    fn unbind(&self, user: &str, socket_path: &str) -> Result<()> {
         let mut map = self
             .bindings
             .lock()
             .map_err(|_| Error::Protocol("streamlocal-forward: lock poisoned"))?;
+        // Only the user that created a binding may cancel it.
+        if map.get(socket_path).is_some_and(|b| b.owner != user) {
+            return Err(Error::Protocol(
+                "cancel-streamlocal-forward: binding owned by another user",
+            ));
+        }
         if let Some(binding) = map.remove(socket_path) {
             // Drop outside the lock to keep `unbind` fast for concurrent
             // callers — the `Drop` impl joins the worker thread.
@@ -401,6 +473,116 @@ mod tests {
             thread::sleep(Duration::from_millis(50));
         }
         assert!(!sock.exists(), "socket should be unlinked after unbind");
+    }
+
+    /// FWD-6: the socket is owner-only (StreamLocalBindMask 0177).
+    #[test]
+    fn bound_socket_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestTempDir::new("mode");
+        let sock = dir.path.join("fwd.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+        let h = DefaultStreamlocalForwardHandler::permit_all();
+        h.bind(
+            "u",
+            &sock_str,
+            StreamlocalForwardContext::for_test_no_opens(),
+        )
+        .expect("bind");
+        let mode = std::fs::metadata(&sock).expect("stat").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+        h.unbind("u", &sock_str).expect("unbind");
+    }
+
+    /// FWD-5: another user can neither displace nor cancel a binding, and
+    /// the binding's live socket survives both attempts.
+    #[test]
+    fn binding_is_owned_by_its_user() {
+        let dir = TestTempDir::new("owner");
+        let sock = dir.path.join("fwd.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+        let h = DefaultStreamlocalForwardHandler::permit_all();
+        h.bind(
+            "alice",
+            &sock_str,
+            StreamlocalForwardContext::for_test_no_opens(),
+        )
+        .expect("bind");
+        assert!(
+            h.bind(
+                "mallory",
+                &sock_str,
+                StreamlocalForwardContext::for_test_no_opens()
+            )
+            .is_err()
+        );
+        assert!(h.unbind("mallory", &sock_str).is_err());
+        assert_eq!(h.binding_count(), 1);
+        assert!(UnixStream::connect(&sock).is_ok(), "alice's socket is live");
+        h.unbind("alice", &sock_str).expect("owner unbind");
+    }
+
+    /// FWD-5: dropping a binding never unlinks a socket that has since been
+    /// replaced by someone else's at the same path.
+    #[test]
+    fn unbind_leaves_a_replacement_socket_alone() {
+        let dir = TestTempDir::new("replace");
+        let sock = dir.path.join("fwd.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+        let h = DefaultStreamlocalForwardHandler::permit_all();
+        h.bind(
+            "u",
+            &sock_str,
+            StreamlocalForwardContext::for_test_no_opens(),
+        )
+        .expect("bind");
+        std::fs::remove_file(&sock).expect("unlink");
+        let other = UnixListener::bind(&sock).expect("rebind elsewhere");
+        h.unbind("u", &sock_str).expect("unbind");
+        assert!(sock.exists(), "the replacement socket must survive");
+        drop(other);
+    }
+
+    /// FWD-6: a stale socket of ours is replaced; a live one is not.
+    #[test]
+    fn only_a_stale_existing_socket_is_unlinked() {
+        let dir = TestTempDir::new("stale");
+        let sock = dir.path.join("fwd.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+        let h = DefaultStreamlocalForwardHandler::permit_all();
+
+        let live = UnixListener::bind(&sock).expect("live listener");
+        assert!(
+            h.bind(
+                "u",
+                &sock_str,
+                StreamlocalForwardContext::for_test_no_opens()
+            )
+            .is_err(),
+            "a live socket must not be replaced"
+        );
+        assert!(UnixStream::connect(&sock).is_ok(), "live socket intact");
+        drop(live); // leaves the (now stale) socket file behind
+
+        h.bind(
+            "u",
+            &sock_str,
+            StreamlocalForwardContext::for_test_no_opens(),
+        )
+        .expect("stale socket replaced");
+        h.unbind("u", &sock_str).expect("unbind");
+
+        // A regular file is never removed.
+        std::fs::write(&sock, b"x").expect("write");
+        assert!(
+            h.bind(
+                "u",
+                &sock_str,
+                StreamlocalForwardContext::for_test_no_opens()
+            )
+            .is_err()
+        );
+        assert_eq!(std::fs::read(&sock).expect("read"), b"x");
     }
 
     #[test]

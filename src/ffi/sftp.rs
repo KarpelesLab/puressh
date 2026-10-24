@@ -698,6 +698,10 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
     })
 }
 
+/// Consecutive empty `SSH_FXP_NAME` replies [`pcssh_sftp_readdir`] accepts
+/// before giving up on the server.
+const MAX_EMPTY_READDIR_CHUNKS: usize = 64;
+
 /// Read one directory entry. Returns [`PCSSH_OK`] with entry data on
 /// success, [`PCSSH_OK`] with `*name_len = 0` and `out_attrs->flags = 0`
 /// on EOF (i.e. no more entries), or a negative code on error. The
@@ -709,6 +713,9 @@ pub unsafe extern "C" fn pcssh_sftp_opendir(
 /// On [`PCSSH_ERR_BUFFER_TOO_SMALL`] the entry is left in the cache and
 /// `*name_len` / `*longname_len` are set to the required sizes, so the
 /// caller can retry the same entry with larger buffers.
+///
+/// Returns [`PCSSH_ERR_PROTOCOL`] if the server keeps answering with empty
+/// chunks (no entries and no end-of-directory).
 ///
 /// # Safety
 ///
@@ -743,8 +750,15 @@ pub unsafe extern "C" fn pcssh_sftp_readdir(
         // and serve one entry per call so no entries are dropped (the prior
         // implementation discarded everything past the first entry of each
         // chunk). Keep requesting until we have an entry or the server
-        // signals end-of-directory.
+        // signals end-of-directory — but not forever: a server answering
+        // every request with an empty SSH_FXP_NAME would otherwise keep
+        // this call looping indefinitely.
+        let mut empty_chunks = 0usize;
         while d.cache.is_empty() && !d.eof {
+            if empty_chunks >= MAX_EMPTY_READDIR_CHUNKS {
+                return PCSSH_ERR_PROTOCOL;
+            }
+            empty_chunks += 1;
             let handle = d.handle.clone();
             let mut chunk_out: Option<Option<Vec<NameEntry>>> = None;
             let rc = with_parent(&d.sftp, |sess| match sess.readdir(&handle) {

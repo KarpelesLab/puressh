@@ -1841,3 +1841,223 @@ fn server_publickey_hostbound_must_name_our_host_key() {
         "publickey-hostbound-v00@openssh.com"
     );
 }
+
+// ---------------------------------------------------------------------------
+// AUTH-1: restrictions recorded by an earlier factor survive a later,
+// rejected publickey attempt, and accepted factors' restrictions combine.
+// ---------------------------------------------------------------------------
+
+/// `AuthenticationMethods publickey,password`-style policy: the trusted key
+/// (restricted by its authorized_keys options) is the first factor, any
+/// certificate is untrusted, and the password completes the chain.
+struct RestrictedKeyThenPassword {
+    trusted: Vec<u8>,
+    key_done: bool,
+}
+impl Authenticator for RestrictedKeyThenPassword {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                public_blob,
+                verified: true,
+                probe_only: false,
+                cert: None,
+                ..
+            } if public_blob == self.trusted => {
+                self.key_done = true;
+                AuthDecision::PartialAccept {
+                    still_required: vec!["password".into()],
+                }
+            }
+            AuthAttempt::Password { .. } if self.key_done => AuthDecision::Accept,
+            _ => AuthDecision::Reject,
+        }
+    }
+    fn key_restrictions(
+        &mut self,
+        _user: &str,
+        _public_blob: &[u8],
+    ) -> Option<super::server::AuthCertCaps> {
+        let mut caps = super::server::AuthCertCaps::unrestricted();
+        caps.permit_pty = false;
+        caps.force_command = Some("/bin/restricted".into());
+        Some(caps)
+    }
+}
+
+fn userauth_service_started(s: &mut ServerAuth) {
+    let _ = s.on_packet(
+        &super::message::ServiceRequest {
+            service: "ssh-userauth".into(),
+        }
+        .encode(),
+    );
+}
+
+#[test]
+fn rejected_cert_attempt_does_not_replace_earlier_factor_restrictions() {
+    let k1 = Ed25519HostKey::from_seed(TEST_SEED);
+    let self_ca = Ed25519HostKey::from_seed([0x55; 32]);
+    let other = Ed25519HostKey::from_seed([0x66; 32]);
+    let mut s = ServerAuth::new(
+        TEST_SID.to_vec(),
+        vec!["publickey", "password"],
+        Box::new(RestrictedKeyThenPassword {
+            trusted: k1.public_blob(),
+            key_done: false,
+        }),
+    );
+    s.set_now(CERT_NOW);
+    userauth_service_started(&mut s);
+    // Factor 1: the restricted key.
+    let first = signed_pubkey_request("alice", "ssh-ed25519", &k1.public_blob(), &k1);
+    match s.on_packet(&first).unwrap() {
+        ServerStep::Send(p) => assert!(UserauthFailure::decode(&p).unwrap().partial_success),
+        _ => panic!("expected partial success"),
+    }
+    // A properly signed cert from an untrusted (self-made) CA: rejected,
+    // and it must not replace the recorded restrictions.
+    let cert = build_ed25519_user_cert(&self_ca, &other, &["alice"], &[]);
+    let req = signed_pubkey_request("alice", "ssh-ed25519-cert-v01@openssh.com", &cert, &other);
+    assert_failure(s.on_packet(&req).unwrap());
+    // Factor 2: password. The key's restrictions still apply.
+    let pw = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::Password {
+            new_password: None,
+            password: "pw".into(),
+        },
+    }
+    .encode();
+    match s.on_packet(&pw).unwrap() {
+        ServerStep::Authenticated { cert_caps, .. } => {
+            let caps = cert_caps.expect("key restrictions carried");
+            assert!(!caps.permit_pty);
+            assert_eq!(caps.force_command.as_deref(), Some("/bin/restricted"));
+        }
+        _ => panic!("expected Authenticated"),
+    }
+}
+
+/// Two publickey factors, each with its own authorized_keys restrictions.
+struct TwoRestrictedKeys(u32);
+impl Authenticator for TwoRestrictedKeys {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        TwoKeys::evaluate(&mut TwoKeys(self.0), attempt).inspect_accept(|| self.0 += 1)
+    }
+    fn key_restrictions(
+        &mut self,
+        _user: &str,
+        blob: &[u8],
+    ) -> Option<super::server::AuthCertCaps> {
+        let mut c = super::server::AuthCertCaps::unrestricted();
+        if blob == Ed25519HostKey::from_seed(TEST_SEED).public_blob() {
+            c.permit_pty = false;
+            c.force_command = Some("/bin/a".into());
+        } else if blob == Ed25519HostKey::from_seed([9u8; 32]).public_blob() {
+            c.permit_port_forwarding = false;
+        } else {
+            c.force_command = Some("/bin/b".into());
+        }
+        Some(c)
+    }
+}
+
+trait InspectAccept {
+    fn inspect_accept(self, f: impl FnOnce()) -> Self;
+}
+impl InspectAccept for AuthDecision {
+    fn inspect_accept(self, f: impl FnOnce()) -> Self {
+        if matches!(
+            self,
+            AuthDecision::Accept | AuthDecision::PartialAccept { .. }
+        ) {
+            f();
+        }
+        self
+    }
+}
+
+#[test]
+fn accepted_factors_restrictions_are_intersected() {
+    let server = || {
+        let mut s = ServerAuth::new(
+            TEST_SID.to_vec(),
+            vec!["publickey"],
+            Box::new(TwoRestrictedKeys(0)),
+        );
+        userauth_service_started(&mut s);
+        s
+    };
+    let k1 = Ed25519HostKey::from_seed(TEST_SEED);
+    let k2 = Ed25519HostKey::from_seed([9u8; 32]);
+    let k3 = Ed25519HostKey::from_seed([10u8; 32]);
+    let first = signed_pubkey_request("alice", "ssh-ed25519", &k1.public_blob(), &k1);
+
+    let mut s = server();
+    match s.on_packet(&first).unwrap() {
+        ServerStep::Send(p) => assert!(UserauthFailure::decode(&p).unwrap().partial_success),
+        _ => panic!("expected partial success"),
+    }
+    let second = signed_pubkey_request("alice", "ssh-ed25519", &k2.public_blob(), &k2);
+    match s.on_packet(&second).unwrap() {
+        ServerStep::Authenticated { cert_caps, .. } => {
+            let caps = cert_caps.expect("caps");
+            assert!(!caps.permit_pty);
+            assert!(!caps.permit_port_forwarding);
+            assert_eq!(caps.force_command.as_deref(), Some("/bin/a"));
+        }
+        _ => panic!("expected Authenticated"),
+    }
+
+    // Conflicting forced commands across factors: the later one is refused.
+    let mut s = server();
+    match s.on_packet(&first).unwrap() {
+        ServerStep::Send(p) => assert!(UserauthFailure::decode(&p).unwrap().partial_success),
+        _ => panic!("expected partial success"),
+    }
+    let third = signed_pubkey_request("alice", "ssh-ed25519", &k3.public_blob(), &k3);
+    assert_failure(s.on_packet(&third).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// AUTH-2: a certificate probe is answered with PK_OK only once the cert
+// itself (CA signature, type, validity, critical options) checks out.
+// ---------------------------------------------------------------------------
+#[test]
+fn cert_probe_requires_a_valid_certificate() {
+    let ca = Ed25519HostKey::from_seed([0x11; 32]);
+    let user_key = Ed25519HostKey::from_seed([0x22; 32]);
+    let alg = "ssh-ed25519-cert-v01@openssh.com";
+    let cert = build_ed25519_user_cert(&ca, &user_key, &["alice"], &[]);
+
+    let mut s = cert_server();
+    match s
+        .on_packet(&probe_pubkey_request("alice", alg, &cert))
+        .unwrap()
+    {
+        ServerStep::Send(p) => {
+            UserauthPkOk::decode(&p).expect("PK_OK");
+        }
+        _ => panic!("expected PK_OK"),
+    }
+
+    // Forged: the CA signature no longer matches.
+    let mut forged = cert.clone();
+    let n = forged.len();
+    forged[n - 1] ^= 0x01;
+    let mut s = cert_server();
+    assert_failure(
+        s.on_packet(&probe_pubkey_request("alice", alg, &forged))
+            .unwrap(),
+    );
+
+    // Unknown critical option.
+    let cert = build_ed25519_user_cert(&ca, &user_key, &["alice"], &[("bogus", Vec::new())]);
+    let mut s = cert_server();
+    assert_failure(
+        s.on_packet(&probe_pubkey_request("alice", alg, &cert))
+            .unwrap(),
+    );
+}

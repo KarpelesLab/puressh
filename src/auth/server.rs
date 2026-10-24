@@ -427,6 +427,16 @@ impl AuthCertCaps {
     }
 }
 
+/// Combine two optional restriction sets (`None` = unrestricted). The outer
+/// `None` means they conflict (different forced commands).
+#[cfg(feature = "alloc")]
+fn merge_caps(a: Option<AuthCertCaps>, b: Option<AuthCertCaps>) -> Option<Option<AuthCertCaps>> {
+    match (a, b) {
+        (Some(a), Some(b)) => a.intersect(b).map(Some),
+        (a, b) => Some(a.or(b)),
+    }
+}
+
 /// `host:port`, `[v6]:port` or (for `permitlisten`) a bare `port`; `*` for
 /// any port.
 #[cfg(feature = "alloc")]
@@ -864,16 +874,22 @@ impl ServerAuth {
         }
 
         if !signature_present {
-            // Probe (no signature). For a certificate, parse it so the
-            // authenticator can decide whether to invite a signature, but do
-            // not yet require CA validity — the binding signature comes next.
+            // Probe (no signature). For a certificate, run the same CA
+            // signature, type, validity and critical-option checks as the
+            // signed step before consulting the authenticator: otherwise an
+            // unauthenticated client could forge a cert naming a trusted CA
+            // key and use the PK_OK / FAILURE answer to enumerate users and
+            // principals.
             let cert_info = if is_cert {
                 match crate::cert::Certificate::parse(&public_blob) {
                     // The offered algorithm name must be one we know and
                     // must belong to the embedded key's family, exactly as
                     // for the signed step — otherwise the PK_OK we would
                     // echo back invites a signature we can never accept.
-                    Ok(c) if cert_plain_algorithm(&algorithm, &c).is_some() => {
+                    Ok(c)
+                        if cert_plain_algorithm(&algorithm, &c).is_some()
+                            && self.user_cert_valid(&c) =>
+                    {
                         Some(CertInfo::from_certificate(&c)?)
                     }
                     // A malformed cert blob is not a probe we can honour.
@@ -936,21 +952,7 @@ impl ServerAuth {
             if signature_algorithm(&sig) != Some(plain) {
                 return self.emit_failure();
             }
-            if cert.check_type(crate::cert::CertType::User).is_err()
-                || cert.check_validity(self.now).is_err()
-                || cert.require_known_critical_options().is_err()
-            {
-                return self.emit_failure();
-            }
-            let ca_algos: Vec<&str> = if self.ca_signature_algorithms.is_empty() {
-                crate::config::algos::CA_SIGNATURE_DEFAULTS.to_vec()
-            } else {
-                self.ca_signature_algorithms
-                    .iter()
-                    .map(|s| s.as_str())
-                    .collect()
-            };
-            if cert.verify_ca_signature(&ca_algos).is_err() {
+            if !self.user_cert_valid(&cert) {
                 return self.emit_failure();
             }
             // The verifier is keyed on the *negotiated* plain name (which
@@ -977,16 +979,11 @@ impl ServerAuth {
             return self.emit_failure();
         }
 
-        // Capture the cert's connection-phase capability gates (default-deny
-        // extensions + `force-command`) BEFORE evaluating, so an eventual
-        // Accept — possibly several factors later under a multi-factor chain —
-        // can carry them. The authenticator still owns the *trust* verdict; we
-        // only record what a successful cert would authorize. Overwrites any
-        // previously-captured caps so the last verified cert wins (matching the
-        // last-cert-verified semantics of a repeated publickey factor).
-        if let Some(ci) = &cert_info {
-            self.pending_cert_caps = Some(AuthCertCaps::from_cert_info(ci));
-        }
+        // The cert's connection-phase capability gates (default-deny
+        // extensions + `force-command`). Kept local until the authenticator
+        // accepts this attempt: a rejected attempt must never change the
+        // restrictions an earlier factor recorded.
+        let cert_caps = cert_info.as_ref().map(AuthCertCaps::from_cert_info);
 
         let decision = self.auth.evaluate(AuthAttempt::PublicKey {
             user: user.clone(),
@@ -997,24 +994,20 @@ impl ServerAuth {
             cert: cert_info,
         });
         // The accepted key's own restrictions (authorized_keys options),
-        // on top of a certificate's.
+        // on top of a certificate's, on top of whatever earlier factors of a
+        // multi-factor chain recorded — the most restrictive wins, and
+        // conflicting forced commands refuse the attempt.
         let decision = match decision {
             d @ (AuthDecision::Accept | AuthDecision::PartialAccept { .. }) => {
-                match self.auth.key_restrictions(&user, &public_blob) {
-                    None => d,
-                    Some(r) => match self.pending_cert_caps.take() {
-                        None => {
-                            self.pending_cert_caps = Some(r);
-                            d
-                        }
-                        Some(c) => match c.intersect(r) {
-                            Some(both) => {
-                                self.pending_cert_caps = Some(both);
-                                d
-                            }
-                            None => AuthDecision::Reject,
-                        },
-                    },
+                let key_caps = self.auth.key_restrictions(&user, &public_blob);
+                let merged = merge_caps(cert_caps, key_caps)
+                    .and_then(|c| merge_caps(self.pending_cert_caps.clone(), c));
+                match merged {
+                    Some(c) => {
+                        self.pending_cert_caps = c;
+                        d
+                    }
+                    None => AuthDecision::Reject,
                 }
             }
             other => other,
@@ -1033,6 +1026,27 @@ impl ServerAuth {
         );
         self.record_success(&decision, line);
         self.apply_decision(decision, &user)
+    }
+
+    /// A user certificate's own validity: type, validity window, critical
+    /// options and CA signature (with the configured CA algorithms). The
+    /// authenticator still decides whether the CA is trusted.
+    fn user_cert_valid(&self, cert: &crate::cert::Certificate) -> bool {
+        if cert.check_type(crate::cert::CertType::User).is_err()
+            || cert.check_validity(self.now).is_err()
+            || cert.require_known_critical_options().is_err()
+        {
+            return false;
+        }
+        let ca_algos: Vec<&str> = if self.ca_signature_algorithms.is_empty() {
+            crate::config::algos::CA_SIGNATURE_DEFAULTS.to_vec()
+        } else {
+            self.ca_signature_algorithms
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
+        };
+        cert.verify_ca_signature(&ca_algos).is_ok()
     }
 
     /// Note a method that succeeded (fully or as one factor).

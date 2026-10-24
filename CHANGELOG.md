@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1](https://github.com/KarpelesLab/puressh/compare/v0.2.0...v0.2.1) - 2026-10-24
+
+### Added
+
+- *(packaging)* publish a signed apt repository on GitHub Pages
+
+### Fixed
+
+- *(proc_transport)* exec the ProxyCommand so drop kills the helper
+
 ## [0.2.0](https://github.com/KarpelesLab/puressh/compare/v0.1.11...v0.2.0) - 2026-10-18
 
 ### Added

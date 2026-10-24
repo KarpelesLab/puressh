@@ -38,7 +38,12 @@
 //! - `0x22` serial-bitmap: `u64 offset`, `mpint bitmap` (bit *N* ⇒ serial
 //!   `offset + N` revoked).
 //! - `0x23` key-id: a run of `string key_id`.
-//! - `0x39` cert-extension: ignored (skipped) defensively.
+//! - `0x39` cert-extension: `string name`, `bool critical`, `string data`;
+//!   skipped unless critical (none is understood, so a critical one is an
+//!   error).
+//!
+//! Unknown section or subsection types are rejected, as OpenSSH does, so a
+//! KRL is never half-applied.
 //!
 //! # Security
 //!
@@ -153,6 +158,20 @@ pub struct Krl {
     fp_sha256: Vec<[u8; 32]>,
 }
 
+/// An extension (top-level or certificate) section body: `string name`,
+/// `bool critical`, `string data`. No extension is understood, so a critical
+/// one is an error (OpenSSH refuses it too); a non-critical one is skipped.
+fn check_extension(body: &[u8]) -> Result<()> {
+    let mut r = Reader::new(body);
+    let _name = r.read_string()?;
+    let critical = r.read_bool()?;
+    let _data = r.read_string()?;
+    if critical {
+        return Err(Error::Format("krl: unsupported critical extension"));
+    }
+    Ok(())
+}
+
 /// Test whether bit `idx` (counting from the least-significant bit of the
 /// big-endian `mpint` magnitude) is set. The magnitude is big-endian, so the
 /// LSB lives in the *last* byte; bit `idx` is byte `len-1 - idx/8`, bit
@@ -210,9 +229,12 @@ impl Krl {
                 // (a trusted local file needs no self-signature) and never
                 // grants trust. We already consumed its body above.
                 SECTION_SIGNATURE => {}
-                // Unknown / extension sections are tolerated and skipped.
-                SECTION_EXTENSION => {}
-                _ => {}
+                // Extensions: a non-critical one is skipped, a critical one
+                // (none is defined) refuses the KRL, as OpenSSH does.
+                SECTION_EXTENSION => check_extension(body)?,
+                // As OpenSSH: an unknown section refuses the KRL rather than
+                // silently dropping revocations it might carry.
+                _ => return Err(Error::Format("krl: unsupported section type")),
             }
         }
         Ok(krl)
@@ -273,9 +295,10 @@ impl Krl {
                         rev.key_ids.push(s.into());
                     }
                 }
-                // Cert extensions are advisory; skip (body already consumed).
-                CERT_EXTENSION => {}
-                _ => {}
+                CERT_EXTENSION => check_extension(sub)?,
+                _ => {
+                    return Err(Error::Format("krl: unsupported certificate section type"));
+                }
             }
         }
         self.cert_revocations.push(rev);

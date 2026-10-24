@@ -316,3 +316,64 @@ fn builder_round_trips() {
     assert!(back.is_revoked_cert(b"other-ca", 9, ""));
     assert!(!back.is_revoked_cert(b"other-ca", 5, ""));
 }
+
+/// An extension section body: `string name`, `bool critical`, `string data`.
+fn extension_body(critical: bool) -> Vec<u8> {
+    let mut b = vec![];
+    b.extend_from_slice(&11u32.to_be_bytes());
+    b.extend_from_slice(b"x@local.dom");
+    b.push(critical as u8);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b
+}
+
+fn append_section(blob: &mut Vec<u8>, ty: u8, body: &[u8]) {
+    blob.push(ty);
+    blob.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    blob.extend_from_slice(body);
+}
+
+#[test]
+fn unknown_section_is_rejected() {
+    let mut blob = KRL_SERIAL.to_vec();
+    append_section(&mut blob, 9, &[1, 2, 3]);
+    assert!(Krl::parse(&blob).is_err());
+}
+
+#[test]
+fn top_level_extension_critical_rejected_noncritical_skipped() {
+    let mut blob = KRL_SERIAL.to_vec();
+    append_section(&mut blob, SECTION_EXTENSION, &extension_body(false));
+    let krl = Krl::parse(&blob).expect("non-critical extension skipped");
+    assert!(krl.is_revoked_cert(CA_BLOB, 10, ""));
+
+    let mut blob = KRL_SERIAL.to_vec();
+    append_section(&mut blob, SECTION_EXTENSION, &extension_body(true));
+    assert!(Krl::parse(&blob).is_err());
+
+    // A malformed extension body is a format error too.
+    let mut blob = KRL_SERIAL.to_vec();
+    append_section(&mut blob, SECTION_EXTENSION, &[0, 0]);
+    assert!(Krl::parse(&blob).is_err());
+}
+
+#[test]
+fn cert_subsections_unknown_and_extensions() {
+    let section = |sub_type: u8, sub: &[u8]| {
+        let mut sec = vec![];
+        sec.extend_from_slice(&0u32.to_be_bytes()); // ca_key (wildcard)
+        sec.extend_from_slice(&0u32.to_be_bytes()); // reserved (empty)
+        sec.push(super::CERT_SERIAL_LIST);
+        sec.extend_from_slice(&8u32.to_be_bytes());
+        sec.extend_from_slice(&7u64.to_be_bytes());
+        sec.push(sub_type);
+        sec.extend_from_slice(&(sub.len() as u32).to_be_bytes());
+        sec.extend_from_slice(sub);
+        krl_with_cert_section(&sec)
+    };
+    let krl = Krl::parse(&section(super::CERT_EXTENSION, &extension_body(false)))
+        .expect("non-critical cert extension skipped");
+    assert!(krl.is_revoked_cert(CA_BLOB, 7, ""));
+    assert!(Krl::parse(&section(super::CERT_EXTENSION, &extension_body(true))).is_err());
+    assert!(Krl::parse(&section(0x30, &[])).is_err());
+}

@@ -319,15 +319,23 @@ impl ClientDriver {
             return Ok(()); // need more bytes for a complete line
         }
 
-        loop {
-            match self.codec.decode(&self.inbox)? {
-                Some((payload, consumed)) => {
-                    self.inbox.drain(..consumed);
-                    self.route_packet(&payload, now)?;
+        // Decode from a moving offset and compact the inbox once at the end:
+        // draining per packet is quadratic for a flood of tiny packets.
+        let mut off = 0;
+        let res = loop {
+            match self.codec.decode(&self.inbox[off..]) {
+                Ok(Some((payload, consumed))) => {
+                    off += consumed;
+                    if let Err(e) = self.route_packet(&payload, now) {
+                        break Err(e);
+                    }
                 }
-                None => return Ok(()),
+                Ok(None) => break Ok(()),
+                Err(e) => break Err(e),
             }
-        }
+        };
+        self.inbox.drain(..off);
+        res
     }
 
     /// Drive re-key and keepalive timers. The frontend calls this on its tick.

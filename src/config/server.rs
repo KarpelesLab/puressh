@@ -666,7 +666,12 @@ impl SshServerConfig {
     /// source order — for a scalar keyword the *first* matching block that
     /// sets it wins — and the resulting values **override** the global
     /// section, which only supplies a keyword no matching block set. List
-    /// fields concatenate (matching blocks first, then global).
+    /// fields concatenate (matching blocks first, then global) — except
+    /// `AllowUsers` / `AllowGroups`, where a list set by the matching blocks
+    /// *replaces* the global one (OpenSSH's `M_CP_STRARRAYOPT`): appending
+    /// would let a global `AllowUsers *` re-admit everyone a `Match` block
+    /// meant to restrict. (`DenyUsers` / `DenyGroups` still concatenate,
+    /// which is only ever stricter.)
     ///
     /// `policy` controls `Match exec` evaluation (default-deny on the server;
     /// see [`ExecPolicy`]).
@@ -677,7 +682,15 @@ impl SshServerConfig {
                 merge_server_options(&mut out, &block.opts);
             }
         }
+        let (match_allow_users, match_allow_groups) =
+            (out.allow_users.len(), out.allow_groups.len());
         merge_server_options(&mut out, &self.global);
+        if match_allow_users > 0 {
+            out.allow_users.truncate(match_allow_users);
+        }
+        if match_allow_groups > 0 {
+            out.allow_groups.truncate(match_allow_groups);
+        }
         out
     }
 
@@ -2166,6 +2179,58 @@ Match Address 10.0.0.0/8
         let eff = cfg.resolve(&outside, ExecPolicy::Deny);
         assert_eq!(eff.password_authentication, Some(true));
         assert_eq!(eff.permit_root_login, Some(PermitRootLogin::Yes));
+    }
+
+    #[test]
+    fn match_allow_lists_replace_global() {
+        // OpenSSH: a matching block's AllowUsers/AllowGroups replaces the
+        // global list; concatenating would let `AllowUsers *` admit everyone.
+        let src = "\
+AllowUsers *
+AllowGroups *
+DenyUsers mallory
+Match Address *,!10.0.0.0/8
+  AllowUsers admin
+  AllowGroups wheel
+  DenyUsers eve
+Match User admin
+  AllowUsers ops
+";
+        let cfg = SshServerConfig::parse(src).unwrap();
+        let outside = MatchContext {
+            host: "h",
+            user: Some("carol"),
+            address: Some("192.0.2.1"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&outside, ExecPolicy::Deny);
+        assert_eq!(eff.allow_users, vec!["admin".to_string()]);
+        assert_eq!(eff.allow_groups, vec!["wheel".to_string()]);
+        // Deny lists still accumulate (stricter).
+        assert_eq!(
+            eff.deny_users,
+            vec!["eve".to_string(), "mallory".to_string()]
+        );
+        // Several matching blocks: their lists combine, still replacing global.
+        let admin = MatchContext {
+            user: Some("admin"),
+            ..outside
+        };
+        let eff = cfg.resolve(&admin, ExecPolicy::Deny);
+        assert_eq!(
+            eff.allow_users,
+            vec!["admin".to_string(), "ops".to_string()]
+        );
+        // No matching block sets them: global applies.
+        let inside = MatchContext {
+            host: "h",
+            user: Some("carol"),
+            address: Some("10.1.2.3"),
+            ..MatchContext::default()
+        };
+        let eff = cfg.resolve(&inside, ExecPolicy::Deny);
+        assert_eq!(eff.allow_users, vec!["*".to_string()]);
+        assert_eq!(eff.allow_groups, vec!["*".to_string()]);
     }
 
     #[test]

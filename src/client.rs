@@ -3982,7 +3982,9 @@ fn pinned_host_key_algorithms(pin: &[u8], over: Option<&[String]>) -> Result<Vec
 }
 
 /// Build the exchange-hash verifier for the host key carried in
-/// `reply_payload`, making the trust decision per `policy` first.
+/// `reply_payload`, making the trust decision per `policy` first. On a
+/// re-key (`runner` already holds the first KEX's host key) the policy is
+/// skipped and the key must equal that first one.
 ///
 /// `host_key_mismatched` is set to `true` (never cleared) when a *changed*
 /// key was let through by [`TofuAction::AcceptWithWarning`]; the frontends
@@ -4012,6 +4014,20 @@ pub(crate) fn build_verifier(
         return Err(Error::Format("kex-ecdh-reply truncated"));
     }
     let k_s = &reply_payload[5..5 + k_s_len];
+
+    // Re-key: the host key is pinned to the one the first KEX verified
+    // (OpenSSH: "Server host key changed during re-key"). The known_hosts
+    // policy is never re-run — no prompt, no store update — so a changed key
+    // is refused and an unchanged one only needs the exchange-hash verifier.
+    if let Some((initial, _)) = runner.initial_host_key_sig() {
+        if k_s != initial {
+            return Err(Error::HostKeyRejected);
+        }
+        let neg = runner
+            .negotiated()
+            .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;
+        return host_key_verify_by_name(&neg.host_key, k_s);
+    }
 
     // Reject misconfigured KnownHosts callers *before* we touch the KEX
     // runner state — the missing-host case is a config error, not a
@@ -5068,6 +5084,92 @@ mod tests {
             .unwrap();
         assert_eq!(client.negotiated().unwrap().host_key, "ssh-ed25519");
         client
+    }
+
+    /// CLI-5a: once the first KEX has completed, a re-key's host key must be
+    /// the same one — a different key is refused without consulting the
+    /// known_hosts policy (no prompt, no save), the same key is accepted.
+    #[test]
+    fn build_verifier_pins_host_key_across_rekey() {
+        let mut rng = OsRng;
+        let over = AlgoOverrides {
+            host_key_algorithms: Some(vec!["ssh-ed25519".to_string()]),
+            ..Default::default()
+        };
+        let server_hk = Ed25519HostKey::from_seed([5u8; 32]);
+        let v = LOCAL_VERSION.as_bytes();
+        let mut server = KexRunner::new(Role::Server, build_default_kexinit(&mut rng, &over));
+        let mut client = KexRunner::new(Role::Client, build_default_kexinit(&mut rng, &over));
+        let (mut s_codec, mut c_codec) = (PacketCodec::new(), PacketCodec::new());
+        let mut to_client: VecDeque<Vec<u8>> = server.start(&mut rng).unwrap().outbound.into();
+        let mut to_server: VecDeque<Vec<u8>> = client.start(&mut rng).unwrap().outbound.into();
+        let mut done = (false, false);
+        for _ in 0..16 {
+            while let Some(p) = to_server.pop_front() {
+                let adv = server
+                    .on_packet(&mut rng, &mut s_codec, &p, Some(&server_hk), None, v, v)
+                    .unwrap();
+                done.0 |= adv.completed;
+                to_client.extend(adv.outbound);
+            }
+            while let Some(p) = to_client.pop_front() {
+                let verifier = if p[0] == SSH_MSG_KEX_ECDH_REPLY {
+                    Some(
+                        host_key_verify_by_name("ssh-ed25519", reply_host_key(&p).unwrap())
+                            .unwrap(),
+                    )
+                } else {
+                    None
+                };
+                let adv = client
+                    .on_packet(&mut rng, &mut c_codec, &p, None, verifier.as_deref(), v, v)
+                    .unwrap();
+                done.1 |= adv.completed;
+                to_server.extend(adv.outbound);
+            }
+            if done == (true, true) {
+                break;
+            }
+        }
+        assert_eq!(done, (true, true), "kex did not complete");
+        assert!(client.initial_host_key_sig().is_some());
+
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let p2 = prompts.clone();
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let mut kh = KnownHostsPolicy::strict(store.clone());
+        kh.on_unknown = TofuAction::Prompt(Arc::new(move |_, _, _, _| {
+            p2.fetch_add(1, Ordering::SeqCst);
+            true
+        }));
+        let policy = HostKeyPolicy::KnownHosts(kh);
+        let flag = AtomicBool::new(false);
+        let other = Ed25519HostKey::from_seed([6u8; 32]).public_blob();
+        let r = build_verifier(
+            &reply_with_k_s(&other),
+            &policy,
+            &client,
+            "h.example",
+            22,
+            None,
+            0,
+            &flag,
+        );
+        assert!(matches!(r, Err(Error::HostKeyRejected)));
+        let same = server_hk.public_blob();
+        build_verifier(
+            &reply_with_k_s(&same),
+            &policy,
+            &client,
+            "h.example",
+            22,
+            None,
+            0,
+            &flag,
+        )
+        .unwrap();
+        assert_eq!(prompts.load(Ordering::SeqCst), 0, "no re-prompt on re-key");
+        assert!(store.lock().unwrap().to_bytes().is_empty(), "no re-save");
     }
 
     fn reply_with_k_s(k_s: &[u8]) -> Vec<u8> {

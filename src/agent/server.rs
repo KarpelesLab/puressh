@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use purecrypto::ct::ConstantTimeEq;
 use purecrypto::hash::{Digest, Sha512};
+use purecrypto::rng::{OsRng, RngCore};
 use purecrypto::zeroize::Zeroizing;
 
 use super::protocol::*;
@@ -97,11 +98,48 @@ pub struct ConnectionState {
 /// `true` to allow it.
 pub type ConfirmFn = Box<dyn FnMut(&str) -> bool + Send>;
 
+/// A locked agent's passphrase: SHA-512 over a random salt and it.
+struct Lock {
+    salt: [u8; 16],
+    digest: Zeroizing<[u8; 64]>,
+}
+
+impl Lock {
+    fn new(pass: &[u8]) -> Self {
+        let mut salt = [0u8; 16];
+        OsRng.fill_bytes(&mut salt);
+        let digest = lock_digest(&salt, pass);
+        Self { salt, digest }
+    }
+
+    fn matches(&self, pass: &[u8]) -> bool {
+        bool::from(self.digest.ct_eq(&*lock_digest(&self.salt, pass)))
+    }
+}
+
+fn lock_digest(salt: &[u8], pass: &[u8]) -> Zeroizing<[u8; 64]> {
+    let mut input = Zeroizing::new(Vec::with_capacity(salt.len() + pass.len()));
+    input.extend_from_slice(salt);
+    input.extend_from_slice(pass);
+    Zeroizing::new(Sha512::digest(&input[..]))
+}
+
+/// Pause after each failed unlock: this much per failure so far, up to
+/// [`UNLOCK_MAX_DELAY`] (OpenSSH's `ssh-agent` sleeps as long).
+const UNLOCK_DELAY_STEP: Duration = Duration::from_millis(100);
+const UNLOCK_MAX_DELAY: Duration = Duration::from_secs(10);
+
 /// The keys an agent holds and its lock state.
 pub struct AgentState {
     keys: Vec<Held>,
-    /// SHA-512 of the lock passphrase while locked.
-    locked: Option<Zeroizing<[u8; 64]>>,
+    /// The lock passphrase while locked.
+    locked: Option<Lock>,
+    /// Failed unlocks since the last successful one, and when the next
+    /// attempt is heard: until then unlocks are refused unchecked (rather
+    /// than sleeping, which would stall every connection sharing the
+    /// state).
+    unlock_failures: u32,
+    unlock_after: Option<Instant>,
     default_lifetime: Option<Duration>,
     confirm: Option<ConfirmFn>,
 }
@@ -142,6 +180,8 @@ impl AgentState {
         Self {
             keys: Vec::new(),
             locked: None,
+            unlock_failures: 0,
+            unlock_after: None,
             default_lifetime: None,
             confirm: None,
         }
@@ -259,7 +299,7 @@ impl AgentState {
                 let Ok(pass) = r.read_string() else {
                     return failure();
                 };
-                self.locked = Some(Zeroizing::new(Sha512::digest(pass)));
+                self.locked = Some(Lock::new(pass));
                 success()
             }
             SSH_AGENTC_UNLOCK if locked => {
@@ -267,15 +307,21 @@ impl AgentState {
                 let Ok(pass) = r.read_string() else {
                     return failure();
                 };
-                let digest = Zeroizing::new(Sha512::digest(pass));
-                let ok = self
-                    .locked
-                    .as_ref()
-                    .is_some_and(|h| bool::from(h.ct_eq(&*digest)));
-                if ok {
+                let now = Instant::now();
+                if self.unlock_after.is_some_and(|t| now < t) {
+                    return failure();
+                }
+                if self.locked.as_ref().is_some_and(|l| l.matches(pass)) {
                     self.locked = None;
+                    self.unlock_failures = 0;
+                    self.unlock_after = None;
                     success()
                 } else {
+                    self.unlock_failures = self.unlock_failures.saturating_add(1);
+                    let delay = UNLOCK_DELAY_STEP
+                        .saturating_mul(self.unlock_failures)
+                        .min(UNLOCK_MAX_DELAY);
+                    self.unlock_after = Some(now + delay);
                     failure()
                 }
             }
@@ -1034,6 +1080,7 @@ mod tests {
             s.handle(&msg(SSH_AGENTC_UNLOCK, bad.as_slice()))[0],
             SSH_AGENT_FAILURE
         );
+        std::thread::sleep(UNLOCK_DELAY_STEP);
         assert_eq!(
             s.handle(&msg(SSH_AGENTC_UNLOCK, w.as_slice()))[0],
             SSH_AGENT_SUCCESS
@@ -1056,6 +1103,46 @@ mod tests {
         assert_eq!(s.handle(&[SSH_AGENTC_EXTENSION])[0], SSH_AGENT_FAILURE);
         assert_eq!(s.handle(&[99])[0], SSH_AGENT_FAILURE);
         assert_eq!(s.handle(&[])[0], SSH_AGENT_FAILURE);
+    }
+
+    /// Failed unlocks back off: until the penalty passes even the right
+    /// passphrase is refused, and each failure lengthens it.
+    #[test]
+    fn unlock_backs_off_after_failures() {
+        let mut s = AgentState::new();
+        let pass = |p: &[u8]| {
+            let mut w = Writer::new();
+            w.write_string(p);
+            w.as_slice().to_vec()
+        };
+        assert_eq!(
+            s.handle(&msg(SSH_AGENTC_LOCK, &pass(b"pw")))[0],
+            SSH_AGENT_SUCCESS
+        );
+        let unlock = |s: &mut AgentState, p: &[u8]| s.handle(&msg(SSH_AGENTC_UNLOCK, &pass(p)))[0];
+        assert_eq!(unlock(&mut s, b"bad"), SSH_AGENT_FAILURE);
+        assert_eq!(
+            unlock(&mut s, b"pw"),
+            SSH_AGENT_FAILURE,
+            "within the penalty"
+        );
+        std::thread::sleep(UNLOCK_DELAY_STEP);
+        assert_eq!(unlock(&mut s, b"bad"), SSH_AGENT_FAILURE);
+        assert_eq!(s.unlock_failures, 2);
+        std::thread::sleep(UNLOCK_DELAY_STEP);
+        assert_eq!(unlock(&mut s, b"pw"), SSH_AGENT_FAILURE, "penalty grows");
+        std::thread::sleep(UNLOCK_DELAY_STEP);
+        assert_eq!(unlock(&mut s, b"pw"), SSH_AGENT_SUCCESS);
+        assert_eq!(s.unlock_failures, 0);
+        // A new lock salts afresh.
+        assert_eq!(
+            s.handle(&msg(SSH_AGENTC_LOCK, &pass(b"pw")))[0],
+            SSH_AGENT_SUCCESS
+        );
+        let salt = s.locked.as_ref().unwrap().salt;
+        assert_eq!(unlock(&mut s, b"pw"), SSH_AGENT_SUCCESS);
+        s.handle(&msg(SSH_AGENTC_LOCK, &pass(b"pw")));
+        assert_ne!(s.locked.as_ref().unwrap().salt, salt);
     }
 
     /// A session bind sent while locked still marks the connection as
@@ -1114,6 +1201,7 @@ mod tests {
         a.lock(b"pw").unwrap();
         assert!(a.identities().unwrap().is_empty());
         assert!(a.unlock(b"bad").is_err());
+        std::thread::sleep(UNLOCK_DELAY_STEP);
         a.unlock(b"pw").unwrap();
         a.remove_identity(&ed.public_key().wire_blob()).unwrap();
         assert!(a.remove_identity(&ed.public_key().wire_blob()).is_err());

@@ -1269,6 +1269,12 @@ impl Client {
                 algorithms.host_key_algorithms.as_deref(),
             )?);
         }
+        // Bring the host-key types we already trust in `known_hosts` to the
+        // front of the offer (OpenSSH's `order_hostkeyalgs()`), so a server
+        // with several host keys presents the one we recorded rather than a
+        // higher-preference type that would look like a changed key. Done here,
+        // before the policy is moved into the verifier closure.
+        prioritize_known_host_key_algorithms(&mut algorithms, &host_key_policy, host, port);
         let target_host = host.to_string();
         let ca_sig_algos = algorithms.ca_signature_algorithms.clone();
         let host_key_mismatched = Arc::new(AtomicBool::new(false));
@@ -3735,6 +3741,106 @@ fn owned_or_default(over: &Option<Vec<String>>, default: &[&str]) -> Vec<String>
 }
 
 /// Build the client's advertised KEXINIT, applying any config algorithm
+/// The default host-key algorithm offer, with the certificate key-types ahead
+/// of the matching plain keys (matching OpenSSH), used when no explicit
+/// `HostKeyAlgorithms` override is given.
+fn default_host_key_algorithms() -> Vec<String> {
+    let mut v: Vec<String> = crate::cert::CERT_KEY_NAMES
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.extend(defaults::HOST_KEY.iter().map(|s| s.to_string()));
+    v
+}
+
+/// The base host-key type an algorithm name verifies against, ignoring the
+/// `-cert-v01@openssh.com` certificate suffix and collapsing the RSA signature
+/// variants (`rsa-sha2-256`, `rsa-sha2-512`, `ssh-rsa`) to one key. Two names
+/// with the same base are backed by the same stored `known_hosts` key.
+fn base_host_key_type(name: &str) -> &str {
+    let n = name.strip_suffix("-cert-v01@openssh.com").unwrap_or(name);
+    match n {
+        "rsa-sha2-256" | "rsa-sha2-512" | "ssh-rsa" => "ssh-rsa",
+        other => other,
+    }
+}
+
+/// Reorder a host-key algorithm offer so the key types already recorded in
+/// `known_hosts` for the target come first, preserving the default relative
+/// order within each group and dropping nothing. This is OpenSSH's
+/// `order_hostkeyalgs()` behaviour: it makes a server that has several host
+/// keys present the one we already trust, so a connection to a host we only
+/// have (say) an ECDSA entry for does not trip a spurious
+/// "REMOTE HOST IDENTIFICATION HAS CHANGED" when the server also has a
+/// newer-preferred Ed25519 key. A brand-new key type still appears (in the
+/// back group) so first-contact and genuine changes are handled as before.
+fn order_host_key_algorithms(defaults: Vec<String>, present_types: &[String]) -> Vec<String> {
+    if present_types.is_empty() {
+        return defaults;
+    }
+    let present: std::collections::HashSet<&str> = present_types
+        .iter()
+        .map(|t| base_host_key_type(t))
+        .collect();
+    let (mut front, mut back): (Vec<String>, Vec<String>) = defaults
+        .into_iter()
+        .partition(|a| present.contains(base_host_key_type(a)));
+    front.append(&mut back);
+    front
+}
+
+/// If no explicit `HostKeyAlgorithms` override is set, reorder the default
+/// host-key offer so the key types already recorded in `known_hosts` for the
+/// target come first (OpenSSH's `order_hostkeyalgs()`; see
+/// [`order_host_key_algorithms`]). Shared by every client frontend so the
+/// behaviour does not depend on which one connects. Call it *after* any
+/// host-key pin has been applied (a pin already fixes the algorithm list, so
+/// the `is_some()` check leaves it untouched) and before the KEXINIT is built.
+/// The lookup mirrors the verifier: `HostKeyAlias` on port 22, otherwise the
+/// connection's host and port, across the writable store and the read-only
+/// global files, counting plain (non-marker) entries only.
+pub(crate) fn prioritize_known_host_key_algorithms(
+    algorithms: &mut AlgoOverrides,
+    policy: &HostKeyPolicy,
+    host: &str,
+    port: u16,
+) {
+    if algorithms.host_key_algorithms.is_some() {
+        return;
+    }
+    let HostKeyPolicy::KnownHosts(kh) = policy else {
+        return;
+    };
+    let (lh, lp) = match &kh.host_key_alias {
+        Some(alias) => (alias.as_str(), 22),
+        None => (host, port),
+    };
+    let mut present: Vec<String> = Vec::new();
+    if let Ok(store) = kh.store.lock() {
+        present.extend(
+            store
+                .find(lh, lp)
+                .into_iter()
+                .filter(|e| e.marker.is_none())
+                .map(|e| e.key_type.clone()),
+        );
+    }
+    for g in &kh.global {
+        present.extend(
+            g.find(lh, lp)
+                .into_iter()
+                .filter(|e| e.marker.is_none())
+                .map(|e| e.key_type.clone()),
+        );
+    }
+    if !present.is_empty() {
+        algorithms.host_key_algorithms = Some(order_host_key_algorithms(
+            default_host_key_algorithms(),
+            &present,
+        ));
+    }
+}
+
 /// overrides over the built-in defaults.
 ///
 /// The client's strict-kex marker (`kex-strict-c-v00@openssh.com`; only the
@@ -3766,14 +3872,7 @@ pub(crate) fn build_default_kexinit<R: RngCore>(rng: &mut R, over: &AlgoOverride
     // not weaken host verification. An explicit override is taken verbatim.
     let host_key = match &over.host_key_algorithms {
         Some(v) => v.clone(),
-        None => {
-            let mut v: Vec<String> = crate::cert::CERT_KEY_NAMES
-                .iter()
-                .map(|s| s.to_string())
-                .collect();
-            v.extend(defaults::HOST_KEY.iter().map(|s| s.to_string()));
-            v
-        }
+        None => default_host_key_algorithms(),
     };
     // Compression preference. `Compression yes` advertises
     // `zlib@openssh.com` ahead of `none` so we still negotiate a session
@@ -4807,6 +4906,54 @@ mod tests {
                 return Err(Error::Protocol("banner line too long"));
             }
         }
+    }
+
+    #[test]
+    fn host_key_order_prioritises_known_type() {
+        // A host we only have an ECDSA entry for: the ecdsa algorithm (and its
+        // cert variant) must come before the otherwise-preferred Ed25519, so
+        // the server presents the key we already trust instead of a changed
+        // one. Nothing is dropped.
+        let ordered = order_host_key_algorithms(
+            default_host_key_algorithms(),
+            &["ecdsa-sha2-nistp256".to_string()],
+        );
+        let ed = ordered.iter().position(|a| a == "ssh-ed25519").unwrap();
+        let ec = ordered
+            .iter()
+            .position(|a| a == "ecdsa-sha2-nistp256")
+            .unwrap();
+        assert!(ec < ed, "ecdsa must precede ed25519: {ordered:?}");
+        assert_eq!(
+            ordered.len(),
+            default_host_key_algorithms().len(),
+            "reordering must not drop or add algorithms"
+        );
+        // The cert variant of the known type is prioritised too.
+        let ec_cert = ordered
+            .iter()
+            .position(|a| a == "ecdsa-sha2-nistp256-cert-v01@openssh.com");
+        assert!(ec_cert.map(|p| p < ed).unwrap_or(true));
+    }
+
+    #[test]
+    fn host_key_order_collapses_rsa_variants() {
+        // A stored `ssh-rsa` key backs every RSA signature algorithm, so all of
+        // them move forward.
+        let ordered =
+            order_host_key_algorithms(default_host_key_algorithms(), &["ssh-rsa".to_string()]);
+        let ed = ordered.iter().position(|a| a == "ssh-ed25519").unwrap();
+        for rsa in ["rsa-sha2-512", "rsa-sha2-256"] {
+            let p = ordered.iter().position(|a| a == rsa).unwrap();
+            assert!(p < ed, "{rsa} must precede ed25519: {ordered:?}");
+        }
+    }
+
+    #[test]
+    fn host_key_order_noop_without_entries() {
+        // No known_hosts entries → the default order is returned unchanged.
+        let def = default_host_key_algorithms();
+        assert_eq!(order_host_key_algorithms(def.clone(), &[]), def);
     }
 
     #[test]

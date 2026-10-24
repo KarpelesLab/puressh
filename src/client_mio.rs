@@ -165,8 +165,15 @@ impl<S: Read + Write> MioClient<S> {
     /// [`pump_writable`](Self::pump_writable).
     pub fn new(stream: S, host: &str, port: u16, cfg: Config) -> Result<Self> {
         let host_key_policy = cfg.host_key_policy;
+        let mut algo_overrides = cfg.algorithms;
+        crate::client::prioritize_known_host_key_algorithms(
+            &mut algo_overrides,
+            &host_key_policy,
+            host,
+            port,
+        );
         let target_host = host.to_string();
-        let ca_sig_algos = cfg.algorithms.ca_signature_algorithms.clone();
+        let ca_sig_algos = algo_overrides.ca_signature_algorithms.clone();
         let host_key_mismatched = Arc::new(AtomicBool::new(false));
         let mismatched_flag = host_key_mismatched.clone();
         let verifier_factory: VerifierFactory = Box::new(move |reply, runner| {
@@ -181,12 +188,12 @@ impl<S: Read + Write> MioClient<S> {
                 &mismatched_flag,
             )
         });
-        let driver = ClientDriver::new(cfg.algorithms.clone(), verifier_factory);
+        let driver = ClientDriver::new(algo_overrides.clone(), verifier_factory);
         let mut me = Self {
             stream,
             driver,
             conn: ConnectionState::new(),
-            algo_overrides: cfg.algorithms,
+            algo_overrides,
             phase: Phase::Handshaking,
             events: VecDeque::new(),
             outbuf: Vec::new(),

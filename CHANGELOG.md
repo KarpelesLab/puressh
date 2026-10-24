@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0](https://github.com/KarpelesLab/puressh/compare/v0.2.3...v0.3.0) - 2026-10-24
+
+### Other
+
+- *(driver)* compact the inbox once per handle_input, not per packet (HAZ-4)
+
+### Security
+
+- *(sshd)* don't bypass restricted login shells with in-process scp/sftp (SSHD-1)
+- *(sshd)* read authorized_keys/principals via one checked fd (SSHD-6)
+- *(sshd)* cap peer-supplied usernames and cert key IDs in auth logs (SSHD-8)
+- *(sshd)* match AllowUsers/DenyUsers user@CIDR as a network (SSHD-5)
+- *(sshd)* bare-IP PAM_RHOST; canonicalise sshd -i peers (SSHD-4, SSHD-7)
+- *(config)* Match AllowUsers/AllowGroups replace the global list (SSHD-3)
+- *(config)* reject negated Match criteria in sshd_config (SSHD-2)
+- *(server)* harden library Server channel/forward/pre-auth handling (SRV-1..SRV-5)
+- *(key)* wipe private key material the agent and exports leave behind (KEY-5)
+- *(key)* parse the DEK-Info IV byte by byte (KEY-4)
+- *(agent)* back off failed unlocks and salt the lock passphrase (KEY-3)
+- *(agent)* mark a session bind refused while locked as attempted (KEY-2)
+- *(agent-fwd)* bind forwarded agent connections to the session (KEY-1)
+- *(scp)* check legacy -O download names against the request (XFER-2)
+- *(sftp)* bound read_to read-ahead to depth chunks past the sink (XFER-4)
+- *(sftp)* keep home-directory/expand-path inside the jail (XFER-5)
+- *(sftp)* bound copy-data to a distinct regular source file (XFER-3)
+- *(sftp)* refuse symlink targets containing '..' under a jail (XFER-1)
+- *(ffi)* disarm the known_hosts TOFU prompt once connect returns (FFI-1)
+- *(client)* refuse unrequested agent / X11 channels in Client::serve (CLI-3)
+- *(client)* pin the host key across re-keys (CLI-5a)
+- *(client)* derive the saved known_hosts key type from the parsed host key (CLI-1)
+- *(known_hosts)* keep non-UTF-8 lines on save, honour undecodable @revoked (CLI-5b)
+- *(knock)* bound leaked-sig1 and made-up-name floods (FWD-3, FWD-4)
+- *(ffi)* stop pcssh_sftp_readdir looping on endless empty chunks (FFI-2)
+- *(proc_transport)* bound the ProxyCommand stdout read-ahead (CLI-4)
+- *(shared)* refuse port forwarding over an accepted host-key mismatch (MUX-2)
+- *(mux)* bind the control socket owner-only and check peer uid (MUX-1)
+- *(shared)* bound the ingress queue of server-opened channels (CLI-2)
+- *(x11)* hold the forwarded display on ::1 as well as 127.0.0.1 (FWD-2)
+- *(forwarding)* owner-only streamlocal sockets, no clobbering (FWD-5, FWD-6)
+- *(forwarding)* tcpip-forward bindings are owned; never replace one (FWD-5)
+- *(forwarding)* force every tcpip-forward bind onto loopback under GatewayPorts no (FWD-1)
+- *(krl)* reject unknown sections and critical extensions (AUTH-3)
+- *(auth)* keep earlier factors' restrictions; verify certs before PK_OK (AUTH-1, AUTH-2)
+- *(transport)* no early failure on a bad CBC packet length (HAZ-3)
+- *(channel)* only accept OPEN_FAILURE for our own pending open (HAZ-2)
+- *(kexinit)* reject non-printable or over-long names in a peer's KEXINIT (HAZ-1)
+- *(ssh-agent)* check peer uid with getpeereid on BSD and macOS (BIN-5)
+- *(ssh-keyscan)* scrub control characters from the banner comment (BIN-4)
+- *(bin)* scrub C1 controls in sanitize_terminal_str (BIN-3)
+- *(ssh)* sanitise server names in negotiation and auth-failure errors (BIN-2)
+- *(ssh)* no UpdateHostKeys over an untrusted host key (BIN-1)
+
 ## [0.2.3](https://github.com/KarpelesLab/puressh/compare/v0.2.2...v0.2.3) - 2026-10-24
 
 ### Fixed

@@ -42,8 +42,9 @@ pub struct SftpServerOptions {
     ///
     /// When set, every resolved path must lie inside this subtree.
     /// Operations that would open or stat through a symlink are additionally
-    /// refused on Unix via `O_NOFOLLOW` / `symlink_metadata`, and absolute
-    /// symlink targets are refused at create time.
+    /// refused on Unix via `O_NOFOLLOW` / `symlink_metadata`, and symlinks
+    /// whose target is absolute or contains a `..` component are refused at
+    /// create time (so links made through the session only point downward).
     ///
     /// This is **best-effort** mitigation, not a full chroot. A confined
     /// daemon should still rely on operating-system mechanisms such as
@@ -701,7 +702,11 @@ impl SftpServerSession {
         // is only a lexical check, so a symlink at `from`/`to` could otherwise
         // redirect the rename outside the jail.
         self.reject_symlink_when_jailed(&from)?;
-        self.reject_symlink_when_jailed(&to)?;
+        // A rename destination normally doesn't exist yet; only a present
+        // one can be a symlink.
+        if fs::symlink_metadata(&to).is_ok() {
+            self.reject_symlink_when_jailed(&to)?;
+        }
         // SFTP v3 RENAME refuses to overwrite the destination.
         if to.exists() {
             return Ok(status_pkt(id, FxpStatus::Failure, "destination exists"));
@@ -742,8 +747,8 @@ impl SftpServerSession {
                 } else {
                     // Relative target: resolve lexically against the link's
                     // parent (where it will be followed from) and refuse it if
-                    // it walks above the jail — mirrors `op_symlink`'s
-                    // create-time check for links planted out-of-band.
+                    // it walks above the jail — for links planted
+                    // out-of-band (`op_symlink` refuses any `..` target).
                     let link_parent = p.parent().unwrap_or(Path::new("/"));
                     let cleaned = lexically_clean(&link_parent.join(&tgt));
                     let has_parent_residue = cleaned
@@ -784,18 +789,22 @@ impl SftpServerSession {
         let link = self.resolve(&link_path)?;
         let target_s = std::str::from_utf8(&target_path)
             .map_err(|_| SftpError::status(FxpStatus::BadMessage))?;
-        // When a jail is configured, refuse to create symlinks that
-        // resolve outside it — either via an absolute target, or via a
-        // relative target whose `..` components walk above the jail
-        // root when resolved against the link's parent directory.
+        // When a jail is configured, refuse absolute targets and any
+        // relative target containing a `..` component, so every symlink
+        // created through this session points strictly *downward* from
+        // the directory it sits in.
         //
-        // This is purely a lexical check; the symlink is written verbatim
-        // (POSIX preserves the original string), but we make sure that
-        // even a *future* path-join against this link cannot leave the
-        // jail. Open-time `O_NOFOLLOW` (applied in op_open above) still
-        // catches the runtime traversal — this check just keeps the
-        // hostile symlink from being created in the first place.
-        if let Some(root) = self.opts.root.as_deref() {
+        // A lexical "does `parent/target` stay inside the jail" check is
+        // not enough: the kernel resolves `..` after following
+        // intermediate symlinks, so a chain of individually-lexically-safe
+        // links (`a/s -> ..`, then `a/t -> s/../..`) or a later rename of
+        // the directory holding a `..` link (`a/b/s -> ../..`, then
+        // `mv a/b b`) lands outside the jail, and the final-component
+        // `O_NOFOLLOW`/`symlink_metadata` guards never see the
+        // intermediate hops. Downward-only links cannot escape whatever
+        // they are chained with or wherever they are moved. A full fix
+        // would resolve every path with `openat2(RESOLVE_BENEATH)`.
+        if self.opts.root.is_some() {
             let target_path_obj = Path::new(target_s);
             if target_path_obj.is_absolute() {
                 return Ok(status_pkt(
@@ -804,20 +813,10 @@ impl SftpServerSession {
                     "absolute symlink target rejected by jail",
                 ));
             }
-            // Resolve the relative target lexically against the link's
-            // parent directory (i.e. where the symlink will sit), then
-            // confirm the result is still inside the jail and contains
-            // no leftover `..` (belt-and-braces — `lexically_clean` will
-            // have collapsed any `..` it could, so a residual one means
-            // the path is unresolvable under any real ancestor).
-            let link_parent = link.parent().unwrap_or(Path::new("/"));
-            let joined = link_parent.join(target_path_obj);
-            let cleaned = lexically_clean(&joined);
-            let root_clean = lexically_clean(root);
-            let has_parent_residue = cleaned
+            if target_path_obj
                 .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir));
-            if has_parent_residue || !is_inside(&cleaned, &root_clean) {
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
                 return Ok(status_pkt(
                     id,
                     FxpStatus::PermissionDenied,
@@ -1119,7 +1118,11 @@ impl SftpServerSession {
         // is only a lexical check, so a symlink at `from`/`to` could otherwise
         // redirect the rename outside the jail.
         self.reject_symlink_when_jailed(&from)?;
-        self.reject_symlink_when_jailed(&to)?;
+        // A rename destination normally doesn't exist yet; only a present
+        // one can be a symlink.
+        if fs::symlink_metadata(&to).is_ok() {
+            self.reject_symlink_when_jailed(&to)?;
+        }
         // OpenSSH posix-rename intentionally overwrites the destination —
         // that's the whole reason it exists alongside SFTP v3 RENAME.
         fs::rename(&from, &to)?;

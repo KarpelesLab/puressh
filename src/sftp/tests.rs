@@ -436,6 +436,65 @@ fn jailed_symlink_with_absolute_target_rejected() {
     h.join().unwrap();
 }
 
+/// Assert an SFTP call failed with `PermissionDenied`.
+fn expect_denied<T: std::fmt::Debug>(r: Result<T, SftpError>) {
+    match r {
+        Err(SftpError::Status { code, .. }) => assert_eq!(code, FxpStatus::PermissionDenied),
+        other => panic!("expected PermissionDenied, got {other:?}"),
+    }
+}
+
+#[test]
+fn jailed_symlink_chain_escape_rejected() {
+    // XFER-1: `a/s -> ..` and `a/t -> s/../..` are each lexically inside
+    // the jail, but the kernel resolves `s/..` after following `s`, so
+    // `a/t` would point one level above the jail root.
+    let tmp = TempDir::new("symjail-chain");
+    let jail = tmp.path().join("jail");
+    fs::create_dir_all(&jail).unwrap();
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    client.mkdir(b"a", Attrs::default()).unwrap();
+    expect_denied(client.symlink(b"..", b"a/s"));
+    expect_denied(client.symlink(b"s/../..", b"a/t"));
+    expect_denied(client.symlink(b"x/../y", b"a/u"));
+    assert!(fs::symlink_metadata(jail.join("a/s")).is_err());
+    assert!(fs::symlink_metadata(jail.join("a/t")).is_err());
+    assert!(
+        client
+            .open(b"a/t/jail", FXF_READ, Attrs::default())
+            .is_err()
+    );
+    // Downward-only relative targets are still fine.
+    client.symlink(b"x/y", b"a/down").unwrap();
+    client.symlink(b"./z", b"a/dot").unwrap();
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_symlink_then_rename_escape_rejected() {
+    // XFER-1: `a/b/s -> ../..` resolves to the jail root where it sits,
+    // but after renaming `a/b` to `b` the same link points above the jail.
+    let tmp = TempDir::new("symjail-rename-chain");
+    let jail = tmp.path().join("jail");
+    fs::create_dir_all(&jail).unwrap();
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.clone()).with_root(jail.clone());
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    client.mkdir(b"a", Attrs::default()).unwrap();
+    client.mkdir(b"a/b", Attrs::default()).unwrap();
+    expect_denied(client.symlink(b"../..", b"a/b/s"));
+    client.rename(b"a/b", b"b").unwrap();
+    assert!(fs::symlink_metadata(jail.join("b/s")).is_err());
+    assert!(client.opendir(b"b/s").is_err());
+    drop(client);
+    h.join().unwrap();
+}
+
 // --- security: readlink must not disclose paths outside the jail (C1) ---
 
 fn expect_permission_denied(r: Result<Vec<u8>, SftpError>) {

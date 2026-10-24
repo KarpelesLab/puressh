@@ -242,12 +242,26 @@ fn write_name_list(w: &mut Writer, names: &[String]) {
     w.write_string(&joined);
 }
 
+/// Longest algorithm name RFC 4251 §6 allows.
+const MAX_NAME_LEN: usize = 64;
+
+/// Decode one KEXINIT name-list. An empty list is legal (e.g. the language
+/// lists); each name in a non-empty list must be printable US-ASCII without
+/// whitespace and at most 64 bytes (RFC 4251 §5/§6). Enforcing that keeps
+/// control characters in a hostile peer's offer out of the `NoMatch` error
+/// text that frontends print.
 fn read_name_list(r: &mut Reader<'_>) -> Result<Vec<String>> {
     let nl = NameList::read(r)?;
     let mut out = Vec::new();
     for entry in nl.iter() {
-        let s =
-            core::str::from_utf8(entry).map_err(|_| Error::Format("non-UTF8 name in name-list"))?;
+        if entry.len() > MAX_NAME_LEN {
+            return Err(Error::Format("over-long name in name-list"));
+        }
+        if !entry.iter().all(|b| (0x21..=0x7e).contains(b)) {
+            return Err(Error::Format("non-printable name in name-list"));
+        }
+        // Printable ASCII is always valid UTF-8.
+        let s = core::str::from_utf8(entry).map_err(|_| Error::Format("bad name in name-list"))?;
         out.push(s.to_string());
     }
     Ok(out)
@@ -471,6 +485,27 @@ mod tests {
         bytes.push(0xff);
         assert!(matches!(KexInit::decode(&bytes), Err(Error::Format(_))));
         ki.cookie[0] = 1;
+    }
+
+    #[test]
+    fn decode_validates_names_but_accepts_empty_lists() {
+        let algs = defaults_algorithms();
+        // Empty compression / language lists are legal.
+        let mut ki = KexInit::from_algorithms(&algs, [0u8; 16]);
+        ki.comp_c2s.clear();
+        ki.lang_s2c.clear();
+        assert_eq!(KexInit::decode(&ki.encode()).unwrap(), ki);
+
+        let bad = |name: &str| {
+            let mut ki = KexInit::from_algorithms(&algs, [0u8; 16]);
+            ki.ciphers_s2c.push(name.to_string());
+            KexInit::decode(&ki.encode())
+        };
+        assert!(matches!(bad("evil\x1b[2J"), Err(Error::Format(_))));
+        assert!(matches!(bad("has space"), Err(Error::Format(_))));
+        assert!(matches!(bad("caf\u{e9}"), Err(Error::Format(_))));
+        assert!(matches!(bad(&"a".repeat(65)), Err(Error::Format(_))));
+        assert!(bad(&"a".repeat(64)).is_ok());
     }
 
     #[test]

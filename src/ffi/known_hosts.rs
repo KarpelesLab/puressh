@@ -16,6 +16,7 @@ use core::ptr;
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::slice;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::client::{PcSshClient, connect_bounded, timeout_from_ms};
@@ -520,6 +521,13 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
         with_cstr(host, |host_s| {
             let timeout = timeout_from_ms(timeout_ms);
 
+            // The header promises `prompt_cb` / `prompt_ctx` are only used
+            // during this call. The closure lives on in the client (a
+            // re-key could reach it), so it is armed only until the connect
+            // returns; disarmed, it refuses without calling into C.
+            let armed = Arc::new(AtomicBool::new(true));
+            let armed_cb = Arc::clone(&armed);
+
             // Build the TOFU prompt (if any) from the C side. Kept as a
             // bare `Arc` so the per-address `make_cfg` below can rebuild
             // a fresh `TofuAction` each time (`Config` is not `Clone`).
@@ -533,6 +541,9 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
                         let ctx_addr = prompt_ctx as usize;
                         Some(Arc::new(
                             move |host: &str, port: u16, alg: &str, blob: &[u8]| -> bool {
+                                if !armed_cb.load(Ordering::SeqCst) {
+                                    return false;
+                                }
                                 let h_cs = match std::ffi::CString::new(host) {
                                     Ok(c) => c,
                                     Err(_) => return false,
@@ -595,7 +606,9 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
                 }
             };
 
-            match connect_bounded(host_s, port, timeout, make_cfg) {
+            let res = connect_bounded(host_s, port, timeout, make_cfg);
+            armed.store(false, Ordering::SeqCst);
+            match res {
                 Ok(c) => {
                     let boxed = Box::new(PcSshClient {
                         inner: SharedClient::from(c),

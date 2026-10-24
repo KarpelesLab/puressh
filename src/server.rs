@@ -23,12 +23,12 @@
 
 #![cfg(feature = "std")]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -70,6 +70,14 @@ const MAX_DRAIN_STEPS: usize = 1_000_000;
 /// the dispatcher can't ship `CHANNEL_DATA` fast enough (remote window
 /// exhausted).
 const SUBSYSTEM_EGRESS_BACKLOG: usize = 32;
+
+/// Bound on the per-handler ingress queue, in chunks (each at most one
+/// `CHANNEL_DATA` packet). Peer data beyond it waits in
+/// [`SubsystemRuntime::pending_ingress`] and its receive window is not
+/// replenished until the handler takes it, so a handler that stops reading
+/// (a `direct-tcpip` target that never reads) stalls the peer instead of
+/// growing server memory without bound.
+const SUBSYSTEM_INGRESS_BACKLOG: usize = 64;
 
 /// High-water mark on a shell's held-over stdout (`pending_stdout`). When a
 /// client stops reading, the remote window stays exhausted and unsent shell
@@ -434,9 +442,14 @@ pub use crate::stream::{ChannelEgress, ChannelStream};
 /// [`ShellRuntime`], owned by `do_connection_phase`.
 struct SubsystemRuntime {
     /// Push peer-sent bytes (or `None` for EOF) to the handler thread.
-    /// Unbounded so the dispatcher never blocks on its own dispatch path —
-    /// memory is bounded by the SSH receive window.
-    ingress_tx: Sender<Option<Vec<u8>>>,
+    /// Bounded and only ever fed with `try_send`, so the dispatcher never
+    /// blocks on its own dispatch path; overflow waits in `pending_ingress`.
+    ingress_tx: SyncSender<Option<Vec<u8>>>,
+    /// Peer-sent chunks (or the EOF marker) not yet accepted by
+    /// `ingress_tx`. The receive window for these bytes is replenished only
+    /// once they move into the handler's queue, so this is bounded by the
+    /// SSH receive window.
+    pending_ingress: VecDeque<Option<Vec<u8>>>,
     /// Drain bytes the handler wants to ship out.
     egress_rx: Receiver<ChannelEgress>,
     /// Egress data that didn't fit in the remote window on the last tick;
@@ -454,6 +467,38 @@ struct SubsystemRuntime {
     pending_stderr: Vec<u8>,
     /// Exit status from the handler, sent once all output has shipped.
     pending_exit: Option<u32>,
+}
+
+impl SubsystemRuntime {
+    /// Queue a peer chunk (or `None` for EOF) for the handler, in order
+    /// behind anything already waiting, and move what fits into the handler's
+    /// queue. Returns the number of data bytes moved — the amount the
+    /// channel's receive window may be replenished by.
+    fn push_ingress(&mut self, item: Option<Vec<u8>>) -> usize {
+        self.pending_ingress.push_back(item);
+        self.flush_ingress()
+    }
+
+    /// Move waiting chunks into the handler's bounded queue until it is full.
+    /// Returns the number of data bytes moved. Chunks for a handler that has
+    /// gone away are discarded and counted as moved, so the peer's window
+    /// keeps flowing as it did before (the data is dropped either way).
+    fn flush_ingress(&mut self) -> usize {
+        let mut moved = 0usize;
+        while let Some(item) = self.pending_ingress.pop_front() {
+            let len = item.as_ref().map_or(0, Vec::len);
+            match self.ingress_tx.try_send(item) {
+                Ok(()) | Err(TrySendError::Disconnected(_)) => {
+                    moved = moved.saturating_add(len);
+                }
+                Err(TrySendError::Full(item)) => {
+                    self.pending_ingress.push_front(item);
+                    break;
+                }
+            }
+        }
+        moved
+    }
 }
 
 /// Per-connection context handed to the [`Config::on_session_open`] hook.
@@ -2175,6 +2220,7 @@ fn handle_connection_inner(
     // mid-session on a keep-alive lull.
     if !grace.is_zero() {
         stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
     }
 
     // Phase 2 (post-auth): resolve the policy with the full user/groups
@@ -2519,7 +2565,7 @@ fn do_server_auth(
                         message: text.to_string(),
                         language: String::new(),
                     };
-                    srv_send(stream, driver, &banner.encode())?;
+                    srv_send_until(stream, driver, &banner.encode(), deadline)?;
                 }
                 resolved_user = Some(user.clone());
             }
@@ -2532,7 +2578,7 @@ fn do_server_auth(
             if method != "none" && !server_auth.accepted_methods().contains(&method) {
                 match server_auth.reject_unadvertised(&user)? {
                     ServerStep::Send(p) => {
-                        srv_send(stream, driver, &p)?;
+                        srv_send_until(stream, driver, &p, deadline)?;
                         continue;
                     }
                     ServerStep::Disconnect(reason) => {
@@ -2550,14 +2596,14 @@ fn do_server_auth(
         }
 
         match server_auth.on_packet(&payload)? {
-            ServerStep::Send(p) => srv_send(stream, driver, &p)?,
+            ServerStep::Send(p) => srv_send_until(stream, driver, &p, deadline)?,
             ServerStep::Authenticated {
                 payload,
                 user,
                 cert_caps,
                 auth_info,
             } => {
-                srv_send(stream, driver, &payload)?;
+                srv_send_until(stream, driver, &payload, deadline)?;
                 return Ok((user, cert_caps, auth_info));
             }
             ServerStep::Disconnect(reason) => {
@@ -3236,12 +3282,12 @@ fn do_connection_loop(
             let sent_before = driver.payloads_enqueued();
             drain_shells(stream, driver, conn, shells)?;
             finalize_exited_shells(stream, driver, conn, shells)?;
-            drain_subsystems(stream, driver, conn, subsystems)?;
+            let ingress_moved = drain_subsystems(stream, driver, conn, subsystems)?;
             forward.drain_pending(stream, driver, conn)?;
             agent_forward.drain_pending(stream, driver, conn)?;
             x11_forward.drain_pending(stream, driver, conn)?;
             streamlocal_forward.drain_pending(stream, driver, conn)?;
-            if driver.payloads_enqueued() != sent_before {
+            if driver.payloads_enqueued() != sent_before || ingress_moved {
                 extras.fast_until = Some(Instant::now() + FAST_WINDOW);
             }
         }
@@ -3453,12 +3499,18 @@ fn finalize_exited_shells(
 /// Pulls `Data` / `Eof` / `Close` from the handler's `egress_rx`, respecting
 /// the remote SSH window — bytes that don't fit go into `pending_data` and
 /// are re-attempted on the next tick.
+///
+/// Also moves peer data waiting in `pending_ingress` into each handler's
+/// queue as the handler makes room, replenishing the receive window for it.
+/// Returns whether any such ingress moved (so the caller keeps the fast
+/// tick while a backlog drains).
 fn drain_subsystems(
     stream: &mut TcpStream,
     driver: &mut ServerDriver,
     conn: &mut ConnectionState,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
-) -> Result<()> {
+) -> Result<bool> {
+    let mut ingress_moved = false;
     let channels: Vec<u32> = subsystems.keys().copied().collect();
     for ch in channels {
         let Some(rt) = subsystems.get_mut(&ch) else {
@@ -3466,6 +3518,19 @@ fn drain_subsystems(
         };
         if rt.close_sent {
             continue;
+        }
+
+        // 0) Peer data the handler's queue had no room for on arrival.
+        if !rt.pending_ingress.is_empty() {
+            let moved = rt.flush_ingress();
+            if moved > 0 {
+                ingress_moved = true;
+                if conn.channel(ch).is_some_and(|c| !c.local_closed)
+                    && let Some(adj) = conn.replenish_window(ch, moved as u32)?
+                {
+                    srv_send(stream, driver, &adj)?;
+                }
+            }
         }
 
         // 1) Re-attempt any leftover bytes from last tick.
@@ -3548,7 +3613,7 @@ fn drain_subsystems(
             }
         }
     }
-    Ok(())
+    Ok(ingress_moved)
 }
 
 /// Send `bytes` over `CHANNEL_DATA`, stashing anything the remote window
@@ -3627,7 +3692,8 @@ fn dispatch_app_packet(
             // `forwarded-tcpip` (ssh -R), `auth-agent@openssh.com`
             // (ssh -A), and `x11` (ssh -X / -Y).
             if let Some(reply) = forward.pending_opens.remove(&channel) {
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                 let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3635,6 +3701,7 @@ fn dispatch_app_packet(
                     channel,
                     SubsystemRuntime {
                         ingress_tx,
+                        pending_ingress: VecDeque::new(),
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3655,7 +3722,8 @@ fn dispatch_app_packet(
                 // SubsystemRuntime so Data/Eof/Close on the agent channel
                 // ride the same dispatch path, then hand the user-facing
                 // ChannelStream to the waiting accept-loop thread.
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                 let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3663,6 +3731,7 @@ fn dispatch_app_packet(
                     channel,
                     SubsystemRuntime {
                         ingress_tx,
+                        pending_ingress: VecDeque::new(),
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3676,7 +3745,8 @@ fn dispatch_app_packet(
                 let _ = reply.send(Ok(cs));
             } else if let Some(reply) = x11_forward.pending_opens.remove(&channel) {
                 // Symmetric with the agent-forward arm, for `x11`.
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                 let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3684,6 +3754,7 @@ fn dispatch_app_packet(
                     channel,
                     SubsystemRuntime {
                         ingress_tx,
+                        pending_ingress: VecDeque::new(),
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3698,7 +3769,8 @@ fn dispatch_app_packet(
             } else if let Some(reply) = streamlocal_forward.pending_opens.remove(&channel) {
                 // Symmetric with the `forwarded-tcpip` arm, for
                 // `forwarded-streamlocal@openssh.com`.
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                 let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3706,6 +3778,7 @@ fn dispatch_app_packet(
                     channel,
                     SubsystemRuntime {
                         ingress_tx,
+                        pending_ingress: VecDeque::new(),
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3812,7 +3885,8 @@ fn dispatch_app_packet(
                     let p = conn.accept_open(channel)?;
                     srv_send(stream, driver, &p)?;
 
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (ingress_tx, ingress_rx) =
+                        mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                     let (egress_tx, egress_rx) =
                         mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3830,6 +3904,7 @@ fn dispatch_app_packet(
                         channel,
                         SubsystemRuntime {
                             ingress_tx,
+                            pending_ingress: VecDeque::new(),
                             egress_rx,
                             pending_data: Vec::new(),
                             pending_eof: false,
@@ -3868,7 +3943,8 @@ fn dispatch_app_packet(
                     let p = conn.accept_open(channel)?;
                     srv_send(stream, driver, &p)?;
 
-                    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                    let (ingress_tx, ingress_rx) =
+                        mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                     let (egress_tx, egress_rx) =
                         mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                     let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -3883,6 +3959,7 @@ fn dispatch_app_packet(
                         channel,
                         SubsystemRuntime {
                             ingress_tx,
+                            pending_ingress: VecDeque::new(),
                             egress_rx,
                             pending_data: Vec::new(),
                             pending_eof: false,
@@ -3932,7 +4009,8 @@ fn dispatch_app_packet(
                         let p = conn.accept_open(channel)?;
                         srv_send(stream, driver, &p)?;
                         extras.tun_ifnames.push(ifname);
-                        let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                        let (ingress_tx, ingress_rx) =
+                            mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                         let (egress_tx, egress_rx) =
                             mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                         thread::spawn(move || {
@@ -3949,6 +4027,7 @@ fn dispatch_app_packet(
                             channel,
                             SubsystemRuntime {
                                 ingress_tx,
+                                pending_ingress: VecDeque::new(),
                                 egress_rx,
                                 pending_data: Vec::new(),
                                 pending_eof: false,
@@ -3993,6 +4072,7 @@ fn dispatch_app_packet(
                 cfg,
                 effective,
                 &extras.tun_ifnames,
+                &extras.session_channels,
                 user,
                 channel,
                 request,
@@ -4026,14 +4106,18 @@ fn dispatch_app_packet(
                     off += n;
                 }
             }
-            // Subsystem ingress: hand the chunk to the handler thread. The
-            // ingress channel is unbounded so we never block the dispatcher;
-            // the actual backpressure comes from the SSH window (we only
-            // replenish after pushing — but pushing is cheap, so it's fine).
-            if let Some(rt) = subsystems.get_mut(&channel) {
-                let _ = rt.ingress_tx.send(Some(data.clone()));
-            }
-            if let Some(adj) = conn.replenish_window(channel, data.len() as u32)? {
+            // Handler-thread ingress: queue the chunk for the handler and
+            // replenish the receive window only for the bytes its bounded
+            // queue actually took. The rest is credited by the per-tick
+            // `drain_subsystems` as the handler reads, so a handler that stops
+            // reading stalls the peer at the window instead of buffering an
+            // unbounded flood. Shell stdin (written synchronously above) and
+            // data for channels with no runtime are credited at once.
+            let credit = match subsystems.get_mut(&channel) {
+                Some(rt) => rt.push_ingress(Some(data)),
+                None => data.len(),
+            };
+            if let Some(adj) = conn.replenish_window(channel, credit as u32)? {
                 srv_send(stream, driver, &adj)?;
             }
         }
@@ -4051,7 +4135,8 @@ fn dispatch_app_packet(
             if let Some(rt) = subsystems.get_mut(&channel) {
                 // None = EOF marker; the handler's `Read::read` returns
                 // `Ok(0)` next time it drains its buffer.
-                let _ = rt.ingress_tx.send(None);
+                // Queued behind any data still waiting for the handler.
+                let _ = rt.push_ingress(None);
             }
         }
         ChannelEvent::Close { channel } => {
@@ -4197,7 +4282,16 @@ fn handle_global_request(
                 effective.gateway_ports,
                 &bind_address,
             );
-            let ok = if bind_port > u16::MAX as u32 {
+            // Only a binding this connection itself established may be
+            // cancelled: the default handlers keep a process-wide listener
+            // map, so an unchecked unbind would let one user tear down (and
+            // then re-bind, intercepting traffic for) another user's forward.
+            let owned = bind_port <= u16::MAX as u32
+                && forward
+                    .owned_bindings
+                    .iter()
+                    .any(|(a, p)| a == &effective_bind && *p == bind_port as u16);
+            let ok = if !owned {
                 false
             } else if let Some(handler) = cfg.tcpip_forward_handler.clone() {
                 let r = handler
@@ -4251,7 +4345,15 @@ fn handle_global_request(
             srv_send(stream, driver, &p)?;
         }
         GlobalRequest::CancelStreamlocalForward { socket_path } => {
-            let ok = if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
+            // As for cancel-tcpip-forward: refuse to unbind a socket path this
+            // connection did not bind itself.
+            let owned = streamlocal_forward
+                .owned_bindings
+                .iter()
+                .any(|p| p == &socket_path);
+            let ok = if !owned {
+                false
+            } else if let Some(handler) = cfg.streamlocal_forward_handler.clone() {
                 let r = handler.unbind(user, &socket_path).is_ok();
                 if r {
                     streamlocal_forward
@@ -4433,6 +4535,7 @@ fn handle_channel_request(
     cfg: &Config,
     effective: &EffectivePolicy,
     tun_ifnames: &[String],
+    session_channels: &BTreeSet<u32>,
     user: &str,
     channel: u32,
     request: ChannelRequest,
@@ -4443,6 +4546,28 @@ fn handle_channel_request(
     agent_forward: &mut AgentForwardConn,
     x11_forward: &mut X11ForwardConn,
 ) -> Result<()> {
+    // Session-only requests (RFC 4254 §6) are honoured on `session` channels
+    // alone. Without this gate a `direct-tcpip` / `tun` / forwarded channel
+    // could carry `shell` or `exec`, which sidesteps `MaxSessions` (it counts
+    // only session opens) and hands a shell to a forwarding-only account.
+    // A session runs at most one program: a second `shell` / `exec` /
+    // `subsystem` on a channel that already started one (or whose buffered
+    // command already ran and closed it) is refused rather than replacing
+    // the running runtime.
+    if let Some(started_request) = session_only_request(&request) {
+        let is_session = session_channels.contains(&channel);
+        let already_started = started_request
+            && (shells.get(&channel).is_some_and(|rt| rt.session.is_some())
+                || subsystems.contains_key(&channel)
+                || conn.channel(channel).is_none_or(|c| c.local_closed));
+        if !is_session || already_started {
+            if want_reply {
+                let p = conn.send_request_failure(channel)?;
+                srv_send(stream, driver, &p)?;
+            }
+            return Ok(());
+        }
+    }
     // Lazily allocate a per-channel env bag for any session-style channel
     // whose Open we somehow missed. Cheap insert; subsequent lookups are
     // O(log n) on the BTreeMap.
@@ -4748,7 +4873,8 @@ fn handle_channel_request(
                 // Ingress: unbounded — the dispatcher must never block on
                 // its own dispatch path. Egress: bounded — the handler
                 // thread self-throttles when the remote window is full.
-                let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+                let (ingress_tx, ingress_rx) =
+                    mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
                 let (egress_tx, egress_rx) =
                     mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
                 let cs = ChannelStream::new(ingress_rx, egress_tx);
@@ -4765,6 +4891,7 @@ fn handle_channel_request(
                     channel,
                     SubsystemRuntime {
                         ingress_tx,
+                        pending_ingress: VecDeque::new(),
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -4832,7 +4959,12 @@ fn handle_channel_request(
             // child shells / exec see it. The handle stays in
             // `x11_forward.active` until the channel closes; its `Drop`
             // impl stops the accept thread.
+            // The protocol name and cookie end up on `xauth`'s stdin (and in
+            // the rc files' environment), so refuse anything that could
+            // smuggle extra xauth commands (CVE-2016-3115), whatever the
+            // handler does with them.
             if effective.x11_forwarding_allowed()
+                && x11_auth_valid(&auth_protocol, &auth_cookie)
                 && let Some(handler) = cfg.x11_forward_handler.clone()
             {
                 let ctx = X11ForwardContext::new(x11_forward.req_tx.clone());
@@ -4884,6 +5016,37 @@ fn handle_channel_request(
     Ok(())
 }
 
+/// Validate an `x11-req`'s authentication protocol and cookie the way
+/// OpenSSH's `xauth_valid_string` does: the protocol a non-empty run of
+/// `[A-Za-z0-9.:/_-]` (OpenSSH's set), the cookie non-empty hex. Anything else (whitespace, a
+/// newline smuggling a second `xauth` command) is refused.
+fn x11_auth_valid(auth_protocol: &str, auth_cookie: &str) -> bool {
+    !auth_protocol.is_empty()
+        && auth_protocol
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b':' | b'/' | b'_' | b'-'))
+        && !auth_cookie.is_empty()
+        && auth_cookie.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Classify a channel request that only makes sense on a `session` channel.
+/// `Some(true)` for the requests that start the session's program (`exec`,
+/// `shell`, `subsystem`), `Some(false)` for the other session-only setup
+/// requests, `None` for everything else (`eow@openssh.com`, `keepalive`,
+/// `window-change`, `signal`, ...), which keeps its existing handling.
+fn session_only_request(request: &ChannelRequest) -> Option<bool> {
+    match request {
+        ChannelRequest::Exec { .. } | ChannelRequest::Shell | ChannelRequest::Subsystem { .. } => {
+            Some(true)
+        }
+        ChannelRequest::PtyReq { .. }
+        | ChannelRequest::Env { .. }
+        | ChannelRequest::AuthAgentReq
+        | ChannelRequest::X11Req { .. } => Some(false),
+        _ => None,
+    }
+}
+
 /// Run `command` on a session channel: first offer it to the
 /// [`ExecStreamHandler`] overlay (if any), otherwise run it through the
 /// buffered [`CommandHandler`] and close the channel. Shared by the `exec`
@@ -4896,7 +5059,7 @@ fn start_stream_handler(
     channel: u32,
     body: impl FnOnce(ChannelStream) + Send + 'static,
 ) {
-    let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+    let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
     let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
     let cs = ChannelStream::new(ingress_rx, egress_tx);
     thread::spawn(move || body(cs));
@@ -4904,6 +5067,7 @@ fn start_stream_handler(
         channel,
         SubsystemRuntime {
             ingress_tx,
+            pending_ingress: VecDeque::new(),
             egress_rx,
             pending_data: Vec::new(),
             pending_eof: false,
@@ -5005,7 +5169,8 @@ fn route_internal_sftp(
     args: Vec<String>,
 ) -> Result<()> {
     if let Some(handler) = cfg.subsystem_handler.clone() {
-        let (ingress_tx, ingress_rx) = mpsc::channel::<Option<Vec<u8>>>();
+        let (ingress_tx, ingress_rx) =
+            mpsc::sync_channel::<Option<Vec<u8>>>(SUBSYSTEM_INGRESS_BACKLOG);
         let (egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(SUBSYSTEM_EGRESS_BACKLOG);
         let cs = ChannelStream::new(ingress_rx, egress_tx);
         let user_owned = user.to_string();
@@ -5017,6 +5182,7 @@ fn route_internal_sftp(
             channel,
             SubsystemRuntime {
                 ingress_tx,
+                pending_ingress: VecDeque::new(),
                 egress_rx,
                 pending_data: Vec::new(),
                 pending_eof: false,
@@ -5310,12 +5476,15 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
     KexInit::from_algorithms_owned(algs, cookie)
 }
 
-/// Arm the per-read socket timeout against an absolute pre-auth `deadline`
-/// (OpenSSH's `LoginGraceTime` as a whole-phase budget rather than a
-/// per-read inactivity window). When `deadline` is `None` the budget is
-/// disabled and the socket timeout is left untouched. If the deadline has
-/// already elapsed, return the canonical pre-auth timeout error so the
-/// caller fails closed instead of issuing a read that would block forever.
+/// Arm the socket read *and write* timeouts against an absolute pre-auth
+/// `deadline` (OpenSSH's `LoginGraceTime` as a whole-phase budget rather than
+/// a per-read inactivity window). The write side matters too: a peer that
+/// finishes KEX, floods `PING`s and never reads would otherwise park the
+/// `PONG` writes (and its `MaxStartups` slot) forever. When `deadline` is
+/// `None` the budget is disabled and the socket timeouts are left untouched.
+/// If the deadline has already elapsed, return the canonical pre-auth
+/// timeout error so the caller fails closed instead of issuing I/O that
+/// would block forever.
 fn arm_preauth_deadline(stream: &TcpStream, deadline: Option<Instant>) -> Result<()> {
     if let Some(deadline) = deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -5327,6 +5496,9 @@ fn arm_preauth_deadline(stream: &TcpStream, deadline: Option<Instant>) -> Result
         }
         stream
             .set_read_timeout(Some(remaining))
+            .map_err(Error::Io)?;
+        stream
+            .set_write_timeout(Some(remaining))
             .map_err(Error::Io)?;
     }
     Ok(())
@@ -5342,8 +5514,33 @@ fn arm_preauth_deadline(stream: &TcpStream, deadline: Option<Instant>) -> Result
 
 /// Flush every frame the driver has queued to the wire.
 fn srv_pump_out(stream: &mut TcpStream, driver: &mut ServerDriver) -> Result<()> {
+    srv_pump_out_until(stream, driver, None)
+}
+
+/// [`srv_pump_out`] under the pre-auth `deadline`: the write timeout is
+/// re-armed to the time remaining before every write, so a peer that stops
+/// reading (or drains a byte at a time) cannot hold the connection past
+/// `LoginGraceTime`.
+fn srv_pump_out_until(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    deadline: Option<Instant>,
+) -> Result<()> {
     while let Some(frame) = driver.poll_transmit() {
-        stream.write_all(&frame)?;
+        if deadline.is_none() {
+            stream.write_all(&frame)?;
+            continue;
+        }
+        let mut off = 0;
+        while off < frame.len() {
+            arm_preauth_deadline(stream, deadline)?;
+            match stream.write(&frame[off..]) {
+                Ok(0) => return Err(Error::Io(ErrorKind::WriteZero.into())),
+                Ok(n) => off += n,
+                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) => return Err(Error::Io(e)),
+            }
+        }
     }
     Ok(())
 }
@@ -5351,8 +5548,18 @@ fn srv_pump_out(stream: &mut TcpStream, driver: &mut ServerDriver) -> Result<()>
 /// Encode `payload` and send it (the driver-backed replacement for the old
 /// `srv_send(stream, driver, payload)`).
 fn srv_send(stream: &mut TcpStream, driver: &mut ServerDriver, payload: &[u8]) -> Result<()> {
+    srv_send_until(stream, driver, payload, None)
+}
+
+/// [`srv_send`] under the pre-auth `deadline` (see [`srv_pump_out_until`]).
+fn srv_send_until(
+    stream: &mut TcpStream,
+    driver: &mut ServerDriver,
+    payload: &[u8],
+    deadline: Option<Instant>,
+) -> Result<()> {
     driver.enqueue_payload(payload)?;
-    srv_pump_out(stream, driver)
+    srv_pump_out_until(stream, driver, deadline)
 }
 
 /// Whether `e` is the client ending the connection: EOF, its
@@ -5388,7 +5595,7 @@ fn srv_read_into(
     if let Err(e) = driver.handle_input(&tmp[..n], Instant::now()) {
         // Say why, when the driver has something to say (a refused
         // identification string), before the connection closes.
-        let _ = srv_pump_out(stream, driver);
+        let _ = srv_pump_out_until(stream, driver, deadline);
         return Err(e);
     }
     Ok(())
@@ -5405,10 +5612,10 @@ fn srv_read(
 ) -> Result<Vec<u8>> {
     loop {
         driver.handle_timeout(Instant::now())?;
-        srv_pump_out(stream, driver)?;
+        srv_pump_out_until(stream, driver, deadline)?;
         while let Some(ev) = driver.poll_event() {
             if let Event::AppData(payload) = ev {
-                srv_pump_out(stream, driver)?;
+                srv_pump_out_until(stream, driver, deadline)?;
                 return Ok(payload);
             }
         }
@@ -5480,10 +5687,10 @@ fn srv_drive_handshake(
     deadline: Option<Instant>,
 ) -> Result<()> {
     loop {
-        srv_pump_out(stream, driver)?;
+        srv_pump_out_until(stream, driver, deadline)?;
         while let Some(ev) = driver.poll_event() {
             if matches!(ev, Event::HandshakeComplete) {
-                srv_pump_out(stream, driver)?;
+                srv_pump_out_until(stream, driver, deadline)?;
                 return Ok(());
             }
         }
@@ -8545,5 +8752,233 @@ mod tests {
         );
         // `no` is `none`-only.
         assert_eq!(build(Some(Compression::No)), vec!["none"]);
+    }
+
+    #[test]
+    fn x11_auth_valid_rejects_xauth_injection() {
+        assert!(x11_auth_valid(
+            "MIT-MAGIC-COOKIE-1",
+            "0123456789abcdefABCDEF"
+        ));
+        assert!(x11_auth_valid("XDM-AUTHORIZATION-1", "00ff"));
+        // Empty fields.
+        assert!(!x11_auth_valid("", "00ff"));
+        assert!(!x11_auth_valid("MIT-MAGIC-COOKIE-1", ""));
+        // CVE-2016-3115: a newline smuggles a second xauth command.
+        assert!(!x11_auth_valid(
+            "MIT-MAGIC-COOKIE-1",
+            "00ff\nsource /etc/shadow"
+        ));
+        assert!(!x11_auth_valid("MIT MAGIC", "00ff"));
+        assert!(!x11_auth_valid("MIT\n-MAGIC", "00ff"));
+        // Cookie must be hex.
+        assert!(!x11_auth_valid("MIT-MAGIC-COOKIE-1", "00fg"));
+    }
+
+    #[test]
+    fn session_only_requests_are_classified() {
+        assert_eq!(
+            session_only_request(&ChannelRequest::Exec {
+                command: "id".into()
+            }),
+            Some(true)
+        );
+        assert_eq!(session_only_request(&ChannelRequest::Shell), Some(true));
+        assert_eq!(
+            session_only_request(&ChannelRequest::Subsystem {
+                name: "sftp".into()
+            }),
+            Some(true)
+        );
+        assert_eq!(
+            session_only_request(&ChannelRequest::Env {
+                name: "A".into(),
+                value: "b".into()
+            }),
+            Some(false)
+        );
+        assert_eq!(
+            session_only_request(&ChannelRequest::AuthAgentReq),
+            Some(false)
+        );
+        // Requests that are legitimate on any channel type keep their
+        // existing handling.
+        assert_eq!(
+            session_only_request(&ChannelRequest::WindowChange {
+                cols: 80,
+                rows: 24,
+                px_w: 0,
+                px_h: 0
+            }),
+            None
+        );
+        assert_eq!(
+            session_only_request(&ChannelRequest::Signal {
+                name: "TERM".into()
+            }),
+            None
+        );
+    }
+
+    fn ingress_test_runtime(backlog: usize) -> (SubsystemRuntime, Receiver<Option<Vec<u8>>>) {
+        let (ingress_tx, ingress_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(backlog);
+        let (_egress_tx, egress_rx) = mpsc::sync_channel::<ChannelEgress>(1);
+        let rt = SubsystemRuntime {
+            ingress_tx,
+            pending_ingress: VecDeque::new(),
+            egress_rx,
+            pending_data: Vec::new(),
+            pending_eof: false,
+            pending_close: false,
+            pending_stderr: Vec::new(),
+            pending_exit: None,
+            eof_sent: false,
+            close_sent: false,
+        };
+        (rt, ingress_rx)
+    }
+
+    #[test]
+    fn ingress_is_credited_only_as_the_handler_takes_it() {
+        let (mut rt, rx) = ingress_test_runtime(2);
+        // Two chunks fit the handler's queue and are credited at once.
+        assert_eq!(rt.push_ingress(Some(vec![0; 10])), 10);
+        assert_eq!(rt.push_ingress(Some(vec![0; 20])), 20);
+        // A handler that is not reading: further data is held, uncredited,
+        // so the peer runs out of window instead of growing server memory.
+        assert_eq!(rt.push_ingress(Some(vec![0; 30])), 0);
+        assert_eq!(rt.push_ingress(None), 0);
+        assert_eq!(rt.flush_ingress(), 0);
+        assert_eq!(rt.pending_ingress.len(), 2);
+        // The handler reads one chunk: the held chunk moves and is credited;
+        // EOF stays queued behind it, in order.
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 10);
+        assert_eq!(rt.flush_ingress(), 30);
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 20);
+        assert_eq!(rt.flush_ingress(), 0);
+        assert!(rt.pending_ingress.is_empty());
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 30);
+        assert_eq!(rx.recv().unwrap(), None);
+    }
+
+    #[test]
+    fn ingress_for_a_departed_handler_is_discarded_and_credited() {
+        let (mut rt, rx) = ingress_test_runtime(1);
+        assert_eq!(rt.push_ingress(Some(vec![0; 5])), 5);
+        assert_eq!(rt.push_ingress(Some(vec![0; 7])), 0);
+        drop(rx);
+        assert_eq!(rt.flush_ingress(), 7);
+        assert_eq!(rt.push_ingress(Some(vec![0; 9])), 9);
+        assert!(rt.pending_ingress.is_empty());
+    }
+
+    #[test]
+    fn cancel_tcpip_forward_refuses_a_binding_this_connection_does_not_own() {
+        let host_seed = fresh_seed();
+        let client_seed = fresh_seed();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let allowed_blob = Ed25519HostKey::from_seed(client_seed).public_blob();
+        let user = "cancel-user".to_string();
+        let user_f = user.clone();
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || -> Box<dyn Authenticator> {
+            Box::new(OneKeyAuth {
+                allowed_user: user_f.clone(),
+                allowed_blob: allowed_blob.clone(),
+            })
+        });
+        let handler = Arc::new(
+            crate::forwarding::reverse::DefaultTcpipForwardHandler::permit_all_interfaces(),
+        );
+        // Another connection's forward, in the handler's process-wide map.
+        let (other_tx, _other_rx) = mpsc::channel();
+        let victim_port = handler
+            .bind("victim", "127.0.0.1", 0, ForwardContext::new(other_tx))
+            .expect("victim bind");
+        let cfg = Config::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(EchoCommandHandler),
+        )
+        .with_tcpip_forward(handler.clone());
+
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let server_done = Arc::new(Mutex::new(false));
+        let sd = server_done.clone();
+        let st = thread::spawn(move || {
+            let r = server.accept_one();
+            *sd.lock().unwrap() = true;
+            r
+        });
+        let mut client = Client::connect(
+            addr,
+            ClientConfig {
+                host_key_policy: HostKeyPolicy::AcceptAny,
+                timeout: Some(Duration::from_secs(10)),
+                algorithms: Default::default(),
+                pinned_host_key: None,
+            },
+        )
+        .expect("connect");
+        client
+            .authenticate_publickey(&user, Box::new(Ed25519HostKey::from_seed(client_seed)))
+            .expect("auth");
+
+        assert!(
+            client
+                .cancel_tcpip_forward("127.0.0.1", victim_port)
+                .is_err(),
+            "another connection's forward must not be cancellable"
+        );
+        assert_eq!(handler.binding_count(), 1, "victim listener still bound");
+
+        // The connection's own forward still cancels.
+        let own = client
+            .request_tcpip_forward("127.0.0.1", 0)
+            .expect("own bind");
+        assert_eq!(handler.binding_count(), 2);
+        client
+            .cancel_tcpip_forward("127.0.0.1", own)
+            .expect("own cancel");
+        assert_eq!(handler.binding_count(), 1);
+
+        w7_finish(client, st, server_done);
+        let _ = handler.unbind("victim", "127.0.0.1", victim_port);
+    }
+
+    #[test]
+    fn preauth_deadline_bounds_writes_too() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let client = TcpStream::connect(addr).expect("connect");
+        let (server_side, _) = listener.accept().expect("accept");
+        arm_preauth_deadline(
+            &server_side,
+            Some(Instant::now() + Duration::from_millis(200)),
+        )
+        .expect("arm");
+        assert!(server_side.read_timeout().unwrap().is_some());
+        assert!(
+            server_side.write_timeout().unwrap().is_some(),
+            "a peer that never reads must not hold a pre-auth write forever"
+        );
+        // A peer that never reads: writing fills the socket buffers and then
+        // fails once the remaining budget runs out instead of blocking.
+        let mut s = server_side;
+        let chunk = vec![0u8; 64 * 1024];
+        let start = Instant::now();
+        let err = loop {
+            match s.write(&chunk) {
+                Ok(n) => assert!(n > 0 && start.elapsed() < Duration::from_secs(10)),
+                Err(e) => break e,
+            }
+        };
+        assert!(matches!(
+            err.kind(),
+            ErrorKind::TimedOut | ErrorKind::WouldBlock
+        ));
+        drop(client);
     }
 }

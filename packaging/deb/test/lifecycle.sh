@@ -123,6 +123,34 @@ ours_log() { journalctl --no-pager -o cat --since "$INSTALLED" SYSLOG_FACILITY=4
 ours_log | grep -q '^Server listening on '
 ours_log | grep -q '^Accepted publickey for tester from .* port [0-9]* ssh2: ED25519 SHA256:'
 
+step "an open session survives an in-place upgrade"
+# Hold a session open, then reinstall the package: same postinst path as a
+# version upgrade (binary replaced on disk, daemon stopped, stale-listener
+# sweep). puressh handles each connection in a forked worker that must outlive
+# the restart; a regression drops the logged-in user mid-upgrade.
+timeout 120 ssh -T -F /dev/null -i /root/tester_key -o BatchMode=yes \
+	-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts \
+	tester@localhost 'echo up; sleep 90' </dev/null >/tmp/held.out 2>&1 &
+held=$!
+# Wait until the session is established (its `echo up` has come back).
+established=
+for _ in $(seq 1 30); do
+	if grep -q '^up$' /tmp/held.out 2>/dev/null; then established=1; break; fi
+	if ! kill -0 "$held" 2>/dev/null; then break; fi
+	sleep 1
+done
+[ -n "$established" ] || { echo "held session never established"; cat /tmp/held.out; exit 1; }
+dpkg -i "$DEB"
+systemctl is-active ssh.service
+sleep 2
+if ! kill -0 "$held" 2>/dev/null; then
+	echo "the in-place upgrade dropped an open session"; cat /tmp/held.out; exit 1
+fi
+kill "$held" 2>/dev/null || true
+wait "$held" 2>/dev/null || true
+# The upgraded daemon still accepts fresh connections.
+try_ssh tester@localhost 'echo upgrade-ok' | grep -q upgrade-ok
+
 step "reload (SIGHUP) picks up an SFTP-only chroot jail"
 # The common deployment: a drop-in with Match User + ChrootDirectory +
 # ForceCommand internal-sftp, applied by a reload.

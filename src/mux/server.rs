@@ -511,6 +511,11 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
         }
         Frame::Forward { kind, spec, cancel } => {
             let reply = match &state.on_forward {
+                // No new forwards over a host key that did not match
+                // known_hosts (cancelling an existing one is fine).
+                Some(_) if !cancel && shared.host_key_mismatched() => Frame::OpenFail {
+                    reason: crate::client::HOST_KEY_MISMATCH_DISABLED.into(),
+                },
                 Some(f) => match f(kind, &spec, cancel) {
                     Ok(port) => Frame::ForwardOk { port: port as u32 },
                     Err(reason) => Frame::OpenFail { reason },

@@ -832,8 +832,12 @@ impl SharedClient {
     /// server listens on (its choice when `bind_port` is 0). The
     /// connections arrive through the handlers given to
     /// [`Self::set_channel_handlers`].
+    ///
+    /// Refused after a changed host key was accepted (see
+    /// [`Self::host_key_mismatched`]).
     pub fn request_tcpip_forward(&self, bind_address: &str, bind_port: u16) -> Result<u16> {
         let mut g = lock_or_poison(&self.inner)?;
+        refuse_if_mismatched(&g)?;
         let p = g.client.conn.send_global_request(
             crate::channel::GlobalRequest::TcpipForward {
                 bind_address: bind_address.to_string(),
@@ -884,8 +888,12 @@ impl SharedClient {
     /// Ask the server to listen on the Unix socket `socket_path` and
     /// forward its connections here (`streamlocal-forward@openssh.com`) —
     /// `ssh -R /path:…` on a connection already in use.
+    ///
+    /// Refused after a changed host key was accepted (see
+    /// [`Self::host_key_mismatched`]).
     pub fn request_streamlocal_forward(&self, socket_path: &str) -> Result<()> {
         let mut g = lock_or_poison(&self.inner)?;
+        refuse_if_mismatched(&g)?;
         let p = g.client.conn.send_global_request(
             crate::channel::GlobalRequest::StreamlocalForward {
                 socket_path: socket_path.to_string(),
@@ -934,6 +942,13 @@ impl SharedClient {
         );
         g.client.write_payload(&p)?;
         await_global_reply_under_lock(&mut g)
+    }
+
+    /// Whether the connection was established through a *changed* host key
+    /// that `StrictHostKeyChecking=no` let through (see
+    /// [`Client::host_key_mismatched`]). Port forwarding is refused then.
+    pub fn host_key_mismatched(&self) -> bool {
+        lock_or_poison(&self.inner).is_ok_and(|g| g.client.host_key_mismatched())
     }
 
     /// The algorithms the most recent key exchange chose.
@@ -1001,6 +1016,10 @@ impl SharedClient {
     ///
     /// Multiple concurrent forwards are supported and can coexist with
     /// SFTP / shell / exec handles.
+    ///
+    /// This is port forwarding (`-L`, `-D`), so it is refused after a
+    /// changed host key was accepted (see [`Self::host_key_mismatched`]);
+    /// [`Self::open_stdio_forward`] is the `-W` carrier that is not.
     pub fn open_direct_tcpip(
         &self,
         dest_host: &str,
@@ -1010,7 +1029,30 @@ impl SharedClient {
     ) -> Result<OwnedChannelStream> {
         let local_id = {
             let mut g = lock_or_poison(&self.inner)?;
+            refuse_if_mismatched(&g)?;
             open_direct_tcpip_under_lock(&mut g, dest_host, dest_port, orig_host, orig_port)?
+        };
+        Ok(OwnedChannelStream {
+            shared: self.clone(),
+            channel: local_id,
+            local_close_sent: false,
+            pty_denied: false,
+        })
+    }
+
+    /// Open a `direct-tcpip` channel to `dest_host:dest_port` to carry the
+    /// caller's own stdio (`ssh -W`) or a further SSH connection (a jump
+    /// host). Unlike [`Self::open_direct_tcpip`] it stays available after a
+    /// changed host key was accepted, as in OpenSSH: nothing local is
+    /// exposed to the server through it.
+    pub fn open_stdio_forward(
+        &self,
+        dest_host: &str,
+        dest_port: u16,
+    ) -> Result<OwnedChannelStream> {
+        let local_id = {
+            let mut g = lock_or_poison(&self.inner)?;
+            open_direct_tcpip_under_lock(&mut g, dest_host, dest_port, "127.0.0.1", 0)?
         };
         Ok(OwnedChannelStream {
             shared: self.clone(),
@@ -1023,9 +1065,13 @@ impl SharedClient {
     /// Open a `direct-streamlocal@openssh.com` channel (OpenSSH extension):
     /// the server connects to the Unix socket `socket_path` and proxies bytes
     /// across the returned stream — `ssh -L …:/remote.sock`.
+    ///
+    /// Refused after a changed host key was accepted (see
+    /// [`Self::host_key_mismatched`]).
     pub fn open_direct_streamlocal(&self, socket_path: &str) -> Result<OwnedChannelStream> {
         let local_id = {
             let mut g = lock_or_poison(&self.inner)?;
+            refuse_if_mismatched(&g)?;
             let (local_id, open_payload) = g.client.conn.open(ChannelOpen::DirectStreamlocal {
                 socket_path: socket_path.to_string(),
             })?;
@@ -1219,6 +1265,15 @@ fn open_session_under_lock(g: &mut Inner, what: &'static str) -> Result<u32> {
 /// Open a `direct-tcpip` channel under an already-held lock guard.
 /// Direct-tcpip channels don't take a follow-on request — once the open
 /// is confirmed, the channel is ready for raw byte I/O.
+/// Port forwarding is off after an accepted host-key change, as in OpenSSH
+/// (see [`Client::host_key_mismatched`]).
+fn refuse_if_mismatched(g: &Inner) -> Result<()> {
+    if g.client.host_key_mismatched() {
+        return Err(Error::Config(crate::client::HOST_KEY_MISMATCH_DISABLED));
+    }
+    Ok(())
+}
+
 fn open_direct_tcpip_under_lock(
     g: &mut Inner,
     dest_host: &str,

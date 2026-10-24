@@ -4231,7 +4231,7 @@ fn run_stdio_forward(client: Client, spec: &str) -> Result<i32, String> {
         .map_err(|_| format!("-W: bad port in {spec:?}"))?;
     let shared: puressh::shared::SharedClient = client.into();
     let mut stream = shared
-        .open_direct_tcpip(&host, port, "127.0.0.1", 0)
+        .open_stdio_forward(&host, port)
         .map_err(|e| format!("stdio forwarding failed: {e}"))?;
     let channel_id = stream.channel_id();
     let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));

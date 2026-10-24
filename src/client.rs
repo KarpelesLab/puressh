@@ -5737,6 +5737,20 @@ mod tests {
                 .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", "00", 0)
                 .map(drop)
         ));
+        // The same over a SharedClient (`-L`, `-D`, `ssh -O forward`).
+        #[cfg(feature = "multichannel")]
+        {
+            let shared: crate::shared::SharedClient = client.into();
+            assert!(shared.host_key_mismatched());
+            assert!(blocked(
+                shared.open_direct_tcpip("h", 1, "127.0.0.1", 0).map(drop)
+            ));
+            assert!(blocked(shared.open_direct_streamlocal("/x").map(drop)));
+            assert!(blocked(
+                shared.request_tcpip_forward("127.0.0.1", 0).map(drop)
+            ));
+            assert!(blocked(shared.request_streamlocal_forward("/x")));
+        }
         // The stored (old) key was NOT rotated.
         assert!(matches!(
             store

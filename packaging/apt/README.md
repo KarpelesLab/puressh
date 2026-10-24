@@ -30,12 +30,14 @@ own.
 
 ### 1. Create the signing key
 
-A dedicated, **passphrase-less** key whose only job is signing this repository
-(reprepro signs non-interactively in CI, so it cannot type a passphrase).
-Protect the exported secret as a GitHub secret and nothing else.
+A dedicated key whose only job is signing this repository. reprepro signs
+non-interactively in CI (via gpgme + gpg-agent), so make it **passphrase-less**
+— note the explicit `--passphrase ''`, without which `gpg` creates a
+*protected* key that CI cannot use:
 
 ```sh
-gpg --batch --quick-gen-key "puressh apt repository <mark@klb.jp>" ed25519 sign never
+gpg --batch --passphrase '' \
+    --quick-gen-key "puressh apt repository <mark@klb.jp>" ed25519 sign never
 # Export the SECRET half for CI (store it in the APT_GPG_PRIVATE_KEY secret):
 gpg --armor --export-secret-keys mark@klb.jp > apt-signing-key.asc
 ```
@@ -43,15 +45,23 @@ gpg --armor --export-secret-keys mark@klb.jp > apt-signing-key.asc
 The public half is published automatically as `puressh-archive-keyring.asc`;
 you do not need to commit it.
 
+> If you must use a passphrase-protected key, keep the passphrase and also set
+> an `APT_GPG_PASSPHRASE` secret (below); the workflow presets it into the
+> agent so gpgme can sign. A passphrase-less key is simpler and needs no second
+> secret.
+
 ### 2. Add the CI secret
 
 In the GitHub repo: **Settings → Secrets and variables → Actions → New
 repository secret**
 
 - `APT_GPG_PRIVATE_KEY` — the full contents of `apt-signing-key.asc`.
+- `APT_GPG_PASSPHRASE` — *(optional)* the key's passphrase, only if the key is
+  protected.
 
-Then delete your local `apt-signing-key.asc`. If the secret is absent the
-`publish-apt` job skips itself, so releases keep working until you set it.
+Then delete your local `apt-signing-key.asc`. If `APT_GPG_PRIVATE_KEY` is
+absent the `publish-apt` job skips itself, so releases keep working until you
+set it.
 
 ### 3. Enable GitHub Pages
 

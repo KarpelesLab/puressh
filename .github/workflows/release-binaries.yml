@@ -222,23 +222,41 @@ jobs:
         id: gpg
         env:
           APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
+          set -euo pipefail
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
-          # Allow a loopback passphrase for the CLI priming sign below, but do
-          # NOT set `pinentry-mode loopback` in gpg.conf: reprepro signs via
-          # gpgme, which in loopback mode expects the caller to supply the
-          # passphrase (reprepro does not), so a global loopback breaks it even
-          # for a passphrase-less key. gpgme uses the agent normally instead.
-          echo "allow-loopback-pinentry" > "$GNUPGHOME/gpg-agent.conf"
+          # reprepro signs via gpgme, which uses gpg-agent and cannot type a
+          # passphrase itself. A passphrase-less key signs directly; a
+          # protected key needs its passphrase preset into the agent (set the
+          # optional APT_GPG_PASSPHRASE secret). Do NOT put `pinentry-mode
+          # loopback` in gpg.conf — in loopback mode gpgme expects the caller
+          # to supply the passphrase, which breaks reprepro even for an
+          # unprotected key.
+          cat > "$GNUPGHOME/gpg-agent.conf" <<'CONF'
+          allow-loopback-pinentry
+          allow-preset-passphrase
+          default-cache-ttl 7200
+          max-cache-ttl 7200
+          CONF
           gpgconf --kill gpg-agent || true
           printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
           keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
           if [ -z "$keyid" ]; then echo "no key imported" >&2; exit 1; fi
-          # Verify the key signs without prompting (the repo signing key must be
-          # passphrase-less for non-interactive CI) and prime the agent.
-          echo priming | gpg --batch --yes --pinentry-mode loopback --passphrase '' \
-            --local-user "$keyid" --sign -o /dev/null
+          # If a passphrase is provided, preset it into the agent so gpgme can
+          # sign unattended (keyed by the secret key's keygrip).
+          if [ -n "${APT_GPG_PASSPHRASE:-}" ]; then
+            grip=$(gpg --list-secret-keys --with-keygrip --with-colons | awk -F: '/^grp:/{print $10; exit}')
+            preset=$(command -v gpg-preset-passphrase || echo /usr/lib/gnupg/gpg-preset-passphrase)
+            printf '%s' "$APT_GPG_PASSPHRASE" | "$preset" --preset "$grip"
+          fi
+          # Prime and verify signing through the agent, exactly as gpgme will.
+          # Fails loudly if the key is protected but no passphrase was provided.
+          if ! echo priming | gpg --batch --yes --local-user "$keyid" --sign -o /dev/null; then
+            echo "::error::signing key cannot sign unattended — generate a passphrase-less key or set the APT_GPG_PASSPHRASE secret (see packaging/apt/README.md)" >&2
+            exit 1
+          fi
           echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
           echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
 

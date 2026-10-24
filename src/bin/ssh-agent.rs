@@ -246,7 +246,33 @@ mod imp {
                 Err(_) => false,
             }
         }
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        // The BSDs and Apple platforms: getpeereid(3), on top of the 0700
+        // socket directory. Fails closed.
+        #[cfg(any(
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        ))]
+        {
+            match nix::unistd::getpeereid(stream) {
+                Ok((uid, _)) => {
+                    let me = nix::unistd::geteuid();
+                    uid == me || uid.is_root()
+                }
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "android",
+            target_vendor = "apple",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+        )))]
         {
             // Elsewhere the 0700 socket directory is the access control.
             let _ = stream;

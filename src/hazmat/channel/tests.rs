@@ -661,6 +661,42 @@ fn open_confirmation_for_peer_initiated_channel_rejected() {
     assert!(matches!(err, crate::Error::Protocol(_)));
 }
 
+fn forged_open_failure(local_id: u32) -> Vec<u8> {
+    let mut w = crate::format::Writer::new();
+    w.write_u8(MSG_CHANNEL_OPEN_FAILURE);
+    w.write_u32(local_id);
+    w.write_u32(SSH_OPEN_CONNECT_FAILED);
+    w.write_string(b"");
+    w.write_string(b"");
+    w.into_vec()
+}
+
+#[test]
+fn open_failure_only_for_our_pending_open() {
+    let (mut a, mut b) = pair();
+
+    // Peer-initiated channel: an OPEN_FAILURE for it must not drop it.
+    let (_, payload) = b.open(ChannelOpen::Session).unwrap();
+    let peer_ch = match a.on_packet(&payload).unwrap() {
+        ChannelEvent::OpenRequest { channel, .. } => channel,
+        _ => unreachable!(),
+    };
+    let err = a.on_packet(&forged_open_failure(peer_ch)).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+    assert!(a.channel(peer_ch).is_some());
+
+    // Our channel, already confirmed: likewise refused.
+    let (ours, payload) = a.open(ChannelOpen::Session).unwrap();
+    let b_ch = match b.on_packet(&payload).unwrap() {
+        ChannelEvent::OpenRequest { channel, .. } => channel,
+        _ => unreachable!(),
+    };
+    a.on_packet(&b.accept_open(b_ch).unwrap()).unwrap();
+    let err = a.on_packet(&forged_open_failure(ours)).unwrap_err();
+    assert!(matches!(err, crate::Error::Protocol(_)));
+    assert!(a.channel(ours).unwrap().is_open());
+}
+
 #[test]
 fn data_before_open_confirmed_rejected() {
     let mut a = ConnectionState::new();

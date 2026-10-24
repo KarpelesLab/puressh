@@ -901,9 +901,20 @@ impl ConnectionState {
             .map_err(|_| Error::Format("invalid utf-8 in open-failure description"))?
             .to_string();
         let _lang = r.read_string()?;
-        self.channels
-            .remove(&local_id)
+        let ch = self
+            .channels
+            .get(&local_id)
             .ok_or(Error::Protocol("open-failure for unknown channel"))?;
+        // Like OPEN_CONFIRMATION, a failure is only legal as the answer to a
+        // CHANNEL_OPEN we sent that is still pending. Otherwise a peer could
+        // tear down a channel it opened (or one already open) behind the
+        // frontend's back.
+        if !ch.initiated_by_us || ch.open_confirmed {
+            return Err(Error::Protocol(
+                "open-failure for channel not pending our open",
+            ));
+        }
+        self.channels.remove(&local_id);
         Ok(ChannelEvent::OpenFailed {
             channel: local_id,
             reason,

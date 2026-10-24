@@ -1,0 +1,6 @@
+Archive: focal
+Component: main
+Origin: puressh
+Label: puressh
+Architecture: arm64
+Description: puressh apt repository (Ubuntu 20.04 LTS)

@@ -1,0 +1,6 @@
+Archive: noble
+Component: main
+Origin: puressh
+Label: puressh
+Architecture: amd64
+Description: puressh apt repository (Ubuntu 24.04 LTS)

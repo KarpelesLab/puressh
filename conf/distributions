@@ -1,0 +1,36 @@
+# reprepro distribution definitions for the puressh apt repository.
+#
+# One suite per supported Ubuntu release, matching the `~ubuntuNN` server
+# packages built by packaging/deb/build-deb.sh. Clients select their suite
+# with `$(lsb_release -cs)`, which resolves to one of these codenames.
+#
+# B3D03356B1A7A5F69245D95F929EFB4B458E355A is replaced at publish time with the fingerprint of the imported
+# signing key (see .github/workflows/release-binaries.yml, job publish-apt).
+# SignWith makes reprepro produce a signed InRelease / Release.gpg.
+
+Origin: puressh
+Label: puressh
+Codename: focal
+Suite: focal
+Architectures: amd64 arm64
+Components: main
+Description: puressh apt repository (Ubuntu 20.04 LTS)
+SignWith: B3D03356B1A7A5F69245D95F929EFB4B458E355A
+
+Origin: puressh
+Label: puressh
+Codename: jammy
+Suite: jammy
+Architectures: amd64 arm64
+Components: main
+Description: puressh apt repository (Ubuntu 22.04 LTS)
+SignWith: B3D03356B1A7A5F69245D95F929EFB4B458E355A
+
+Origin: puressh
+Label: puressh
+Codename: noble
+Suite: noble
+Architectures: amd64 arm64
+Components: main
+Description: puressh apt repository (Ubuntu 24.04 LTS)
+SignWith: B3D03356B1A7A5F69245D95F929EFB4B458E355A

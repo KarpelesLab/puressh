@@ -1,0 +1,29 @@
+Origin: puressh
+Label: puressh
+Suite: focal
+Codename: focal
+Date: Sat, 24 Oct 2026 09:23:24 UTC
+Architectures: amd64 arm64
+Components: main
+Description: puressh apt repository (Ubuntu 20.04 LTS)
+MD5Sum:
+ 08d4564059a920e39c278673a4607239 2101 main/binary-amd64/Packages
+ 1a54a8b7f2f14fe56fc00cd6d11749c8 991 main/binary-amd64/Packages.gz
+ 298ef956a237dfa6b42c0a3762c8222d 137 main/binary-amd64/Release
+ 74a2a09e5f8047079af2a9c26180e8de 2101 main/binary-arm64/Packages
+ 80d5c7c5633df4385afdd4074a12ed5f 997 main/binary-arm64/Packages.gz
+ 94a0ca6d0e545af1ce80e4fe01bf942c 137 main/binary-arm64/Release
+SHA1:
+ 9c100d6552f354ec3825905fdc5ab38c3de9f466 2101 main/binary-amd64/Packages
+ 072068e4407546ced5a85d424f663b20009f2bc4 991 main/binary-amd64/Packages.gz
+ ec52b0e3bda23da5a31fdf5197b387ae8dbab39d 137 main/binary-amd64/Release
+ 705b83378f1d1548ab939a80f9c98508f5f7d96e 2101 main/binary-arm64/Packages
+ 9499c03601cafdb044f0ee71323641510fa6d192 997 main/binary-arm64/Packages.gz
+ 21b6fae3214495b75d6a470afb053e62db8c1e9a 137 main/binary-arm64/Release
+SHA256:
+ c459ec5773b6c8bd899c63d4238dc8c96566b913cc0d9d7a9fd68890585a0fad 2101 main/binary-amd64/Packages
+ 13b156455dd3760e4dac5a0c192d2e4423fb36fbe4f59c93e43e5026decb0b34 991 main/binary-amd64/Packages.gz
+ 945c044384fc5b8c19eb17d44d2e6a922019cfa9eb2b7577d811b634c67e3c70 137 main/binary-amd64/Release
+ f82b94e059c2885c4fb0600bb82ca79f14355bbd8e59d46010c96bef9255a058 2101 main/binary-arm64/Packages
+ ee667c5c25417f5465ab6b0441b1eb68a1d3d40b1ca8f91a9c331df3f23ea225 997 main/binary-arm64/Packages.gz
+ 7292213733e530f0db0d8b7fa19c001add151e9215c17ab6f80811df0fa62906 137 main/binary-arm64/Release

@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>puressh apt repository</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { max-width: 46rem; margin: 3rem auto; padding: 0 16px;
+         font: 16px/1.6 system-ui, sans-serif; }
+  h1 { font-size: 1.6rem; } h2 { font-size: 1.1rem; margin-top: 2rem; }
+  pre { background: color-mix(in srgb, currentColor 8%, transparent);
+        padding: 1rem; border-radius: 8px; overflow-x: auto; }
+  code { font-family: ui-monospace, monospace; }
+  a { color: inherit; }
+</style>
+
+<h1>puressh apt repository</h1>
+<p>
+  A pure-Rust SSH suite, packaged for Ubuntu 20.04, 22.04 and 24.04
+  (amd64 and arm64). Source and docs:
+  <a href="https://github.com/KarpelesLab/puressh">github.com/KarpelesLab/puressh</a>.
+</p>
+
+<h2>Install</h2>
+<pre><code>curl -fsSL https://karpeleslab.github.io/puressh/puressh-archive-keyring.asc \
+  | sudo gpg --dearmor -o /usr/share/keyrings/puressh.gpg
+echo "deb [signed-by=/usr/share/keyrings/puressh.gpg] https://karpeleslab.github.io/puressh $(lsb_release -cs) main" \
+  | sudo tee /etc/apt/sources.list.d/puressh.list
+sudo apt update
+sudo apt install puressh-server   # drop-in sshd replacement
+# or: sudo apt install puressh-client   # ssh/scp/sftp/... alongside OpenSSH</code></pre>
+
+<p>
+  Installing <code>puressh-server</code> removes <code>openssh-server</code> but
+  keeps <code>/etc/ssh/sshd_config</code> and the host keys. Switch back any time
+  with <code>sudo apt install openssh-server</code>.
+</p>
+
+<h2>Contact</h2>
+<p>Mark Karpeles &lt;mark@klb.jp&gt;</p>

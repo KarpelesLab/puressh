@@ -1,0 +1,51 @@
+Package: puressh-client
+Version: 0.2.1-1
+Architecture: amd64
+Maintainer: Mark Karpeles <mark@klb.jp>
+Installed-Size: 17264
+Depends: libc6 (>= 2.31)
+Recommends: openssh-client
+Provides: ssh-client
+Homepage: https://github.com/KarpelesLab/puressh
+Priority: optional
+Section: net
+Filename: pool/main/p/puressh-client/puressh-client_0.2.1-1_amd64.deb
+Size: 2460332
+SHA256: eebdcd1365c4f45f7ddfddbed74412f885d6550976898c6d7fc266b46947f9bf
+SHA1: f84d256be2ede68aba43573d918970c05ed8046a
+MD5sum: a71db76c91ddf5ea0ea0b96d5e8345a9
+Description: puressh secure shell (SSH) client programs, in place of OpenSSH's
+ ssh, scp, sftp, ssh-add, ssh-agent, ssh-keygen, ssh-keyscan and ssh-copy-id
+ from puressh, a pure-Rust SSH implementation, as drop-in replacements for
+ OpenSSH's: same options, configuration files (/etc/ssh/ssh_config,
+ ~/.ssh) and keys.
+ .
+ OpenSSH's programs are kept as /usr/bin/<name>.openssh while this package
+ is installed and get their names back when it is removed.
+
+Package: puressh-server
+Version: 0.2.1-1~ubuntu24.04
+Architecture: amd64
+Maintainer: Mark Karpeles <mark@klb.jp>
+Installed-Size: 8140
+Depends: libc6 (>= 2.31), libpam0g (>= 0.99.7.1), libpam-modules, libpam-runtime
+Recommends: libpam-systemd, ncurses-term, xauth
+Provides: openssh-server (= 1:9.9p1-0puressh1), ssh-server
+Conflicts: openssh-server
+Replaces: openssh-server
+Homepage: https://github.com/KarpelesLab/puressh
+Priority: optional
+Section: net
+Filename: pool/main/p/puressh-server/puressh-server_0.2.1-1~ubuntu24.04_amd64.deb
+Size: 1710180
+SHA256: d38d76a1bfe4c9c2d087614599badf3531c1aa89d7d9f0e9254dceb7c19aabe9
+SHA1: 8a803b3b5ff5fdfc93f99ccdc127a3304d584512
+MD5sum: 5d71060a8e58f20417d88acd4c19a985
+Description: puressh secure shell (SSH) server, replacing OpenSSH's
+ sshd from puressh, a pure-Rust SSH implementation, packaged as a drop-in
+ replacement for openssh-server: it reads /etc/ssh/sshd_config, uses the
+ existing host keys and PAM configuration, and runs as ssh.service.
+ .
+ Installing it removes openssh-server; the configuration and host keys are
+ kept. Reinstalling openssh-server switches back.
+

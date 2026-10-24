@@ -1,0 +1,39 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: puressh
+Label: puressh
+Suite: noble
+Codename: noble
+Date: Sat, 24 Oct 2026 09:23:25 UTC
+Architectures: amd64 arm64
+Components: main
+Description: puressh apt repository (Ubuntu 24.04 LTS)
+MD5Sum:
+ 33408586a124d97922e01bd1aad9db9c 2101 main/binary-amd64/Packages
+ 4d9d38ef303796d529de51a8d0497832 996 main/binary-amd64/Packages.gz
+ 546d9e9e57a478fdab05b1a7e892d5d3 137 main/binary-amd64/Release
+ e58a2a0827ec13539fca18079775e3b0 2101 main/binary-arm64/Packages
+ 1d43a411750ad6a1438550ec83b2a3d0 995 main/binary-arm64/Packages.gz
+ f834f5d089ad2bb7411bfbcc8ad2a700 137 main/binary-arm64/Release
+SHA1:
+ 9ab3a02f241b5a2c16fcf54e9c95c68a5eb3ac49 2101 main/binary-amd64/Packages
+ 79a41449ec9e59f50f089772769d4b5aebbc4607 996 main/binary-amd64/Packages.gz
+ 6ece7336d77a86de29667dcc0f415f268594ac60 137 main/binary-amd64/Release
+ dbd714b0b7ab243540663a6b3616e7f103ef2c63 2101 main/binary-arm64/Packages
+ a55fbbf0b1f06f1fcecd63fa2ddd75d43624a3ae 995 main/binary-arm64/Packages.gz
+ 0950a856847c462a7362dc925948a740d6e35feb 137 main/binary-arm64/Release
+SHA256:
+ 96b0482b6b4ce85f9621629754df5a177f8cc046fda6dfd3d6b4a12c1ee5c669 2101 main/binary-amd64/Packages
+ 5a0bf9952440fa75c303a3655af1574b9a5f4c832c4c8072b95c08513aab0ead 996 main/binary-amd64/Packages.gz
+ fab210d961d947199ef6e500fc61528d5a30718bbf73e91479d420ab112b02fb 137 main/binary-amd64/Release
+ 290a94736c93247a6ef2ce182f2cdcd2b3c6e06ed387752107c8a8af11326ed3 2101 main/binary-arm64/Packages
+ 7747af1cfd4a928a84beeb31dadbb4260cf82294d7cda54194986732709a4714 995 main/binary-arm64/Packages.gz
+ d4ef14c8d72df85f5e0b6d6975802625d9aae98e014b6777f78b4197e841210b 137 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQSz0DNWsael9pJF2V+SnvtLRY41WgUCatx5DQAKCRCSnvtLRY41
+WoExAQCvhn1MncI6G2Bgymu/Q3fWidXMK6fqcQqIExovN54oIAEA4Ge3mtHr17eB
+ToAhzhP7mz3OE36EyG5QQgDtZelI+wU=
+=vX4r
+-----END PGP SIGNATURE-----

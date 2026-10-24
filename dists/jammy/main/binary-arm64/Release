@@ -1,0 +1,6 @@
+Archive: jammy
+Component: main
+Origin: puressh
+Label: puressh
+Architecture: arm64
+Description: puressh apt repository (Ubuntu 22.04 LTS)

@@ -1,0 +1,39 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Origin: puressh
+Label: puressh
+Suite: jammy
+Codename: jammy
+Date: Sat, 24 Oct 2026 09:23:24 UTC
+Architectures: amd64 arm64
+Components: main
+Description: puressh apt repository (Ubuntu 22.04 LTS)
+MD5Sum:
+ 4b724076575d3c070a270e3f2f258038 2101 main/binary-amd64/Packages
+ 544cc1c907494b242c5bb0e824235993 994 main/binary-amd64/Packages.gz
+ 93a99ac3714457e9fcb3a44a798ef4ba 137 main/binary-amd64/Release
+ 9b24c204a69dc3ddd115281ab0a5fb93 2101 main/binary-arm64/Packages
+ 84aef891cbbe827a95a9e2dc684dc272 995 main/binary-arm64/Packages.gz
+ 88943a457b58d0a9ca1c852ca8a2536c 137 main/binary-arm64/Release
+SHA1:
+ 4b865d3e5c87cc984851f3d70268b43d09e98d41 2101 main/binary-amd64/Packages
+ bc82034aefc188ff213efdea57b685c2a81d62ed 994 main/binary-amd64/Packages.gz
+ 8e798b0f8f08109c66acf6361762cb4a37d027bf 137 main/binary-amd64/Release
+ 1bd4d2f086d6f5275bc642f56b80b56834f347b3 2101 main/binary-arm64/Packages
+ 4a0f78581c3dc2f7c60800ff7e4d4bedd5537fac 995 main/binary-arm64/Packages.gz
+ 087f4c9ca2e816a24450658c98d05c43fdace174 137 main/binary-arm64/Release
+SHA256:
+ cdcdf4c2b30684130bc675c34c6f3fb645c829494b14d30c7a649c30fdaa6fee 2101 main/binary-amd64/Packages
+ 10b92575151296e36f165a6aba36e6f8079cdda8123dcefdd90e6266d5368bd4 994 main/binary-amd64/Packages.gz
+ e1c504c1629deb384d047fac8cc00ef66c024c3a4b108c6d732a4380fea2ee55 137 main/binary-amd64/Release
+ f1057af856dcd17ca55ce311d6d6863d34810e662afc1289a43aff4bdc22ecdd 2101 main/binary-arm64/Packages
+ 1177aca7269b2737ccf6cd02f78596f070e6085141a785b79543984143ea95b3 995 main/binary-arm64/Packages.gz
+ 6bd9f346529c014441c566af33ba272b2436aab75ff0ca8cc52e8be5863e6d4f 137 main/binary-arm64/Release
+-----BEGIN PGP SIGNATURE-----
+
+iHUEARYKAB0WIQSz0DNWsael9pJF2V+SnvtLRY41WgUCatx5DQAKCRCSnvtLRY41
+WpOaAQCYXZul5ZC6DSmBhcPA9v/TpiKQO56r79ugA3Xg65TPNgEAhCmI1KZR2JDk
+DlnqVddJmXyAWw42gdj6UzZE2A4x5QQ=
+=hDtr
+-----END PGP SIGNATURE-----

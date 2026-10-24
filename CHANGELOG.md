@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/KarpelesLab/puressh/compare/v0.2.1...v0.2.2) - 2026-10-24
+
+### Fixed
+
+- *(client)* offer known_hosts host-key types first (order_hostkeyalgs)
+- *(packaging)* drop xauth and ncurses-term from puressh-server recommends
+- *(ci)* sign apt repo via gpg-agent, support protected keys
+- *(ci)* make the apt-repo job route packages and sign correctly
+
+### Other
+
+- *(readme)* add an Install section
+
 ## [0.2.1](https://github.com/KarpelesLab/puressh/compare/v0.2.0...v0.2.1) - 2026-10-24
 
 ### Added

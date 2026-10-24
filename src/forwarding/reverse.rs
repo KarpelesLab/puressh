@@ -323,9 +323,13 @@ fn coerce_to_loopback(bind_address: &str, port: u16) -> Result<SocketAddr> {
 /// to the handler's `bind`:
 ///
 /// - `No` (also the default when `policy` is `None`): force the listener onto
-///   loopback — any wildcard / loopback request becomes `127.0.0.1`, an IPv6
-///   wildcard / loopback becomes `::1`, and any other literal is left as-is
-///   for the handler's own policy to accept or refuse.
+///   loopback whatever was asked for, as OpenSSH's `GatewayPorts=no` does —
+///   any IPv6 literal (`::`, `::0`, `::ffff:0.0.0.0`, a public v6 address…)
+///   becomes `::1`, and everything else (`""`, `0.0.0.0`, `localhost`, a
+///   public IPv4 address, a host name) becomes `127.0.0.1`. Passing a
+///   non-loopback literal through would let a handler that honours addresses
+///   verbatim (e.g. [`DefaultTcpipForwardHandler::permit_all_interfaces`])
+///   open a public listener despite `GatewayPorts no`.
 /// - `Yes`: bind on all interfaces — a loopback / empty request is widened to
 ///   `0.0.0.0` (`::` is preserved); any explicit address is honoured.
 /// - `ClientSpecified`: honour the client's address verbatim.
@@ -338,11 +342,18 @@ pub fn apply_gateway_ports(
     use crate::config::ServerGatewayPorts as GP;
     match policy.unwrap_or(GP::No) {
         GP::ClientSpecified => bind_address.to_string(),
-        GP::No => match bind_address {
-            "" | "0.0.0.0" | "127.0.0.1" | "localhost" => "127.0.0.1".to_string(),
-            "::" | "::1" => "::1".to_string(),
-            other => other.to_string(),
-        },
+        GP::No => {
+            // Bracketed (`[::1]`) or scoped (`fe80::1%eth0`) spellings still
+            // count as IPv6 so the client keeps the address family it asked
+            // for; every other spelling lands on IPv4 loopback.
+            let bare = bind_address.trim_start_matches('[').trim_end_matches(']');
+            let bare = bare.split('%').next().unwrap_or(bare);
+            if bare.parse::<std::net::Ipv6Addr>().is_ok() {
+                "::1".to_string()
+            } else {
+                "127.0.0.1".to_string()
+            }
+        }
         GP::Yes => match bind_address {
             "" | "127.0.0.1" | "localhost" => "0.0.0.0".to_string(),
             other => other.to_string(),
@@ -620,6 +631,39 @@ mod tests {
         // policy violation, not a silent widen.
         assert!(coerce_to_loopback("192.0.2.1", 22).is_err());
         assert!(coerce_to_loopback("bogus", 22).is_err());
+    }
+
+    /// FWD-1: under `GatewayPorts no` every requested address — not just the
+    /// wildcard / loopback spellings — is forced onto loopback, so a handler
+    /// that honours addresses verbatim can never open a public listener.
+    #[test]
+    fn gateway_ports_no_forces_every_address_to_loopback() {
+        use crate::config::ServerGatewayPorts as GP;
+        for v4 in [
+            "",
+            "0.0.0.0",
+            "127.0.0.1",
+            "localhost",
+            "203.0.113.5",
+            "0",
+            "example.com",
+            "*",
+        ] {
+            assert_eq!(apply_gateway_ports(Some(GP::No), v4), "127.0.0.1", "{v4:?}");
+            assert_eq!(apply_gateway_ports(None, v4), "127.0.0.1", "{v4:?}");
+        }
+        for v6 in [
+            "::",
+            "::1",
+            "::0",
+            "0:0:0:0:0:0:0:0",
+            "::ffff:0.0.0.0",
+            "2001:db8::1",
+            "[::]",
+            "fe80::1%eth0",
+        ] {
+            assert_eq!(apply_gateway_ports(Some(GP::No), v6), "::1", "{v6:?}");
+        }
     }
 
     /// `permit_localhost_only` refuses a literal non-loopback IP request

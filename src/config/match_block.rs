@@ -373,7 +373,19 @@ fn parse_match_line_impl(
     let mut out = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        // `!criterion`: the criterion must not match (client side).
+        // `!criterion`: the criterion must not match (client side). OpenSSH's
+        // sshd has no criterion negation; accepting it here and then
+        // stripping the `!` would silently invert the operator's policy
+        // (`Match !user root` acting as `Match user root`), so reject it.
+        if server && args[i].starts_with('!') {
+            return Err(ConfigError::Unsupported {
+                line: line_no,
+                msg: alloc::format!(
+                    "Match criterion negation ({}) is not valid in sshd_config",
+                    args[i]
+                ),
+            });
+        }
         let negate = !server && args[i].starts_with('!');
         let before = out.len();
         let kw = args[i].trim_start_matches('!').to_ascii_lowercase();
@@ -753,6 +765,30 @@ mod tests {
     }
 
     // ---- server-side criteria --------------------------------------------
+
+    #[test]
+    fn server_rejects_negated_criterion() {
+        // sshd has no `!criterion`; it must not silently parse as the
+        // un-negated criterion (inverting the policy).
+        for args in [
+            vec!["!user".to_string(), "root".to_string()],
+            vec!["!user=root".to_string()],
+            vec![
+                "address".to_string(),
+                "10.0.0.0/8".to_string(),
+                "!group".to_string(),
+                "x".to_string(),
+            ],
+        ] {
+            match parse_match_line_server(&args, 4).unwrap_err() {
+                ConfigError::Unsupported { line, .. } => assert_eq!(line, 4),
+                e => panic!("wrong err: {e:?}"),
+            }
+        }
+        // The client side keeps supporting negation.
+        let conds = parse_match_line(&["!user".to_string(), "root".to_string()], 1).unwrap();
+        assert!(matches!(conds[0], MatchCondition::Not(_)));
+    }
 
     #[test]
     fn server_parses_address_group_localport() {

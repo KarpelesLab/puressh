@@ -4792,6 +4792,46 @@ fn run_control_command(cmd: &str, path: &std::path::Path, cli: &Cli) -> Result<i
     }
 }
 
+/// Whether a client on the control socket may use the master: only our own
+/// user or root, by peer credentials, as OpenSSH's master checks.
+#[cfg(unix)]
+fn mux_peer_allowed(sock: &std::os::unix::net::UnixStream) -> bool {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let uid = {
+        let mut cred: libc::ucred = unsafe { core::mem::zeroed() };
+        peer_sockopt(sock, libc::SOL_SOCKET, libc::SO_PEERCRED, &mut cred).map(|()| cred.uid)
+    };
+    #[cfg(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))]
+    let uid = {
+        use std::os::fd::AsRawFd;
+        let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
+        // SAFETY: both out-pointers are valid for the call.
+        (unsafe { libc::getpeereid(sock.as_raw_fd(), &mut uid, &mut gid) } == 0).then_some(uid)
+    };
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )))]
+    let uid = {
+        // No way to ask here: the owner-only socket is the access control.
+        let _ = sock;
+        return true;
+    };
+    // SAFETY: geteuid(2) cannot fail.
+    uid.is_some_and(|u| u == 0 || u == unsafe { libc::geteuid() })
+}
+
 /// The master's process id, from the control socket's peer credentials.
 #[cfg(unix)]
 fn master_pid(sock: &std::os::unix::net::UnixStream) -> Option<i32> {
@@ -5088,7 +5128,8 @@ where
     let started = extras.started;
     let cfg = cfg
         .with_on_forward(move |kind, spec, cancel| forwards.handle(kind, spec, cancel))
-        .with_on_conninfo(move || connection_info(&info_shared, started));
+        .with_on_conninfo(move || connection_info(&info_shared, started))
+        .with_peer_check(mux_peer_allowed);
 
     // ControlPersist no: master lives and dies with the foreground session in
     // this process. No daemonization.

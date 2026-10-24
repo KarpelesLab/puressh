@@ -56,10 +56,18 @@ pub struct MasterConfig {
     pub on_forward: Option<ForwardHook>,
     /// Describes the connection for `ssh -O conninfo`.
     pub on_conninfo: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// Decides whether an accepted control-socket connection may be served
+    /// (OpenSSH lets in only its own user and root, by peer credentials).
+    /// The library cannot read peer credentials itself; without a check,
+    /// the owner-only socket is the access control.
+    pub peer_check: Option<PeerCheck>,
 }
 
 /// See [`MasterConfig::on_forward`].
 pub type ForwardHook = Arc<dyn Fn(u8, &str, bool) -> Result<u16, String> + Send + Sync>;
+
+/// See [`MasterConfig::peer_check`].
+pub type PeerCheck = Arc<dyn Fn(&UnixStream) -> bool + Send + Sync>;
 
 impl MasterConfig {
     /// Pair a (length-checked) control-socket path with a persist policy.
@@ -70,6 +78,7 @@ impl MasterConfig {
             on_exit: None,
             on_forward: None,
             on_conninfo: None,
+            peer_check: None,
         }
     }
 
@@ -94,6 +103,16 @@ impl MasterConfig {
         self.on_exit = Some(Arc::new(f));
         self
     }
+
+    /// Serve only the control-socket connections `f` accepts (see
+    /// [`MasterConfig::peer_check`]).
+    pub fn with_peer_check(
+        mut self,
+        f: impl Fn(&UnixStream) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.peer_check = Some(Arc::new(f));
+        self
+    }
 }
 
 /// Shared liveness state for the accept loop and the reaper.
@@ -114,6 +133,8 @@ struct MasterState {
     on_forward: Option<ForwardHook>,
     /// See [`MasterConfig::on_conninfo`].
     on_conninfo: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// See [`MasterConfig::peer_check`].
+    peer_check: Option<PeerCheck>,
 }
 
 /// Bind the control socket at `cfg.control_path`, taking care not to clobber a
@@ -142,6 +163,19 @@ fn bind_socket(path: &Path) -> Result<UnixListener, String> {
             parent.display()
         ));
     }
+    match bind_private(path) {
+        Ok(l) => return Ok(l),
+        // The temporary name did not fit in a socket address (a very short
+        // ControlPath file name): bind in place below.
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(format!(
+                "ControlPath {} already has a live master; refusing to clobber it",
+                path.display()
+            ));
+        }
+        Err(e) => return Err(format!("bind control socket {}: {e}", path.display())),
+    }
     let listener = UnixListener::bind(path)
         .map_err(|e| format!("bind control socket {}: {e}", path.display()))?;
     // 0600: only the owner may connect to the multiplexed connection.
@@ -150,6 +184,52 @@ fn bind_socket(path: &Path) -> Result<UnixListener, String> {
         return Err(format!("chmod 0600 {}: {e}", path.display()));
     }
     Ok(listener)
+}
+
+/// Bind a listener at `path` that nobody else can reach at any point.
+///
+/// A plain bind creates the socket `0777 & ~umask` and the chmod after it
+/// leaves a window where another user can connect. OpenSSH binds a
+/// temporary name under umask 0177 and link(2)s it into place; the library
+/// cannot change the umask (`forbid(unsafe_code)`), so it binds inside a
+/// fresh 0700 directory next to `path` instead, makes the socket 0600 there
+/// and then links it to `path` — which, unlike a rename, fails rather than
+/// replace a master that bound `path` in the meantime.
+fn bind_private(path: &Path) -> std::io::Result<UnixListener> {
+    use std::os::unix::fs::DirBuilderExt;
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos())
+        ^ std::process::id().rotate_left(16);
+    let mut dir = None;
+    for i in 0..16u32 {
+        // Kept short: the socket inside must still fit in `sun_path`.
+        let d = parent.join(format!(".m{:06x}", seed.wrapping_add(i) & 0xff_ffff));
+        match fs::DirBuilder::new().mode(0o700).create(&d) {
+            Ok(()) => {
+                dir = Some(d);
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    let Some(dir) = dir else {
+        return Err(std::io::Error::other("no free temporary directory name"));
+    };
+    let tmp = dir.join("s");
+    let res = UnixListener::bind(&tmp).and_then(|l| {
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        fs::hard_link(&tmp, path)?;
+        Ok(l)
+    });
+    let _ = fs::remove_file(&tmp);
+    let _ = fs::remove_dir(&dir);
+    res
 }
 
 /// Become the master: bind the socket and serve clients until the
@@ -180,6 +260,7 @@ where
         on_exit: cfg.on_exit.clone(),
         on_forward: cfg.on_forward.clone(),
         on_conninfo: cfg.on_conninfo.clone(),
+        peer_check: cfg.peer_check.clone(),
     });
 
     // Accept loop in its own thread so the foreground session can run
@@ -254,6 +335,7 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         on_exit: cfg.on_exit.clone(),
         on_forward: cfg.on_forward.clone(),
         on_conninfo: cfg.on_conninfo.clone(),
+        peer_check: cfg.peer_check.clone(),
     });
 
     let accept_shared = shared.clone();
@@ -317,6 +399,11 @@ fn accept_loop(listener: UnixListener, shared: SharedClient, state: Arc<MasterSt
         };
         // macOS hands accepted sockets the listener's O_NONBLOCK.
         if stream.set_nonblocking(false).is_err() {
+            continue;
+        }
+        if let Some(check) = &state.peer_check
+            && !check(&stream)
+        {
             continue;
         }
         let s = shared.clone();
@@ -657,4 +744,34 @@ fn splice(ctrl: UnixStream, chan: OwnedChannelStream, shared: &SharedClient) {
     }
     drop(t_in);
     drop(chan);
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    #[test]
+    fn control_socket_is_bound_owner_only_and_never_clobbered() {
+        let dir = PathBuf::from("/tmp").join(format!("p-muxb-{:x}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("control-socket");
+        let l = bind_private(&sock).unwrap();
+        let mode = fs::symlink_metadata(&sock).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // The temporary directory is gone; only the socket is left.
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, vec![std::ffi::OsString::from("control-socket")]);
+        // The listener answers at the final name.
+        let _c = UnixStream::connect(&sock).unwrap();
+        assert!(l.accept().is_ok());
+        // A second master does not replace the first.
+        let e = bind_private(&sock).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

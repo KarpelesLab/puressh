@@ -53,7 +53,7 @@ pub use path::{
 #[cfg(feature = "multichannel")]
 mod server;
 #[cfg(feature = "multichannel")]
-pub use server::{ForwardHook, MasterConfig, Persist, run_master, run_master_daemon};
+pub use server::{ForwardHook, MasterConfig, PeerCheck, Persist, run_master, run_master_daemon};
 
 #[cfg(feature = "multichannel")]
 mod client;

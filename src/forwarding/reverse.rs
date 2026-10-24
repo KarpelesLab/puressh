@@ -40,6 +40,9 @@ const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// thread to stop and joins it. The thread observes the flag in between
 /// `accept()` polls, then exits, releasing the [`TcpListener`].
 struct Binding {
+    /// The authenticated user that created the binding; only they may
+    /// cancel it.
+    owner: String,
     stop: Arc<AtomicBool>,
     /// Carrying an `Option` so the destructor can take ownership of the
     /// `JoinHandle` and call `.join()`.
@@ -390,6 +393,20 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
         let actual_port = listener.local_addr()?.port();
         listener.set_nonblocking(true)?;
 
+        // The map is shared by every connection: never replace an existing
+        // entry (that would tear down another session's listener and hand
+        // its key to this one). The kernel bind above normally rules a clash
+        // out already; this keeps the map invariant regardless. The lock is
+        // held until the new entry is inserted so the check cannot race.
+        let mut map = self
+            .bindings
+            .lock()
+            .map_err(|_| Error::Protocol("tcpip-forward: lock poisoned"))?;
+        let key = (bind_address.to_string(), actual_port);
+        if map.contains_key(&key) {
+            return Err(Error::Protocol("tcpip-forward: address already bound"));
+        }
+
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let bind_address_owned = bind_address.to_string();
@@ -438,20 +455,10 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
             }
         });
 
-        let mut map = self
-            .bindings
-            .lock()
-            .map_err(|_| Error::Protocol("tcpip-forward: lock poisoned"))?;
-        let key = (bind_address.to_string(), actual_port);
-        // If somehow we already have a binding under that key (e.g. the
-        // peer asked twice), drop the existing one first to keep the map
-        // invariant clean.
-        if let Some(existing) = map.remove(&key) {
-            drop(existing);
-        }
         map.insert(
             key,
             Binding {
+                owner: user.to_string(),
                 stop,
                 handle: Some(handle),
             },
@@ -459,12 +466,18 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
         Ok(actual_port)
     }
 
-    fn unbind(&self, _user: &str, bind_address: &str, bind_port: u16) -> Result<()> {
+    fn unbind(&self, user: &str, bind_address: &str, bind_port: u16) -> Result<()> {
         let mut map = self
             .bindings
             .lock()
             .map_err(|_| Error::Protocol("tcpip-forward: lock poisoned"))?;
         let key = (bind_address.to_string(), bind_port);
+        // Only the user that created a binding may cancel it.
+        if map.get(&key).is_some_and(|b| b.owner != user) {
+            return Err(Error::Protocol(
+                "cancel-tcpip-forward: binding owned by another user",
+            ));
+        }
         if let Some(binding) = map.remove(&key) {
             // Drop outside the lock to keep `unbind` fast for concurrent
             // callers — the `Drop` impl on `Binding` joins the worker
@@ -508,6 +521,31 @@ mod tests {
             .expect("rebind released port");
         assert_eq!(again, port);
         h.unbind("u", "127.0.0.1", port).expect("final unbind");
+    }
+
+    /// FWD-5: another user can neither cancel a binding nor displace it by
+    /// binding the same key.
+    #[test]
+    fn binding_is_owned_by_its_user() {
+        let h = DefaultTcpipForwardHandler::permit_all_interfaces();
+        let port = h
+            .bind("alice", "127.0.0.1", 0, ForwardContext::for_test_no_opens())
+            .expect("bind");
+        assert!(h.unbind("mallory", "127.0.0.1", port).is_err());
+        assert!(
+            h.bind(
+                "mallory",
+                "127.0.0.1",
+                port,
+                ForwardContext::for_test_no_opens()
+            )
+            .is_err()
+        );
+        assert_eq!(h.binding_count(), 1);
+        // The listener survived both attempts.
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        h.unbind("alice", "127.0.0.1", port).expect("owner unbind");
+        assert_eq!(h.binding_count(), 0);
     }
 
     #[test]

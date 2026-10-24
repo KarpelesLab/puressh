@@ -57,18 +57,13 @@ pub use puressh::config::StrictMode;
 /// `ESC]0;...BEL`) to clear the screen, retitle the window, or spoof a prompt
 /// to phish a password. Mirroring `sftp`'s `sanitize_terminal_bytes`, every
 /// control byte — anything below `0x20` (including ESC `0x1b`, TAB `0x09`,
-/// CR/LF) and DEL `0x7f` — is replaced with a `?` placeholder. Printable
-/// non-ASCII characters (e.g. UTF-8 multibyte) pass through unchanged; only
-/// the C0 control range and DEL are scrubbed.
+/// CR/LF), DEL `0x7f`, and the C1 controls `U+0080`–`U+009F` (which include
+/// the single-character CSI `U+009B` and OSC `U+009D` some terminals honour)
+/// — is replaced with a `?` placeholder. Printable non-ASCII characters
+/// (e.g. UTF-8 multibyte) pass through unchanged.
 pub fn sanitize_terminal_str(src: &str) -> String {
     src.chars()
-        .map(|c| {
-            if (c as u32) < 0x20 || c == '\u{7f}' {
-                '?'
-            } else {
-                c
-            }
-        })
+        .map(|c| if c.is_control() { '?' } else { c })
         .collect()
 }
 
@@ -2023,6 +2018,14 @@ mod target_tests {
         // Printable text is preserved; each scrubbed byte maps to one '?'.
         assert!(out.starts_with("ok?]0;pwned?"));
         assert!(out.ends_with("end"));
+    }
+
+    #[test]
+    fn sanitize_strips_c1_controls() {
+        // C1 CSI (U+009B) and OSC (U+009D) act as ESC[ / ESC] on some
+        // terminals; NEL (U+0085) as a newline.
+        let out = sanitize_terminal_str("a\u{9b}2Jb\u{9d}0;x\u{9c}c\u{85}d\u{80}\u{9f}");
+        assert_eq!(out, "a?2Jb?0;x?c?d??");
     }
 
     #[test]

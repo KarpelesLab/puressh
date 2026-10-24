@@ -364,9 +364,18 @@ fn mint_socket_path(parent: &Path) -> Result<PathBuf> {
 /// `None` if `path` doesn't exist (lets the binary fail-soft when no
 /// agent is running locally and skip wiring `on_auth_agent` at all).
 ///
-/// Drop-in for [`crate::client::ClientHandlers::with_auth_agent`].
+/// The agent connections are **not** bound to the session
+/// (`session-bind@openssh.com`), so the agent treats them as local ones and
+/// keys added with destination constraints (`ssh-add -h`) are not
+/// restricted to the hosts they name: the server could use them to log in
+/// onward as a first hop. Use [`bound_splice_to_unix_socket_callback`].
 ///
 /// [`AuthAgentCallback`]: crate::client::AuthAgentCallback
+#[deprecated(
+    since = "0.2.4",
+    note = "does not bind forwarded agent connections to the session; \
+            use bound_splice_to_unix_socket_callback"
+)]
 pub fn splice_to_unix_socket_callback(
     path: PathBuf,
 ) -> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>> {
@@ -376,13 +385,9 @@ pub fn splice_to_unix_socket_callback(
     Some(Arc::new(move |stream: ChannelStream| {
         match UnixStream::connect(&path) {
             Ok(uds) => spawn_unix_splice(uds, stream),
-            Err(_) => {
-                // Local agent went away or refused. Drop the channel —
-                // the server will observe EOF/Close.
-                let (_rx, tx) = stream.into_raw();
-                let _ = tx.send(ChannelEgress::Eof);
-                let _ = tx.send(ChannelEgress::Close);
-            }
+            // Local agent went away or refused. Drop the channel — the
+            // server will observe EOF/Close.
+            Err(_) => close_channel(stream),
         }
     }))
 }
@@ -391,17 +396,94 @@ pub fn splice_to_unix_socket_callback(
 /// socket path from the process env (`$SSH_AUTH_SOCK`). Returns `None` if
 /// the env var is unset or empty, or names no Unix-domain socket (nothing
 /// to forward; OpenSSH says nothing either).
+///
+/// Like [`splice_to_unix_socket_callback`], it does not bind the agent
+/// connections to the session; use [`bound_splice_to_local_agent_callback`].
+#[deprecated(
+    since = "0.2.4",
+    note = "does not bind forwarded agent connections to the session; \
+            use bound_splice_to_local_agent_callback"
+)]
 pub fn splice_to_local_agent_callback() -> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>>
 {
+    let path = local_auth_sock()?;
+    #[allow(deprecated)]
+    splice_to_unix_socket_callback(path)
+}
+
+/// Build an [`AuthAgentCallback`]-shaped closure that, for each incoming
+/// `auth-agent@openssh.com` channel, connects to the agent at `path`, binds
+/// that connection to the session as a forwarding one
+/// (`session-bind@openssh.com` with `forwarded` set, as OpenSSH's `ssh -A`)
+/// and splices it to the channel. An agent then lets keys added with
+/// destination constraints (`ssh-add -h`) sign only along the hops they
+/// name. Returns `None` if `path` doesn't exist.
+///
+/// The callback is installed before the connection exists, so the binding
+/// arrives through `binding`: set it from
+/// [`crate::client::Client::session_binding`] once connected (before
+/// requesting agent forwarding). A channel that opens while `binding` is
+/// unset, or whose agent connection fails, is closed without reaching the
+/// agent. An agent that answers the bind with a refusal (one without
+/// `session-bind@openssh.com` support, e.g.) is still spliced, as OpenSSH
+/// does: such an agent enforces no destination constraints, and OpenSSH's
+/// agent refuses constrained keys on a connection whose bind failed.
+///
+/// [`AuthAgentCallback`]: crate::client::AuthAgentCallback
+#[cfg(feature = "client")]
+pub fn bound_splice_to_unix_socket_callback(
+    path: PathBuf,
+    binding: Arc<std::sync::OnceLock<crate::client::SessionBinding>>,
+) -> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>> {
+    if !path.exists() {
+        return None;
+    }
+    Some(Arc::new(move |stream: ChannelStream| {
+        let Some(b) = binding.get() else {
+            return close_channel(stream);
+        };
+        let Ok(mut agent) = crate::agent::Agent::connect(&path) else {
+            return close_channel(stream);
+        };
+        // `Ok(false)`: the agent refused the bind (see above); an I/O
+        // error leaves the connection in an unknown state, so drop it.
+        if agent
+            .bind_session(&b.host_key, &b.session_id, &b.signature, true)
+            .is_err()
+        {
+            return close_channel(stream);
+        }
+        spawn_unix_splice(agent.into_stream(), stream);
+    }))
+}
+
+/// Convenience over [`bound_splice_to_unix_socket_callback`] that pulls the
+/// socket path from the process env (`$SSH_AUTH_SOCK`). Returns `None` if
+/// the env var is unset or empty, or names no Unix-domain socket.
+#[cfg(feature = "client")]
+pub fn bound_splice_to_local_agent_callback(
+    binding: Arc<std::sync::OnceLock<crate::client::SessionBinding>>,
+) -> Option<Arc<dyn Fn(ChannelStream) + Send + Sync + 'static>> {
+    bound_splice_to_unix_socket_callback(local_auth_sock()?, binding)
+}
+
+/// `$SSH_AUTH_SOCK`, when set and naming a usable Unix-domain socket.
+fn local_auth_sock() -> Option<PathBuf> {
     let raw = std::env::var("SSH_AUTH_SOCK").ok()?;
     if raw.is_empty() {
         return None;
     }
     let path = PathBuf::from(raw);
-    if crate::agent::client::validate_auth_sock(&path).is_err() {
-        return None;
-    }
-    splice_to_unix_socket_callback(path)
+    crate::agent::client::validate_auth_sock(&path).ok()?;
+    Some(path)
+}
+
+/// Refuse a forwarded agent channel: EOF then Close, so the server sees the
+/// channel go away without any agent traffic.
+fn close_channel(stream: ChannelStream) {
+    let (_rx, tx) = stream.into_raw();
+    let _ = tx.send(ChannelEgress::Eof);
+    let _ = tx.send(ChannelEgress::Close);
 }
 
 #[cfg(feature = "server")]
@@ -584,5 +666,106 @@ mod tests {
             }
             other => panic!("unexpected error: {other:?}"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "client"))]
+mod bound_tests {
+    use super::*;
+    use std::io::Write;
+    use std::os::unix::net::UnixListener;
+    use std::sync::OnceLock;
+    use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+    use std::time::Duration;
+
+    /// `SSH_AGENTC_EXTENSION` / `SSH_AGENT_SUCCESS`.
+    const EXTENSION: u8 = 27;
+    const SUCCESS: u8 = 6;
+
+    fn binding() -> crate::client::SessionBinding {
+        crate::client::SessionBinding {
+            host_key: b"hostkey".to_vec(),
+            session_id: b"sessionid".to_vec(),
+            signature: b"sig".to_vec(),
+        }
+    }
+
+    /// A fresh channel stream plus the far ends: the sender feeding
+    /// `CHANNEL_DATA` in and the receiver of what the callback sends out.
+    fn channel() -> (
+        ChannelStream,
+        SyncSender<Option<Vec<u8>>>,
+        Receiver<ChannelEgress>,
+    ) {
+        let (in_tx, in_rx) = sync_channel(16);
+        let (out_tx, out_rx) = sync_channel(16);
+        (ChannelStream::new(in_rx, out_tx), in_tx, out_rx)
+    }
+
+    fn sock_path(tag: &str) -> PathBuf {
+        let p = PathBuf::from("/tmp").join(format!("p-abind-{tag}-{:x}", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn read_frame(s: &mut UnixStream) -> Vec<u8> {
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).unwrap();
+        let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+        s.read_exact(&mut body).unwrap();
+        body
+    }
+
+    /// The agent connection is bound as a forwarding one
+    /// (`session-bind@openssh.com`, forwarded = 1) before any channel byte
+    /// reaches the agent.
+    #[test]
+    fn binds_as_forwarded_before_splicing() {
+        let path = sock_path("ok");
+        let listener = UnixListener::bind(&path).unwrap();
+        let cell = Arc::new(OnceLock::new());
+        let cb = bound_splice_to_unix_socket_callback(path.clone(), cell.clone()).unwrap();
+        cell.set(binding()).unwrap();
+        let (stream, in_tx, _out_rx) = channel();
+        in_tx.send(Some(b"\0\0\0\x01\x0b".to_vec())).unwrap();
+        // The callback blocks on the bind reply; play the agent meanwhile.
+        let agent = thread::spawn(move || {
+            let (mut agent, _) = listener.accept().unwrap();
+            agent
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let bind = read_frame(&mut agent);
+            agent.write_all(&[0, 0, 0, 1, SUCCESS]).unwrap();
+            (bind, read_frame(&mut agent))
+        });
+        cb(stream);
+        let (bind, next) = agent.join().unwrap();
+        let mut w = crate::format::Writer::new();
+        w.write_u8(EXTENSION);
+        w.write_string(b"session-bind@openssh.com");
+        w.write_string(b"hostkey");
+        w.write_string(b"sessionid");
+        w.write_string(b"sig");
+        w.write_u8(1);
+        assert_eq!(bind, w.as_slice());
+        // Then the channel's bytes come through.
+        assert_eq!(next, [0x0b]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// No binding yet: the channel is closed and the agent never contacted.
+    #[test]
+    fn unbound_channel_is_closed() {
+        let path = sock_path("unset");
+        let listener = UnixListener::bind(&path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let cb =
+            bound_splice_to_unix_socket_callback(path.clone(), Arc::new(OnceLock::new())).unwrap();
+        let (stream, _in_tx, out_rx) = channel();
+        cb(stream);
+        assert!(matches!(out_rx.recv().unwrap(), ChannelEgress::Eof));
+        assert!(matches!(out_rx.recv().unwrap(), ChannelEgress::Close));
+        assert!(listener.accept().is_err());
+        let _ = std::fs::remove_file(&path);
     }
 }

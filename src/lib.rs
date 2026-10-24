@@ -159,8 +159,8 @@ pub mod agent;
 
 // `forwarding` exposes both server-side handlers (DefaultDirectTcpipHandler,
 // DefaultAgentForwardHandler, DefaultX11ForwardHandler, …) AND the matching
-// client-side splice callbacks (splice_to_local_agent_callback, splice_to_
-// local_display_callback) used by the `ssh` binary's `-A` / `-X` flags. Gate
+// client-side splice callbacks (bound_splice_to_local_agent_callback,
+// splice_to_local_display_callback) for `-A` / `-X`-style forwarding. Gate
 // it on either feature so a client-only build still picks up the callbacks.
 #[cfg(all(feature = "std", any(feature = "client", feature = "server")))]
 pub mod forwarding;

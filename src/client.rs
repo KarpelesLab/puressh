@@ -821,9 +821,10 @@ impl ClientHandlers {
     }
 
     /// Install an `auth-agent@openssh.com` handler (`ssh -A` server-initiated
-    /// opens). For the default behaviour (splice each incoming channel
-    /// against the local `$SSH_AUTH_SOCK`), see
-    /// [`crate::forwarding::agent::splice_to_local_agent_callback`].
+    /// opens). For the default behaviour (bind each incoming channel's agent
+    /// connection to the session and splice it against the local
+    /// `$SSH_AUTH_SOCK`), see
+    /// [`crate::forwarding::agent::bound_splice_to_local_agent_callback`].
     pub fn with_auth_agent(mut self, cb: Arc<AuthAgentCallback>) -> Self {
         self.on_auth_agent = Some(cb);
         self

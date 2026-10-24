@@ -74,7 +74,7 @@ Architecture: $ARCH
 Maintainer: Mark Karpeles <mark@klb.jp>
 Installed-Size: $SIZE
 Depends: libc6 (>= 2.31), libpam0g (>= 0.99.7.1), libpam-modules, libpam-runtime
-Recommends: libpam-systemd, ncurses-term, xauth
+Recommends: libpam-systemd
 Provides: openssh-server (= 1:9.9p1-0puressh1), ssh-server
 Conflicts: openssh-server
 Replaces: openssh-server

@@ -1326,7 +1326,6 @@ impl Client {
     }
 
     /// Whether X11 forwarding was requested ([`Self::set_request_x11_forwarding`]).
-    #[cfg(feature = "multichannel")]
     pub(crate) fn wants_x11(&self) -> bool {
         self.request_x11.is_some()
     }
@@ -4677,7 +4676,8 @@ fn serve_dispatch_packet(
                 // a stricter per-binding match could reject legitimate
                 // forwards. Callers needing exact correlation should also
                 // check `origin` in their callback.
-                if client.tcpip_forward_grants.is_empty() {
+                // Never over a host key that did not match known_hosts.
+                if client.tcpip_forward_grants.is_empty() || client.host_key_mismatched() {
                     let p = client.conn.reject_open(
                         channel,
                         SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
@@ -4736,7 +4736,7 @@ fn serve_dispatch_packet(
                 // `forwarded-streamlocal@openssh.com` open must correlate to a
                 // streamlocal-forward the client actually requested. Reject if
                 // there are zero outstanding grants.
-                if client.streamlocal_forward_grants.is_empty() {
+                if client.streamlocal_forward_grants.is_empty() || client.host_key_mismatched() {
                     let p = client.conn.reject_open(
                         channel,
                         SSH_OPEN_ADMINISTRATIVELY_PROHIBITED,
@@ -4771,7 +4771,12 @@ fn serve_dispatch_packet(
                 }
             }
             ChannelOpen::AuthAgent => {
-                if let Some(cb) = handlers.on_auth_agent.clone() {
+                // Only when agent forwarding was requested, and never over a
+                // host key that did not match known_hosts (mirrors
+                // `shared::incoming_kind`): a handler being installed is not
+                // consent to a server-initiated agent channel.
+                let allowed = client.request_auth_agent && !client.host_key_mismatched();
+                if let Some(cb) = handlers.on_auth_agent.clone().filter(|_| allowed) {
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
 
@@ -4798,7 +4803,10 @@ fn serve_dispatch_packet(
                 orig_host: _,
                 orig_port: _,
             } => {
-                if let Some(cb) = handlers.on_x11.clone() {
+                // Only when X11 forwarding was requested, and never over a
+                // mismatched host key (as for `auth-agent` above).
+                let allowed = client.wants_x11() && !client.host_key_mismatched();
+                if let Some(cb) = handlers.on_x11.clone().filter(|_| allowed) {
                     let p = client.conn.accept_open(channel)?;
                     client.write_payload(&p)?;
 

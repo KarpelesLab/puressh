@@ -5765,6 +5765,60 @@ mod imp {
         }
     }
 
+    /// Whether this connection's login shell is an ordinary one (see
+    /// [`shell_is_listed`]): 0 = not yet known, 1 = yes, 2 = no.
+    /// Resolved once by `on_session_open`, before any `ChrootDirectory`, and
+    /// COW-isolated per forked connection like [`SESSION_USER`].
+    static SESSION_SHELL_LISTED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+    fn remember_session_shell(info: &UserInfo) {
+        let listed = shell_is_listed(&info.shell_str, "/etc/shells");
+        SESSION_SHELL_LISTED.store(if listed { 1 } else { 2 }, Ordering::Relaxed);
+    }
+
+    /// May work that OpenSSH runs through the login shell (`scp -t|-f`, an
+    /// external `sftp-server` subsystem) be served in-process instead? Only
+    /// for a user whose shell is a listed, ordinary one: for a `nologin`,
+    /// `false`, git's restricted shell, `scponly`, `rssh` or `rbash` account
+    /// the shell is the access policy, and bypassing it would grant file
+    /// access OpenSSH refuses. Unknown (the session hook did not run) counts
+    /// as no.
+    fn session_shell_is_listed() -> bool {
+        SESSION_SHELL_LISTED.load(Ordering::Relaxed) == 1
+    }
+
+    /// Basenames of ordinary, unrestricted command shells. `/etc/shells`
+    /// alone is not enough: distributions list restricted shells there too
+    /// (Debian's git package adds its restricted shell, scponly adds itself,
+    /// `rbash` ships listed).
+    const ORDINARY_SHELLS: &[&str] = &[
+        "sh", "bash", "dash", "ash", "zsh", "ksh", "ksh93", "mksh", "oksh", "pdksh", "yash",
+        "posh", "csh", "tcsh", "fish",
+    ];
+
+    /// Is `shell` an ordinary command shell (basename in [`ORDINARY_SHELLS`])
+    /// that is also listed in the `shells` file (`/etc/shells`)? Anything
+    /// else — including an unreadable file — answers no, and the caller falls
+    /// back to running the command via the login shell, as OpenSSH always
+    /// does.
+    fn shell_is_listed(shell: &str, shells: &str) -> bool {
+        use std::io::Read;
+        let base = shell.rsplit('/').next().unwrap_or(shell);
+        if !ORDINARY_SHELLS.contains(&base) {
+            return false;
+        }
+        let mut body = String::new();
+        let read = std::fs::File::open(shells)
+            .and_then(|f| f.take(USER_AUTH_FILE_MAX).read_to_string(&mut body));
+        if read.is_err() {
+            return false;
+        }
+        body.lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .any(|l| l == shell)
+    }
+
     fn lookup_user(name: &str) -> puressh::Result<UserInfo> {
         if let Ok(g) = SESSION_USER.lock()
             && let Some(info) = g.as_ref()
@@ -6082,6 +6136,12 @@ mod imp {
         /// `subsystem sftp` requests are served (a forced `internal-sftp`
         /// is, regardless).
         enabled: bool,
+        /// SFTP was enabled explicitly (`--sftp`, `SftpEnabled`) rather than
+        /// by default; then a `subsystem sftp` request with no `Subsystem`
+        /// line is served whatever the login shell. By default it is served
+        /// only to a user with an ordinary shell (see
+        /// [`session_shell_is_listed`]).
+        explicit: bool,
         read_only: bool,
         root: Option<std::path::PathBuf>,
         /// The `Subsystem sftp` line's sftp-server arguments.
@@ -6091,7 +6151,14 @@ mod imp {
 
     impl SubsystemHandler for SftpSubsystemHandler {
         fn serves(&self, name: &str) -> bool {
-            self.enabled && name == "sftp"
+            self.enabled && name == "sftp" && (self.explicit || session_shell_is_listed())
+        }
+
+        fn serves_external_sftp_server(&self, _user: &str) -> bool {
+            // `Subsystem sftp /usr/lib/openssh/sftp-server`: OpenSSH runs
+            // that via the login shell; serve it in-process only when the
+            // shell is an ordinary one, else run it as written.
+            session_shell_is_listed()
         }
 
         fn handle(
@@ -6101,7 +6168,7 @@ mod imp {
             name: &str,
             stream: ChannelStream,
         ) -> puressh::Result<()> {
-            if name != "sftp" || !self.enabled {
+            if !self.serves(name) {
                 if self.debug {
                     eprintln!(
                         "sshd: refusing unknown subsystem '{}' for {user}",
@@ -6269,7 +6336,11 @@ mod imp {
             stream: ChannelStream,
         ) -> puressh::Result<()> {
             match &self.scp {
-                Some(scp) if scp.claims(command) => scp.run(user, env, command, stream),
+                // In-process only for an ordinary login shell: OpenSSH runs
+                // scp via `$SHELL -c`, which a restricted shell refuses.
+                Some(scp) if session_shell_is_listed() && scp.claims(command) => {
+                    scp.run(user, env, command, stream)
+                }
                 _ => self.shell.run_streaming(user, env, Some(command), stream),
             }
         }
@@ -8568,6 +8639,7 @@ mod imp {
         // `Subsystem sftp` line, as OpenSSH's does.
         config = config.with_subsystem(Arc::new(SftpSubsystemHandler {
             enabled: sftp_enabled,
+            explicit: cli.sftp.or(sshd_cfg.global.sftp_enabled) == Some(true),
             read_only: sftp_read_only,
             root: sftp_root.clone(),
             args: sshd_cfg
@@ -8683,6 +8755,9 @@ mod imp {
                 )));
             }
             remember_session_user(&info);
+            // Whether scp / an external sftp-server may bypass the login
+            // shell; decided from the real /etc/shells, before any chroot.
+            remember_session_shell(&info);
             // Stash the resolved PrintMotd for this connection so the PTY shell
             // handler (which runs later, in a COW-isolated forked child) can
             // read it. Default-off; only printed when PrintMotd=yes — which
@@ -10174,6 +10249,40 @@ mod imp {
             assert!(!principals_match_option(&list, &["dev".to_string()]));
             assert!(!principals_match_option(&list, &[]));
             assert!(!principals_match_option(&[], &["ops".to_string()]));
+        }
+
+        #[test]
+        fn shell_is_listed_reads_etc_shells() {
+            let dir = tempdir_for_test("shells");
+            let shells = dir.join("shells");
+            std::fs::write(
+                &shells,
+                "# comment\n/bin/sh\n  /bin/bash  \n\n/usr/bin/zsh\n",
+            )
+            .expect("write");
+            let f = shells.to_str().unwrap();
+            assert!(shell_is_listed("/bin/sh", f));
+            assert!(shell_is_listed("/bin/bash", f));
+            assert!(shell_is_listed("/usr/bin/zsh", f));
+            // Restricted / non-login shells are not listed: in-process scp
+            // and sftp-server mapping must not bypass them.
+            assert!(!shell_is_listed("/usr/sbin/nologin", f));
+            assert!(!shell_is_listed("/bin/false", f));
+            assert!(!shell_is_listed("/usr/bin/scponly", f));
+            // Listed but restricted: still not ordinary.
+            let restricted = dir.join("shells2");
+            std::fs::write(
+                &restricted,
+                "/bin/rbash\n/usr/bin/git-shell\n/usr/bin/scponly\n",
+            )
+            .expect("write");
+            let r = restricted.to_str().unwrap();
+            assert!(!shell_is_listed("/bin/rbash", r));
+            assert!(!shell_is_listed("/usr/bin/git-shell", r));
+            assert!(!shell_is_listed("/usr/bin/scponly", r));
+            assert!(!shell_is_listed("# comment", f));
+            // Unreadable file: nothing is listed (fall back to the shell).
+            assert!(!shell_is_listed("/bin/sh", "/nonexistent/puressh/shells"));
         }
 
         #[test]

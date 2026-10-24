@@ -548,6 +548,16 @@ pub trait SubsystemHandler: Send + Sync {
         true
     }
 
+    /// Whether a `Subsystem sftp` line naming OpenSSH's *external*
+    /// `sftp-server` binary may be served in-process for `user` (instead of
+    /// running that command through the user's shell, as OpenSSH does). An
+    /// `internal-sftp` command is always served in-process. The default
+    /// allows it.
+    fn serves_external_sftp_server(&self, user: &str) -> bool {
+        let _ = user;
+        true
+    }
+
     /// Run the SFTP server for a forced `internal-sftp` command line
     /// (`ForceCommand internal-sftp -d /srv`), with its arguments as
     /// OpenSSH's in-process sftp-server takes them; `name` is `"sftp"`.
@@ -4849,7 +4859,9 @@ fn handle_channel_request(
                 // OpenSSH's in-process sftp-server (or its external one,
                 // served the same way).
                 if let Some(args) = sftp_server_args(&command)
-                    && cfg.subsystem_handler.is_some()
+                    && let Some(h) = cfg.subsystem_handler.as_ref()
+                    && (internal_sftp_args(&command).is_some()
+                        || h.serves_external_sftp_server(user))
                 {
                     return route_internal_sftp(
                         stream, driver, conn, cfg, user, channel, want_reply, subsystems, envs,

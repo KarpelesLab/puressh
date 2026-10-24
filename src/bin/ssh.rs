@@ -1198,7 +1198,8 @@ fn authenticate_client(
         Err(puressh::Error::AuthFailed) => {
             eprintln!(
                 "{user}@{host}: Permission denied ({}).",
-                client.auth_methods_left().join(",")
+                // Server-supplied method names (USERAUTH_FAILURE).
+                sanitize_terminal_str(&client.auth_methods_left().join(","))
             );
             Err(String::new())
         }
@@ -2815,7 +2816,11 @@ fn run() -> Result<i32, String> {
                 // OpenSSH's wording, which admins and tools (Ansible's
                 // error hints) recognise: the fix is in "Their offer".
                 Some(m) => {
-                    eprintln!("Unable to negotiate with {peer_ip} port {port}: {m}");
+                    // `m` quotes the server's KEXINIT name lists.
+                    eprintln!(
+                        "Unable to negotiate with {peer_ip} port {port}: {}",
+                        sanitize_terminal_str(&m)
+                    );
                     String::new()
                 }
                 None if matches!(e, puressh::Error::HostKeyRejected) => {

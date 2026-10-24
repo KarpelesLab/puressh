@@ -2852,8 +2852,19 @@ fn run() -> Result<i32, String> {
         client.set_rekey_policy(policy);
     }
     // UpdateHostKeys: the server's `hostkeys-00@openssh.com` (sent after
-    // authentication) is acted on once the connection is shared.
-    let hostkeys_updater = HostKeysUpdater::for_connection(&cli, &cfg_block, &connect_host, port);
+    // authentication) is acted on once the connection is shared. Never over
+    // a host key that failed known_hosts verification but was let through
+    // (StrictHostKeyChecking=no): a MITM's key list must not rewrite the
+    // recorded keys, as with OpenSSH.
+    let hostkeys_updater = if client.host_key_mismatched() {
+        vlog(
+            1,
+            "UpdateHostkeys is disabled because the host key is not trusted.",
+        );
+        None
+    } else {
+        HostKeysUpdater::for_connection(&cli, &cfg_block, &connect_host, port)
+    };
     if let Some(u) = &hostkeys_updater {
         let u = u.clone();
         let negotiated = client.negotiated().map(|n| n.host_key);
@@ -3021,6 +3032,13 @@ fn run() -> Result<i32, String> {
     let command = cli.command.clone();
     let subsystem = cli.subsystem;
     let no_command = cli.no_command;
+    // Backstop: a re-key could have accepted a mismatched host key since the
+    // updater was created; never let UpdateHostKeys run over it.
+    if client.host_key_mismatched()
+        && let Some(u) = &hostkeys_updater
+    {
+        u.distrust();
+    }
     let shared: puressh::shared::SharedClient = client.into();
     shared.set_channel_handlers(handlers);
     let connected_at = std::time::Instant::now();
@@ -3163,6 +3181,9 @@ struct HostKeysUpdater {
     algorithms: Vec<String>,
     state: std::sync::Mutex<HostKeysUpdateState>,
     done: std::sync::Condvar,
+    /// Set once the session's host key is known not to match known_hosts;
+    /// no update is then made (checked again right before writing).
+    untrusted: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
@@ -3216,7 +3237,18 @@ impl HostKeysUpdater {
             }),
             state: std::sync::Mutex::new(HostKeysUpdateState::default()),
             done: std::sync::Condvar::new(),
+            untrusted: std::sync::atomic::AtomicBool::new(false),
         }))
+    }
+
+    /// The session's host key is not trusted: make no update.
+    fn distrust(&self) {
+        self.untrusted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn trusted(&self) -> bool {
+        !self.untrusted.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// The server's host key list arrived.
@@ -3241,7 +3273,7 @@ impl HostKeysUpdater {
         let (Some(raw), Some(shared)) = (g.offered.clone(), g.shared.clone()) else {
             return;
         };
-        if g.started {
+        if g.started || !self.trusted() {
             return;
         }
         g.started = true;
@@ -3288,6 +3320,13 @@ impl HostKeysUpdater {
         raw: &[u8],
         host_key_alg: Option<&str>,
     ) {
+        if !self.trusted() {
+            vlog(
+                1,
+                "UpdateHostkeys is disabled because the host key is not trusted.",
+            );
+            return;
+        }
         // The offered keys: plain ones HostKeyAlgorithms allows.
         let mut offered: Vec<Vec<u8>> = Vec::new();
         let mut rest = raw;
@@ -3410,6 +3449,10 @@ impl HostKeysUpdater {
                     common::fingerprint_b64_sha256(old)
                 ),
             );
+        }
+        // Last check before rewriting the recorded keys.
+        if !self.trusted() {
+            return;
         }
         kh.update_host_keys(&self.host, self.port, &plan.old, &add, self.hash);
         if let Err(e) = kh.save(&self.file) {

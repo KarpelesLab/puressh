@@ -171,6 +171,10 @@ struct Args {
     sshfp_generic: bool,
     /// `-M generate|screen`: moduli generation / screening.
     moduli: Option<String>,
+    /// `-w provider`: the FIDO `SecurityKeyProvider`.
+    sk_provider: Option<String>,
+    /// `-K`: download the authenticator's resident keys.
+    download_sk: bool,
 }
 
 /// Split getopt-style arguments as OpenSSH's ssh-keygen takes them: flags
@@ -358,6 +362,11 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
                 out.find_host = Some(args.get(i).ok_or("-F requires a host")?.clone());
             }
             "-H" => out.hash_all = true,
+            "-K" => out.download_sk = true,
+            "-w" => {
+                i += 1;
+                out.sk_provider = Some(args.get(i).ok_or("-w requires a provider")?.clone());
+            }
             "-A" => out.host_keys = true,
             "-q" => out.quiet = true,
             "-" => out.rest.push(a.clone()),
@@ -385,6 +394,20 @@ fn load_reason(e: &puressh::Error) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// Write `contents` to `path` (replacing it), readable by the owner only:
+/// OpenSSH's `sshbuf_write_file` under `umask(077)`.
+#[cfg_attr(not(feature = "security-key"), allow(dead_code))]
+fn write_private_bytes(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    let mut o = fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    o.open(path)?.write_all(contents)
 }
 
 fn write_private(path: &str, contents: &str) -> Result<(), String> {
@@ -711,6 +734,8 @@ fn run_generate(args: &Args) -> Result<i32, String> {
         "ecdsa-sha2-nistp256" => ("ecdsa".to_string(), Some(256)),
         "ecdsa-sha2-nistp384" => ("ecdsa".to_string(), Some(384)),
         "ecdsa-sha2-nistp521" => ("ecdsa".to_string(), Some(521)),
+        "sk-ecdsa-sha2-nistp256@openssh.com" => ("ecdsa-sk".to_string(), None),
+        "sk-ssh-ed25519@openssh.com" => ("ed25519-sk".to_string(), None),
         other => (other.to_lowercase(), None),
     };
     if !args.quiet {
@@ -754,7 +779,16 @@ fn run_generate(args: &Args) -> Result<i32, String> {
     let comment = args.comment.clone().unwrap_or_else(user_at_host);
 
     let mut rng = OsRng;
+    #[cfg_attr(not(feature = "security-key"), allow(unused_mut))]
+    let mut attestation: Option<(String, Vec<u8>)> = None;
     let sk = match ty.as_str() {
+        #[cfg(feature = "security-key")]
+        "ecdsa-sk" | "ed25519-sk" => {
+            let (mut key, attest) = security_key::enroll(args, &ty)?;
+            key.set_comment(comment);
+            attestation = attest;
+            key
+        }
         "ed25519" => PrivateKey::generate_ed25519(&mut rng, comment),
         "mldsa44-ed25519" => PrivateKey::generate_mldsa44_ed25519(&mut rng, comment),
         "ecdsa" => {
@@ -803,6 +837,13 @@ fn run_generate(args: &Args) -> Result<i32, String> {
 
     write_private(&file, &pem)?;
     write_public(&pub_path, &pub_full)?;
+    if let Some((path, blob)) = attestation {
+        write_private_bytes(&path, &blob)
+            .map_err(|e| format!("{RAW}Unable to write attestation data \"{path}\": {e}"))?;
+        if !args.quiet {
+            println!("Your FIDO attestation certificate has been saved in {path}");
+        }
+    }
 
     if !args.quiet {
         let pk = sk.public_key();
@@ -1700,6 +1741,10 @@ fn run() -> Result<i32, i32> {
         return Err(2);
     }
 
+    #[cfg(feature = "security-key")]
+    if let Some(p) = &parsed.sk_provider {
+        let _ = security_key::PROVIDER.set(p.clone());
+    }
     let res = if parsed.fingerprint && !finding {
         run_fingerprint(&parsed)
     } else if parsed.export {
@@ -1718,6 +1763,13 @@ fn run() -> Result<i32, i32> {
         run_known_hosts_hash(&parsed)
     } else if parsed.host_keys {
         run_host_keys(&parsed)
+    } else if parsed.download_sk {
+        #[cfg(feature = "security-key")]
+        {
+            security_key::download(&parsed)
+        }
+        #[cfg(not(feature = "security-key"))]
+        Err("security key support not enabled".into())
     } else if parsed.sig_file.is_some() {
         certs::sign(&parsed)
     } else if parsed.list_cert {
@@ -1920,6 +1972,10 @@ mod sig {
             }
         };
         let pk = sk.public_key();
+        #[cfg(feature = "security-key")]
+        if sk.sk_credential().is_some() {
+            return Ok((Signer::Key(super::security_key::signer(path, sk)?), pk));
+        }
         let key = sk.into_host_key().map_err(|e| format!("{path}: {e}"))?;
         Ok((Signer::Key(key), pk))
     }
@@ -3482,5 +3538,294 @@ mod moduli {
             now() - t0
         );
         Ok(0)
+    }
+}
+
+/// FIDO security keys: enrolment (`-t ecdsa-sk|ed25519-sk`) and resident
+/// key download (`-K`), as OpenSSH's ssh-keygen does them.
+#[cfg(feature = "security-key")]
+mod security_key {
+    use super::{
+        Args, RAW, ask, encode_private, read_new_passphrase_confirmed, read_passphrase_interactive,
+        write_private, write_public,
+    };
+    use purecrypto::zeroize::Zeroizing;
+    use puressh::Error;
+    use puressh::key::PrivateKey;
+    use puressh::sk::{self, Algorithm, SkError};
+    use std::io::Write;
+
+    /// `-w`, for the operations that sign with a security key.
+    pub(super) static PROVIDER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+    fn provider(args: &Args) -> Result<std::sync::Arc<dyn sk::Provider>, String> {
+        let path = sk::provider_path(args.sk_provider.as_deref());
+        sk::open_provider(&path).map_err(|e| format!("{RAW}{e}"))
+    }
+
+    /// What signing asks for, as OpenSSH's ssh-keygen asks it.
+    struct TtyPrompt(String);
+
+    impl sk::Prompt for TtyPrompt {
+        fn touch(&self, key: &PrivateKey) {
+            let pk = key.public_key();
+            eprintln!(
+                "Confirm user presence for key {} {}",
+                pk.type_label(),
+                pk.sha256_fingerprint()
+            );
+        }
+
+        fn pin(&self, key: &PrivateKey) -> Option<Zeroizing<String>> {
+            let prompt = format!(
+                "Enter PIN for {} key {}: ",
+                key.public_key().type_label(),
+                self.0
+            );
+            read_passphrase_interactive(&prompt)
+                .ok()
+                .filter(|p| !p.is_empty())
+        }
+    }
+
+    /// A signer for the security key `key` (the file `path`).
+    pub(super) fn signer(
+        path: &str,
+        key: PrivateKey,
+    ) -> Result<Box<dyn puressh::hostkey::HostKey + Send>, String> {
+        let provider = sk::lazy_provider(&sk::provider_path(PROVIDER.get().map(String::as_str)));
+        let prompt = std::sync::Arc::new(TtyPrompt(path.to_string()));
+        sk::SkSigner::new(key, provider, Some(prompt))
+            .map(|s| Box::new(s) as Box<dyn puressh::hostkey::HostKey + Send>)
+            .map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// `Enter PIN for authenticator: `, empty ⇒ none.
+    fn read_pin() -> Result<Option<Zeroizing<String>>, String> {
+        let pin = read_passphrase_interactive("Enter PIN for authenticator: ")?;
+        Ok((!pin.is_empty()).then_some(pin))
+    }
+
+    /// Enrol a key with the `-O` options OpenSSH takes, retrying for a PIN
+    /// (three times) and, for a resident key, an overwrite. Returns the key
+    /// and the attestation to write (`write-attestation=`).
+    pub(super) fn enroll(
+        args: &Args,
+        ty: &str,
+    ) -> Result<(PrivateKey, Option<Attestation>), String> {
+        let alg = Algorithm::from_name(ty).ok_or("unsupported key type")?;
+        let mut flags = sk::USER_PRESENCE_REQD;
+        let (mut device, mut user, mut application) = (None, None, None);
+        let mut challenge = None;
+        let mut attestation_path = None;
+        for o in &args.sig_options {
+            let lower = o.to_ascii_lowercase();
+            let value = |prefix: &str| {
+                lower
+                    .starts_with(prefix)
+                    .then(|| o[prefix.len()..].to_string())
+            };
+            if lower == "no-touch-required" {
+                flags &= !sk::USER_PRESENCE_REQD;
+            } else if lower == "verify-required" {
+                flags |= sk::USER_VERIFICATION_REQD;
+            } else if lower == "resident" {
+                flags |= sk::RESIDENT_KEY;
+            } else if let Some(v) = value("device=") {
+                device = Some(v);
+            } else if let Some(v) = value("user=") {
+                user = Some(v);
+            } else if let Some(v) = value("challenge=") {
+                challenge = Some(std::fs::read(&v).map_err(|e| {
+                    format!("{RAW}Unable to load FIDO enrollment challenge \"{v}\": {e}")
+                })?);
+            } else if let Some(v) = value("write-attestation=") {
+                attestation_path = Some(v);
+            } else if let Some(v) = value("application=") {
+                if !v.starts_with("ssh:") {
+                    return Err(format!(
+                        "{RAW}FIDO application string must begin with \"ssh:\""
+                    ));
+                }
+                application = Some(v);
+            } else {
+                return Err(format!(
+                    "{RAW}Option \"{o}\" is unsupported for FIDO authenticator enrollment"
+                ));
+            }
+        }
+        let provider = provider(args)?;
+        let options = sk::options(device.as_deref(), user.as_deref());
+        let app = application.clone().unwrap_or_else(|| "ssh:".into());
+        let mut pin: Option<Zeroizing<String>> = None;
+        let mut again = false;
+        let mut tries = 0;
+        let enrolled = loop {
+            if !args.quiet {
+                println!(
+                    "You may need to touch your authenticator{} to authorize key generation.",
+                    if again { " again" } else { "" }
+                );
+            }
+            let _ = std::io::stdout().flush();
+            match sk::enroll(
+                &*provider,
+                alg,
+                &app,
+                flags,
+                pin.as_deref().map(|p| p.as_str()),
+                challenge.as_deref(),
+                &options,
+            ) {
+                Ok(e) => break e,
+                Err(Error::SecurityKey(SkError::CredentialExists))
+                    if flags & sk::RESIDENT_KEY != 0 && flags & sk::FORCE_OPERATION == 0 =>
+                {
+                    println!(
+                        "A resident key scoped to '{}' with user id '{}' already exists.",
+                        application.as_deref().unwrap_or("ssh:"),
+                        user.as_deref().unwrap_or("null")
+                    );
+                    if !ask("Overwrite key in token (y/n)? ")
+                        .is_some_and(|a| a.starts_with(['y', 'Y']))
+                    {
+                        return Err(format!(
+                            "{RAW}Key enrollment failed: {}",
+                            SkError::CredentialExists
+                        ));
+                    }
+                    flags |= sk::FORCE_OPERATION;
+                }
+                Err(Error::SecurityKey(SkError::PinRequired)) => {
+                    if pin.take().is_some() {
+                        eprintln!("PIN incorrect");
+                    }
+                    tries += 1;
+                    if tries >= 3 {
+                        return Err(format!("{RAW}Too many incorrect PINs"));
+                    }
+                    pin = read_pin()?;
+                }
+                Err(e) => return Err(format!("{RAW}Key enrollment failed: {e}")),
+            }
+            again = true;
+        };
+        let attestation = attestation_path.map(|p| (p, enrolled.attestation));
+        Ok((enrolled.key, attestation))
+    }
+
+    /// Where to write the attestation (`write-attestation=`), and the blob.
+    pub(super) type Attestation = (String, Vec<u8>);
+
+    /// The file name suffix OpenSSH derives from a resident key's
+    /// application and user ID (`sk_suffix`).
+    fn suffix(application: &str, user_id: &[u8]) -> String {
+        let mut out = application
+            .strip_prefix("ssh://")
+            .or_else(|| application.strip_prefix("ssh:"))
+            .unwrap_or(application)
+            .to_string();
+        let len = user_id.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+        if len > 0 {
+            let mut user = String::from_utf8_lossy(&user_id[..len]).into_owned();
+            // Never a path or control character in a file name.
+            if user.contains('/') || user.contains("..") || user.contains('\\') {
+                user = user_id[..len].iter().map(|b| format!("{b:02x}")).collect();
+            }
+            if !out.is_empty() {
+                out.push('_');
+            }
+            out.push_str(&user);
+        }
+        out
+    }
+
+    /// `ssh-keygen -K`: save each resident key as `id_<type>_rk[_suffix]`
+    /// in the current directory.
+    pub(super) fn download(args: &Args) -> Result<i32, String> {
+        let provider = provider(args)?;
+        let pin = read_pin()?;
+        if !args.quiet {
+            println!("You may need to touch your authenticator to authorize key download.");
+        }
+        let device = args
+            .sig_options
+            .iter()
+            .find_map(|o| o.strip_prefix("device="));
+        let keys = match sk::load_resident_keys(
+            &*provider,
+            pin.as_deref().map(|p| p.as_str()),
+            &sk::options(device, None),
+        ) {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Unable to load resident keys: {e}");
+                return Ok(255);
+            }
+        };
+        drop(pin);
+        if keys.is_empty() {
+            eprintln!("No keys to download");
+        }
+        let mut pass: Option<Zeroizing<String>> = None;
+        for rk in keys {
+            let mut key = rk.key;
+            let sk = key.sk_credential().ok_or("not a security key")?;
+            let application = sk.application.clone();
+            let ext = suffix(&application, &rk.user_id);
+            let kind = if matches!(key, PrivateKey::SkEcdsaP256 { .. }) {
+                "ecdsa_sk"
+            } else {
+                "ed25519_sk"
+            };
+            let path = format!("id_{kind}_rk{}{ext}", if ext.is_empty() { "" } else { "_" });
+            if std::path::Path::new(&path).exists() {
+                println!("{path} already exists.");
+                if !ask("Overwrite (y/n)? ").is_some_and(|a| a.starts_with(['y', 'Y'])) {
+                    return Ok(255);
+                }
+            }
+            // The application string is the comment, as with OpenSSH.
+            key.set_comment(application.clone());
+            if pass.is_none() {
+                pass = Some(match (&args.old_pass, &args.new_pass) {
+                    (Some(p), _) | (None, Some(p)) => p.clone(),
+                    (None, None) => read_new_passphrase_confirmed(&format!(
+                        "Enter passphrase for \"{path}\" (empty for no passphrase): "
+                    ))?,
+                });
+            }
+            let pem = encode_private(&key, args, pass.as_deref().map_or("", |p| p.as_str()))
+                .map_err(|e| format!("{RAW}Saving key \"{path}\" failed: {e}"))?;
+            write_private(&path, &pem)?;
+            if !args.quiet {
+                println!(
+                    "Saved {} key{}{} to {path}",
+                    key.public_key().type_label(),
+                    if ext.is_empty() { "" } else { " " },
+                    if ext.is_empty() {
+                        ""
+                    } else {
+                        application.as_str()
+                    },
+                );
+            }
+            let mut line = key.public_key().to_authorized_keys_line();
+            line.push('\n');
+            write_public(&format!("{path}.pub"), &line)?;
+        }
+        Ok(0)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn suffix_matches_openssh() {
+            assert_eq!(super::suffix("ssh:", &[0; 32]), "");
+            assert_eq!(super::suffix("ssh:work", &[0; 32]), "work");
+            assert_eq!(super::suffix("ssh://srv", b"alice\0\0"), "srv_alice");
+            assert_eq!(super::suffix("ssh:", b"bob"), "bob");
+            assert_eq!(super::suffix("ssh:", b"../x"), "2e2e2f78");
+        }
     }
 }

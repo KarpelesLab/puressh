@@ -890,7 +890,7 @@ impl puressh::hostkey::HostKey for LazyIdentity {
                 }
                 match PrivateKey::parse_pem(&self.pem, Some(pass.as_bytes())) {
                     Ok(k) => {
-                        *loaded = Some(k.into_host_key_sync()?);
+                        *loaded = Some(key_signer(&self.path, k)?);
                         break;
                     }
                     Err(Error::Crypto(_)) => {}
@@ -903,6 +903,79 @@ impl puressh::hostkey::HostKey for LazyIdentity {
             None => Err(Error::Crypto("no passphrase for the identity")),
         }
     }
+}
+
+/// `SecurityKeyProvider` (`ssh_config`, `-o`, `ssh-add -S`) for the
+/// security-key identities loaded after it is set. Unset: `$SSH_SK_PROVIDER`,
+/// else `internal`, as OpenSSH resolves it.
+#[cfg(feature = "security-key")]
+static SK_PROVIDER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Set the `SecurityKeyProvider` (first call wins).
+#[cfg(feature = "security-key")]
+#[allow(dead_code)] // not every binary loads security keys
+pub fn set_security_key_provider(path: &str) {
+    let _ = SK_PROVIDER.set(path.to_string());
+}
+
+/// The resolved `SecurityKeyProvider`.
+#[cfg(feature = "security-key")]
+#[allow(dead_code)] // not every binary loads security keys
+pub fn security_key_provider() -> String {
+    puressh::sk::provider_path(SK_PROVIDER.get().map(String::as_str))
+}
+
+/// Ask on the terminal what a security key needs, as OpenSSH's ssh does.
+#[cfg(feature = "security-key")]
+pub struct SkTtyPrompt {
+    /// The identity file, named in the PIN prompt.
+    pub path: String,
+}
+
+#[cfg(feature = "security-key")]
+impl puressh::sk::Prompt for SkTtyPrompt {
+    fn touch(&self, key: &PrivateKey) {
+        let pk = key.public_key();
+        eprintln!(
+            "Confirm user presence for key {} {}",
+            pk.type_label(),
+            pk.sha256_fingerprint()
+        );
+    }
+
+    fn pin(&self, key: &PrivateKey) -> Option<Zeroizing<String>> {
+        if !secret_prompt_available() {
+            return None;
+        }
+        let prompt = format!(
+            "Enter PIN for {} key {}: ",
+            key.public_key().type_label(),
+            self.path
+        );
+        read_secret(&prompt).ok().filter(|p| !p.is_empty())
+    }
+}
+
+/// The signer for a loaded identity: in memory, or (a security key) the
+/// authenticator through the `SecurityKeyProvider`.
+fn key_signer(
+    path: &str,
+    key: PrivateKey,
+) -> puressh::Result<Box<dyn puressh::hostkey::HostKey + Send + Sync>> {
+    #[cfg(feature = "security-key")]
+    if key.sk_credential().is_some() {
+        let provider = puressh::sk::lazy_provider(&security_key_provider());
+        let prompt = Arc::new(SkTtyPrompt {
+            path: path.to_string(),
+        });
+        return Ok(Box::new(puressh::sk::SkSigner::new(
+            key,
+            provider,
+            Some(prompt),
+        )?));
+    }
+    let _ = path;
+    key.into_host_key_sync()
 }
 
 /// An identity file as a publickey credential: loaded now when it is not
@@ -938,7 +1011,7 @@ pub fn identity_signer(
     }
     match PrivateKey::parse_pem(&pem, None) {
         Ok(k) => Ok(Some(
-            k.into_host_key_sync().map_err(|e| format!("{path}: {e}"))?,
+            key_signer(path, k).map_err(|e| format!("{path}: {e}"))?,
         )),
         Err(Error::Crypto(_)) => {
             if batch || !secret_prompt_available() {

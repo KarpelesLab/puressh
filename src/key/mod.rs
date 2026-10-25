@@ -916,6 +916,22 @@ impl PrivateKey {
         }
     }
 
+    /// The private key for a security key's public half and credential
+    /// (what `ssh-keygen` writes after enrolment).
+    pub fn from_security_key(public: PublicKey, sk: SkCredential) -> Result<Self> {
+        match public {
+            PublicKey::SkEcdsaP256 { point, comment, .. } => {
+                Ok(PrivateKey::SkEcdsaP256 { point, sk, comment })
+            }
+            PublicKey::SkEd25519 { raw, comment, .. } => Ok(PrivateKey::SkEd25519 {
+                public: raw,
+                sk,
+                comment,
+            }),
+            _ => Err(Error::Config("not a security key")),
+        }
+    }
+
     /// The security-key credential, for a key held by an authenticator.
     pub fn sk_credential(&self) -> Option<&SkCredential> {
         match self {
@@ -1470,11 +1486,16 @@ impl PrivateKey {
                 sk: SkCredential::read(r)?,
                 comment: String::new(),
             },
-            PublicKey::SkEd25519 { raw, .. } => PrivateKey::SkEd25519 {
-                public: raw,
-                sk: SkCredential::read(r)?,
-                comment: String::new(),
-            },
+            PublicKey::SkEd25519 { raw, .. } => {
+                if r.read_string()? != raw {
+                    return Err(Error::Format("ed25519: certificate key mismatch"));
+                }
+                PrivateKey::SkEd25519 {
+                    public: raw,
+                    sk: SkCredential::read(r)?,
+                    comment: String::new(),
+                }
+            }
         };
         let comment = String::from_utf8_lossy(r.read_string()?).into_owned();
         let pk = attach_comment(pk, comment);

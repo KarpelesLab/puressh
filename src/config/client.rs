@@ -359,6 +359,9 @@ pub struct ClientOptions {
     pub certificate_files: Vec<String>,
     /// `IdentitiesOnly` (yes/no).
     pub identities_only: Option<bool>,
+    /// `SecurityKeyProvider`: `internal` or a FIDO middleware library, for
+    /// security-key identities (`$SSH_SK_PROVIDER` when unset).
+    pub security_key_provider: Option<String>,
     /// `StrictHostKeyChecking`.
     pub strict_host_key: Option<StrictMode>,
     /// `UserKnownHostsFile`.
@@ -943,6 +946,9 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         }
         "identitiesonly" => {
             opts.identities_only = Some(parse_yes_no(line)?);
+        }
+        "securitykeyprovider" => {
+            opts.security_key_provider = Some(one_arg(line)?.to_string());
         }
         "stricthostkeychecking" => {
             opts.strict_host_key = Some(parse_strict(line)?);
@@ -1541,7 +1547,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
         &["1024", "2048"],
         "RSA keys under 2048 bits are always refused; a higher floor is not supported",
     ),
-    ("SecurityKeyProvider", &["*"], ""),
     ("StreamLocalBindMask", &["*"], ""),
     ("StreamLocalBindUnlink", &["*"], ""),
     ("SyslogFacility", &["*"], ""),
@@ -1596,6 +1601,7 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(port);
     take_scalar!(user);
     take_scalar!(identities_only);
+    take_scalar!(security_key_provider);
     take_scalar!(strict_host_key);
     take_scalar!(user_known_hosts);
     take_scalar!(hash_known_hosts);

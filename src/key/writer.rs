@@ -428,9 +428,18 @@ impl PrivateKey {
                 comment
             }
             // The certificate carries the public fields; only the
-            // credential follows.
-            PrivateKey::SkEcdsaP256 { sk, comment, .. }
-            | PrivateKey::SkEd25519 { sk, comment, .. } => {
+            // credential follows (after the Ed25519 key, which OpenSSH
+            // repeats as for a plain Ed25519 certificate).
+            PrivateKey::SkEcdsaP256 { sk, comment, .. } => {
+                sk.write(&mut w);
+                comment
+            }
+            PrivateKey::SkEd25519 {
+                public,
+                sk,
+                comment,
+            } => {
+                w.write_string(public);
                 sk.write(&mut w);
                 comment
             }

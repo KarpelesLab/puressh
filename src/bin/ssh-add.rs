@@ -67,6 +67,12 @@ mod imp {
         destinations: Vec<String>,
         hostkey_files: Vec<String>,
         files: Vec<String>,
+        /// `-S`: the `SecurityKeyProvider`.
+        sk_provider: Option<String>,
+        /// `-K`: add the authenticator's resident keys.
+        download: bool,
+        /// `-P`: don't ask for the authenticator's PIN.
+        no_pin: bool,
     }
 
     fn parse_lifetime(v: &str) -> Option<u32> {
@@ -146,12 +152,11 @@ mod imp {
                         },
                         'h' => o.destinations.push(v),
                         'H' => o.hostkey_files.push(v),
+                        'S' => o.sk_provider = Some(v),
+                        // Deprecated, ignored (OpenSSH's too).
+                        'M' | 'm' => {}
                         _ => {
-                            return Err(
-                                "PKCS#11 tokens and security keys (-s/-e/-S/-M/-m) are not \
-                                 supported"
-                                    .into(),
-                            );
+                            return Err("PKCS#11 tokens (-s/-e) are not supported".into());
                         }
                     }
                     break;
@@ -177,7 +182,8 @@ mod imp {
                     'C' => o.cert_only = true,
                     'N' => o.no_cert_lifetime = true,
                     'v' => {}
-                    'K' => return Err("security key resident keys (-K) are not supported".into()),
+                    'K' => o.download = true,
+                    'P' => o.no_pin = true,
                     _ => return Err(format!("unknown option -- {c}")),
                 }
                 j += 1;
@@ -209,11 +215,17 @@ mod imp {
 
     fn default_files() -> Vec<String> {
         let home = std::env::var("HOME").unwrap_or_default();
-        ["id_rsa", "id_ecdsa", "id_ed25519"]
-            .iter()
-            .map(|n| format!("{home}/.ssh/{n}"))
-            .filter(|p| std::path::Path::new(p).exists())
-            .collect()
+        [
+            "id_rsa",
+            "id_ecdsa",
+            "id_ecdsa_sk",
+            "id_ed25519",
+            "id_ed25519_sk",
+        ]
+        .iter()
+        .map(|n| format!("{home}/.ssh/{n}"))
+        .filter(|p| std::path::Path::new(p).exists())
+        .collect()
     }
 
     /// A key or certificate file's public half: the key itself, or a
@@ -678,6 +690,13 @@ mod imp {
         let mut constraints = AddConstraints::default();
         constraints.lifetime = o.lifetime;
         constraints.confirm = o.confirm;
+        // OpenSSH's `SSH_SK_PROVIDER` / `-S`, else `internal`.
+        constraints.sk_provider = Some(
+            o.sk_provider
+                .clone()
+                .or_else(|| std::env::var("SSH_SK_PROVIDER").ok())
+                .unwrap_or_else(|| "internal".into()),
+        );
         for d in &o.destinations {
             match parse_destination(d, &hostkey_files) {
                 Ok(c) => constraints.destinations.push(c),
@@ -685,6 +704,16 @@ mod imp {
                     eprintln!("{e}");
                     return 1;
                 }
+            }
+        }
+
+        if o.download {
+            #[cfg(feature = "security-key")]
+            return add_resident_keys(&mut agent, &o, &constraints);
+            #[cfg(not(feature = "security-key"))]
+            {
+                eprintln!("Unable to load resident keys: requested feature not supported");
+                return 1;
             }
         }
 
@@ -730,6 +759,74 @@ mod imp {
             }
         }
         status
+    }
+
+    /// `ssh-add -K`: add each resident key on the authenticator, as
+    /// OpenSSH's `load_resident_keys`.
+    #[cfg(feature = "security-key")]
+    fn add_resident_keys(agent: &mut Agent, o: &Opts, c: &AddConstraints) -> i32 {
+        let provider_path = c.sk_provider.clone().unwrap_or_default();
+        let pin = if o.no_pin {
+            None
+        } else {
+            common::read_secret("Enter PIN for authenticator: ")
+                .ok()
+                .filter(|p| !p.is_empty())
+        };
+        let keys = puressh::sk::open_provider(&provider_path)
+            .map_err(puressh::Error::from)
+            .and_then(|p| {
+                puressh::sk::load_resident_keys(&*p, pin.as_deref().map(|p| p.as_str()), &[])
+            });
+        drop(pin);
+        let keys = match keys {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("Unable to load resident keys: {e}");
+                return 1;
+            }
+        };
+        if keys.is_empty() {
+            return 1;
+        }
+        let mut status = 0;
+        for rk in keys {
+            let mut key = rk.key;
+            let app = key
+                .sk_credential()
+                .map(|s| s.application.clone())
+                .unwrap_or_default();
+            key.set_comment(app);
+            let pk = key.public_key();
+            let fp = fingerprint(&pk, o.md5);
+            if agent.add_constrained(&key, None, c).is_err() {
+                eprintln!("Unable to add key {} {fp}", pk.type_label());
+                status = 1;
+                continue;
+            }
+            if !o.quiet {
+                eprintln!("Resident identity added: {} {fp}", pk.type_label());
+                if let Some(t) = c.lifetime {
+                    eprintln!("Lifetime set to {t} seconds");
+                }
+                if c.confirm {
+                    eprintln!("The user must confirm each use of the key");
+                }
+            }
+        }
+        status
+    }
+
+    /// `pk`'s fingerprint, MD5 (`-E md5`) or SHA-256.
+    fn fingerprint(pk: &PublicKey, md5: bool) -> String {
+        if md5 {
+            use purecrypto::hash::{Digest, Md5};
+            let d = Md5::digest(&pk.wire_blob());
+            let hex: Vec<String> = d.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+            format!("MD5:{}", hex.join(":"))
+        } else {
+            pk.sha256_fingerprint()
+        }
     }
 
     fn lock_agent(agent: &mut Agent, lock: bool) -> i32 {
@@ -804,15 +901,7 @@ mod imp {
                 println!(
                     "{} {} {} ({}{})",
                     pk.bit_length(),
-                    if o.md5 {
-                        use purecrypto::hash::{Digest, Md5};
-                        let d = Md5::digest(&pk.wire_blob());
-                        let hex: Vec<String> =
-                            d.as_ref().iter().map(|b| format!("{b:02x}")).collect();
-                        format!("MD5:{}", hex.join(":"))
-                    } else {
-                        pk.sha256_fingerprint()
-                    },
+                    fingerprint(&pk, o.md5),
                     if id.comment().is_empty() {
                         "no comment"
                     } else {

@@ -67,6 +67,10 @@ fn algorithms_for(ty: &str, cert: bool) -> &'static [&'static str] {
         ],
         ("ed25519", false) => &["ssh-ed25519"],
         ("ed25519", true) => &["ssh-ed25519-cert-v01@openssh.com"],
+        ("ecdsa-sk", false) => &["sk-ecdsa-sha2-nistp256@openssh.com"],
+        ("ecdsa-sk", true) => &["sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"],
+        ("ed25519-sk", false) => &["sk-ssh-ed25519@openssh.com"],
+        ("ed25519-sk", true) => &["sk-ssh-ed25519-cert-v01@openssh.com"],
         ("mldsa44-ed25519", false) => &["ssh-mldsa44-ed25519@openssh.com"],
         ("mldsa44-ed25519", true) => &["ssh-mldsa44-ed25519-cert-v01@openssh.com"],
         _ => &[],
@@ -84,7 +88,15 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
         sshfp_hash: None,
         port: 22,
         timeout: Duration::from_secs(5),
-        types: vec!["rsa", "ecdsa", "ed25519", "mldsa44-ed25519"],
+        // OpenSSH's order (its `KT_*` bits).
+        types: vec![
+            "rsa",
+            "ecdsa",
+            "ed25519",
+            "ecdsa-sk",
+            "ed25519-sk",
+            "mldsa44-ed25519",
+        ],
         hosts: Vec::new(),
     };
     let mut files: Vec<String> = Vec::new();
@@ -141,9 +153,11 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                                 "ssh-mldsa44-ed25519@openssh.com" | "mldsa44-ed25519" => {
                                     "mldsa44-ed25519"
                                 }
+                                "sk-ecdsa-sha2-nistp256@openssh.com" | "ecdsa-sk" => "ecdsa-sk",
+                                "sk-ssh-ed25519@openssh.com" | "ed25519-sk" => "ed25519-sk",
                                 // Not supported by this build: skipped like
                                 // a type the server does not offer.
-                                "dsa" | "ssh-dss" | "ecdsa-sk" | "ed25519-sk" => continue,
+                                "dsa" | "ssh-dss" => continue,
                                 other => return Err(format!("unknown key type {other}")),
                             };
                             if !o.types.contains(&t) {

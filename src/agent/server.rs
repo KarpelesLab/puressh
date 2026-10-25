@@ -37,6 +37,9 @@ struct Held {
     expires: Option<Instant>,
     confirm: bool,
     dest: Vec<DestConstraint>,
+    /// A security key's `sk-provider@openssh.com` (canonical path, or
+    /// `internal`).
+    sk_provider: Option<String>,
 }
 
 impl Drop for Held {
@@ -149,6 +152,29 @@ pub struct AgentState {
     unlock_after: Option<Instant>,
     default_lifetime: Option<Duration>,
     confirm: Option<ConfirmFn>,
+    /// `-P`: the security-key (and PKCS#11) providers that may be loaded.
+    allowed_providers: String,
+    /// `-O allow-remote-pkcs11`: a forwarded connection may add providers.
+    remote_add_provider: bool,
+    /// `-O websafe-allow=` (`ssh:*` by default), `None` with `-O
+    /// no-restrict-websafe`: the FIDO applications that may sign anything;
+    /// a key for any other (a web origin) signs only SSH requests.
+    websafe_allowlist: Option<String>,
+    #[cfg(feature = "security-key")]
+    sk_prompt: Option<alloc::sync::Arc<dyn crate::sk::Prompt>>,
+}
+
+/// The providers `ssh-agent` loads by default (`-P`).
+pub const DEFAULT_ALLOWED_PROVIDERS: &str = "/usr/lib*/*,/usr/local/lib*/*";
+
+/// Whether `s` matches the comma-separated `list` of `*`/`?` patterns
+/// (`!` negating), case-sensitively, as OpenSSH's `match_pattern_list`.
+fn pattern_list_matches(list: &str, s: &str) -> bool {
+    let patterns: Vec<crate::config::HostPattern> = list
+        .split(',')
+        .map(crate::config::HostPattern::parse)
+        .collect();
+    crate::config::host_matches(&patterns, s)
 }
 
 impl Default for AgentState {
@@ -191,7 +217,39 @@ impl AgentState {
             unlock_after: None,
             default_lifetime: None,
             confirm: None,
+            allowed_providers: DEFAULT_ALLOWED_PROVIDERS.into(),
+            remote_add_provider: false,
+            websafe_allowlist: Some("ssh:*".into()),
+            #[cfg(feature = "security-key")]
+            sk_prompt: None,
         }
+    }
+
+    /// `ssh-agent -P`: the provider libraries keys may name (patterns,
+    /// comma-separated), [`DEFAULT_ALLOWED_PROVIDERS`] by default.
+    pub fn set_allowed_providers(&mut self, list: &str) {
+        self.allowed_providers = list.into();
+    }
+
+    /// `ssh-agent -O allow-remote-pkcs11`: let forwarded connections add
+    /// keys naming a provider library.
+    pub fn set_remote_add_provider(&mut self, allow: bool) {
+        self.remote_add_provider = allow;
+    }
+
+    /// `ssh-agent -O websafe-allow=` (`Some`, `ssh:*` by default) or `-O
+    /// no-restrict-websafe` (`None`): which FIDO applications may sign any
+    /// data. A key for another application (a web origin, which a browser
+    /// could ask to sign a login challenge) only signs SSH user
+    /// authentication requests and SSHSIG signatures.
+    pub fn set_websafe_allowlist(&mut self, list: Option<&str>) {
+        self.websafe_allowlist = list.map(Into::into);
+    }
+
+    /// How a security key asks for a touch or its PIN when it signs.
+    #[cfg(feature = "security-key")]
+    pub fn set_security_key_prompt(&mut self, prompt: alloc::sync::Arc<dyn crate::sk::Prompt>) {
+        self.sk_prompt = Some(prompt);
     }
 
     /// Forget every key (`ssh-agent` on SIGUSR1).
@@ -396,11 +454,38 @@ impl AgentState {
                 return None;
             }
         }
-        let signer = held.key.agent_signer(flags).ok()?;
-        let sig = signer.sign(data).ok()?;
+        let sig = if let Some(sk) = held.key.sk_credential() {
+            // A web-origin key never signs a challenge a site could use.
+            if let Some(allow) = &self.websafe_allowlist
+                && !pattern_list_matches(allow, &sk.application)
+                && parse_userauth_request(data, blob).is_none()
+                && !data.starts_with(b"SSHSIG")
+            {
+                return None;
+            }
+            self.sign_security_key(held, data)?
+        } else {
+            held.key.agent_signer(flags).ok()?.sign(data).ok()?
+        };
         let mut w = Writer::new();
         w.write_string(&sig);
         Some(reply(SSH_AGENT_SIGN_RESPONSE, w.as_slice()))
+    }
+
+    /// A security key's signature, made through its provider.
+    #[cfg(feature = "security-key")]
+    fn sign_security_key(&self, held: &Held, data: &[u8]) -> Option<Vec<u8>> {
+        use crate::hostkey::HostKey;
+        let provider = crate::sk::open_provider(held.sk_provider.as_deref()?).ok()?;
+        crate::sk::SkSigner::new(held.key.clone(), provider, self.sk_prompt.clone())
+            .ok()?
+            .sign(data)
+            .ok()
+    }
+
+    #[cfg(not(feature = "security-key"))]
+    fn sign_security_key(&self, _held: &Held, _data: &[u8]) -> Option<Vec<u8>> {
+        None
     }
 
     fn add(&mut self, conn: &ConnectionState, body: &[u8], constrained: bool) -> Option<Vec<u8>> {
@@ -421,6 +506,7 @@ impl AgentState {
         let mut lifetime = None;
         let mut confirm = false;
         let mut dest: Option<Vec<DestConstraint>> = None;
+        let mut sk_provider: Option<String> = None;
         if constrained {
             while !r.is_empty() {
                 match r.read_u8().ok()? {
@@ -444,6 +530,13 @@ impl AgentState {
                             }
                             dest = Some(list);
                         }
+                        b"sk-provider@openssh.com" if sk_provider.is_none() => {
+                            sk_provider = Some(
+                                core::str::from_utf8(r.read_string().ok()?)
+                                    .ok()?
+                                    .to_string(),
+                            );
+                        }
                         _ => return None,
                     },
                     _ => return None,
@@ -451,6 +544,21 @@ impl AgentState {
             }
         } else if !r.is_empty() {
             return None;
+        }
+        if let Some(p) = sk_provider.as_mut() {
+            key.sk_credential()?;
+            if !p.eq_ignore_ascii_case("internal") {
+                // Only a provider on the allowlist, and from a forwarded
+                // connection only when allowed.
+                let remote = conn.bind_attempted || !conn.binds.is_empty();
+                if remote && !self.remote_add_provider {
+                    return None;
+                }
+                *p = std::fs::canonicalize(&*p).ok()?.to_str()?.to_string();
+                if !pattern_list_matches(&self.allowed_providers, p) {
+                    return None;
+                }
+            }
         }
         let blob = cert.unwrap_or_else(|| key.public_key().wire_blob());
         let comment = key.comment().to_string();
@@ -472,6 +580,7 @@ impl AgentState {
             expires,
             confirm,
             dest: dest.unwrap_or_default(),
+            sk_provider,
         });
         Some(success())
     }
@@ -753,6 +862,54 @@ mod tests {
 
     fn msg(t: u8, body: &[u8]) -> Vec<u8> {
         reply(t, body)
+    }
+
+    /// A security key added with `sk-provider@openssh.com`: `internal` and
+    /// allow-listed libraries are taken, others refused, and the
+    /// constraint is refused on a key that is not a security key.
+    #[test]
+    fn sk_provider_constraint() {
+        let sk_key = {
+            let path = format!(
+                "{}/tests/fixtures/sk/ed25519-sk",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            PrivateKey::parse_openssh_pem(&std::fs::read_to_string(path).unwrap(), None).unwrap()
+        };
+        let with_provider = |key: &PrivateKey, p: &str| {
+            let mut body = key.to_agent_add_body();
+            let mut w = Writer::new();
+            w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+            w.write_string(b"sk-provider@openssh.com");
+            w.write_string(p.as_bytes());
+            body.extend_from_slice(w.as_slice());
+            msg(SSH_AGENTC_ADD_ID_CONSTRAINED, &body)
+        };
+        let mut s = AgentState::new();
+        assert_eq!(
+            s.handle(&with_provider(&sk_key, "internal"))[0],
+            SSH_AGENT_SUCCESS
+        );
+        assert_eq!(s.keys[0].sk_provider.as_deref(), Some("internal"));
+        // Not under /usr/lib*: refused.
+        let here = std::env::current_exe().unwrap();
+        let mut s = AgentState::new();
+        assert_eq!(
+            s.handle(&with_provider(&sk_key, here.to_str().unwrap()))[0],
+            SSH_AGENT_FAILURE
+        );
+        // Allowed by -P, and canonicalised.
+        s.set_allowed_providers(here.parent().unwrap().join("*").to_str().unwrap());
+        assert_eq!(
+            s.handle(&with_provider(&sk_key, here.to_str().unwrap()))[0],
+            SSH_AGENT_SUCCESS
+        );
+        // A provider for a key held in memory is refused.
+        let mut s = AgentState::new();
+        assert_eq!(
+            s.handle(&with_provider(&fixture("u_ed25519"), "internal"))[0],
+            SSH_AGENT_FAILURE
+        );
     }
 
     fn add(state: &mut AgentState, key: &PrivateKey) -> u8 {

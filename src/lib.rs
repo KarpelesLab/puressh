@@ -1,5 +1,11 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-#![cfg_attr(not(feature = "ffi"), forbid(unsafe_code))]
+#![cfg_attr(
+    not(any(feature = "ffi", feature = "security-key")),
+    forbid(unsafe_code)
+)]
+// Loading a security-key provider or PKCS#11 module is FFI: `unsafe` is
+// allowed in those modules alone.
+#![cfg_attr(all(not(feature = "ffi"), feature = "security-key"), deny(unsafe_code))]
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
@@ -141,6 +147,10 @@ pub mod shared;
 // puressh-only extension, see `docs/knock.md`.
 #[cfg(feature = "knock")]
 pub mod knock;
+
+#[cfg(feature = "security-key")]
+#[allow(unsafe_code)]
+pub mod sk;
 
 #[cfg(feature = "server")]
 pub mod server;

@@ -28,6 +28,10 @@ pub struct AddConstraints {
     pub confirm: bool,
     /// Where the key may be used (`ssh-add -h`); empty for anywhere.
     pub destinations: Vec<DestinationConstraint>,
+    /// The `SecurityKeyProvider` the agent signs a security key through
+    /// (`sk-provider@openssh.com`, `ssh-add -S`). Sent for security keys
+    /// only.
+    pub sk_provider: Option<String>,
 }
 
 /// One hop of a [`DestinationConstraint`].
@@ -297,6 +301,16 @@ impl Agent {
             w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
             w.write_string(b"restrict-destination-v00@openssh.com");
             w.write_string(list.as_slice());
+            body.extend_from_slice(w.as_slice());
+            constrained = true;
+        }
+        if let Some(p) = c.sk_provider.as_deref()
+            && key.sk_credential().is_some()
+        {
+            let mut w = crate::format::Writer::new();
+            w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+            w.write_string(b"sk-provider@openssh.com");
+            w.write_string(p.as_bytes());
             body.extend_from_slice(w.as_slice());
             constrained = true;
         }

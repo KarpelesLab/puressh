@@ -21,7 +21,7 @@ autobins = false
 # The defaults are what a client-library consumer needs. The server side
 # (`server`, `pam`) and the agent daemon (`agent`) are opt-in; the release
 # builds of the binaries enable all three.
-default = ["std", "client", "compress", "multichannel", "knock"]
+default = ["std", "client", "compress", "multichannel", "knock", "security-key"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -39,6 +39,12 @@ compress = ["dep:compcol"]
 # drain). Default on; turning it off keeps the borrow-based Client API and
 # strips ~600 lines of code from `src/shared.rs`.
 multichannel = ["client"]
+# FIDO security keys (`sk-ecdsa`, `sk-ed25519`) on the authenticator side:
+# signing, enrolment and resident keys through an OpenSSH
+# `SecurityKeyProvider` library or `internal` (libfido2), both loaded at run
+# time with `dlsym`, so there is no link-time dependency. Verifying their
+# signatures needs no feature. Default on.
+security-key = ["std", "dep:dlsym"]
 # Stealth UDP rendezvous ("knock", `docs/knock.md`): a signed UDP datagram
 # opens a one-shot TCP listener in front of a regular SSH session. puressh
 # only; not understood by other SSH implementations. Default on.
@@ -73,6 +79,15 @@ mio = ["client"]
 pam = ["server", "dep:dlsym"]
 
 [dependencies]
+# `libc` for the few low-level POSIX bits: constants the library passes to
+# std (`O_NOFOLLOW`, termios mode numbers), and the binaries' own calls
+# (terminal control, fork, peer credentials) where they don't use `nix`. The
+# library calls into it only to free what a loaded security-key provider or
+# PKCS#11 module allocated (its `free`, on every platform).
+libc = { version = "0.2", default-features = false }
+# Run-time loading of libpam, FIDO providers and libfido2, and PKCS#11
+# modules (none is a link-time dependency).
+dlsym = { version = "0.0.2", optional = true }
 # 0.7 made `ec` stop implying `alloc`, so the boxed multi-curve path, `CurveId`
 # and every DER/PEM codec now need `alloc` named explicitly. We already name it
 # (our own `alloc` feature forwards to `purecrypto/alloc`, and `std` implies
@@ -145,18 +160,10 @@ tokio-util = { version = "0.7", default-features = false, features = ["compat"],
 nix = { version = "0.31", default-features = false, optional = true, features = [
     "process", "signal", "term", "fs", "ioctl", "user", "poll", "socket", "net",
 ] }
-# `libc` for the few low-level POSIX bits: constants the library passes to
-# std (`O_NOFOLLOW`, termios mode numbers), and the binaries' own calls
-# (terminal control, fork, peer credentials) where they don't use `nix`. The
-# library itself stays `forbid(unsafe_code)` and never calls into it.
-libc = { version = "0.2", default-features = false }
 
-# `dlsym` loads libpam at run time for the sshd PAM integration, so there
-# is no link-time libpam dep (nor -dev package to build). Linux only: the
-# binding uses Linux-PAM's constants, which OpenPAM (macOS / *BSD) numbers
-# differently.
-[target.'cfg(target_os = "linux")'.dependencies]
-dlsym = { version = "0.0.2", optional = true }
+# The sshd PAM integration's `dlsym` dependency is declared with the others
+# (it loads libpam at run time); `sshd_pam` itself is Linux only, as it uses
+# Linux-PAM's constants, which OpenPAM (macOS / *BSD) numbers differently.
 
 [dev-dependencies]
 hex = "0.4"

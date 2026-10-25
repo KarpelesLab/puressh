@@ -16,9 +16,9 @@
 //!
 //! ## Invariants
 //!
-//! - `#![cfg_attr(not(feature = "ffi"), forbid(unsafe_code))]` at the
-//!   crate root (`src/lib.rs:1`) — any `unsafe` outside this directory
-//!   tree is a build break.
+//! - Without `ffi`, the crate root forbids `unsafe` (denies it, with an
+//!   exemption for the provider loader `sk`, when `security-key` is on):
+//!   `unsafe` belongs in this directory tree and in that loader only.
 //! - All entry points wrap their body in
 //!   `catch_unwind(AssertUnwindSafe(...))` and return [`PCSSH_ERR_PANIC`]
 //!   on unwind.

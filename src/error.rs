@@ -72,6 +72,9 @@ pub enum Error {
         /// The server's offer.
         server: alloc::string::String,
     },
+    /// A FIDO security-key provider failed.
+    #[cfg(feature = "security-key")]
+    SecurityKey(crate::sk::SkError),
     /// The peer ended the connection with `SSH_MSG_DISCONNECT`.
     #[cfg(feature = "alloc")]
     Disconnected {
@@ -122,6 +125,8 @@ impl fmt::Display for Error {
                 reason,
                 description,
             } => write!(f, "disconnected by peer: {reason}: {description}"),
+            #[cfg(feature = "security-key")]
+            Error::SecurityKey(e) => write!(f, "{e}"),
         }
     }
 }

@@ -75,6 +75,14 @@ mod imp {
         bind: Option<PathBuf>,
         lifetime: Option<Duration>,
         command: Vec<String>,
+        /// `-P`: the provider libraries keys may name.
+        allowed_providers: Option<String>,
+        /// `-O no-restrict-websafe`.
+        no_restrict_websafe: bool,
+        /// `-O websafe-allow=`.
+        websafe_allow: Option<String>,
+        /// `-O allow-remote-pkcs11`.
+        remote_add_provider: bool,
     }
 
     /// OpenSSH time format: `90`, `90s`, `10m`, `1h30m`, `2d`, `1w`.
@@ -113,6 +121,10 @@ mod imp {
             bind: None,
             lifetime: None,
             command: Vec::new(),
+            allowed_providers: None,
+            no_restrict_websafe: false,
+            websafe_allow: None,
+            remote_add_provider: false,
         };
         let mut i = 0;
         while i < args.len() {
@@ -147,8 +159,24 @@ mod imp {
                                     .ok_or_else(|| format!("Invalid lifetime {v}"))?,
                             )
                         }
-                        // Fingerprint hash, PKCS#11 providers, options:
-                        // nothing to configure in this agent.
+                        'P' => {
+                            if o.allowed_providers.is_some() {
+                                return Err("-P option already specified".into());
+                            }
+                            o.allowed_providers = Some(v);
+                        }
+                        'O' => match v.as_str() {
+                            "no-restrict-websafe" => o.no_restrict_websafe = true,
+                            "allow-remote-pkcs11" => o.remote_add_provider = true,
+                            w => match w.strip_prefix("websafe-allow=") {
+                                Some(_) if o.websafe_allow.is_some() => {
+                                    return Err("websafe-allow already set".into());
+                                }
+                                Some(list) => o.websafe_allow = Some(list.to_string()),
+                                None => return Err("Unknown -O option".into()),
+                            },
+                        },
+                        // Fingerprint hash: nothing to configure here.
                         _ => {}
                     }
                     break;
@@ -409,6 +437,110 @@ mod imp {
         out.status.success() && (answer.is_empty() || answer.eq_ignore_ascii_case("yes"))
     }
 
+    /// Whether askpass may be shown (a display, or `SSH_ASKPASS_REQUIRE`).
+    fn askpass_allowed() -> bool {
+        let set = |v: &str| std::env::var_os(v).is_some_and(|s| !s.is_empty());
+        let require = std::env::var("SSH_ASKPASS_REQUIRE").unwrap_or_default();
+        if require.eq_ignore_ascii_case("force") {
+            true
+        } else if require.eq_ignore_ascii_case("never") {
+            false
+        } else {
+            set("DISPLAY") || set("WAYLAND_DISPLAY")
+        }
+    }
+
+    fn askpass_command() -> std::process::Command {
+        let askpass = std::env::var_os("SSH_ASKPASS")
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "/usr/bin/ssh-askpass".into());
+        std::process::Command::new(askpass)
+    }
+
+    /// What a security key asks for while the agent signs with it, as
+    /// OpenSSH's agent asks: a notification (askpass with
+    /// `SSH_ASKPASS_PROMPT=none`, closed once signed) to touch it, and its
+    /// PIN through askpass.
+    #[cfg(feature = "security-key")]
+    #[derive(Default)]
+    struct AskpassSkPrompt {
+        notifier: Mutex<Option<std::process::Child>>,
+    }
+
+    #[cfg(feature = "security-key")]
+    impl puressh::sk::Prompt for AskpassSkPrompt {
+        fn touch(&self, key: &puressh::key::PrivateKey) {
+            let pk = key.public_key();
+            let msg = format!(
+                "Confirm user presence for key {} {}",
+                pk.type_label(),
+                pk.sha256_fingerprint()
+            );
+            if !askpass_allowed() {
+                eprintln!("{msg}");
+                return;
+            }
+            let child = askpass_command()
+                .arg(&msg)
+                .env("SSH_ASKPASS_PROMPT", "none")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .ok();
+            if let Ok(mut n) = self.notifier.lock() {
+                *n = child;
+            }
+        }
+
+        fn pin(
+            &self,
+            key: &puressh::key::PrivateKey,
+        ) -> Option<purecrypto::zeroize::Zeroizing<String>> {
+            if !askpass_allowed() {
+                return None;
+            }
+            let pk = key.public_key();
+            let touch = key
+                .sk_credential()
+                .is_some_and(|c| c.flags & puressh::sk::USER_PRESENCE_REQD != 0);
+            let prompt = format!(
+                "Enter PIN{}for {} key {}: ",
+                if touch {
+                    " and confirm user presence "
+                } else {
+                    " "
+                },
+                pk.type_label(),
+                pk.sha256_fingerprint()
+            );
+            let out = askpass_command()
+                .arg(prompt)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::inherit())
+                .output()
+                .ok()?;
+            let pin = purecrypto::zeroize::Zeroizing::new(
+                String::from_utf8_lossy(&out.stdout)
+                    .split(['\r', '\n'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            let mut raw = out.stdout;
+            purecrypto::zeroize::Zeroize::zeroize(&mut raw);
+            (out.status.success() && !pin.is_empty()).then_some(pin)
+        }
+
+        fn done(&self) {
+            if let Ok(mut n) = self.notifier.lock()
+                && let Some(mut child) = n.take()
+            {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
     fn install_signals() {
         // SAFETY: the handler only stores into an AtomicBool.
         unsafe {
@@ -467,6 +599,17 @@ mod imp {
         let mut state = AgentState::new();
         state.set_default_lifetime(o.lifetime);
         state.set_confirm(Box::new(ask_permission));
+        if let Some(p) = &o.allowed_providers {
+            state.set_allowed_providers(p);
+        }
+        state.set_remote_add_provider(o.remote_add_provider);
+        if o.no_restrict_websafe {
+            state.set_websafe_allowlist(None);
+        } else if let Some(list) = &o.websafe_allow {
+            state.set_websafe_allowlist(Some(list));
+        }
+        #[cfg(feature = "security-key")]
+        state.set_security_key_prompt(Arc::new(AskpassSkPrompt::default()));
         let state = Arc::new(Mutex::new(state));
 
         if o.foreground {

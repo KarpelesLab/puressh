@@ -207,6 +207,14 @@ impl PrivateKey {
     }
 }
 
+impl PublicKey {
+    /// OpenSSH's name for the key type in messages (`sshkey_type`): `RSA`,
+    /// `ECDSA`, `ED25519`, `ECDSA-SK`, `ED25519-SK`, `MLDSA44-ED25519`.
+    pub fn type_label(&self) -> &'static str {
+        type_label(self)
+    }
+}
+
 /// OpenSSH's label for `-e` comments and `ssh-keygen -l` (`RSA`, …).
 fn type_label(pk: &PublicKey) -> &'static str {
     match pk {

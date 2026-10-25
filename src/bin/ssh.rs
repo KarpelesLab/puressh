@@ -761,6 +761,10 @@ fn collect_credentials(
     cli_identities: &[String],
     identities_only: bool,
 ) -> Vec<ClientCredential> {
+    #[cfg(feature = "security-key")]
+    if let Some(p) = &cfg_block.security_key_provider {
+        common::set_security_key_provider(p);
+    }
     // `PubkeyAuthentication no` (or a PreferredAuthentications list that omits
     // publickey) disables publickey credentials entirely — return nothing so
     // the auth driver falls straight to password.
@@ -1890,6 +1894,12 @@ fn print_config(
             list(&c.ciphers, puressh::config::AlgoCategory::Cipher)
         ),
         format!("macs {}", list(&c.macs, puressh::config::AlgoCategory::Mac)),
+        format!(
+            "securitykeyprovider {}",
+            c.security_key_provider
+                .as_deref()
+                .unwrap_or("$SSH_SK_PROVIDER")
+        ),
         format!(
             "kexalgorithms {}",
             list(&c.kex_algorithms, puressh::config::AlgoCategory::Kex)

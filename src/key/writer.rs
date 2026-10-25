@@ -1,14 +1,14 @@
 //! openssh-key-v1 PEM writer, key generators, and SHA-256 fingerprint.
 //!
 //! Mirrors the parser in `super`: encodes the binary payload, optionally
-//! encrypts the inner block with `aes256-ctr` keyed by `bcrypt_pbkdf`, and
+//! encrypts the inner block (`aes256-ctr` unless told otherwise) keyed by
+//! `bcrypt_pbkdf`, and
 //! wraps the result in PEM at 70 columns.
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use purecrypto::bignum::{BoxedUint, inv_mod_boxed};
-use purecrypto::cipher::{Aes256, Ctr};
 use purecrypto::der::Reader as DerReader;
 use purecrypto::ec::{BoxedEcdsaPrivateKey, CurveId, Ed25519PrivateKey};
 use purecrypto::hash::{Digest, Sha256};
@@ -19,6 +19,7 @@ use purecrypto::rng::{CryptoRng, RngCore};
 use purecrypto::rsa::BoxedRsaPrivateKey;
 use purecrypto::zeroize::Zeroizing;
 
+use super::kcipher::KeyCipher;
 use super::{MAGIC, PrivateKey, PublicKey, base64};
 use crate::error::{Error, Result};
 use crate::format::{Writer, write_mpint};
@@ -48,8 +49,8 @@ const PEM_WRAP: usize = 70;
 /// generation or `ssh-keygen -p`) pick up the new default.
 const BCRYPT_ROUNDS: u32 = 24;
 const SALT_LEN: usize = 16;
-const KEY_LEN: usize = 32;
-const IV_LEN: usize = 16;
+/// The cipher of new encrypted private keys, as OpenSSH's.
+const DEFAULT_CIPHER: &str = "aes256-ctr";
 
 impl PublicKey {
     /// SHA-256 fingerprint of the wire-format public-key blob, formatted as
@@ -64,6 +65,36 @@ impl PublicKey {
         out.push_str("SHA256:");
         out.push_str(&s);
         out
+    }
+
+    /// The digest of the wire-format blob a fingerprint is made of, with
+    /// the hash's name as OpenSSH prints it: `hash` is `md5`, `sha1`,
+    /// `sha256`, `sha384` or `sha512`, in any case (`-E`). `None` for
+    /// another name.
+    pub fn fingerprint_digest(&self, hash: &str) -> Option<(&'static str, Vec<u8>)> {
+        use purecrypto::hash::{Md5, Sha1, Sha384, Sha512};
+        let blob = self.wire_blob();
+        Some(match hash.to_ascii_lowercase().as_str() {
+            "md5" => ("MD5", Md5::digest(&blob).as_ref().to_vec()),
+            "sha1" => ("SHA1", Sha1::digest(&blob).as_ref().to_vec()),
+            "sha256" => ("SHA256", Sha256::digest(&blob).as_ref().to_vec()),
+            "sha384" => ("SHA384", Sha384::digest(&blob).as_ref().to_vec()),
+            "sha512" => ("SHA512", Sha512::digest(&blob).as_ref().to_vec()),
+            _ => return None,
+        })
+    }
+
+    /// The fingerprint with the `-E` hash `hash` (see
+    /// [`Self::fingerprint_digest`]): `MD5:xx:xx:…` in hex, else
+    /// `<HASH>:<base64>` without padding.
+    pub fn fingerprint(&self, hash: &str) -> Option<String> {
+        let (name, digest) = self.fingerprint_digest(hash)?;
+        if name == "MD5" {
+            let hex: Vec<String> = digest.iter().map(|b| alloc::format!("{b:02x}")).collect();
+            return Some(alloc::format!("MD5:{}", hex.join(":")));
+        }
+        let b64 = base64::encode(&digest);
+        Some(alloc::format!("{name}:{}", b64.trim_end_matches('=')))
     }
 
     /// The DNS SSHFP algorithm number (RFC 4255, 6594, 7479): RSA 1,
@@ -228,49 +259,71 @@ impl PrivateKey {
         passphrase: Option<&[u8]>,
         rounds: u32,
     ) -> Result<String> {
+        self.to_openssh_pem_with_rng_cipher(rng, passphrase, rounds, DEFAULT_CIPHER)
+    }
+
+    /// [`Self::to_openssh_pem_with_rounds`], encrypting with `cipher` (one
+    /// of [`super::OPENSSH_KEY_CIPHERS`], `ssh-keygen -Z`) rather than
+    /// `aes256-ctr`.
+    #[cfg(feature = "std")]
+    pub fn to_openssh_pem_with_cipher(
+        &self,
+        passphrase: Option<&[u8]>,
+        rounds: u32,
+        cipher: &str,
+    ) -> Result<String> {
+        let mut rng = OsRng;
+        self.to_openssh_pem_with_rng_cipher(&mut rng, passphrase, rounds, cipher)
+    }
+
+    /// [`Self::to_openssh_pem_with_rng_rounds`] with an explicit cipher.
+    pub fn to_openssh_pem_with_rng_cipher<R: CryptoRng + RngCore>(
+        &self,
+        rng: &mut R,
+        passphrase: Option<&[u8]>,
+        rounds: u32,
+        cipher: &str,
+    ) -> Result<String> {
         if rounds == 0 {
             return Err(Error::Config("bcrypt rounds must be > 0"));
         }
+        let cipher = KeyCipher::by_name(cipher.as_bytes())
+            .ok_or(Error::Unsupported("openssh key cipher"))?;
         // `non_empty_pass` is the single source of truth for "encrypt?": both
         // the `block` choice and the encryption branch read from it, so the
         // branches can't disagree (which was the latent risk behind the prior
         // `passphrase.expect("checked above")`).
         let non_empty_pass = passphrase.filter(|p| !p.is_empty());
-        let block = if non_empty_pass.is_some() { 16 } else { 8 };
+        let block = if non_empty_pass.is_some() {
+            cipher.block
+        } else {
+            8
+        };
 
         let inner = encode_inner_block(rng, self, block);
         let pub_blob = self.public_key().wire_blob();
 
-        let (ciphername, kdfname, kdfoptions, payload): (_, _, _, Zeroizing<Vec<u8>>) =
+        let (ciphername, kdfname, kdfoptions, payload, tag): (_, _, _, Zeroizing<Vec<u8>>, _) =
             if let Some(pass) = non_empty_pass {
                 let mut salt = [0u8; SALT_LEN];
                 rng.fill_bytes(&mut salt);
                 // `derived` is a wrapping passphrase-equivalent secret: from
-                // it you can reconstruct the AES key and IV that protect the
+                // it you can reconstruct the key and IV that protect the
                 // private key blob. Wrap in `Zeroizing` so it is wiped from
                 // memory at scope exit — without this it would linger in the
                 // heap until the allocator reused the slot.
                 let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
-                    bcrypt_pbkdf(pass, &salt, rounds, KEY_LEN + IV_LEN)
+                    bcrypt_pbkdf(pass, &salt, rounds, cipher.key_len + cipher.iv_len)
                         .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
                 );
-                // `key` and `iv` are derived material too; wrap so the stack
-                // copies are wiped when the block ends. The `Aes256` instance
-                // takes a copy internally but that is owned by the Ctr cipher
-                // and dropped at end of scope; the copies we hold are wiped.
-                let mut key: Zeroizing<[u8; KEY_LEN]> = Zeroizing::new([0u8; KEY_LEN]);
-                key.copy_from_slice(&derived[..KEY_LEN]);
-                let mut iv: Zeroizing<[u8; IV_LEN]> = Zeroizing::new([0u8; IV_LEN]);
-                iv.copy_from_slice(&derived[KEY_LEN..KEY_LEN + IV_LEN]);
                 let mut buf = inner;
-                let mut ctr = Ctr::new(Aes256::new(&key), &iv);
-                ctr.apply_keystream(&mut buf);
+                let tag = cipher.seal(&derived, &mut buf)?;
                 let mut opts = Writer::new();
                 opts.write_string(&salt);
                 opts.write_u32(rounds);
-                ("aes256-ctr", "bcrypt", opts.into_vec(), buf)
+                (cipher.name, "bcrypt", opts.into_vec(), buf, tag)
             } else {
-                ("none", "none", Vec::new(), inner)
+                ("none", "none", Vec::new(), inner, Vec::new())
             };
 
         let mut w = Writer::new();
@@ -281,6 +334,8 @@ impl PrivateKey {
         w.write_u32(1);
         w.write_string(&pub_blob);
         w.write_string(&payload);
+        // An AEAD cipher's tag follows the encrypted section.
+        w.write_raw(&tag);
         // For an unencrypted key `bin` (and its base64 form) carry the
         // cleartext secret; wipe the intermediates, leaving only the
         // returned PEM string as the caller's responsibility.

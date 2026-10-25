@@ -18,19 +18,34 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use purecrypto::bignum::BoxedUint;
-use purecrypto::cipher::{Aes128, Aes256, Ctr};
 use purecrypto::ec::{BoxedEcdsaPrivateKey, BoxedEcdsaPublicKey, CurveId, Ed25519PrivateKey};
 use purecrypto::kdf::bcrypt_pbkdf;
 use purecrypto::zeroize::{Zeroize, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer, read_mpint, write_mpint};
+use kcipher::KeyCipher;
 
 pub(crate) mod base64;
 mod encrypted;
 mod export;
+mod kcipher;
 mod pkcs;
 mod writer;
+
+pub use kcipher::OPENSSH_KEY_CIPHERS;
+
+/// The hashes a fingerprint may use (`-E`), as OpenSSH's.
+pub const FINGERPRINT_HASHES: &[&str] = &["md5", "sha1", "sha256", "sha384", "sha512"];
+
+/// Whether `name` (in any case) is one of [`FINGERPRINT_HASHES`].
+pub fn is_fingerprint_hash(name: &str) -> bool {
+    let mut known = false;
+    for h in FINGERPRINT_HASHES {
+        known |= h.eq_ignore_ascii_case(name);
+    }
+    known
+}
 
 pub use writer::EcdsaCurve;
 
@@ -1197,12 +1212,20 @@ impl PrivateKey {
             return Err(Error::Unsupported("openssh key: multiple keys"));
         }
         let public_blob = r.read_string()?.to_vec();
-        let encrypted = r.read_string()?;
-        if !r.is_empty() {
+        let encrypted_len = r.read_u32()? as usize;
+        let cipher =
+            KeyCipher::by_name(ciphername).ok_or(Error::Unsupported("openssh key cipher"))?;
+        // An AEAD cipher's tag follows the encrypted section, as OpenSSH's.
+        let rest = r.take(r.remaining())?;
+        if rest.len() < cipher.tag_len || rest.len() - cipher.tag_len < encrypted_len {
+            return Err(Error::Format("openssh key: truncated"));
+        }
+        if rest.len() != encrypted_len + cipher.tag_len {
             return Err(Error::Format("openssh key: trailing data"));
         }
+        let (encrypted, tag) = rest.split_at(encrypted_len);
 
-        let plain = decrypt_payload(ciphername, kdfname, kdfoptions, encrypted, passphrase)?;
+        let plain = decrypt_payload(&cipher, kdfname, kdfoptions, encrypted, tag, passphrase)?;
         let mut pr = Reader::new(&plain);
         let checkint1 = pr.read_u32()?;
         let checkint2 = pr.read_u32()?;
@@ -1655,19 +1678,23 @@ fn strip_pem(pem: &str) -> Result<&str> {
 }
 
 fn decrypt_payload(
-    ciphername: &[u8],
+    cipher: &KeyCipher,
     kdfname: &[u8],
     kdfoptions: &[u8],
     encrypted: &[u8],
+    tag: &[u8],
     passphrase: Option<&[u8]>,
 ) -> Result<Zeroizing<Vec<u8>>> {
-    if ciphername == b"none" {
-        if kdfname != b"none" {
+    if kdfname == b"none" {
+        if cipher.name != "none" {
             return Err(Error::Format(
-                "openssh key: cipher 'none' with non-none kdf",
+                "openssh key: cipher other than 'none' with kdf 'none'",
             ));
         }
         return Ok(Zeroizing::new(encrypted.to_vec()));
+    }
+    if kdfname != b"bcrypt" {
+        return Err(Error::Unsupported("openssh key kdf"));
     }
 
     // Treat an empty passphrase as "no passphrase". Callers occasionally
@@ -1683,14 +1710,8 @@ fn decrypt_payload(
         _ => return Err(Error::Crypto("passphrase required")),
     };
 
-    let (key_len, iv_len) = match ciphername {
-        b"aes256-ctr" => (32usize, 16usize),
-        b"aes128-ctr" => (16, 16),
-        _ => return Err(Error::Unsupported("openssh key cipher")),
-    };
-
-    if kdfname != b"bcrypt" {
-        return Err(Error::Unsupported("openssh key kdf"));
+    if encrypted.len() < cipher.block || !encrypted.len().is_multiple_of(cipher.block) {
+        return Err(Error::Format("openssh key: encrypted length not aligned"));
     }
 
     let mut kr = Reader::new(kdfoptions);
@@ -1716,37 +1737,15 @@ fn decrypt_payload(
         ));
     }
 
-    // `derived` is passphrase-equivalent (it yields the AES key + IV that
-    // protect the private key); `k`/`iv` are copies of it and `out` is the
-    // cleartext private section. All are wiped on drop.
+    // `derived` is passphrase-equivalent (it yields the key + IV that
+    // protect the private key); `out` is the cleartext private section.
+    // Both are wiped on drop.
     let derived: Zeroizing<Vec<u8>> = Zeroizing::new(
-        bcrypt_pbkdf(pass, salt, rounds, key_len + iv_len)
+        bcrypt_pbkdf(pass, salt, rounds, cipher.key_len + cipher.iv_len)
             .map_err(|_| Error::Crypto("bcrypt_pbkdf: invalid parameters"))?,
     );
-
-    if !encrypted.len().is_multiple_of(16) {
-        return Err(Error::Format("openssh key: encrypted length not aligned"));
-    }
-
-    let mut iv: Zeroizing<[u8; 16]> = Zeroizing::new([0u8; 16]);
-    iv.copy_from_slice(&derived[key_len..key_len + iv_len]);
-
     let mut out: Zeroizing<Vec<u8>> = Zeroizing::new(encrypted.to_vec());
-    match ciphername {
-        b"aes256-ctr" => {
-            let mut k: Zeroizing<[u8; 32]> = Zeroizing::new([0u8; 32]);
-            k.copy_from_slice(&derived[..32]);
-            let mut ctr = Ctr::new(Aes256::new(&k), &iv);
-            ctr.apply_keystream(&mut out);
-        }
-        b"aes128-ctr" => {
-            let mut k: Zeroizing<[u8; 16]> = Zeroizing::new([0u8; 16]);
-            k.copy_from_slice(&derived[..16]);
-            let mut ctr = Ctr::new(Aes128::new(&k), &iv);
-            ctr.apply_keystream(&mut out);
-        }
-        _ => unreachable!(),
-    }
+    cipher.open(&derived, &mut out, tag)?;
     Ok(out)
 }
 

@@ -1067,3 +1067,82 @@ fn wipe_clears_the_secret_half() {
     };
     assert_eq!(seed, &[0u8; 32]);
 }
+
+/// Keys OpenSSH's `ssh-keygen -Z <cipher> -N pw -a 1` wrote, with each
+/// cipher family a key may use.
+#[test]
+fn openssh_key_ciphers_interop() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/key");
+    for name in [
+        "chacha20-poly1305",
+        "aes256-gcm",
+        "aes128-cbc",
+        "3des-cbc",
+        "aes192-ctr",
+    ] {
+        let pem = std::fs::read_to_string(format!("{dir}/ed25519_{name}")).unwrap();
+        let pub_line = std::fs::read_to_string(format!("{dir}/ed25519_{name}.pub")).unwrap();
+        let sk = PrivateKey::parse_openssh_pem(&pem, Some(b"pw")).unwrap();
+        assert_eq!(sk.comment(), name);
+        assert_eq!(
+            sk.public_key().to_authorized_keys_line().trim(),
+            pub_line.trim()
+        );
+        assert!(PrivateKey::parse_openssh_pem(&pem, Some(b"wrong")).is_err());
+        assert!(PrivateKey::parse_openssh_pem(&pem, None).is_err());
+    }
+}
+
+#[test]
+fn every_key_cipher_round_trips() {
+    let mut rng = purecrypto::rng::OsRng;
+    let sk = PrivateKey::generate_ed25519(&mut rng, "c".to_string());
+    for cipher in OPENSSH_KEY_CIPHERS {
+        let pem = sk
+            .to_openssh_pem_with_rng_cipher(&mut rng, Some(b"pw"), 1, cipher)
+            .unwrap();
+        let back = PrivateKey::parse_openssh_pem(&pem, Some(b"pw")).unwrap();
+        assert_eq!(back.public_key(), sk.public_key(), "{cipher}");
+        if *cipher != "none" {
+            assert!(
+                PrivateKey::parse_openssh_pem(&pem, Some(b"bad")).is_err(),
+                "{cipher}"
+            );
+        }
+    }
+    assert!(
+        sk.to_openssh_pem_with_rng_cipher(&mut rng, Some(b"pw"), 1, "rc4")
+            .is_err()
+    );
+}
+
+#[test]
+fn fingerprints_with_every_hash() {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/key/ed25519_aes192-ctr.pub"
+    );
+    let line = std::fs::read_to_string(path).unwrap();
+    let pk = PublicKey::parse_authorized_keys_line(line.trim()).unwrap();
+    // As OpenSSH's `ssh-keygen -l -E <hash>` prints them.
+    for (hash, want) in [
+        ("md5", "MD5:1e:58:9b:56:81:bd:3b:6f:2d:16:ad:dc:cc:00:ac:81"),
+        ("SHA1", "SHA1:K3jLeMhbU2Rk4wiNu9fCivTRKyo"),
+        (
+            "sha256",
+            "SHA256:YnEcibPIE4SVRjFeYbkQRKnblhI7QnxnFyzoF0841eg",
+        ),
+        (
+            "sha384",
+            "SHA384:PVvpMsr8bsqxaZb5JBC0Ji+0mrouHyvTR48/sSsFuGxhXn2+XNUB3+5wSQ19QNM7",
+        ),
+        (
+            "sha512",
+            "SHA512:+MOGTR3Pk5033AVbd4vWVIk91IUf6TitbaymPmaK3ILq4gcSAttWtEtE7K1DmiKAUpmuP60OC6KsXggY89Nb4g",
+        ),
+    ] {
+        assert_eq!(pk.fingerprint(hash).as_deref(), Some(want), "{hash}");
+    }
+    assert_eq!(pk.fingerprint("sha256"), Some(pk.sha256_fingerprint()));
+    assert!(pk.fingerprint("sha224").is_none());
+}

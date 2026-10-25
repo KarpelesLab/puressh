@@ -140,6 +140,17 @@ impl<T: Read + Write> SftpClient<T> {
         self.extended("hardlink@openssh.com", &d).map(|_| ())
     }
 
+    /// `lsetstat@openssh.com`: `setstat` that does not follow a final
+    /// symlink (sftp's `chmod -h` & co.).
+    pub fn lsetstat(&mut self, path: &[u8], attrs: &Attrs) -> Result<(), SftpError> {
+        let mut d = Vec::new();
+        put_string(&mut d, path);
+        let mut w = crate::format::Writer::new();
+        super::packet::encode_attrs(&mut w, attrs);
+        d.extend_from_slice(&w.into_vec());
+        self.extended("lsetstat@openssh.com", &d).map(|_| ())
+    }
+
     /// `fsync@openssh.com`: flush an open file to stable storage.
     pub fn fsync(&mut self, handle: &[u8]) -> Result<(), SftpError> {
         let mut d = Vec::new();

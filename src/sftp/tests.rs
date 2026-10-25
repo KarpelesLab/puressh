@@ -189,6 +189,32 @@ fn symlink_and_readlink() {
 }
 
 #[test]
+fn lsetstat_does_not_follow_symlink() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = TempDir::new("lsetstat");
+    fs::write(tmp.path().join("target"), b"x").unwrap();
+    std::os::unix::fs::symlink("target", tmp.path().join("link")).unwrap();
+    let before = fs::metadata(tmp.path().join("target")).unwrap().mtime();
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+    assert!(client.has_extension("lsetstat@openssh.com"));
+    let attrs = Attrs {
+        atime_mtime: Some((1_000_000, 1_000_000)),
+        ..Attrs::default()
+    };
+    client.lsetstat(b"link", &attrs).unwrap();
+    let link = fs::symlink_metadata(tmp.path().join("link")).unwrap();
+    assert_eq!(link.mtime(), 1_000_000);
+    assert_eq!(
+        fs::metadata(tmp.path().join("target")).unwrap().mtime(),
+        before
+    );
+    drop(client);
+    h.join().unwrap();
+}
+
+#[test]
 fn jail_blocks_traversal_escape() {
     let tmp = TempDir::new("jail");
     let jail = tmp.path().to_path_buf();

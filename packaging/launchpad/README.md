@@ -49,12 +49,8 @@ them.
 The `publish-launchpad` job of the release workflow builds, signs and
 uploads the four source packages when a release is published. It signs with
 the apt repository's key (`APT_GPG_PRIVATE_KEY`, and `APT_GPG_PASSPHRASE` if
-it has one; see [`../apt/README.md`](../apt/README.md)). That key,
-`B3D03356B1A7A5F69245D95F929EFB4B458E355A`, is on keyserver.ubuntu.com and
-registered on the Launchpad account that owns the PPA
-(https://launchpad.net/~/+editpgpkeys). A new key has to be registered the
-same way before it can upload: Launchpad drops uploads signed by a key it
-doesn't know, without any mail.
+it has one; see [`../apt/README.md`](../apt/README.md)), which must be
+registered on a Launchpad account that may upload to the PPA.
 
 The PPA must build for amd64 and arm64: enable arm64 under "Change details"
 → "Processors" on the PPA's page.

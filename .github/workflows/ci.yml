@@ -164,7 +164,7 @@ jobs:
         run: >
           sudo apt-get update &&
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
-          debhelper dpkg-dev fakeroot cargo-1.91 rustc-1.91
+          build-essential debhelper dpkg-dev fakeroot cargo-1.91 rustc-1.91
 
       - name: Build the source and binary packages
         run: |

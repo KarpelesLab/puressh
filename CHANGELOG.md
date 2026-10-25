@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/KarpelesLab/puressh/compare/v0.2.4...v0.2.5) - 2026-10-25
+
+### Other
+
+- *(agent)* check the unlock backoff without racing the clock
+- license as MIT only
+- add the MIT LICENSE file
+- *(deps)* replace MPL-2.0 pam-client2 with a dlsym-loaded libpam binding
+
 ## [0.2.4](https://github.com/KarpelesLab/puressh/compare/v0.2.3...v0.2.4) - 2026-10-24
 
 ### Other

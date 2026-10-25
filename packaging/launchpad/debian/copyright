@@ -1,0 +1,41 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: puressh
+Source: https://github.com/KarpelesLab/puressh
+
+Files: *
+Copyright: 2026 Karpelès Lab Inc.
+License: Expat
+ Permission is hereby granted, free of charge, to any person obtaining a copy
+ of this software and associated documentation files (the "Software"), to deal
+ in the Software without restriction, including without limitation the rights
+ to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ copies of the Software, and to permit persons to whom the Software is
+ furnished to do so, subject to the following conditions:
+ .
+ The above copyright notice and this permission notice shall be included in all
+ copies or substantial portions of the Software.
+ .
+ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ SOFTWARE.
+
+Files: etc/pam.d/sshd etc/default/ssh etc/ufw/applications.d/openssh-server
+ usr/share/puressh/sshd_config
+Copyright: 1995 Tatu Ylonen, Espoo, Finland, and the OpenSSH and Debian
+ openssh package authors
+License: BSD-2-clause
+ These configuration files are copied unchanged from Ubuntu's openssh-server
+ package (20.04, 22.04 and 24.04) so the replacement keeps the same files.
+ See /usr/share/doc/openssh-client/copyright for the full OpenSSH licence.
+
+Files: vendor/*
+Copyright: the authors of each crate
+License: various
+ The Rust crates puressh is built from, as published on crates.io, each
+ under the license named in its vendor/<crate>/Cargo.toml: MIT, some of them
+ dual-licensed MIT or Apache-2.0, or MIT or the Unlicense. They are compiled
+ into the binaries.

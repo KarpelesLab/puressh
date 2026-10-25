@@ -144,6 +144,9 @@ jobs:
           /tmp/ansible-venv/bin/pip install -q ansible-core
           sh tests/interop/ansible.sh target/debug /tmp/ansible-venv/bin
 
+  # The Launchpad packages (packaging/launchpad), built as Launchpad builds
+  # them: from the source package, offline, with Ubuntu's own toolchain
+  # (rustc 1.91 on jammy and noble). Then the lifecycle tests on a real VM.
   deb:
     name: Ubuntu package (${{ matrix.release }} ${{ matrix.arch }})
     runs-on: ${{ matrix.os }}
@@ -157,24 +160,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: deb-${{ matrix.os }}
-
-      - name: Build the server and client programs
+      - name: Install Ubuntu's toolchain and debhelper
         run: >
-          cargo build --release --features server,pam,agent --bin sshd --bin ssh-keygen --bin ssh --bin scp
-          --bin sftp --bin ssh-add --bin ssh-agent --bin ssh-keyscan
+          sudo apt-get update &&
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+          debhelper dpkg-dev fakeroot cargo-1.91 rustc-1.91
 
-      - name: Build the packages
+      - name: Build the source and binary packages
         run: |
-          version="$(cargo pkgid | sed 's/.*[#@]//')"
-          packaging/deb/build-deb.sh ${{ matrix.release }} ${{ matrix.arch }} "$version" target/release out
-          packaging/deb/build-client-deb.sh ${{ matrix.arch }} "$version" target/release out-client
+          version="$(cargo-1.91 pkgid | sed 's/.*[#@]//')"
+          REF=HEAD CARGO=cargo-1.91 packaging/launchpad/build-source.sh "$version" src ${{ matrix.release }}
+          dpkg-source -x src/puressh_*.dsc build
+          (cd build && dpkg-buildpackage -b -us -uc)
+          mkdir out out-client
+          mv puressh-server_*.deb out/
+          mv puressh-client_*.deb out-client/
 
       # Real VM with systemd: stock OpenSSH -> puressh-server -> reload ->
       # purge openssh-server (host keys restored) -> back to OpenSSH.
@@ -185,6 +185,40 @@ jobs:
       # OpenSSH's client programs diverted and restored.
       - name: Client package lifecycle
         run: sudo packaging/deb/test/client-lifecycle.sh out-client/*.deb
+
+  # The series Launchpad gets only puressh-client for. Containers, so
+  # privileged: OpenSSH's sshd (the test's server) needs pam_loginuid.
+  deb-client:
+    name: Ubuntu client package (${{ matrix.release }}, container)
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:${{ matrix.release }}
+      options: --privileged
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { release: resolute, cargo: cargo-1.91, deps: cargo-1.91 rustc-1.91 }
+          - { release: stonking, cargo: cargo, deps: cargo rustc }
+    steps:
+      - name: Install Ubuntu's toolchain and debhelper
+        run: >
+          apt-get update &&
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+          ca-certificates git build-essential debhelper dpkg-dev fakeroot ${{ matrix.deps }}
+
+      - uses: actions/checkout@v6
+
+      - name: Build the source and binary packages
+        run: |
+          git config --global --add safe.directory "$PWD"
+          version="$(${{ matrix.cargo }} pkgid | sed 's/.*[#@]//')"
+          REF=HEAD CARGO=${{ matrix.cargo }} packaging/launchpad/build-source.sh "$version" src ${{ matrix.release }}
+          dpkg-source -x src/puressh_*.dsc build
+          (cd build && dpkg-buildpackage -b -us -uc)
+
+      - name: Client package lifecycle
+        run: packaging/deb/test/client-lifecycle.sh puressh-client_*.deb
 
   # GitHub has no Ubuntu 20.04 VM runners any more: build and install inside
   # an ubuntu:20.04 container (glibc 2.31, dpkg 1.19), without systemd.

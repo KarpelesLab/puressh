@@ -52,7 +52,10 @@ OpenSSH's programs their names back.
 
 ## Tests
 
-CI installs both packages on real 22.04 and 24.04 machines (amd64, arm64)
-and in 20.04 containers: `test/lifecycle.sh` (server: replace OpenSSH,
+CI installs both packages on real 22.04 and 24.04 machines (amd64, arm64),
+built as the Launchpad PPA builds them (see
+[`../launchpad/README.md`](../launchpad/README.md)), the client package in
+26.04 and 26.10 containers, and the `build-deb.sh` packages in 20.04
+containers: `test/lifecycle.sh` (server: replace OpenSSH,
 reload, purge, back), `test/no-systemd.sh` (server without systemd) and
 `test/client-lifecycle.sh` (client: divert, use, restore).

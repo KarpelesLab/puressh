@@ -1,0 +1,22 @@
+Source: puressh
+Section: net
+Priority: optional
+Maintainer: Mark Karpeles <mark@klb.jp>
+Build-Depends: debhelper-compat (= 13), @CARGO_DEPS@
+Standards-Version: 4.6.2
+Homepage: https://github.com/KarpelesLab/puressh
+Rules-Requires-Root: no
+
+Package: puressh-client
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: openssh-client
+Provides: ssh-client
+Description: puressh secure shell (SSH) client programs, in place of OpenSSH's
+ ssh, scp, sftp, ssh-add, ssh-agent, ssh-keygen, ssh-keyscan and ssh-copy-id
+ from puressh, a pure-Rust SSH implementation, as drop-in replacements for
+ OpenSSH's: same options, configuration files (/etc/ssh/ssh_config,
+ ~/.ssh) and keys.
+ .
+ OpenSSH's programs are kept as /usr/bin/<name>.openssh while this package
+ is installed and get their names back when it is removed.

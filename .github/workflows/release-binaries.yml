@@ -16,6 +16,11 @@ on:
         description: "Release tag to upload to (e.g. v0.0.3)"
         required: true
         type: string
+      ppa_rev:
+        description: "PPA revision (bump to re-upload a version Launchpad already has)"
+        required: false
+        default: "1"
+        type: string
 
 permissions:
   # gh release upload needs to attach assets.
@@ -189,6 +194,91 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: gh release upload "${TAG}" out/* --clobber
+
+  # Upload Ubuntu source packages to ppa:karpeleslab/puressh; Launchpad builds
+  # them (see packaging/launchpad/README.md). Skips itself (no failure) until
+  # the LAUNCHPAD_GPG_PRIVATE_KEY secret is set: a key registered on the
+  # Launchpad account that may upload to the PPA.
+  publish-launchpad:
+    name: upload to Launchpad
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check for signing key
+        id: check
+        env:
+          LAUNCHPAD_GPG_PRIVATE_KEY: ${{ secrets.LAUNCHPAD_GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "$LAUNCHPAD_GPG_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "LAUNCHPAD_GPG_PRIVATE_KEY is not set; skipping the Launchpad upload." >&2
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        if: steps.check.outputs.enabled == 'true'
+        with:
+          fetch-depth: 0
+
+      - name: Install packaging tools
+        if: steps.check.outputs.enabled == 'true'
+        run: >
+          sudo apt-get update &&
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
+          devscripts dput dpkg-dev
+
+      - name: Import signing key
+        if: steps.check.outputs.enabled == 'true'
+        id: gpg
+        env:
+          LAUNCHPAD_GPG_PRIVATE_KEY: ${{ secrets.LAUNCHPAD_GPG_PRIVATE_KEY }}
+          LAUNCHPAD_GPG_PASSPHRASE: ${{ secrets.LAUNCHPAD_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
+          printf '%s' "$LAUNCHPAD_GPG_PRIVATE_KEY" | gpg --batch --import
+          keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
+          # debsign runs this instead of gpg, so a protected key signs
+          # unattended (LAUNCHPAD_GPG_PASSPHRASE, optional).
+          printf '%s' "${LAUNCHPAD_GPG_PASSPHRASE:-}" > "$RUNNER_TEMP/passphrase"
+          cat > "$RUNNER_TEMP/gpg-batch" <<SH
+          #!/bin/sh
+          exec gpg --batch --pinentry-mode loopback --passphrase-file "$RUNNER_TEMP/passphrase" "\$@"
+          SH
+          chmod 755 "$RUNNER_TEMP/gpg-batch"
+          echo priming | "$RUNNER_TEMP/gpg-batch" --local-user "$keyid" --sign -o /dev/null
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
+
+      # Every series of a version must be uploaded with the same orig
+      # tarball, re-runs included: it is kept as a release asset.
+      - name: Build the source packages
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REV: ${{ inputs.ppa_rev || '1' }}
+          DEBFULLNAME: Mark Karpeles
+          DEBEMAIL: mark@klb.jp
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          orig="puressh_${version}.orig.tar.xz"
+          mkdir -p lp
+          if gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$orig" --dir lp; then
+            echo "reusing the release's $orig"
+          fi
+          REF="$TAG" packaging/launchpad/build-source.sh "$version" lp jammy noble resolute stonking
+          gh release upload "$TAG" "lp/$orig" --repo "$GITHUB_REPOSITORY" --clobber
+
+      - name: Sign and upload
+        if: steps.check.outputs.enabled == 'true'
+        env:
+          KEYID: ${{ steps.gpg.outputs.keyid }}
+        run: |
+          set -euo pipefail
+          debsign -p"$RUNNER_TEMP/gpg-batch" -k"$KEYID" --re-sign lp/*_source.changes
+          dput ppa:karpeleslab/puressh lp/*_source.changes
 
   # Rebuild the GitHub Pages apt repository from the .deb assets publish-linux
   # just uploaded, so `apt install puressh-server` works on Ubuntu. Skips

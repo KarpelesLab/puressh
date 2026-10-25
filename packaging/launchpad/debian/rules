@@ -1,0 +1,77 @@
+#!/usr/bin/make -f
+# Turned into debian/rules for one Ubuntu series by
+# packaging/launchpad/build-source.sh, which fills in the @...@ values.
+#
+# Launchpad builds offline: every crate comes from vendor/ in the orig
+# tarball. Ubuntu's toolchain may be older than the rust-version we declare
+# (jammy and noble have 1.91), hence --ignore-rust-version; CI builds this
+# package with that toolchain to catch code that really needs a newer one.
+
+CARGO := @CARGO@
+export RUSTC := @RUSTC@
+SERVER := @SERVER@
+UNITDIR := @UNITDIR@
+SERIES := @SERIES@
+
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR := $(CURDIR)/target
+export CARGO_INCREMENTAL := 0
+
+JOBS := $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+CARGOFLAGS := --release --offline --locked --ignore-rust-version \
+	--features server,pam,agent $(if $(JOBS),-j$(JOBS))
+CLIENT_BINS := ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan
+BINS := $(CLIENT_BINS) $(if $(filter yes,$(SERVER)),sshd)
+
+DEB := packaging/deb
+OUT := $(CARGO_TARGET_DIR)/release
+CLIENT := debian/puressh-client
+SRV := debian/puressh-server
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	printf '[source.crates-io]\nreplace-with = "vendored"\n\n[source.vendored]\ndirectory = "%s"\n' \
+		'$(CURDIR)/vendor' >$(CARGO_HOME)/config.toml
+
+override_dh_auto_build:
+	$(CARGO) build $(CARGOFLAGS) $(addprefix --bin ,$(BINS))
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(CARGO) test $(CARGOFLAGS) --lib
+endif
+
+override_dh_auto_install:
+	install -d $(CLIENT)/usr/bin
+	for p in $(CLIENT_BINS); do install -m 0755 $(OUT)/$$p $(CLIENT)/usr/bin/$$p; done
+	install -m 0755 scripts/ssh-copy-id $(CLIENT)/usr/bin/ssh-copy-id
+ifeq ($(SERVER),yes)
+	install -d $(SRV)/usr/sbin $(SRV)/usr/lib/puressh $(SRV)/usr/share/puressh \
+		$(SRV)/$(UNITDIR) $(SRV)/etc/pam.d $(SRV)/etc/default $(SRV)/etc/ufw/applications.d
+	install -m 0755 $(OUT)/sshd $(SRV)/usr/sbin/sshd
+	install -m 0755 $(OUT)/ssh-keygen $(SRV)/usr/lib/puressh/ssh-keygen
+	install -m 0755 $(DEB)/files/sshd-prepare $(SRV)/usr/lib/puressh/sshd-prepare
+	install -m 0644 $(DEB)/sshd_config/$(SERIES) $(SRV)/usr/share/puressh/sshd_config
+	install -m 0644 $(DEB)/files/ssh.service $(SRV)/$(UNITDIR)/ssh.service
+	install -m 0644 $(DEB)/files/pam-sshd $(SRV)/etc/pam.d/sshd
+	install -m 0644 $(DEB)/files/default-ssh $(SRV)/etc/default/ssh
+	install -m 0644 $(DEB)/files/ufw-openssh-server $(SRV)/etc/ufw/applications.d/openssh-server
+endif
+
+# The maintainer scripts start, enable and restart ssh.service themselves,
+# only when OpenSSH's was (see packaging/deb/scripts/postinst).
+override_dh_installsystemd:
+
+# dwz does not help with (and can choke on) Rust's DWARF.
+override_dh_dwz:
+
+override_dh_auto_clean:
+	rm -rf target debian/cargo-home
+
+# dh_clean deletes *.orig files, and with them the vendored crates'
+# Cargo.toml.orig, which their .cargo-checksum.json lists.
+override_dh_clean:
+	dh_clean -XCargo.toml.orig

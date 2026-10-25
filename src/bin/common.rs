@@ -1809,6 +1809,108 @@ pub fn remote_stderr() -> Box<dyn std::io::Write + Send> {
     Box::new(std::io::stderr())
 }
 
+/// A `SyslogFacility` name as the syslog(3) constant.
+#[cfg(unix)]
+#[allow(dead_code)] // ssh only
+pub fn syslog_facility(name: &str) -> Option<libc::c_int> {
+    Some(match name.to_ascii_uppercase().as_str() {
+        "DAEMON" => libc::LOG_DAEMON,
+        "USER" => libc::LOG_USER,
+        "AUTH" => libc::LOG_AUTH,
+        #[cfg(not(target_os = "solaris"))]
+        "AUTHPRIV" => libc::LOG_AUTHPRIV,
+        "LOCAL0" => libc::LOG_LOCAL0,
+        "LOCAL1" => libc::LOG_LOCAL1,
+        "LOCAL2" => libc::LOG_LOCAL2,
+        "LOCAL3" => libc::LOG_LOCAL3,
+        "LOCAL4" => libc::LOG_LOCAL4,
+        "LOCAL5" => libc::LOG_LOCAL5,
+        "LOCAL6" => libc::LOG_LOCAL6,
+        "LOCAL7" => libc::LOG_LOCAL7,
+        _ => return None,
+    })
+}
+
+/// The thread passing ssh's messages on to syslog (`-y`).
+#[cfg(unix)]
+static SYSLOG_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
+
+/// `ssh -y`: ssh's own messages (fd 2) go to syslog(3) as `ident[pid]`
+/// with `facility`, a line at a time, at the priority their prefix names
+/// (`debugN:` debug, `error:` / `fatal:` errors, else info), as OpenSSH's
+/// `log.c` sends them. The remote command's stderr does not (as under
+/// `-E`). [`finish_log`] passes the last lines on.
+#[cfg(unix)]
+#[allow(dead_code)] // ssh only
+pub fn log_to_syslog(ident: &'static std::ffi::CStr, facility: libc::c_int) -> Result<(), String> {
+    use std::io::BufRead;
+    use std::os::fd::{AsFd, FromRawFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: pipe(2) fills two descriptors we then own.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(format!("-y: pipe: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: both are fresh descriptors from pipe(2).
+    let (rd, wr) = unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    };
+    for fd in fds {
+        // SAFETY: fcntl on our own descriptor.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    if ORIGINAL_STDERR.get().is_none() {
+        let saved = std::io::stderr()
+            .as_fd()
+            .try_clone_to_owned()
+            .map_err(|e| format!("-y: {e}"))?;
+        let _ = ORIGINAL_STDERR.set(std::fs::File::from(saved));
+    }
+    // SAFETY: the ident is a static C string, as openlog(3) requires.
+    unsafe { libc::openlog(ident.as_ptr(), libc::LOG_PID, facility) };
+    unix_sys::dup2(&wr, 2).map_err(|e| format!("-y: {e}"))?;
+    drop(wr);
+    let t = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(rd).split(b'\n') {
+            let Ok(line) = line else {
+                break;
+            };
+            let text = String::from_utf8_lossy(&line);
+            let pri = if text.starts_with("debug") {
+                libc::LOG_DEBUG
+            } else if text.starts_with("fatal") {
+                libc::LOG_CRIT
+            } else if text.starts_with("error") {
+                libc::LOG_ERR
+            } else {
+                libc::LOG_INFO
+            };
+            let Ok(c) = std::ffi::CString::new(text.into_owned()) else {
+                continue;
+            };
+            // SAFETY: a constant format string and a NUL-terminated argument.
+            unsafe { libc::syslog(pri, c"%s".as_ptr(), c.as_ptr()) };
+        }
+    });
+    if let Ok(mut g) = SYSLOG_THREAD.lock() {
+        *g = Some(t);
+    }
+    Ok(())
+}
+
+/// Pass ssh's last messages on to syslog (`-y`) before it exits.
+#[allow(dead_code)] // ssh only
+pub fn finish_log() {
+    #[cfg(unix)]
+    if let Some(t) = SYSLOG_THREAD.lock().ok().and_then(|mut g| g.take()) {
+        // Closing the pipe's last write end ends the thread.
+        restore_stderr();
+        let _ = t.join();
+    }
+}
+
 /// Give fd 2 back to the original stderr (for code that writes the remote
 /// stderr there itself).
 #[allow(dead_code)] // ssh only
@@ -1819,11 +1921,45 @@ pub fn restore_stderr() {
     }
 }
 
+#[track_caller]
 pub fn vlog(level: u8, msg: &str) {
     let level = level.clamp(1, 3);
-    if VERBOSE.load(Ordering::Relaxed) >= level {
+    if VERBOSE.load(Ordering::Relaxed) >= level || log_verbose_here(std::panic::Location::caller())
+    {
         eprintln!("debug{level}: {msg}");
     }
+}
+
+/// `LogVerbose` patterns (`file:function:line`).
+static LOG_VERBOSE: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// Set the `LogVerbose` patterns.
+#[allow(dead_code)] // ssh only
+pub fn set_log_verbose(patterns: Vec<String>) {
+    let _ = LOG_VERBOSE.set(patterns);
+}
+
+/// Whether a debug message from `at` is shown whatever the level, by a
+/// `LogVerbose` pattern: OpenSSH's `file:function:line`, matched here
+/// against the source file's name and the line (Rust has no function name
+/// to give, so that part must be `*`).
+fn log_verbose_here(at: &std::panic::Location<'_>) -> bool {
+    let Some(patterns) = LOG_VERBOSE.get() else {
+        return false;
+    };
+    let file = at.file().rsplit(['/', '\\']).next().unwrap_or("");
+    let line = at.line().to_string();
+    patterns.iter().any(|p| {
+        let mut parts = p.splitn(3, ':');
+        let (f, func, l) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or("*"),
+            parts.next().unwrap_or("*"),
+        );
+        puressh::config::host_matches(&[puressh::config::HostPattern::parse(f)], file)
+            && func == "*"
+            && puressh::config::host_matches(&[puressh::config::HostPattern::parse(l)], &line)
+    })
 }
 
 /// OpenSSH-style default identity paths under `$HOME/.ssh/`, in

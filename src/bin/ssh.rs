@@ -180,6 +180,9 @@ struct Cli {
     /// `-E file`: append diagnostics to `file` instead of stderr.
     #[cfg_attr(not(unix), allow(dead_code))]
     log_file: Option<String>,
+    /// `-y`: ssh's own messages go to syslog.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    use_syslog: bool,
     /// `-Q query`: print the supported algorithms of a kind and exit.
     query: Option<String>,
     /// `-V`: print the version and exit.
@@ -301,6 +304,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut print_config = false;
     let mut escape_char: Option<Option<u8>> = None;
     let mut log_file: Option<String> = None;
+    let mut use_syslog = false;
     let mut query: Option<String> = None;
     let mut version = false;
     let mut tty_count = 0u8;
@@ -452,7 +456,8 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             match c {
                 '1' => return Err("SSH protocol v.1 is no longer supported".into()),
-                '2' | 'k' | 'y' => {}
+                '2' | 'k' => {}
+                'y' => use_syslog = true,
                 '4' => extra_o.push("AddressFamily inet".into()),
                 '6' => extra_o.push("AddressFamily inet6".into()),
                 'a' => {
@@ -537,6 +542,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             print_config,
             escape_char,
             log_file,
+            use_syslog,
             query,
             version,
             verbose,
@@ -595,6 +601,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         print_config,
         escape_char,
         log_file,
+        use_syslog,
         query,
         version,
         verbose,
@@ -2828,6 +2835,19 @@ fn run() -> Result<i32, String> {
     // LogLevel (OpenSSH's numbering): QUIET..ERROR hide the informational
     // messages (`Warning: Permanently added …`), as -q does; VERBOSE and
     // DEBUGn are -v levels.
+    // `-y`: ssh's messages go to syslog, with the SyslogFacility.
+    #[cfg(unix)]
+    if cli.use_syslog {
+        let facility = cfg_block
+            .syslog_facility
+            .as_deref()
+            .and_then(common::syslog_facility)
+            .unwrap_or(libc::LOG_USER);
+        common::log_to_syslog(c"ssh", facility)?;
+    }
+    if let Some(v) = cfg_block.log_verbose.clone().filter(|v| !v.is_empty()) {
+        common::set_log_verbose(v);
+    }
     if cli.verbose == 0
         && !cli.quiet
         && let Some(level) = cfg_block.log_level
@@ -7426,7 +7446,7 @@ fn mint_x11_cookie() -> Result<String, String> {
 static LOG_QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn main() -> ExitCode {
-    match run() {
+    let code = match run() {
         Ok(code) => {
             let clamped = code.clamp(0, 255) as u8;
             ExitCode::from(clamped)
@@ -7438,7 +7458,9 @@ fn main() -> ExitCode {
             }
             ExitCode::from(255)
         }
-    }
+    };
+    common::finish_log();
+    code
 }
 
 /// Client side of the puressh UDP knock (`docs/knock.md` §6) for the direct

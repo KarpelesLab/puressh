@@ -93,7 +93,7 @@ pub struct ServerDriver {
 impl ServerDriver {
     /// Build a driver from the server [`Config`] (host keys + algorithm
     /// policy). Call [`ServerDriver::start`] before pumping to emit the
-    /// version line and initial KEXINIT.
+    /// version line; the initial KEXINIT follows the client's.
     pub fn new(cfg: Arc<Config>) -> Self {
         let mut rng = OsRng;
         let placeholder = build_server_kexinit(&mut rng, &cfg);
@@ -134,12 +134,21 @@ impl ServerDriver {
         self.keepalive = Some((interval, count_max));
     }
 
-    /// Emit the local version line and the initial KEXINIT (with the
-    /// `ext-info-s` marker and queued outbound EXT_INFO). `now` seeds the
-    /// keepalive clock. Call once, before pumping.
+    /// Emit the local version line. `now` seeds the keepalive clock. Call
+    /// once, before pumping.
+    ///
+    /// The initial KEXINIT waits for the client's identification line, as
+    /// OpenSSH's sshd does: whatever connects sees only the version line
+    /// until it has itself spoken SSH.
     pub fn start(&mut self, now: Instant) -> Result<()> {
         self.last_activity = now;
         self.outbox.push_back(VersionExchange::outgoing_bytes());
+        Ok(())
+    }
+
+    /// Queue the initial KEXINIT (with the `ext-info-s` marker and the
+    /// outbound EXT_INFO), once the client's version line is in.
+    fn start_kex(&mut self) -> Result<()> {
         let advert =
             build_server_kexinit(&mut self.rng, &self.cfg).with_ext_info_marker(Role::Server);
         self.runner = KexRunner::new(Role::Server, advert);
@@ -328,6 +337,7 @@ impl ServerDriver {
         };
         self.v_c = parsed.into_bytes();
         self.phase = Phase::Kex;
+        self.start_kex()?;
         Ok(true)
     }
 
@@ -773,9 +783,7 @@ mod tests {
         KexInit::from_algorithms(&algs, [7u8; 16]).encode()
     }
 
-    /// A server driver that has sent its KEXINIT and consumed the peer's
-    /// version line: the initial KEX is in flight, nothing decoded yet.
-    fn server_in_initial_kex() -> ServerDriver {
+    fn fresh_server() -> ServerDriver {
         let host_key: Box<dyn HostKey + Send + Sync> =
             Box::new(Ed25519HostKey::from_seed(fresh_seed()));
         let factory: Arc<dyn AuthenticatorFactory> =
@@ -786,7 +794,35 @@ mod tests {
             vec!["publickey"],
             Arc::new(UnusedHandler),
         ));
-        let mut d = ServerDriver::new(cfg);
+        ServerDriver::new(cfg)
+    }
+
+    /// As OpenSSH's sshd: the version line goes out alone, and the KEXINIT
+    /// only once the client has sent its own identification.
+    #[test]
+    fn kexinit_waits_for_client_version() {
+        let mut d = fresh_server();
+        d.start(Instant::now()).expect("start");
+        let banner = d.poll_transmit().expect("version line");
+        assert!(banner.starts_with(b"SSH-2.0-") && banner.ends_with(b"\r\n"));
+        assert!(
+            d.poll_transmit().is_none(),
+            "nothing after the version line"
+        );
+        d.handle_input(b"SSH-2.0-", Instant::now())
+            .expect("partial line");
+        assert!(d.poll_transmit().is_none(), "not on a partial line either");
+        d.handle_input(b"peer\r\n", Instant::now())
+            .expect("version line");
+        let kexinit = d.poll_transmit().expect("kexinit after the version");
+        // Unencrypted packet: length(4) padding(1), then the message type.
+        assert_eq!(kexinit[5], 20, "SSH_MSG_KEXINIT");
+    }
+
+    /// A server driver that has consumed the peer's version line and queued
+    /// its KEXINIT: the initial KEX is in flight, nothing decoded yet.
+    fn server_in_initial_kex() -> ServerDriver {
+        let mut d = fresh_server();
         d.start(Instant::now()).expect("start");
         while d.poll_transmit().is_some() {}
         d.handle_input(b"SSH-2.0-peer\r\n", Instant::now())

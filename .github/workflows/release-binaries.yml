@@ -196,9 +196,8 @@ jobs:
         run: gh release upload "${TAG}" out/* --clobber
 
   # Upload Ubuntu source packages to ppa:karpeleslab/puressh; Launchpad builds
-  # them (see packaging/launchpad/README.md). Signed with the apt repository's
-  # key (APT_GPG_PRIVATE_KEY), which has to be registered on the Launchpad
-  # account that may upload to the PPA; skips itself without that secret.
+  # them (see packaging/launchpad/README.md). Signed with APT_GPG_PRIVATE_KEY;
+  # skips itself without that secret.
   publish-launchpad:
     name: upload to Launchpad
     runs-on: ubuntu-latest

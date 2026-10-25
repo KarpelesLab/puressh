@@ -168,7 +168,7 @@ jobs:
 
       - name: Build the source and binary packages
         run: |
-          version="$(cargo-1.91 pkgid | sed 's/.*[#@]//')"
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           REF=HEAD CARGO=cargo-1.91 packaging/launchpad/build-source.sh "$version" src ${{ matrix.release }}
           dpkg-source -x src/puressh_*.dsc build
           (cd build && dpkg-buildpackage -b -us -uc)
@@ -212,7 +212,7 @@ jobs:
       - name: Build the source and binary packages
         run: |
           git config --global --add safe.directory "$PWD"
-          version="$(${{ matrix.cargo }} pkgid | sed 's/.*[#@]//')"
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
           REF=HEAD CARGO=${{ matrix.cargo }} packaging/launchpad/build-source.sh "$version" src ${{ matrix.release }}
           dpkg-source -x src/puressh_*.dsc build
           (cd build && dpkg-buildpackage -b -us -uc)

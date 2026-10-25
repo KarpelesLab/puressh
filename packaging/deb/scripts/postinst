@@ -13,60 +13,6 @@ ssh_wanted() {
 		[ -L /etc/systemd/system/sshd.service ]
 }
 
-# Record the per-connection session processes *before* we stop anything,
-# while each is still a child of its listener. puressh's sshd handles every
-# connection in a `fork()`ed worker (see sshd(8)); the stop below reparents
-# those workers to PID 1, and an upgrade has just replaced their on-disk
-# binary, after which they are indistinguishable from a stale listener by
-# exe + PPid alone. `stop_stale_listeners` skips anything recorded here so an
-# upgrade (or a swap from openssh-server) does not drop open sessions.
-record_sessions() {
-	session_pids=" "
-	for d in /proc/[0-9]*; do
-		case "$(readlink "$d/exe" 2>/dev/null)" in
-		/usr/sbin/sshd*) ;;
-		*) continue ;;
-		esac
-		ppid=$(awk '/^PPid:/ { print $2 }' "$d/status" 2>/dev/null)
-		[ -n "$ppid" ] && [ "$ppid" != 1 ] || continue
-		case "$(readlink "/proc/$ppid/exe" 2>/dev/null)" in
-		/usr/sbin/sshd*) session_pids="$session_pids${d#/proc/} " ;;
-		esac
-	done
-}
-
-# An OpenSSH listener can outlive openssh-server's removal: its prerm does
-# not stop it, and with KillMode=process it stays behind in ssh.service's
-# cgroup once that unit is ours, holding port 22. Its binary has been
-# replaced, so it shows up as "/usr/sbin/sshd (deleted)" with PID 1 as its
-# parent. Stop only such listeners: per-connection processes are their
-# children, so open sessions survive. Processes recorded by `record_sessions`
-# are skipped — the stop above orphans them to PID 1 and the upgrade deleted
-# their binary, so they would otherwise look exactly like a stale listener.
-# PIDs are collected first so a child orphaned by an earlier kill is never
-# mistaken for a listener.
-stop_stale_listeners() {
-	pids=
-	for d in /proc/[0-9]*; do
-		pid=${d#/proc/}
-		case "${session_pids:- }" in *" $pid "*) continue ;; esac
-		[ "$(readlink "$d/exe" 2>/dev/null)" = "/usr/sbin/sshd (deleted)" ] || continue
-		[ "$(awk '/^PPid:/ { print $2 }' "$d/status" 2>/dev/null)" = 1 ] || continue
-		pids="$pids $pid"
-	done
-	[ -n "$pids" ] || return 0
-	# shellcheck disable=SC2086
-	kill -TERM $pids 2>/dev/null || true
-	for _ in 1 2 3 4 5 6 7 8 9 10; do
-		alive=
-		for pid in $pids; do
-			[ -d "/proc/$pid" ] && alive=1
-		done
-		[ -n "$alive" ] || return 0
-		sleep 0.5
-	done
-}
-
 if [ "$1" = "configure" ]; then
 	/usr/lib/puressh/sshd-prepare
 
@@ -99,15 +45,14 @@ MSG
 		# systemd reloads unit files: stopping it under a replaced unit
 		# definition has crashed PID 1 (systemd 255, service_sigchld_event).
 		# KillMode=process: only the listener stops, open sessions survive.
-		# Note which processes are live sessions before the stop orphans them.
-		record_sessions
+		# Other sshd processes are left alone: an orphaned one may well be an
+		# open session from before.
 		was_active=
 		systemctl stop ssh.socket >/dev/null 2>&1 || true
 		if systemctl -q is-active ssh.service 2>/dev/null; then
 			was_active=1
 			systemctl stop ssh.service || true
 		fi
-		stop_stale_listeners
 		# openssh-server's postrm masks ssh.service and ssh.socket on 20.04
 		# and 22.04; ssh.service is ours now.
 		deb-systemd-helper unmask ssh.service >/dev/null || true

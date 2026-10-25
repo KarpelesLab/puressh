@@ -125,8 +125,7 @@ ours_log | grep -q '^Accepted publickey for tester from .* port [0-9]* ssh2: ED2
 
 step "an open session survives an in-place upgrade"
 # Hold a session open, then reinstall the package: same postinst path as a
-# version upgrade (binary replaced on disk, daemon stopped, stale-listener
-# sweep). puressh handles each connection in a forked worker that must outlive
+# version upgrade (binary replaced on disk, daemon stopped). puressh handles each connection in a forked worker that must outlive
 # the restart; a regression drops the logged-in user mid-upgrade.
 timeout 120 ssh -T -F /dev/null -i /root/tester_key -o BatchMode=yes \
 	-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts \

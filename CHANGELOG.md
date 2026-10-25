@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.7](https://github.com/KarpelesLab/puressh/compare/v0.2.6...v0.2.7) - 2026-10-25
+
+### Added
+
+- *(packaging)* Ubuntu source packages for the Launchpad PPA
+
+### Fixed
+
+- *(ci)* install build-essential for the package build, which noble's dpkg checks for
+- *(ci)* take the package version from Cargo.toml, as cargo-1.91 pkgid needs a lockfile
+- *(test)* allow the env-mutating tests' unsafe under the default features
+
+### Other
+
+- *(packaging)* the apt key is registered on Launchpad; no encryption subkey needed
+- *(release)* sign Launchpad uploads with the apt repository's key
+
 ## [0.2.6](https://github.com/KarpelesLab/puressh/compare/v0.2.5...v0.2.6) - 2026-10-25
 
 ### Added

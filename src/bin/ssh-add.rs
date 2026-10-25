@@ -39,7 +39,7 @@ mod imp {
     use puressh::cert::Certificate;
     use puressh::key::{PrivateKey, PublicKey};
 
-    const USAGE: &str = "usage: ssh-add [-CcDdKkLlNqvXx] [-E fingerprint_hash] [-H hostkey_file]\n               [-h destination_constraint] [-S provider] [-t life]\n               [file ...]\n       ssh-add -s pkcs11 [-Cv] [certificate ...]\n       ssh-add -e pkcs11\n       ssh-add -T pubkey ...";
+    const USAGE: &str = "usage: ssh-add [-CcDdKkLlqvXx] [-E fingerprint_hash] [-H hostkey_file]\n               [-h destination_constraint] [-S provider] [-t life]\n               [file ...]\n       ssh-add -s pkcs11 [-Cv] [certificate ...]\n       ssh-add -e pkcs11\n       ssh-add -T pubkey ...";
 
     /// How long after a certificate's expiry it may still be added
     /// (OpenSSH's `CERT_EXPIRY_GRACE`).
@@ -64,6 +64,8 @@ mod imp {
         lifetime: Option<u32>,
         /// `-E md5`: MD5 fingerprints (else SHA-256).
         md5: bool,
+        /// `-v` count: OpenSSH's debug1 to debug3 messages.
+        verbose: u8,
         destinations: Vec<String>,
         hostkey_files: Vec<String>,
         files: Vec<String>,
@@ -77,29 +79,67 @@ mod imp {
         pkcs11: Option<String>,
     }
 
-    fn parse_lifetime(v: &str) -> Option<u32> {
-        let mut total = 0u64;
-        let mut num = String::new();
-        for c in v.chars() {
-            if c.is_ascii_digit() {
-                num.push(c);
-                continue;
-            }
-            let n: u64 = num.parse().ok()?;
-            num.clear();
-            total += n * match c.to_ascii_lowercase() {
-                's' => 1,
-                'm' => 60,
-                'h' => 3600,
-                'd' => 86400,
-                'w' => 604800,
-                _ => return None,
+    /// How `ssh-add` stops before doing anything: OpenSSH's `usage()`
+    /// (exit 1, after an optional message), `fatal()` (exit 255) or
+    /// another error (exit 1).
+    #[derive(Debug, PartialEq)]
+    enum Exit {
+        Usage(Option<String>),
+        Fatal(String),
+        Fail(String),
+    }
+
+    /// OpenSSH's `convtime`: `90`, `90s`, `1.5`, `10m`, `1h30m`, `2d`,
+    /// `1w`, in seconds.
+    fn convtime(v: &str) -> Option<u64> {
+        if v.is_empty() {
+            return None;
+        }
+        let mut total = 0f64;
+        let mut seen_seconds = false;
+        let mut rest = v;
+        while !rest.is_empty() {
+            let end = rest
+                .find(|c: char| !c.is_ascii_digit() && c != '.')
+                .unwrap_or(rest.len());
+            let (num, tail) = rest.split_at(end);
+            let val: f64 = num.parse().ok()?;
+            let mut chars = tail.chars();
+            let mult = match chars.next() {
+                None | Some('s' | 'S') => {
+                    if seen_seconds {
+                        return None;
+                    }
+                    seen_seconds = true;
+                    1.0
+                }
+                Some('m' | 'M') => 60.0,
+                Some('h' | 'H') => 3600.0,
+                Some('d' | 'D') => 86400.0,
+                Some('w' | 'W') => 604800.0,
+                Some(_) => return None,
             };
+            // A fraction only for seconds, and with digits after the dot.
+            if num.contains('.') && (mult > 1.0 || num.ends_with('.')) {
+                return None;
+            }
+            total += val * mult;
+            rest = chars.as_str();
         }
-        if !num.is_empty() {
-            total += num.parse::<u64>().ok()?;
+        (total <= i32::MAX as f64).then_some(total as u64)
+    }
+
+    /// `-t`: a lifetime, `None` for `0` (no limit).
+    fn parse_lifetime(v: &str) -> Result<Option<u32>, Exit> {
+        let t = convtime(v).ok_or_else(|| Exit::Fail("Invalid lifetime".into()))?;
+        Ok((t > 0).then_some(t as u32))
+    }
+
+    /// OpenSSH's `debugN()`, shown from `N` `-v`s on.
+    fn debug(o: &Opts, level: u8, msg: impl FnOnce() -> String) {
+        if o.verbose >= level {
+            eprintln!("debug{level}: {}", msg());
         }
-        u32::try_from(total).ok().filter(|t| *t > 0)
     }
 
     /// OpenSSH's `fmt_timeframe`.
@@ -117,8 +157,10 @@ mod imp {
         }
     }
 
-    fn parse_args(args: &[String]) -> Result<Opts, String> {
+    fn parse_args(args: &[String]) -> Result<Opts, Exit> {
         let mut o = Opts::default();
+        // The first of -l/-L and of -x/-X, for OpenSSH's message.
+        let (mut lflag, mut xflag) = (None, None);
         let mut i = 0;
         while i < args.len() {
             let a = &args[i];
@@ -142,15 +184,19 @@ mod imp {
                     } else {
                         i += 1;
                         args.get(i)
-                            .ok_or_else(|| format!("option requires an argument -- {c}"))?
+                            .ok_or_else(|| {
+                                Exit::Usage(Some(format!("option requires an argument -- {c}")))
+                            })?
                             .clone()
                     };
                     match c {
-                        't' => o.lifetime = Some(parse_lifetime(&v).ok_or("Invalid lifetime")?),
-                        'E' => match v.as_str() {
+                        't' => o.lifetime = parse_lifetime(&v)?,
+                        'E' => match v.to_ascii_lowercase().as_str() {
                             "md5" => o.md5 = true,
                             "sha256" => o.md5 = false,
-                            other => return Err(format!("Invalid hash algorithm \"{other}\"")),
+                            _ => {
+                                return Err(Exit::Fatal(format!("Invalid hash algorithm \"{v}\"")));
+                            }
                         },
                         'h' => o.destinations.push(v),
                         'H' => o.hostkey_files.push(v),
@@ -166,18 +212,26 @@ mod imp {
                     break;
                 }
                 match c {
-                    'l' | 'L' if o.list || o.list_full => {
-                        return Err(format!("-{c} flag already specified"));
+                    'l' | 'L' if lflag.is_some() => {
+                        let f = lflag.unwrap_or(c);
+                        return Err(Exit::Fatal(format!("-{f} flag already specified")));
                     }
-                    'x' | 'X' if o.lock || o.unlock => {
-                        return Err(format!("-{c} flag already specified"));
+                    'x' | 'X' if xflag.is_some() => {
+                        let f = xflag.unwrap_or(c);
+                        return Err(Exit::Fatal(format!("-{f} flag already specified")));
                     }
-                    'l' => o.list = true,
-                    'L' => o.list_full = true,
+                    'l' | 'L' => {
+                        lflag = Some(c);
+                        o.list = c == 'l';
+                        o.list_full = c == 'L';
+                    }
                     'd' => o.delete = true,
                     'D' => o.delete_all = true,
-                    'x' => o.lock = true,
-                    'X' => o.unlock = true,
+                    'x' | 'X' => {
+                        xflag = Some(c);
+                        o.lock = c == 'x';
+                        o.unlock = c == 'X';
+                    }
                     'q' => o.quiet = true,
                     'Q' => o.query = true,
                     'T' => o.test = true,
@@ -185,10 +239,10 @@ mod imp {
                     'k' => o.key_only = true,
                     'C' => o.cert_only = true,
                     'N' => o.no_cert_lifetime = true,
-                    'v' => {}
+                    'v' => o.verbose = (o.verbose + 1).min(3),
                     'K' => o.download = true,
                     'P' => o.no_pin = true,
-                    _ => return Err(format!("unknown option -- {c}")),
+                    _ => return Err(Exit::Usage(Some(format!("unknown option -- {c}")))),
                 }
                 j += 1;
             }
@@ -201,7 +255,7 @@ mod imp {
             o.query,
         ];
         if actions.iter().filter(|a| **a).count() > 1 {
-            return Err("Invalid combination of actions".into());
+            return Err(Exit::Fatal("Invalid combination of actions".into()));
         }
         Ok(o)
     }
@@ -544,6 +598,11 @@ mod imp {
         let sig = match agent.sign(&blob, &data, if rsa { 2 } else { 0 }) {
             Ok(s) => s,
             Err(e) => {
+                // The agent's SSH_AGENT_FAILURE, worded as OpenSSH's.
+                let e = match e {
+                    puressh::Error::Protocol(_) => "agent refused operation".to_string(),
+                    e => e.to_string(),
+                };
                 eprintln!("Agent signature failed for {path}: {e}");
                 return false;
             }
@@ -556,28 +615,61 @@ mod imp {
         true
     }
 
+    /// A key type as OpenSSH's `sshkey_type` names it.
+    fn blob_label(blob: &[u8]) -> &'static str {
+        PublicKey::parse_wire_blob(blob).map_or("unknown", |pk| label(&pk))
+    }
+
     /// The keys `known_hosts`-style `files` hold for `host`: plain keys and
-    /// `@cert-authority` keys (revoked ones are skipped).
-    fn host_keys(files: &[String], host: &str) -> Vec<(Vec<u8>, bool)> {
+    /// `@cert-authority` keys (revoked ones are skipped), with where each
+    /// is from (for `-v`).
+    fn host_keys(o: &Opts, files: &[String], host: &str) -> Vec<(Vec<u8>, bool, String)> {
         use puressh::known_hosts::{KnownHosts, Marker};
         let mut keys = Vec::new();
         for f in files {
-            let Ok(kh) = KnownHosts::load(common::expand_tilde(f)) else {
+            let path = common::expand_tilde(f);
+            debug(o, 2, || {
+                format!("parse_dest_constraint_hop: looking up host keys for \"{host}\" in {path}")
+            });
+            let Ok(text) = std::fs::read(&path) else {
                 continue;
             };
-            for e in kh.find(host, 22) {
-                match e.marker {
-                    None => keys.push((e.key_blob.clone(), false)),
-                    Some(Marker::CertAuthority) => keys.push((e.key_blob.clone(), true)),
-                    Some(_) => {}
+            let mut loaded = 0;
+            // Line by line, to say where each key is from.
+            for (n, line) in text.split(|b| *b == b'\n').enumerate() {
+                for e in KnownHosts::from_bytes(line).find(host, 22) {
+                    loaded += 1;
+                    let kind = match e.marker {
+                        None => "",
+                        Some(Marker::CertAuthority) => "ca ",
+                        Some(_) => "revoked ",
+                    };
+                    debug(o, 3, || {
+                        format!(
+                            "record_hostkey: found {kind}key type {} in file {path}:{}",
+                            blob_label(&e.key_blob),
+                            n + 1
+                        )
+                    });
+                    let ca = match e.marker {
+                        None => false,
+                        Some(Marker::CertAuthority) => true,
+                        Some(_) => continue,
+                    };
+                    keys.push((e.key_blob.clone(), ca, format!("{path}:{}", n + 1)));
                 }
+            }
+            if loaded > 0 {
+                debug(o, 3, || {
+                    format!("load_hostkeys_file: loaded {loaded} keys from {host}")
+                });
             }
         }
         keys
     }
 
     /// One side of a `-h` constraint: `[user@]host`.
-    fn parse_hop(s: &str, files: &[String]) -> Result<DestinationHop, String> {
+    fn parse_hop(o: &Opts, s: &str, files: &[String]) -> Result<DestinationHop, String> {
         let (user, host) = match s.rfind('@') {
             Some(i) => (Some(&s[..i]), &s[i + 1..]),
             None => (None, s),
@@ -595,41 +687,82 @@ mod imp {
             }
             return Ok(DestinationHop::new(user, None, Vec::new()));
         }
-        let keys = host_keys(files, host);
-        if keys.is_empty() {
+        let found = host_keys(o, files, host);
+        if found.is_empty() {
             return Err(format!("No host keys found for destination \"{host}\""));
+        }
+        let mut keys = Vec::with_capacity(found.len());
+        for (i, (blob, ca, from)) in found.into_iter().enumerate() {
+            debug(o, 3, || {
+                let user = user.as_ref().map_or(String::new(), |u| format!("{u}@"));
+                let ca_tag = if ca { "CA " } else { "" };
+                format!(
+                    "parse_dest_constraint_hop: {user}{host}: adding {} {ca_tag}key from {from} as key {i}",
+                    blob_label(&blob)
+                )
+            });
+            keys.push((blob, ca));
         }
         Ok(DestinationHop::new(user, Some(host.to_string()), keys))
     }
 
     /// A `-h` argument: `[user@]host` or `host>[user@]host`.
-    fn parse_destination(s: &str, files: &[String]) -> Result<DestinationConstraint, String> {
-        match s.split_once('>') {
-            None => Ok(DestinationConstraint::new(
-                DestinationHop::default(),
-                parse_hop(s, files)?,
-            )),
+    fn parse_destination(
+        o: &Opts,
+        s: &str,
+        files: &[String],
+    ) -> Result<(DestinationConstraint, String), String> {
+        let (from, to) = match s.split_once('>') {
+            None => (DestinationHop::default(), parse_hop(o, s, files)?),
             Some((from, to)) => {
-                let from_hop = parse_hop(from, files)?;
+                let from_hop = parse_hop(o, from, files)?;
+                let to_hop = parse_hop(o, to, files)?;
                 if from_hop.user.is_some() {
                     return Err(format!(
-                        "Invalid key constraint {from}: cannot specify user on 'from' host"
+                        "Invalid key constraint {s}: cannot specify user on 'from' host"
                     ));
                 }
-                Ok(DestinationConstraint::new(from_hop, parse_hop(to, files)?))
+                (from_hop, to_hop)
             }
-        }
+        };
+        // OpenSSH's debug2 summary of the constraint.
+        let hop = |h: &DestinationHop, none: &str| {
+            let user = h.user.as_ref().map_or(String::new(), |u| format!("{u}@"));
+            let host = h.hostname.as_deref().unwrap_or(none);
+            format!("{user}{host} ({} keys)", h.keys.len())
+        };
+        let summary = format!("{} > {}", hop(&from, "(ORIGIN)"), hop(&to, "(ANY)"));
+        Ok((DestinationConstraint::new(from, to), summary))
     }
 
     pub fn run() -> i32 {
         let args: Vec<String> = std::env::args().skip(1).collect();
         let o = match parse_args(&args) {
             Ok(o) => o,
-            Err(e) => {
-                eprintln!("{e}\n{USAGE}");
+            Err(Exit::Usage(msg)) => {
+                if let Some(m) = msg {
+                    eprintln!("{m}");
+                }
+                eprintln!("{USAGE}");
+                return 1;
+            }
+            Err(Exit::Fatal(m)) => {
+                eprintln!("{m}");
+                return 255;
+            }
+            Err(Exit::Fail(m)) => {
+                eprintln!("{m}");
                 return 1;
             }
         };
+        if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK") {
+            debug(&o, 3, || {
+                format!(
+                    "ssh_get_authentication_socket_path: path '{}'",
+                    sock.to_string_lossy()
+                )
+            });
+        }
         let mut agent = match Agent::connect_env() {
             Ok(Some(a)) => a,
             Ok(None) => {
@@ -702,11 +835,17 @@ mod imp {
                 .unwrap_or_else(|| "internal".into()),
         );
         for d in &o.destinations {
-            match parse_destination(d, &hostkey_files) {
-                Ok(c) => constraints.destinations.push(c),
+            match parse_destination(&o, d, &hostkey_files) {
+                Ok((c, summary)) => {
+                    let n = constraints.destinations.len();
+                    debug(&o, 2, || {
+                        format!("parse_dest_constraint: constraint {n}: {summary}")
+                    });
+                    constraints.destinations.push(c);
+                }
                 Err(e) => {
                     eprintln!("{e}");
-                    return 1;
+                    return 255;
                 }
             }
         }
@@ -728,7 +867,7 @@ mod imp {
         if o.test {
             if o.files.is_empty() {
                 eprintln!("no keys to test");
-                return 1;
+                return 255;
             }
             let mut ok = true;
             for f in &o.files {
@@ -971,5 +1110,60 @@ mod imp {
             }
         }
         0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn parse(args: &[&str]) -> Result<Opts, Exit> {
+            let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            parse_args(&v)
+        }
+
+        #[test]
+        fn verbosity_stacks_to_three() {
+            assert_eq!(parse(&[]).unwrap().verbose, 0);
+            assert_eq!(parse(&["-v", "-v"]).unwrap().verbose, 2);
+            assert_eq!(parse(&["-vvvvv"]).unwrap().verbose, 3);
+        }
+
+        #[test]
+        fn errors_as_openssh() {
+            // The first of the two flags is named.
+            assert_eq!(
+                parse(&["-L", "-l"]).err(),
+                Some(Exit::Fatal("-L flag already specified".into()))
+            );
+            assert_eq!(
+                parse(&["-X", "-x"]).err(),
+                Some(Exit::Fatal("-X flag already specified".into()))
+            );
+            assert_eq!(
+                parse(&["-l", "-D"]).err(),
+                Some(Exit::Fatal("Invalid combination of actions".into()))
+            );
+            assert_eq!(
+                parse(&["-E", "sha1"]).err(),
+                Some(Exit::Fatal("Invalid hash algorithm \"sha1\"".into()))
+            );
+            assert_eq!(
+                parse(&["-t", "1y"]).err(),
+                Some(Exit::Fail("Invalid lifetime".into()))
+            );
+            assert_eq!(
+                parse(&["-t"]).err(),
+                Some(Exit::Usage(Some("option requires an argument -- t".into())))
+            );
+        }
+
+        #[test]
+        fn lifetimes() {
+            assert_eq!(parse(&["-t", "0"]).unwrap().lifetime, None);
+            assert_eq!(parse(&["-t", "1h30"]).unwrap().lifetime, Some(3630));
+            assert_eq!(parse(&["-t", "2.5"]).unwrap().lifetime, Some(2));
+            assert_eq!(convtime("1.5h"), None);
+            assert_eq!(convtime("1s1"), None);
+        }
     }
 }

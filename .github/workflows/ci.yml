@@ -204,9 +204,10 @@ jobs:
       - name: Boot the container
         run: |
           printf '%s\n' "FROM ubuntu:${{ matrix.release }}" \
-            'RUN rm -f /usr/sbin/policy-rc.d && apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus ubuntu-server git ca-certificates build-essential debhelper dpkg-dev fakeroot cargo rustc' \
+            'RUN apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq systemd systemd-sysv dbus ubuntu-server git ca-certificates build-essential debhelper dpkg-dev fakeroot cargo rustc && rm -f /usr/sbin/policy-rc.d' \
             'STOPSIGNAL SIGRTMIN+3' 'CMD ["/sbin/init"]' > "$RUNNER_TEMP/Dockerfile"
-          docker build -q -t ubuntu-systemd -f "$RUNNER_TEMP/Dockerfile" "$RUNNER_TEMP"
+          docker build -t ubuntu-systemd -f "$RUNNER_TEMP/Dockerfile" "$RUNNER_TEMP" >"$RUNNER_TEMP/build.log" 2>&1 ||
+            { tail -40 "$RUNNER_TEMP/build.log"; exit 1; }
           docker run -d --name ub --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
             -v "$PWD:/src:ro" ubuntu-systemd
           for _ in $(seq 1 60); do

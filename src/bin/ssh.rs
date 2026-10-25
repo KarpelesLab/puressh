@@ -3302,10 +3302,22 @@ fn run() -> Result<i32, String> {
                 &user,
             )
             .map_err(|e| format!("ProxyCommand: {e}"))?;
-            vlog(1, &format!("proxycommand: spawning {cmd:?}"));
-            let proc = puressh::proc_transport::ProcTransport::spawn(&cmd)
-                .map_err(|e| format!("ProxyCommand: spawn failed: {e}"))?;
-            let client = Client::connect_via(Box::new(proc), connect_host.as_str(), port, cfg)
+            let transport: Box<dyn puressh::client::Transport> =
+                if cfg_block.proxy_use_fdpass == Some(true) {
+                    // ProxyUseFdpass: the command hands back a connected
+                    // socket and exits; the connection runs over that.
+                    vlog(1, &format!("Executing proxy dialer command: {cmd}"));
+                    let sock = proxy_fdpass_connect(&cmd)?;
+                    configure_socket(&sock, &cfg_block)?;
+                    Box::new(sock)
+                } else {
+                    vlog(1, &format!("proxycommand: spawning {cmd:?}"));
+                    Box::new(
+                        puressh::proc_transport::ProcTransport::spawn(&cmd)
+                            .map_err(|e| format!("ProxyCommand: spawn failed: {e}"))?,
+                    )
+                };
+            let client = Client::connect_via(transport, connect_host.as_str(), port, cfg)
                 .map_err(|e| format!("ProxyCommand: handshake: {e}"))?;
             vlog(
                 1,
@@ -7711,6 +7723,81 @@ fn spawn_dynamic_forward_listener(
             });
         }
     });
+}
+
+/// OpenSSH's `ssh_proxy_fdpass_connect`: run the proxy dialer with its
+/// stdin and stdout on one end of a socket pair, receive the connected
+/// socket it passes back (`SCM_RIGHTS`), and wait for it to exit.
+#[cfg(unix)]
+fn proxy_fdpass_connect(cmd: &str) -> Result<TcpStream, String> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::io::AsRawFd;
+    let (ours, theirs) = std::os::unix::net::UnixStream::pair().map_err(|e| {
+        format!(
+            "Could not create socketpair to communicate with proxy dialer: {}",
+            common::io_reason(&e)
+        )
+    })?;
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/sh".into());
+    let theirs_out = theirs.try_clone().map_err(|e| e.to_string())?;
+    let mut child = std::process::Command::new(&shell)
+        .arg("-c")
+        .arg(cmd)
+        .stdin(std::process::Stdio::from(OwnedFd::from(theirs)))
+        .stdout(std::process::Stdio::from(OwnedFd::from(theirs_out)))
+        .spawn()
+        .map_err(|e| format!("{shell}: {}", common::io_reason(&e)))?;
+    // One byte of data, one descriptor (OpenSSH's mm_receive_fd).
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr() as *mut libc::c_void,
+        iov_len: 1,
+    };
+    // SAFETY: CMSG_SPACE is a pure size computation.
+    let space = unsafe { libc::CMSG_SPACE(core::mem::size_of::<libc::c_int>() as u32) } as usize;
+    let mut cbuf = vec![0u8; space];
+    // SAFETY: a zeroed msghdr is valid; the pointers set below outlive the
+    // recvmsg call.
+    let mut msg: libc::msghdr = unsafe { core::mem::zeroed() };
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = space as _;
+    let fd = loop {
+        // SAFETY: recvmsg on our socket into the buffers described above.
+        let n = unsafe { libc::recvmsg(ours.as_raw_fd(), &mut msg, 0) };
+        if n < 0 && std::io::Error::last_os_error().kind() == ErrorKind::Interrupted {
+            continue;
+        }
+        // SAFETY: walking the control buffer recvmsg filled.
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+        if n != 1 || cmsg.is_null() {
+            break None;
+        }
+        // SAFETY: `cmsg` points into `cbuf`, checked non-null above.
+        let c = unsafe { &*cmsg };
+        if c.cmsg_level != libc::SOL_SOCKET || c.cmsg_type != libc::SCM_RIGHTS {
+            break None;
+        }
+        // SAFETY: an SCM_RIGHTS message carries a c_int descriptor.
+        break Some(unsafe {
+            core::ptr::read_unaligned(libc::CMSG_DATA(cmsg) as *const libc::c_int)
+        });
+    };
+    drop(ours);
+    let _ = child.wait();
+    let Some(fd) = fd else {
+        eprintln!("proxy dialer did not pass back a connection");
+        return Err(String::new());
+    };
+    // SAFETY: the descriptor the dialer passed is ours now.
+    let sock = unsafe { TcpStream::from_raw_fd(fd) };
+    // SAFETY: fcntl on our own descriptor.
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    Ok(sock)
 }
 
 /// `n` random bytes (an X11 cookie), from the OS RNG only: a credential

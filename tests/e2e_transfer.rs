@@ -274,3 +274,49 @@ fn sftp_batch_mode() {
     assert_ok(&out, "sftp host:file");
     assert!(fetched.join("renamed.txt").is_file());
 }
+
+#[test]
+#[ignore]
+fn sftp_openssh_commands() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fixture("sftpcmds");
+    let cfg = f.config.display().to_string();
+    let remote = f.dir.join("remote");
+    make_tree(&remote);
+    std::os::unix::fs::symlink("a.txt", remote.join("link")).unwrap();
+    let local = f.dir.join("local");
+    std::fs::create_dir(&local).unwrap();
+    std::fs::write(local.join("up1.txt"), b"one\n").unwrap();
+    std::fs::write(local.join("up2.txt"), b"two\n").unwrap();
+    let sftp = env!("CARGO_BIN_EXE_sftp");
+    let batch = format!(
+        "cd {r}\nlcd {l}\nmget *.txt\nmput up*.txt\n@ls -1 sub\nLS -1 sub/c.txt\n\
+         -chmod -h 600 link\n-@mkdir -p deep/er/est\n-bogus\nchown 1x a.txt\nmkdir never\n",
+        r = remote.display(),
+        l = local.display()
+    );
+    let out = run(sftp, &["-F", &cfg, "-b", "-", "t"], batch.as_bytes());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The batch runs up to the bad chown, which aborts it.
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(!remote.join("never").exists());
+    assert_eq!(std::fs::read(local.join("a.txt")).unwrap(), b"alpha\n");
+    assert_eq!(std::fs::read(remote.join("up2.txt")).unwrap(), b"two\n");
+    assert!(remote.join("deep/er/est").is_dir());
+    // `@` hides the echo; listings show the path as given.
+    assert!(!stdout.contains("sftp> @ls"), "{stdout}");
+    assert!(stdout.contains("sub/c.txt\n"), "{stdout}");
+    assert!(stdout.contains("sftp> LS -1 sub/c.txt\n"), "{stdout}");
+    // `-h` goes through lsetstat@openssh.com: the link's target is untouched.
+    let mode = std::fs::metadata(remote.join("a.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o644, "{stderr}");
+    assert!(stderr.contains("Invalid command.\r\n"), "{stderr}");
+    assert!(
+        stderr.contains("You must supply a numeric argument to the chown command."),
+        "{stderr}"
+    );
+}

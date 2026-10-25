@@ -47,7 +47,7 @@ const PEM_WRAP: usize = 70;
 /// a leaked private key file. Existing keys keep whatever round count
 /// they were originally written with — only re-encrypt operations (key
 /// generation or `ssh-keygen -p`) pick up the new default.
-const BCRYPT_ROUNDS: u32 = 24;
+pub const DEFAULT_KDF_ROUNDS: u32 = 24;
 const SALT_LEN: usize = 16;
 /// The cipher of new encrypted private keys, as OpenSSH's.
 const DEFAULT_CIPHER: &str = "aes256-ctr";
@@ -237,7 +237,7 @@ impl PrivateKey {
         rng: &mut R,
         passphrase: Option<&[u8]>,
     ) -> Result<String> {
-        self.to_openssh_pem_with_rng_rounds(rng, passphrase, BCRYPT_ROUNDS)
+        self.to_openssh_pem_with_rng_rounds(rng, passphrase, DEFAULT_KDF_ROUNDS)
     }
 
     /// [`Self::to_openssh_pem`] with `rounds` bcrypt KDF rounds instead of

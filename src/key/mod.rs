@@ -47,7 +47,7 @@ pub fn is_fingerprint_hash(name: &str) -> bool {
     known
 }
 
-pub use writer::EcdsaCurve;
+pub use writer::{DEFAULT_KDF_ROUNDS, EcdsaCurve};
 
 /// Decode standard (padded) base64, as used in `authorized_keys` / `.pub` /
 /// `*-cert.pub` files. Exposed crate-wide so the certificate module can parse

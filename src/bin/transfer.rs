@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use puressh::sftp::{Attrs, FXF_APPEND, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE, SftpClient};
+use puressh::sftp::{
+    Attrs, FXF_APPEND, FXF_CREAT, FXF_READ, FXF_TRUNC, FXF_WRITE, SftpClient, SftpError,
+};
 
 /// `ssh` invocation shared by scp and sftp: the program (`-S`) and the
 /// options passed through from their own command line.
@@ -594,6 +596,9 @@ impl Limiter {
 struct Limited<S> {
     inner: S,
     limiter: Option<Limiter>,
+    /// The local file's own I/O error, if any (as opposed to the remote
+    /// side's), for the message.
+    error: Option<String>,
 }
 
 impl<S> Limited<S> {
@@ -605,7 +610,46 @@ impl<S> Limited<S> {
                 start: Instant::now(),
                 bytes: 0,
             }),
+            error: None,
         }
+    }
+
+    fn note<T>(&mut self, r: io::Result<T>) -> io::Result<T> {
+        if let Err(e) = &r {
+            self.error = Some(strerror(e));
+        }
+        r
+    }
+}
+
+/// C `strerror` text for an I/O error.
+fn strerror(e: &io::Error) -> String {
+    let s = e.to_string();
+    match s.rfind(" (os error ") {
+        Some(i) => s[..i].to_string(),
+        None => s,
+    }
+}
+
+/// OpenSSH's `fx2txt`: the text for a status.
+fn fx2txt(e: &puressh::sftp::SftpError) -> String {
+    use puressh::sftp::FxpStatus;
+    match e {
+        puressh::sftp::SftpError::Status { code, .. } => match code {
+            FxpStatus::Ok => "No error",
+            FxpStatus::Eof => "End of file",
+            FxpStatus::NoSuchFile => "No such file or directory",
+            FxpStatus::PermissionDenied => "Permission denied",
+            FxpStatus::Failure => "Failure",
+            FxpStatus::BadMessage => "Bad message",
+            FxpStatus::NoConnection => "No connection",
+            FxpStatus::ConnectionLost => "Connection lost",
+            FxpStatus::OpUnsupported => "Operation unsupported",
+            #[allow(unreachable_patterns)]
+            _ => "Unknown status",
+        }
+        .into(),
+        other => other.to_string(),
     }
 }
 
@@ -622,7 +666,8 @@ fn check_interrupted() -> io::Result<()> {
 impl<R: Read> Read for Limited<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         check_interrupted()?;
-        let n = self.inner.read(buf)?;
+        let r = self.inner.read(buf);
+        let n = self.note(r)?;
         if let Some(l) = &mut self.limiter {
             l.account(n);
         }
@@ -633,14 +678,16 @@ impl<R: Read> Read for Limited<R> {
 impl<W: Write> Write for Limited<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         check_interrupted()?;
-        let n = self.inner.write(buf)?;
+        let r = self.inner.write(buf);
+        let n = self.note(r)?;
         if let Some(l) = &mut self.limiter {
             l.account(n);
         }
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        let r = self.inner.flush();
+        self.note(r)
     }
 }
 
@@ -1007,7 +1054,7 @@ fn download_at<T: Read + Write>(
     let total = attrs.size.unwrap_or(0);
     let h = sftp
         .open(remote, FXF_READ, Attrs::default())
-        .map_err(|e| format!("{shown}: {}", sftp_err(e)))?;
+        .map_err(|e| format!("remote open \"{shown}\": {}", fx2txt(&e)))?;
     let mut options = std::fs::File::options();
     options.write(true).create(true);
     #[cfg(unix)]
@@ -1025,13 +1072,17 @@ fn download_at<T: Read + Write>(
         Ok(f) => f,
         Err(e) => {
             let _ = sftp.close(&h);
-            return Err(format!("{}: {e}", local.display()));
+            return Err(format!(
+                "open local \"{}\": {}",
+                local.display(),
+                strerror(&e)
+            ));
         }
     };
     if opts.resume && start > total {
         let _ = sftp.close(&h);
         return Err(format!(
-            "{}: local file is larger than the remote one",
+            "Unable to resume download of \"{}\": local file is larger than remote",
             local.display()
         ));
     }
@@ -1046,9 +1097,11 @@ fn download_at<T: Read + Write>(
         meter.update(start + n)
     });
     let _ = sftp.close(&h);
-    let n = res.map_err(|e| format!("{shown}: {}", sftp_err(e)))?;
-    file.flush()
-        .map_err(|e| format!("{}: {e}", local.display()))?;
+    let res = res.and_then(|n| file.flush().map(|()| n).map_err(SftpError::Io));
+    let n = res.map_err(|e| match &file.error {
+        Some(err) => format!("write local \"{}\": {err}", local.display()),
+        None => format!("read remote \"{shown}\" : {}", fx2txt(&e)),
+    })?;
     meter.finish(start + n);
     if opts.inplace {
         let _ = file.inner.get_ref().set_len(start + n);
@@ -1146,10 +1199,11 @@ fn upload_at<T: Read + Write>(
         FXF_WRITE | FXF_CREAT | FXF_TRUNC
     };
     let _ = FXF_APPEND;
+    let mut file = std::fs::File::open(local)
+        .map_err(|e| format!("open local \"{shown}\": {}", strerror(&e)))?;
     let h = sftp
         .open(remote, flags, local_attrs(&md, false))
-        .map_err(|e| format!("{remote_shown}: {}", sftp_err(e)))?;
-    let mut file = std::fs::File::open(local).map_err(|e| format!("{shown}: {e}"))?;
+        .map_err(|e| format!("dest open \"{remote_shown}\": {}", fx2txt(&e)))?;
     if start > 0 {
         use std::io::Seek;
         file.seek(io::SeekFrom::Start(start))
@@ -1172,8 +1226,11 @@ fn upload_at<T: Read + Write>(
         let _ = sftp.fsetstat(&h, size);
     }
     let close = sftp.close(&h);
-    let n = res.map_err(|e| format!("{remote_shown}: {}", sftp_err(e)))?;
-    close.map_err(|e| format!("{remote_shown}: {}", sftp_err(e)))?;
+    let n = res.map_err(|e| match &src.error {
+        Some(err) => format!("read local \"{shown}\": {err}"),
+        None => format!("write remote \"{remote_shown}\": {}", fx2txt(&e)),
+    })?;
+    close.map_err(|e| format!("close remote: {}", fx2txt(&e)))?;
     meter.finish(start + n);
     if opts.preserve {
         let _ = sftp.setstat(remote, local_attrs(&md, true));

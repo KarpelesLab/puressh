@@ -397,7 +397,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     }
                     'E' => log_file = Some(v),
                     'F' => config_file = Some(PathBuf::from(v)),
-                    'I' => return Err("-I: PKCS#11 tokens are not supported".into()),
+                    'I' => extra_o.push(format!("PKCS11Provider {v}")),
                     // Also a first-obtained `ProxyJump` (so it excludes a
                     // configured ProxyCommand, as OpenSSH's).
                     'J' => {
@@ -794,6 +794,60 @@ fn collect_credentials(
                 credentials.append(&mut from_agent);
             }
             Err(e) => warn!("warning: agent: {e}"),
+        }
+    }
+    // PKCS#11 token keys (`PKCS11Provider`, `-I`) come before the identity
+    // files, as OpenSSH lists them, each with any `CertificateFile` that
+    // certifies it.
+    #[cfg(feature = "pkcs11")]
+    if let Some(module) = cfg_block
+        .pkcs11_provider
+        .as_deref()
+        .filter(|p| !p.eq_ignore_ascii_case("none"))
+    {
+        let batch = cfg_block.batch_mode == Some(true);
+        for key in common::pkcs11_keys(module, batch) {
+            let blob = key.public_key().wire_blob();
+            for cert_path in &cfg_block.certificate_files {
+                let cert_path = expand_tilde(cert_path);
+                let Ok(cert) = std::fs::read_to_string(&cert_path)
+                    .map_err(|_| ())
+                    .and_then(|t| {
+                        puressh::cert::Certificate::parse_openssh_line(&t).map_err(|_| ())
+                    })
+                else {
+                    continue;
+                };
+                if cert.embedded_pubkey_blob() != blob {
+                    continue;
+                }
+                let Some(name) = puressh::cert::cert_name_for_key_type(cert.embedded_algorithm())
+                else {
+                    continue;
+                };
+                if let Ok(ch) = puressh::hostkey::CertHostKey::new(
+                    Box::new(common::Pkcs11Signer(key.clone())),
+                    &cert,
+                    name,
+                ) {
+                    vlog(
+                        1,
+                        &format!("certificate {cert_path}: offered (PKCS#11 key)"),
+                    );
+                    credentials.push(ClientCredential::PublicKey(Box::new(ch)));
+                }
+            }
+            vlog(
+                1,
+                &format!(
+                    "PKCS#11 key {} {}",
+                    key.public_key().type_label(),
+                    key.public_key().sha256_fingerprint()
+                ),
+            );
+            credentials.push(ClientCredential::PublicKey(Box::new(common::Pkcs11Signer(
+                key,
+            ))));
         }
     }
     // User certificates (`CertificateFile`). Each cert is paired with the

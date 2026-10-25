@@ -329,7 +329,9 @@ impl PublicKey {
         Self::parse_wire_blob(&w.into_vec())
     }
 
-    fn from_spki_der(der_bytes: &[u8]) -> Result<Self> {
+    /// A DER `SubjectPublicKeyInfo` (RSA, Ed25519, ECDSA on the NIST
+    /// curves).
+    pub(crate) fn from_spki_der(der_bytes: &[u8]) -> Result<Self> {
         let bad = || Error::Format("bad SubjectPublicKeyInfo");
         let mut r = der::Reader::new(der_bytes);
         let mut spki = r.read_sequence().map_err(|_| bad())?;

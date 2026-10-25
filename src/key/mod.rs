@@ -578,6 +578,20 @@ impl PublicKey {
         }
     }
 
+    /// Replace the comment.
+    pub fn set_comment(&mut self, comment: impl Into<String>) {
+        match self {
+            PublicKey::Ed25519 { comment: c, .. }
+            | PublicKey::EcdsaP256 { comment: c, .. }
+            | PublicKey::EcdsaP384 { comment: c, .. }
+            | PublicKey::EcdsaP521 { comment: c, .. }
+            | PublicKey::Rsa { comment: c, .. }
+            | PublicKey::MlDsa44Ed25519 { comment: c, .. }
+            | PublicKey::SkEcdsaP256 { comment: c, .. }
+            | PublicKey::SkEd25519 { comment: c, .. } => *c = comment.into(),
+        }
+    }
+
     /// Comment string (the trailing word on an `authorized_keys` line).
     pub fn comment(&self) -> &str {
         match self {

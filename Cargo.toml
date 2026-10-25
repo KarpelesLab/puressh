@@ -21,7 +21,7 @@ autobins = false
 # The defaults are what a client-library consumer needs. The server side
 # (`server`, `pam`) and the agent daemon (`agent`) are opt-in; the release
 # builds of the binaries enable all three.
-default = ["std", "client", "compress", "multichannel", "knock", "security-key"]
+default = ["std", "client", "compress", "multichannel", "knock", "security-key", "pkcs11"]
 std = ["purecrypto/std", "alloc"]
 alloc = ["purecrypto/alloc"]
 # High-level client and server APIs depend on `std::net` / `std::io` /
@@ -45,6 +45,9 @@ multichannel = ["client"]
 # time with `dlsym`, so there is no link-time dependency. Verifying their
 # signatures needs no feature. Default on.
 security-key = ["std", "dep:dlsym"]
+# PKCS#11 tokens (`PKCS11Provider`, `ssh -I`, `ssh-keygen -D`, `ssh-add
+# -s`): a module loaded at run time with `dlsym`. Default on.
+pkcs11 = ["std", "dep:dlsym"]
 # Stealth UDP rendezvous ("knock", `docs/knock.md`): a signed UDP datagram
 # opens a one-shot TCP listener in front of a regular SSH session. puressh
 # only; not understood by other SSH implementations. Default on.

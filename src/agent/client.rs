@@ -278,42 +278,11 @@ impl Agent {
             Some(cert) => key.to_agent_add_cert_body(cert),
             None => key.to_agent_add_body(),
         });
-        let mut constrained = false;
-        if let Some(t) = c.lifetime {
-            body.push(SSH_AGENT_CONSTRAIN_LIFETIME);
-            body.extend_from_slice(&t.to_be_bytes());
-            constrained = true;
-        }
-        if c.confirm {
-            body.push(SSH_AGENT_CONSTRAIN_CONFIRM);
-            constrained = true;
-        }
-        if !c.destinations.is_empty() {
-            let mut list = crate::format::Writer::new();
-            for d in &c.destinations {
-                let mut w = crate::format::Writer::new();
-                w.write_string(&d.from.encode());
-                w.write_string(&d.to.encode());
-                w.write_string(b"");
-                list.write_string(w.as_slice());
-            }
-            let mut w = crate::format::Writer::new();
-            w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
-            w.write_string(b"restrict-destination-v00@openssh.com");
-            w.write_string(list.as_slice());
-            body.extend_from_slice(w.as_slice());
-            constrained = true;
-        }
-        if let Some(p) = c.sk_provider.as_deref()
-            && key.sk_credential().is_some()
-        {
-            let mut w = crate::format::Writer::new();
-            w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
-            w.write_string(b"sk-provider@openssh.com");
-            w.write_string(p.as_bytes());
-            body.extend_from_slice(w.as_slice());
-            constrained = true;
-        }
+        let sk_provider = c
+            .sk_provider
+            .as_deref()
+            .filter(|_| key.sk_credential().is_some());
+        let constrained = encode_constraints(&mut body, c, sk_provider, None);
         let msg_type = if constrained {
             SSH_AGENTC_ADD_ID_CONSTRAINED
         } else {
@@ -321,6 +290,53 @@ impl Agent {
         };
         let frame = purecrypto::zeroize::Zeroizing::new(encode_message(msg_type, &body));
         self.simple_request(&frame, "add-identity")
+    }
+
+    /// Have the agent load the PKCS#11 module `provider` with `pin` and
+    /// hold its keys (`ssh-add -s`), under the constraints `c`, along with
+    /// `certs` (certificate blobs) for them, and only those if
+    /// `cert_only`.
+    pub fn add_smartcard(
+        &mut self,
+        provider: &str,
+        pin: &str,
+        c: &AddConstraints,
+        certs: &[Vec<u8>],
+        cert_only: bool,
+    ) -> Result<()> {
+        let mut body = purecrypto::zeroize::Zeroizing::new(Vec::new());
+        let mut w = crate::format::Writer::new();
+        w.write_string(provider.as_bytes());
+        w.write_string(pin.as_bytes());
+        body.extend_from_slice(w.as_slice());
+        let mut wiped = w.into_vec();
+        purecrypto::zeroize::Zeroize::zeroize(&mut wiped);
+        let constrained = encode_constraints(
+            &mut body,
+            c,
+            None,
+            (!certs.is_empty()).then_some((certs, cert_only)),
+        );
+        let msg_type = if constrained {
+            super::protocol::SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED
+        } else {
+            super::protocol::SSH_AGENTC_ADD_SMARTCARD_KEY
+        };
+        let frame = purecrypto::zeroize::Zeroizing::new(encode_message(msg_type, &body));
+        self.simple_request(&frame, "add-smartcard")
+    }
+
+    /// Have the agent forget the keys of the PKCS#11 module `provider`
+    /// (`ssh-add -e`).
+    pub fn remove_smartcard(&mut self, provider: &str) -> Result<()> {
+        let mut w = crate::format::Writer::new();
+        w.write_string(provider.as_bytes());
+        w.write_string(b"");
+        let frame = encode_message(
+            super::protocol::SSH_AGENTC_REMOVE_SMARTCARD_KEY,
+            w.as_slice(),
+        );
+        self.simple_request(&frame, "remove-smartcard")
     }
 
     /// The extensions the agent supports (the `query` extension,
@@ -446,6 +462,65 @@ impl Agent {
         let body = buf.split_off(1);
         Ok((msg_type, body))
     }
+}
+
+/// Append the constraints `c` (plus a security key's provider, or a
+/// smartcard's associated certificates) to an add request's `body`;
+/// whether there were any.
+fn encode_constraints(
+    body: &mut Vec<u8>,
+    c: &AddConstraints,
+    sk_provider: Option<&str>,
+    certs: Option<(&[Vec<u8>], bool)>,
+) -> bool {
+    let mut constrained = false;
+    if let Some(t) = c.lifetime {
+        body.push(SSH_AGENT_CONSTRAIN_LIFETIME);
+        body.extend_from_slice(&t.to_be_bytes());
+        constrained = true;
+    }
+    if c.confirm {
+        body.push(SSH_AGENT_CONSTRAIN_CONFIRM);
+        constrained = true;
+    }
+    if !c.destinations.is_empty() {
+        let mut list = crate::format::Writer::new();
+        for d in &c.destinations {
+            let mut w = crate::format::Writer::new();
+            w.write_string(&d.from.encode());
+            w.write_string(&d.to.encode());
+            w.write_string(b"");
+            list.write_string(w.as_slice());
+        }
+        let mut w = crate::format::Writer::new();
+        w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+        w.write_string(b"restrict-destination-v00@openssh.com");
+        w.write_string(list.as_slice());
+        body.extend_from_slice(w.as_slice());
+        constrained = true;
+    }
+    if let Some(p) = sk_provider {
+        let mut w = crate::format::Writer::new();
+        w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+        w.write_string(b"sk-provider@openssh.com");
+        w.write_string(p.as_bytes());
+        body.extend_from_slice(w.as_slice());
+        constrained = true;
+    }
+    if let Some((certs, cert_only)) = certs {
+        let mut list = crate::format::Writer::new();
+        for cert in certs {
+            list.write_string(cert);
+        }
+        let mut w = crate::format::Writer::new();
+        w.write_u8(SSH_AGENT_CONSTRAIN_EXTENSION);
+        w.write_string(b"associated-certs-v00@openssh.com");
+        w.write_u8(u8::from(cert_only));
+        w.write_string(list.as_slice());
+        body.extend_from_slice(w.as_slice());
+        constrained = true;
+    }
+    constrained
 }
 
 /// Whether `path` is a Unix-domain socket (following symlinks, as

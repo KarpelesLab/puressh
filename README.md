@@ -123,6 +123,8 @@ cargo add puressh --features server
 | `pam`          | no      | PAM session integration for `sshd` (Linux only, libpam loaded at run time); implies `server` |
 | `multichannel` | yes     | Concurrent multi-channel client (`SharedClient`, `SftpSession`) |
 | `knock`        | yes     | Stealth UDP knock rendezvous in front of SSH (puressh-only, see [`docs/knock.md`](docs/knock.md)) |
+| `security-key` | yes     | FIDO security keys (`sk-ecdsa`, `sk-ed25519`): signing, enrolment and resident keys through a `SecurityKeyProvider` library or `internal` (libfido2), loaded at run time. Verifying their signatures needs no feature |
+| `pkcs11`       | yes     | PKCS#11 tokens (`PKCS11Provider`, `ssh -I`, `ssh-keygen -D`, `ssh-add -s`), the module loaded at run time |
 | `agent`        | no      | Agent daemon side (`agent::AgentState`, the `ssh-agent` binary); pulls in `nix` on Unix. The agent client is always available |
 | `async`        | no      | Runtime-agnostic async frontends (`AsyncClient`, `AsyncServerConnection`) over `futures_io` |
 | `tokio`        | no      | Native tokio entry points (`connect_tokio` / `accept_tokio`) accepting `tokio::io` streams; builds on `async` |
@@ -268,10 +270,12 @@ and enforced by a dedicated CI job. Older toolchains are not supported.
 
 ## Non-goals
 
-A few OpenSSH directives are intentionally unsupported and are rejected (strict
-mode) rather than silently ignored: `PermitTunnel` (tun/tap device forwarding)
-and external-command `Subsystem` entries. Two userauth methods are also not yet
-implemented: `hostbased` and `gssapi-with-mic`.
+Two userauth methods are not implemented: `hostbased` (and `ssh-keysign`) and
+`gssapi-with-mic` (with GSSAPI key exchange). Their keywords are accepted where
+ignoring them can only refuse a login, never allow one.
+
+Security-key providers and PKCS#11 modules run inside the calling process,
+where OpenSSH isolates them in `ssh-sk-helper` / `ssh-pkcs11-helper`.
 
 ## Security
 

@@ -75,6 +75,9 @@ pub enum Error {
     /// A FIDO security-key provider failed.
     #[cfg(feature = "security-key")]
     SecurityKey(crate::sk::SkError),
+    /// A PKCS#11 module or token failed.
+    #[cfg(feature = "pkcs11")]
+    Pkcs11(crate::pkcs11::Pkcs11Error),
     /// The peer ended the connection with `SSH_MSG_DISCONNECT`.
     #[cfg(feature = "alloc")]
     Disconnected {
@@ -127,6 +130,8 @@ impl fmt::Display for Error {
             } => write!(f, "disconnected by peer: {reason}: {description}"),
             #[cfg(feature = "security-key")]
             Error::SecurityKey(e) => write!(f, "{e}"),
+            #[cfg(feature = "pkcs11")]
+            Error::Pkcs11(e) => write!(f, "{e}"),
         }
     }
 }

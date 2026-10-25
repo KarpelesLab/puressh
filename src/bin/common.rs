@@ -978,6 +978,77 @@ fn key_signer(
     key.into_host_key_sync()
 }
 
+/// Asks for a PKCS#11 token's PIN on the terminal, as OpenSSH's ssh does.
+#[cfg(feature = "pkcs11")]
+pub struct Pkcs11TtyPrompt;
+
+#[cfg(feature = "pkcs11")]
+impl puressh::pkcs11::PinPrompt for Pkcs11TtyPrompt {
+    fn pin(&self, label: &str) -> Option<Zeroizing<String>> {
+        if !secret_prompt_available() {
+            return None;
+        }
+        read_secret(&format!("Enter PIN for '{label}': "))
+            .ok()
+            .filter(|p| !p.is_empty())
+    }
+}
+
+/// A token key as a publickey signer (shared, so a certificate can wrap it
+/// as well).
+#[cfg(feature = "pkcs11")]
+pub struct Pkcs11Signer(pub Arc<puressh::pkcs11::Pkcs11Key>);
+
+#[cfg(feature = "pkcs11")]
+impl puressh::hostkey::HostKey for Pkcs11Signer {
+    fn algorithm(&self) -> &'static str {
+        puressh::hostkey::HostKey::algorithm(&*self.0)
+    }
+
+    fn public_blob(&self) -> Vec<u8> {
+        self.0.public_key().wire_blob()
+    }
+
+    fn sign(&self, msg: &[u8]) -> puressh::Result<Vec<u8>> {
+        puressh::hostkey::HostKey::sign(&*self.0, msg)
+    }
+
+    fn upgraded_for(&self, server_sig_algs: &str) -> Option<Box<dyn puressh::hostkey::HostKey>> {
+        // An RSA token key signs with what the server prefers, as an RSA
+        // key held in memory does.
+        if !matches!(self.0.public_key(), puressh::key::PublicKey::Rsa { .. }) {
+            return None;
+        }
+        let algs: Vec<&str> = server_sig_algs.split(',').collect();
+        let alg = ["rsa-sha2-512", "rsa-sha2-256"]
+            .into_iter()
+            .find(|a| algs.contains(a))?;
+        Some(Box::new(puressh::pkcs11::Pkcs11RsaSigner::new(
+            self.0.clone(),
+            alg,
+        )))
+    }
+}
+
+/// The keys of the PKCS#11 module `path` (`PKCS11Provider`, `ssh -I`),
+/// logging in when signing needs it (asking for the PIN unless `batch`).
+#[cfg(feature = "pkcs11")]
+#[allow(dead_code)] // ssh only
+pub fn pkcs11_keys(path: &str, batch: bool) -> Vec<Arc<puressh::pkcs11::Pkcs11Key>> {
+    let prompt: Option<Arc<dyn puressh::pkcs11::PinPrompt>> = if batch {
+        None
+    } else {
+        Some(Arc::new(Pkcs11TtyPrompt))
+    };
+    match puressh::pkcs11::load(path, None, prompt) {
+        Ok(keys) => keys,
+        Err(e) => {
+            eprintln!("{e}");
+            Vec::new()
+        }
+    }
+}
+
 /// An identity file as a publickey credential: loaded now when it is not
 /// encrypted, else a [`LazyIdentity`] (when a passphrase can be asked for).
 /// `Ok(None)` for a default identity that does not exist or is unusable,

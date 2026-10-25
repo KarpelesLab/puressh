@@ -175,6 +175,8 @@ struct Args {
     sk_provider: Option<String>,
     /// `-K`: download the authenticator's resident keys.
     download_sk: bool,
+    /// `-D pkcs11`: list a PKCS#11 module's keys.
+    pkcs11: Option<String>,
 }
 
 /// Split getopt-style arguments as OpenSSH's ssh-keygen takes them: flags
@@ -363,6 +365,10 @@ fn parse_args(args: &[String]) -> Result<Args, String> {
             }
             "-H" => out.hash_all = true,
             "-K" => out.download_sk = true,
+            "-D" => {
+                i += 1;
+                out.pkcs11 = Some(args.get(i).ok_or("-D requires a provider")?.clone());
+            }
             "-w" => {
                 i += 1;
                 out.sk_provider = Some(args.get(i).ok_or("-w requires a provider")?.clone());
@@ -853,6 +859,46 @@ fn run_generate(args: &Args) -> Result<i32, String> {
         println!("{} {}", pk.sha256_fingerprint(), pk.comment());
         println!("The key's randomart image is:");
         println!("{}", randomart(&pk, &sha256(&pk.wire_blob()), "SHA256"));
+    }
+    Ok(0)
+}
+
+/// `ssh-keygen -D module`: the public keys of the module's tokens, as
+/// `authorized_keys` lines commented with their labels (`-l`: their
+/// fingerprints), as OpenSSH's `do_download`.
+#[cfg(feature = "pkcs11")]
+fn run_pkcs11_download(args: &Args, module: &str) -> Result<i32, i32> {
+    struct Prompt;
+    impl puressh::pkcs11::PinPrompt for Prompt {
+        fn pin(&self, label: &str) -> Option<Zeroizing<String>> {
+            read_passphrase_interactive(&format!("Enter PIN for '{label}': "))
+                .ok()
+                .filter(|p| !p.is_empty())
+        }
+    }
+    let keys = match puressh::pkcs11::load(module, None, Some(std::sync::Arc::new(Prompt))) {
+        Ok(k) if !k.is_empty() => k,
+        Ok(_) | Err(_) => {
+            eprintln!("cannot read public key from pkcs11");
+            return Err(255);
+        }
+    };
+    for k in &keys {
+        let pk = k.public_key();
+        if args.fingerprint {
+            let fp = if args.bubble {
+                bubblebabble(&sha1(&pk.wire_blob()))
+            } else {
+                pk.sha256_fingerprint()
+            };
+            println!(
+                "{} {fp} {} (PKCS11 key)",
+                pk.bit_length(),
+                algorithm_label(pk)
+            );
+        } else {
+            println!("{}", pk.to_authorized_keys_line());
+        }
     }
     Ok(0)
 }
@@ -1744,6 +1790,16 @@ fn run() -> Result<i32, i32> {
     #[cfg(feature = "security-key")]
     if let Some(p) = &parsed.sk_provider {
         let _ = security_key::PROVIDER.set(p.clone());
+    }
+    if let Some(module) = &parsed.pkcs11 {
+        #[cfg(feature = "pkcs11")]
+        return run_pkcs11_download(&parsed, module);
+        #[cfg(not(feature = "pkcs11"))]
+        {
+            let _ = module;
+            eprintln!("no pkcs11 support");
+            return Err(255);
+        }
     }
     let res = if parsed.fingerprint && !finding {
         run_fingerprint(&parsed)

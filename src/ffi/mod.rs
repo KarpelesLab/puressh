@@ -17,8 +17,8 @@
 //! ## Invariants
 //!
 //! - Without `ffi`, the crate root forbids `unsafe` (denies it, with an
-//!   exemption for the provider loader `sk`, when `security-key` is on):
-//!   `unsafe` belongs in this directory tree and in that loader only.
+//!   exemption for the loaders `sk` and `pkcs11`, when their features are on):
+//!   `unsafe` belongs in this directory tree and in those loaders only.
 //! - All entry points wrap their body in
 //!   `catch_unwind(AssertUnwindSafe(...))` and return [`PCSSH_ERR_PANIC`]
 //!   on unwind.

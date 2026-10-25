@@ -30,8 +30,37 @@ use super::protocol::*;
 use crate::format::{Reader, Writer};
 use crate::key::PrivateKey;
 
+/// A held key: in memory, or on a PKCS#11 token (`ssh-add -s`).
+enum HeldKey {
+    Soft(PrivateKey),
+    #[cfg(feature = "pkcs11")]
+    Token {
+        key: alloc::sync::Arc<crate::pkcs11::Pkcs11Key>,
+        /// The module's canonical path (`ssh-add -e` removes by it).
+        provider: String,
+    },
+}
+
+impl HeldKey {
+    fn public_key(&self) -> crate::key::PublicKey {
+        match self {
+            HeldKey::Soft(k) => k.public_key(),
+            #[cfg(feature = "pkcs11")]
+            HeldKey::Token { key, .. } => key.public_key().clone(),
+        }
+    }
+
+    fn soft(&self) -> Option<&PrivateKey> {
+        match self {
+            HeldKey::Soft(k) => Some(k),
+            #[cfg(feature = "pkcs11")]
+            HeldKey::Token { .. } => None,
+        }
+    }
+}
+
 struct Held {
-    key: PrivateKey,
+    key: HeldKey,
     blob: Vec<u8>,
     comment: String,
     expires: Option<Instant>,
@@ -45,13 +74,15 @@ struct Held {
 impl Drop for Held {
     /// Removed, expired or dropped with the agent: wipe the key.
     fn drop(&mut self) {
-        self.key.wipe();
+        if let HeldKey::Soft(k) = &mut self.key {
+            k.wipe();
+        }
     }
 }
 
 /// One hop of a destination constraint: a user pattern, a host name and
 /// its host (or CA) keys.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Hop {
     user: Option<String>,
     hostname: Option<String>,
@@ -61,7 +92,7 @@ struct Hop {
 
 /// `from > to`: the key may be used to reach `to` from `from` (from the
 /// origin when `from` has no host).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DestConstraint {
     from: Hop,
     to: Hop,
@@ -341,6 +372,16 @@ impl AgentState {
             SSH_AGENTC_ADD_IDENTITY | SSH_AGENTC_ADD_ID_CONSTRAINED => self
                 .add(conn, body, msg_type == SSH_AGENTC_ADD_ID_CONSTRAINED)
                 .unwrap_or_else(failure),
+            #[cfg(feature = "pkcs11")]
+            SSH_AGENTC_ADD_SMARTCARD_KEY | SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED => self
+                .add_smartcard(
+                    conn,
+                    body,
+                    msg_type == SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED,
+                )
+                .unwrap_or_else(failure),
+            #[cfg(feature = "pkcs11")]
+            SSH_AGENTC_REMOVE_SMARTCARD_KEY => self.remove_smartcard(body).unwrap_or_else(failure),
             SSH_AGENTC_REMOVE_IDENTITY => {
                 let mut r = Reader::new(body);
                 let Ok(blob) = r.read_string() else {
@@ -454,7 +495,22 @@ impl AgentState {
                 return None;
             }
         }
-        let sig = if let Some(sk) = held.key.sk_credential() {
+        #[cfg(feature = "pkcs11")]
+        if let HeldKey::Token { key, .. } = &held.key {
+            // SSH_AGENT_RSA_SHA2_512 / _256, as for a key in memory.
+            let alg = match key.public_key() {
+                crate::key::PublicKey::Rsa { .. } if flags & 4 != 0 => "rsa-sha2-512",
+                crate::key::PublicKey::Rsa { .. } if flags & 2 != 0 => "rsa-sha2-256",
+                crate::key::PublicKey::Rsa { .. } => "ssh-rsa",
+                other => other.algorithm(),
+            };
+            let sig = key.sign_with(alg, data).ok()?;
+            let mut w = Writer::new();
+            w.write_string(&sig);
+            return Some(reply(SSH_AGENT_SIGN_RESPONSE, w.as_slice()));
+        }
+        let key = held.key.soft()?;
+        let sig = if let Some(sk) = key.sk_credential() {
             // A web-origin key never signs a challenge a site could use.
             if let Some(allow) = &self.websafe_allowlist
                 && !pattern_list_matches(allow, &sk.application)
@@ -465,7 +521,7 @@ impl AgentState {
             }
             self.sign_security_key(held, data)?
         } else {
-            held.key.agent_signer(flags).ok()?.sign(data).ok()?
+            key.agent_signer(flags).ok()?.sign(data).ok()?
         };
         let mut w = Writer::new();
         w.write_string(&sig);
@@ -477,7 +533,7 @@ impl AgentState {
     fn sign_security_key(&self, held: &Held, data: &[u8]) -> Option<Vec<u8>> {
         use crate::hostkey::HostKey;
         let provider = crate::sk::open_provider(held.sk_provider.as_deref()?).ok()?;
-        crate::sk::SkSigner::new(held.key.clone(), provider, self.sk_prompt.clone())
+        crate::sk::SkSigner::new(held.key.soft()?.clone(), provider, self.sk_prompt.clone())
             .ok()?
             .sign(data)
             .ok()
@@ -503,88 +559,232 @@ impl AgentState {
         } else {
             (PrivateKey::from_agent_add_body(&mut r).ok()?, None)
         };
-        let mut lifetime = None;
-        let mut confirm = false;
-        let mut dest: Option<Vec<DestConstraint>> = None;
-        let mut sk_provider: Option<String> = None;
-        if constrained {
-            while !r.is_empty() {
-                match r.read_u8().ok()? {
-                    SSH_AGENT_CONSTRAIN_LIFETIME if lifetime.is_none() => {
-                        lifetime = Some(Duration::from_secs(r.read_u32().ok()? as u64));
-                    }
-                    // Without a way to ask, a key to confirm is refused
-                    // rather than held unconfirmed.
-                    SSH_AGENT_CONSTRAIN_CONFIRM if !confirm && self.confirm.is_some() => {
-                        confirm = true;
-                    }
-                    SSH_AGENT_CONSTRAIN_EXTENSION => match r.read_string().ok()? {
-                        b"restrict-destination-v00@openssh.com" if dest.is_none() => {
-                            let mut b = Reader::new(r.read_string().ok()?);
-                            let mut list = Vec::new();
-                            while !b.is_empty() {
-                                if list.len() >= MAX_DEST_CONSTRAINTS {
-                                    return None;
-                                }
-                                list.push(parse_dest_constraint(&mut b)?);
-                            }
-                            dest = Some(list);
-                        }
-                        b"sk-provider@openssh.com" if sk_provider.is_none() => {
-                            sk_provider = Some(
-                                core::str::from_utf8(r.read_string().ok()?)
-                                    .ok()?
-                                    .to_string(),
-                            );
-                        }
-                        _ => return None,
-                    },
-                    _ => return None,
-                }
-            }
+        let c = if constrained {
+            self.parse_constraints(&mut r, true, false)?
         } else if !r.is_empty() {
             return None;
-        }
+        } else {
+            Constraints::default()
+        };
+        let mut sk_provider = c.sk_provider;
         if let Some(p) = sk_provider.as_mut() {
             key.sk_credential()?;
             if !p.eq_ignore_ascii_case("internal") {
                 // Only a provider on the allowlist, and from a forwarded
                 // connection only when allowed.
-                let remote = conn.bind_attempted || !conn.binds.is_empty();
-                if remote && !self.remote_add_provider {
-                    return None;
-                }
-                *p = std::fs::canonicalize(&*p).ok()?.to_str()?.to_string();
-                if !pattern_list_matches(&self.allowed_providers, p) {
-                    return None;
-                }
+                *p = self.allowed_provider(conn, p)?;
             }
         }
         let blob = cert.unwrap_or_else(|| key.public_key().wire_blob());
         let comment = key.comment().to_string();
-        let expires = lifetime
+        let held = Held {
+            key: HeldKey::Soft(key),
+            blob,
+            comment,
+            expires: None,
+            confirm: c.confirm,
+            dest: c.dest,
+            sk_provider,
+        };
+        self.insert(conn, held, c.lifetime).then(success)
+    }
+
+    /// Hold `held` (with `lifetime`, else the default one), replacing the
+    /// same key, unless this connection could not see that one.
+    fn insert(
+        &mut self,
+        conn: &ConnectionState,
+        mut held: Held,
+        lifetime: Option<Duration>,
+    ) -> bool {
+        held.expires = lifetime
             .or(self.default_lifetime)
             .map(|d| Instant::now() + d);
-        // Re-adding a key replaces it (new comment / constraints), unless
-        // this connection could not see it.
-        if let Some(i) = self.keys.iter().position(|k| k.blob == blob) {
+        if let Some(i) = self.keys.iter().position(|k| k.blob == held.blob) {
             if !identity_permitted(&self.keys[i], conn, None) {
-                return None;
+                return false;
             }
             self.keys.remove(i);
         }
-        self.keys.push(Held {
-            key,
-            blob,
-            comment,
-            expires,
-            confirm,
-            dest: dest.unwrap_or_default(),
-            sk_provider,
-        });
-        Some(success())
+        self.keys.push(held);
+        true
+    }
+
+    /// Key constraints (`SSH_AGENT_CONSTRAIN_*` to the end of the request):
+    /// `sk-provider@openssh.com` for an identity, the associated
+    /// certificates for a smartcard.
+    fn parse_constraints(
+        &self,
+        r: &mut Reader<'_>,
+        sk: bool,
+        smartcard: bool,
+    ) -> Option<Constraints> {
+        let mut c = Constraints::default();
+        let (mut have_life, mut have_dest, mut have_certs) = (false, false, false);
+        while !r.is_empty() {
+            match r.read_u8().ok()? {
+                SSH_AGENT_CONSTRAIN_LIFETIME if !have_life => {
+                    have_life = true;
+                    c.lifetime = Some(Duration::from_secs(r.read_u32().ok()? as u64));
+                }
+                // Without a way to ask, a key to confirm is refused
+                // rather than held unconfirmed.
+                SSH_AGENT_CONSTRAIN_CONFIRM if !c.confirm && self.confirm.is_some() => {
+                    c.confirm = true;
+                }
+                SSH_AGENT_CONSTRAIN_EXTENSION => match r.read_string().ok()? {
+                    b"restrict-destination-v00@openssh.com" if !have_dest => {
+                        have_dest = true;
+                        let mut b = Reader::new(r.read_string().ok()?);
+                        while !b.is_empty() {
+                            if c.dest.len() >= MAX_DEST_CONSTRAINTS {
+                                return None;
+                            }
+                            c.dest.push(parse_dest_constraint(&mut b)?);
+                        }
+                    }
+                    b"sk-provider@openssh.com" if sk && c.sk_provider.is_none() => {
+                        c.sk_provider = Some(
+                            core::str::from_utf8(r.read_string().ok()?)
+                                .ok()?
+                                .to_string(),
+                        );
+                    }
+                    b"associated-certs-v00@openssh.com" if smartcard && !have_certs => {
+                        have_certs = true;
+                        c.cert_only = r.read_u8().ok()? != 0;
+                        let mut b = Reader::new(r.read_string().ok()?);
+                        while !b.is_empty() {
+                            if c.certs.len() >= MAX_ASSOCIATED_CERTS {
+                                return None;
+                            }
+                            c.certs.push(b.read_string().ok()?.to_vec());
+                        }
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+        Some(c)
+    }
+
+    /// The provider `path`, canonical, if this connection may load it
+    /// (`-P`, and `-O allow-remote-pkcs11` for a forwarded connection).
+    fn allowed_provider(&self, conn: &ConnectionState, path: &str) -> Option<String> {
+        let remote = conn.bind_attempted || !conn.binds.is_empty();
+        if remote && !self.remote_add_provider {
+            return None;
+        }
+        let p = std::fs::canonicalize(path).ok()?.to_str()?.to_string();
+        pattern_list_matches(&self.allowed_providers, &p).then_some(p)
+    }
+
+    /// `SSH_AGENTC_ADD_SMARTCARD_KEY[_CONSTRAINED]` (`ssh-add -s`): load
+    /// the PKCS#11 module with the PIN and hold its keys, and the given
+    /// certificates for them, as OpenSSH's agent does.
+    #[cfg(feature = "pkcs11")]
+    fn add_smartcard(
+        &mut self,
+        conn: &ConnectionState,
+        body: &[u8],
+        constrained: bool,
+    ) -> Option<Vec<u8>> {
+        let mut r = Reader::new(body);
+        let provider = core::str::from_utf8(r.read_string().ok()?)
+            .ok()?
+            .to_string();
+        let pin = Zeroizing::new(
+            core::str::from_utf8(r.read_string().ok()?)
+                .ok()?
+                .to_string(),
+        );
+        let c = if constrained {
+            self.parse_constraints(&mut r, false, true)?
+        } else if !r.is_empty() {
+            return None;
+        } else {
+            Constraints::default()
+        };
+        let provider = self.allowed_provider(conn, &provider)?;
+        let keys = crate::pkcs11::load(&provider, Some(&pin), None).ok()?;
+        let mut added = false;
+        for key in keys {
+            let blob = key.public_key().wire_blob();
+            let comment = match key.public_key().comment() {
+                "" => provider.clone(),
+                c => c.to_string(),
+            };
+            for cert in &c.certs {
+                let Ok(parsed) = crate::cert::Certificate::parse(cert) else {
+                    continue;
+                };
+                if parsed.embedded_pubkey_blob() != blob {
+                    continue;
+                }
+                let held = Held {
+                    key: HeldKey::Token {
+                        key: key.clone(),
+                        provider: provider.clone(),
+                    },
+                    blob: cert.clone(),
+                    comment: comment.clone(),
+                    expires: None,
+                    confirm: c.confirm,
+                    dest: c.dest.clone(),
+                    sk_provider: None,
+                };
+                added |= self.insert(conn, held, c.lifetime);
+            }
+            if !c.cert_only && !self.keys.iter().any(|k| k.blob == blob) {
+                let held = Held {
+                    key: HeldKey::Token {
+                        key,
+                        provider: provider.clone(),
+                    },
+                    blob,
+                    comment,
+                    expires: None,
+                    confirm: c.confirm,
+                    dest: c.dest.clone(),
+                    sk_provider: None,
+                };
+                added |= self.insert(conn, held, c.lifetime);
+            }
+        }
+        added.then(success)
+    }
+
+    /// `SSH_AGENTC_REMOVE_SMARTCARD_KEY` (`ssh-add -e`): forget every key
+    /// from that module.
+    #[cfg(feature = "pkcs11")]
+    fn remove_smartcard(&mut self, body: &[u8]) -> Option<Vec<u8>> {
+        let mut r = Reader::new(body);
+        let provider = core::str::from_utf8(r.read_string().ok()?).ok()?;
+        let provider = std::fs::canonicalize(provider).ok()?;
+        let provider = provider.to_str()?;
+        let before = self.keys.len();
+        self.keys
+            .retain(|k| !matches!(&k.key, HeldKey::Token { provider: p, .. } if p == provider));
+        (self.keys.len() != before).then(success)
     }
 }
+
+/// What an add request constrains.
+#[derive(Default)]
+struct Constraints {
+    lifetime: Option<Duration>,
+    confirm: bool,
+    dest: Vec<DestConstraint>,
+    sk_provider: Option<String>,
+    /// `associated-certs-v00@openssh.com` (smartcards): certificates to
+    /// hold for the token's keys, and whether to hold only those.
+    certs: Vec<Vec<u8>>,
+    cert_only: bool,
+}
+
+/// Most certificates one smartcard request may associate (OpenSSH's).
+const MAX_ASSOCIATED_CERTS: usize = 1024;
 
 /// `session-bind@openssh.com`: record that `conn` serves the session whose
 /// ID the host key signed (`forwarded`: for a forwarded agent rather than

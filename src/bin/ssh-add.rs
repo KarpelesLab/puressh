@@ -73,6 +73,8 @@ mod imp {
         download: bool,
         /// `-P`: don't ask for the authenticator's PIN.
         no_pin: bool,
+        /// `-s` / `-e`: the PKCS#11 module to add or remove.
+        pkcs11: Option<String>,
     }
 
     fn parse_lifetime(v: &str) -> Option<u32> {
@@ -153,11 +155,13 @@ mod imp {
                         'h' => o.destinations.push(v),
                         'H' => o.hostkey_files.push(v),
                         'S' => o.sk_provider = Some(v),
-                        // Deprecated, ignored (OpenSSH's too).
-                        'M' | 'm' => {}
-                        _ => {
-                            return Err("PKCS#11 tokens (-s/-e) are not supported".into());
+                        's' => o.pkcs11 = Some(v),
+                        'e' => {
+                            o.delete = true;
+                            o.pkcs11 = Some(v);
                         }
+                        // Deprecated, ignored (OpenSSH's too).
+                        _ => {}
                     }
                     break;
                 }
@@ -707,6 +711,10 @@ mod imp {
             }
         }
 
+        if let Some(module) = &o.pkcs11 {
+            return update_card(&mut agent, &o, module, &constraints);
+        }
+
         if o.download {
             #[cfg(feature = "security-key")]
             return add_resident_keys(&mut agent, &o, &constraints);
@@ -815,6 +823,56 @@ mod imp {
             }
         }
         status
+    }
+
+    /// `ssh-add -s module [certificate …]` / `-e module`: have the agent
+    /// add or remove a PKCS#11 module's keys, as OpenSSH's `update_card`.
+    fn update_card(agent: &mut Agent, o: &Opts, module: &str, c: &AddConstraints) -> i32 {
+        let add = !o.delete;
+        let mut certs = Vec::new();
+        if add && !o.key_only {
+            for f in &o.files {
+                match std::fs::read_to_string(f)
+                    .map_err(|e| e.to_string())
+                    .and_then(|t| Certificate::parse_openssh_line(&t).map_err(|e| e.to_string()))
+                {
+                    Ok(cert) => certs.push(cert.raw),
+                    Err(e) => {
+                        eprintln!("load certificate {f}: {e}");
+                        return 255;
+                    }
+                }
+            }
+        }
+        let pin = if add && !o.no_pin {
+            match common::read_secret("Enter passphrase for PKCS#11: ") {
+                Ok(p) => p,
+                Err(_) => return 1,
+            }
+        } else {
+            Zeroizing::new(String::new())
+        };
+        let res = if add {
+            agent.add_smartcard(module, &pin, c, &certs, o.cert_only)
+        } else {
+            agent.remove_smartcard(module)
+        };
+        drop(pin);
+        match res {
+            Ok(()) => {
+                if !o.quiet {
+                    eprintln!("Card {}: {module}", if add { "added" } else { "removed" });
+                }
+                0
+            }
+            Err(_) => {
+                eprintln!(
+                    "Could not {} card \"{module}\": agent refused operation",
+                    if add { "add" } else { "remove" }
+                );
+                1
+            }
+        }
     }
 
     /// `pk`'s fingerprint, MD5 (`-E md5`) or SHA-256.

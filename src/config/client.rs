@@ -359,6 +359,9 @@ pub struct ClientOptions {
     pub certificate_files: Vec<String>,
     /// `IdentitiesOnly` (yes/no).
     pub identities_only: Option<bool>,
+    /// `PKCS11Provider` (`ssh -I`): the PKCS#11 module whose tokens'
+    /// keys are offered; `Some("none")` turns it off.
+    pub pkcs11_provider: Option<String>,
     /// `SecurityKeyProvider`: `internal` or a FIDO middleware library, for
     /// security-key identities (`$SSH_SK_PROVIDER` when unset).
     pub security_key_provider: Option<String>,
@@ -947,6 +950,9 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "identitiesonly" => {
             opts.identities_only = Some(parse_yes_no(line)?);
         }
+        "pkcs11provider" => {
+            opts.pkcs11_provider = Some(one_arg(line)?);
+        }
         "securitykeyprovider" => {
             opts.security_key_provider = Some(one_arg(line)?.to_string());
         }
@@ -1533,11 +1539,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("LogVerbose", &["*"], ""),
     ("NoHostAuthenticationForLocalhost", &["*"], ""),
     (
-        "PKCS11Provider",
-        &["none"],
-        "PKCS#11 tokens are not supported",
-    ),
-    (
         "ProxyUseFdpass",
         &["no"],
         "a ProxyCommand that passes a file descriptor is not supported",
@@ -1602,6 +1603,7 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(user);
     take_scalar!(identities_only);
     take_scalar!(security_key_provider);
+    take_scalar!(pkcs11_provider);
     take_scalar!(strict_host_key);
     take_scalar!(user_known_hosts);
     take_scalar!(hash_known_hosts);
@@ -2577,13 +2579,27 @@ Host *.example.com !secret.example.com
         assert_eq!(o.connection_attempts, Some(3));
     }
 
+    /// `PKCS11Provider` and `SecurityKeyProvider` are taken as given.
+    #[test]
+    fn token_providers_parse() {
+        let cfg = SshClientConfig::parse(
+            "PKCS11Provider /usr/lib/opensc-pkcs11.so\nSecurityKeyProvider internal\n",
+        )
+        .unwrap();
+        let o = cfg.lookup("h");
+        assert_eq!(
+            o.pkcs11_provider.as_deref(),
+            Some("/usr/lib/opensc-pkcs11.so")
+        );
+        assert_eq!(o.security_key_provider.as_deref(), Some("internal"));
+    }
+
     /// Ignored keywords whose value would change behaviour are refused.
     #[test]
     fn unsupported_values_refused() {
         for src in [
             "Tunnel maybe\n",
             "ProxyUseFdpass yes\n",
-            "PKCS11Provider /usr/lib/opensc-pkcs11.so\n",
             "RequiredRSASize 4096\n",
         ] {
             assert!(

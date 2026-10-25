@@ -1,11 +1,17 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(
-    not(any(feature = "ffi", feature = "security-key")),
+    not(any(feature = "ffi", feature = "security-key", feature = "pkcs11")),
     forbid(unsafe_code)
 )]
 // Loading a security-key provider or PKCS#11 module is FFI: `unsafe` is
 // allowed in those modules alone.
-#![cfg_attr(all(not(feature = "ffi"), feature = "security-key"), deny(unsafe_code))]
+#![cfg_attr(
+    all(
+        not(feature = "ffi"),
+        any(feature = "security-key", feature = "pkcs11")
+    ),
+    deny(unsafe_code)
+)]
 #![deny(rust_2018_idioms)]
 #![warn(missing_docs)]
 
@@ -151,6 +157,10 @@ pub mod knock;
 #[cfg(feature = "security-key")]
 #[allow(unsafe_code)]
 pub mod sk;
+
+#[cfg(feature = "pkcs11")]
+#[allow(unsafe_code)]
+pub mod pkcs11;
 
 #[cfg(feature = "server")]
 pub mod server;

@@ -70,6 +70,8 @@ pub(crate) fn map_error(err: &Error) -> c_int {
         | Error::CertUnknownCriticalOption => PCSSH_ERR_HOSTKEY_REJECTED,
         #[cfg(feature = "security-key")]
         Error::SecurityKey(_) => PCSSH_ERR_AUTH_FAILED,
+        #[cfg(feature = "pkcs11")]
+        Error::Pkcs11(_) => PCSSH_ERR_AUTH_FAILED,
     }
 }
 

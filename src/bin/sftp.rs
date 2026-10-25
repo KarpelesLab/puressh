@@ -711,6 +711,69 @@ fn basename(p: &[u8]) -> Vec<u8> {
     p[start..end].to_vec()
 }
 
+/// Skip a `[...]` class starting at `p[i]`: the index of its `]`, if any.
+fn class_end(p: &[u8], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    if p.get(j) == Some(&b'!') {
+        j += 1;
+    }
+    if p.get(j) == Some(&b']') {
+        j += 1;
+    }
+    p[j.min(p.len())..]
+        .iter()
+        .position(|c| *c == b']')
+        .map(|k| j + k)
+}
+
+/// `glob(3)`'s `GLOB_BRACE`: `a{b,c{d,e}}f` as `abf`, `acdf`, `acef`
+/// (unbalanced braces and `{}` stay literal).
+fn brace_expand(p: &[u8]) -> Vec<Vec<u8>> {
+    if p == b"{}" {
+        return vec![p.to_vec()];
+    }
+    let mut i = 0;
+    while i < p.len() && p[i] != b'{' {
+        i += if p[i] == b'\\' { 2 } else { 1 };
+    }
+    if i >= p.len() {
+        return vec![p.to_vec()];
+    }
+    // The matching `}` and the top-level commas between.
+    let (open, mut depth, mut commas, mut close) = (i, 0, Vec::new(), None);
+    let mut j = i;
+    while j < p.len() {
+        match p[j] {
+            b'\\' => j += 1,
+            b'[' => j = class_end(p, j).unwrap_or(j),
+            b'{' => depth += 1,
+            b',' if depth == 1 => commas.push(j),
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(j);
+                    break;
+                }
+            }
+            _ => {}
+        }
+        j += 1;
+    }
+    let Some(close) = close else {
+        return vec![p.to_vec()];
+    };
+    let mut out = Vec::new();
+    let mut from = open + 1;
+    for end in commas.into_iter().chain([close]) {
+        let mut alt = p[..open].to_vec();
+        alt.extend_from_slice(&p[from..end]);
+        alt.extend_from_slice(&p[close + 1..]);
+        out.extend(brace_expand(&alt));
+        from = end + 1;
+    }
+    out
+}
+
 /// OpenSSH's `argv_split` for `-D`: words with `'`/`"` quoting and `\`
 /// escapes; `#` ends the line.
 fn argv_split(s: &str) -> Option<Vec<String>> {
@@ -1283,6 +1346,19 @@ impl Session {
             }
             g.paths.push(p);
             g.stats.push(None);
+        }
+        g
+    }
+
+    /// `ls`'s glob, which also expands `{a,b}` (`GLOB_BRACE`): each
+    /// alternative is a pattern of its own.
+    fn glob_brace(&mut self, pattern: &[u8]) -> Glob {
+        let mut g = Glob::default();
+        for p in brace_expand(pattern) {
+            let one = self.glob(&p, true, true);
+            g.matched += one.matched;
+            g.paths.extend(one.paths);
+            g.stats.extend(one.stats);
         }
         g
     }
@@ -1870,7 +1946,7 @@ impl Session {
     /// `ls path` (OpenSSH's `do_globbed_ls`): the matches of a pattern, or
     /// a single directory's contents.
     fn do_globbed_ls(&mut self, path: &[u8], strip: Option<&[u8]>, lflag: u32) -> Res {
-        let g = self.glob(path, true, true);
+        let g = self.glob_brace(path);
         if g.matched == 0 {
             return Err(format!("Can't ls: \"{}\" not found", lossy(path)));
         }
@@ -3116,6 +3192,22 @@ mod tests {
             Some(argv(&["srv", "-d", "/a b", "x y"]))
         );
         assert_eq!(argv_split("srv 'x"), None);
+    }
+
+    #[test]
+    fn braces() {
+        let e = |p: &str| -> Vec<String> {
+            brace_expand(p.as_bytes())
+                .iter()
+                .map(|v| lossy(v))
+                .collect()
+        };
+        assert_eq!(e("a{b,c{d,e}}f"), ["abf", "acdf", "acef"]);
+        assert_eq!(e("{a.txt,nope}"), ["a.txt", "nope"]);
+        assert_eq!(e("x{[,]}y"), ["x[,]y"]);
+        assert_eq!(e("{}"), ["{}"]);
+        assert_eq!(e("a{b"), ["a{b"]);
+        assert_eq!(e("a\\{b,c}"), ["a\\{b,c}"]);
     }
 
     #[test]

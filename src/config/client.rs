@@ -544,6 +544,83 @@ pub struct ClientOptions {
     pub global_known_hosts_files: Option<Vec<String>>,
     /// `ConnectionAttempts`.
     pub connection_attempts: Option<u32>,
+    /// `CheckHostIP` (default no): also check (and record) the server's
+    /// address in `known_hosts`.
+    pub check_host_ip: Option<bool>,
+    /// `VerifyHostKeyDNS` (default no): check the host key against the
+    /// host's `SSHFP` records.
+    pub verify_host_key_dns: Option<VerifyHostKeyDns>,
+    /// `VisualHostKey` (default no): show the host key's randomart.
+    pub visual_host_key: Option<bool>,
+    /// `NoHostAuthenticationForLocalhost` (default no): accept any host key
+    /// from a loopback address.
+    pub no_host_authentication_for_localhost: Option<bool>,
+    /// `FingerprintHash`: the hash fingerprints are shown with, as OpenSSH
+    /// names it (`MD5`, `SHA1`, `SHA256`, `SHA384`, `SHA512`; default
+    /// `SHA256`).
+    pub fingerprint_hash: Option<String>,
+    /// `BindInterface`: the interface the connection is made from.
+    pub bind_interface: Option<String>,
+    /// `IPQoS`: the TOS / DSCP values for interactive and non-interactive
+    /// traffic, each [`IPQOS_NONE`] for the system default.
+    pub ip_qos: Option<(u32, u32)>,
+    /// `ForwardX11Timeout` in seconds (default 1200, `0`: no timeout).
+    pub forward_x11_timeout: Option<u32>,
+    /// `XAuthLocation` (default `/usr/bin/xauth`).
+    pub xauth_location: Option<String>,
+    /// `CanonicalizePermittedCNAMEs`: `(source domains, target domains)`
+    /// pattern lists, empty for `none`.
+    pub canonicalize_permitted_cnames: Option<Vec<(String, String)>>,
+    /// `ChannelTimeout`: `type=interval` entries as written (`none` is
+    /// empty); [`parse_channel_timeout`] reads one.
+    pub channel_timeouts: Option<Vec<String>>,
+    /// `LogVerbose`: `file:function:line` patterns (empty for `none`).
+    pub log_verbose: Option<Vec<String>>,
+    /// `SyslogFacility` (default `USER`), upper-cased.
+    pub syslog_facility: Option<String>,
+    /// `StreamLocalBindMask` (default `0177`).
+    pub stream_local_bind_mask: Option<u32>,
+    /// `StreamLocalBindUnlink` (default no).
+    pub stream_local_bind_unlink: Option<bool>,
+    /// `RequiredRSASize` (default 1024; this library never accepts RSA
+    /// keys under 2048 bits whatever the value).
+    pub required_rsa_size: Option<u32>,
+    /// `ProxyUseFdpass` (default no): the `ProxyCommand` passes back a
+    /// connected socket instead of carrying the connection.
+    pub proxy_use_fdpass: Option<bool>,
+    /// `KbdInteractiveDevices`: the comma-separated `submethods` sent with
+    /// keyboard-interactive authentication.
+    pub kbd_interactive_devices: Option<String>,
+    /// `WarnWeakCrypto` (default yes): warn when the negotiated key
+    /// exchange is not post-quantum.
+    pub warn_weak_crypto: Option<bool>,
+    /// `VersionAddendum`: appended to the client's identification string
+    /// (`none` is kept as an empty string).
+    pub version_addendum: Option<String>,
+    /// `RefuseConnection`: a matching block refuses the connection; this
+    /// is the message (`<location>: RefuseConnection: <reason>`).
+    pub refuse_connection: Option<String>,
+    /// `Tunnel`: `yes`, `point-to-point`, `ethernet` or `no`, as written.
+    pub tunnel: Option<String>,
+    /// `TunnelDevice`: `local[:remote]`, as written.
+    pub tunnel_device: Option<String>,
+    /// `EnableEscapeCommandline` (default no): the `~C` command line.
+    pub enable_escape_commandline: Option<bool>,
+}
+
+/// [`ClientOptions::ip_qos`]'s value for `none`: the system default.
+pub const IPQOS_NONE: u32 = u32::MAX;
+
+/// `VerifyHostKeyDNS` value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerifyHostKeyDns {
+    /// `no`: SSHFP records are not consulted.
+    No,
+    /// `yes`: a key matching a DNSSEC-validated SSHFP record is trusted.
+    Yes,
+    /// `ask`: matching records are reported, but known_hosts still decides.
+    Ask,
 }
 
 /// One block in a parsed `ssh_config` — either a `Host` block or a `Match`
@@ -614,7 +691,8 @@ impl SshClientConfig {
     #[cfg(feature = "std")]
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> Result<Self, ConfigError> {
         let lines = super::include::tokenize_file_with_includes(path.as_ref(), 0)?;
-        let blocks = parse_blocks(lines)?;
+        let mut blocks = parse_blocks(lines)?;
+        name_source(&mut blocks, path.as_ref());
         Ok(SshClientConfig {
             blocks,
             enable_match_exec: false,
@@ -631,7 +709,8 @@ impl SshClientConfig {
     ) -> Result<Self, ConfigError> {
         let lines =
             super::include::tokenize_file_with_includes_expanding(path.as_ref(), 0, expand)?;
-        let blocks = parse_blocks(lines)?;
+        let mut blocks = parse_blocks(lines)?;
+        name_source(&mut blocks, path.as_ref());
         Ok(SshClientConfig {
             blocks,
             enable_match_exec: false,
@@ -765,6 +844,20 @@ impl SshClientConfig {
             }
         }
         out
+    }
+}
+
+/// Name the file a configuration was read from in the messages that
+/// quote its own lines (`RefuseConnection`), as OpenSSH words them
+/// (`<file> line <n>: ...`); an included file's lines name theirs already.
+#[cfg(feature = "std")]
+fn name_source(blocks: &mut [Block], path: &std::path::Path) {
+    for b in blocks {
+        if let Some(msg) = &mut b.opts_mut().refuse_connection
+            && msg.starts_with("line ")
+        {
+            *msg = format!("{} {msg}", path.display());
+        }
     }
 }
 
@@ -926,8 +1019,12 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
 fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), ConfigError> {
     // OpenSSH's older names for current keywords.
     let kw = match line.keyword.as_str() {
-        "challengeresponseauthentication" => "kbdinteractiveauthentication",
+        "challengeresponseauthentication" | "skeyauthentication" | "tisauthentication" => {
+            "kbdinteractiveauthentication"
+        }
         "dsaauthentication" => "pubkeyauthentication",
+        "keepalive" => "tcpkeepalive",
+        "identityfile2" => "identityfile",
         kw => kw,
     };
     let args = &line.args;
@@ -950,7 +1047,7 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "identitiesonly" => {
             opts.identities_only = Some(parse_yes_no(line)?);
         }
-        "pkcs11provider" => {
+        "pkcs11provider" | "smartcarddevice" => {
             opts.pkcs11_provider = Some(one_arg(line)?);
         }
         "securitykeyprovider" => {
@@ -1462,6 +1559,210 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     }
                 })?);
         }
+        "checkhostip" => opts.check_host_ip = Some(parse_yes_no(line)?),
+        "verifyhostkeydns" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            opts.verify_host_key_dns = Some(match v.as_str() {
+                "yes" | "true" => VerifyHostKeyDns::Yes,
+                "no" | "false" => VerifyHostKeyDns::No,
+                "ask" => VerifyHostKeyDns::Ask,
+                _ => return Err(bad_value(line, format!("expected yes/no/ask, got {v:?}"))),
+            });
+        }
+        "visualhostkey" => opts.visual_host_key = Some(parse_yes_no(line)?),
+        "nohostauthenticationforlocalhost" => {
+            opts.no_host_authentication_for_localhost = Some(parse_yes_no(line)?)
+        }
+        "fingerprinthash" => {
+            let v = one_arg(line)?;
+            opts.fingerprint_hash = Some(
+                fingerprint_hash_name(&v)
+                    .ok_or_else(|| bad_value(line, format!("Invalid hash algorithm \"{v}\"")))?
+                    .to_string(),
+            );
+        }
+        "bindinterface" => opts.bind_interface = Some(one_arg(line)?),
+        "ipqos" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(bad_value(line, "expected one or two values".into()));
+            }
+            let mut values = [IPQOS_NONE; 2];
+            for (slot, a) in values.iter_mut().zip(args.iter()) {
+                *slot = parse_ipqos(a)
+                    .ok_or_else(|| bad_value(line, format!("Bad IPQoS value: {a}")))?;
+            }
+            // One value is for both kinds of traffic.
+            let bulk = if args.len() == 2 {
+                values[1]
+            } else {
+                values[0]
+            };
+            opts.ip_qos = Some((values[0], bulk));
+        }
+        "forwardx11timeout" => {
+            let v = one_arg(line)?;
+            opts.forward_x11_timeout = Some(if v.eq_ignore_ascii_case("none") {
+                0
+            } else {
+                parse_time(line, &v)?
+            });
+        }
+        "xauthlocation" => opts.xauth_location = Some(one_arg(line)?),
+        "canonicalizepermittedcnames" => {
+            let mut rules = Vec::new();
+            for a in args {
+                if a.eq_ignore_ascii_case("none") {
+                    if args.len() != 1 {
+                        return Err(bad_value(
+                            line,
+                            "\"none\" argument must appear alone.".into(),
+                        ));
+                    }
+                } else if a == "*" {
+                    rules.push(("*".to_string(), "*".to_string()));
+                } else {
+                    match a.to_ascii_lowercase().split_once(':') {
+                        Some((from, to)) if !to.is_empty() => {
+                            rules.push((from.to_string(), to.to_string()))
+                        }
+                        _ => {
+                            return Err(bad_value(
+                                line,
+                                format!("Invalid permitted CNAME \"{a}\""),
+                            ));
+                        }
+                    }
+                }
+            }
+            if args.is_empty() {
+                return Err(bad_value(
+                    line,
+                    "no CanonicalizePermittedCNAMEs specified".into(),
+                ));
+            }
+            if opts.canonicalize_permitted_cnames.is_none() {
+                opts.canonicalize_permitted_cnames = Some(rules);
+            }
+        }
+        "channeltimeout" => {
+            let mut list = Vec::new();
+            for a in args {
+                if a.eq_ignore_ascii_case("none") {
+                    if args.len() != 1 {
+                        return Err(bad_value(
+                            line,
+                            "\"none\" argument must appear alone.".into(),
+                        ));
+                    }
+                } else if parse_channel_timeout(a).is_none() {
+                    return Err(bad_value(line, format!("invalid channel timeout {a}")));
+                } else {
+                    list.push(a.clone());
+                }
+            }
+            if args.is_empty() {
+                return Err(bad_value(line, "no ChannelTimeout specified".into()));
+            }
+            if opts.channel_timeouts.is_none() {
+                opts.channel_timeouts = Some(list);
+            }
+        }
+        "logverbose" => {
+            let mut list = Vec::new();
+            for a in args {
+                if a.eq_ignore_ascii_case("none") {
+                    if args.len() != 1 {
+                        return Err(bad_value(
+                            line,
+                            "\"none\" argument must appear alone.".into(),
+                        ));
+                    }
+                } else {
+                    list.push(a.clone());
+                }
+            }
+            // OpenSSH keeps only the first pattern of the line it takes.
+            list.truncate(1);
+            if opts.log_verbose.is_none() && !args.is_empty() {
+                opts.log_verbose = Some(list);
+            }
+        }
+        "syslogfacility" => {
+            let v = one_arg(line)?;
+            let f = syslog_facility_name(&v)
+                .ok_or_else(|| bad_value(line, format!("unsupported log facility '{v}'")))?;
+            opts.syslog_facility = Some(f.to_string());
+        }
+        "streamlocalbindmask" => {
+            let v = one_arg(line)?;
+            let mask = u32::from_str_radix(&v, 8)
+                .ok()
+                .filter(|m| *m <= 0o777)
+                .ok_or_else(|| bad_value(line, "Bad mask.".into()))?;
+            opts.stream_local_bind_mask = Some(mask);
+        }
+        "streamlocalbindunlink" => opts.stream_local_bind_unlink = Some(parse_yes_no(line)?),
+        "requiredrsasize" => opts.required_rsa_size = Some(parse_u32(line)?),
+        "proxyusefdpass" => opts.proxy_use_fdpass = Some(parse_yes_no(line)?),
+        "kbdinteractivedevices" => opts.kbd_interactive_devices = Some(one_arg(line)?),
+        "warnweakcrypto" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            opts.warn_weak_crypto = Some(match v.as_str() {
+                "yes" | "true" => true,
+                "no" | "false" | "no-pq-kex" => false,
+                _ => {
+                    return Err(bad_value(
+                        line,
+                        format!("expected yes/no/no-pq-kex, got {v:?}"),
+                    ));
+                }
+            });
+        }
+        "versionaddendum" => {
+            // The rest of the line as written (OpenSSH keeps a trailing
+            // `# ...` too).
+            let v = line.rest.trim();
+            if v.is_empty() {
+                return Err(bad_value(line, "VersionAddendum missing argument.".into()));
+            }
+            if v.contains('\r') {
+                return Err(bad_value(line, "Invalid VersionAddendum argument".into()));
+            }
+            if opts.version_addendum.is_none() {
+                opts.version_addendum = Some(if v.eq_ignore_ascii_case("none") {
+                    String::new()
+                } else {
+                    v.to_string()
+                });
+            }
+        }
+        "refuseconnection" => {
+            // Refused when the block applies (OpenSSH stops right there).
+            let reason = line
+                .args
+                .first()
+                .filter(|a| !a.is_empty())
+                .ok_or_else(|| bad_value(line, "Missing argument.".into()))?;
+            if opts.refuse_connection.is_none() {
+                opts.refuse_connection =
+                    Some(format!("{}: RefuseConnection: {reason}", line.location()));
+            }
+        }
+        "tunnel" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            if !matches!(
+                v.as_str(),
+                "yes" | "true" | "no" | "false" | "point-to-point" | "ethernet"
+            ) {
+                return Err(bad_value(
+                    line,
+                    "expected yes, no, point-to-point or ethernet".into(),
+                ));
+            }
+            opts.tunnel = Some(v);
+        }
+        "tunneldevice" => opts.tunnel_device = Some(one_arg(line)?),
+        "enableescapecommandline" => opts.enable_escape_commandline = Some(parse_yes_no(line)?),
         _ => {
             if let Some((_, allowed, why)) = IGNORED_KEYWORDS
                 .iter()
@@ -1511,18 +1812,11 @@ pub fn parse_escape_char(v: &str) -> Option<Option<u8>> {
 /// stricter or lose a convenience. A value whose loss would silently weaken
 /// security or break the connection is refused instead.
 const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
-    ("BindInterface", &["*"], ""),
-    ("CanonicalizePermittedCNAMEs", &["*"], ""),
-    ("ChannelTimeout", &["*"], ""),
-    ("CheckHostIP", &["*"], ""),
-    ("EnableEscapeCommandline", &["*"], ""),
     (
         "EnableSSHKeysign",
         &["no"],
         "host-based authentication is not supported",
     ),
-    ("FingerprintHash", &["*"], ""),
-    ("ForwardX11Timeout", &["*"], ""),
     ("GSSAPIAuthentication", &["*"], ""),
     ("GSSAPIDelegateCredentials", &["*"], ""),
     ("GSSAPIKeyExchange", &["*"], ""),
@@ -1534,34 +1828,7 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("HostbasedAcceptedAlgorithms", &["*"], ""),
     ("HostbasedKeyTypes", &["*"], ""),
     ("HostbasedAuthentication", &["*"], ""),
-    ("IPQoS", &["*"], ""),
-    ("KbdInteractiveDevices", &["*"], ""),
-    ("LogVerbose", &["*"], ""),
-    ("NoHostAuthenticationForLocalhost", &["*"], ""),
-    (
-        "ProxyUseFdpass",
-        &["no"],
-        "a ProxyCommand that passes a file descriptor is not supported",
-    ),
-    (
-        "RequiredRSASize",
-        &["1024", "2048"],
-        "RSA keys under 2048 bits are always refused; a higher floor is not supported",
-    ),
-    ("StreamLocalBindMask", &["*"], ""),
-    ("StreamLocalBindUnlink", &["*"], ""),
-    ("SyslogFacility", &["*"], ""),
-    (
-        "Tunnel",
-        &["yes", "true", "no", "false", "point-to-point", "ethernet"],
-        "expected yes, no, point-to-point or ethernet",
-    ),
-    ("TunnelDevice", &["*"], ""),
     ("UseKeychain", &["*"], ""),
-    ("VerifyHostKeyDNS", &["*"], ""),
-    ("VisualHostKey", &["*"], ""),
-    ("WarnWeakCrypto", &["*"], ""),
-    ("XAuthLocation", &["*"], ""),
     // Removed from OpenSSH; it ignores them with a warning.
     ("Protocol", &["*"], ""),
     ("Cipher", &["*"], ""),
@@ -1569,9 +1836,15 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("UseRoaming", &["*"], ""),
     ("RSAAuthentication", &["*"], ""),
     ("RhostsRSAAuthentication", &["*"], ""),
+    ("RhostsAuthentication", &["*"], ""),
     ("UsePrivilegedPort", &["*"], ""),
     ("FallBackToRsh", &["*"], ""),
     ("UseRsh", &["*"], ""),
+    ("GlobalKnownHostsFile2", &["*"], ""),
+    ("UserKnownHostsFile2", &["*"], ""),
+    ("AFSTokenPassing", &["*"], ""),
+    ("KerberosAuthentication", &["*"], ""),
+    ("KerberosTGTPassing", &["*"], ""),
 ];
 
 impl ClientOptions {
@@ -1674,6 +1947,30 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(revoked_host_keys);
     take_scalar!(global_known_hosts_files);
     take_scalar!(connection_attempts);
+    take_scalar!(check_host_ip);
+    take_scalar!(verify_host_key_dns);
+    take_scalar!(visual_host_key);
+    take_scalar!(no_host_authentication_for_localhost);
+    take_scalar!(fingerprint_hash);
+    take_scalar!(bind_interface);
+    take_scalar!(ip_qos);
+    take_scalar!(forward_x11_timeout);
+    take_scalar!(xauth_location);
+    take_scalar!(canonicalize_permitted_cnames);
+    take_scalar!(channel_timeouts);
+    take_scalar!(log_verbose);
+    take_scalar!(syslog_facility);
+    take_scalar!(stream_local_bind_mask);
+    take_scalar!(stream_local_bind_unlink);
+    take_scalar!(required_rsa_size);
+    take_scalar!(proxy_use_fdpass);
+    take_scalar!(kbd_interactive_devices);
+    take_scalar!(warn_weak_crypto);
+    take_scalar!(version_addendum);
+    take_scalar!(refuse_connection);
+    take_scalar!(tunnel);
+    take_scalar!(tunnel_device);
+    take_scalar!(enable_escape_commandline);
     dst.identity_files
         .extend(src.identity_files.iter().cloned());
     dst.certificate_files
@@ -1898,6 +2195,109 @@ fn parse_obscure_keystroke_timing(
     }
     let interval_ms = u32::try_from(ms).map_err(|_| bad("interval: too large".into()))?;
     Ok(ObscureKeystrokeTiming::On { interval_ms })
+}
+
+fn bad_value(line: &ParsedLine, msg: String) -> ConfigError {
+    ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg,
+    }
+}
+
+/// OpenSSH's name for the fingerprint hash `v` names (any case), as
+/// `FingerprintHash` takes it.
+pub fn fingerprint_hash_name(v: &str) -> Option<&'static str> {
+    const NAMES: &[&str] = &["MD5", "SHA1", "SHA256", "SHA384", "SHA512"];
+    NAMES.iter().find(|n| n.eq_ignore_ascii_case(v)).copied()
+}
+
+/// OpenSSH's `SyslogFacility` names.
+const SYSLOG_FACILITIES: &[&str] = &[
+    "DAEMON", "USER", "AUTH", "AUTHPRIV", "LOCAL0", "LOCAL1", "LOCAL2", "LOCAL3", "LOCAL4",
+    "LOCAL5", "LOCAL6", "LOCAL7",
+];
+
+/// The `SyslogFacility` `v` names (any case), upper-cased.
+pub fn syslog_facility_name(v: &str) -> Option<&'static str> {
+    SYSLOG_FACILITIES
+        .iter()
+        .find(|n| n.eq_ignore_ascii_case(v))
+        .copied()
+}
+
+/// OpenSSH's `IPQoS` names and their TOS values (`none`: [`IPQOS_NONE`]).
+const IPQOS_NAMES: [(&str, u32); 25] = [
+    ("none", IPQOS_NONE),
+    ("af11", 0x28),
+    ("af12", 0x30),
+    ("af13", 0x38),
+    ("af21", 0x48),
+    ("af22", 0x50),
+    ("af23", 0x58),
+    ("af31", 0x68),
+    ("af32", 0x70),
+    ("af33", 0x78),
+    ("af41", 0x88),
+    ("af42", 0x90),
+    ("af43", 0x98),
+    ("cs0", 0x00),
+    ("cs1", 0x20),
+    ("cs2", 0x40),
+    ("cs3", 0x60),
+    ("cs4", 0x80),
+    ("cs5", 0xa0),
+    ("cs6", 0xc0),
+    ("cs7", 0xe0),
+    ("ef", 0xb8),
+    ("le", 0x04),
+    ("va", 0xb0),
+    // Not DSCP values: OpenSSH takes the system default for them.
+    ("lowdelay", IPQOS_NONE),
+];
+
+/// One `IPQoS` value: a name (`af21`, `ef`, `none`, …) or a number up to
+/// 255. The deprecated `lowdelay`, `throughput` and `reliability` mean the
+/// system default, as in OpenSSH.
+pub fn parse_ipqos(v: &str) -> Option<u32> {
+    if v.eq_ignore_ascii_case("throughput") || v.eq_ignore_ascii_case("reliability") {
+        return Some(IPQOS_NONE);
+    }
+    for (n, tos) in IPQOS_NAMES {
+        if n.eq_ignore_ascii_case(v) {
+            return Some(tos);
+        }
+    }
+    // `strtonum(cp, 0, 255)`: decimal only.
+    v.parse::<u32>().ok().filter(|n| *n <= 255)
+}
+
+/// OpenSSH's spelling of an `IPQoS` value (`iptos2str`): its name, else
+/// `0x..`.
+pub fn ipqos_name(tos: u32) -> String {
+    for (n, t) in IPQOS_NAMES {
+        if t == tos && n != "lowdelay" {
+            return n.to_string();
+        }
+    }
+    format!("0x{tos:02x}")
+}
+
+/// One `ChannelTimeout` entry, `type=interval`: the type pattern and the
+/// timeout in seconds (`0`: none).
+pub fn parse_channel_timeout(spec: &str) -> Option<(String, u32)> {
+    let (ty, interval) = spec.split_once('=')?;
+    if ty.is_empty() || interval.is_empty() {
+        return None;
+    }
+    let probe = ParsedLine {
+        line_no: 0,
+        keyword: String::new(),
+        args: Vec::new(),
+        rest: String::new(),
+        file: None,
+    };
+    Some((ty.to_string(), parse_time(&probe, interval).ok()?))
 }
 
 fn parse_yes_no(line: &ParsedLine) -> Result<bool, ConfigError> {
@@ -2598,9 +2998,7 @@ Host *.example.com !secret.example.com
     #[test]
     fn unsupported_values_refused() {
         for src in [
-            "Tunnel maybe\n",
-            "ProxyUseFdpass yes\n",
-            "RequiredRSASize 4096\n",
+            "EnableSSHKeysign yes\n",
         ] {
             assert!(
                 matches!(
@@ -2610,6 +3008,127 @@ Host *.example.com !secret.example.com
                 "{src}"
             );
         }
+    }
+
+    /// The keywords OpenSSH's client acts on, with its value checks.
+    #[test]
+    fn client_keywords_parse_as_openssh() {
+        let cfg = SshClientConfig::parse(
+            "CheckHostIP yes\nVerifyHostKeyDNS ask\nVisualHostKey yes\n\
+             NoHostAuthenticationForLocalhost yes\nFingerprintHash md5\n\
+             BindInterface eth0\nIPQoS af21\nForwardX11Timeout 1h\n\
+             XAuthLocation /opt/xauth\n\
+             CanonicalizePermittedCNAMEs *.a.example:*.b.example *\n\
+             ChannelTimeout session=5m global=0\nLogVerbose kex.c:*:1000 x.c:*\n\
+             SyslogFacility local3\nStreamLocalBindMask 022\nStreamLocalBindUnlink yes\n\
+             RequiredRSASize 3072\nProxyUseFdpass yes\nKbdInteractiveDevices pam\n\
+             WarnWeakCrypto no-pq-kex\nVersionAddendum hello there\n\
+             Tunnel ethernet\nTunnelDevice 1:2\nEnableEscapeCommandline yes\n",
+        )
+        .unwrap();
+        let o = cfg.lookup("h");
+        assert_eq!(o.check_host_ip, Some(true));
+        assert_eq!(o.verify_host_key_dns, Some(VerifyHostKeyDns::Ask));
+        assert_eq!(o.visual_host_key, Some(true));
+        assert_eq!(o.no_host_authentication_for_localhost, Some(true));
+        assert_eq!(o.fingerprint_hash.as_deref(), Some("MD5"));
+        assert_eq!(o.bind_interface.as_deref(), Some("eth0"));
+        assert_eq!(o.ip_qos, Some((0x48, 0x48)));
+        assert_eq!(o.forward_x11_timeout, Some(3600));
+        assert_eq!(o.xauth_location.as_deref(), Some("/opt/xauth"));
+        assert_eq!(
+            o.canonicalize_permitted_cnames,
+            Some(vec![
+                ("*.a.example".to_string(), "*.b.example".to_string()),
+                ("*".to_string(), "*".to_string()),
+            ])
+        );
+        assert_eq!(
+            o.channel_timeouts,
+            Some(vec!["session=5m".to_string(), "global=0".to_string()])
+        );
+        // Only the first pattern counts, as in OpenSSH.
+        assert_eq!(o.log_verbose, Some(vec!["kex.c:*:1000".to_string()]));
+        assert_eq!(o.syslog_facility.as_deref(), Some("LOCAL3"));
+        assert_eq!(o.stream_local_bind_mask, Some(0o22));
+        assert_eq!(o.stream_local_bind_unlink, Some(true));
+        assert_eq!(o.required_rsa_size, Some(3072));
+        assert_eq!(o.proxy_use_fdpass, Some(true));
+        assert_eq!(o.kbd_interactive_devices.as_deref(), Some("pam"));
+        assert_eq!(o.warn_weak_crypto, Some(false));
+        assert_eq!(o.version_addendum.as_deref(), Some("hello there"));
+        assert_eq!(o.tunnel.as_deref(), Some("ethernet"));
+        assert_eq!(o.tunnel_device.as_deref(), Some("1:2"));
+        assert_eq!(o.enable_escape_commandline, Some(true));
+        assert!(o.unimplemented.is_empty(), "{:?}", o.unimplemented);
+
+        for bad in [
+            "Tunnel maybe\n",
+            "IPQoS af99\n",
+            "IPQoS 256\n",
+            "IPQoS ef cs0 af11\n",
+            "FingerprintHash crc32\n",
+            "SyslogFacility kern\n",
+            "StreamLocalBindMask 0999\n",
+            "ChannelTimeout session\n",
+            "ChannelTimeout none session=1\n",
+            "CanonicalizePermittedCNAMEs a.example\n",
+            "VerifyHostKeyDNS maybe\n",
+            "WarnWeakCrypto maybe\n",
+            "RefuseConnection\n",
+        ] {
+            assert!(
+                matches!(
+                    SshClientConfig::parse(bad),
+                    Err(ConfigError::BadValue { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// OpenSSH's older names still work.
+    #[test]
+    fn obsolete_aliases() {
+        let o =
+            SshClientConfig::parse("KeepAlive no\nIdentityFile2 ~/.ssh/k\nTISAuthentication no\n")
+                .unwrap()
+                .lookup("h");
+        assert_eq!(o.tcp_keep_alive, Some(false));
+        assert_eq!(o.identity_files, vec!["~/.ssh/k".to_string()]);
+        assert_eq!(o.kbd_interactive_authentication, Some(false));
+        let o = SshClientConfig::parse("SkeyAuthentication yes\n")
+            .unwrap()
+            .lookup("h");
+        assert_eq!(o.kbd_interactive_authentication, Some(true));
+    }
+
+    /// `RefuseConnection` in a matching block (only) refuses, naming the
+    /// line; `none` values of the list keywords are empty lists.
+    #[test]
+    fn refuse_connection_and_none_lists() {
+        let cfg = SshClientConfig::parse(
+            "Host a\n  RefuseConnection \"not today\"\nHost *\n  ChannelTimeout none\n  \
+             CanonicalizePermittedCNAMEs none\n  IPQoS none throughput\n  \
+             VersionAddendum none\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.lookup("a").refuse_connection.as_deref(),
+            Some("line 2: RefuseConnection: not today")
+        );
+        let o = cfg.lookup("b");
+        assert_eq!(o.refuse_connection, None);
+        assert_eq!(o.channel_timeouts, Some(Vec::new()));
+        assert_eq!(o.canonicalize_permitted_cnames, Some(Vec::new()));
+        assert_eq!(o.ip_qos, Some((IPQOS_NONE, IPQOS_NONE)));
+        assert_eq!(o.version_addendum.as_deref(), Some(""));
+        assert_eq!(ipqos_name(0xb8), "ef");
+        assert_eq!(ipqos_name(16), "0x10");
+        assert_eq!(
+            parse_channel_timeout("x11-*=1m"),
+            Some(("x11-*".into(), 60))
+        );
     }
 
     #[test]

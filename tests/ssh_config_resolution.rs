@@ -5,10 +5,12 @@
 use std::process::Command;
 
 fn g(config: &str, args: &[&str]) -> String {
+    // Tests run in parallel: each call its own directory.
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "puressh-cfgres-{}-{}",
         std::process::id(),
-        config.len()
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config");
@@ -88,4 +90,74 @@ fn user_known_hosts_files_default_to_both() {
     assert!(files[0].ends_with("known_hosts") && files[1].ends_with("known_hosts2"));
     let out = g("UserKnownHostsFile none\n", &["h"]);
     assert_eq!(value(&out, "userknownhostsfile"), ["none"]);
+}
+
+#[test]
+fn client_keywords_print_as_openssh() {
+    let out = g(
+        "CheckHostIP yes\nVisualHostKey yes\nFingerprintHash md5\nIPQoS af21 16\n\
+         ForwardX11Timeout 1h\nChannelTimeout session=5m\nSyslogFacility local3\n\
+         StreamLocalBindMask 022\nRequiredRSASize 3072\nWarnWeakCrypto no\n\
+         VersionAddendum hi there\nVerifyHostKeyDNS yes\n\
+         CanonicalizePermittedCNAMEs *.a:*.b\nTunnel ethernet\nTunnelDevice 3\n",
+        &["h"],
+    );
+    for (key, want) in [
+        ("checkhostip", "yes"),
+        ("visualhostkey", "yes"),
+        ("fingerprinthash", "MD5"),
+        ("ipqos", "af21 0x10"),
+        ("forwardx11timeout", "3600"),
+        ("channeltimeout", "session=5m"),
+        ("syslogfacility", "LOCAL3"),
+        ("streamlocalbindmask", "022"),
+        ("requiredrsasize", "3072"),
+        ("warnweakcrypto", "no"),
+        ("versionaddendum", "hi there"),
+        ("verifyhostkeydns", "true"),
+        // VerifyHostKeyDNS turns the UpdateHostKeys default off.
+        ("updatehostkeys", "false"),
+        ("canonicalizepermittedcnames", "*.a:*.b"),
+        ("tunnel", "ethernet"),
+        ("tunneldevice", "3:any"),
+    ] {
+        assert_eq!(value(&out, key), [want], "{key}");
+    }
+    let out = g("", &["h"]);
+    for (key, want) in [
+        ("ipqos", "ef cs0"),
+        ("logverbose", "none"),
+        ("streamlocalbindmask", "0177"),
+        ("syslogfacility", "USER"),
+        ("warnweakcrypto", "yes"),
+        ("xauthlocation", "/usr/bin/xauth"),
+    ] {
+        assert_eq!(value(&out, key), [want], "{key}");
+    }
+}
+
+#[test]
+fn refuse_connection_stops_before_printing() {
+    let dir = std::env::temp_dir().join(format!("puressh-refuse-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config");
+    std::fs::write(
+        &path,
+        "Host other\n  Port 2\nHost h\n  RefuseConnection \"go away\"\n",
+    )
+    .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ssh"))
+        .arg("-F")
+        .arg(&path)
+        .args(["-G", "h"])
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(out.status.code(), Some(255));
+    assert!(out.stdout.is_empty());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("config line 4: RefuseConnection: go away"),
+        "{err}"
+    );
 }

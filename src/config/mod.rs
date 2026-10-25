@@ -49,9 +49,10 @@ pub use algos::{
 };
 pub use client::{
     AddressFamily, CanonicalizeHostname, ClientOptions, ControlMaster, ControlPersist,
-    DynamicForwardSpec, ForwardEndpoint, ForwardSpec, GatewayPorts, IdentityAgent, KnockSetting,
-    LocalForwardSpec, ObscureKeystrokeTiming, RemoteForwardSpec, RequestTty, SessionType,
-    SshClientConfig, StrictMode, parse_escape_char, parse_forward,
+    DynamicForwardSpec, ForwardEndpoint, ForwardSpec, GatewayPorts, IPQOS_NONE, IdentityAgent,
+    KnockSetting, LocalForwardSpec, ObscureKeystrokeTiming, RemoteForwardSpec, RequestTty,
+    SessionType, SshClientConfig, StrictMode, VerifyHostKeyDns, fingerprint_hash_name, ipqos_name,
+    parse_channel_timeout, parse_escape_char, parse_forward, parse_ipqos, syslog_facility_name,
 };
 pub use glob::{HostPattern, host_matches};
 pub use host_port::{parse_host_port, parse_host_port_pattern};

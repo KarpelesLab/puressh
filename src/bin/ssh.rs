@@ -1758,9 +1758,9 @@ fn apply_identity_agent(setting: Option<&puressh::config::IdentityAgent>, _ident
 }
 
 /// `ssh -G`: the resolved configuration as `keyword value` lines (lower-case
-/// keywords, OpenSSH's format), with OpenSSH's defaults for unset values.
-/// Scripts typically read `hostname`, `user`, `port`, `identityfile`,
-/// `proxyjump` / `proxycommand` and `controlpath` from it.
+/// keywords, OpenSSH's format and order), with OpenSSH's defaults for unset
+/// values. Scripts typically read `hostname`, `user`, `port`,
+/// `identityfile`, `proxyjump` / `proxycommand` and `controlpath` from it.
 fn print_config(
     cli: &Cli,
     c: &puressh::config::ClientOptions,
@@ -1768,11 +1768,30 @@ fn print_config(
     user: &str,
     port: u16,
 ) {
-    use puressh::config::{AddressFamily, ControlMaster, RequestTty, StrictMode};
+    use puressh::config::{AddressFamily, ControlMaster, RequestTty, StrictMode, VerifyHostKeyDns};
     let yn = |b: Option<bool>, default: bool| if b.unwrap_or(default) { "yes" } else { "no" };
+    let tf = |b: Option<bool>, default: bool| {
+        if b.unwrap_or(default) {
+            "true"
+        } else {
+            "false"
+        }
+    };
     let list = |l: &Option<Vec<String>>, cat| match l {
         Some(v) => v.join(","),
         None => puressh::config::default_algorithms(cat).join(","),
+    };
+    let oneline = |l: Option<&Vec<String>>| match l {
+        Some(v) if !v.is_empty() => v.join(" "),
+        _ => "none".to_string(),
+    };
+    // Keywords this build accepts without acting on them: as configured,
+    // else OpenSSH's default.
+    let unimplemented = |key: &str, default: &'static str| -> String {
+        c.unimplemented
+            .iter()
+            .find(|(k, _)| k == key)
+            .map_or(default.to_string(), |(_, v)| v.clone())
     };
     let mut out = vec![
         format!("host {}", cli.host),
@@ -1789,42 +1808,6 @@ fn print_config(
         ),
         format!("batchmode {}", yn(c.batch_mode, false)),
         format!(
-            "compression {}",
-            yn(cli.compression.or(c.compression), false)
-        ),
-        format!(
-            "forwardagent {}",
-            match &c.forward_agent_socket {
-                Some(sock) if c.forward_agent == Some(true) => sock.clone(),
-                _ => yn(c.forward_agent.or(Some(cli.agent_forward)), false).to_string(),
-            }
-        ),
-        format!("forwardx11 {}", yn(c.forward_x11, false)),
-        format!("forwardx11trusted {}", yn(c.forward_x11_trusted, false)),
-        format!(
-            "identitiesonly {}",
-            yn(cli.identities_only.or(c.identities_only), false)
-        ),
-        format!(
-            "hashknownhosts {}",
-            yn(cli.hash_known_hosts.or(c.hash_known_hosts), false)
-        ),
-        format!("tcpkeepalive {}", yn(c.tcp_keep_alive, true)),
-        format!("clearallforwardings {}", yn(c.clear_all_forwardings, false)),
-        format!(
-            "exitonforwardfailure {}",
-            yn(c.exit_on_forward_failure, false)
-        ),
-        format!(
-            "stricthostkeychecking {}",
-            match cli.strict.or(c.strict_host_key) {
-                Some(StrictMode::Yes) => "true",
-                Some(StrictMode::No) => "false",
-                Some(StrictMode::AcceptNew) => "accept-new",
-                _ => "ask",
-            }
-        ),
-        format!(
             "canonicalizefallbacklocal {}",
             yn(c.canonicalize_fallback_local, true)
         ),
@@ -1836,104 +1819,10 @@ fn print_config(
                 _ => "false",
             }
         ),
+        format!("checkhostip {}", yn(c.check_host_ip, false)),
         format!(
-            "canonicalizemaxdots {}",
-            c.canonicalize_max_dots.unwrap_or(1)
-        ),
-        format!(
-            "canonicaldomains {}",
-            match c.canonical_domains.as_deref() {
-                Some(d) if !d.is_empty() => d.join(" "),
-                _ => "none".to_string(),
-            }
-        ),
-        "canonicalizePermittedcnames none".to_string(),
-        format!(
-            "permitremoteopen {}",
-            c.permit_remote_open
-                .as_ref()
-                .map_or("any".to_string(), |v| v.join(" "))
-        ),
-        // In bytes and seconds, 0 for the defaults, as OpenSSH prints it.
-        format!(
-            "rekeylimit {} {}",
-            c.rekey_limit.and_then(|r| r.max_bytes).unwrap_or(0),
-            c.rekey_limit.and_then(|r| r.max_seconds).unwrap_or(0)
-        ),
-        format!(
-            "addkeystoagent {}",
-            if c.add_keys_to_agent == Some(true) {
-                "true"
-            } else {
-                "false"
-            }
-        ),
-        format!(
-            "casignaturealgorithms {}",
-            list(
-                &c.ca_signature_algorithms,
-                puressh::config::AlgoCategory::CaSignature
-            )
-        ),
-        format!(
-            "controlpersist {}",
-            match c.control_persist {
-                Some(puressh::config::ControlPersist::Yes) => "yes".to_string(),
-                Some(puressh::config::ControlPersist::Seconds(n)) => n.to_string(),
-                _ => "no".to_string(),
-            }
-        ),
-        format!(
-            "gatewayports {}",
-            match c.gateway_ports {
-                Some(puressh::config::GatewayPorts::Yes) => "yes",
-                _ => "no",
-            }
-        ),
-        format!(
-            "obscurekeystroketiming {}",
-            match c.obscure_keystroke_timing {
-                Some(puressh::config::ObscureKeystrokeTiming::Off) => "no".to_string(),
-                Some(puressh::config::ObscureKeystrokeTiming::On { interval_ms })
-                    if interval_ms != 20 =>
-                {
-                    format!("interval:{interval_ms}")
-                }
-                _ => "yes".to_string(),
-            }
-        ),
-        format!(
-            "pubkeyauthentication {}",
-            if c.pubkey_authentication == Some(false) {
-                "false"
-            } else {
-                "true"
-            }
-        ),
-        format!(
-            "revokedhostkeys {}",
-            c.revoked_host_keys.as_deref().unwrap_or("none")
-        ),
-        format!(
-            "loglevel {}",
-            match (cli.quiet, cli.verbose) {
-                (true, _) => "QUIET",
-                (_, 1) => "DEBUG1",
-                (_, 2) => "DEBUG2",
-                (_, v) if v >= 3 => "DEBUG3",
-                _ =>
-                    puressh::config::server::LOG_LEVELS
-                        [usize::from(c.log_level.unwrap_or(3).min(7))],
-            }
-        ),
-        format!(
-            "requesttty {}",
-            match cli.request_tty.or(c.request_tty) {
-                Some(RequestTty::No) => "false",
-                Some(RequestTty::Yes) => "true",
-                Some(RequestTty::Force) => "force",
-                _ => "auto",
-            }
+            "compression {}",
+            yn(cli.compression.or(c.compression), false)
         ),
         format!(
             "controlmaster {}",
@@ -1944,75 +1833,62 @@ fn print_config(
             }
         ),
         format!(
-            "ciphers {}",
-            list(&c.ciphers, puressh::config::AlgoCategory::Cipher)
+            "enablesshkeysign {}",
+            unimplemented("enablesshkeysign", "no")
         ),
-        format!("macs {}", list(&c.macs, puressh::config::AlgoCategory::Mac)),
+        format!("clearallforwardings {}", yn(c.clear_all_forwardings, false)),
         format!(
-            "securitykeyprovider {}",
-            c.security_key_provider
-                .as_deref()
-                .unwrap_or("$SSH_SK_PROVIDER")
+            "exitonforwardfailure {}",
+            yn(c.exit_on_forward_failure, false)
         ),
         format!(
-            "kexalgorithms {}",
-            list(&c.kex_algorithms, puressh::config::AlgoCategory::Kex)
+            "fingerprinthash {}",
+            c.fingerprint_hash.as_deref().unwrap_or("SHA256")
+        ),
+        format!("forwardx11 {}", yn(c.forward_x11, false)),
+        format!("forwardx11trusted {}", yn(c.forward_x11_trusted, false)),
+        format!(
+            "gatewayports {}",
+            match c.gateway_ports {
+                Some(puressh::config::GatewayPorts::Yes) => "yes",
+                _ => "no",
+            }
         ),
         format!(
-            "hostkeyalgorithms {}",
-            list(
-                &c.host_key_algorithms,
-                puressh::config::AlgoCategory::HostKey
-            )
+            "hashknownhosts {}",
+            yn(cli.hash_known_hosts.or(c.hash_known_hosts), false)
         ),
         format!(
-            "pubkeyacceptedalgorithms {}",
-            list(
-                &c.pubkey_accepted_algorithms,
-                puressh::config::AlgoCategory::PubkeyAccepted
-            )
+            "hostbasedauthentication {}",
+            unimplemented("hostbasedauthentication", "no")
         ),
         format!(
-            "connecttimeout {}",
-            c.connect_timeout
-                .filter(|t| *t > 0)
-                .map_or("none".into(), |t| t.to_string())
-        ),
-        format!(
-            "serveraliveinterval {}",
-            c.server_alive_interval.unwrap_or(0)
-        ),
-        format!(
-            "serveralivecountmax {}",
-            c.server_alive_count_max.unwrap_or(3)
-        ),
-        format!(
-            "numberofpasswordprompts {}",
-            c.number_of_password_prompts.unwrap_or(3)
-        ),
-        format!(
-            "passwordauthentication {}",
-            yn(c.password_authentication, true)
+            "identitiesonly {}",
+            yn(cli.identities_only.or(c.identities_only), false)
         ),
         format!(
             "kbdinteractiveauthentication {}",
             yn(c.kbd_interactive_authentication, true)
         ),
-        format!("connectionattempts {}", c.connection_attempts.unwrap_or(1)),
         format!(
-            "escapechar {}",
-            match cli.escape_char.unwrap_or(Some(b'~')) {
-                None => "none".to_string(),
-                Some(b) if b < 0x20 => format!("^{}", (b + b'@') as char),
-                Some(b) => (b as char).to_string(),
-            }
+            "nohostauthenticationforlocalhost {}",
+            yn(c.no_host_authentication_for_localhost, false)
         ),
         format!(
-            "globalknownhostsfile {}",
-            c.global_known_hosts_files
-                .as_ref()
-                .map(|f| f.join(" "))
-                .unwrap_or_else(|| "/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2".into())
+            "passwordauthentication {}",
+            yn(c.password_authentication, true)
+        ),
+        format!("permitlocalcommand {}", yn(c.permit_local_command, false)),
+        format!("proxyusefdpass {}", yn(c.proxy_use_fdpass, false)),
+        format!("pubkeyauthentication {}", tf(c.pubkey_authentication, true)),
+        format!(
+            "requesttty {}",
+            match cli.request_tty.or(c.request_tty) {
+                Some(RequestTty::No) => "false",
+                Some(RequestTty::Yes) => "true",
+                Some(RequestTty::Force) => "force",
+                _ => "auto",
+            }
         ),
         format!(
             "sessiontype {}",
@@ -2027,158 +1903,191 @@ fn print_config(
             "forkafterauthentication {}",
             yn(c.fork_after_authentication, false)
         ),
+        format!(
+            "streamlocalbindunlink {}",
+            yn(c.stream_local_bind_unlink, false)
+        ),
+        format!(
+            "stricthostkeychecking {}",
+            match cli.strict.or(c.strict_host_key) {
+                Some(StrictMode::Yes) => "true",
+                Some(StrictMode::No) => "false",
+                Some(StrictMode::AcceptNew) => "accept-new",
+                _ => "ask",
+            }
+        ),
+        format!("tcpkeepalive {}", tf(c.tcp_keep_alive, true)),
+        format!(
+            "tunnel {}",
+            tunnel_dump("tunnel", c.tunnel.as_deref().unwrap_or("no"))
+        ),
+        format!(
+            "verifyhostkeydns {}",
+            match c.verify_host_key_dns {
+                Some(VerifyHostKeyDns::Yes) => "true",
+                Some(VerifyHostKeyDns::Ask) => "ask",
+                _ => "false",
+            }
+        ),
+        format!("visualhostkey {}", yn(c.visual_host_key, false)),
+        format!(
+            "updatehostkeys {}",
+            match c.update_host_keys.as_deref() {
+                Some("no") => "false",
+                Some("ask") => "ask",
+                Some(_) => "true",
+                None if update_host_keys_by_default(cli, c) => "true",
+                None => "false",
+            }
+        ),
+        format!(
+            "enableescapecommandline {}",
+            yn(c.enable_escape_commandline, false)
+        ),
+        format!("warnweakcrypto {}", yn(c.warn_weak_crypto, true)),
+        format!(
+            "canonicalizemaxdots {}",
+            c.canonicalize_max_dots.unwrap_or(1)
+        ),
+        format!("connectionattempts {}", c.connection_attempts.unwrap_or(1)),
+        format!(
+            "forwardx11timeout {}",
+            c.forward_x11_timeout.unwrap_or(1200)
+        ),
+        format!(
+            "numberofpasswordprompts {}",
+            c.number_of_password_prompts.unwrap_or(3)
+        ),
+        format!(
+            "serveralivecountmax {}",
+            c.server_alive_count_max.unwrap_or(3)
+        ),
+        format!(
+            "serveraliveinterval {}",
+            c.server_alive_interval.unwrap_or(0)
+        ),
+        format!("requiredrsasize {}", c.required_rsa_size.unwrap_or(1024)),
+        format!(
+            "obscurekeystroketiming {}",
+            match c.obscure_keystroke_timing {
+                Some(puressh::config::ObscureKeystrokeTiming::Off) => "no".to_string(),
+                Some(puressh::config::ObscureKeystrokeTiming::On { interval_ms })
+                    if interval_ms != 20 =>
+                {
+                    interval_ms.to_string()
+                }
+                _ => "yes".to_string(),
+            }
+        ),
     ];
-    // As written (OpenSSH expands them only when loading).
-    let identities: Vec<String> = if !cli.identities.is_empty() || !c.identity_files.is_empty() {
-        cli.identities
-            .iter()
-            .chain(c.identity_files.iter())
-            .cloned()
-            .collect()
-    } else {
-        [
-            "id_rsa",
-            "id_ecdsa",
-            "id_ecdsa_sk",
-            "id_ed25519",
-            "id_ed25519_sk",
-        ]
-        .iter()
-        .map(|n| format!("~/.ssh/{n}"))
-        .collect()
-    };
-    // Keywords this build accepts without acting on them: as configured,
-    // else OpenSSH's default (as Ubuntu's OpenSSH prints it).
-    for (key, default) in [
-        ("checkhostip", "no"),
-        ("enablesshkeysign", "no"),
-        ("fingerprinthash", "SHA256"),
-        ("hostbasedauthentication", "no"),
-        ("nohostauthenticationforlocalhost", "no"),
-        ("proxyusefdpass", "no"),
-        ("streamlocalbindunlink", "no"),
-        ("tunnel", "false"),
-        ("verifyhostkeydns", "false"),
-        ("visualhostkey", "no"),
-        ("updatehostkeys", "true"),
-        ("enableescapecommandline", "no"),
-        ("forwardx11timeout", "1200"),
-        ("requiredrsasize", "1024"),
-        ("xauthlocation", "/usr/bin/xauth"),
-        ("logverbose", "none"),
-        ("channeltimeout", "none"),
-        ("tunneldevice", "any:any"),
-        ("ipqos", "af21 cs1"),
-        ("streamlocalbindmask", "0177"),
-        ("syslogfacility", "USER"),
-    ] {
-        let value = c
-            .unimplemented
-            .iter()
-            .find(|(k, _)| k == key)
-            .map_or(default, |(_, v)| v.as_str());
-        if key == "tunnel" || key == "tunneldevice" {
-            out.push(format!("{key} {}", tunnel_dump(key, value)));
-            continue;
-        }
-        out.push(format!("{key} {value}"));
-    }
-    out.extend(identities.into_iter().map(|p| format!("identityfile {p}")));
-    out.extend(
-        c.certificate_files
-            .iter()
-            .map(|p| format!("certificatefile {p}")),
-    );
-    let known_hosts = cli
-        .known_hosts_path
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or_else(|| c.user_known_hosts.clone())
-        .unwrap_or_else(|| {
-            format!(
-                "{} {}",
-                expand_tilde("~/.ssh/known_hosts"),
-                expand_tilde("~/.ssh/known_hosts2")
-            )
-        });
-    out.push(format!("userknownhostsfile {known_hosts}"));
+    // String options, when set.
     let not_none = |p: &&String| !p.eq_ignore_ascii_case("none");
-    if let Some(p) = cli
-        .proxy_jump
-        .as_ref()
-        .or(c.proxy_jump.as_ref())
-        .filter(not_none)
-    {
-        // As OpenSSH keeps them: `[user@]host[:port]` (ssh:// URIs too).
-        let hops: Vec<String> = match parse_jump_hops(p) {
-            Ok(hops) => hops
-                .iter()
-                .map(|h| {
-                    let mut s = String::new();
-                    if let Some(u) = &h.user {
-                        s.push_str(u);
-                        s.push('@');
-                    }
-                    s.push_str(&h.host);
-                    if let Some(port) = h.port {
-                        s.push_str(&format!(":{port}"));
-                    }
-                    s
-                })
-                .collect(),
-            Err(_) => vec![p.clone()],
-        };
-        out.push(format!("proxyjump {}", hops.join(",")));
-    }
-    if let Some(p) = c.proxy_command.as_ref().filter(not_none) {
-        out.push(format!("proxycommand {p}"));
-    }
-    if let Some(p) = &c.control_path {
-        out.push(format!("controlpath {p}"));
-    }
     if let Some(b) = &c.bind_address {
         out.push(format!("bindaddress {b}"));
     }
+    if let Some(b) = &c.bind_interface {
+        out.push(format!("bindinterface {b}"));
+    }
+    out.push(format!(
+        "ciphers {}",
+        list(&c.ciphers, puressh::config::AlgoCategory::Cipher)
+    ));
+    if let Some(p) = &c.control_path {
+        out.push(format!("controlpath {p}"));
+    }
+    out.push(format!(
+        "hostkeyalgorithms {}",
+        list(
+            &c.host_key_algorithms,
+            puressh::config::AlgoCategory::HostKey
+        )
+    ));
     if let Some(a) = &c.host_key_alias {
         out.push(format!("hostkeyalias {a}"));
-    }
-    if let Some(r) = &c.remote_command {
-        out.push(format!("remotecommand {r}"));
-    }
-    if let Some(t) = &c.tag {
-        out.push(format!("tag {t}"));
     }
     match &c.identity_agent {
         Some(puressh::config::IdentityAgent::Path(p)) => out.push(format!("identityagent {p}")),
         Some(puressh::config::IdentityAgent::None) => out.push("identityagent none".to_string()),
         _ => {}
     }
+    if let Some(d) = &c.kbd_interactive_devices {
+        out.push(format!("kbdinteractivedevices {d}"));
+    }
     out.push(format!(
-        "permitlocalcommand {}",
-        if c.permit_local_command == Some(true) {
-            "yes"
-        } else {
-            "no"
-        }
+        "kexalgorithms {}",
+        list(&c.kex_algorithms, puressh::config::AlgoCategory::Kex)
     ));
-    if let Some(l) = c
-        .local_command
-        .as_ref()
-        .filter(|l| !l.eq_ignore_ascii_case("none"))
-    {
+    out.push(format!(
+        "casignaturealgorithms {}",
+        list(
+            &c.ca_signature_algorithms,
+            puressh::config::AlgoCategory::CaSignature
+        )
+    ));
+    if let Some(l) = c.local_command.as_ref().filter(not_none) {
         out.push(format!("localcommand {l}"));
     }
+    if let Some(r) = c.remote_command.as_ref().filter(not_none) {
+        out.push(format!("remotecommand {r}"));
+    }
+    out.push(format!(
+        "loglevel {}",
+        match (cli.quiet, cli.verbose) {
+            (true, _) => "QUIET",
+            (_, 1) => "DEBUG1",
+            (_, 2) => "DEBUG2",
+            (_, v) if v >= 3 => "DEBUG3",
+            _ => puressh::config::server::LOG_LEVELS[usize::from(c.log_level.unwrap_or(3).min(7))],
+        }
+    ));
+    out.push(format!(
+        "macs {}",
+        list(&c.macs, puressh::config::AlgoCategory::Mac)
+    ));
+    if let Some(p) = &c.pkcs11_provider {
+        out.push(format!("pkcs11provider {p}"));
+    }
+    out.push(format!(
+        "securitykeyprovider {}",
+        c.security_key_provider
+            .as_deref()
+            .unwrap_or("$SSH_SK_PROVIDER")
+    ));
     if let Some(p) = &c.preferred_authentications {
         out.push(format!("preferredauthentications {}", p.join(",")));
     }
-    out.extend(c.send_env.iter().map(|e| format!("sendenv {e}")));
-    out.extend(c.set_env.iter().map(|(k, v)| format!("setenv {k}={v}")));
+    out.push(format!(
+        "pubkeyacceptedalgorithms {}",
+        list(
+            &c.pubkey_accepted_algorithms,
+            puressh::config::AlgoCategory::PubkeyAccepted
+        )
+    ));
+    out.push(format!(
+        "xauthlocation {}",
+        c.xauth_location.as_deref().unwrap_or(DEFAULT_XAUTH)
+    ));
+    if let Some(k) = c.known_hosts_command.as_ref().filter(not_none) {
+        out.push(format!("knownhostscommand {k}"));
+    }
+    if let Some(t) = &c.tag {
+        out.push(format!("tag {t}"));
+    }
+    if let Some(v) = &c.version_addendum {
+        out.push(format!("versionaddendum {v}"));
+    }
     // As OpenSSH's dump_cfg_forwards: a listen port without an address is
     // bare, any address is bracketed.
     let listen = |a: &Option<String>, p: u16| match a {
         Some(a) => format!("[{a}]:{p}"),
         None => p.to_string(),
     };
+    for f in cli.dynamics_raw.iter().chain(c.dynamic_forwards.iter()) {
+        out.push(format!(
+            "dynamicforward {}",
+            listen(&f.bind_addr, f.listen_port)
+        ));
+    }
     // The command line's and the configuration's, as OpenSSH keeps them.
     for f in &cli.locals {
         let from = f
@@ -2205,16 +2114,196 @@ fn print_config(
             )),
         }
     }
-    for f in &c.dynamic_forwards {
-        out.push(format!(
-            "dynamicforward {}",
-            listen(&f.bind_addr, f.listen_port)
-        ));
+    // As written (OpenSSH expands them only when loading).
+    if !cli.identities.is_empty() || !c.identity_files.is_empty() {
+        out.extend(
+            cli.identities
+                .iter()
+                .chain(c.identity_files.iter())
+                .map(|p| format!("identityfile {p}")),
+        );
+    } else {
+        out.extend(
+            DEFAULT_IDENTITY_NAMES
+                .iter()
+                .map(|n| format!("identityfile ~/.ssh/{n}")),
+        );
+    }
+    out.push(format!(
+        "canonicaldomains {}",
+        oneline(c.canonical_domains.as_ref())
+    ));
+    out.extend(
+        c.certificate_files
+            .iter()
+            .map(|p| format!("certificatefile {p}")),
+    );
+    out.push(format!(
+        "globalknownhostsfile {}",
+        c.global_known_hosts_files
+            .as_ref()
+            .map(|f| f.join(" "))
+            .unwrap_or_else(|| "/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2".into())
+    ));
+    let known_hosts = cli
+        .known_hosts_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or_else(|| c.user_known_hosts.clone())
+        .unwrap_or_else(|| {
+            format!(
+                "{} {}",
+                expand_tilde("~/.ssh/known_hosts"),
+                expand_tilde("~/.ssh/known_hosts2")
+            )
+        });
+    out.push(format!("userknownhostsfile {known_hosts}"));
+    out.push(format!(
+        "revokedhostkeys {}",
+        c.revoked_host_keys.as_deref().unwrap_or("none")
+    ));
+    out.extend(c.send_env.iter().map(|e| format!("sendenv {e}")));
+    out.extend(c.set_env.iter().map(|(k, v)| format!("setenv {k}={v}")));
+    out.push(format!("logverbose {}", oneline(c.log_verbose.as_ref())));
+    out.push(format!(
+        "channeltimeout {}",
+        oneline(c.channel_timeouts.as_ref())
+    ));
+    out.push(format!(
+        "permitremoteopen {}",
+        c.permit_remote_open
+            .as_ref()
+            .map_or("any".to_string(), |v| v.join(" "))
+    ));
+    out.push(format!("addkeystoagent {}", tf(c.add_keys_to_agent, false)));
+    out.push(format!(
+        "forwardagent {}",
+        match &c.forward_agent_socket {
+            Some(sock) if c.forward_agent == Some(true) => sock.clone(),
+            _ => yn(c.forward_agent.or(Some(cli.agent_forward)), false).to_string(),
+        }
+    ));
+    out.push(format!(
+        "connecttimeout {}",
+        c.connect_timeout
+            .filter(|t| *t > 0)
+            .map_or("none".into(), |t| t.to_string())
+    ));
+    out.push(format!(
+        "tunneldevice {}",
+        tunnel_dump(
+            "tunneldevice",
+            c.tunnel_device.as_deref().unwrap_or("any:any")
+        )
+    ));
+    out.push(format!(
+        "canonicalizepermittedcnames {}",
+        match c.canonicalize_permitted_cnames.as_deref() {
+            Some(rules) if !rules.is_empty() => rules
+                .iter()
+                .map(|(from, to)| format!("{from}:{to}"))
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => "none".to_string(),
+        }
+    ));
+    out.push(format!(
+        "controlpersist {}",
+        match c.control_persist {
+            Some(puressh::config::ControlPersist::Yes) => "yes".to_string(),
+            Some(puressh::config::ControlPersist::Seconds(n)) => n.to_string(),
+            _ => "no".to_string(),
+        }
+    ));
+    out.push(format!(
+        "escapechar {}",
+        match cli.escape_char.unwrap_or(Some(b'~')) {
+            None => "none".to_string(),
+            Some(b) if b < 0x20 => format!("^{}", (b + b'@') as char),
+            Some(b) => (b as char).to_string(),
+        }
+    ));
+    let (interactive, bulk) = c.ip_qos.unwrap_or(DEFAULT_IPQOS);
+    out.push(format!(
+        "ipqos {} {}",
+        puressh::config::ipqos_name(interactive),
+        puressh::config::ipqos_name(bulk)
+    ));
+    // In bytes and seconds, 0 for the defaults, as OpenSSH prints it.
+    out.push(format!(
+        "rekeylimit {} {}",
+        c.rekey_limit.and_then(|r| r.max_bytes).unwrap_or(0),
+        c.rekey_limit.and_then(|r| r.max_seconds).unwrap_or(0)
+    ));
+    out.push(format!(
+        "streamlocalbindmask 0{:o}",
+        c.stream_local_bind_mask.unwrap_or(0o177)
+    ));
+    out.push(format!(
+        "syslogfacility {}",
+        c.syslog_facility.as_deref().unwrap_or("USER")
+    ));
+    if let Some(p) = cli
+        .proxy_jump
+        .as_ref()
+        .or(c.proxy_jump.as_ref())
+        .filter(not_none)
+    {
+        // As OpenSSH keeps them: `[user@]host[:port]` (ssh:// URIs too),
+        // a numeric last host in brackets.
+        let hops: Vec<String> = match parse_jump_hops(p) {
+            Ok(hops) => {
+                let n = hops.len();
+                hops.iter()
+                    .enumerate()
+                    .map(|(i, h)| {
+                        let mut s = String::new();
+                        if let Some(u) = &h.user {
+                            s.push_str(u);
+                            s.push('@');
+                        }
+                        let numeric = h.host.contains(':')
+                            || h.host.bytes().all(|b| b.is_ascii_digit() || b == b'.');
+                        if i + 1 == n && numeric {
+                            s.push_str(&format!("[{}]", h.host));
+                        } else {
+                            s.push_str(&h.host);
+                        }
+                        if let Some(port) = h.port {
+                            s.push_str(&format!(":{port}"));
+                        }
+                        s
+                    })
+                    .collect()
+            }
+            Err(_) => vec![p.clone()],
+        };
+        out.push(format!("proxyjump {}", hops.join(",")));
+    } else if let Some(p) = c.proxy_command.as_ref().filter(not_none) {
+        out.push(format!("proxycommand {p}"));
     }
     for line in out {
         println!("{line}");
     }
 }
+
+/// `XAuthLocation`'s default, as OpenSSH's build on Linux has it.
+const DEFAULT_XAUTH: &str = "/usr/bin/xauth";
+
+/// `IPQoS`'s default: `ef` for interactive sessions, `cs0` for the rest
+/// (OpenSSH 10).
+const DEFAULT_IPQOS: (u32, u32) = (0xb8, 0x00);
+
+/// The default `IdentityFile`s, in OpenSSH's order (`~/.ssh/` names; the
+/// FIDO `_sk` ones are tried only by a build with security keys).
+const DEFAULT_IDENTITY_NAMES: [&str; 6] = [
+    "id_rsa",
+    "id_ecdsa",
+    "id_ecdsa_sk",
+    "id_ed25519",
+    "id_ed25519_sk",
+    "id_mldsa44_ed25519",
+];
 
 /// `ssh -Q KIND`: list the algorithms this build supports, one per line.
 /// The key types this build implements, each with its certificate type, in
@@ -2428,6 +2517,12 @@ fn run() -> Result<i32, String> {
     // re-using the strict config parser for validation.
     apply_extra_o(&mut cfg_block, &cli.extra_o)?;
     final_config_pass(&ssh_cfg, &mut cfg_block, &cli, &local_user)?;
+    // RefuseConnection in a block that applies: OpenSSH stops there, before
+    // even `-G` prints anything.
+    if let Some(why) = &cfg_block.refuse_connection {
+        eprintln!("{why}");
+        return Err(String::new());
+    }
     // -W implies ExitOnForwardFailure and ClearAllForwardings, unless the
     // configuration or -o says otherwise (OpenSSH).
     if cli.stdio_forward.is_some() {
@@ -3110,10 +3205,7 @@ fn run() -> Result<i32, String> {
     let escape: Option<u8> = cli.escape_char.unwrap_or(Some(b'~'));
     // EnableEscapeCommandline (default no, as in OpenSSH 9.2+): `~C`.
     ESCAPE_CMDLINE.store(
-        cfg_block.unimplemented.iter().any(|(k, v)| {
-            k == "enableescapecommandline"
-                && (v.eq_ignore_ascii_case("yes") || v.eq_ignore_ascii_case("true"))
-        }),
+        cfg_block.enable_escape_commandline == Some(true),
         std::sync::atomic::Ordering::Relaxed,
     );
     // ObscureKeystrokeTiming: unset ⇒ OpenSSH default (on@20ms); only used
@@ -3299,6 +3391,20 @@ struct HostKeysUpdateState {
     finished: bool,
 }
 
+/// OpenSSH's `UpdateHostKeys` default: on, unless `VerifyHostKeyDNS` is or
+/// `UserKnownHostsFile` names files other than `~/.ssh/known_hosts`.
+fn update_host_keys_by_default(cli: &Cli, cfg_block: &puressh::config::ClientOptions) -> bool {
+    if matches!(
+        cfg_block.verify_host_key_dns,
+        Some(puressh::config::VerifyHostKeyDns::Yes | puressh::config::VerifyHostKeyDns::Ask)
+    ) {
+        return false;
+    }
+    let explicit = cli.known_hosts_path.is_some() || cfg_block.user_known_hosts.is_some();
+    let files = user_known_hosts_files(cli, cfg_block);
+    !explicit || (files.len() == 1 && common::default_known_hosts_path().as_ref() == files.first())
+}
+
 impl HostKeysUpdater {
     /// The updater for this connection, unless UpdateHostKeys is off (by
     /// default it is on when UserKnownHostsFile is not set, or is just
@@ -3310,15 +3416,10 @@ impl HostKeysUpdater {
         port: u16,
     ) -> Option<Arc<Self>> {
         let files = user_known_hosts_files(cli, cfg_block);
-        let explicit = cli.known_hosts_path.is_some() || cfg_block.user_known_hosts.is_some();
         let on = match cfg_block.update_host_keys.as_deref() {
             Some("yes") => true,
             Some(_) => false,
-            None => {
-                !explicit
-                    || (files.len() == 1
-                        && common::default_known_hosts_path().as_ref() == files.first())
-            }
+            None => update_host_keys_by_default(cli, cfg_block),
         };
         let file = files.into_iter().next()?;
         if !on || file == std::path::Path::new("/dev/null") {
@@ -3598,18 +3699,12 @@ fn parse_tun_units(s: &str) -> Option<(u32, u32)> {
 /// The tunnel `Tunnel` / `TunnelDevice` (or `-w`) ask for: `(mode, local
 /// unit, remote unit)`, `None` when tunnelling is off.
 fn tunnel_request(cfg: &puressh::config::ClientOptions) -> Result<Option<(u32, u32, u32)>, String> {
-    let get = |k: &str| {
-        cfg.unimplemented
-            .iter()
-            .find(|(n, _)| n == k)
-            .map(|(_, v)| v.as_str())
-    };
-    let mode = match get("tunnel").map(str::to_ascii_lowercase).as_deref() {
+    let mode = match cfg.tunnel.as_deref() {
         Some("yes" | "true" | "point-to-point") => 1,
         Some("ethernet") => 2,
         _ => return Ok(None),
     };
-    let device = get("tunneldevice").unwrap_or("any:any");
+    let device = cfg.tunnel_device.as_deref().unwrap_or("any:any");
     let (local, remote) =
         parse_tun_units(device).ok_or_else(|| format!("Bad tun device '{device}'"))?;
     Ok(Some((mode, local, remote)))

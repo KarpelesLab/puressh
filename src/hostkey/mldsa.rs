@@ -1,12 +1,12 @@
-//! `ssh-mldsa44-ed25519@openssh.com` — OpenSSH's post-quantum composite
+//! `ssh-mldsa44-ed25519` — OpenSSH's post-quantum composite
 //! signature (OpenSSH 10.3+): ML-DSA-44 (FIPS 204) and Ed25519 over the same
 //! message, both of which must verify, following the IETF LAMPS composite
 //! signatures (`COMPSIG-MLDSA44-Ed25519-SHA512`).
 //!
 //! ```text
-//! public key:  string "ssh-mldsa44-ed25519@openssh.com"
+//! public key:  string "ssh-mldsa44-ed25519"
 //!              string ML-DSA-44 public key (1312 B) || Ed25519 public key (32 B)
-//! signature:   string "ssh-mldsa44-ed25519@openssh.com"
+//! signature:   string "ssh-mldsa44-ed25519"
 //!              string ML-DSA-44 signature (2420 B) || Ed25519 signature (64 B)
 //! private key: ML-DSA-44 seed (32 B) || Ed25519 seed (32 B)
 //! ```
@@ -26,11 +26,11 @@ use super::{HostKey, HostKeyAlgorithm, HostKeyVerify};
 use crate::error::{Error, Result};
 use crate::format::{Reader, Writer};
 
-/// Marker for the `ssh-mldsa44-ed25519@openssh.com` algorithm.
+/// Marker for the `ssh-mldsa44-ed25519` algorithm.
 pub struct SshMlDsa44Ed25519;
 
 impl HostKeyAlgorithm for SshMlDsa44Ed25519 {
-    const NAME: &'static str = "ssh-mldsa44-ed25519@openssh.com";
+    const NAME: &'static str = "ssh-mldsa44-ed25519";
 }
 
 /// ML-DSA-44 public key length.
@@ -71,7 +71,7 @@ pub fn public_from_seeds(seeds: &[u8; PRIVATE_KEY_BYTES]) -> Vec<u8> {
     pk
 }
 
-/// An `ssh-mldsa44-ed25519@openssh.com` key: a verifier, and a signer when
+/// An `ssh-mldsa44-ed25519` key: a verifier, and a signer when
 /// built from the private seeds.
 pub struct MlDsa44Ed25519HostKey {
     seeds: Option<Zeroizing<[u8; PRIVATE_KEY_BYTES]>>,

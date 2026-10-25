@@ -71,8 +71,8 @@ fn algorithms_for(ty: &str, cert: bool) -> &'static [&'static str] {
         ("ecdsa-sk", true) => &["sk-ecdsa-sha2-nistp256-cert-v01@openssh.com"],
         ("ed25519-sk", false) => &["sk-ssh-ed25519@openssh.com"],
         ("ed25519-sk", true) => &["sk-ssh-ed25519-cert-v01@openssh.com"],
-        ("mldsa44-ed25519", false) => &["ssh-mldsa44-ed25519@openssh.com"],
-        ("mldsa44-ed25519", true) => &["ssh-mldsa44-ed25519-cert-v01@openssh.com"],
+        ("mldsa44-ed25519", false) => &["ssh-mldsa44-ed25519"],
+        ("mldsa44-ed25519", true) => &["ssh-mldsa44-ed25519-cert"],
         _ => &[],
     }
 }
@@ -150,9 +150,7 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
                                 | "ecdsa-sha2-nistp521"
                                 | "ecdsa" => "ecdsa",
                                 "ssh-ed25519" | "ed25519" => "ed25519",
-                                "ssh-mldsa44-ed25519@openssh.com" | "mldsa44-ed25519" => {
-                                    "mldsa44-ed25519"
-                                }
+                                "ssh-mldsa44-ed25519" | "mldsa44-ed25519" => "mldsa44-ed25519",
                                 "sk-ecdsa-sha2-nistp256@openssh.com" | "ecdsa-sk" => "ecdsa-sk",
                                 "sk-ssh-ed25519@openssh.com" | "ed25519-sk" => "ed25519-sk",
                                 // Not supported by this build: skipped like

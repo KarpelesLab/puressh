@@ -75,10 +75,10 @@ impl CertType {
     }
 }
 
-/// The ML-DSA-44 + Ed25519 composite (opt-in, as in OpenSSH: not among the
-/// defaults).
-const MLDSA: &str = "ssh-mldsa44-ed25519@openssh.com";
-const MLDSA_CERT: &str = "ssh-mldsa44-ed25519-cert-v01@openssh.com";
+/// The ML-DSA-44 + Ed25519 composite, under its IANA names (OpenSSH 10.6;
+/// earlier OpenSSH had it as an experimental `@openssh.com` name).
+const MLDSA: &str = "ssh-mldsa44-ed25519";
+const MLDSA_CERT: &str = "ssh-mldsa44-ed25519-cert";
 
 /// Security-key certificates (the WebAuthn name is a signature name for an
 /// `sk-ecdsa` certificate, never a blob type).
@@ -106,11 +106,13 @@ pub const CERT_KEY_NAMES: &[&str] = &[
     WEBAUTHN_SK_ECDSA_CERT,
     "rsa-sha2-512-cert-v01@openssh.com",
     "rsa-sha2-256-cert-v01@openssh.com",
+    MLDSA_CERT,
 ];
 
 /// Returns true if `name` is one of the OpenSSH certificate key-type names.
 pub fn is_cert_name(name: &str) -> bool {
-    name.ends_with("-cert-v01@openssh.com")
+    // The ML-DSA composite's IANA name has no `-v01@openssh.com` suffix.
+    name.ends_with("-cert-v01@openssh.com") || name == MLDSA_CERT
 }
 
 /// Map a *negotiated* certificate key-type name (the one that appears on the
@@ -806,7 +808,7 @@ impl CertificateBuilder {
             b"ecdsa-sha2-nistp384" => "ecdsa-sha2-nistp384-cert-v01@openssh.com",
             b"ecdsa-sha2-nistp521" => "ecdsa-sha2-nistp521-cert-v01@openssh.com",
             b"ssh-rsa" => "ssh-rsa-cert-v01@openssh.com",
-            b"ssh-mldsa44-ed25519@openssh.com" => MLDSA_CERT,
+            b"ssh-mldsa44-ed25519" => MLDSA_CERT,
             b"sk-ssh-ed25519@openssh.com" => SK_ED25519_CERT,
             b"sk-ecdsa-sha2-nistp256@openssh.com" => SK_ECDSA_CERT,
             _ => return Err(Error::Unsupported("cert: key type")),

@@ -43,7 +43,7 @@ impl AgentHostKey {
             "ecdsa-sha2-nistp256" => ("ecdsa-sha2-nistp256", 0),
             "ecdsa-sha2-nistp384" => ("ecdsa-sha2-nistp384", 0),
             "ecdsa-sha2-nistp521" => ("ecdsa-sha2-nistp521", 0),
-            "ssh-mldsa44-ed25519@openssh.com" => ("ssh-mldsa44-ed25519@openssh.com", 0),
+            "ssh-mldsa44-ed25519" => ("ssh-mldsa44-ed25519", 0),
             // Default RSA to SHA-2-256 (OpenSSH ≥8.2 deprecates ssh-rsa
             // by default); callers can swap via [`Self::with_rsa_hash`].
             "ssh-rsa" => ("rsa-sha2-256", SSH_AGENT_RSA_SHA2_256),

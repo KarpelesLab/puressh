@@ -4040,7 +4040,7 @@ fn pinned_host_key_algorithms(pin: &[u8], over: Option<&[String]>) -> Result<Vec
         b"ecdsa-sha2-nistp256" => &["ecdsa-sha2-nistp256"],
         b"ecdsa-sha2-nistp384" => &["ecdsa-sha2-nistp384"],
         b"ecdsa-sha2-nistp521" => &["ecdsa-sha2-nistp521"],
-        b"ssh-mldsa44-ed25519@openssh.com" => &["ssh-mldsa44-ed25519@openssh.com"],
+        b"ssh-mldsa44-ed25519" => &["ssh-mldsa44-ed25519"],
         _ => return Err(Error::Unsupported("pinned host key type")),
     };
     let out: Vec<String> = match over {

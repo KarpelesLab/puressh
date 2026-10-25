@@ -147,6 +147,7 @@ pub mod defaults {
         "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
         "rsa-sha2-512",
         "rsa-sha2-256",
+        "ssh-mldsa44-ed25519",
     ];
 
     /// Cipher algorithms (same list for both directions).

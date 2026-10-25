@@ -1552,7 +1552,10 @@ mod imp {
         line("KexAlgorithms", &list(&opts.kex_algorithms, defaults::KEX));
         line(
             "CASignatureAlgorithms",
-            &list(&opts.ca_signature_algorithms, defaults::HOST_KEY),
+            &list(
+                &opts.ca_signature_algorithms,
+                &puressh::config::default_algorithms(puressh::config::AlgoCategory::CaSignature),
+            ),
         );
         // Certificate algorithms first, as OpenSSH lists them.
         let with_certs: Vec<&str> = puressh::cert::CERT_KEY_NAMES

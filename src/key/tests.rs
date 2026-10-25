@@ -916,18 +916,13 @@ fn mldsa44_ed25519_key_roundtrip_and_signatures() {
     let back = PrivateKey::parse_openssh_pem(&pem, None).unwrap();
     assert_eq!(back.public_key(), sk.public_key());
     let line = sk.public_key().to_authorized_keys_line();
-    assert!(line.starts_with("ssh-mldsa44-ed25519@openssh.com "));
+    assert!(line.starts_with("ssh-mldsa44-ed25519 "));
     let pk = PublicKey::parse_authorized_keys_line(&line).unwrap();
     assert_eq!(pk.comment(), "pq");
     let signer = back.into_host_key().unwrap();
     let sig = signer.sign(b"data").unwrap();
-    crate::hostkey::verify_signature(
-        "ssh-mldsa44-ed25519@openssh.com",
-        &pk.wire_blob(),
-        b"data",
-        &sig,
-    )
-    .unwrap();
+    crate::hostkey::verify_signature("ssh-mldsa44-ed25519", &pk.wire_blob(), b"data", &sig)
+        .unwrap();
 }
 
 #[test]
@@ -1145,4 +1140,31 @@ fn fingerprints_with_every_hash() {
     }
     assert_eq!(pk.fingerprint("sha256"), Some(pk.sha256_fingerprint()));
     assert!(pk.fingerprint("sha224").is_none());
+}
+
+/// A key written under ML-DSA's old experimental name
+/// (`ssh-mldsa44-ed25519@openssh.com`) still reads, as the new one.
+#[test]
+fn mldsa_old_name_still_reads() {
+    let key = PrivateKey::generate_mldsa44_ed25519(&mut purecrypto::rng::OsRng, String::new());
+    let PublicKey::MlDsa44Ed25519 { raw, .. } = key.public_key() else {
+        unreachable!()
+    };
+    let mut w = crate::format::Writer::new();
+    w.write_string(b"ssh-mldsa44-ed25519@openssh.com");
+    w.write_string(&raw);
+    let old = w.into_vec();
+    let pk = PublicKey::parse_wire_blob(&old).unwrap();
+    assert_eq!(pk.algorithm(), "ssh-mldsa44-ed25519");
+    assert_eq!(pk.wire_blob(), key.public_key().wire_blob());
+    let line = format!(
+        "ssh-mldsa44-ed25519@openssh.com {} old",
+        super::base64::encode(&old)
+    );
+    let pk = PublicKey::parse_authorized_keys_line(&line).unwrap();
+    assert_eq!(pk.algorithm(), "ssh-mldsa44-ed25519");
+    assert!(
+        pk.to_authorized_keys_line()
+            .starts_with("ssh-mldsa44-ed25519 ")
+    );
 }

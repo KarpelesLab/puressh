@@ -141,7 +141,7 @@ fn modulus_bit_len(n: &[u8]) -> u32 {
 }
 
 impl PrivateKey {
-    /// Generate a new `ssh-mldsa44-ed25519@openssh.com` keypair.
+    /// Generate a new `ssh-mldsa44-ed25519` keypair.
     pub fn generate_mldsa44_ed25519<R: CryptoRng + RngCore>(rng: &mut R, comment: String) -> Self {
         let mut seeds = [0u8; 64];
         rng.fill_bytes(&mut seeds);
@@ -381,7 +381,7 @@ impl PrivateKey {
                 public,
                 comment,
             } => {
-                w.write_string(b"ssh-mldsa44-ed25519@openssh.com");
+                w.write_string(b"ssh-mldsa44-ed25519");
                 w.write_string(public);
                 w.write_string(seeds);
                 w.write_string(comment.as_bytes());
@@ -563,7 +563,7 @@ fn encode_inner_block<R: CryptoRng + RngCore>(
             public,
             comment,
         } => {
-            w.write_string(b"ssh-mldsa44-ed25519@openssh.com");
+            w.write_string(b"ssh-mldsa44-ed25519");
             w.write_string(public);
             w.write_string(seeds);
             w.write_string(comment.as_bytes());

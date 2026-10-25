@@ -136,7 +136,7 @@ pub struct ClientAuth {
 /// never appear there and must be reduced before matching.
 fn signature_algorithm(algo: &str) -> &str {
     // The certificate table knows names whose plain form is not a suffix
-    // strip (`ssh-mldsa44-ed25519-cert-v01@openssh.com`).
+    // strip (`ssh-mldsa44-ed25519-cert`).
     crate::cert::cert_name_to_plain(algo)
         .unwrap_or_else(|| algo.strip_suffix("-cert-v01@openssh.com").unwrap_or(algo))
 }
@@ -594,8 +594,8 @@ mod tests {
         // credential has to be matched on the algorithm it actually signs
         // with, not on its certificate name.
         assert_eq!(
-            signature_algorithm("ssh-mldsa44-ed25519-cert-v01@openssh.com"),
-            "ssh-mldsa44-ed25519@openssh.com"
+            signature_algorithm("ssh-mldsa44-ed25519-cert"),
+            "ssh-mldsa44-ed25519"
         );
         assert_eq!(
             signature_algorithm("ssh-ed25519-cert-v01@openssh.com"),

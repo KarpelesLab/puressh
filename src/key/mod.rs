@@ -352,7 +352,7 @@ pub enum PublicKey {
         /// Trailing comment.
         comment: String,
     },
-    /// `ssh-mldsa44-ed25519@openssh.com` — ML-DSA-44 + Ed25519 composite.
+    /// `ssh-mldsa44-ed25519` — ML-DSA-44 + Ed25519 composite.
     MlDsa44Ed25519 {
         /// ML-DSA-44 public key (1312 bytes) || Ed25519 public key (32).
         raw: Vec<u8>,
@@ -441,7 +441,7 @@ pub enum PrivateKey {
         /// Trailing comment.
         comment: String,
     },
-    /// `ssh-mldsa44-ed25519@openssh.com`.
+    /// `ssh-mldsa44-ed25519`.
     MlDsa44Ed25519 {
         /// ML-DSA-44 seed (32 bytes) || Ed25519 seed (32 bytes).
         seeds: [u8; 64],
@@ -548,7 +548,10 @@ const ECDSA_P256: &str = "ecdsa-sha2-nistp256";
 const ECDSA_P384: &str = "ecdsa-sha2-nistp384";
 const ECDSA_P521: &str = "ecdsa-sha2-nistp521";
 const RSA: &str = "ssh-rsa";
-const MLDSA44_ED25519: &str = "ssh-mldsa44-ed25519@openssh.com";
+const MLDSA44_ED25519: &str = "ssh-mldsa44-ed25519";
+/// Its experimental name before IANA assigned one (puressh before 0.3 and
+/// OpenSSH before 10.6 wrote it): still read in key files, never written.
+const MLDSA44_ED25519_OLD: &str = "ssh-mldsa44-ed25519@openssh.com";
 const SK_ECDSA: &str = crate::hostkey::sk::SK_ECDSA;
 const SK_ED25519: &str = crate::hostkey::sk::SK_ED25519;
 
@@ -573,6 +576,7 @@ fn is_known_algorithm_name(s: &str) -> bool {
             | "rsa-sha2-256"
             | "rsa-sha2-512"
             | MLDSA44_ED25519
+            | MLDSA44_ED25519_OLD
             | SK_ECDSA
             | SK_ED25519
     )
@@ -702,7 +706,12 @@ impl PublicKey {
                 "authorized_keys: line begins with options or unknown tag — refusing rather than silently dropping",
             ));
         }
-        let algo = first;
+        // The old ML-DSA name reads as the new one.
+        let algo = if first == MLDSA44_ED25519_OLD {
+            MLDSA44_ED25519
+        } else {
+            first
+        };
         let b64 = it
             .next()
             .ok_or(Error::Format("authorized_keys: missing key blob"))?;
@@ -820,7 +829,7 @@ impl PublicKey {
                     comment: String::new(),
                 }
             }
-            b if b == MLDSA44_ED25519.as_bytes() => {
+            b if b == MLDSA44_ED25519.as_bytes() || b == MLDSA44_ED25519_OLD.as_bytes() => {
                 let raw = r.read_string()?;
                 crate::hostkey::MlDsa44Ed25519HostKey::from_public(raw)?;
                 PublicKey::MlDsa44Ed25519 {
@@ -1571,7 +1580,7 @@ fn parse_private_fields(r: &mut Reader<'_>) -> Result<PrivateKey> {
                 comment: String::new(),
             })
         }
-        b if b == MLDSA44_ED25519.as_bytes() => {
+        b if b == MLDSA44_ED25519.as_bytes() || b == MLDSA44_ED25519_OLD.as_bytes() => {
             let public = r.read_string()?;
             crate::hostkey::MlDsa44Ed25519HostKey::from_public(public)?;
             let sk = r.read_string()?;

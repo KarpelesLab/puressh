@@ -470,10 +470,7 @@ mod dns_tests {
         // Another key type's record neither matches nor fails.
         let v = check_sshfp(&set, "ssh-rsa", blob).unwrap();
         assert!(v.found && !v.matched);
-        assert_eq!(
-            check_sshfp(&set, "ssh-mldsa44-ed25519@openssh.com", blob),
-            None
-        );
+        assert_eq!(check_sshfp(&set, "ssh-mldsa44-ed25519", blob), None);
         // NXDOMAIN, no answers, a wrong ID.
         assert_eq!(
             parse_reply(&reply(7, [0x81, 0x83], &[]), 7, TYPE_SSHFP),

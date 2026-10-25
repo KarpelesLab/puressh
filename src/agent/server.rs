@@ -123,7 +123,7 @@ const ALLOWED_CA_SIGALGS: &[&str] = &[
     "ecdsa-sha2-nistp521",
     "rsa-sha2-512",
     "rsa-sha2-256",
-    "ssh-mldsa44-ed25519@openssh.com",
+    "ssh-mldsa44-ed25519",
 ];
 
 /// What one agent connection has been bound to: the sessions `ssh`

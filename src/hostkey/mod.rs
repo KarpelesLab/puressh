@@ -85,6 +85,7 @@ pub const HOST_KEY_VERIFY_NAMES: &[&str] = &[
     "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
     "rsa-sha2-512",
     "rsa-sha2-256",
+    "ssh-mldsa44-ed25519",
 ];
 
 /// OpenSSH certificate host-key / signature algorithm names this build can
@@ -161,9 +162,7 @@ pub(crate) fn host_key_verify_by_name(
 ) -> crate::Result<Box<dyn HostKeyVerify>> {
     match name {
         "ssh-ed25519" => Ok(Box::new(Ed25519HostKey::from_public_blob(blob)?)),
-        "ssh-mldsa44-ed25519@openssh.com" => {
-            Ok(Box::new(MlDsa44Ed25519HostKey::from_public_blob(blob)?))
-        }
+        "ssh-mldsa44-ed25519" => Ok(Box::new(MlDsa44Ed25519HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp256" => Ok(Box::new(EcdsaP256HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp384" => Ok(Box::new(EcdsaP384HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp521" => Ok(Box::new(EcdsaP521HostKey::from_public_blob(blob)?)),

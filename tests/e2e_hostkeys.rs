@@ -217,7 +217,7 @@ fn update_host_keys_both_ways() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// `ssh-mldsa44-ed25519@openssh.com` (OpenSSH 10.3+), opt-in on both sides:
+/// `ssh-mldsa44-ed25519` (OpenSSH 10.3+), opt-in on both sides:
 /// as host key and as user key, each way between the real binaries. Skipped
 /// when the local OpenSSH predates it.
 #[test]
@@ -227,7 +227,7 @@ fn mldsa_keys_both_ways() {
         eprintln!("e2e_hostkeys: skipping (no sshd)");
         return;
     };
-    const ALG: &str = "ssh-mldsa44-ed25519@openssh.com";
+    const ALG: &str = "ssh-mldsa44-ed25519";
     let knows = Command::new("ssh")
         .args(["-Q", "key"])
         .output()

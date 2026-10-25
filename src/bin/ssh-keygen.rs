@@ -733,7 +733,7 @@ fn default_key_file(args: &Args) -> Result<String, String> {
         "rsa" | "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => "id_rsa",
         "ed25519" | "ssh-ed25519" => "id_ed25519",
         "ed25519-sk" | "sk-ssh-ed25519@openssh.com" => "id_ed25519_sk",
-        "mldsa44-ed25519" | "ssh-mldsa44-ed25519@openssh.com" => "id_mldsa44_ed25519",
+        "mldsa44-ed25519" | "ssh-mldsa44-ed25519" => "id_mldsa44_ed25519",
         _ => return Err(format!("{FATAL}bad key type")),
     };
     #[cfg(unix)]
@@ -778,7 +778,7 @@ fn run_generate(args: &Args) -> Result<i32, String> {
     let named = args.type_.as_deref().unwrap_or("ed25519");
     let (ty, curve_bits) = match named {
         "ssh-ed25519" => ("ed25519".to_string(), None),
-        "ssh-mldsa44-ed25519@openssh.com" => ("mldsa44-ed25519".to_string(), None),
+        "ssh-mldsa44-ed25519" => ("mldsa44-ed25519".to_string(), None),
         "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512" => ("rsa".to_string(), None),
         "ecdsa-sha2-nistp256" => ("ecdsa".to_string(), Some(256)),
         "ecdsa-sha2-nistp384" => ("ecdsa".to_string(), Some(384)),

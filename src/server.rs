@@ -5485,44 +5485,51 @@ fn rsa_family(name: &str) -> Option<bool> {
 /// Carries `server-sig-algs` (RFC 8308 §3.1) so the client can pick
 /// rsa-sha2-{256,512} instead of legacy `ssh-rsa` for publickey signatures.
 pub(crate) fn server_ext_info(cfg: &Config) -> ExtInfo {
-    // Algorithms we are willing to verify a client publickey signature with.
-    // Order is the same priority as our host-key KEX list — strongest first.
-    // Legacy `ssh-rsa` (SHA-1) is listed only with the opt-in
-    // (hostkey::set_allow_rsa_sha1; sshd sets it for
-    // `PubkeyAcceptedAlgorithms +ssh-rsa`), as old clients need it listed.
-    // The certificate key-type names are advertised too, so a client holding a
-    // user certificate offers it (its `HostKey::algorithm()` is the cert name,
-    // which the client filters against this list). Accepting the resulting
-    // signature still requires CA trust + principal authorization at the
-    // authenticator — advertising the name does not weaken anything.
-    let mut algs = String::from(
-        "ssh-ed25519-cert-v01@openssh.com,\
-         ecdsa-sha2-nistp256-cert-v01@openssh.com,ecdsa-sha2-nistp384-cert-v01@openssh.com,\
-         ecdsa-sha2-nistp521-cert-v01@openssh.com,\
-         rsa-sha2-512-cert-v01@openssh.com,rsa-sha2-256-cert-v01@openssh.com,\
-         ssh-ed25519,ecdsa-sha2-nistp256,ecdsa-sha2-nistp384,ecdsa-sha2-nistp521,\
-         rsa-sha2-512,rsa-sha2-256",
-    );
-    if crate::hostkey::allow_rsa_sha1() {
-        algs.push_str(",ssh-rsa");
-    }
-    let named = |n: &str| {
+    // Algorithms we are willing to verify a client publickey signature with:
+    // OpenSSH 10.6's list and order (its `sshkey_alg_list`), filtered by
+    // `PubkeyAcceptedAlgorithms` as OpenSSH filters it. Legacy `ssh-rsa`
+    // (SHA-1) is listed only with the opt-in (hostkey::set_allow_rsa_sha1;
+    // sshd sets it for `PubkeyAcceptedAlgorithms +ssh-rsa`). The certificate
+    // key-type names are advertised ahead of them, so a client holding a
+    // user certificate offers it (its `HostKey::algorithm()` is the cert
+    // name, which our client filters against this list). Accepting the
+    // resulting signature still requires CA trust + principal authorization
+    // at the authenticator — advertising the name does not weaken anything.
+    const CERTS: &[&str] = &[
+        "ssh-ed25519-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp256-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp384-cert-v01@openssh.com",
+        "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+        "rsa-sha2-512-cert-v01@openssh.com",
+        "rsa-sha2-256-cert-v01@openssh.com",
+    ];
+    const PLAIN: &[&str] = &[
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+        "rsa-sha2-512",
+        "rsa-sha2-256",
+        "ssh-mldsa44-ed25519",
+        "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
+    ];
+    let accepted = |n: &str| {
         cfg.pubkey_accepted_algorithms
             .as_ref()
-            .is_some_and(|l| l.iter().any(|a| a == n))
+            .is_none_or(|l| l.iter().any(|a| a == n))
     };
-    let (cert, plain) = (
-        "ssh-mldsa44-ed25519-cert-v01@openssh.com",
-        "ssh-mldsa44-ed25519@openssh.com",
-    );
-    if named(cert) {
-        algs.push(',');
-        algs.push_str(cert);
+    let mut names: Vec<&str> = Vec::new();
+    for n in CERTS.iter().chain(PLAIN) {
+        if accepted(n) {
+            names.push(n);
+        }
     }
-    if named(plain) || named(cert) {
-        algs.push(',');
-        algs.push_str(plain);
+    if crate::hostkey::allow_rsa_sha1() {
+        names.push("ssh-rsa");
     }
+    let algs = names.join(",");
     // `publickey-hostbound-v00@openssh.com` is accepted (OpenSSH 8.9+).
     ExtInfo::new()
         .with_server_sig_algs(algs)
@@ -5585,15 +5592,9 @@ pub(crate) fn build_server_kexinit<R: RngCore>(rng: &mut R, cfg: &Config) -> Kex
     // for is a silent no-op, and the override CAN intentionally exclude an
     // algorithm we hold a key for.
     // Algorithms that are never advertised by default, only when the
-    // override names them: OpenSSH's ML-DSA composite, and SHA-1 `ssh-rsa`
-    // (for an RSA key, with the process-wide SHA-1 opt-in).
-    let mut opt_in: Vec<&'static str> = [
-        "ssh-mldsa44-ed25519-cert-v01@openssh.com",
-        "ssh-mldsa44-ed25519@openssh.com",
-    ]
-    .into_iter()
-    .filter(|n| host_keys.iter().any(|k| k.algorithm() == *n))
-    .collect();
+    // override names them: SHA-1 `ssh-rsa` (for an RSA key, with the
+    // process-wide SHA-1 opt-in).
+    let mut opt_in: Vec<&'static str> = Vec::new();
     if crate::hostkey::allow_rsa_sha1() {
         for (name, cert) in [("ssh-rsa-cert-v01@openssh.com", true), ("ssh-rsa", false)] {
             if host_keys

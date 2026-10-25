@@ -47,18 +47,9 @@ them.
 ## Uploading
 
 The `publish-launchpad` job of the release workflow builds, signs and
-uploads the four source packages when a release is published. It signs with
-the apt repository's key (`APT_GPG_PRIVATE_KEY`, and `APT_GPG_PASSPHRASE` if
-it has one; see [`../apt/README.md`](../apt/README.md)), which must be
-registered on a Launchpad account that may upload to the PPA.
-
-The PPA must build for amd64 and arm64: enable arm64 under "Change details"
-→ "Processors" on the PPA's page.
-
-Without the secret the job skips itself. A failed upload can be retried
-with "Run workflow" on the release workflow; Launchpad never accepts the
-same version twice, so give a new `ppa_rev` to re-upload a version it has
-already accepted (`0.2.7-1ppa2~ubuntu24.04` and so on).
+uploads the four source packages when a release is published. Launchpad
+never accepts the same version twice: re-running it for a version already
+uploaded takes a new `ppa_rev` (`0.2.7-1ppa2~ubuntu24.04` and so on).
 
 By hand:
 

@@ -53,7 +53,7 @@ use common::{
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const USAGE: &str = "usage: ssh [-46AaCfGgKkMNnqsTtVvXxYy] [-B bind_interface] [-b bind_address]\n           \
+const USAGE: &str = "usage: ssh [-46AaCfGgKkMNnqsTtVvXxYyZ] [-B bind_interface] [-b bind_address]\n           \
                      [-c cipher_spec] [-D [bind_address:]port] [-E log_file]\n           \
                      [-e escape_char] [-F configfile] [-I pkcs11] [-i identity_file]\n           \
                      [-J destination] [-L address] [-l login_name] [-m mac_spec]\n           \
@@ -174,6 +174,8 @@ struct Cli {
     subsystem: bool,
     /// `-G`: print the resolved configuration and exit.
     print_config: bool,
+    /// `-Z`: list the public keys authentication would try and exit.
+    dump_pubkeys: bool,
     /// `-e char`: escape character for the interactive session (`None` in the
     /// outer option = default `~`; `Some(None)` = `-e none`).
     escape_char: Option<Option<u8>>,
@@ -249,7 +251,7 @@ fn parse_remote_forward(s: &str) -> Result<RemoteForward, String> {
 /// `1246ab:c:e:fgi:kl:m:no:p:qstvxAB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy`).
 const SSH_VALUE_OPTS: &str = "bceilmopBDEFIJLOPQRSwW";
 /// Options of OpenSSH's `ssh` that are plain flags.
-const SSH_FLAG_OPTS: &str = "1246afgknqstvxACGKMNTVXYy";
+const SSH_FLAG_OPTS: &str = "1246afgknqstvxACGKMNTVXYyZ";
 
 /// Parse `-e` values: a single character, `^X` for a control character, or
 /// `none`.
@@ -302,6 +304,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     let mut stdio_forward: Option<String> = None;
     let mut subsystem = false;
     let mut print_config = false;
+    let mut dump_pubkeys = false;
     let mut escape_char: Option<Option<u8>> = None;
     let mut log_file: Option<String> = None;
     let mut use_syslog = false;
@@ -418,9 +421,8 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     // the multiplexing control commands puressh's mux master
                     // honors: `check` (is the master alive?), `exit`/`stop`.
                     'O' => match v.as_str() {
-                        "check" | "exit" | "stop" | "forward" | "cancel" | "conninfo" => {
-                            control_cmd = Some(v)
-                        }
+                        "check" | "exit" | "stop" | "forward" | "cancel" | "conninfo"
+                        | "channels" => control_cmd = Some(v),
                         "proxy" => mux_proxy = true,
                         _ => return Err("Invalid multiplex command.".into()),
                     },
@@ -472,6 +474,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 }
                 'g' => extra_o.push("GatewayPorts yes".into()),
                 'G' => print_config = true,
+                'Z' => dump_pubkeys = true,
                 // GSSAPI authentication / credential delegation: not
                 // implemented, so (as with GSSAPIAuthentication) nothing to
                 // turn on; OpenSSH without a Kerberos ticket behaves alike.
@@ -540,6 +543,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             stdio_forward,
             subsystem,
             print_config,
+            dump_pubkeys,
             escape_char,
             log_file,
             use_syslog,
@@ -599,6 +603,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         stdio_forward,
         subsystem,
         print_config,
+        dump_pubkeys,
         escape_char,
         log_file,
         use_syslog,
@@ -2550,6 +2555,108 @@ const DEFAULT_IDENTITY_NAMES: [&str; 6] = [
     "id_mldsa44_ed25519",
 ];
 
+/// `ssh -Z`: the public keys authentication would try, in OpenSSH's order
+/// and its `format_identity` words: user certificates, the agent's keys
+/// (those an identity file names first, as that file), then the other
+/// identity files (a missing default one with no key).
+fn dump_pubkeys(cli: &Cli, cfg_block: &puressh::config::ClientOptions, identities_only: bool) {
+    let hash = cfg_block.fingerprint_hash.as_deref().unwrap_or("SHA256");
+    let describe = |blob: &[u8]| {
+        format!(
+            "{} {}",
+            puressh::client::host_key_type_label(blob),
+            fingerprint::fingerprint(blob, hash)
+        )
+    };
+    // The public half of an identity file: its `.pub`, else the file.
+    let public_of = |path: &str| -> Option<Vec<u8>> {
+        let text = std::fs::read_to_string(format!("{path}.pub"))
+            .or_else(|_| std::fs::read_to_string(path))
+            .ok()?;
+        if let Ok(pk) = puressh::key::PublicKey::parse_authorized_keys_line(text.trim()) {
+            return Some(pk.wire_blob());
+        }
+        puressh::key::PrivateKey::parse_pem(&text, None)
+            .ok()
+            .map(|k| k.public_key().wire_blob())
+    };
+    let explicit = !cli.identities.is_empty() || !cfg_block.identity_files.is_empty();
+    let mut files: Vec<(String, Option<Vec<u8>>, bool)> = Vec::new();
+    if explicit {
+        for p in cli
+            .identities
+            .iter()
+            .cloned()
+            .chain(cfg_block.identity_files.iter().map(|p| expand_tilde(p)))
+        {
+            if let Err(e) = std::fs::metadata(&p) {
+                eprintln!(
+                    "Warning: Identity file {p} not accessible: {}.",
+                    common::io_reason(&e)
+                );
+                continue;
+            }
+            let key = public_of(&p);
+            files.push((p, key, true));
+        }
+    } else {
+        for n in DEFAULT_IDENTITY_NAMES {
+            let p = expand_tilde(&format!("~/.ssh/{n}"));
+            let key = public_of(&p);
+            files.push((p, key, false));
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for c in &cfg_block.certificate_files {
+        let p = expand_tilde(c);
+        if let Ok(cert) = std::fs::read_to_string(&p)
+            .map_err(|_| ())
+            .and_then(|t| puressh::cert::Certificate::parse_openssh_line(&t).map_err(|_| ()))
+        {
+            out.push(format!("{p} {} explicit", describe(&cert.raw)));
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(Some(mut agent)) = puressh::agent::Agent::connect_env()
+        && let Ok(ids) = agent.identities()
+    {
+        let mut others = Vec::new();
+        for id in ids {
+            match files
+                .iter()
+                .position(|(_, k, _)| k.as_deref() == Some(&id.key_blob[..]))
+            {
+                Some(i) => {
+                    let (p, _, user) = files.remove(i);
+                    out.push(format!(
+                        "{p} {}{} agent",
+                        describe(&id.key_blob),
+                        if user { " explicit" } else { "" }
+                    ));
+                }
+                None if !identities_only => {
+                    others.push(format!("{} {} agent", id.comment, describe(&id.key_blob)))
+                }
+                None => {}
+            }
+        }
+        out.extend(others);
+    }
+    for (p, key, user) in files {
+        match key {
+            Some(blob) => out.push(format!(
+                "{p} {}{}",
+                describe(&blob),
+                if user { " explicit" } else { "" }
+            )),
+            None => out.push(format!("{p} {}", if user { "explicit" } else { "" })),
+        }
+    }
+    for line in out {
+        println!("{line}");
+    }
+}
+
 /// `ssh -Q KIND`: list the algorithms this build supports, one per line.
 /// The key types this build implements, each with its certificate type, in
 /// OpenSSH's `-Q key` order (which also lists the FIDO `sk-` types we lack).
@@ -2985,6 +3092,12 @@ fn run() -> Result<i32, String> {
         .iter()
         .map(|p| tokens.expand_path(p))
         .collect();
+    // `-Z`: the keys authentication would offer, and stop.
+    if cli.dump_pubkeys {
+        apply_identity_agent(cfg_block.identity_agent.as_ref(), identities_only);
+        dump_pubkeys(&cli, &cfg_block, identities_only);
+        return Ok(0);
+    }
     let mut cfg = config_for_host(&cfg_block, &cli, &connect_host)?;
     // KnownHostsCommand: its output joins the global known_hosts files.
     if let Some(template) = cfg_block
@@ -3517,6 +3630,12 @@ fn run() -> Result<i32, String> {
     // start in the process that keeps it (a ControlPersist master forks).
     let alive_count = cfg_block.server_alive_count_max.unwrap_or(3);
     let alive_host = connect_host.clone();
+    let channel_timeouts: Vec<(String, u32)> = cfg_block
+        .channel_timeouts
+        .iter()
+        .flatten()
+        .filter_map(|t| puressh::config::parse_channel_timeout(t))
+        .collect();
     let start_serving = move |shared: &puressh::shared::SharedClient| {
         serve_local_listeners(listeners, shared);
         if let Some(link) = tunnel {
@@ -3524,6 +3643,9 @@ fn run() -> Result<i32, String> {
         }
         if let Some(interval) = server_alive {
             spawn_keepalive(shared, interval, alive_count, alive_host);
+        }
+        if channel_timeouts.iter().any(|(_, secs)| *secs > 0) {
+            spawn_channel_timeouts(shared, channel_timeouts);
         }
     };
 
@@ -4093,6 +4215,109 @@ fn run_local_command(cmd: &str) {
             common::io_reason(&e)
         );
     }
+}
+
+/// The name `ChannelTimeout` (and the channel list) call a channel of wire
+/// type `kind` by, as OpenSSH's client.
+fn channel_type_name(kind: &str) -> &str {
+    match kind {
+        "auth-agent@openssh.com" => "agent-connection",
+        "x11" => "x11-connection",
+        "tun@openssh.com" => "tun-connection",
+        other => other,
+    }
+}
+
+/// The open channels, worded as OpenSSH's `channel_open_message` heads
+/// them (`~#`, `ssh -O channels`).
+fn channel_list(shared: &puressh::shared::SharedClient) -> String {
+    let mut out = String::from("The following connections are open:\r\n");
+    for (id, kind, _) in shared.open_channels().unwrap_or_default() {
+        out.push_str(&format!("  #{id} {}\r\n", channel_type_name(&kind)));
+    }
+    out
+}
+
+/// The channel of this process's own session (`u32::MAX`: none yet).
+static MAIN_SESSION: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+
+/// `ChannelTimeout`: close each channel idle (no data either way) for
+/// longer than the first `type=interval` its type matches, and every
+/// channel when all of them together have been idle past `global`, as
+/// OpenSSH's client does.
+fn spawn_channel_timeouts(shared: &puressh::shared::SharedClient, timeouts: Vec<(String, u32)>) {
+    let s = shared.clone();
+    thread::spawn(move || {
+        let limit_for = |ty: &str| {
+            for (pat, secs) in &timeouts {
+                if pat != "global"
+                    && puressh::config::host_matches(
+                        &[puressh::config::HostPattern::parse(pat)],
+                        ty,
+                    )
+                {
+                    return *secs;
+                }
+            }
+            0
+        };
+        let global = timeouts
+            .iter()
+            .find(|(pat, _)| pat == "global")
+            .map_or(0, |(_, secs)| *secs);
+        let mut idle: std::collections::BTreeMap<u32, (u64, std::time::Instant)> =
+            std::collections::BTreeMap::new();
+        let mut all_idle = (0u64, std::time::Instant::now());
+        loop {
+            thread::sleep(std::time::Duration::from_secs(1));
+            let Ok(open) = s.open_channels() else {
+                return;
+            };
+            let now = std::time::Instant::now();
+            let mut expired = Vec::new();
+            let mut total = 0u64;
+            for (id, kind, activity) in &open {
+                total = total.wrapping_add(*activity);
+                let e = idle.entry(*id).or_insert((*activity, now));
+                if e.0 != *activity {
+                    *e = (*activity, now);
+                }
+                let limit = limit_for(channel_type_name(kind));
+                if limit > 0 && now.duration_since(e.1).as_secs() >= u64::from(limit) {
+                    vlog(1, &format!("channel {id}: timed out after {limit} seconds"));
+                    expired.push(*id);
+                }
+            }
+            idle.retain(|id, _| open.iter().any(|(o, _, _)| o == id));
+            if all_idle.0 != total || open.is_empty() {
+                all_idle = (total, now);
+            } else if global > 0 && now.duration_since(all_idle.1).as_secs() >= u64::from(global) {
+                vlog(
+                    1,
+                    &format!("inactive channels timed out after {global} seconds"),
+                );
+                expired = open.iter().map(|(id, _, _)| *id).collect();
+                all_idle = (total, now);
+            }
+            for id in expired {
+                idle.remove(&id);
+                let _ = s.close_channel(id);
+                // The session itself: ssh ends there (status 255), as
+                // OpenSSH's client does without waiting for the server.
+                if id == MAIN_SESSION.load(std::sync::atomic::Ordering::Relaxed) {
+                    #[cfg(unix)]
+                    if let Ok(g) = ORIGINAL_TERMIOS.lock()
+                        && let Some(t) = g.as_ref()
+                    {
+                        // SAFETY: restoring a termios captured from fd 0.
+                        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
+                    }
+                    common::finish_log();
+                    std::process::exit(255);
+                }
+            }
+        }
+    });
 }
 
 /// `ServerAliveInterval`: a keepalive on the connection every `interval`
@@ -5288,6 +5513,11 @@ fn run_control_command(cmd: &str, path: &std::path::Path, cli: &Cli) -> Result<i
             print!("{text}");
             Ok(0)
         }
+        "channels" => {
+            let text = puressh::mux::channels(path).map_err(|e| format!("-O channels: {e}"))?;
+            print!("{text}");
+            Ok(0)
+        }
         other => Err(format!("-O: unsupported control command {other:?}")),
     }
 }
@@ -5625,10 +5855,12 @@ where
         listeners: Arc::default(),
     };
     let info_shared = shared.clone();
+    let chan_shared = shared.clone();
     let started = extras.started;
     let cfg = cfg
         .with_on_forward(move |kind, spec, cancel| forwards.handle(kind, spec, cancel))
         .with_on_conninfo(move || connection_info(&info_shared, started))
+        .with_on_channels(move || channel_list(&chan_shared))
         .with_peer_check(mux_peer_allowed);
 
     // ControlPersist no: master lives and dies with the foreground session in
@@ -6369,7 +6601,7 @@ fn run_escape(action: EscapeAction, ch: u8, shared: &puressh::shared::SharedClie
             let _ = shared.rekey();
         }
         EscapeAction::ListForwards => {
-            eprint!("The following connections are open:\r\n  #0 session\r\n");
+            eprint!("{}", channel_list(shared));
         }
         EscapeAction::ConnInfo => {
             eprint!("{e}I\r\n");
@@ -6595,6 +6827,7 @@ fn run_session(
         send_no_more_sessions(shared);
     }
     let channel_id = stream.channel_id();
+    MAIN_SESSION.store(channel_id, std::sync::atomic::Ordering::Relaxed);
     if stream.pty_denied() {
         // As OpenSSH: say so and leave raw mode; a terminal asked for with
         // -t / RequestTTY yes|force is required, else carry on without.
@@ -7848,7 +8081,14 @@ mod extra_o_tests {
         let c = parse_args(&args(&["-o", "Port 2200", "-oUser=bob", "host"])).unwrap();
         assert!(c.extra_o.contains(&"Port 2200".to_string()));
         assert!(c.extra_o.contains(&"User bob".to_string()));
-        assert!(parse_args(&args(&["-Z", "host"])).is_err());
+        assert!(parse_args(&args(&["-Z", "host"])).unwrap().dump_pubkeys);
+        assert!(parse_args(&args(&["-U", "host"])).is_err());
+        assert_eq!(
+            parse_args(&args(&["-B", "eth0", "-O", "channels", "host"]))
+                .unwrap()
+                .extra_o,
+            ["BindInterface eth0"]
+        );
         assert!(parse_args(&args(&["host", "-p"])).is_err());
     }
 

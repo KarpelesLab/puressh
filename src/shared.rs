@@ -951,6 +951,36 @@ impl SharedClient {
         lock_or_poison(&self.inner).is_ok_and(|g| g.client.host_key_mismatched())
     }
 
+    /// The open channels as `(local id, channel type, data bytes carried so
+    /// far)`, in id order — for listing them (`ssh -O channels`, `~#`) and
+    /// for idle timeouts (`ChannelTimeout`).
+    pub fn open_channels(&self) -> Result<Vec<(u32, String, u64)>> {
+        let g = lock_or_poison(&self.inner)?;
+        Ok(g.client
+            .conn
+            .channels()
+            .filter(|c| c.is_open())
+            .map(|c| (c.local_id, c.kind.clone(), c.activity))
+            .collect())
+    }
+
+    /// End `channel` from this side (`SSH_MSG_CHANNEL_EOF`, then
+    /// `SSH_MSG_CHANNEL_CLOSE`), as an expired `ChannelTimeout` does; its
+    /// reader then sees the end of the channel.
+    pub fn close_channel(&self, channel: u32) -> std::io::Result<()> {
+        let _ticket = LockTicket::new(&self.lock_waiters);
+        let mut g = lock_or_poison_io(&self.inner)?;
+        let q = g.queues.entry(channel).or_default();
+        let eof = !q.local_eof_sent;
+        q.local_eof_sent = true;
+        if eof && let Ok(p) = g.client.conn.send_eof(channel) {
+            g.client.write_payload(&p).map_err(io_err)?;
+        }
+        let p = g.client.conn.send_close(channel).map_err(io_err)?;
+        g.client.write_payload(&p).map_err(io_err)?;
+        Ok(())
+    }
+
     /// The algorithms the most recent key exchange chose.
     pub fn negotiated(&self) -> Option<crate::transport::Negotiated> {
         lock_or_poison(&self.inner).ok()?.client.negotiated()

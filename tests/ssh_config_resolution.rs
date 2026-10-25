@@ -136,6 +136,53 @@ fn client_keywords_print_as_openssh() {
     }
 }
 
+/// `ssh -Z`: the keys that would be offered, as OpenSSH's `pubkey_dump`.
+#[test]
+fn dash_z_lists_the_identities() {
+    let dir = std::env::temp_dir().join(format!("puressh-dashz-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let key = dir.join("k");
+    std::fs::write(&key, "not read: the .pub is\n").unwrap();
+    std::fs::write(
+        dir.join("k.pub"),
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILlxF+s0ktFl1xHsUrt7F0Z0wRAWTiAD1wnH+b5NKoSI t\n",
+    )
+    .unwrap();
+    let missing = dir.join("missing");
+    let out = Command::new(env!("CARGO_BIN_EXE_ssh"))
+        .args(["-F", "none", "-o", "FingerprintHash=md5", "-Z", "-i"])
+        .arg(&key)
+        .arg("-i")
+        .arg(&missing)
+        .arg("h")
+        .env("SSH_AUTH_SOCK", "")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!(
+            "{} ED25519 MD5:ea:87:de:32:10:ab:3b:c6:fb:a2:60:54:37:ac:48:81 explicit\n",
+            key.display()
+        )
+    );
+    // (strerror's words are the Unix ones.)
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains(&format!(
+            "Warning: Identity file {} not accessible: {}",
+            missing.display(),
+            if cfg!(unix) {
+                "No such file or directory."
+            } else {
+                ""
+            }
+        )),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn refuse_connection_stops_before_printing() {
     let dir = std::env::temp_dir().join(format!("puressh-refuse-{}", std::process::id()));

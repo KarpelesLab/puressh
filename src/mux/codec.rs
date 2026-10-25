@@ -37,6 +37,8 @@ const T_FORWARD: u8 = 16;
 const T_FORWARD_OK: u8 = 17;
 const T_CONNINFO: u8 = 18;
 const T_CONNINFO_REPLY: u8 = 19;
+const T_CHANINFO: u8 = 20;
+const T_CHANINFO_REPLY: u8 = 21;
 
 /// A decoded mux control-socket message.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,6 +142,13 @@ pub enum Frame {
     ConnInfo,
     /// Master → client: the description.
     ConnInfoReply {
+        /// Text, as OpenSSH prints it.
+        text: String,
+    },
+    /// Client → master: list the open channels (`ssh -O channels`).
+    ChanInfo,
+    /// Master → client: the list.
+    ChanInfoReply {
         /// Text, as OpenSSH prints it.
         text: String,
     },
@@ -254,6 +263,11 @@ impl Frame {
                 out.push(T_CONNINFO_REPLY);
                 put_str(out, text);
             }
+            Frame::ChanInfo => out.push(T_CHANINFO),
+            Frame::ChanInfoReply { text } => {
+                out.push(T_CHANINFO_REPLY);
+                put_str(out, text);
+            }
         }
     }
 
@@ -352,6 +366,8 @@ impl Frame {
             T_FORWARD_OK => Frame::ForwardOk { port: r.u32()? },
             T_CONNINFO => Frame::ConnInfo,
             T_CONNINFO_REPLY => Frame::ConnInfoReply { text: r.str()? },
+            T_CHANINFO => Frame::ChanInfo,
+            T_CHANINFO_REPLY => Frame::ChanInfoReply { text: r.str()? },
             other => return Err(MuxError::UnknownType(other)),
         };
         // Variants with fixed-length payloads must consume the whole body;

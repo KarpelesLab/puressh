@@ -204,6 +204,16 @@ pub fn conninfo(path: &Path) -> Result<String, MuxError> {
     }
 }
 
+/// `ssh -O channels`: the master's list of its open channels.
+pub fn channels(path: &Path) -> Result<String, MuxError> {
+    let mut sock = hello(path)?;
+    write_frame(&mut sock, &Frame::ChanInfo)?;
+    match read_frame(&mut sock)? {
+        Some(Frame::ChanInfoReply { text }) => Ok(text),
+        _ => Err(MuxError::Unexpected("expected CHANINFO_REPLY from master")),
+    }
+}
+
 /// Splice a mux forward control socket (from [`open_forward`]) against a local
 /// byte stream `local` (e.g. an accepted `ssh -L` TCP socket): local→master is
 /// sent as `StdinData`, master→local arrives as `StdoutData`, and either side's

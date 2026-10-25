@@ -59,7 +59,7 @@ pub use server::{ForwardHook, MasterConfig, PeerCheck, Persist, run_master, run_
 mod client;
 #[cfg(feature = "multichannel")]
 pub use client::{
-    ControlCommand, ProbeOutcome, SessionRequest, TryCloneStream, conninfo, open_forward,
+    ControlCommand, ProbeOutcome, SessionRequest, TryCloneStream, channels, conninfo, open_forward,
     probe_master, request_forward, run_client, send_control_command, splice_forward,
     validate_control_socket,
 };

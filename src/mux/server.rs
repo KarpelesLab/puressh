@@ -56,6 +56,8 @@ pub struct MasterConfig {
     pub on_forward: Option<ForwardHook>,
     /// Describes the connection for `ssh -O conninfo`.
     pub on_conninfo: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// Lists the open channels for `ssh -O channels`.
+    pub on_channels: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// Decides whether an accepted control-socket connection may be served
     /// (OpenSSH lets in only its own user and root, by peer credentials).
     /// The library cannot read peer credentials itself; without a check,
@@ -78,6 +80,7 @@ impl MasterConfig {
             on_exit: None,
             on_forward: None,
             on_conninfo: None,
+            on_channels: None,
             peer_check: None,
         }
     }
@@ -89,6 +92,12 @@ impl MasterConfig {
         f: impl Fn(u8, &str, bool) -> Result<u16, String> + Send + Sync + 'static,
     ) -> Self {
         self.on_forward = Some(Arc::new(f));
+        self
+    }
+
+    /// Serve `ssh -O channels` with `f`.
+    pub fn with_on_channels(mut self, f: impl Fn() -> String + Send + Sync + 'static) -> Self {
+        self.on_channels = Some(Arc::new(f));
         self
     }
 
@@ -133,6 +142,8 @@ struct MasterState {
     on_forward: Option<ForwardHook>,
     /// See [`MasterConfig::on_conninfo`].
     on_conninfo: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// See [`MasterConfig::on_channels`].
+    on_channels: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     /// See [`MasterConfig::peer_check`].
     peer_check: Option<PeerCheck>,
 }
@@ -260,6 +271,7 @@ where
         on_exit: cfg.on_exit.clone(),
         on_forward: cfg.on_forward.clone(),
         on_conninfo: cfg.on_conninfo.clone(),
+        on_channels: cfg.on_channels.clone(),
         peer_check: cfg.peer_check.clone(),
     });
 
@@ -335,6 +347,7 @@ pub fn run_master_daemon(cfg: MasterConfig, shared: SharedClient) -> Result<(), 
         on_exit: cfg.on_exit.clone(),
         on_forward: cfg.on_forward.clone(),
         on_conninfo: cfg.on_conninfo.clone(),
+        on_channels: cfg.on_channels.clone(),
         peer_check: cfg.peer_check.clone(),
     });
 
@@ -530,6 +543,11 @@ fn handle_client(stream: UnixStream, shared: SharedClient, state: Arc<MasterStat
         Frame::ConnInfo => {
             let text = state.on_conninfo.as_ref().map_or_else(String::new, |f| f());
             let _ = write_frame(&mut ctrl, &Frame::ConnInfoReply { text });
+            return;
+        }
+        Frame::ChanInfo => {
+            let text = state.on_channels.as_ref().map_or_else(String::new, |f| f());
+            let _ = write_frame(&mut ctrl, &Frame::ChanInfoReply { text });
             return;
         }
         Frame::OpenDirectTcpip {

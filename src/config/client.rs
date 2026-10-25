@@ -1559,29 +1559,36 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     }
                 })?);
         }
-        "checkhostip" => opts.check_host_ip = Some(parse_yes_no(line)?),
+        "checkhostip" => {
+            opts.check_host_ip.get_or_insert(parse_yes_no(line)?);
+        }
         "verifyhostkeydns" => {
             let v = one_arg(line)?.to_ascii_lowercase();
-            opts.verify_host_key_dns = Some(match v.as_str() {
+            opts.verify_host_key_dns.get_or_insert(match v.as_str() {
                 "yes" | "true" => VerifyHostKeyDns::Yes,
                 "no" | "false" => VerifyHostKeyDns::No,
                 "ask" => VerifyHostKeyDns::Ask,
                 _ => return Err(bad_value(line, format!("expected yes/no/ask, got {v:?}"))),
             });
         }
-        "visualhostkey" => opts.visual_host_key = Some(parse_yes_no(line)?),
+        "visualhostkey" => {
+            opts.visual_host_key.get_or_insert(parse_yes_no(line)?);
+        }
         "nohostauthenticationforlocalhost" => {
-            opts.no_host_authentication_for_localhost = Some(parse_yes_no(line)?)
+            opts.no_host_authentication_for_localhost
+                .get_or_insert(parse_yes_no(line)?);
         }
         "fingerprinthash" => {
             let v = one_arg(line)?;
-            opts.fingerprint_hash = Some(
+            opts.fingerprint_hash.get_or_insert(
                 fingerprint_hash_name(&v)
                     .ok_or_else(|| bad_value(line, format!("Invalid hash algorithm \"{v}\"")))?
                     .to_string(),
             );
         }
-        "bindinterface" => opts.bind_interface = Some(one_arg(line)?),
+        "bindinterface" => {
+            opts.bind_interface.get_or_insert(one_arg(line)?);
+        }
         "ipqos" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(bad_value(line, "expected one or two values".into()));
@@ -1597,17 +1604,20 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             } else {
                 values[0]
             };
-            opts.ip_qos = Some((values[0], bulk));
+            opts.ip_qos.get_or_insert((values[0], bulk));
         }
         "forwardx11timeout" => {
             let v = one_arg(line)?;
-            opts.forward_x11_timeout = Some(if v.eq_ignore_ascii_case("none") {
-                0
-            } else {
-                parse_time(line, &v)?
-            });
+            opts.forward_x11_timeout
+                .get_or_insert(if v.eq_ignore_ascii_case("none") {
+                    0
+                } else {
+                    parse_time(line, &v)?
+                });
         }
-        "xauthlocation" => opts.xauth_location = Some(one_arg(line)?),
+        "xauthlocation" => {
+            opts.xauth_location.get_or_insert(one_arg(line)?);
+        }
         "canonicalizepermittedcnames" => {
             let mut rules = Vec::new();
             for a in args {
@@ -1691,7 +1701,7 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
             let v = one_arg(line)?;
             let f = syslog_facility_name(&v)
                 .ok_or_else(|| bad_value(line, format!("unsupported log facility '{v}'")))?;
-            opts.syslog_facility = Some(f.to_string());
+            opts.syslog_facility.get_or_insert(f.to_string());
         }
         "streamlocalbindmask" => {
             let v = one_arg(line)?;
@@ -1699,15 +1709,24 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                 .ok()
                 .filter(|m| *m <= 0o777)
                 .ok_or_else(|| bad_value(line, "Bad mask.".into()))?;
-            opts.stream_local_bind_mask = Some(mask);
+            opts.stream_local_bind_mask.get_or_insert(mask);
         }
-        "streamlocalbindunlink" => opts.stream_local_bind_unlink = Some(parse_yes_no(line)?),
-        "requiredrsasize" => opts.required_rsa_size = Some(parse_u32(line)?),
-        "proxyusefdpass" => opts.proxy_use_fdpass = Some(parse_yes_no(line)?),
-        "kbdinteractivedevices" => opts.kbd_interactive_devices = Some(one_arg(line)?),
+        "streamlocalbindunlink" => {
+            opts.stream_local_bind_unlink
+                .get_or_insert(parse_yes_no(line)?);
+        }
+        "requiredrsasize" => {
+            opts.required_rsa_size.get_or_insert(parse_u32(line)?);
+        }
+        "proxyusefdpass" => {
+            opts.proxy_use_fdpass.get_or_insert(parse_yes_no(line)?);
+        }
+        "kbdinteractivedevices" => {
+            opts.kbd_interactive_devices.get_or_insert(one_arg(line)?);
+        }
         "warnweakcrypto" => {
             let v = one_arg(line)?.to_ascii_lowercase();
-            opts.warn_weak_crypto = Some(match v.as_str() {
+            opts.warn_weak_crypto.get_or_insert(match v.as_str() {
                 "yes" | "true" => true,
                 "no" | "false" | "no-pq-kex" => false,
                 _ => {
@@ -1759,10 +1778,15 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
                     "expected yes, no, point-to-point or ethernet".into(),
                 ));
             }
-            opts.tunnel = Some(v);
+            opts.tunnel.get_or_insert(v);
         }
-        "tunneldevice" => opts.tunnel_device = Some(one_arg(line)?),
-        "enableescapecommandline" => opts.enable_escape_commandline = Some(parse_yes_no(line)?),
+        "tunneldevice" => {
+            opts.tunnel_device.get_or_insert(one_arg(line)?);
+        }
+        "enableescapecommandline" => {
+            opts.enable_escape_commandline
+                .get_or_insert(parse_yes_no(line)?);
+        }
         _ => {
             if let Some((_, allowed, why)) = IGNORED_KEYWORDS
                 .iter()
@@ -3059,6 +3083,13 @@ Host *.example.com !secret.example.com
         assert_eq!(o.tunnel_device.as_deref(), Some("1:2"));
         assert_eq!(o.enable_escape_commandline, Some(true));
         assert!(o.unimplemented.is_empty(), "{:?}", o.unimplemented);
+        // The first value obtained wins, in a block too (as `-w` after
+        // `-o Tunnel=ethernet`).
+        let o = SshClientConfig::parse("Tunnel ethernet\nTunnel yes\nIPQoS ef\nIPQoS cs1\n")
+            .unwrap()
+            .lookup("h");
+        assert_eq!(o.tunnel.as_deref(), Some("ethernet"));
+        assert_eq!(o.ip_qos, Some((0xb8, 0xb8)));
 
         for bad in [
             "Tunnel maybe\n",

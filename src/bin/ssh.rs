@@ -392,9 +392,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         &mut extra_o,
                     )?,
                     'p' => port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?),
-                    'B' => {
-                        return Err("-B (BindInterface) is not supported; use -b ADDRESS".into());
-                    }
+                    'B' => extra_o.push(format!("BindInterface {v}")),
                     'D' => {
                         dynamics_raw.push(parse_dynamic_forward(&v)?);
                         forward_specs.push((b'D', v));
@@ -3309,6 +3307,7 @@ fn run() -> Result<i32, String> {
     // `ProxyCommand ssh -W %h:%p jump` form); no session.
     if let Some(spec) = cli.stdio_forward.clone() {
         background_ready();
+        set_session_qos(false);
         return run_stdio_forward(client, &spec, no_more_sessions);
     }
 
@@ -3413,6 +3412,8 @@ fn run() -> Result<i32, String> {
     }
     let has_command = cli.command.is_some();
     let use_pty = want_pty(&cli, &cfg_block, has_command, cli.subsystem);
+    // IPQoS: interactive for a terminal session (or X11), else bulk.
+    set_session_qos(use_pty || cli.x11_forward.is_some());
     // A terminal asked for explicitly (-t, RequestTTY yes / force) must be
     // granted, as OpenSSH; one it chose to ask for may be refused.
     let pty_required = matches!(
@@ -6826,7 +6827,11 @@ fn dial_tcp(
             std::thread::sleep(std::time::Duration::from_secs(1));
         }
         for addr in resolve_addrs(host, port, cfg_block)? {
-            let sock = match connect_one(addr, cfg_block.bind_address.as_deref(), timeout) {
+            let bind = (
+                cfg_block.bind_address.as_deref(),
+                cfg_block.bind_interface.as_deref(),
+            );
+            let sock = match connect_from(addr, bind, timeout) {
                 Ok(s) => s,
                 Err(e) => {
                     last_err = Some(e);
@@ -6894,7 +6899,156 @@ fn configure_socket(
         set_so_keepalive(sock, true)?;
     }
     let _ = sock.set_nodelay(true);
+    // IPQoS: the interactive value until the session says otherwise
+    // (`set_session_qos`).
+    let (interactive, bulk) = cfg_block.ip_qos.unwrap_or(DEFAULT_IPQOS);
+    set_sock_tos(sock, interactive);
+    if let Ok(clone) = sock.try_clone()
+        && let Ok(mut g) = QOS_SOCKET.lock()
+    {
+        *g = Some((clone, interactive, bulk));
+    }
     Ok(())
+}
+
+/// The connection's socket and its `IPQoS` values (interactive, bulk), for
+/// [`set_session_qos`].
+static QOS_SOCKET: std::sync::Mutex<Option<(TcpStream, u32, u32)>> = std::sync::Mutex::new(None);
+
+/// `IPQoS` once the session is known: the interactive value for a terminal
+/// session, the bulk one otherwise (OpenSSH's `ssh_packet_set_interactive`).
+fn set_session_qos(interactive: bool) {
+    if let Ok(g) = QOS_SOCKET.lock()
+        && let Some((sock, i, b)) = g.as_ref()
+    {
+        vlog(
+            2,
+            &format!(
+                "session QoS is now {}",
+                if interactive {
+                    "interactive"
+                } else {
+                    "non-interactive"
+                }
+            ),
+        );
+        set_sock_tos(sock, if interactive { *i } else { *b });
+    }
+}
+
+/// Set the socket's TOS (IPv4) or traffic class (IPv6); `IPQOS_NONE`
+/// leaves the system default.
+#[cfg(unix)]
+fn set_sock_tos(sock: &TcpStream, tos: u32) {
+    use std::os::unix::io::AsRawFd;
+    if tos == puressh::config::IPQOS_NONE {
+        return;
+    }
+    let (level, name) = match sock.local_addr() {
+        Ok(a) if a.is_ipv4() => (libc::IPPROTO_IP, libc::IP_TOS),
+        #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
+        Ok(_) => (libc::IPPROTO_IPV6, libc::IPV6_TCLASS),
+        _ => return,
+    };
+    let val = tos as libc::c_int;
+    // SAFETY: setsockopt on a valid fd with a correctly-sized int.
+    let rc = unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            level,
+            name,
+            &val as *const _ as *const libc::c_void,
+            core::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        vlog(
+            1,
+            &format!(
+                "setsockopt IP_TOS {tos}: {}",
+                std::io::Error::last_os_error()
+            ),
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn set_sock_tos(_sock: &TcpStream, _tos: u32) {}
+
+/// `BindInterface`: an address of interface `ifname` in the family asked
+/// for, preferring one that is neither loopback nor link-local (OpenSSH's
+/// `check_ifaddrs`).
+#[cfg(unix)]
+fn interface_address(ifname: &str, v4: bool) -> Option<std::net::IpAddr> {
+    let mut list: *mut libc::ifaddrs = core::ptr::null_mut();
+    // SAFETY: getifaddrs fills `list`, released by freeifaddrs below.
+    if unsafe { libc::getifaddrs(&mut list) } != 0 {
+        return None;
+    }
+    let mut found: Vec<std::net::IpAddr> = Vec::new();
+    let mut cur = list;
+    while !cur.is_null() {
+        // SAFETY: `cur` walks the list getifaddrs returned.
+        let ifa = unsafe { &*cur };
+        cur = ifa.ifa_next;
+        if ifa.ifa_addr.is_null()
+            || ifa.ifa_name.is_null()
+            || ifa.ifa_flags & (libc::IFF_UP as libc::c_uint) == 0
+        {
+            continue;
+        }
+        // SAFETY: a NUL-terminated interface name.
+        let name = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) };
+        if name.to_bytes() != ifname.as_bytes() {
+            continue;
+        }
+        // SAFETY: the address is a sockaddr of the family it says.
+        let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
+        if v4 && family == libc::AF_INET {
+            let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
+            found.push(std::net::IpAddr::from(sa.sin_addr.s_addr.to_ne_bytes()));
+        } else if !v4 && family == libc::AF_INET6 {
+            let sa = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
+            found.push(std::net::IpAddr::from(sa.sin6_addr.s6_addr));
+        }
+    }
+    // SAFETY: the list from getifaddrs above.
+    unsafe { libc::freeifaddrs(list) };
+    let local = |a: &std::net::IpAddr| match a {
+        std::net::IpAddr::V4(a) => a.is_loopback(),
+        std::net::IpAddr::V6(a) => a.is_loopback() || (a.segments()[0] & 0xffc0) == 0xfe80,
+    };
+    found
+        .iter()
+        .find(|a| !local(a))
+        .or_else(|| found.first())
+        .copied()
+}
+
+#[cfg(not(unix))]
+fn interface_address(_ifname: &str, _v4: bool) -> Option<std::net::IpAddr> {
+    eprintln!("BindInterface not supported on this platform.");
+    None
+}
+
+/// [`connect_one`] from `BindAddress`, else from `BindInterface`'s address
+/// of the target's family (`bind`: the two, as configured).
+fn connect_from(
+    addr: std::net::SocketAddr,
+    bind: (Option<&str>, Option<&str>),
+    timeout: Option<std::time::Duration>,
+) -> std::io::Result<TcpStream> {
+    match bind {
+        (Some(a), _) => connect_one(addr, Some(a), timeout),
+        (None, Some(ifname)) => match interface_address(ifname, addr.is_ipv4()) {
+            Some(a) => connect_one(addr, Some(&a.to_string()), timeout),
+            None => {
+                eprintln!("getifaddrs: {ifname}: no suitable addresses");
+                Err(std::io::Error::other("failure"))
+            }
+        },
+        (None, None) => connect_one(addr, None, timeout),
+    }
 }
 
 /// Connect to a single resolved address, optionally binding a local source
@@ -7335,7 +7489,9 @@ mod knock_support {
         let addrs = resolve_addrs(host, port, cfg_block)?;
         let timeout = connect_timeout(cfg_block);
         let bind = cfg_block.bind_address.clone();
-        let dialer: TcpDialer = Arc::new(move |a| connect_one(a, bind.as_deref(), timeout));
+        let bind_if = cfg_block.bind_interface.clone();
+        let dialer: TcpDialer =
+            Arc::new(move |a| connect_from(a, (bind.as_deref(), bind_if.as_deref()), timeout));
 
         let mut sig1_cache = Sig1Cache::load();
         let identities: Vec<KnockIdentity<'_>> = signers

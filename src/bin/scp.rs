@@ -328,17 +328,32 @@ struct Session {
     sftp: SftpClient<SshPipe>,
 }
 
+/// `-v`: OpenSSH's note of the ssh it runs.
+fn note_exec(cli: &Cli, r: &Remote, cmd: &str) {
+    if cli.verbose {
+        eprintln!(
+            "Executing: program {} host {}, user {}, command {cmd}",
+            transfer::ssh_program(cli.ssh.program.as_deref()),
+            r.host,
+            r.user.as_deref().unwrap_or("(unspecified)")
+        );
+    }
+}
+
 fn open_sftp(cli: &Cli, r: &Remote) -> Result<Session, String> {
     let pipe = match &cli.sftp_direct {
         Some(server) => SshPipe::spawn_program(server, &[]),
-        None => SshPipe::spawn(
-            &cli.ssh,
-            r.user.as_deref(),
-            &r.host,
-            r.port.or(cli.port),
-            true,
-            &["sftp".to_string()],
-        ),
+        None => {
+            note_exec(cli, r, "sftp");
+            SshPipe::spawn(
+                &cli.ssh,
+                r.user.as_deref(),
+                &r.host,
+                r.port.or(cli.port),
+                true,
+                &["sftp".to_string()],
+            )
+        }
     }
     .map_err(|e| e.to_string())?;
     let sftp = SftpClient::new(pipe).map_err(|e| format!("Connection closed ({e})"))?;
@@ -520,13 +535,15 @@ fn legacy_cmd(cli: &Cli, mode: &str, path: &str) -> Vec<String> {
 }
 
 fn legacy_pipe(cli: &Cli, r: &Remote, mode: &str) -> Result<SshPipe, String> {
+    let cmd = legacy_cmd(cli, mode, &r.path);
+    note_exec(cli, r, &cmd[0]);
     SshPipe::spawn(
         &cli.ssh,
         r.user.as_deref(),
         &r.host,
         r.port.or(cli.port),
         false,
-        &legacy_cmd(cli, mode, &r.path),
+        &cmd,
     )
     .map_err(|e| e.to_string())
 }
@@ -723,6 +740,23 @@ fn remote_to_remote_direct(cli: &Cli, from: &Remote, target: &str, errs: &mut u3
     }
 }
 
+/// OpenSSH's `argv_assemble` of one word: `\`, `'` and `"` escaped, the
+/// whole double-quoted if it has blanks.
+fn shell_word(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        if matches!(c, '\\' | '\'' | '"') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    if s.contains([' ', '\t']) {
+        format!("\"{out}\"")
+    } else {
+        out
+    }
+}
+
 fn local_copy(cli: &Cli, sources: &[String], target: &str, errs: &mut u32) {
     let mut cmd = std::process::Command::new("cp");
     if cli.xfer.recursive {
@@ -732,6 +766,11 @@ fn local_copy(cli: &Cli, sources: &[String], target: &str, errs: &mut u32) {
         cmd.arg("-p");
     }
     cmd.arg("--").args(sources).arg(target);
+    if cli.verbose {
+        let mut words = vec!["cp".to_string()];
+        words.extend(cmd.get_args().map(|a| shell_word(&a.to_string_lossy())));
+        eprintln!("Executing: {}", words.join(" "));
+    }
     match cmd.status() {
         Ok(s) if s.success() => {}
         Ok(_) => *errs += 1,

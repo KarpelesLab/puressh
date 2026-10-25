@@ -266,6 +266,8 @@ jobs:
           ./configure --prefix="$PWD/../ossh" --with-privsep-path="$PWD/../ossh/empty" --with-pam
           make -j"$(nproc)"
           make install-nokeys
+          # OpenSSH's software FIDO authenticator, for the provider tests.
+          make regress/misc/sk-dummy/sk-dummy.so
           "$PWD/../ossh/sbin/sshd" -T -f /dev/null -C user=x,host=x,addr=1.2.3.4 2>/dev/null | grep -i mlkem || \
             "$PWD/../ossh/bin/ssh" -Q kex | grep -i mlkem
           sudo mkdir -p /run/sshd
@@ -292,6 +294,25 @@ jobs:
           export PATH="$PWD/ossh/sbin:$PWD/ossh/bin:$PATH"
           cargo test --features server,pam,agent --test e2e_legacy_algos -- \
             --ignored --test-threads=1 --nocapture
+
+      # FIDO security keys through a real OpenSSH middleware library
+      # (sk-dummy), and PKCS#11 through SoftHSM with an RSA, an ECDSA and an
+      # Ed25519 key on its token.
+      - name: Run security-key provider and PKCS#11 token tests
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y softhsm2 opensc
+          mkdir -p "$PWD/hsm/tokens"
+          printf 'directories.tokendir = %s/hsm/tokens\nobjectstore.backend = file\n' "$PWD" > hsm/softhsm2.conf
+          export SOFTHSM2_CONF="$PWD/hsm/softhsm2.conf"
+          softhsm2-util --init-token --free --label puressh --pin 1234 --so-pin 5678
+          module=/usr/lib/softhsm/libsofthsm2.so
+          pkcs11-tool --module "$module" -l --pin 1234 --keypairgen --key-type rsa:2048 --id 01 --label rsakey
+          pkcs11-tool --module "$module" -l --pin 1234 --keypairgen --key-type EC:prime256v1 --id 02 --label eckey
+          pkcs11-tool --module "$module" -l --pin 1234 --keypairgen --key-type EC:edwards25519 --id 03 --label edkey
+          SK_DUMMY="$PWD/openssh-10.6p1/regress/misc/sk-dummy/sk-dummy.so" \
+            PKCS11_MODULE="$module" PKCS11_PIN=1234 \
+            cargo test --all-features --lib -- sk:: pkcs11:: --nocapture
 
   msrv:
     name: MSRV (Rust 1.95)

@@ -1,7 +1,7 @@
 //! `scp` — copy files between hosts, a drop-in for OpenSSH's.
 //!
 //! ```text
-//! scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
+//! scp [-346ABCOpqRrTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
 //!     [-i identity_file] [-J destination] [-l limit] [-o ssh_option]
 //!     [-P port] [-S program] [-X sftp_option] source ... target
 //! ```
@@ -24,7 +24,7 @@ use puressh::sftp::SftpClient;
 mod transfer;
 use transfer::{Remote, SshOptions, SshPipe, XferOpts};
 
-const USAGE: &str = "usage: scp [-346ABCOpqRrsTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
+const USAGE: &str = "usage: scp [-346ABCOpqRrTv] [-c cipher] [-D sftp_server_path] [-F ssh_config]
            [-i identity_file] [-J destination] [-l limit] [-o ssh_option]
            [-P port] [-S program] [-X sftp_option] source ... target";
 
@@ -50,7 +50,76 @@ struct Cli {
     operands: Vec<String>,
 }
 
-fn parse_args(args: &[String]) -> Result<Cli, String> {
+/// Why the command line was refused, as OpenSSH reports it.
+#[derive(Debug, PartialEq)]
+enum ArgError {
+    /// The usage text (exit status 1), after `scp: <message>` if any.
+    Usage(Option<String>),
+    /// `scp: <message>`, exit status 255 (OpenSSH's `fatal()`).
+    Fatal(String),
+}
+
+/// `strtonum(3)`: `s` as a number in `min..=max`, or OpenSSH's reason.
+fn strtonum(s: &str, min: i64, max: i64) -> Result<i64, &'static str> {
+    match s.parse::<i64>() {
+        Ok(n) if n < min => Err("too small"),
+        Ok(n) if n > max => Err("too large"),
+        Ok(n) => Ok(n),
+        Err(e) => match e.kind() {
+            std::num::IntErrorKind::PosOverflow => Err("too large"),
+            std::num::IntErrorKind::NegOverflow => Err("too small"),
+            _ => Err("invalid"),
+        },
+    }
+}
+
+/// `scan_scaled(3)`: a size with an optional `B`/`K`/`M`/`G`/`T`/`P`/`E`
+/// suffix (a power of 1024; a fraction counts only with a suffix), or the
+/// `strerror` of why not.
+fn scan_scaled(s: &str) -> Result<i64, &'static str> {
+    const EINVAL: &str = "Invalid argument";
+    const ERANGE: &str = "Result too large";
+    let t = s.trim_start();
+    let (neg, t) = match t.as_bytes().first() {
+        Some(b'-') => (true, &t[1..]),
+        Some(b'+') => (false, &t[1..]),
+        _ => (false, t),
+    };
+    let end = t
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(t.len());
+    let (num, unit) = t.split_at(end);
+    let (whole, frac) = num.split_once('.').unwrap_or((num, ""));
+    if frac.contains('.') {
+        return Err(EINVAL);
+    }
+    let whole: i64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().map_err(|_| ERANGE)?
+    };
+    let mut shift = 0;
+    if let Some(u) = unit.chars().next() {
+        let Some(i) = "BKMGTPE".find(u.to_ascii_uppercase()) else {
+            return Err(EINVAL);
+        };
+        if unit[1..].starts_with(|c: char| c.is_ascii_alphanumeric()) {
+            return Err(EINVAL);
+        }
+        shift = 10 * i as u32;
+    }
+    let mut v = whole.checked_mul(1 << shift).ok_or(ERANGE)?;
+    if shift > 0 && !frac.is_empty() {
+        // fraction * 1024^i, truncated, as OpenSSH's.
+        let digits = &frac[..frac.len().min(18)];
+        let f: i128 = digits.parse().unwrap_or(0);
+        let part = (f << shift) / 10i128.pow(digits.len() as u32);
+        v = v.checked_add(part as i64).ok_or(ERANGE)?;
+    }
+    Ok(if neg { -v } else { v })
+}
+
+fn parse_args(args: &[String]) -> Result<Cli, ArgError> {
     const WITH_ARG: &str = "cDFiJloPSX";
     let mut c = Cli {
         ssh: SshOptions::default(),
@@ -95,12 +164,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     rest
                 } else {
                     i += 1;
-                    args.get(i)
-                        .cloned()
-                        .ok_or_else(|| format!("option requires an argument -- {f}"))?
+                    args.get(i).cloned().ok_or_else(|| {
+                        ArgError::Usage(Some(format!("option requires an argument -- {f}")))
+                    })?
                 };
                 match f {
-                    'c' => c.ssh.push("-c", Some(&v)),
+                    'c' => {
+                        c.ssh.push("-c", Some(&v));
+                        c.passthrough.extend(["-c".into(), v]);
+                    }
                     'D' => c.sftp_direct = Some(v),
                     'F' => {
                         c.ssh.push("-F", Some(&v));
@@ -110,13 +182,14 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         c.ssh.push("-i", Some(&v));
                         c.passthrough.extend(["-i".into(), v]);
                     }
-                    'J' => c.ssh.push("-J", Some(&v)),
+                    'J' => {
+                        c.ssh.push("-J", Some(&v));
+                        c.passthrough.extend(["-J".into(), v]);
+                    }
                     'l' => {
-                        let kbit: u64 = v
-                            .parse()
-                            .ok()
-                            .filter(|n| *n > 0)
-                            .ok_or_else(|| format!("bad limit {v}"))?;
+                        let kbit = strtonum(&v, 1, 100 * 1024 * 1024)
+                            .map_err(|_| ArgError::Usage(None))?
+                            as u64;
                         c.xfer.limit = Some(kbit * 1024 / 8);
                         c.passthrough.extend(["-l".into(), v]);
                     }
@@ -125,33 +198,55 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         c.passthrough.extend(["-o".into(), v]);
                     }
                     'P' => {
-                        c.port = Some(v.parse().map_err(|_| format!("bad port \"{v}\""))?);
+                        // OpenSSH's message has a stray `\n`: a blank line.
+                        c.port = Some(
+                            v.parse()
+                                .ok()
+                                .filter(|p| *p != 0)
+                                .ok_or_else(|| ArgError::Fatal(format!("bad port \"{v}\"\n")))?,
+                        );
                     }
                     'S' => c.ssh.program = Some(v),
-                    'X' => match v.split_once('=') {
-                        Some(("buffer", n)) => {
-                            c.xfer.chunk = n
-                                .parse()
-                                .ok()
-                                .filter(|n| (1..=256 * 1024).contains(n))
-                                .ok_or_else(|| format!("Invalid buffer size \"{n}\""))?;
+                    'X' => {
+                        if let Some(n) = v.strip_prefix("buffer=") {
+                            let len = scan_scaled(n)
+                                .and_then(|l| {
+                                    if (1..=256 * 1024).contains(&l) {
+                                        Ok(l)
+                                    } else {
+                                        Err("Invalid argument")
+                                    }
+                                })
+                                .map_err(|e| {
+                                    ArgError::Fatal(format!("Invalid buffer size \"{n}\": {e}"))
+                                })?;
+                            c.xfer.chunk = len as u32;
+                        } else if let Some(n) = v.strip_prefix("nrequests=") {
+                            let reqs = strtonum(n, 1, 256 * 1024).map_err(|e| {
+                                ArgError::Fatal(format!("Invalid number of requests \"{n}\": {e}"))
+                            })?;
+                            c.xfer.depth = reqs as usize;
+                        } else {
+                            return Err(ArgError::Fatal("Invalid -X option".into()));
                         }
-                        Some(("nrequests", n)) => {
-                            c.xfer.depth = n
-                                .parse()
-                                .ok()
-                                .filter(|n| *n >= 1)
-                                .ok_or_else(|| format!("Invalid number of requests \"{n}\""))?;
-                        }
-                        _ => return Err(format!("Invalid -X option \"{v}\"")),
-                    },
+                    }
                     _ => unreachable!(),
                 }
                 break;
             }
             match f {
+                '1' => {
+                    return Err(ArgError::Fatal(
+                        "SSH protocol v.1 is no longer supported".into(),
+                    ));
+                }
+                // The only protocol there is.
+                '2' => {}
                 '3' => c.through_local = true,
                 'R' => {
+                    eprintln!(
+                        "warning: remote/remote -R copy mode is deprecated and will soon be removed"
+                    );
                     c.through_local = false;
                     c.remote_to_remote_direct = true;
                 }
@@ -159,13 +254,17 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     c.ssh.push(&format!("-{f}"), None);
                     c.passthrough.push(format!("-{f}"));
                 }
-                'A' => c.ssh.forward_agent = true,
+                'A' => {
+                    c.ssh.forward_agent = true;
+                    c.passthrough.push("-A".into());
+                }
                 'B' => {
                     c.ssh.push("-oBatchMode=yes", None);
                     c.passthrough.push("-B".into());
                 }
                 'O' => c.legacy = true,
-                's' => c.legacy = false,
+                // Once "use SFTP", now the default; ignored as OpenSSH's.
+                's' => {}
                 'p' => {
                     c.xfer.preserve = true;
                     c.passthrough.push("-p".into());
@@ -188,7 +287,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 't' => c.sink = true,
                 'f' => c.source = true,
                 'd' => c.target_dir = true,
-                _ => return Err(format!("unknown option -- {f}")),
+                _ => return Err(ArgError::Usage(Some(format!("unknown option -- {f}")))),
             }
             j += 1;
         }
@@ -196,12 +295,12 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     }
     if c.sink || c.source {
         if c.operands.is_empty() {
-            return Err(USAGE.into());
+            return Err(ArgError::Usage(None));
         }
         return Ok(c);
     }
     if c.operands.len() < 2 {
-        return Err(USAGE.into());
+        return Err(ArgError::Usage(None));
     }
     c.xfer.progress = !c.quiet && io::stdout().is_terminal();
     Ok(c)
@@ -696,9 +795,7 @@ fn remote_end(cli: &Cli) -> u32 {
     }
 }
 
-fn run() -> Result<u32, String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli = parse_args(&args)?;
+fn run(cli: Cli) -> Result<u32, String> {
     if cli.sink || cli.source {
         return Ok(remote_end(&cli));
     }
@@ -773,7 +870,22 @@ fn run() -> Result<u32, String> {
 }
 
 fn main() -> ExitCode {
-    match run() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = match parse_args(&args) {
+        Ok(c) => c,
+        Err(ArgError::Usage(msg)) => {
+            if let Some(m) = msg {
+                eprintln!("scp: {m}");
+            }
+            eprintln!("{USAGE}");
+            return ExitCode::from(1);
+        }
+        Err(ArgError::Fatal(m)) => {
+            eprintln!("scp: {m}");
+            return ExitCode::from(255);
+        }
+    };
+    match run(cli) {
         Ok(0) => ExitCode::SUCCESS,
         Ok(_) => ExitCode::from(1),
         Err(msg) => {
@@ -785,7 +897,66 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::requested_patterns;
+    use super::{ArgError, parse_args, requested_patterns, scan_scaled, strtonum};
+
+    fn parse(args: &[&str]) -> Result<super::Cli, ArgError> {
+        let v: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        parse_args(&v)
+    }
+
+    #[test]
+    fn protocol_flags_match_openssh() {
+        assert_eq!(
+            parse(&["-1", "a", "b"]).err(),
+            Some(ArgError::Fatal(
+                "SSH protocol v.1 is no longer supported".into()
+            ))
+        );
+        assert!(parse(&["-2", "a", "b"]).is_ok());
+        // `-s` is ignored: it does not undo `-O`.
+        assert!(parse(&["-O", "-s", "a", "b"]).unwrap().legacy);
+    }
+
+    #[test]
+    fn option_values_are_checked_as_openssh() {
+        assert_eq!(
+            parse(&["-l", "0", "a", "b"]).err(),
+            Some(ArgError::Usage(None))
+        );
+        assert_eq!(
+            parse(&["-P", "0", "a", "b"]).err(),
+            Some(ArgError::Fatal("bad port \"0\"\n".into()))
+        );
+        assert_eq!(
+            parse(&["-X", "nrequests=0", "a", "b"]).err(),
+            Some(ArgError::Fatal(
+                "Invalid number of requests \"0\": too small".into()
+            ))
+        );
+        assert_eq!(
+            parse(&["-X", "buffer=2k", "a", "b"]).unwrap().xfer.chunk,
+            2048
+        );
+        assert_eq!(
+            parse(&["-c"]).err(),
+            Some(ArgError::Usage(Some(
+                "option requires an argument -- c".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn scaled_and_ranged_numbers() {
+        assert_eq!(scan_scaled("12"), Ok(12));
+        assert_eq!(scan_scaled("1.5K"), Ok(1536));
+        assert_eq!(scan_scaled("1m"), Ok(1 << 20));
+        assert_eq!(scan_scaled("1Kb"), Err("Invalid argument"));
+        assert_eq!(scan_scaled("1.2.3"), Err("Invalid argument"));
+        assert_eq!(strtonum("5", 1, 9), Ok(5));
+        assert_eq!(strtonum("0", 1, 9), Err("too small"));
+        assert_eq!(strtonum("10", 1, 9), Err("too large"));
+        assert_eq!(strtonum("x", 1, 9), Err("invalid"));
+    }
 
     fn pats(p: &str) -> Option<Vec<String>> {
         requested_patterns(p)

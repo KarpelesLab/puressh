@@ -41,6 +41,10 @@ pub enum GlobalRequest {
     },
     /// OpenSSH's `"keepalive@openssh.com"` heartbeat.
     Keepalive,
+    /// OpenSSH's `"no-more-sessions@openssh.com"` (PROTOCOL §2.2): the
+    /// client will open no further `session` channels, and a server that
+    /// honours it ends the connection if one is opened anyway.
+    NoMoreSessions,
     /// Any request type we don't recognise.
     Other {
         /// Request name as advertised on the wire.
@@ -61,6 +65,7 @@ impl GlobalRequest {
                 "cancel-streamlocal-forward@openssh.com"
             }
             GlobalRequest::Keepalive => "keepalive@openssh.com",
+            GlobalRequest::NoMoreSessions => "no-more-sessions@openssh.com",
             GlobalRequest::Other { name, .. } => name.as_str(),
         }
     }
@@ -83,7 +88,7 @@ impl GlobalRequest {
             | GlobalRequest::CancelStreamlocalForward { socket_path } => {
                 w.write_string(socket_path.as_bytes());
             }
-            GlobalRequest::Keepalive => {}
+            GlobalRequest::Keepalive | GlobalRequest::NoMoreSessions => {}
             GlobalRequest::Other { raw, .. } => {
                 w.write_raw(raw);
             }
@@ -119,6 +124,7 @@ impl GlobalRequest {
                 Ok(GlobalRequest::CancelStreamlocalForward { socket_path })
             }
             "keepalive@openssh.com" => Ok(GlobalRequest::Keepalive),
+            "no-more-sessions@openssh.com" => Ok(GlobalRequest::NoMoreSessions),
             other => Ok(GlobalRequest::Other {
                 name: other.to_string(),
                 raw: body.to_vec(),

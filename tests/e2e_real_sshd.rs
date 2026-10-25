@@ -1356,6 +1356,89 @@ fn compressed_rekey_against_real_sshd() {
     );
 }
 
+/// `no-more-sessions@openssh.com` against a real sshd: sessions open until
+/// the client sends it, then the next `session` open makes sshd disconnect
+/// (protocol error, "Possible attack: …") — what our own sshd mirrors.
+#[test]
+#[ignore]
+fn no_more_sessions_against_real_sshd() {
+    let tmp = tempdir();
+    let host_key = tmp.join("host_ed25519");
+    let client_key = tmp.join("client_ed25519");
+    let authorized = tmp.join("authorized_keys");
+    let config = tmp.join("sshd_config");
+    ssh_keygen(&host_key, "ed25519");
+    ssh_keygen(&client_key, "ed25519");
+    let pubkey = std::fs::read(format!("{}.pub", client_key.display())).expect("client pub");
+    std::fs::write(&authorized, &pubkey).expect("write authorized_keys");
+    chmod_600(&authorized);
+    let user = current_user();
+    let port = pick_free_port();
+    let cfg_body = format!(
+        "Port {port}\n\
+         ListenAddress 127.0.0.1\n\
+         HostKey {host_key}\n\
+         PidFile {pid}\n\
+         AuthorizedKeysFile {authorized}\n\
+         StrictModes no\n\
+         UsePAM no\n\
+         PasswordAuthentication no\n\
+         KbdInteractiveAuthentication no\n\
+         PubkeyAuthentication yes\n\
+         AllowUsers {user}\n\
+         LogLevel DEBUG1\n",
+        host_key = host_key.display(),
+        authorized = authorized.display(),
+        pid = tmp.join("sshd.pid").display(),
+    );
+    std::fs::write(&config, cfg_body).expect("write sshd_config");
+    let sshd = which("sshd").unwrap_or_else(|| PathBuf::from("/usr/sbin/sshd"));
+    let guard = SshdGuard::spawn(&sshd, &config);
+    wait_for_tcp(port, Duration::from_secs(5));
+
+    let mut client = Client::connect(
+        ("127.0.0.1", port),
+        Config::new(HostKeyPolicy::AcceptAny).with_timeout(Duration::from_secs(10)),
+    )
+    .expect("connect");
+    let pem = std::fs::read_to_string(&client_key).expect("client key pem");
+    let pk = PrivateKey::parse_openssh_pem(&pem, None).expect("parse client key");
+    client
+        .authenticate(
+            &user,
+            vec![ClientCredential::PublicKey(pk.into_host_key().unwrap())],
+        )
+        .expect("auth");
+    let shared: puressh::shared::SharedClient = client.into();
+
+    let mut first = shared.exec_stream("echo first").expect("first session");
+    let mut out = String::new();
+    first.read_to_string(&mut out).expect("read first");
+    assert_eq!(out.trim(), "first");
+    drop(first);
+
+    shared.no_more_sessions().expect("send no-more-sessions");
+    match shared.exec_stream("echo second") {
+        Err(puressh::Error::Disconnected {
+            reason,
+            description,
+        }) => {
+            assert_eq!(reason, 2);
+            assert_eq!(
+                description,
+                "Possible attack: attempt to open a session after additional sessions disabled"
+            );
+        }
+        Err(e) => panic!("expected a disconnect, got {e}"),
+        Ok(_) => panic!("a session opened after no-more-sessions"),
+    }
+    let log = guard.log.lock().unwrap().clone();
+    assert!(
+        String::from_utf8_lossy(&log).contains("rtype no-more-sessions@openssh.com want_reply 0"),
+        "sshd did not see the request"
+    );
+}
+
 fn tempdir() -> PathBuf {
     common::tempdir("puressh_e2e")
 }

@@ -548,6 +548,31 @@ fn global_request_keepalive_replies_failure() {
 }
 
 #[test]
+fn global_request_no_more_sessions_wire_format() {
+    // As OpenSSH's ssh sends it: the bare name, want_reply 0, no body.
+    let conn = ConnectionState::new();
+    let payload = conn.send_global_request(GlobalRequest::NoMoreSessions, false);
+    let mut want = vec![80u8];
+    want.extend_from_slice(&28u32.to_be_bytes());
+    want.extend_from_slice(b"no-more-sessions@openssh.com");
+    want.push(0);
+    assert_eq!(payload, want);
+
+    let mut peer = ConnectionState::new();
+    match peer.on_packet(&payload).unwrap() {
+        ChannelEvent::GlobalRequest {
+            request,
+            want_reply,
+        } => {
+            assert_eq!(request, GlobalRequest::NoMoreSessions);
+            assert_eq!(request.name(), "no-more-sessions@openssh.com");
+            assert!(!want_reply);
+        }
+        _ => panic!(),
+    }
+}
+
+#[test]
 fn global_request_cancel_forward_round_trip() {
     let req = GlobalRequest::CancelTcpipForward {
         bind_address: "::1".to_string(),

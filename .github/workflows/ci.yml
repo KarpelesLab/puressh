@@ -78,12 +78,15 @@ jobs:
       # (baseline) and `compression_zlib_interop_against_real_sshd` (the
       # `zlib@openssh.com` round-trip — our guard against the inflate-truncation
       # class of bug). The `interactive_shell_…chaff` test is excluded: it is
-      # timing-sensitive and unsuitable for gating.
+      # timing-sensitive and unsuitable for gating. `no_more_sessions_…` checks
+      # how sshd answers a session opened after `no-more-sessions@openssh.com`
+      # (what our sshd mirrors).
       - name: Run client-mode compression interop against real sshd
         run: >
           cargo test --test e2e_real_sshd --
           --ignored --test-threads=1 --nocapture
           exec_against_real_sshd compression_zlib_interop_against_real_sshd
+          no_more_sessions_against_real_sshd
 
       # Re-key interop (RFC 4253 §9). These force frequent re-keys via tiny
       # `RekeyLimit` / client `RekeyPolicy` and assert the stream survives.

@@ -966,6 +966,28 @@ impl SharedClient {
         Ok(lock_or_poison(&self.inner)?.client.session_id().to_vec())
     }
 
+    /// See [`crate::client::Client::server_ident`].
+    pub fn server_ident(&self) -> Result<String> {
+        Ok(lock_or_poison(&self.inner)?
+            .client
+            .server_ident()
+            .to_string())
+    }
+
+    /// Send `no-more-sessions@openssh.com` (no reply wanted): tell the
+    /// server this connection will open no further `session` channels, so
+    /// one that honours it (OpenSSH's sshd, ours) ends the connection if
+    /// something opens one anyway. OpenSSH's `ssh` sends it to OpenSSH
+    /// servers whenever it is not a ControlMaster.
+    pub fn no_more_sessions(&self) -> Result<()> {
+        let mut g = lock_or_poison(&self.inner)?;
+        let p = g
+            .client
+            .conn
+            .send_global_request(crate::channel::GlobalRequest::NoMoreSessions, false);
+        g.client.write_payload(&p)
+    }
+
     /// See [`crate::client::Client::session_binding`].
     pub fn session_binding(&self) -> Result<Option<crate::client::SessionBinding>> {
         Ok(lock_or_poison(&self.inner)?.client.session_binding())

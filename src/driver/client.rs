@@ -199,6 +199,12 @@ impl ClientDriver {
         &self.session_id
     }
 
+    /// The server's identification line (`SSH-2.0-…`, without CR LF).
+    /// Empty until it has been received.
+    pub fn server_ident(&self) -> &[u8] {
+        &self.v_s
+    }
+
     /// The first key exchange's host key and its signature over the
     /// session id (see [`crate::client::SessionBinding`]).
     pub fn initial_host_key_sig(&self) -> Option<(&[u8], &[u8])> {

@@ -1329,12 +1329,16 @@ fn config_for_host(
 /// target and runs the real session over that. Each hop re-runs
 /// `ssh_cfg.lookup(hop.host)` for its own identities / known_hosts / user;
 /// host-key checking runs per hop (a rejection at any hop aborts).
+///
+/// Also says whether the last hop is owed `no-more-sessions@openssh.com`
+/// once the caller's channel is open: OpenSSH runs each hop as an `ssh -W`
+/// of its own, which sends it then (see [`server_honours_no_more_sessions`]).
 fn connect_jump_chain(
     hops: &[JumpHop],
     ssh_cfg: &puressh::config::SshClientConfig,
     cli: &Cli,
-) -> Result<puressh::shared::SharedClient, String> {
-    let mut current: Option<puressh::shared::SharedClient> = None;
+) -> Result<(puressh::shared::SharedClient, bool), String> {
+    let mut current: Option<(puressh::shared::SharedClient, bool)> = None;
     for (idx, hop) in hops.iter().enumerate() {
         let block = ssh_cfg.lookup(&hop.host);
         let connect_host = block.host_name.clone().unwrap_or_else(|| hop.host.clone());
@@ -1357,10 +1361,13 @@ fn connect_jump_chain(
                 .map_err(|e| hop_connect_error(idx, "connect", e))?,
             // Subsequent hop: tunnel a direct-tcpip channel through the
             // previous hop and run the client over it.
-            Some(prev) => {
+            Some((prev, prev_no_more_sessions)) => {
                 let ch = prev
                     .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
                     .map_err(|e| format!("proxyjump hop {}: open channel: {e}", idx + 1))?;
+                if *prev_no_more_sessions {
+                    send_no_more_sessions(prev);
+                }
                 Client::connect_via(Box::new(ch), connect_host.as_str(), port, cfg)
                     .map_err(|e| hop_connect_error(idx, "handshake", e))?
             }
@@ -1380,7 +1387,11 @@ fn connect_jump_chain(
         )?;
         vlog(1, &format!("proxyjump hop {}: authenticated", idx + 1));
 
-        current = Some(hop_client.into());
+        let no_more_sessions = matches!(
+            block.control_master,
+            None | Some(puressh::config::ControlMaster::No)
+        ) && server_honours_no_more_sessions(hop_client.server_ident());
+        current = Some((hop_client.into(), no_more_sessions));
     }
     current.ok_or_else(|| "ProxyJump: no hops".into())
 }
@@ -2719,7 +2730,7 @@ fn run() -> Result<i32, String> {
         // ---- ProxyJump ----
         let hops = parse_jump_hops(&spec)?;
         vlog(1, &format!("proxyjump: {} hop(s)", hops.len()));
-        let last = connect_jump_chain(&hops, &ssh_cfg, &cli)?;
+        let (last, last_no_more_sessions) = connect_jump_chain(&hops, &ssh_cfg, &cli)?;
         // Final hop: open a direct-tcpip channel from the last jump host to
         // the real target and run the client over it. Host/port flow through
         // so the target's host-key check runs against its own known_hosts.
@@ -2730,6 +2741,9 @@ fn run() -> Result<i32, String> {
         let ch = last
             .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
             .map_err(|e| format!("proxyjump: open channel to target: {e}"))?;
+        if last_no_more_sessions {
+            send_no_more_sessions(&last);
+        }
         let client = Client::connect_via(Box::new(ch), connect_host.as_str(), port, cfg)
             .map_err(|e| format!("proxyjump: target handshake: {e}"))?;
         // `ch` (now inside `client`) holds a clone of `last`'s SharedClient,
@@ -2899,6 +2913,15 @@ fn run() -> Result<i32, String> {
     // ServerAliveInterval: started once the connection is shared (below).
     let server_alive = cfg_block.server_alive_interval.filter(|i| *i > 0);
 
+    // As OpenSSH's ssh_session2: a connection that is not a ControlMaster
+    // will open no other session than its own (if any), so once that is
+    // open it asks the server to refuse any more — only an OpenSSH server
+    // (by banner), or ours.
+    let no_more_sessions = matches!(
+        cfg_block.control_master,
+        None | Some(puressh::config::ControlMaster::No)
+    ) && server_honours_no_more_sessions(client.server_ident());
+
     // `-f`: authenticated; continue in the background.
     #[cfg(unix)]
     if cli.fork_after_auth {
@@ -2909,7 +2932,7 @@ fn run() -> Result<i32, String> {
     // `ProxyCommand ssh -W %h:%p jump` form); no session.
     if let Some(spec) = cli.stdio_forward.clone() {
         background_ready();
-        return run_stdio_forward(client, &spec);
+        return run_stdio_forward(client, &spec, no_more_sessions);
     }
 
     // Forwarding, set up the way OpenSSH does it, alongside the session:
@@ -3106,6 +3129,9 @@ fn run() -> Result<i32, String> {
         // Forwards up, control socket (if any) bound: `-f` may detach.
         background_ready();
         if no_command {
+            if no_more_sessions {
+                send_no_more_sessions(s);
+            }
             return match s.pump_until_closed() {
                 Ok(()) => 0,
                 Err(e) => {
@@ -3121,7 +3147,16 @@ fn run() -> Result<i32, String> {
         // With forwards or remote channels to serve, keep pumping the
         // connection when the session is not reading.
         let what = session_request(command.as_deref(), subsystem);
-        let code = run_session(s, what, use_pty, pty_required, okt, escape).unwrap_or_else(|e| {
+        let code = run_session(
+            s,
+            what,
+            use_pty,
+            pty_required,
+            okt,
+            escape,
+            no_more_sessions,
+        )
+        .unwrap_or_else(|e| {
             // Empty: already reported in OpenSSH's words.
             if let Some(m) = transport_fatal(&e, &peer) {
                 eprintln!("{m}");
@@ -4213,7 +4248,33 @@ fn background_ready() {
 
 /// `ssh -W host:port`: splice stdin/stdout with a `direct-tcpip` channel to
 /// `host:port`. Exits 0 when the connection ends.
-fn run_stdio_forward(client: Client, spec: &str) -> Result<i32, String> {
+/// Whether OpenSSH's `ssh` would send `no-more-sessions@openssh.com` to a
+/// server identifying itself as `ident`: its `SSH_NEW_OPENSSH` compat
+/// flag (`compat.c`: any `OpenSSH*` software version but 2.x to 4.x,
+/// since other implementations may abort on the request). puressh's sshd
+/// honours it too.
+fn server_honours_no_more_sessions(ident: &str) -> bool {
+    // `SSH-protoversion-softwareversion SP comments`.
+    let software = ident.splitn(3, '-').nth(2).unwrap_or("");
+    if software.starts_with("puressh_") {
+        return true;
+    }
+    for old in ["OpenSSH_2", "OpenSSH_3", "OpenSSH_4"] {
+        if software.starts_with(old) {
+            return false;
+        }
+    }
+    software.starts_with("OpenSSH")
+}
+
+/// Send `no-more-sessions@openssh.com`, as OpenSSH does once its session
+/// (if any) is open. A failure to send shows up on the next read.
+fn send_no_more_sessions(shared: &puressh::shared::SharedClient) {
+    vlog(1, "Requesting no-more-sessions@openssh.com");
+    let _ = shared.no_more_sessions();
+}
+
+fn run_stdio_forward(client: Client, spec: &str, no_more_sessions: bool) -> Result<i32, String> {
     // host:port, [v6]:port, or host/port style is not accepted by OpenSSH.
     let (host, port) = if let Some(rest) = spec.strip_prefix('[') {
         let (h, p) = rest
@@ -4233,6 +4294,9 @@ fn run_stdio_forward(client: Client, spec: &str) -> Result<i32, String> {
     let mut stream = shared
         .open_stdio_forward(&host, port)
         .map_err(|e| format!("stdio forwarding failed: {e}"))?;
+    if no_more_sessions {
+        send_no_more_sessions(&shared);
+    }
     let channel_id = stream.channel_id();
     let _ = shared.set_read_timeout(Some(std::time::Duration::from_millis(50)));
     let w = shared.clone();
@@ -6046,6 +6110,7 @@ fn run_session(
     pty_required: bool,
     okt: puressh::config::ObscureKeystrokeTiming,
     escape: Option<u8>,
+    no_more_sessions: bool,
 ) -> Result<i32, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -6089,6 +6154,10 @@ fn run_session(
         }
         e => e.to_string(),
     })?;
+    // Our one session is open: no other may follow.
+    if no_more_sessions {
+        send_no_more_sessions(shared);
+    }
     let channel_id = stream.channel_id();
     if stream.pty_denied() {
         // As OpenSSH: say so and leave raw mode; a terminal asked for with
@@ -7263,6 +7332,27 @@ mod extra_o_tests {
             block.control_master,
             Some(puressh::config::ControlMaster::Auto)
         );
+    }
+}
+
+#[cfg(test)]
+mod no_more_sessions_tests {
+    use super::server_honours_no_more_sessions as honours;
+
+    #[test]
+    fn sent_to_openssh_5_and_later_and_to_puressh() {
+        assert!(honours("SSH-2.0-OpenSSH_10.6"));
+        assert!(honours("SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.5"));
+        assert!(honours("SSH-2.0-OpenSSH_5.3"));
+        assert!(honours("SSH-1.99-OpenSSH_7.4"));
+        assert!(honours("SSH-2.0-puressh_0.2.5"));
+        // OpenSSH 2.x-4.x lack SSH_NEW_OPENSSH; others may abort on it.
+        assert!(!honours("SSH-2.0-OpenSSH_4.7"));
+        assert!(!honours("SSH-2.0-OpenSSH_3.9p1"));
+        assert!(!honours("SSH-2.0-dropbear_2024.86"));
+        assert!(!honours("SSH-2.0-libssh_0.10.6"));
+        assert!(!honours("SSH-2.0-Go"));
+        assert!(!honours(""));
     }
 }
 

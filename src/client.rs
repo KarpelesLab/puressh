@@ -1561,6 +1561,13 @@ impl Client {
         self.driver.session_id()
     }
 
+    /// The server's identification line (`SSH-2.0-OpenSSH_10.6`, without
+    /// CR LF), from which OpenSSH's client infers the peer's quirks.
+    pub fn server_ident(&self) -> &str {
+        // `VersionExchange::parse_remote` only accepts UTF-8.
+        core::str::from_utf8(self.driver.server_ident()).unwrap_or("")
+    }
+
     /// What binds an `ssh-agent` connection to this session
     /// (`session-bind@openssh.com`, for keys added with destination
     /// constraints): the server's host key, the session id and the host's
@@ -3034,7 +3041,7 @@ impl Client {
     /// Block until the server answers a `GLOBAL_REQUEST` with
     /// `want_reply = true`. Returns the request-specific tail bytes
     /// (empty for requests without a payload).
-    fn await_global_reply(&mut self, what: &'static str) -> Result<Vec<u8>> {
+    pub(crate) fn await_global_reply(&mut self, what: &'static str) -> Result<Vec<u8>> {
         for _ in 0..MAX_EXEC_ITER {
             let payload = self.read_one_packet()?;
             match self.conn.on_packet(&payload)? {

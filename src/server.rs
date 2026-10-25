@@ -105,6 +105,12 @@ const MAX_ENV_BYTES_PER_CHANNEL: usize = 16 * 1024;
 
 const SSH_DISCONNECT_BY_APPLICATION: u32 = 11;
 const SSH_DISCONNECT_HOST_NOT_ALLOWED: u32 = 9;
+const SSH_DISCONNECT_PROTOCOL_ERROR: u32 = 2;
+
+/// What OpenSSH's sshd says (and disconnects with) when a client opens a
+/// `session` channel after `no-more-sessions@openssh.com`.
+const NO_MORE_SESSIONS_VIOLATION: &str =
+    "Possible attack: attempt to open a session after additional sessions disabled";
 
 /// Result returned by a [`CommandHandler`] after running a command.
 #[derive(Debug, Clone)]
@@ -3069,6 +3075,9 @@ struct ConnExtras {
     /// Interfaces of the tunnels opened so far, for sessions'
     /// `SSH_TUNNEL`.
     tun_ifnames: Vec<String>,
+    /// The client sent `no-more-sessions@openssh.com`: a further `session`
+    /// open ends the connection.
+    no_more_sessions: bool,
 }
 
 /// Poll interval while traffic flows (see [`ConnExtras::fast_until`]).
@@ -3092,6 +3101,7 @@ impl ConnExtras {
             last_keepalive: now,
             missed_keepalives: 0,
             tun_ifnames: Vec::new(),
+            no_more_sessions: false,
         }
     }
 }
@@ -3846,6 +3856,18 @@ fn dispatch_app_packet(
             srv_send(stream, driver, &failure_payload)?;
         }
         ChannelEvent::OpenRequest { channel, kind } => match kind {
+            // After `no-more-sessions@openssh.com`, OpenSSH's sshd answers a
+            // `session` open by disconnecting (serverloop.c), not with an
+            // open failure.
+            ChannelOpen::Session if extras.no_more_sessions => {
+                let _ = srv_send_disconnect(
+                    stream,
+                    driver,
+                    SSH_DISCONNECT_PROTOCOL_ERROR,
+                    NO_MORE_SESSIONS_VIOLATION,
+                );
+                return Err(Error::Protocol(NO_MORE_SESSIONS_VIOLATION));
+            }
             ChannelOpen::Session => {
                 *any_channel_opened = true;
                 // MaxSessions (capability ceiling): reject the open with
@@ -4199,6 +4221,7 @@ fn dispatch_app_packet(
                 user,
                 request,
                 want_reply,
+                extras,
                 forward,
                 streamlocal_forward,
             )?;
@@ -4233,6 +4256,7 @@ fn handle_global_request(
     user: &str,
     request: crate::channel::GlobalRequest,
     want_reply: bool,
+    extras: &mut ConnExtras,
     forward: &mut ForwardConn,
     streamlocal_forward: &mut StreamlocalForwardConn,
 ) -> Result<()> {
@@ -4404,6 +4428,15 @@ fn handle_global_request(
                     Some(sigs) => conn.send_global_success(&sigs),
                     None => conn.send_global_failure(),
                 };
+                srv_send(stream, driver, &p)?;
+            }
+        }
+        // As OpenSSH's sshd: from now on a `session` open ends the
+        // connection (see `dispatch_app_packet`).
+        GlobalRequest::NoMoreSessions => {
+            extras.no_more_sessions = true;
+            if want_reply {
+                let p = conn.send_global_success(&[]);
                 srv_send(stream, driver, &p)?;
             }
         }
@@ -8696,6 +8729,45 @@ mod tests {
             got.1, "the-client-command",
             "original command exposed as SSH_ORIGINAL_COMMAND"
         );
+    }
+
+    #[test]
+    fn no_more_sessions_disconnects_on_next_session_open() {
+        let (mut client, st, _sd) = w7_server_and_client("", false);
+        // Sessions open normally until the client says otherwise.
+        assert!(client.exec("first").is_ok());
+        let p = client
+            .conn
+            .send_global_request(crate::channel::GlobalRequest::NoMoreSessions, false);
+        client.write_payload(&p).expect("send no-more-sessions");
+        // As OpenSSH's sshd: the next session open ends the connection.
+        match client.exec("second") {
+            Err(Error::Disconnected {
+                reason,
+                description,
+            }) => {
+                assert_eq!(reason, SSH_DISCONNECT_PROTOCOL_ERROR);
+                assert_eq!(description, NO_MORE_SESSIONS_VIOLATION);
+            }
+            other => panic!("expected a disconnect, got {:?}", other.map(|_| ())),
+        }
+        match st.join().expect("server thread") {
+            Err(Error::Protocol(m)) => assert_eq!(m, NO_MORE_SESSIONS_VIOLATION),
+            other => panic!("server should fail the connection: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_more_sessions_reply_when_asked() {
+        let (mut client, st, sd) = w7_server_and_client("", false);
+        let p = client
+            .conn
+            .send_global_request(crate::channel::GlobalRequest::NoMoreSessions, true);
+        client.write_payload(&p).expect("send no-more-sessions");
+        client
+            .await_global_reply("no-more-sessions@openssh.com")
+            .expect("REQUEST_SUCCESS");
+        w7_finish(client, st, sd);
     }
 
     #[test]

@@ -566,7 +566,7 @@ const IPQOS_NAMES: &[(&str, Option<u8>)] = &[
     ("reliability", None),
 ];
 
-/// Parse one `IPQoS` value: a name from [`IPQOS_NAMES`] (any case) or a
+/// Parse one `IPQoS` value: a name from `IPQOS_NAMES` (any case) or a
 /// number `0..=255`. `Some(None)` is `none` (or a deprecated ToS name, which
 /// OpenSSH also turns into the system default).
 pub fn parse_ipqos(s: &str) -> Option<Option<u8>> {

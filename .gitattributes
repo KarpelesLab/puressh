@@ -1,0 +1,3 @@
+# Test fixtures are compared byte for byte (signed messages, keys): never
+# convert their line endings on checkout.
+tests/fixtures/** -text

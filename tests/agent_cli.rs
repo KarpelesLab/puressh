@@ -173,9 +173,9 @@ fn option_errors_match_openssh() {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     };
-    let (code, err) = run(&["-E", "sha1"]);
+    let (code, err) = run(&["-E", "sha224"]);
     assert_eq!(code, Some(255));
-    assert_eq!(err, "Invalid hash algorithm \"sha1\"\n");
+    assert_eq!(err, "Invalid hash algorithm \"sha224\"\n");
     let (code, err) = run(&["-T", "-a", "/x"]);
     assert_eq!(code, Some(1));
     assert!(err.starts_with("usage: ssh-agent"), "{err}");

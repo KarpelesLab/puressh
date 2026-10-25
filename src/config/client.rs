@@ -2997,9 +2997,7 @@ Host *.example.com !secret.example.com
     /// Ignored keywords whose value would change behaviour are refused.
     #[test]
     fn unsupported_values_refused() {
-        for src in [
-            "EnableSSHKeysign yes\n",
-        ] {
+        for src in ["EnableSSHKeysign yes\n"] {
             assert!(
                 matches!(
                     SshClientConfig::parse(src),

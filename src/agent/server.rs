@@ -193,8 +193,8 @@ pub struct AgentState {
     websafe_allowlist: Option<String>,
     #[cfg(feature = "security-key")]
     sk_prompt: Option<alloc::sync::Arc<dyn crate::sk::Prompt>>,
-    /// Show MD5 rather than SHA-256 fingerprints (`ssh-agent -E md5`).
-    md5_fingerprints: bool,
+    /// The hash of fingerprints in prompts (`ssh-agent -E`).
+    fingerprint_hash: String,
 }
 
 /// The providers `ssh-agent` loads by default (`-P`).
@@ -255,7 +255,7 @@ impl AgentState {
             websafe_allowlist: Some("ssh:*".into()),
             #[cfg(feature = "security-key")]
             sk_prompt: None,
-            md5_fingerprints: false,
+            fingerprint_hash: "sha256".into(),
         }
     }
 
@@ -304,10 +304,15 @@ impl AgentState {
         self.default_lifetime = lifetime;
     }
 
-    /// Fingerprints in confirmation prompts as `MD5:xx:xx:…` rather than
-    /// `SHA256:…` (`ssh-agent -E md5`).
-    pub fn set_md5_fingerprints(&mut self, md5: bool) {
-        self.md5_fingerprints = md5;
+    /// The hash of the fingerprints in confirmation prompts
+    /// (`ssh-agent -E`): `md5`, `sha1`, `sha256` (the default), `sha384`
+    /// or `sha512`. `false`, and no change, for another name.
+    pub fn set_fingerprint_hash(&mut self, hash: &str) -> bool {
+        let known = crate::key::is_fingerprint_hash(hash);
+        if known {
+            self.fingerprint_hash = hash.to_string();
+        }
+        known
     }
 
     /// Number of keys held (expired ones excluded).
@@ -492,13 +497,9 @@ impl AgentState {
         }
         if held.confirm {
             let pk = held.key.public_key();
-            let fp = if self.md5_fingerprints {
-                let digest = purecrypto::hash::Md5::digest(&pk.wire_blob());
-                let hex: Vec<String> = digest.iter().map(|b| format!("{b:02x}")).collect();
-                format!("MD5:{}", hex.join(":"))
-            } else {
-                pk.sha256_fingerprint()
-            };
+            let fp = pk
+                .fingerprint(&self.fingerprint_hash)
+                .unwrap_or_else(|| pk.sha256_fingerprint());
             let mut prompt = format!("Allow use of key {}?\nKey fingerprint {fp}.", held.comment);
             if let Some(d) = sig_dest {
                 prompt.push('\n');
@@ -1605,10 +1606,10 @@ mod tests {
         let blob = ed.public_key().wire_blob();
         let mut body = ed.to_agent_add_body();
         body.push(SSH_AGENT_CONSTRAIN_CONFIRM);
-        for (md5, want) in [
-            (false, ed.public_key().sha256_fingerprint()),
+        for (hash, want) in [
+            ("sha256", ed.public_key().sha256_fingerprint()),
             (
-                true,
+                "md5",
                 "MD5:05:cf:97:c7:22:3d:df:5b:87:d6:93:67:f8:60:25:79".into(),
             ),
         ] {
@@ -1619,7 +1620,7 @@ mod tests {
                 *log.lock().unwrap() = p.to_string();
                 true
             }));
-            s.set_md5_fingerprints(md5);
+            assert!(s.set_fingerprint_hash(hash));
             assert_eq!(
                 s.handle(&msg(SSH_AGENTC_ADD_ID_CONSTRAINED, &body))[0],
                 SSH_AGENT_SUCCESS

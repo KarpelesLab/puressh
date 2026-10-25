@@ -62,8 +62,8 @@ mod imp {
         /// `-N`: don't cap a certificate's lifetime at its expiry.
         no_cert_lifetime: bool,
         lifetime: Option<u32>,
-        /// `-E md5`: MD5 fingerprints (else SHA-256).
-        md5: bool,
+        /// `-E`: the fingerprint hash (else SHA-256).
+        fp_hash: Option<String>,
         /// `-v` count: OpenSSH's debug1 to debug3 messages.
         verbose: u8,
         destinations: Vec<String>,
@@ -191,13 +191,12 @@ mod imp {
                     };
                     match c {
                         't' => o.lifetime = parse_lifetime(&v)?,
-                        'E' => match v.to_ascii_lowercase().as_str() {
-                            "md5" => o.md5 = true,
-                            "sha256" => o.md5 = false,
-                            _ => {
+                        'E' => {
+                            if !puressh::key::is_fingerprint_hash(&v) {
                                 return Err(Exit::Fatal(format!("Invalid hash algorithm \"{v}\"")));
                             }
-                        },
+                            o.fp_hash = Some(v);
+                        }
                         'h' => o.destinations.push(v),
                         'H' => o.hostkey_files.push(v),
                         'S' => o.sk_provider = Some(v),
@@ -945,7 +944,9 @@ mod imp {
                 .unwrap_or_default();
             key.set_comment(app);
             let pk = key.public_key();
-            let fp = fingerprint(&pk, o.md5);
+            let fp = pk
+                .fingerprint(o.fp_hash.as_deref().unwrap_or("sha256"))
+                .unwrap_or_else(|| pk.sha256_fingerprint());
             if agent.add_constrained(&key, None, c).is_err() {
                 eprintln!("Unable to add key {} {fp}", pk.type_label());
                 status = 1;
@@ -1011,18 +1012,6 @@ mod imp {
                 );
                 1
             }
-        }
-    }
-
-    /// `pk`'s fingerprint, MD5 (`-E md5`) or SHA-256.
-    fn fingerprint(pk: &PublicKey, md5: bool) -> String {
-        if md5 {
-            use purecrypto::hash::{Digest, Md5};
-            let d = Md5::digest(&pk.wire_blob());
-            let hex: Vec<String> = d.as_ref().iter().map(|b| format!("{b:02x}")).collect();
-            format!("MD5:{}", hex.join(":"))
-        } else {
-            pk.sha256_fingerprint()
         }
     }
 
@@ -1098,7 +1087,8 @@ mod imp {
                 println!(
                     "{} {} {} ({}{})",
                     pk.bit_length(),
-                    fingerprint(&pk, o.md5),
+                    pk.fingerprint(o.fp_hash.as_deref().unwrap_or("sha256"))
+                        .unwrap_or_else(|| pk.sha256_fingerprint()),
                     if id.comment().is_empty() {
                         "no comment"
                     } else {
@@ -1144,8 +1134,12 @@ mod imp {
                 Some(Exit::Fatal("Invalid combination of actions".into()))
             );
             assert_eq!(
-                parse(&["-E", "sha1"]).err(),
-                Some(Exit::Fatal("Invalid hash algorithm \"sha1\"".into()))
+                parse(&["-E", "sha224"]).err(),
+                Some(Exit::Fatal("Invalid hash algorithm \"sha224\"".into()))
+            );
+            assert_eq!(
+                parse(&["-E", "SHA384"]).unwrap().fp_hash.as_deref(),
+                Some("SHA384")
             );
             assert_eq!(
                 parse(&["-t", "1y"]).err(),

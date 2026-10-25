@@ -118,8 +118,8 @@ mod imp {
         /// `-U`: leave stale sockets alone.
         keep_stale: bool,
         lifetime: Option<Duration>,
-        /// `-E md5`.
-        md5: bool,
+        /// `-E`: the fingerprint hash.
+        fp_hash: Option<String>,
         /// `-O` and `-P` settings, for security-key and PKCS#11 providers.
         providers: ProviderOpts,
         command: Vec<String>,
@@ -205,7 +205,7 @@ mod imp {
             clean_only: 0,
             keep_stale: false,
             lifetime: None,
-            md5: false,
+            fp_hash: None,
             providers: ProviderOpts {
                 restrict_websafe: true,
                 ..ProviderOpts::default()
@@ -244,13 +244,12 @@ mod imp {
                     match c {
                         'A' => dir_arg = Some(v),
                         'a' => o.bind = Some(PathBuf::from(v)),
-                        'E' => match v.to_ascii_lowercase().as_str() {
-                            "md5" => o.md5 = true,
-                            "sha256" => o.md5 = false,
-                            _ => {
+                        'E' => {
+                            if !puressh::key::is_fingerprint_hash(&v) {
                                 return Err(Exit::Fatal(format!("Invalid hash algorithm \"{v}\"")));
                             }
-                        },
+                            o.fp_hash = Some(v);
+                        }
                         'O' => {
                             let p = &mut o.providers;
                             if v == "no-restrict-websafe" {
@@ -1025,7 +1024,9 @@ mod imp {
 
         let mut state = AgentState::new();
         state.set_default_lifetime(o.lifetime);
-        state.set_md5_fingerprints(o.md5);
+        if let Some(h) = &o.fp_hash {
+            state.set_fingerprint_hash(h);
+        }
         state.set_confirm(Box::new(ask_permission));
         if let Some(p) = &o.providers.allowed_providers {
             state.set_allowed_providers(p);
@@ -1149,10 +1150,11 @@ mod imp {
         #[test]
         fn option_values_are_checked() {
             assert_eq!(
-                parse(&["-E", "sha1"]).err(),
-                Some(Exit::Fatal("Invalid hash algorithm \"sha1\"".into()))
+                parse(&["-E", "sha224"]).err(),
+                Some(Exit::Fatal("Invalid hash algorithm \"sha224\"".into()))
             );
-            assert!(parse(&["-E", "md5"]).unwrap().md5);
+            let o = parse(&["-E", "SHA512"]).unwrap();
+            assert_eq!(o.fp_hash.as_deref(), Some("SHA512"));
             assert_eq!(
                 parse(&["-O", "bogus"]).err(),
                 Some(Exit::Fatal("Unknown -O option".into()))

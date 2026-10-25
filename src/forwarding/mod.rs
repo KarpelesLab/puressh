@@ -85,6 +85,11 @@ pub mod tun;
 #[cfg(unix)]
 pub mod x11;
 
+/// Called with each TCP socket a forwarding handler connects or accepts,
+/// before it carries data — e.g. to turn on `SO_KEEPALIVE`, as sshd's
+/// `TCPKeepAlive all` does.
+pub type SocketHook = std::sync::Arc<dyn Fn(&std::net::TcpStream) + Send + Sync>;
+
 /// A local socket a forwarded channel is spliced with.
 #[allow(dead_code)] // which splices are built depends on the features
 pub(crate) trait SpliceSocket: std::io::Write {

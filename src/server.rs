@@ -5163,12 +5163,20 @@ fn handle_channel_request(
                     Ok(handle) => {
                         let env = envs.entry(channel).or_default();
                         env.insert("DISPLAY".to_string(), handle.display_env.clone());
-                        // For xauth / the rc files: X11UseLocalhost's
-                        // `unix:N.S` entry, as OpenSSH writes it.
+                        // For xauth / the rc files, as OpenSSH writes it:
+                        // `unix:N.S` for a loopback display, `host/unix:N.S`
+                        // for one on the wildcard address.
+                        let n = handle.display_number;
+                        let auth_display = match handle.display_env.split_once(':') {
+                            Some((host, _)) if !host.is_empty() && host != "localhost" => {
+                                alloc::format!("{host}/unix:{n}.{screen}")
+                            }
+                            _ => alloc::format!("unix:{n}.{screen}"),
+                        };
                         env.set_x11_auth(
                             auth_protocol.as_str(),
                             auth_cookie.as_str(),
-                            alloc::format!("unix:{}.{screen}", handle.display_number),
+                            auth_display,
                         );
                         x11_forward.active.insert(channel, handle);
                         if want_reply {

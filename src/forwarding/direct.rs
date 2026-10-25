@@ -78,6 +78,7 @@ enum Policy {
 pub struct DefaultDirectTcpipHandler {
     policy: Policy,
     connect_timeout: Option<Duration>,
+    socket_hook: Option<super::SocketHook>,
 }
 
 impl Default for DefaultDirectTcpipHandler {
@@ -99,6 +100,7 @@ impl DefaultDirectTcpipHandler {
         Self {
             policy: Policy::Deny,
             connect_timeout: Some(Duration::from_secs(10)),
+            socket_hook: None,
         }
     }
 
@@ -114,6 +116,7 @@ impl DefaultDirectTcpipHandler {
         Self {
             policy: Policy::All,
             connect_timeout: Some(Duration::from_secs(10)),
+            socket_hook: None,
         }
     }
 
@@ -131,6 +134,12 @@ impl DefaultDirectTcpipHandler {
         F: Fn(&str, u16) -> bool + Send + Sync + 'static,
     {
         self.policy = Policy::Filter(Box::new(filter));
+        self
+    }
+
+    /// Run `hook` on each socket connected to a destination.
+    pub fn with_socket_hook(mut self, hook: super::SocketHook) -> Self {
+        self.socket_hook = Some(hook);
         self
     }
 
@@ -173,6 +182,9 @@ impl DirectTcpipHandler for DefaultDirectTcpipHandler {
             Ok(s) => s,
             Err(_) => return Ok(()),
         };
+        if let Some(hook) = &self.socket_hook {
+            hook(&tcp);
+        }
         splice(stream, tcp)
     }
 }

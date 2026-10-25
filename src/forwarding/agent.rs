@@ -67,6 +67,8 @@ struct AgentBinding {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     socket_path: PathBuf,
+    /// A directory made for the socket alone (`shared:`), removed with it.
+    socket_dir: Option<PathBuf>,
 }
 
 #[cfg(feature = "server")]
@@ -81,6 +83,105 @@ impl Drop for AgentBinding {
         // (post-drop privileges, no longer owner), there's nothing useful
         // we can do.
         let _ = std::fs::remove_file(&self.socket_path);
+        if let Some(dir) = &self.socket_dir {
+            let _ = std::fs::remove_dir(dir);
+        }
+    }
+}
+
+/// Where a forwarded agent's socket is created: OpenSSH 10's
+/// `AgentSocketPath`, already expanded for the user.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AgentSocketLocation {
+    /// `user:` — directly in `dir` (made, mode 0700, where missing) as
+    /// `s.<host_hash>.sshd.<pid>.<random>`.
+    User {
+        /// The directory.
+        dir: PathBuf,
+        /// OpenSSH's hash of the host name, telling hosts sharing a home
+        /// directory apart.
+        host_hash: String,
+    },
+    /// `shared:` — in a fresh private `ssh-XXXXXXXXXXXX` directory under
+    /// `dir`, as `agent.sshd.<pid>`; the directory goes with the socket.
+    Shared {
+        /// The directory the private one is made in.
+        dir: PathBuf,
+    },
+    /// `none`: agent forwarding is refused.
+    Disabled,
+}
+
+/// See [`DefaultAgentForwardHandler::with_socket_location`].
+#[cfg(feature = "server")]
+pub type AgentSocketLocationFn = Arc<dyn Fn(&str) -> AgentSocketLocation + Send + Sync>;
+
+/// OpenSSH's characters for random socket and directory names.
+#[cfg(feature = "server")]
+const PRESENTATION_CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+#[cfg(feature = "server")]
+fn random_name(n: usize) -> String {
+    (0..n)
+        .map(|_| {
+            let i = OsRng.next_u32() as usize % PRESENTATION_CHARS.len();
+            PRESENTATION_CHARS[i] as char
+        })
+        .collect()
+}
+
+/// OpenSSH's `mkdir_path(dir, 0700)`: every missing component of `dir` is
+/// made with mode 0700; existing ones are left as they are.
+#[cfg(feature = "server")]
+fn mkdir_path_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let mut at = PathBuf::new();
+    for part in dir.components() {
+        at.push(part);
+        match std::fs::DirBuilder::new().mode(0o700).create(&at) {
+            Ok(()) => {}
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// The socket path (and the directory made for it alone) for `location`.
+#[cfg(feature = "server")]
+fn place_socket(location: &AgentSocketLocation) -> Result<(PathBuf, Option<PathBuf>)> {
+    use std::os::unix::fs::DirBuilderExt;
+    let pid = std::process::id();
+    match location {
+        AgentSocketLocation::User { dir, host_hash } => {
+            mkdir_path_private(dir)?;
+            let name = format!("s.{host_hash}.sshd.{pid}.{}", random_name(10));
+            Ok((dir.join(name), None))
+        }
+        AgentSocketLocation::Shared { dir } => {
+            // mkdtemp(3): a fresh, private directory.
+            for _ in 0..16 {
+                let sub = dir.join(format!("ssh-{}", random_name(12)));
+                match std::fs::DirBuilder::new().mode(0o700).create(&sub) {
+                    Ok(()) => {
+                        let path = sub.join(format!("agent.sshd.{pid}"));
+                        return Ok((path, Some(sub)));
+                    }
+                    Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(crate::error::Error::Io(std::io::Error::new(
+                ErrorKind::AlreadyExists,
+                "agent-forward: could not make a socket directory",
+            )))
+        }
+        AgentSocketLocation::Disabled => Err(crate::error::Error::Io(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "agent-forward: no agent path specified",
+        ))),
     }
 }
 
@@ -103,6 +204,8 @@ pub struct DefaultAgentForwardHandler {
     /// `/tmp`. Useful for tests that want to drive the handler against a
     /// scratch directory.
     parent_dir: Option<PathBuf>,
+    /// Per-user socket placement (`AgentSocketPath`), over `parent_dir`.
+    location: Option<AgentSocketLocationFn>,
 }
 
 #[cfg(feature = "server")]
@@ -117,7 +220,17 @@ impl DefaultAgentForwardHandler {
     /// Build a fresh handler that picks a parent directory at `setup` time
     /// (`$XDG_RUNTIME_DIR` if set, otherwise `/tmp`).
     pub fn new() -> Self {
-        Self { parent_dir: None }
+        Self {
+            parent_dir: None,
+            location: None,
+        }
+    }
+
+    /// Place each user's socket where `location` says (OpenSSH 10's
+    /// `AgentSocketPath`), instead of under the parent directory.
+    pub fn with_socket_location(mut self, location: AgentSocketLocationFn) -> Self {
+        self.location = Some(location);
+        self
     }
 
     /// Build a handler that places every per-session socket under `dir`.
@@ -125,6 +238,7 @@ impl DefaultAgentForwardHandler {
     pub fn with_parent_dir(dir: PathBuf) -> Self {
         Self {
             parent_dir: Some(dir),
+            location: None,
         }
     }
 
@@ -217,9 +331,11 @@ fn ensure_private_dir(dir: &Path, euid: u32) -> Result<()> {
 
 #[cfg(feature = "server")]
 impl AgentForwardHandler for DefaultAgentForwardHandler {
-    fn setup(&self, _user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle> {
-        let parent = self.resolve_parent()?;
-        let socket_path = mint_socket_path(&parent)?;
+    fn setup(&self, user: &str, ctx: AgentForwardContext) -> Result<AgentForwardHandle> {
+        let (socket_path, socket_dir) = match &self.location {
+            Some(location) => place_socket(&location(user))?,
+            None => (mint_socket_path(&self.resolve_parent()?)?, None),
+        };
         // Don't unlink-then-bind: a `remove_file` followed by `bind` opens a
         // narrow window where an attacker (or a buggy peer) can swap a
         // symlink into place pointing at /etc/passwd, $HOME/.ssh/, etc., and
@@ -242,7 +358,15 @@ impl AgentForwardHandler for DefaultAgentForwardHandler {
             )));
         }
 
-        let listener = UnixListener::bind(&socket_path)?;
+        let listener = match UnixListener::bind(&socket_path) {
+            Ok(l) => l,
+            Err(e) => {
+                if let Some(dir) = &socket_dir {
+                    let _ = std::fs::remove_dir(dir);
+                }
+                return Err(e.into());
+            }
+        };
         listener.set_nonblocking(true)?;
         // Belt-and-braces: UnixListener::bind honours the process umask, which
         // we don't trust to be tight enough. Lock the socket down to the owner
@@ -284,6 +408,7 @@ impl AgentForwardHandler for DefaultAgentForwardHandler {
             stop,
             handle: Some(handle),
             socket_path: socket_path.clone(),
+            socket_dir,
         };
         Ok(AgentForwardHandle {
             auth_sock_path: socket_path,
@@ -572,6 +697,77 @@ mod tests {
         assert!(
             !path.exists(),
             "socket should be unlinked when the handle is dropped (path={path:?})",
+        );
+    }
+
+    /// `AgentSocketPath`: `user:` makes the directory (0700) and names the
+    /// socket as OpenSSH does; `shared:` makes a private directory that
+    /// goes with the socket; `none` refuses.
+    #[test]
+    fn socket_location_places_the_socket_as_openssh() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestTempDir::new("loc");
+        let user_dir = dir.path().join("h/.ssh/agent");
+        let loc = AgentSocketLocation::User {
+            dir: user_dir.clone(),
+            host_hash: "abcdefghij".into(),
+        };
+        let h = DefaultAgentForwardHandler::new().with_socket_location(Arc::new(move |user| {
+            assert_eq!(user, "u");
+            loc.clone()
+        }));
+        let handle = h
+            .setup("u", AgentForwardContext::for_test_no_opens())
+            .expect("setup");
+        let path = handle.auth_sock_path.clone();
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        let prefix = format!("s.abcdefghij.sshd.{}.", std::process::id());
+        assert!(
+            name.starts_with(&prefix) && name.len() == prefix.len() + 10,
+            "{name}"
+        );
+        assert_eq!(path.parent(), Some(user_dir.as_path()));
+        let mode = std::fs::metadata(&user_dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        drop(handle);
+
+        let shared = dir.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let loc = AgentSocketLocation::Shared {
+            dir: shared.clone(),
+        };
+        let h =
+            DefaultAgentForwardHandler::new().with_socket_location(Arc::new(move |_| loc.clone()));
+        let handle = h
+            .setup("u", AgentForwardContext::for_test_no_opens())
+            .expect("setup");
+        let path = handle.auth_sock_path.clone();
+        let sub = path.parent().unwrap().to_path_buf();
+        assert_eq!(sub.parent(), Some(shared.as_path()));
+        assert!(
+            sub.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("ssh-")
+        );
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("agent.sshd.{}", std::process::id())
+        );
+        drop(handle);
+        for _ in 0..50 {
+            if !sub.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!sub.exists(), "the private directory goes with the socket");
+
+        let h = DefaultAgentForwardHandler::new()
+            .with_socket_location(Arc::new(|_| AgentSocketLocation::Disabled));
+        assert!(
+            h.setup("u", AgentForwardContext::for_test_no_opens())
+                .is_err()
         );
     }
 

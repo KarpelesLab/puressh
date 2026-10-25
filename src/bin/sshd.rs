@@ -737,7 +737,6 @@ mod imp {
         allowed_users: Vec<String>,
         /// `-u len`: the longest host name recorded in utmp; a longer one
         /// (and any, with `-u0`) is recorded as the address.
-        #[allow(dead_code)] // wired up with UseDNS
         utmp_len: usize,
         /// `-d` given (any number of times).
         debug: bool,
@@ -938,7 +937,6 @@ mod imp {
     /// the device its socket is bound to, as OpenSSH portable's
     /// `sys_get_rdomain`. `None` when it is not bound to one.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    #[allow(dead_code)] // wired up with Match RDomain
     fn get_rdomain(fd: &impl AsFd) -> Option<String> {
         let name =
             nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::BindToDevice).ok()?;
@@ -947,7 +945,6 @@ mod imp {
     }
 
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    #[allow(dead_code)] // wired up with Match RDomain
     fn get_rdomain(_fd: &impl AsFd) -> Option<String> {
         None
     }
@@ -2505,16 +2502,28 @@ mod imp {
                 return false;
             };
             let ip_s = ip.to_string();
+            // With `UseDNS yes`, the host name too (OpenSSH's
+            // match_host_and_ip), compared in lower case.
+            let host_name = conn_host_name();
             let mut admitted = false;
             for pat in from.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                 let (negated, p) = match pat.strip_prefix('!') {
                     Some(p) => (true, p),
                     None => (false, pat),
                 };
+                let glob = |s: &str| {
+                    puressh::config::host_matches(&[puressh::config::HostPattern::parse(p)], s)
+                };
                 let hit = if p.contains('/') {
                     cidr_matches(p, ip)
                 } else {
-                    puressh::config::host_matches(&[puressh::config::HostPattern::parse(p)], &ip_s)
+                    glob(&ip_s)
+                        || host_name.as_deref().is_some_and(|h| {
+                            puressh::config::host_matches(
+                                &[puressh::config::HostPattern::parse(&p.to_ascii_lowercase())],
+                                h,
+                            )
+                        })
                 };
                 if hit && negated {
                     admitted = false;
@@ -3525,7 +3534,12 @@ mod imp {
                     .and_then(parse_peer_ip)
                     .is_some_and(|ip| cidr_matches(cidr, ip.to_canonical())),
                 (Some(h), None) => match peer {
-                    Some(p) => puressh::config::host_matches(core::slice::from_ref(h), p),
+                    Some(p) => {
+                        puressh::config::host_matches(core::slice::from_ref(h), p)
+                            || conn_host_name().is_some_and(|name| {
+                                puressh::config::host_matches(core::slice::from_ref(h), &name)
+                            })
+                    }
                     None => false,
                 },
             }
@@ -4188,9 +4202,15 @@ mod imp {
                 }
             };
             let opts = resolve_conn_options(&pol.config, user, &groups, self.peer.as_deref());
-            // `LogVerbose` as the connection's `Match` blocks have it.
+            // `LogVerbose` and `IPQoS` as the connection's `Match` blocks
+            // have them.
             if let Some(lists) = &opts.log_verbose {
                 sshd_log::set_log_verbose(lists);
+            }
+            if let Some(qos) = opts.ip_qos
+                && let Ok(mut g) = QOS_CLASSES.lock()
+            {
+                *g = qos;
             }
             // `RefuseConnection`: OpenSSH drops the connection as soon as the
             // user (and so every `Match` criterion) is known.
@@ -5308,6 +5328,220 @@ mod imp {
             .map(|ip| ip.to_string())
     }
 
+    /// This connection's host name (`UseDNS yes`) and routing domain, looked
+    /// up once, after the key exchange (see `Config::peer_names`).
+    static CONN_NAMES: std::sync::OnceLock<puressh::server::PeerNames> = std::sync::OnceLock::new();
+
+    /// The client's host name, when `UseDNS` found one.
+    fn conn_host_name() -> Option<String> {
+        CONN_NAMES.get().and_then(|n| n.host.clone())
+    }
+
+    /// OpenSSH's `ssh_remote_hostname`: the name `ip` maps back to, when that
+    /// name maps forward to `ip` again; `None` (use the address) otherwise,
+    /// logging why as OpenSSH does.
+    fn remote_hostname(ip: IpAddr) -> Option<String> {
+        use std::net::ToSocketAddrs;
+        let ip = ip.to_canonical();
+        let ntop = ip.to_string();
+        let sa = nix::sys::socket::SockaddrStorage::from(std::net::SocketAddr::new(ip, 0));
+        let mut name = [0 as libc::c_char; 1025];
+        // SAFETY: `sa` is a valid sockaddr of `sa.len()` bytes; `name` is a
+        // writable buffer of the length passed; no service is asked for.
+        let rc = unsafe {
+            libc::getnameinfo(
+                nix::sys::socket::SockaddrLike::as_ptr(&sa),
+                nix::sys::socket::SockaddrLike::len(&sa),
+                name.as_mut_ptr(),
+                name.len() as libc::socklen_t,
+                std::ptr::null_mut(),
+                0,
+                libc::NI_NAMEREQD,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        // SAFETY: getnameinfo NUL-terminated the name within the buffer.
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+            .to_string_lossy()
+            .into_owned();
+        // A PTR record that looks like an address is someone's trick.
+        if name.parse::<IpAddr>().is_ok() {
+            sshd_log::info(&format!(
+                "Nasty PTR record \"{name}\" is set up for {ntop}, ignoring"
+            ));
+            return None;
+        }
+        let name = name.to_ascii_lowercase();
+        let Ok(addrs) = (name.as_str(), 0).to_socket_addrs() else {
+            sshd_log::info(&format!(
+                "reverse mapping checking getaddrinfo for {name} [{ntop}] failed."
+            ));
+            return None;
+        };
+        let mut addrs = addrs.map(|a| a.ip().to_canonical());
+        if !addrs.any(|a| a == ip) {
+            sshd_log::info(&format!(
+                "Address {ntop} maps to {name}, but this does not map back to the address."
+            ));
+            return None;
+        }
+        Some(name)
+    }
+
+    /// What utmp / wtmp / lastlog record as the peer (OpenSSH's
+    /// `session_get_remote_name_or_ip`): the host name if it fits in
+    /// `utmp_len` (`-u`), else the address.
+    #[cfg(any(test, all(target_os = "linux", target_env = "gnu")))]
+    fn utmp_host(ip: IpAddr, host_name: Option<&str>, utmp_len: usize) -> String {
+        match host_name {
+            Some(h) if utmp_len > 0 && h.len() <= utmp_len => h.to_string(),
+            _ => sshd_log::addr_str(ip),
+        }
+    }
+
+    /// `-u`: the longest host name utmp records.
+    static UTMP_LEN: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(UTMP_HOST_MAX);
+
+    /// `IPQoS`: this connection's socket, its family, the `(interactive,
+    /// other)` classes in force and which one applies now.
+    static QOS_FD: AtomicI32 = AtomicI32::new(-1);
+    static QOS_V6: AtomicBool = AtomicBool::new(false);
+    static QOS_CLASSES: Mutex<(Option<u8>, Option<u8>)> = Mutex::new(DEFAULT_IP_QOS);
+    static QOS_INTERACTIVE: AtomicBool = AtomicBool::new(false);
+
+    /// Set the connection socket's DSCP for its current traffic class
+    /// (OpenSSH's `apply_qos` / `set_sock_tos`); `none` leaves it alone.
+    fn apply_qos() {
+        let fd = QOS_FD.load(Ordering::Relaxed);
+        if fd < 0 {
+            return;
+        }
+        let (interactive, other) = QOS_CLASSES.lock().map(|g| *g).unwrap_or(DEFAULT_IP_QOS);
+        let class = if QOS_INTERACTIVE.load(Ordering::Relaxed) {
+            interactive
+        } else {
+            other
+        };
+        let Some(tos) = class else {
+            return;
+        };
+        let tos = libc::c_int::from(tos);
+        let (level, name) = if QOS_V6.load(Ordering::Relaxed) {
+            (libc::IPPROTO_IPV6, libc::IPV6_TCLASS)
+        } else {
+            (libc::IPPROTO_IP, libc::IP_TOS)
+        };
+        // SAFETY: an int option on a socket this process owns, with its size.
+        unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                name,
+                (&tos as *const libc::c_int).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
+
+    /// The options in force for `user` on this connection (its `Match`
+    /// blocks applied).
+    fn conn_options_for(
+        config: &puressh::config::SshServerConfig,
+        user: &str,
+    ) -> puressh::config::ServerOptions {
+        let groups = lookup_user_groups(user);
+        let peer = conn_peer_ip();
+        resolve_conn_options(config, user, &groups, peer.as_deref())
+    }
+
+    /// This host's name (`gethostname(2)`), empty if it cannot be had.
+    fn host_name() -> String {
+        let mut buf = [0 as libc::c_char; 256];
+        // SAFETY: a writable buffer of the length passed; the last byte is
+        // left NUL so the name is terminated even when truncated.
+        if unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len() - 1) } != 0 {
+            return String::new();
+        }
+        // SAFETY: NUL-terminated within the buffer (see above).
+        unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    /// OpenSSH's `hostname_hash`: the host name's SHA-512 in its
+    /// presentation characters, `len` of them.
+    fn hostname_hash(len: usize) -> String {
+        use purecrypto::hash::{Digest, Sha512};
+        const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        Sha512::digest(host_name().as_bytes())
+            .iter()
+            .take(len)
+            .map(|b| CHARS[usize::from(*b) % CHARS.len()] as char)
+            .collect()
+    }
+
+    /// `AgentSocketPath` for `info`: `%u`, `%U` and `%h` expanded, `~` and
+    /// relative paths taken from the home directory (OpenSSH's
+    /// `expand_pathspec`).
+    fn agent_socket_location(
+        spec: &str,
+        info: &UserInfo,
+    ) -> puressh::forwarding::agent::AgentSocketLocation {
+        use puressh::forwarding::agent::AgentSocketLocation as L;
+        let expand = |path: &str| -> Option<std::path::PathBuf> {
+            let mut out = String::new();
+            let mut chars = path.chars();
+            while let Some(c) = chars.next() {
+                if c != '%' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next()? {
+                    'u' => out.push_str(&info.name),
+                    'U' => out.push_str(&info.uid.as_raw().to_string()),
+                    'h' => out.push_str(&info.home_str),
+                    '%' => out.push('%'),
+                    _ => return None,
+                }
+            }
+            let out = match out.strip_prefix('~') {
+                Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+                    format!("{}{rest}", info.home_str)
+                }
+                _ => out,
+            };
+            Some(if out.starts_with('/') {
+                std::path::PathBuf::from(out)
+            } else {
+                std::path::Path::new(&info.home_str).join(out)
+            })
+        };
+        if let Some(dir) = spec.strip_prefix("shared:") {
+            match expand(dir) {
+                Some(dir) => L::Shared { dir },
+                None => L::Disabled,
+            }
+        } else if let Some(dir) = spec.strip_prefix("user:") {
+            match expand(dir) {
+                Some(dir) => L::User {
+                    dir,
+                    host_hash: hostname_hash(10),
+                },
+                None => L::Disabled,
+            }
+        } else {
+            L::Disabled
+        }
+    }
+
+    /// `TCPKeepAlive all`: `SO_KEEPALIVE` on a forwarded connection's socket.
+    fn keepalive_hook(stream: &std::net::TcpStream) {
+        let _ = nix::sys::socket::setsockopt(stream, nix::sys::socket::sockopt::KeepAlive, &true);
+    }
+
     /// Resolve the `sshd_config` policy for a connection once the login user
     /// is known: user, groups, peer address, and this child's local socket
     /// (for `Match LocalAddress` / `LocalPort`).
@@ -5323,8 +5557,12 @@ mod imp {
         ctx.user = Some(user);
         ctx.groups = Some(groups);
         ctx.address = peer_ip;
-        // `Match host`: the client's address (OpenSSH's `UseDNS no`).
-        ctx.host = peer_ip.unwrap_or("UNKNOWN");
+        // `Match host`: the client's host name (`UseDNS yes`), else its
+        // address.
+        let host_name = conn_host_name();
+        ctx.host = host_name.as_deref().or(peer_ip).unwrap_or("UNKNOWN");
+        let rdomain = CONN_NAMES.get().and_then(|n| n.rdomain.clone());
+        ctx.rdomain = rdomain.as_deref();
         ctx.invalid_user = Some(lookup_user(user).is_err());
         ctx.local_address = local_ip.as_deref();
         ctx.local_port = local.map(|a| a.port());
@@ -8000,7 +8238,8 @@ mod imp {
 
     /// Send one message line to the daemon parent over this connection's
     /// pipe, which stays open for the connection's life: `A` (authenticated),
-    /// `L pid tty user uid` / `O pid tty` (a pty login / logout to record —
+    /// `H name` (the client's host name, before that), `L pid tty user uid`
+    /// / `O pid tty` (a pty login / logout to record —
     /// the parent is root and the connection no longer is). False when there
     /// is no pipe (tests, a pipe() failure at accept time).
     fn tell_parent(line: &[u8]) -> bool {
@@ -8037,7 +8276,15 @@ mod imp {
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         {
             let peer = conn_addrs().map(|(p, _)| p.ip());
-            let host = peer.map(sshd_log::addr_str).unwrap_or_default();
+            let host = peer
+                .map(|ip| {
+                    utmp_host(
+                        ip,
+                        conn_host_name().as_deref(),
+                        UTMP_LEN.load(Ordering::Relaxed),
+                    )
+                })
+                .unwrap_or_default();
             Some(LoginRecord::Local(sshd_login::login(
                 pid, tty, user, uid, &host, peer,
             )))
@@ -8070,6 +8317,9 @@ mod imp {
         authenticated: bool,
         /// Unprocessed bytes from the pipe (messages are lines).
         buf: Vec<u8>,
+        /// The client's host name (`UseDNS`), as the child said before
+        /// authenticating.
+        host_name: Option<String>,
         /// Pty logins recorded for this child, closed when it says so or
         /// when it is reaped.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
@@ -8081,6 +8331,19 @@ mod imp {
         fn message(&mut self, line: &[u8]) {
             if line == [AUTH_OK_BYTE] {
                 self.authenticated = true;
+            } else if let Some(name) = line.strip_prefix(b"H\t") {
+                // `UseDNS`: the client's host name, said before
+                // authentication (by code the client does not control).
+                if !self.authenticated
+                    && let Ok(name) = std::str::from_utf8(name)
+                    && !name.is_empty()
+                    && name.len() <= 1024
+                    && name
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
+                {
+                    self.host_name = Some(name.to_string());
+                }
             } else {
                 #[cfg(all(target_os = "linux", target_env = "gnu"))]
                 self.login_message(line);
@@ -8104,7 +8367,11 @@ mod imp {
                             return;
                         }
                         // The peer as this parent knows it, not as claimed.
-                        let host = sshd_log::addr_str(self.ip);
+                        let host = utmp_host(
+                            self.ip,
+                            self.host_name.as_deref(),
+                            UTMP_LEN.load(Ordering::Relaxed),
+                        );
                         self.logins.push(sshd_login::login(
                             pid,
                             tty,
@@ -8401,6 +8668,7 @@ mod imp {
                     auth_rx,
                     authenticated: false,
                     buf: Vec::new(),
+                    host_name: None,
                     #[cfg(all(target_os = "linux", target_env = "gnu"))]
                     logins: Vec::new(),
                 },
@@ -9081,19 +9349,35 @@ mod imp {
         // PermitListen, GatewayPorts (bind-address rewrite),
         // AllowStreamLocalForwarding and DisableForwarding first, and the
         // connection already runs as the logged-in user.
+        // `TCPKeepAlive all`: their sockets get SO_KEEPALIVE too.
+        let keepalive_forwarded = sshd_cfg.global.tcp_keep_alive_forwarded == Some(true);
+        let socket_hook: Option<puressh::forwarding::SocketHook> = keepalive_forwarded
+            .then(|| Arc::new(keepalive_hook) as puressh::forwarding::SocketHook);
+        let mut direct = puressh::forwarding::direct::DefaultDirectTcpipHandler::permit_all();
+        let mut reverse =
+            puressh::forwarding::reverse::DefaultTcpipForwardHandler::permit_all_interfaces();
+        if let Some(hook) = &socket_hook {
+            direct = direct.with_socket_hook(hook.clone());
+            reverse = reverse.with_socket_hook(hook.clone());
+        }
+        // StreamLocalBindMask / StreamLocalBindUnlink, per user.
+        let streamlocal_cfg = sshd_cfg.clone();
+        let streamlocal =
+            puressh::forwarding::streamlocal::DefaultStreamlocalForwardHandler::permit_all()
+                .with_bind_options(Arc::new(move |user| {
+                    let o = conn_options_for(&streamlocal_cfg, user);
+                    puressh::forwarding::streamlocal::StreamlocalBindOptions::new(
+                        o.stream_local_bind_mask.unwrap_or(0o177),
+                        o.stream_local_bind_unlink == Some(true),
+                    )
+                }));
         config = config
-            .with_direct_tcpip(Arc::new(
-                puressh::forwarding::direct::DefaultDirectTcpipHandler::permit_all(),
-            ))
-            .with_tcpip_forward(Arc::new(
-                puressh::forwarding::reverse::DefaultTcpipForwardHandler::permit_all_interfaces(),
-            ))
+            .with_direct_tcpip(Arc::new(direct))
+            .with_tcpip_forward(Arc::new(reverse))
             .with_direct_streamlocal(Arc::new(
                 puressh::forwarding::direct_streamlocal::DefaultDirectStreamlocalHandler::permit_all(),
             ))
-            .with_streamlocal_forward(Arc::new(
-                puressh::forwarding::streamlocal::DefaultStreamlocalForwardHandler::permit_all(),
-            ))
+            .with_streamlocal_forward(Arc::new(streamlocal))
             // PermitTunnel (default no) gates it; the device is opened as
             // the logged-in user, as OpenSSH's sshd does.
             .with_tun(Arc::new(TunDevices));
@@ -9106,13 +9390,43 @@ mod imp {
         }));
 
         if agent_forward {
-            use puressh::forwarding::agent::DefaultAgentForwardHandler;
-            config = config.with_agent_forward(Arc::new(DefaultAgentForwardHandler::new()));
+            use puressh::forwarding::agent::{AgentSocketLocation, DefaultAgentForwardHandler};
+            // AgentSocketPath (OpenSSH 10's `user:.ssh/agent` by default),
+            // per user; created as the user, after the privilege drop.
+            let agent_cfg = sshd_cfg.clone();
+            let handler =
+                DefaultAgentForwardHandler::new().with_socket_location(Arc::new(move |user| {
+                    let o = conn_options_for(&agent_cfg, user);
+                    let spec = o
+                        .agent_socket_path
+                        .unwrap_or_else(|| DEFAULT_AGENT_SOCKET_PATH.to_string());
+                    match lookup_user(user) {
+                        Ok(info) => agent_socket_location(&spec, &info),
+                        Err(_) => AgentSocketLocation::Disabled,
+                    }
+                }));
+            config = config.with_agent_forward(Arc::new(handler));
         }
 
         if x11_forward {
-            use puressh::forwarding::x11::DefaultX11ForwardHandler;
-            config = config.with_x11_forward(Arc::new(DefaultX11ForwardHandler::new()));
+            use puressh::forwarding::x11::{DefaultX11ForwardHandler, X11DisplayPolicy};
+            // X11DisplayOffset / X11UseLocalhost, per user.
+            let x11_cfg = sshd_cfg.clone();
+            let mut handler =
+                DefaultX11ForwardHandler::new().with_display_policy(Arc::new(move |user| {
+                    let o = conn_options_for(&x11_cfg, user);
+                    let host = host_name();
+                    X11DisplayPolicy::new(
+                        o.x11_display_offset
+                            .map_or(10, |n| u16::try_from(n).unwrap_or(u16::MAX)),
+                        o.x11_use_localhost != Some(false),
+                        host,
+                    )
+                }));
+            if let Some(hook) = &socket_hook {
+                handler = handler.with_socket_hook(hook.clone());
+            }
+            config = config.with_x11_forward(Arc::new(handler));
         }
 
         // Connection-level session open. Two steps, in this order, exactly
@@ -9266,6 +9580,34 @@ mod imp {
         if sshd_cfg.global.warn_weak_crypto != Some(false) {
             config.on_kex = Some(Arc::new(warn_weak_kex));
         }
+
+        // UseDNS (global) and the connection's routing domain, for `Match
+        // Host` / `Match RDomain`, `from=` and `AllowUsers user@host`; the
+        // name also goes to the parent for utmp (`-u`).
+        let use_dns = sshd_cfg.global.use_dns == Some(true);
+        UTMP_LEN.store(cli.utmp_len, Ordering::Relaxed);
+        config.peer_names = Some(Arc::new(move |stream, peer| {
+            let host = if use_dns {
+                remote_hostname(peer.ip())
+            } else {
+                None
+            };
+            if let Some(name) = &host {
+                tell_parent(format!("H\t{name}\n").as_bytes());
+            }
+            let names = puressh::server::PeerNames::new(host, get_rdomain(stream));
+            let _ = CONN_NAMES.set(names.clone());
+            names
+        }));
+
+        // IPQoS: the connection's class follows what it carries.
+        if let Ok(mut g) = QOS_CLASSES.lock() {
+            *g = sshd_cfg.global.ip_qos.unwrap_or(DEFAULT_IP_QOS);
+        }
+        config.on_qos = Some(Arc::new(|interactive| {
+            QOS_INTERACTIVE.store(interactive, Ordering::Relaxed);
+            apply_qos();
+        }));
 
         // AddressFamily (startup-only): `-4`/`-6` > config; restricts the
         // listener family.
@@ -9629,6 +9971,11 @@ mod imp {
                             *g = Some((peer, stream.local_addr().ok()));
                         }
                         sshd_log::conn_begin(peer, stream.local_addr().ok());
+                        // IPQoS: the non-interactive class until the
+                        // connection carries an interactive session.
+                        QOS_FD.store(stream.as_raw_fd(), Ordering::Relaxed);
+                        QOS_V6.store(peer.is_ipv6(), Ordering::Relaxed);
+                        apply_qos();
 
                         let result = handle_session_with_peer(stream, peer, cfg.clone());
                         sshd_log::conn_end(match &result {
@@ -10281,6 +10628,54 @@ mod imp {
                 .and_then(|n| lookup_user(&n).ok())
                 .or_else(|| lookup_user("root").ok())
                 .expect("a resolvable test user")
+        }
+
+        #[test]
+        fn agent_socket_path_expands_as_openssh() {
+            use puressh::forwarding::agent::AgentSocketLocation as L;
+            let mut info = lookup_user_for_test();
+            info.name = "alice".into();
+            info.home_str = "/home/alice".into();
+            let uid = info.uid.as_raw();
+            match agent_socket_location("user:.ssh/agent", &info) {
+                L::User { dir, host_hash } => {
+                    assert_eq!(dir, std::path::Path::new("/home/alice/.ssh/agent"));
+                    assert_eq!(host_hash.len(), 10);
+                    assert!(host_hash.bytes().all(|b| b.is_ascii_alphanumeric()));
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(
+                agent_socket_location("shared:/run/agents/%u-%U", &info),
+                L::Shared {
+                    dir: format!("/run/agents/alice-{uid}").into()
+                }
+            );
+            assert!(matches!(
+                agent_socket_location("user:~/sock", &info),
+                L::User { dir, .. } if dir == std::path::Path::new("/home/alice/sock")
+            ));
+            assert_eq!(agent_socket_location("none", &info), L::Disabled);
+            assert_eq!(agent_socket_location("user:%x", &info), L::Disabled);
+        }
+
+        #[test]
+        fn utmp_host_is_the_name_when_it_fits() {
+            let ip: IpAddr = "192.0.2.7".parse().unwrap();
+            assert_eq!(utmp_host(ip, None, 65), "192.0.2.7");
+            assert_eq!(utmp_host(ip, Some("box.example"), 65), "box.example");
+            // `-u0`, or a name longer than `-u N`: the address.
+            assert_eq!(utmp_host(ip, Some("box.example"), 0), "192.0.2.7");
+            assert_eq!(utmp_host(ip, Some("box.example"), 5), "192.0.2.7");
+        }
+
+        #[test]
+        fn refused_connections_are_penalised_as_such() {
+            let pid = nix::unistd::Pid::from_raw(1);
+            assert_eq!(
+                penalty_for(&WaitStatus::Exited(pid, EXIT_CONFIG_REFUSED), false),
+                Some(PenaltyKind::RefuseConnection)
+            );
         }
 
         #[test]

@@ -139,6 +139,11 @@ impl Drop for X11Binding {
 pub struct DefaultX11ForwardHandler {
     min_display: u16,
     max_display: u16,
+    /// Per-user `X11DisplayOffset` / `X11UseLocalhost` (see
+    /// [`Self::with_display_policy`]).
+    display_policy: Option<X11DisplayPolicyFn>,
+    /// Run on each accepted X client connection.
+    socket_hook: Option<super::SocketHook>,
     /// When `true`, accepted local connections are spliced straight through
     /// without validating the X11 authorisation cookie. This is the legacy
     /// "trust loopback" behaviour and is OPT-IN: a local user on the server
@@ -147,6 +152,38 @@ pub struct DefaultX11ForwardHandler {
     /// `MIT-MAGIC-COOKIE-1` check against the cookie from `x11-req`.
     permit_unauthenticated: bool,
 }
+
+/// Where a user's forwarded displays go: OpenSSH's `X11DisplayOffset` and
+/// `X11UseLocalhost`.
+#[cfg(feature = "server")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct X11DisplayPolicy {
+    /// The first display number to try (`X11DisplayOffset`, 10 by default).
+    pub offset: u16,
+    /// Listen on loopback, `DISPLAY=localhost:N` (the default); otherwise on
+    /// the wildcard address, `DISPLAY=<host_name>:N`.
+    pub use_localhost: bool,
+    /// This host's name, for a wildcard display's `DISPLAY`.
+    pub host_name: String,
+}
+
+#[cfg(feature = "server")]
+impl X11DisplayPolicy {
+    /// A policy; see the fields.
+    pub fn new(offset: u16, use_localhost: bool, host_name: impl Into<String>) -> Self {
+        X11DisplayPolicy {
+            offset,
+            use_localhost,
+            host_name: host_name.into(),
+        }
+    }
+}
+
+/// See [`DefaultX11ForwardHandler::with_display_policy`]: the policy for
+/// the user setting up a display.
+#[cfg(feature = "server")]
+pub type X11DisplayPolicyFn = Arc<dyn Fn(&str) -> X11DisplayPolicy + Send + Sync>;
 
 #[cfg(feature = "server")]
 impl Default for DefaultX11ForwardHandler {
@@ -164,6 +201,8 @@ impl DefaultX11ForwardHandler {
         Self {
             min_display: DEFAULT_MIN_DISPLAY,
             max_display: DEFAULT_MAX_DISPLAY,
+            display_policy: None,
+            socket_hook: None,
             permit_unauthenticated: false,
         }
     }
@@ -175,6 +214,8 @@ impl DefaultX11ForwardHandler {
         Self {
             min_display,
             max_display,
+            display_policy: None,
+            socket_hook: None,
             permit_unauthenticated: false,
         }
     }
@@ -193,6 +234,20 @@ impl DefaultX11ForwardHandler {
         self
     }
 
+    /// Pick each user's first display number and listening address with
+    /// `policy` (OpenSSH's `X11DisplayOffset`, `X11UseLocalhost`). Displays
+    /// still end at the configured maximum.
+    pub fn with_display_policy(mut self, policy: X11DisplayPolicyFn) -> Self {
+        self.display_policy = Some(policy);
+        self
+    }
+
+    /// Run `hook` on each accepted X client connection.
+    pub fn with_socket_hook(mut self, hook: super::SocketHook) -> Self {
+        self.socket_hook = Some(hook);
+        self
+    }
+
     /// Bind the first display `N` whose port is free on *every* loopback
     /// address `localhost` may resolve to — `127.0.0.1` and `::1`, as
     /// OpenSSH's `X11UseLocalhost` does.
@@ -204,8 +259,8 @@ impl DefaultX11ForwardHandler {
     /// taken is skipped like one where `127.0.0.1` is. A `::1` bind that
     /// fails for any other reason (no IPv6 on the host) is tolerated: there
     /// is then nothing for anyone to bind on `::1`.
-    fn bind_first_free(&self) -> Result<(Vec<TcpListener>, u16)> {
-        for n in self.min_display..=self.max_display {
+    fn bind_first_free(&self, min_display: u16) -> Result<(Vec<TcpListener>, u16)> {
+        for n in min_display..=self.max_display {
             let port = X_BASE_PORT.saturating_add(n);
             let v4: SocketAddr = ([127u8, 0, 0, 1], port).into();
             let Ok(v4_listener) = TcpListener::bind(v4) else {
@@ -223,13 +278,36 @@ impl DefaultX11ForwardHandler {
             "x11-forward: no free display number in configured range",
         )))
     }
+
+    /// `X11UseLocalhost no`: the first display `N` free on the wildcard
+    /// address. A `[::]` that fails as in use once `0.0.0.0` is bound is a
+    /// dual-stack host's IPv6 socket already covering IPv4; that, or no
+    /// IPv6 at all, leaves the IPv4 listener alone.
+    fn bind_first_free_wildcard(&self, min_display: u16) -> Result<(Vec<TcpListener>, u16)> {
+        for n in min_display..=self.max_display {
+            let port = X_BASE_PORT.saturating_add(n);
+            let v6: SocketAddr = (std::net::Ipv6Addr::UNSPECIFIED, port).into();
+            let v4: SocketAddr = (std::net::Ipv4Addr::UNSPECIFIED, port).into();
+            let Ok(v4_listener) = TcpListener::bind(v4) else {
+                continue;
+            };
+            match TcpListener::bind(v6) {
+                Ok(v6_listener) => return Ok((vec![v4_listener, v6_listener], n)),
+                Err(_) => return Ok((vec![v4_listener], n)),
+            }
+        }
+        Err(Error::Io(std::io::Error::new(
+            ErrorKind::AddrInUse,
+            "x11-forward: no free display number in configured range",
+        )))
+    }
 }
 
 #[cfg(feature = "server")]
 impl X11ForwardHandler for DefaultX11ForwardHandler {
     fn setup(
         &self,
-        _user: &str,
+        user: &str,
         single_connection: bool,
         auth_protocol: &str,
         auth_cookie: &str,
@@ -282,7 +360,13 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
             CookiePolicy::RequireCookie(Arc::new(cookie))
         };
 
-        let (listeners, display_number) = self.bind_first_free()?;
+        let policy_for_user = self.display_policy.as_ref().map(|p| p(user));
+        let (listeners, display_number) = match &policy_for_user {
+            Some(p) if !p.use_localhost => self.bind_first_free_wildcard(p.offset)?,
+            Some(p) => self.bind_first_free(p.offset)?,
+            None => self.bind_first_free(self.min_display)?,
+        };
+        let socket_hook = self.socket_hook.clone();
         for listener in &listeners {
             listener.set_nonblocking(true)?;
         }
@@ -310,6 +394,9 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
                             // A failure here leaves a socket we cannot use; drop it.
                             if conn.set_nonblocking(false).is_err() {
                                 continue;
+                            }
+                            if let Some(hook) = &socket_hook {
+                                hook(&conn);
                             }
                             // Validate the X11 authorisation cookie on the first
                             // setup packet before doing anything else. On any
@@ -368,7 +455,11 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
             }
         });
 
-        let display_env = format!("localhost:{display_number}.{screen}");
+        let host = match &policy_for_user {
+            Some(p) if !p.use_localhost => p.host_name.as_str(),
+            _ => "localhost",
+        };
+        let display_env = format!("{host}:{display_number}.{screen}");
         let binding = X11Binding {
             stop,
             handle: Some(handle),
@@ -808,6 +899,31 @@ mod tests {
             TcpListener::bind(addr).is_ok(),
             "port should be free after the handle is dropped"
         );
+    }
+
+    /// `X11DisplayOffset` / `X11UseLocalhost no`: the display starts at the
+    /// user's offset, listens on the wildcard address and is named by host.
+    #[test]
+    fn display_policy_sets_offset_and_wildcard() {
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_in = Arc::clone(&seen);
+        let h = DefaultX11ForwardHandler::with_display_range(10, 640).with_display_policy(
+            Arc::new(move |user| {
+                *seen_in.lock().unwrap() = user.to_string();
+                X11DisplayPolicy::new(620, false, "box.example")
+            }),
+        );
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("alice", false, "MIT-MAGIC-COOKIE-1", "deadbeef", 1, ctx)
+            .expect("setup");
+        let n = handle.display_number;
+        assert!((620..=640).contains(&n), "n out of range: {n}");
+        assert_eq!(handle.display_env, format!("box.example:{n}.1"));
+        assert_eq!(*seen.lock().unwrap(), "alice");
+        let any: SocketAddr = ([0u8, 0, 0, 0], 6000 + n).into();
+        assert!(TcpListener::bind(any).is_err(), "wildcard port held");
+        drop(handle);
     }
 
     /// FWD-2: the display is held on `::1` too, so nobody else can listen

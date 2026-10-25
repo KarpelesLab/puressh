@@ -109,20 +109,20 @@ fn is_stale_own_socket(path: &std::path::Path, meta: &std::fs::Metadata) -> bool
     )
 }
 
-/// Bind a listening socket at `path`, owner-only (OpenSSH's default
-/// `StreamLocalBindMask 0177`), and return it with the `(st_dev, st_ino)` of
-/// the socket file.
+/// Bind a listening socket at `path` with the mode `StreamLocalBindMask`
+/// leaves (`0777 & !mask`: owner-only, `0600`, for OpenSSH's default
+/// `0177`), and return it with the `(st_dev, st_ino)` of the socket file.
 ///
 /// The umask is process-wide (and the server is multi-threaded), so the
-/// socket is created under it and immediately `chmod`ed to `0600`, before
-/// the accept loop starts. Any connection that slipped in during that window
-/// is drained from the backlog and dropped unserved.
+/// socket is created under it and immediately `chmod`ed, before the accept
+/// loop starts. Any connection that slipped in during that window is
+/// drained from the backlog and dropped unserved.
 #[cfg(feature = "server")]
-fn bind_owner_only(path: &std::path::Path) -> Result<(UnixListener, (u64, u64))> {
+fn bind_with_mask(path: &std::path::Path, mask: u32) -> Result<(UnixListener, (u64, u64))> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let listener = UnixListener::bind(path)?;
     let finish = || -> Result<(u64, u64)> {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777 & !mask))?;
         let meta = std::fs::symlink_metadata(path)?;
         listener.set_nonblocking(true)?;
         while listener.accept().is_ok() {}
@@ -176,7 +176,40 @@ enum Policy {
 pub struct DefaultStreamlocalForwardHandler {
     bindings: Mutex<BTreeMap<String, Binding>>,
     policy: Policy,
+    bind_options: Option<BindOptionsFn>,
 }
+
+/// How a user's forwarded sockets are bound: OpenSSH's
+/// `StreamLocalBindMask` and `StreamLocalBindUnlink`.
+#[cfg(feature = "server")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamlocalBindOptions {
+    /// The umask the socket is created with (`0177` by default: `0600`).
+    pub mask: u32,
+    /// Remove whatever is at the path first (`no` by default: only a stale
+    /// socket of the user's own is replaced).
+    pub unlink: bool,
+}
+
+#[cfg(feature = "server")]
+impl StreamlocalBindOptions {
+    /// Options; see the fields.
+    pub fn new(mask: u32, unlink: bool) -> Self {
+        StreamlocalBindOptions { mask, unlink }
+    }
+}
+
+#[cfg(feature = "server")]
+impl Default for StreamlocalBindOptions {
+    fn default() -> Self {
+        StreamlocalBindOptions::new(0o177, false)
+    }
+}
+
+/// See [`DefaultStreamlocalForwardHandler::with_bind_options`].
+#[cfg(feature = "server")]
+pub type BindOptionsFn = Arc<dyn Fn(&str) -> StreamlocalBindOptions + Send + Sync>;
 
 #[cfg(feature = "server")]
 impl Default for DefaultStreamlocalForwardHandler {
@@ -192,6 +225,7 @@ impl DefaultStreamlocalForwardHandler {
         Self {
             bindings: Mutex::new(BTreeMap::new()),
             policy: Policy::Deny,
+            bind_options: None,
         }
     }
 
@@ -201,6 +235,7 @@ impl DefaultStreamlocalForwardHandler {
         Self {
             bindings: Mutex::new(BTreeMap::new()),
             policy: Policy::All,
+            bind_options: None,
         }
     }
 
@@ -212,6 +247,13 @@ impl DefaultStreamlocalForwardHandler {
         F: Fn(&str, &str) -> bool + Send + Sync + 'static,
     {
         self.policy = Policy::Filter(Box::new(filter));
+        self
+    }
+
+    /// Bind each user's sockets as `options` says (OpenSSH's
+    /// `StreamLocalBindMask`, `StreamLocalBindUnlink`).
+    pub fn with_bind_options(mut self, options: BindOptionsFn) -> Self {
+        self.bind_options = Some(options);
         self
     }
 
@@ -252,7 +294,16 @@ impl StreamlocalForwardHandler for DefaultStreamlocalForwardHandler {
             return Err(Error::Protocol("streamlocal-forward: path already bound"));
         }
 
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+        let options = self
+            .bind_options
+            .as_ref()
+            .map(|f| f(user))
+            .unwrap_or_default();
+        if options.unlink {
+            // `StreamLocalBindUnlink yes`: OpenSSH unlinks whatever is there
+            // first (a symlink itself, never its target).
+            let _ = std::fs::remove_file(&path);
+        } else if let Ok(meta) = std::fs::symlink_metadata(&path) {
             // Refuse to bind over a symlink: following it could plant our
             // socket (and redirect connections) into a directory an attacker
             // controls.
@@ -270,7 +321,7 @@ impl StreamlocalForwardHandler for DefaultStreamlocalForwardHandler {
             }
         }
 
-        let (listener, socket_id) = bind_owner_only(&path)?;
+        let (listener, socket_id) = bind_with_mask(&path, options.mask)?;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
@@ -583,6 +634,31 @@ mod tests {
             .is_err()
         );
         assert_eq!(std::fs::read(&sock).expect("read"), b"x");
+    }
+
+    /// `StreamLocalBindMask` / `StreamLocalBindUnlink yes`: the socket's
+    /// mode, and whatever was at the path replaced.
+    #[test]
+    fn bind_options_set_mode_and_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestTempDir::new("bindopts");
+        let sock = dir.path.join("fwd.sock");
+        let sock_str = sock.to_string_lossy().to_string();
+        std::fs::write(&sock, b"x").expect("write");
+        let h = DefaultStreamlocalForwardHandler::permit_all()
+            .with_bind_options(Arc::new(|_| StreamlocalBindOptions::new(0o117, true)));
+        h.bind(
+            "u",
+            &sock_str,
+            StreamlocalForwardContext::for_test_no_opens(),
+        )
+        .expect("bind over the file");
+        let mode = std::fs::symlink_metadata(&sock)
+            .expect("stat")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o660);
+        h.unbind("u", &sock_str).expect("unbind");
     }
 
     #[test]

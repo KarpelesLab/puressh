@@ -122,6 +122,7 @@ enum Policy {
 pub struct DefaultTcpipForwardHandler {
     bindings: Mutex<BTreeMap<(String, u16), Binding>>,
     policy: Policy,
+    socket_hook: Option<super::SocketHook>,
 }
 
 impl Default for DefaultTcpipForwardHandler {
@@ -143,6 +144,7 @@ impl DefaultTcpipForwardHandler {
         Self {
             bindings: Mutex::new(BTreeMap::new()),
             policy: Policy::Deny,
+            socket_hook: None,
         }
     }
 
@@ -167,6 +169,7 @@ impl DefaultTcpipForwardHandler {
         Self {
             bindings: Mutex::new(BTreeMap::new()),
             policy: Policy::LocalhostOnly,
+            socket_hook: None,
         }
     }
 
@@ -177,6 +180,7 @@ impl DefaultTcpipForwardHandler {
         Self {
             bindings: Mutex::new(BTreeMap::new()),
             policy: Policy::AllInterfaces,
+            socket_hook: None,
         }
     }
 
@@ -204,6 +208,12 @@ impl DefaultTcpipForwardHandler {
             Policy::LocalhostOnly | Policy::AllInterfaces => true,
             Policy::Filter(f) => f(user, bind_address, bind_port),
         }
+    }
+
+    /// Run `hook` on each connection a forwarded port accepts.
+    pub fn with_socket_hook(mut self, hook: super::SocketHook) -> Self {
+        self.socket_hook = Some(hook);
+        self
     }
 
     /// Number of bindings currently held. Useful for tests / monitoring.
@@ -410,6 +420,7 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let bind_address_owned = bind_address.to_string();
+        let socket_hook = self.socket_hook.clone();
         let handle = thread::spawn(move || {
             while !stop_thread.load(Ordering::SeqCst) {
                 match listener.accept() {
@@ -421,6 +432,9 @@ impl TcpipForwardHandler for DefaultTcpipForwardHandler {
                         // A failure here leaves a socket we cannot use; drop it.
                         if conn.set_nonblocking(false).is_err() {
                             continue;
+                        }
+                        if let Some(hook) = &socket_hook {
+                            hook(&conn);
                         }
                         // Ask the per-connection server loop to open a
                         // `forwarded-tcpip` channel back to the client.

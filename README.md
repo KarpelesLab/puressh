@@ -119,7 +119,7 @@ cargo add puressh --features server
 | `client`       | yes     | High-level client API                                  |
 | `server`       | no      | High-level server API (incl. the SFTP server); pulls in `nix` on Unix |
 | `compress`     | yes     | `zlib` compression via `compcol`                       |
-| `pam`          | no      | PAM session integration for `sshd` (Linux only); implies `server` |
+| `pam`          | no      | PAM session integration for `sshd` (Linux only, libpam loaded at run time); implies `server` |
 | `multichannel` | yes     | Concurrent multi-channel client (`SharedClient`, `SftpSession`) |
 | `knock`        | yes     | Stealth UDP knock rendezvous in front of SSH (puressh-only, see [`docs/knock.md`](docs/knock.md)) |
 | `agent`        | no      | Agent daemon side (`agent::AgentState`, the `ssh-agent` binary); pulls in `nix` on Unix. The agent client is always available |

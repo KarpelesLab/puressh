@@ -34,14 +34,6 @@ jobs:
         with:
           key: ${{ matrix.os }}
 
-      # `pam-client2` (gated to Linux in Cargo.toml) links against libpam,
-      # so the Ubuntu runner needs the dev headers + shared library before
-      # any `--all-features` build. macOS and Windows don't see the dep at
-      # all (target-conditional) so nothing extra is needed there.
-      - name: Install libpam (Linux only)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
-
       - name: Format
         if: runner.os == 'Linux' # formatting is platform-independent
         run: cargo fmt --all --check
@@ -68,11 +60,9 @@ jobs:
 
       # The interop tests spawn the system `sshd` (client-mode tests) and use
       # `ssh-keygen`; both come from the OpenSSH packages. The runner ships
-      # the client but not always the server. `libpam0g-dev` is needed because
-      # building the test graph links our own `sshd` binary, which pulls in
-      # `pam-client2` (a default feature on Linux).
-      - name: Install OpenSSH server + client and libpam
-        run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client libpam0g-dev
+      # the client but not always the server.
+      - name: Install OpenSSH server + client
+        run: sudo apt-get update && sudo apt-get install -y openssh-server openssh-client
 
       # A non-root sshd still fatals without its privilege-separation
       # directory; a fresh runner that never started the ssh service may not
@@ -172,9 +162,6 @@ jobs:
         with:
           key: deb-${{ matrix.os }}
 
-      - name: Install libpam
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
-
       - name: Build the server and client programs
         run: >
           cargo build --release --features server,pam,agent --bin sshd --bin ssh-keygen --bin ssh --bin scp
@@ -213,7 +200,7 @@ jobs:
         run: >
           apt-get update &&
           DEBIAN_FRONTEND=noninteractive apt-get install -y
-          curl ca-certificates build-essential git libpam0g-dev
+          curl ca-certificates build-essential git
 
       - uses: actions/checkout@v6
 
@@ -255,8 +242,7 @@ jobs:
       # (default KEX in OpenSSH 9.9+), so client re-keys there always fall back
       # to curve25519. Build a current OpenSSH into a throwaway prefix so the
       # re-key suite actually exercises the post-quantum KEX real deployments
-      # negotiate. `--with-pam` keeps `UsePAM` a recognized keyword; libpam is
-      # also needed to link our own test-graph `sshd`.
+      # negotiate. `--with-pam` keeps `UsePAM` a recognized keyword.
       #
       # Keep this at a *recent* OpenSSH, not merely an ML-KEM-capable one. 10.4
       # enforces RFC 4253 §7.1 strictly, aborting the connection on any
@@ -315,10 +301,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: msrv
-
-      # `--all-features` pulls in `pam` (Linux), which links libpam.
-      - name: Install libpam
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
 
       - name: Check (all features, all targets) on MSRV
         run: cargo check --all-targets --all-features
@@ -393,9 +375,6 @@ jobs:
 
       - name: Cache
         uses: Swatinem/rust-cache@v2
-
-      - name: Install libpam (for --all-features doc build)
-        run: sudo apt-get update && sudo apt-get install -y libpam0g-dev
 
       - name: cargo doc --no-deps --all-features
         run: cargo doc --no-deps --all-features

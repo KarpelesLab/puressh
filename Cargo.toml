@@ -70,7 +70,7 @@ mio = ["client"]
 # PAM session integration for the `sshd` binary; implies `server`. Opt-in:
 # without it there is no libpam runtime dep. The dep itself is also gated to
 # Linux, so other builds stay clean.
-pam = ["server", "dep:pam-client2"]
+pam = ["server", "dep:dlsym"]
 
 [dependencies]
 # 0.7 made `ec` stop implying `alloc`, so the boxed multi-curve path, `CurveId`
@@ -151,17 +151,12 @@ nix = { version = "0.31", default-features = false, optional = true, features = 
 # library itself stays `forbid(unsafe_code)` and never calls into it.
 libc = { version = "0.2", default-features = false }
 
-# `pam-client2` is gated to **Linux only**, not all of `cfg(unix)`.
-# Upstream `pam-client2 0.5.5` references Linux-PAM constants
-# (`PAM_CONV_AGAIN`, `PAM_INCOMPLETE`) that OpenPAM (macOS / *BSD) does not
-# expose, so the crate fails to compile there. Confining the dep to Linux
-# keeps `cargo build --all-features` green on macOS, at the cost of PAM
-# session integration being a Linux-only feature for now.
-#
-# `default-features = false` drops the `cli` feature (which would pull in
-# `rpassword`) — the sshd binary is a non-interactive PAM consumer.
+# `dlsym` loads libpam at run time for the sshd PAM integration, so there
+# is no link-time libpam dep (nor -dev package to build). Linux only: the
+# binding uses Linux-PAM's constants, which OpenPAM (macOS / *BSD) numbers
+# differently.
 [target.'cfg(target_os = "linux")'.dependencies]
-pam-client2 = { version = "0.5", default-features = false, optional = true }
+dlsym = { version = "0.0.2", optional = true }
 
 [dev-dependencies]
 hex = "0.4"

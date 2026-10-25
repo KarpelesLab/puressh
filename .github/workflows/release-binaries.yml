@@ -126,7 +126,7 @@ jobs:
         run: >
           apt-get update &&
           DEBIAN_FRONTEND=noninteractive apt-get install -y
-          curl ca-certificates build-essential git libpam0g-dev
+          curl ca-certificates build-essential git
 
       - uses: actions/checkout@v6
 

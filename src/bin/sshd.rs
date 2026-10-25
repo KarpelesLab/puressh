@@ -54,13 +54,13 @@
 //! status is reaped via `waitpid(WNOHANG)` and forwarded to the client
 //! as `exit-status` / `exit-signal`.
 //!
-//! When the `pam` feature is on (default), every successful SSH
+//! When the `pam` feature is on, every successful SSH
 //! authentication is followed by `pam_acct_mgmt` + `pam_open_session`
 //! against service `sshd` — `pam_env` contributions land in the user's
 //! shell environment and `pam_close_session` runs at connection
-//! teardown. Building with `--no-default-features` (or any combination
-//! that omits `pam`) drops the libpam runtime dep entirely; the binary
-//! still works but offers no session management.
+//! teardown. libpam is loaded at run time, so it is not a link-time
+//! dependency; a build without `pam` never touches it, and still works
+//! but offers no session management.
 //!
 //! Windows builds compile but `main` prints "not supported" — every line
 //! of the implementation lives behind `#[cfg(unix)]`.
@@ -87,6 +87,10 @@ mod tundev;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 #[path = "sshd_login.rs"]
 mod sshd_login;
+
+#[cfg(all(feature = "pam", target_os = "linux"))]
+#[path = "sshd_pam.rs"]
+mod sshd_pam;
 
 #[cfg(unix)]
 mod imp {
@@ -143,7 +147,7 @@ mod imp {
     // PAM session gate.
     //
     // The `pam` feature compiles the real implementation against
-    // `pam-client2`; without the feature, a no-op stub provides the same
+    // libpam (`sshd_pam`, loaded at run time); without the feature, a no-op stub provides the same
     // surface so the rest of the binary doesn't need feature-gates. Either
     // way `ensure(user, tty)` is the only entry point handlers use.
     //
@@ -155,20 +159,17 @@ mod imp {
     // daemon's parent process never opens any PAM session itself.
     // -------------------------------------------------------------------------
     // The real PAM gate compiles only when both the `pam` feature is enabled
-    // AND we're targeting Linux — `pam-client2` itself is dep-gated to Linux
-    // because it references Linux-PAM constants that OpenPAM (macOS / *BSD)
-    // doesn't expose. Every other configuration (Linux without `pam`, macOS
+    // AND we're targeting Linux — `sshd_pam` uses Linux-PAM's constants,
+    // which OpenPAM (macOS / *BSD) numbers differently. Every other configuration (Linux without `pam`, macOS
     // with `--all-features`, etc.) falls through to the stub below.
     #[cfg(all(feature = "pam", target_os = "linux"))]
     mod pam_gate {
         use std::ffi::{CStr, CString};
-        use std::os::unix::ffi::OsStrExt;
         use std::sync::mpsc::{Receiver, Sender, channel};
         use std::sync::{Arc, Mutex};
         use std::thread::JoinHandle;
 
-        use pam_client2::conv_null::Conversation;
-        use pam_client2::{Context, ConversationHandler, ErrorCode, Flag, SessionToken};
+        use crate::sshd_pam::{Context, ConversationHandler, NullConversation};
         use purecrypto::zeroize::Zeroizing;
 
         /// One step of a live keyboard-interactive PAM conversation, returned
@@ -232,16 +233,16 @@ mod imp {
         struct BridgeConv {
             to_main: Sender<FromWorker>,
             from_main: Receiver<ToWorker>,
-            /// `text_info` / `error_msg` text accumulated since the last
+            /// `PAM_TEXT_INFO` / `PAM_ERROR_MSG` text accumulated since the last
             /// prompt, attached to the next prompt's instruction.
             pending_info: String,
         }
 
-        impl BridgeConv {
+        impl ConversationHandler for BridgeConv {
             /// Block until the authenticator supplies the answer to `prompt`.
             /// A closed channel (authenticator dropped the conversation) maps
             /// to a PAM conversation error so `authenticate()` aborts cleanly.
-            fn ask(&mut self, prompt: &CStr, echo: bool) -> Result<CString, ErrorCode> {
+            fn prompt(&mut self, prompt: &CStr, echo: bool) -> Option<Zeroizing<Vec<u8>>> {
                 let instruction = core::mem::take(&mut self.pending_info);
                 let prompt = String::from_utf8_lossy(prompt.to_bytes()).into_owned();
                 self.to_main
@@ -250,32 +251,18 @@ mod imp {
                         prompt,
                         echo,
                     })
-                    .map_err(|_| ErrorCode::CONV_ERR)?;
-                let answer = self.from_main.recv().map_err(|_| ErrorCode::CONV_ERR)?;
-                // The answer may not contain an interior NUL.
-                CString::new(answer.to_vec()).map_err(|_| ErrorCode::CONV_ERR)
+                    .ok()?;
+                self.from_main.recv().ok()
             }
-        }
-
-        impl ConversationHandler for BridgeConv {
-            fn prompt_echo_on(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
-                self.ask(prompt, true)
-            }
-            fn prompt_echo_off(&mut self, prompt: &CStr) -> Result<CString, ErrorCode> {
-                self.ask(prompt, false)
-            }
-            fn text_info(&mut self, msg: &CStr) {
+            /// Errors (e.g. "Account locked") are surfaced as instruction
+            /// text too; they precede the next prompt or are dropped if the
+            /// conversation ends.
+            fn info(&mut self, msg: &CStr, _error: bool) {
                 let s = String::from_utf8_lossy(msg.to_bytes());
                 if !self.pending_info.is_empty() {
                     self.pending_info.push('\n');
                 }
                 self.pending_info.push_str(&s);
-            }
-            fn error_msg(&mut self, msg: &CStr) {
-                // Surface errors as instruction text too (e.g. "Account
-                // locked"); they precede the next prompt or are dropped if the
-                // conversation ends.
-                self.text_info(msg);
             }
         }
 
@@ -350,39 +337,21 @@ mod imp {
         }
 
         impl ConversationHandler for PasswordConv {
-            fn prompt_echo_on(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
-                // Username/echo-on prompts: nothing to supply (the context
-                // already carries the target user). Empty answer.
-                CString::new(Vec::new()).map_err(|_| ErrorCode::CONV_ERR)
-            }
-            fn prompt_echo_off(&mut self, _prompt: &CStr) -> Result<CString, ErrorCode> {
-                // The password may not contain an interior NUL.
-                CString::new(self.password.to_vec()).map_err(|_| ErrorCode::CONV_ERR)
-            }
-            fn text_info(&mut self, _msg: &CStr) {}
-            fn error_msg(&mut self, _msg: &CStr) {}
-        }
-
-        /// Holds the live PAM `Context` and the leaked session handle.
-        /// Drop order matters: the leaked `Session` must be re-acquired
-        /// (via `unleak_session`) so its own `Drop` calls
-        /// `pam_close_session`, *then* the boxed context drops and calls
-        /// `pam_end`.
-        struct PamHolder {
-            context: Box<Context<Conversation>>,
-            token: Option<SessionToken>,
-        }
-
-        impl Drop for PamHolder {
-            fn drop(&mut self) {
-                if let Some(token) = self.token.take() {
-                    // Re-attach the session to its context; the returned
-                    // `Session` drops in place, closing the PAM session.
-                    let _session = self.context.unleak_session(token);
+            fn prompt(&mut self, _prompt: &CStr, echo: bool) -> Option<Zeroizing<Vec<u8>>> {
+                if echo {
+                    // Username/echo-on prompts: nothing to supply (the
+                    // context already carries the target user). Empty answer.
+                    Some(Zeroizing::new(Vec::new()))
+                } else {
+                    Some(self.password.clone())
                 }
-                // Box<Context<…>> drops next: pam_end.
             }
+            fn info(&mut self, _msg: &CStr, _error: bool) {}
         }
+
+        /// The live PAM session's context: dropping it closes the session
+        /// (`pam_close_session`, credentials deleted) and runs `pam_end`.
+        type PamHolder = Context<NullConversation>;
 
         pub struct PamGate {
             service: &'static str,
@@ -439,41 +408,20 @@ mod imp {
                     return Ok(self.envs.lock().unwrap().clone());
                 }
 
-                let mut ctx = Box::new(
-                    Context::new(self.service, Some(user), Conversation::new())
-                        .map_err(|e| pam_err("pam_start", e))?,
-                );
+                let mut ctx = Context::new(self.service, user, NullConversation)
+                    .map_err(|e| pam_err("pam_start", e))?;
                 if let Some(rhost) = self.peer.lock().unwrap().clone() {
-                    ctx.set_rhost(Some(&rhost))
-                        .map_err(|e| pam_err("set_rhost", e))?;
+                    ctx.set_rhost(&rhost).map_err(|e| pam_err("set_rhost", e))?;
                 }
-                ctx.set_tty(Some(tty)).map_err(|e| pam_err("set_tty", e))?;
-                ctx.acct_mgmt(Flag::NONE)
-                    .map_err(|e| pam_err("acct_mgmt", e))?;
+                ctx.set_tty(tty).map_err(|e| pam_err("set_tty", e))?;
+                ctx.acct_mgmt().map_err(|e| pam_err("acct_mgmt", e))?;
+                ctx.open_session().map_err(|e| pam_err("open_session", e))?;
 
-                let session = ctx
-                    .open_session(Flag::NONE)
-                    .map_err(|e| pam_err("open_session", e))?;
-
-                // Snapshot the PAM env. `iter_tuples` yields
-                // `(&OsStr, &OsStr)`; we keep `CString`s because the
-                // post-fork shell needs `*const c_char` for `setenv`.
-                let envs: Vec<(CString, CString)> = session
-                    .envlist()
-                    .iter_tuples()
-                    .filter_map(|(k, v)| {
-                        let k = CString::new(k.as_bytes()).ok()?;
-                        let v = CString::new(v.as_bytes()).ok()?;
-                        Some((k, v))
-                    })
-                    .collect();
-
-                let token = session.leak();
+                // Snapshot the PAM env as `CString`s: the post-fork shell
+                // needs `*const c_char` for `setenv`.
+                let envs = ctx.envlist();
                 *self.envs.lock().unwrap() = envs.clone();
-                *guard = Some(PamHolder {
-                    context: ctx,
-                    token: Some(token),
-                });
+                *guard = Some(ctx);
                 if self.debug {
                     eprintln!(
                         "sshd: PAM session opened (user={user}, tty={tty}, envs={})",
@@ -511,16 +459,13 @@ mod imp {
                 rhost: Option<&str>,
             ) -> puressh::Result<()> {
                 let conv = PasswordConv { password };
-                let mut ctx = Context::new(self.service, Some(user), conv)
-                    .map_err(|e| pam_err("pam_start", e))?;
+                let mut ctx =
+                    Context::new(self.service, user, conv).map_err(|e| pam_err("pam_start", e))?;
                 if let Some(rhost) = rhost {
-                    ctx.set_rhost(Some(rhost))
-                        .map_err(|e| pam_err("set_rhost", e))?;
+                    ctx.set_rhost(rhost).map_err(|e| pam_err("set_rhost", e))?;
                 }
-                ctx.authenticate(Flag::NONE)
-                    .map_err(|e| pam_err("authenticate", e))?;
-                ctx.acct_mgmt(Flag::NONE)
-                    .map_err(|e| pam_err("acct_mgmt", e))?;
+                ctx.authenticate().map_err(|e| pam_err("authenticate", e))?;
+                ctx.acct_mgmt().map_err(|e| pam_err("acct_mgmt", e))?;
                 // `ctx` (and the embedded `PasswordConv`, whose buffer is
                 // `Zeroizing`) drops here — pam_end runs, no session opened.
                 Ok(())
@@ -579,7 +524,7 @@ mod imp {
                     };
                     // Build the context on THIS thread; the PAM handle never
                     // leaves it.
-                    let mut ctx = match Context::new(service, Some(&user), conv) {
+                    let mut ctx = match Context::new(service, &user, conv) {
                         Ok(c) => c,
                         Err(_) => {
                             let _ = to_main.send(FromWorker::Done(false));
@@ -587,15 +532,14 @@ mod imp {
                         }
                     };
                     if let Some(rhost) = rhost.as_deref()
-                        && ctx.set_rhost(Some(rhost)).is_err()
+                        && ctx.set_rhost(rhost).is_err()
                     {
                         let _ = to_main.send(FromWorker::Done(false));
                         return;
                     }
                     // authenticate() drives the conversation: each prompt
                     // blocks in BridgeConv::ask until the authenticator answers.
-                    let ok =
-                        ctx.authenticate(Flag::NONE).is_ok() && ctx.acct_mgmt(Flag::NONE).is_ok();
+                    let ok = ctx.authenticate().is_ok() && ctx.acct_mgmt().is_ok();
                     let _ = to_main.send(FromWorker::Done(ok));
                     // `ctx` drops here on the worker thread → pam_end.
                 });
@@ -666,7 +610,7 @@ mod imp {
         use std::sync::Arc;
 
         /// Stub gate used when the `pam` feature is off, or when the
-        /// target isn't Linux (the `pam-client2` dep is Linux-only — see
+        /// target isn't Linux (`sshd_pam` is Linux-PAM only — see
         /// the cfg gate on the real `pam_gate` module above). All
         /// operations are no-ops so the rest of the binary can ignore
         /// the feature state.

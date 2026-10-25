@@ -267,12 +267,12 @@ fn option_with_arg(c: &mut Cli, f: char, v: String) -> Result<(), Exit> {
             c.xfer.limit = Some(kbps as u64 * 1024 / 8);
         }
         'P' => {
-            c.port = Some(
-                v.parse::<u16>()
-                    .ok()
-                    .filter(|p| *p > 0)
-                    .ok_or_else(|| Exit::Fatal(format!("Bad port \"{v}\"\n")))?,
-            )
+            // OpenSSH's a2port: a number or a TCP service name.
+            let port = strtonum(&v, 0, 65535)
+                .ok()
+                .or_else(|| service_port(&v))
+                .filter(|p| *p > 0);
+            c.port = Some(port.ok_or_else(|| Exit::Fatal(format!("Bad port \"{v}\"\n")))? as u16)
         }
         'R' => {
             c.xfer.depth = strtoll(&v, 10)
@@ -337,6 +337,28 @@ fn strtoll(s: &str, base: u32) -> Option<i64> {
         v = v.checked_mul(i64::from(base))?.checked_add(d)?;
     }
     Some(if neg { -v } else { v })
+}
+
+/// The port of a TCP service (`getservbyname`), for `-P ssh`.
+fn service_port(name: &str) -> Option<i64> {
+    #[cfg(unix)]
+    {
+        let name = std::ffi::CString::new(name).ok()?;
+        // SAFETY: NUL-terminated strings; the result is NULL or a pointer to
+        // a static record, read at once.
+        unsafe {
+            let se = libc::getservbyname(name.as_ptr(), c"tcp".as_ptr());
+            if se.is_null() {
+                return None;
+            }
+            Some(i64::from(u16::from_be((*se).s_port as u16)))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        None
+    }
 }
 
 /// OpenBSD `strtonum`, with its error strings.
@@ -3153,6 +3175,13 @@ mod tests {
         let c = parse_args(&argv(&["-qN", "h", "-v"])).ok().unwrap();
         assert!(!c.quiet && c.log_quiet);
         assert_eq!(c.local.as_deref(), Some("-v"));
+        assert_eq!(fatal(&["-P", "0", "h"]), "Bad port \"0\"\n");
+        assert_eq!(
+            fatal(&["-P", "no-such-service", "h"]),
+            "Bad port \"no-such-service\"\n"
+        );
+        let c = parse_args(&argv(&["-P", "2222", "h"])).ok().unwrap();
+        assert_eq!(c.port, Some(2222));
     }
 
     #[test]

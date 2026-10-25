@@ -175,7 +175,14 @@ fn authorized_keys_and_principals_commands() {
         .arg("-D")
         .arg("-f")
         .arg(p("sshd_config"))
-        .args(["-b", "127.0.0.1", "-p", &port.to_string(), "-u", &user])
+        .args([
+            "-o",
+            "ListenAddress=127.0.0.1",
+            "-p",
+            &port.to_string(),
+            "-u",
+            &user,
+        ])
         .arg("-h")
         .arg(p("host"))
         .arg("--no-strict-modes")

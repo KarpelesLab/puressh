@@ -132,10 +132,10 @@ mod imp {
 
     const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-    const USAGE: &str = "usage: sshd [-46DdeqTt] [-C connection_spec] [-f configfile] [-p port]... \
-                         [-b address]... \
-                         [-h host_key_file]... [-c host_cert_file]... [-o option]... \
-                         [-E log_file] [-g login_grace_time] [-A authorized_keys_file] \
+    const USAGE: &str = "usage: sshd [-46DdeGiqTtV] [-C connection_spec] [-c host_cert_file] \
+                         [-E log_file] [-f config_file] [-g login_grace_time] \
+                         [-h host_key_file] [-o option] [-p port] [-u len] \
+                         [-A authorized_keys_file] \
                          [-u allowed_user]... [--no-sftp] [--sftp-read-only] \
                          [--sftp-root PATH] [--no-scp] [--no-agent-forward] \
                          [--x11-forward] [--no-strict-modes] [--debug-commands] \
@@ -704,8 +704,12 @@ mod imp {
         config_options: Vec<String>,
         /// `-p port`, repeatable. Empty ⇒ `Port` lines, else 22.
         ports: Vec<u16>,
-        /// `-T`: print the effective configuration and exit.
+        /// `-T`: check the host keys like `-t`, then print the effective
+        /// configuration and exit.
         dump_config: bool,
+        /// `-G`: print the effective configuration and exit, without
+        /// loading host keys.
+        dump_config_only: bool,
         /// `-C spec` (repeatable): connection parameters (`user=`, `addr=`,
         /// …) whose `Match` blocks `-T` applies.
         connection_spec: Vec<String>,
@@ -725,18 +729,21 @@ mod imp {
         log_stderr: bool,
         /// `-q`: log nothing.
         quiet: bool,
-        /// `-b ADDR`: bind to ADDR (host or `host:port`). Repeats are
-        /// recognised; v1 uses only the first one and warns about extras
-        /// until multi-address bind lands. Config `ListenAddress` lines
-        /// fold into the same list.
-        listen_addresses: Vec<String>,
         host_key_files: Vec<String>,
         host_certificate_files: Vec<String>,
         /// `-A FILE`: one global authorized_keys file for the single allowed
         /// user (see the module docs). `None` ⇒ per-user `AuthorizedKeysFile`.
         authorized_keys_file: Option<String>,
         allowed_users: Vec<String>,
+        /// `-u len`: the longest host name recorded in utmp; a longer one
+        /// (and any, with `-u0`) is recorded as the address.
+        #[allow(dead_code)] // wired up with UseDNS
+        utmp_len: usize,
+        /// `-d` given (any number of times).
         debug: bool,
+        /// `-d` / `-dd` / `-ddd`: the log level they set (DEBUG1..DEBUG3);
+        /// with `-q`, whichever came last wins.
+        debug_level: Option<sshd_log::Level>,
         /// SFTP subsystem on by default; `--no-sftp` disables it.
         sftp: Option<bool>,
         /// Refuse any operation that would mutate the filesystem.
@@ -797,15 +804,17 @@ mod imp {
     /// user explicitly opts in via `-f`. Relative includes resolve against the
     /// directory of the file being parsed (and, for the system entry point at
     /// `/etc/ssh/...`, that is `/etc/ssh`).
-    /// Resolve `-b` / `ListenAddress` specs into the addresses to listen on,
-    /// with OpenSSH's syntax: `host`, `host:port`, `[v6]`, `[v6]:port`, or a
-    /// bare IPv6 literal. A spec without a port listens on every port in
-    /// `ports`. No spec ⇒ the wildcard address of each allowed family.
+    /// Resolve `ListenAddress` specs into the addresses to listen on, with
+    /// OpenSSH's syntax: `host`, `host:port`, `[v6]`, `[v6]:port`, or a bare
+    /// IPv6 literal, optionally followed by `rdomain NAME` (the routing
+    /// domain, returned with each address). A spec without a port listens on
+    /// every port in `ports`. No spec ⇒ the wildcard address of each allowed
+    /// family.
     fn listen_addrs(
         specs: &[String],
         ports: &[u16],
         af: Option<puressh::config::ServerAddressFamily>,
-    ) -> Result<Vec<std::net::SocketAddr>, String> {
+    ) -> Result<Vec<(std::net::SocketAddr, Option<String>)>, String> {
         use puressh::config::ServerAddressFamily as Af;
         use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
         let family_ok = |a: &SocketAddr| match af {
@@ -813,26 +822,27 @@ mod imp {
             Some(Af::Inet6) => a.is_ipv6(),
             _ => true,
         };
-        let mut out: Vec<SocketAddr> = Vec::new();
-        let mut push = |a: SocketAddr| {
-            if family_ok(&a) && !out.contains(&a) {
-                out.push(a);
+        let mut out: Vec<(SocketAddr, Option<String>)> = Vec::new();
+        let mut push = |a: SocketAddr, rdomain: Option<&str>| {
+            let entry = (a, rdomain.map(str::to_string));
+            if family_ok(&a) && !out.contains(&entry) {
+                out.push(entry);
             }
         };
         if specs.is_empty() {
             for &p in ports {
-                push(SocketAddr::from((Ipv6Addr::UNSPECIFIED, p)));
-                push(SocketAddr::from((Ipv4Addr::UNSPECIFIED, p)));
+                push(SocketAddr::from((Ipv6Addr::UNSPECIFIED, p)), None);
+                push(SocketAddr::from((Ipv4Addr::UNSPECIFIED, p)), None);
             }
         }
         for spec in specs {
             let mut words = spec.split_whitespace();
             let addr = words.next().unwrap_or("");
-            if let Some(extra) = words.next() {
-                return Err(format!(
-                    "ListenAddress {spec:?}: {extra} (routing domains) is not supported"
-                ));
-            }
+            let rdomain = match (words.next(), words.next(), words.next()) {
+                (None, ..) => None,
+                (Some("rdomain"), Some(name), None) => Some(name),
+                _ => return Err(format!("ListenAddress {spec:?}: bad ListenAddress syntax")),
+            };
             let bad_port = || format!("ListenAddress {spec:?}: bad port");
             // (host, explicit port)
             let (host, port): (&str, Option<u16>) = if let Some(rest) = addr.strip_prefix('[') {
@@ -860,7 +870,7 @@ mod imp {
                     .to_socket_addrs()
                     .map_err(|e| format!("ListenAddress {spec:?}: {e}"))?;
                 for a in resolved {
-                    push(a);
+                    push(a, rdomain);
                 }
             }
         }
@@ -872,8 +882,13 @@ mod imp {
 
     /// Bind a listening TCP socket. IPv6 sockets are `IPV6_V6ONLY` (as in
     /// OpenSSH) so `[::]` and `0.0.0.0` coexist and IPv4 peers keep their
-    /// IPv4 addresses for `AllowUsers` / `Match Address`.
-    fn bind_listener(addr: std::net::SocketAddr) -> std::io::Result<std::net::TcpListener> {
+    /// IPv4 addresses for `AllowUsers` / `Match Address`. `rdomain` (from
+    /// `ListenAddress … rdomain NAME`) binds it to that VRF device, as
+    /// OpenSSH portable does on Linux (`SO_BINDTODEVICE`).
+    fn bind_listener(
+        addr: std::net::SocketAddr,
+        rdomain: Option<&str>,
+    ) -> std::io::Result<std::net::TcpListener> {
         use nix::sys::socket::{
             AddressFamily, Backlog, SockFlag, SockType, SockaddrIn, SockaddrIn6, bind, listen,
             setsockopt, socket, sockopt,
@@ -886,6 +901,9 @@ mod imp {
         let fd = socket(family, SockType::Stream, SockFlag::empty(), None)?;
         fcntl(&fd, FcntlArg::F_SETFD(FdFlag::FD_CLOEXEC))?;
         setsockopt(&fd, sockopt::ReuseAddr, &true)?;
+        if let Some(name) = rdomain {
+            set_rdomain(&fd, name)?;
+        }
         match addr {
             std::net::SocketAddr::V6(v6) => {
                 setsockopt(&fd, sockopt::Ipv6V6Only, &true)?;
@@ -897,8 +915,70 @@ mod imp {
         Ok(std::net::TcpListener::from(fd))
     }
 
+    /// Bind a socket to routing domain `name`: a VRF (or any) device on
+    /// Linux, as OpenSSH portable's `sys_set_rdomain`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn set_rdomain(fd: &OwnedFd, name: &str) -> std::io::Result<()> {
+        nix::sys::socket::setsockopt(
+            fd,
+            nix::sys::socket::sockopt::BindToDevice,
+            &std::ffi::OsString::from(name),
+        )
+        .map_err(|e| std::io::Error::other(format!("setsockopt SO_BINDTODEVICE {name}: {e}")))
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    fn set_rdomain(_fd: &OwnedFd, _name: &str) -> std::io::Result<()> {
+        Err(std::io::Error::other(
+            "routing domains are not supported on this platform",
+        ))
+    }
+
+    /// The routing domain a connection arrived in (`Match RDomain`, `%D`):
+    /// the device its socket is bound to, as OpenSSH portable's
+    /// `sys_get_rdomain`. `None` when it is not bound to one.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[allow(dead_code)] // wired up with Match RDomain
+    fn get_rdomain(fd: &impl AsFd) -> Option<String> {
+        let name =
+            nix::sys::socket::getsockopt(fd, nix::sys::socket::sockopt::BindToDevice).ok()?;
+        let name = name.to_string_lossy().trim_end_matches('\0').to_string();
+        (!name.is_empty()).then_some(name)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    #[allow(dead_code)] // wired up with Match RDomain
+    fn get_rdomain(_fd: &impl AsFd) -> Option<String> {
+        None
+    }
+
+    /// Whether `name` can be used as a routing domain: binding a scratch
+    /// socket to it works (OpenSSH portable's `sys_valid_rdomain`).
+    fn valid_rdomain(name: &str) -> bool {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, socket};
+        socket(
+            AddressFamily::Inet,
+            SockType::Stream,
+            SockFlag::empty(),
+            None,
+        )
+        .is_ok_and(|fd| set_rdomain(&fd, name).is_ok())
+    }
+
     /// The `sshd_config` read when `-f` is not given (OpenSSH's default).
     const DEFAULT_CONFIG: &str = "/etc/ssh/sshd_config";
+
+    /// `ModuliFile`'s default: where Debian / Ubuntu ship `moduli(5)`.
+    const DEFAULT_MODULI_FILE: &str = "/etc/ssh/moduli";
+
+    /// `-u`'s default and largest value: `HOST_NAME_MAX + 1`.
+    const UTMP_HOST_MAX: usize = 65;
+
+    /// `AgentSocketPath`'s default (OpenSSH 10's).
+    const DEFAULT_AGENT_SOCKET_PATH: &str = "user:.ssh/agent";
+
+    /// `IPQoS`'s default: `ef` for interactive sessions, `cs0` otherwise.
+    const DEFAULT_IP_QOS: (Option<u8>, Option<u8>) = (Some(0xb8), Some(0x00));
 
     /// Host keys tried when neither `-h` nor `HostKey` names any (OpenSSH's
     /// defaults); missing files are skipped.
@@ -936,10 +1016,21 @@ mod imp {
                     .map_err(|e| format!("{}: {e}", path.display()))?,
             );
         }
-        puressh::config::SshServerConfig::from_lines(lines).map_err(|e| match &path {
+        let where_ = |e: &dyn std::fmt::Display| match &path {
             Some(p) => format!("{}: {e}", p.display()),
             None => e.to_string(),
-        })
+        };
+        let cfg = puressh::config::SshServerConfig::from_lines(lines).map_err(|e| where_(&e))?;
+        // `ListenAddress … rdomain NAME`: refused unless NAME is usable, as
+        // OpenSSH checks it while parsing.
+        for spec in &cfg.global.listen_addresses {
+            if let Some((_, name)) = spec.split_once(" rdomain ")
+                && !valid_rdomain(name)
+            {
+                return Err(where_(&format!("ListenAddress {spec}: bad routing domain")));
+            }
+        }
+        Ok(cfg)
     }
 
     /// Fill unset global options with OpenSSH's defaults where this daemon's
@@ -982,9 +1073,6 @@ mod imp {
         }
     }
 
-    /// `-T [-C spec]`: print the effective configuration like OpenSSH's
-    /// `sshd -T`: lowercase keywords, every setting with its default, and
-    /// the `Match` blocks selected by `-C` applied.
     /// Opens the tun / tap devices clients forward (`ssh -w`).
     struct TunDevices;
 
@@ -1015,39 +1103,65 @@ mod imp {
         }
     }
 
-    fn dump_config(cli: &Cli, cfg: &puressh::config::SshServerConfig) -> Result<i32, String> {
-        use puressh::config::{
-            Compression, ExecPolicy, MatchContext, PermitRootLogin, ServerAddressFamily as Af,
-            ServerGatewayPorts as GatewayPorts, TcpForwarding,
-        };
+    /// `-C user=…,addr=…` (any order, repeatable): the connection `-T`
+    /// resolves `Match` blocks for.
+    #[derive(Default)]
+    struct ConnectionSpec {
+        user: Option<String>,
+        host: Option<String>,
+        addr: Option<String>,
+        laddr: Option<String>,
+        lport: Option<u16>,
+        rdomain: Option<String>,
+        invalid_user: bool,
+    }
 
-        // `-C user=…,addr=…` (any order, repeatable).
-        let (mut user, mut host, mut addr, mut laddr, mut lport) = (None, None, None, None, None);
-        let mut invalid_user = false;
-        let mut rdomain = None;
-        for spec in &cli.connection_spec {
+    fn parse_connection_spec(specs: &[String]) -> Result<ConnectionSpec, String> {
+        let mut c = ConnectionSpec::default();
+        for spec in specs {
             for kv in spec.split(',').filter(|kv| !kv.is_empty()) {
                 if kv == "invalid-user" {
-                    invalid_user = true;
+                    c.invalid_user = true;
                     continue;
                 }
                 let (k, v) = kv
                     .split_once('=')
                     .ok_or_else(|| format!("Invalid test mode specification {kv}"))?;
                 match k.to_ascii_lowercase().as_str() {
-                    "user" => user = Some(v.to_string()),
-                    "host" => host = Some(v.to_string()),
-                    "addr" => addr = Some(v.to_string()),
-                    "laddr" => laddr = Some(v.to_string()),
+                    "user" => c.user = Some(v.to_string()),
+                    "host" => c.host = Some(v.to_string()),
+                    "addr" => c.addr = Some(v.to_string()),
+                    "laddr" => c.laddr = Some(v.to_string()),
                     "lport" => {
-                        lport = Some(v.parse::<u16>().map_err(|_| format!("Invalid port {v}"))?)
+                        c.lport = Some(v.parse::<u16>().map_err(|_| format!("Invalid port {v}"))?)
                     }
-                    "rdomain" => rdomain = Some(v.to_string()),
+                    "rdomain" => c.rdomain = Some(v.to_string()),
                     _ => return Err(format!("Invalid test mode specification {kv}")),
                 }
             }
         }
-        let opts = if cli.connection_spec.is_empty() {
+        Ok(c)
+    }
+
+    /// `-G` / `-T [-C spec]`: print the effective configuration as OpenSSH
+    /// 10.6's sshd does: its keyword spellings and order, every setting with
+    /// its default, and the `Match` blocks selected by `-C` applied.
+    fn dump_config(cli: &Cli, cfg: &puressh::config::SshServerConfig) -> Result<i32, String> {
+        use puressh::config::{
+            Compression, ExecPolicy, MatchContext, PermitRootLogin, ServerAddressFamily as Af,
+            ServerGatewayPorts as GatewayPorts, TcpForwarding,
+        };
+
+        let ConnectionSpec {
+            user,
+            host,
+            addr,
+            laddr,
+            lport,
+            rdomain,
+            invalid_user,
+        } = parse_connection_spec(&cli.connection_spec)?;
+        let mut opts = if cli.connection_spec.is_empty() {
             cfg.global.clone()
         } else {
             let groups = user.as_deref().map(lookup_user_groups);
@@ -1062,7 +1176,15 @@ mod imp {
             ctx.local_port = lport;
             cfg.resolve(&ctx, ExecPolicy::Deny)
         };
+        // `-d` / `-q` set LogLevel before the file is read.
+        if let Some(level) = cli.debug_level {
+            opts.log_level = Some(level as u8);
+        }
+        if cli.quiet {
+            opts.log_level = Some(0);
+        }
 
+        // OpenSSH 10.6's dump_config(): its keyword spellings and order.
         let mut out = String::new();
         let mut line = |k: &str, v: &str| {
             out.push_str(k);
@@ -1088,7 +1210,13 @@ mod imp {
                 .join(","),
         };
         let none_or = |v: &Option<String>| v.clone().unwrap_or_else(|| "none".into());
+        // Paths are shown absolute, as OpenSSH derelativises them.
+        let abs = |p: &str| match std::path::absolute(p) {
+            Ok(a) if p != "none" => a.display().to_string(),
+            _ => p.to_string(),
+        };
 
+        // These are usually at the top of the config.
         let ports: Vec<u16> = if !cli.ports.is_empty() {
             cli.ports.clone()
         } else if !opts.ports.is_empty() {
@@ -1097,21 +1225,324 @@ mod imp {
             vec![22]
         };
         for p in &ports {
-            line("port", &p.to_string());
+            line("Port", &p.to_string());
         }
         let af = cli.address_family.or(opts.address_family);
         line(
-            "addressfamily",
+            "AddressFamily",
             match af {
                 Some(Af::Inet) => "inet",
                 Some(Af::Inet6) => "inet6",
                 _ => "any",
             },
         );
-        let mut specs = cli.listen_addresses.clone();
-        specs.extend(opts.listen_addresses.iter().cloned());
-        for a in listen_addrs(&specs, &ports, af)? {
-            line("listenaddress", &a.to_string());
+        // Grouped by routing domain, in order of appearance.
+        let listen = listen_addrs(&opts.listen_addresses, &ports, af)?;
+        let mut domains: Vec<Option<&str>> = Vec::new();
+        for (_, rd) in &listen {
+            if !domains.contains(&rd.as_deref()) {
+                domains.push(rd.as_deref());
+            }
+        }
+        for d in domains {
+            for (a, rd) in listen.iter().filter(|(_, rd)| rd.as_deref() == d) {
+                match rd {
+                    Some(rd) => line("ListenAddress", &format!("{a} rdomain {rd}")),
+                    None => line("ListenAddress", &a.to_string()),
+                }
+            }
+        }
+
+        // Integer arguments.
+        line(
+            "UsePAM",
+            yn(opts
+                .use_pam
+                .unwrap_or(cfg!(all(feature = "pam", target_os = "linux")))),
+        );
+        line(
+            "PAMServiceName",
+            opts.pam_service_name.as_deref().unwrap_or("sshd"),
+        );
+        line(
+            "LoginGraceTime",
+            &cli.login_grace_time
+                .or(opts.login_grace_time)
+                .unwrap_or(120)
+                .to_string(),
+        );
+        line(
+            "X11DisplayOffset",
+            &opts.x11_display_offset.unwrap_or(10).to_string(),
+        );
+        line(
+            "MaxAuthTries",
+            &opts
+                .max_auth_tries
+                .unwrap_or(puressh::server::DEFAULT_MAX_AUTH_TRIES)
+                .to_string(),
+        );
+        line("MaxSessions", &opts.max_sessions.unwrap_or(10).to_string());
+        line(
+            "ClientAliveInterval",
+            &opts.client_alive_interval.unwrap_or(0).to_string(),
+        );
+        line(
+            "ClientAliveCountMax",
+            &opts.client_alive_count_max.unwrap_or(3).to_string(),
+        );
+        line(
+            "RequiredRSASize",
+            &opts
+                .required_rsa_size
+                .unwrap_or(DEFAULT_REQUIRED_RSA_SIZE)
+                .to_string(),
+        );
+        line(
+            "StreamLocalBindMask",
+            &format!("0{:o}", opts.stream_local_bind_mask.unwrap_or(0o177)),
+        );
+        line(
+            "UnusedConnectionTimeout",
+            &match opts.unused_connection_timeout {
+                None | Some(0) => "none".to_string(),
+                Some(t) => t.to_string(),
+            },
+        );
+
+        // Formatted integer arguments.
+        line(
+            "PermitRootLogin",
+            match cli.permit_root_login.or(opts.permit_root_login) {
+                Some(PermitRootLogin::Yes) => "yes",
+                Some(PermitRootLogin::No) => "no",
+                _ => "prohibit-password",
+            },
+        );
+        // Host-based authentication does not exist here: what describes it.
+        line("IgnoreRhosts", "yes");
+        line("IgnoreUserKnownHosts", "no");
+        line("HostbasedAuthentication", "no");
+        line("HostbasedUsesNameFromPacketOnly", "no");
+        line(
+            "PubkeyAuthentication",
+            yn(opts.pubkey_authentication != Some(false)),
+        );
+        line(
+            "PasswordAuthentication",
+            yn(opts.password_authentication != Some(false)),
+        );
+        line(
+            "KbdInteractiveAuthentication",
+            yn(opts.kbd_interactive_authentication != Some(false)),
+        );
+        line("PrintMotd", yn(opts.print_motd.unwrap_or(true)));
+        line("PrintLastLog", yn(opts.print_last_log.unwrap_or(true)));
+        line(
+            "X11Forwarding",
+            yn(cli.x11_forward.or(opts.x11_forwarding).unwrap_or(false)),
+        );
+        line(
+            "X11UseLocalhost",
+            yn(opts.x11_use_localhost.unwrap_or(true)),
+        );
+        line("PermitTTY", yn(opts.permit_tty != Some(false)));
+        line("PermitUserRC", yn(opts.permit_user_rc.unwrap_or(true)));
+        line(
+            "StrictModes",
+            yn(cli.strict_modes.or(opts.strict_modes).unwrap_or(true)),
+        );
+        line(
+            "TCPKeepAlive",
+            match (opts.tcp_keep_alive, opts.tcp_keep_alive_forwarded) {
+                (Some(false), _) => "false",
+                (_, Some(true)) => "all",
+                _ => "true",
+            },
+        );
+        line(
+            "PermitEmptyPasswords",
+            yn(opts.permit_empty_passwords == Some(true)),
+        );
+        line(
+            "Compression",
+            yn(!matches!(opts.compression, Some(Compression::No))),
+        );
+        line(
+            "GatewayPorts",
+            match opts.gateway_ports {
+                Some(GatewayPorts::Yes) => "yes",
+                Some(GatewayPorts::ClientSpecified) => "clientspecified",
+                _ => "no",
+            },
+        );
+        line("UseDNS", yn(opts.use_dns == Some(true)));
+        line("AllowTcpForwarding", fwd(opts.allow_tcp_forwarding));
+        line(
+            "AllowAgentForwarding",
+            yn(cli
+                .agent_forward
+                .or(opts.allow_agent_forwarding)
+                .unwrap_or(true)),
+        );
+        line(
+            "DisableForwarding",
+            yn(opts.disable_forwarding == Some(true)),
+        );
+        line(
+            "AllowStreamLocalForwarding",
+            fwd(opts.allow_stream_local_forwarding),
+        );
+        line(
+            "StreamLocalBindUnlink",
+            yn(opts.stream_local_bind_unlink == Some(true)),
+        );
+        line(
+            "FingerprintHash",
+            opts.fingerprint_hash
+                .unwrap_or(puressh::config::server::FingerprintHash::Sha256)
+                .name(),
+        );
+        line("ExposeAuthInfo", yn(opts.expose_auth_info.unwrap_or(false)));
+        line(
+            "WarnWeakCrypto",
+            if opts.warn_weak_crypto == Some(false) {
+                "false"
+            } else {
+                "true"
+            },
+        );
+        line("RefuseConnection", yn(opts.refuse_connection == Some(true)));
+
+        // String arguments.
+        line(
+            "PidFile",
+            &if opts.pid_file_set {
+                none_or(&opts.pid_file.as_deref().map(abs))
+            } else {
+                "/run/sshd.pid".to_string()
+            },
+        );
+        line(
+            "ModuliFile",
+            &abs(opts.moduli_file.as_deref().unwrap_or(DEFAULT_MODULI_FILE)),
+        );
+        line(
+            "XAuthLocation",
+            &match opts.xauth_location.as_deref() {
+                Some(p) if p.eq_ignore_ascii_case("none") => "none".to_string(),
+                Some(p) => abs(p),
+                None => "/usr/bin/xauth".to_string(),
+            },
+        );
+        use puressh::hazmat::transport::kex::defaults;
+        line("Ciphers", &list(&opts.ciphers, defaults::CIPHERS));
+        line("Macs", &list(&opts.macs, defaults::MACS));
+        line("Banner", &none_or(&opts.banner));
+        line("ForceCommand", &none_or(&opts.force_command));
+        line("ChrootDirectory", &none_or(&opts.chroot_directory));
+        line("TrustedUserCAKeys", &none_or(&opts.trusted_user_ca_keys));
+        line("SecurityKeyProvider", "internal");
+        line(
+            "AuthorizedPrincipalsFile",
+            &none_or(&opts.authorized_principals_file),
+        );
+        line(
+            "VersionAddendum",
+            match opts.version_addendum.as_deref() {
+                None | Some("") => "none",
+                Some(v) => v,
+            },
+        );
+        let command = |c: &Option<Vec<String>>| match c {
+            Some(c) if !c.is_empty() => c.join(" "),
+            _ => "none".to_string(),
+        };
+        line(
+            "AuthorizedKeysCommand",
+            &command(&opts.authorized_keys_command),
+        );
+        line(
+            "AuthorizedKeysCommandUser",
+            &none_or(&opts.authorized_keys_command_user),
+        );
+        line(
+            "AuthorizedPrincipalsCommand",
+            &command(&opts.authorized_principals_command),
+        );
+        line(
+            "AuthorizedPrincipalsCommandUser",
+            &none_or(&opts.authorized_principals_command_user),
+        );
+        line("HostKeyAgent", &none_or(&opts.host_key_agent));
+        line("KexAlgorithms", &list(&opts.kex_algorithms, defaults::KEX));
+        line(
+            "CASignatureAlgorithms",
+            &list(&opts.ca_signature_algorithms, defaults::HOST_KEY),
+        );
+        // Certificate algorithms first, as OpenSSH lists them.
+        let with_certs: Vec<&str> = puressh::cert::CERT_KEY_NAMES
+            .iter()
+            .chain(defaults::HOST_KEY)
+            .copied()
+            .collect();
+        line("HostbasedAcceptedAlgorithms", &list(&None, &with_certs));
+        line(
+            "HostKeyAlgorithms",
+            &list(&opts.host_key_algorithms, &with_certs),
+        );
+        line(
+            "PubkeyAcceptedAlgorithms",
+            &list(&opts.pubkey_accepted_algorithms, &with_certs),
+        );
+        line(
+            "SshdSessionPath",
+            &abs(opts
+                .sshd_session_path
+                .as_deref()
+                .unwrap_or("/usr/lib/openssh/sshd-session")),
+        );
+        line(
+            "SshdAuthPath",
+            &abs(opts
+                .sshd_auth_path
+                .as_deref()
+                .unwrap_or("/usr/lib/openssh/sshd-auth")),
+        );
+        line(
+            "PerSourcePenaltyExemptList",
+            opts.per_source_penalty_exempt.as_deref().unwrap_or("none"),
+        );
+        line(
+            "AgentSocketPath",
+            opts.agent_socket_path
+                .as_deref()
+                .unwrap_or(DEFAULT_AGENT_SOCKET_PATH),
+        );
+
+        // String arguments requiring a lookup.
+        line(
+            "LogLevel",
+            puressh::config::server::LOG_LEVELS[usize::from(opts.log_level.unwrap_or(3).min(7))],
+        );
+        line(
+            "SyslogFacility",
+            opts.syslog_facility.as_deref().unwrap_or("AUTH"),
+        );
+
+        // String array arguments: `none` empties the list (no line).
+        let files = opts
+            .authorized_keys_file
+            .clone()
+            .unwrap_or_else(default_authorized_keys_files);
+        if !files.is_empty() {
+            line("AuthorizedKeysFile", &files.join(" "));
+        }
+        if let Some(files) = opts.revoked_keys.as_ref().filter(|v| !v.is_empty()) {
+            line(
+                "RevokedKeys",
+                &files.iter().map(|f| abs(f)).collect::<Vec<_>>().join(" "),
+            );
         }
         let mut host_keys = cli.host_key_files.clone();
         host_keys.extend(opts.host_key_files.iter().cloned());
@@ -1119,58 +1550,141 @@ mod imp {
             host_keys = DEFAULT_HOST_KEYS.iter().map(|s| s.to_string()).collect();
         }
         for k in &host_keys {
-            line("hostkey", k);
+            line("HostKey", &abs(k));
         }
         let mut certs = cli.host_certificate_files.clone();
         certs.extend(opts.host_certificate_files.iter().cloned());
         for c in &certs {
-            line("hostcertificate", c);
+            line("HostCertificate", &abs(c));
         }
-        if let Some(a) = &opts.host_key_agent {
-            line("hostkeyagent", a);
+        for (k, v) in [
+            ("AllowUsers", &opts.allow_users),
+            ("DenyUsers", &opts.deny_users),
+            ("AllowGroups", &opts.allow_groups),
+            ("DenyGroups", &opts.deny_groups),
+            ("AcceptEnv", &opts.accept_env),
+            ("SetEnv", &opts.set_env),
+        ] {
+            for item in v {
+                line(k, item);
+            }
+        }
+        match &opts.authentication_methods {
+            Some(m) if !(m.len() == 1 && m[0] == "any") => {
+                line("AuthenticationMethods", &m.join(" "))
+            }
+            _ => line("AuthenticationMethods", "any"),
+        }
+        if let Some(v) = &opts.log_verbose {
+            line("LogVerbose", &v.join(" "));
         }
         line(
-            "pamservicename",
-            opts.pam_service_name.as_deref().unwrap_or("sshd"),
+            "ChannelTimeout",
+            &match &opts.channel_timeouts {
+                Some(list) if !list.is_empty() => list
+                    .iter()
+                    .map(|(t, secs)| format!("{t}={secs}"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => "none".to_string(),
+            },
         );
-        line(
-            "usepam",
-            yn(opts
-                .use_pam
-                .unwrap_or(cfg!(all(feature = "pam", target_os = "linux")))),
-        );
-        line(
-            "logingracetime",
-            &cli.login_grace_time
-                .or(opts.login_grace_time)
-                .unwrap_or(120)
-                .to_string(),
-        );
-        line(
-            "maxauthtries",
-            &opts
-                .max_auth_tries
-                .unwrap_or(puressh::server::DEFAULT_MAX_AUTH_TRIES)
-                .to_string(),
-        );
-        line("maxsessions", &opts.max_sessions.unwrap_or(10).to_string());
+
+        // Other arguments.
+        let subsystems = opts.subsystems.clone().unwrap_or_default();
+        // SFTP is served without a `Subsystem` line too (unlike OpenSSH):
+        // show it as the line that would do it.
+        if !subsystems.iter().any(|(n, _)| n == "sftp")
+            && opts.subsystem_sftp != Some(false)
+            && opts.sftp_enabled != Some(false)
+        {
+            line("Subsystem", "sftp internal-sftp");
+        }
+        for (name, command) in &subsystems {
+            line("Subsystem", &format!("{name} {command}"));
+        }
         let full = opts.max_startups.unwrap_or(100);
         match opts.max_startups_early {
-            Some((start, rate)) => line("maxstartups", &format!("{start}:{rate}:{full}")),
-            None => line("maxstartups", &format!("{full}:100:{full}")),
+            Some((start, rate)) => line("MaxStartups", &format!("{start}:{rate}:{full}")),
+            None => line("MaxStartups", &format!("{full}:100:{full}")),
         }
         line(
-            "persourcemaxstartups",
+            "PerSourceMaxStartups",
             &match opts.per_source_max_startups {
                 None | Some(0) => "none".to_string(),
                 Some(n) => n.to_string(),
             },
         );
         let (v4, v6) = opts.per_source_net_block_size.unwrap_or((32, 128));
-        line("persourcenetblocksize", &format!("{v4}:{v6}"));
+        line("PerSourceNetBlockSize", &format!("{v4}:{v6}"));
+        line(
+            "PermitTunnel",
+            match opts.permit_tunnel.unwrap_or(0) {
+                3 => "yes",
+                1 => "point-to-point",
+                2 => "ethernet",
+                _ => "no",
+            },
+        );
+        let (qos_interactive, qos_bulk) = opts.ip_qos.unwrap_or(DEFAULT_IP_QOS);
+        line(
+            "IPQoS",
+            &format!(
+                "{} {}",
+                puressh::config::server::ipqos_name(qos_interactive),
+                puressh::config::server::ipqos_name(qos_bulk)
+            ),
+        );
+        let (bytes, secs) = opts
+            .rekey_limit
+            .map(|rk| (rk.max_bytes.unwrap_or(0), rk.max_seconds.unwrap_or(0)))
+            .unwrap_or((0, 0));
+        line("RekeyLimit", &format!("{bytes} {secs}"));
+        let hostport = |hp: &Option<Vec<puressh::config::HostPort>>| match hp {
+            None => "any".to_string(),
+            Some(v) if v.is_empty() => "none".to_string(),
+            // What `any` parses to.
+            Some(v) if v.len() == 1 && v[0].host == "*" && v[0].port.is_none() => "any".to_string(),
+            Some(v) => v
+                .iter()
+                .map(|h| {
+                    let host = if h.host.contains(':') {
+                        format!("[{}]", h.host)
+                    } else {
+                        h.host.clone()
+                    };
+                    match h.port {
+                        Some(p) => format!("{host}:{p}"),
+                        None => format!("{host}:*"),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        };
+        line("PermitOpen", &hostport(&opts.permit_open));
+        line("PermitListen", &hostport(&opts.permit_listen));
+        line(
+            "PermitUserEnvironment",
+            opts.permit_user_environment.as_deref().unwrap_or("no"),
+        );
+        line("PubkeyAuthOptions", &{
+            let (touch, verify) = opts.pubkey_auth_options.unwrap_or_default();
+            let mut v = String::new();
+            if !touch && !verify {
+                v.push_str("none");
+            }
+            if touch {
+                v.push_str(" touch-required");
+            }
+            if verify {
+                v.push_str(" verify-required");
+            }
+            v.push_str(" max-pk-ok:6");
+            v.trim_start().to_string()
+        });
         let p = opts.per_source_penalties.clone().unwrap_or_default();
         line(
-            "persourcepenalties",
+            "PerSourcePenalties",
             &if p.enabled {
                 let f = |n: u32| format!("{n}.000000");
                 let o = |deny: bool| if deny { "deny-all" } else { "permissive" };
@@ -1195,278 +1709,6 @@ mod imp {
                 "no".to_string()
             },
         );
-        line(
-            "persourcepenaltyexemptlist",
-            opts.per_source_penalty_exempt.as_deref().unwrap_or("none"),
-        );
-        line(
-            "channeltimeout",
-            &match &opts.channel_timeouts {
-                Some(list) if !list.is_empty() => list
-                    .iter()
-                    .map(|(t, secs)| format!("{t}={secs}"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                _ => "none".to_string(),
-            },
-        );
-        line("exposeauthinfo", yn(opts.expose_auth_info.unwrap_or(false)));
-        line(
-            "clientaliveinterval",
-            &opts.client_alive_interval.unwrap_or(0).to_string(),
-        );
-        line(
-            "clientalivecountmax",
-            &opts.client_alive_count_max.unwrap_or(3).to_string(),
-        );
-        line(
-            "unusedconnectiontimeout",
-            &match opts.unused_connection_timeout {
-                None | Some(0) => "none".to_string(),
-                Some(t) => t.to_string(),
-            },
-        );
-        line(
-            "requiredrsasize",
-            &opts
-                .required_rsa_size
-                .unwrap_or(DEFAULT_REQUIRED_RSA_SIZE)
-                .to_string(),
-        );
-        line(
-            "permitrootlogin",
-            match cli.permit_root_login.or(opts.permit_root_login) {
-                Some(PermitRootLogin::Yes) => "yes",
-                Some(PermitRootLogin::No) => "no",
-                _ => "without-password",
-            },
-        );
-        line(
-            "pubkeyauthentication",
-            yn(opts.pubkey_authentication != Some(false)),
-        );
-        line(
-            "pubkeyauthoptions",
-            match opts.pubkey_auth_options.unwrap_or_default() {
-                (false, false) => "none",
-                (true, false) => "touch-required",
-                (false, true) => "verify-required",
-                (true, true) => "touch-required verify-required",
-            },
-        );
-        line(
-            "passwordauthentication",
-            yn(opts.password_authentication != Some(false)),
-        );
-        line(
-            "kbdinteractiveauthentication",
-            yn(opts.kbd_interactive_authentication != Some(false)),
-        );
-        line(
-            "permitemptypasswords",
-            yn(opts.permit_empty_passwords == Some(true)),
-        );
-        line(
-            "strictmodes",
-            yn(cli.strict_modes.or(opts.strict_modes).unwrap_or(true)),
-        );
-        line(
-            "x11forwarding",
-            yn(cli.x11_forward.or(opts.x11_forwarding).unwrap_or(false)),
-        );
-        line(
-            "allowagentforwarding",
-            yn(cli
-                .agent_forward
-                .or(opts.allow_agent_forwarding)
-                .unwrap_or(true)),
-        );
-        line("allowtcpforwarding", fwd(opts.allow_tcp_forwarding));
-        line(
-            "allowstreamlocalforwarding",
-            fwd(opts.allow_stream_local_forwarding),
-        );
-        line(
-            "gatewayports",
-            match opts.gateway_ports {
-                Some(GatewayPorts::Yes) => "yes",
-                Some(GatewayPorts::ClientSpecified) => "clientspecified",
-                _ => "no",
-            },
-        );
-        line(
-            "disableforwarding",
-            yn(opts.disable_forwarding == Some(true)),
-        );
-        line(
-            "permittunnel",
-            match opts.permit_tunnel.unwrap_or(0) {
-                3 => "yes",
-                1 => "point-to-point",
-                2 => "ethernet",
-                _ => "no",
-            },
-        );
-        line("permittty", yn(opts.permit_tty != Some(false)));
-        line("printmotd", yn(opts.print_motd.unwrap_or(true)));
-        line("printlastlog", yn(opts.print_last_log.unwrap_or(true)));
-        line(
-            "compression",
-            yn(!matches!(opts.compression, Some(Compression::No))),
-        );
-        line(
-            "loglevel",
-            puressh::config::server::LOG_LEVELS[usize::from(opts.log_level.unwrap_or(3).min(7))],
-        );
-        line(
-            "syslogfacility",
-            opts.syslog_facility.as_deref().unwrap_or("AUTH"),
-        );
-        match &opts.authorized_keys_file {
-            Some(files) => line("authorizedkeysfile", &files.join(" ")),
-            None => line(
-                "authorizedkeysfile",
-                &default_authorized_keys_files().join(" "),
-            ),
-        }
-        line(
-            "authorizedprincipalsfile",
-            &none_or(&opts.authorized_principals_file),
-        );
-        let command = |c: &Option<Vec<String>>| match c {
-            Some(c) if !c.is_empty() => c.join(" "),
-            _ => "none".to_string(),
-        };
-        line(
-            "authorizedkeyscommand",
-            &command(&opts.authorized_keys_command),
-        );
-        line(
-            "authorizedkeyscommanduser",
-            &none_or(&opts.authorized_keys_command_user),
-        );
-        line(
-            "authorizedprincipalscommand",
-            &command(&opts.authorized_principals_command),
-        );
-        line(
-            "authorizedprincipalscommanduser",
-            &none_or(&opts.authorized_principals_command_user),
-        );
-        line("trustedusercakeys", &none_or(&opts.trusted_user_ca_keys));
-        line(
-            "revokedkeys",
-            &none_or(
-                &opts
-                    .revoked_keys
-                    .as_ref()
-                    .filter(|v| !v.is_empty())
-                    .map(|v| v.join(" ")),
-            ),
-        );
-        line("banner", &none_or(&opts.banner));
-        line("forcecommand", &none_or(&opts.force_command));
-        line("chrootdirectory", &none_or(&opts.chroot_directory));
-        line("permituserrc", yn(opts.permit_user_rc.unwrap_or(true)));
-        line("tcpkeepalive", yn(opts.tcp_keep_alive.unwrap_or(true)));
-        line(
-            "permituserenvironment",
-            opts.permit_user_environment.as_deref().unwrap_or("no"),
-        );
-        for e in &opts.set_env {
-            line("setenv", e);
-        }
-        line(
-            "xauthlocation",
-            opts.xauth_location.as_deref().unwrap_or("/usr/bin/xauth"),
-        );
-        line(
-            "pidfile",
-            &if opts.pid_file_set {
-                none_or(&opts.pid_file)
-            } else {
-                "/run/sshd.pid".to_string()
-            },
-        );
-        match &opts.authentication_methods {
-            Some(m) => line("authenticationmethods", &m.join(" ")),
-            None => line("authenticationmethods", "any"),
-        }
-        let hostport = |hp: &Option<Vec<puressh::config::HostPort>>| match hp {
-            None => "any".to_string(),
-            Some(v) if v.is_empty() => "none".to_string(),
-            // What `any` parses to.
-            Some(v) if v.len() == 1 && v[0].host == "*" && v[0].port.is_none() => "any".to_string(),
-            Some(v) => v
-                .iter()
-                .map(|h| match h.port {
-                    Some(p) => format!("{}:{p}", h.host),
-                    None => format!("{}:*", h.host),
-                })
-                .collect::<Vec<_>>()
-                .join(" "),
-        };
-        line("permitopen", &hostport(&opts.permit_open));
-        line("permitlisten", &hostport(&opts.permit_listen));
-        let (bytes, secs) = opts
-            .rekey_limit
-            .map(|rk| (rk.max_bytes.unwrap_or(0), rk.max_seconds.unwrap_or(0)))
-            .unwrap_or((0, 0));
-        line("rekeylimit", &format!("{bytes} {secs}"));
-        use puressh::hazmat::transport::kex::defaults;
-        line("ciphers", &list(&opts.ciphers, defaults::CIPHERS));
-        line("macs", &list(&opts.macs, defaults::MACS));
-        line("kexalgorithms", &list(&opts.kex_algorithms, defaults::KEX));
-        // Certificate algorithms first, as OpenSSH lists them.
-        let with_certs: Vec<&str> = puressh::cert::CERT_KEY_NAMES
-            .iter()
-            .chain(defaults::HOST_KEY)
-            .copied()
-            .collect();
-        line(
-            "hostkeyalgorithms",
-            &list(&opts.host_key_algorithms, &with_certs),
-        );
-        line(
-            "pubkeyacceptedalgorithms",
-            &list(&opts.pubkey_accepted_algorithms, &with_certs),
-        );
-        line(
-            "casignaturealgorithms",
-            &list(&opts.ca_signature_algorithms, defaults::HOST_KEY),
-        );
-        // Features this daemon does not have, shown with the value that
-        // describes its behaviour (the config parser only accepts these).
-        for (k, v) in [
-            ("hostbasedauthentication", "no"),
-            ("ignorerhosts", "yes"),
-            ("gssapiauthentication", "no"),
-            ("usedns", "no"),
-            ("fingerprinthash", "SHA256"),
-        ] {
-            line(k, v);
-        }
-        let subsystems = opts.subsystems.clone().unwrap_or_default();
-        if !subsystems.iter().any(|(n, _)| n == "sftp")
-            && opts.subsystem_sftp != Some(false)
-            && opts.sftp_enabled != Some(false)
-        {
-            line("subsystem", "sftp internal-sftp");
-        }
-        for (name, command) in &subsystems {
-            line("subsystem", &format!("{name} {command}"));
-        }
-        for (k, v) in [
-            ("allowusers", &opts.allow_users),
-            ("denyusers", &opts.deny_users),
-            ("allowgroups", &opts.allow_groups),
-            ("denygroups", &opts.deny_groups),
-            ("acceptenv", &opts.accept_env),
-        ] {
-            for item in v {
-                line(k, item);
-            }
-        }
         print!("{out}");
         Ok(0)
     }
@@ -1476,6 +1718,7 @@ mod imp {
         let mut config_options: Vec<String> = Vec::new();
         let mut ports: Vec<u16> = Vec::new();
         let mut dump_config = false;
+        let mut dump_config_only = false;
         let mut connection_spec: Vec<String> = Vec::new();
         let mut test_only = false;
         let mut inetd = false;
@@ -1484,12 +1727,13 @@ mod imp {
         let mut quiet = false;
         let mut address_family: Option<puressh::config::ServerAddressFamily> = None;
         let mut log_file: Option<String> = None;
-        let mut listen_addresses: Vec<String> = Vec::new();
         let mut host_key_files: Vec<String> = Vec::new();
         let mut host_certificate_files: Vec<String> = Vec::new();
         let mut authorized_keys_file: Option<String> = None;
         let mut allowed_users: Vec<String> = Vec::new();
+        let mut utmp_len = UTMP_HOST_MAX;
         let mut debug = false;
+        let mut debug_level: Option<sshd_log::Level> = None;
         let mut sftp: Option<bool> = None;
         let mut sftp_read_only: Option<bool> = None;
         let mut sftp_root: Option<String> = None;
@@ -1564,6 +1808,10 @@ mod imp {
                 "-t" => test_only = true,
                 "-i" => inetd = true,
                 "-T" => dump_config = true,
+                "-G" => dump_config_only = true,
+                // OpenSSH: `-Q` is ignored; `-R` is its internal re-exec flag.
+                "-Q" => {}
+                "-R" => return Err("-R not supported here".into()),
                 "-C" => {
                     i += 1;
                     connection_spec.push(args.get(i).ok_or("-C requires a value")?.clone());
@@ -1590,16 +1838,18 @@ mod imp {
                 }
                 // `-e`: log to stderr rather than syslog; `-q`: log nothing.
                 "-e" => log_stderr = true,
-                "-q" => quiet = true,
+                "-q" => {
+                    quiet = true;
+                    debug_level = None;
+                }
                 "-D" => no_detach = true,
-                // OpenSSH compatibility no-ops: `-r` no re-exec, `-k`
-                // obsolete key regeneration.
-                "-r" => {}
-                "-k" => i += 1,
-                "-b" => {
+                // OpenSSH compatibility no-ops: `-r` (no re-exec) is only
+                // logged; `-k` and `-b` (protocol 1's key regeneration
+                // interval and server key size) take a value, ignored.
+                "-r" => eprintln!("-r option is deprecated"),
+                "-k" | "-b" => {
                     i += 1;
-                    let v = args.get(i).ok_or("-b requires a value")?.clone();
-                    listen_addresses.push(v);
+                    args.get(i).ok_or(format!("{a} requires a value"))?;
                 }
                 "-h" => {
                     i += 1;
@@ -1622,13 +1872,26 @@ mod imp {
                 "-u" => {
                     i += 1;
                     let v = args.get(i).ok_or("-u requires a value")?.clone();
-                    // OpenSSH's `-u len` (utmp host-name length) is numeric
-                    // and ignorable; anything else is puressh's allowed user.
-                    if v.parse::<u32>().is_err() {
-                        allowed_users.push(v);
+                    // OpenSSH's `-u len`: the utmp host-name length. Anything
+                    // not numeric is puressh's allowed user.
+                    match v.parse::<u64>() {
+                        Ok(n) if n <= UTMP_HOST_MAX as u64 => utmp_len = n as usize,
+                        Ok(_) => return Err("Invalid utmp length.".into()),
+                        Err(_) => allowed_users.push(v),
                     }
                 }
-                "-d" => debug = true,
+                // OpenSSH: the first `-d` sets DEBUG1, each further one
+                // raises it, up to DEBUG3.
+                "-d" => {
+                    use sshd_log::Level;
+                    debug_level = Some(match debug_level {
+                        Some(Level::Debug1) => Level::Debug2,
+                        Some(Level::Debug2 | Level::Debug3) => Level::Debug3,
+                        _ => Level::Debug1,
+                    });
+                    debug = true;
+                    quiet = false;
+                }
                 "--no-sftp" => sftp = Some(false),
                 "--sftp-read-only" => sftp_read_only = Some(true),
                 "--sftp-root" => {
@@ -1704,6 +1967,7 @@ mod imp {
             config_options,
             ports,
             dump_config,
+            dump_config_only,
             connection_spec,
             test_only,
             inetd,
@@ -1712,12 +1976,13 @@ mod imp {
             log_file,
             log_stderr,
             quiet,
-            listen_addresses,
             host_key_files,
             host_certificate_files,
             authorized_keys_file,
             allowed_users,
+            utmp_len,
             debug,
+            debug_level,
             sftp,
             sftp_read_only,
             sftp_root,
@@ -8218,7 +8483,15 @@ mod imp {
         for w in sshd_cfg.warnings() {
             eprintln!("sshd: warning: config {w}");
         }
-        if cli.dump_config {
+        // OpenSSH: `-C` only goes with `-T`; `-G` prints before the host
+        // keys are loaded, `-T` once they have been (as `-t` checks them).
+        parse_connection_spec(&cli.connection_spec)?;
+        if !cli.connection_spec.is_empty() && !cli.dump_config {
+            return Err(
+                "Config test connection parameter (-C) provided without test mode (-T)".into(),
+            );
+        }
+        if cli.dump_config_only {
             return dump_config(&cli, &sshd_cfg);
         }
 
@@ -8232,8 +8505,10 @@ mod imp {
         {
             let configured = puressh::config::server::LOG_LEVELS[usize::from(log_level.min(7))];
             let mut level = sshd_log::Level::parse(configured).unwrap_or(sshd_log::Level::Info);
-            if cli.debug {
-                level = level.max(sshd_log::Level::Debug1);
+            // `-d` / `-q` set the level before the file is read, so they
+            // win over its LogLevel.
+            if let Some(debug_level) = cli.debug_level {
+                level = debug_level;
             }
             if cli.quiet {
                 level = sshd_log::Level::Quiet;
@@ -8352,9 +8627,8 @@ mod imp {
         let mut accept_env = cli.accept_env.clone();
         accept_env.extend(sshd_cfg.global.accept_env.iter().cloned());
 
-        // Listen addresses: `-b` + `ListenAddress` (cumulative), on `ports`.
-        let mut bind_specs = cli.listen_addresses.clone();
-        bind_specs.extend(sshd_cfg.global.listen_addresses.iter().cloned());
+        // Listen addresses: `ListenAddress` (cumulative), on `ports`.
+        let bind_specs = sshd_cfg.global.listen_addresses.clone();
 
         let mut host_certificate_files = cli.host_certificate_files.clone();
         host_certificate_files.extend(sshd_cfg.global.host_certificate_files.iter().cloned());
@@ -8374,6 +8648,9 @@ mod imp {
             strict_modes,
             host_key_agent.as_deref(),
         )?;
+        if cli.dump_config {
+            return dump_config(&cli, &sshd_cfg);
+        }
         // Authorized keys come in two mutually exclusive modes:
         //
         //  * Per-user (the default, OpenSSH semantics): `AuthorizedKeysFile`
@@ -8900,8 +9177,8 @@ mod imp {
         let mut listeners = Vec::with_capacity(listen.len());
         let mut bound = Vec::with_capacity(listen.len());
         let mut bind_errors = Vec::new();
-        for a in &listen {
-            match bind_listener(*a) {
+        for (a, rdomain) in &listen {
+            match bind_listener(*a, rdomain.as_deref()) {
                 Ok(l) => {
                     listeners.push(l);
                     bound.push(*a);

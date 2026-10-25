@@ -114,7 +114,7 @@ fn spawn_our_sshd(tmp: &Path) -> Option<(u16, String, PathBuf, SshdGuard)> {
     let child = Command::new(&sshd_bin)
         .arg("-D")
         .args(["-f", &config.display().to_string()])
-        .args(["-b", "127.0.0.1"])
+        .args(["-o", "ListenAddress=127.0.0.1"])
         .args(["-p", &port.to_string()])
         .args(["-h", &host_key.display().to_string()])
         .args(["-A", &authorized.display().to_string()])

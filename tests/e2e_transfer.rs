@@ -51,8 +51,8 @@ fn fixture(label: &str) -> Fixture {
             .args([
                 "-f",
                 "/dev/null",
-                "-b",
-                "127.0.0.1",
+                "-o",
+                "ListenAddress=127.0.0.1",
                 "-p",
                 &port.to_string(),
             ])

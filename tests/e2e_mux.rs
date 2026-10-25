@@ -74,8 +74,8 @@ fn control_master_shares_one_connection() {
         .args([
             "-f",
             "/dev/null",
-            "-b",
-            "127.0.0.1",
+            "-o",
+            "ListenAddress=127.0.0.1",
             "-p",
             &port.to_string(),
         ])

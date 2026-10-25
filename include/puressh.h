@@ -6,7 +6,7 @@
  *
  * Version: matches CARGO_PKG_VERSION at build time. Call pcssh_version() at
  *          runtime for the exact string.
- * License: MIT OR Apache-2.0
+ * License: MIT
  */
 
 #ifndef PURESSH_H

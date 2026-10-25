@@ -609,8 +609,19 @@ impl<S> Limited<S> {
     }
 }
 
+/// Set (by sftp's SIGINT handler) to stop the transfer in progress.
+pub static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn check_interrupted() -> io::Result<()> {
+    if INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err(io::Error::other("interrupted"));
+    }
+    Ok(())
+}
+
 impl<R: Read> Read for Limited<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        check_interrupted()?;
         let n = self.inner.read(buf)?;
         if let Some(l) = &mut self.limiter {
             l.account(n);
@@ -621,6 +632,7 @@ impl<R: Read> Read for Limited<R> {
 
 impl<W: Write> Write for Limited<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        check_interrupted()?;
         let n = self.inner.write(buf)?;
         if let Some(l) = &mut self.limiter {
             l.account(n);

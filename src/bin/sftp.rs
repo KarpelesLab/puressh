@@ -1398,6 +1398,9 @@ impl Session {
                 let g = self.glob(&pat, false, true);
                 let mut err = false;
                 for f in &g.paths {
+                    if interrupted() {
+                        break;
+                    }
                     if !self.quiet {
                         println!("Removing {}", safe_display(f));
                     }
@@ -1487,6 +1490,9 @@ impl Session {
                 let g = self.glob(&pat, false, true);
                 let mut err = false;
                 for f in &g.paths {
+                    if interrupted() {
+                        break;
+                    }
                     if !self.quiet {
                         println!("Changing mode on {}", safe_display(f));
                     }
@@ -1506,6 +1512,9 @@ impl Session {
                 let g = self.glob(&pat, false, true);
                 let mut err = false;
                 for f in &g.paths {
+                    if interrupted() {
+                        break;
+                    }
                     let cur = if p.has('h') {
                         self.sftp.lstat(f)
                     } else {
@@ -1707,6 +1716,11 @@ impl Session {
         };
         let mut out = Vec::new();
         let res = loop {
+            if interrupted() {
+                // No partial listings after an interrupt.
+                out.clear();
+                break Ok(out);
+            }
             match self.sftp.readdir(&h) {
                 Ok(Some(batch)) => {
                     for e in batch {
@@ -1826,6 +1840,9 @@ impl Session {
         let mut out = out.lock();
         let mut c = 1;
         for e in d.iter().filter(|e| shown(e)) {
+            if interrupted() {
+                break;
+            }
             let fname = path_strip(&path_append(path, &e.filename), strip);
             if long {
                 let line = if lflag & (LS_NUMERIC_VIEW | LS_SI_UNITS) != 0 || can_ids {
@@ -1894,6 +1911,9 @@ impl Session {
         }
         let mut c = 1;
         for i in idx {
+            if interrupted() {
+                break;
+            }
             let fname = path_strip(&g.paths[i], strip);
             if long {
                 let Some(st) = &g.stats[i] else {
@@ -1996,6 +2016,9 @@ impl Session {
         );
         let mut failed = false;
         for path in &g.paths {
+            if interrupted() {
+                break;
+            }
             // `..` and remote roots download into the destination itself.
             let mut filename = lossy(&basename(path));
             if filename == ".." || filename.bytes().all(|c| c == b'/') {
@@ -2053,6 +2076,9 @@ impl Session {
         );
         let mut failed = false;
         for path in &paths {
+            if interrupted() {
+                break;
+            }
             if let Err(e) = std::fs::metadata(path) {
                 error!("stat {path}: {}", strerror(&e));
                 failed = true;
@@ -2115,7 +2141,9 @@ impl Session {
         }
         let opts = self.opts(preserve, resume);
         if let Err(e) = transfer::download(&mut self.sftp, remote, Path::new(local), &opts) {
-            error!("{e}");
+            if !interrupted() {
+                error!("{e}");
+            }
             return false;
         }
         if resume && have >= a.size.unwrap_or(0) {
@@ -2192,6 +2220,9 @@ impl Session {
         };
         let mut ok = true;
         for e in entries {
+            if interrupted() {
+                break;
+            }
             let new_dst = lossy(&path_append(dst.as_bytes(), &e.filename));
             let new_src = path_append(src, &e.filename);
             let a = e.attrs;
@@ -2276,7 +2307,9 @@ impl Session {
         }
         let opts = self.opts(preserve, resume);
         if let Err(e) = transfer::upload(&mut self.sftp, Path::new(local), remote, &opts) {
-            error!("{e}");
+            if !interrupted() {
+                error!("{e}");
+            }
             return false;
         }
         if fsync
@@ -2373,6 +2406,9 @@ impl Session {
         };
         let mut ok = true;
         for entry in rd.flatten() {
+            if interrupted() {
+                break;
+            }
             let filename = entry.file_name().to_string_lossy().into_owned();
             let new_dst = path_append(dst, filename.as_bytes());
             let new_src = lossy(&path_append(src.as_bytes(), filename.as_bytes()));
@@ -2405,6 +2441,69 @@ impl Session {
             let _ = self.setstat(dst, &a, false);
         }
         ok
+    }
+}
+
+fn interrupted() -> bool {
+    transfer::INTERRUPTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn set_interrupted(v: bool) {
+    transfer::INTERRUPTED.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// SIGINT as OpenSSH's sftp handles it: at the interactive prompt a new
+/// prompt, during a command "Interrupt" (the command stops), otherwise
+/// the end of sftp (status 1).
+mod sigint {
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    pub const EXIT: u8 = 0;
+    pub const PROMPT: u8 = 1;
+    pub const COMMAND: u8 = 2;
+
+    static MODE: AtomicU8 = AtomicU8::new(EXIT);
+
+    pub fn set(mode: u8) {
+        MODE.store(mode, Ordering::Relaxed);
+    }
+
+    #[cfg(unix)]
+    extern "C" fn handler(_: libc::c_int) {
+        // Only atomics, write(2) and _exit(2): async-signal-safe.
+        let msg: &[u8] = match MODE.load(Ordering::Relaxed) {
+            COMMAND => b"\rInterrupt  \n",
+            PROMPT => b"\nsftp> ",
+            // SAFETY: _exit is async-signal-safe.
+            _ => unsafe { libc::_exit(1) },
+        };
+        super::transfer::INTERRUPTED.store(true, Ordering::Relaxed);
+        let fd = if msg[0] == b'\r' { 2 } else { 1 };
+        // SAFETY: a valid buffer; the result does not matter.
+        unsafe {
+            libc::write(fd, msg.as_ptr().cast(), msg.len());
+        }
+    }
+
+    /// Ignore SIGINT (inherited by the transport we spawn next).
+    pub fn ignore() {
+        #[cfg(unix)]
+        // SAFETY: setting a disposition.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+        }
+    }
+
+    pub fn install() {
+        #[cfg(unix)]
+        // SAFETY: a plain sigaction with an async-signal-safe handler.
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handler as *const () as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        }
     }
 }
 
@@ -2632,12 +2731,22 @@ fn command_loop(sess: &mut Session, input: &mut dyn BufRead, batch: bool) -> u8 
     let interactive = !batch && io::stdin().is_terminal();
     let mut buf = Vec::new();
     loop {
+        set_interrupted(false);
+        // Ctrl-C at the prompt starts a new one; otherwise it ends sftp.
+        sigint::set(if interactive {
+            sigint::PROMPT
+        } else {
+            sigint::EXIT
+        });
         if interactive {
             print!("sftp> ");
             let _ = io::stdout().flush();
         }
         buf.clear();
-        match input.read_until(b'\n', &mut buf) {
+        let read = input.read_until(b'\n', &mut buf);
+        set_interrupted(false);
+        sigint::set(sigint::COMMAND);
+        match read {
             Ok(0) | Err(_) => {
                 if interactive {
                     println!();
@@ -2678,6 +2787,7 @@ fn run() -> u8 {
     }
     QUIET.store(cli.quiet, std::sync::atomic::Ordering::Relaxed);
     let mut file1 = None;
+    sigint::ignore();
     let (pipe, label) = match &cli.sftp_direct {
         Some(server) => {
             let Some(argv) = argv_split(server) else {
@@ -2739,6 +2849,9 @@ fn run() -> u8 {
             (pipe, format!("Connected to {host}."))
         }
     };
+    // The transport is spawned with SIGINT ignored, so Ctrl-C reaches
+    // only us (it interrupts a command, as OpenSSH's sftp).
+    sigint::install();
     let pipe = match pipe {
         Ok(p) => p,
         Err(e) => {

@@ -77,12 +77,9 @@ struct DynamicForward {
     listen_port: u16,
 }
 
-/// Parsed `-X` / `-Y` mode. `Untrusted` corresponds to `-X` (untrusted X11
-/// forwarding); `Trusted` to `-Y`. In v0 both modes emit identical wire
-/// arguments (`single_connection=false`, screen 0, generated cookie). The
-/// distinction is retained so a follow-up can split them — minting a fresh
-/// cookie via `xauth` for `-X` and forwarding the real `$XAUTHORITY` cookie
-/// for `-Y`.
+/// Parsed `-X` / `-Y` mode: `-X` forwards with an untrusted cookie
+/// (`xauth generate … untrusted`, the X SECURITY extension), `-Y` (or
+/// `ForwardX11Trusted`) with the display's own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum X11Forward {
     Untrusted,
@@ -141,8 +138,8 @@ struct Cli {
     /// `-X` (untrusted) / `-Y` (trusted): ask the server to forward X11.
     /// The lib sends `x11-req` on the session channel; incoming `x11`
     /// channels get spliced against `$DISPLAY` via
-    /// `ClientHandlers::on_x11`. `None` = no X11; in v0 `-X` and `-Y`
-    /// both set the same wire arguments (no untrusted cookie minting).
+    /// `ClientHandlers::on_x11`, with the real cookie swapped in for the
+    /// fake one the server was given. `None` = no X11.
     x11_forward: Option<X11Forward>,
     /// `-J [user@]host[:port][,…]`: ProxyJump chain. `None` when the flag
     /// wasn't supplied; the ssh_config `ProxyJump` then wins.
@@ -3099,6 +3096,11 @@ fn run() -> Result<i32, String> {
         return Ok(0);
     }
     let mut cfg = config_for_host(&cfg_block, &cli, &connect_host)?;
+    #[cfg(unix)]
+    let _ = STREAMLOCAL_BIND.set((
+        cfg_block.stream_local_bind_mask.unwrap_or(0o177),
+        cfg_block.stream_local_bind_unlink == Some(true),
+    ));
     // KnownHostsCommand: its output joins the global known_hosts files.
     if let Some(template) = cfg_block
         .known_hosts_command
@@ -3538,32 +3540,40 @@ fn run() -> Result<i32, String> {
     if let Some(mode) = cli.x11_forward {
         #[cfg(unix)]
         {
-            // No display: no forwarding (OpenSSH: "DISPLAY not set").
-            let cb = puressh::forwarding::x11::splice_to_local_display_callback();
-            if cb.is_none() {
-                vlog(
-                    1,
-                    "-X/-Y: $DISPLAY is unset or not a display we can reach; not forwarding X11",
-                );
-            }
-            // puressh has no SECURITY-extension cookie isolation yet: -X
-            // behaves like -Y. Say so rather than silently downgrading.
-            if mode == X11Forward::Untrusted && cb.is_some() {
-                warn!(
-                    "Warning: -X is currently equivalent to -Y in puressh (no \
-                     SECURITY-extension cookie); the remote can read X11 input from \
-                     your local display."
-                );
-            }
-            if let Some(cb) = cb {
-                let cookie = mint_x11_cookie()?;
-                handlers = handlers.with_x11(cb);
-                client.set_request_x11_forwarding(Some((
-                    false,
-                    "MIT-MAGIC-COOKIE-1".to_string(),
-                    cookie,
-                    0,
-                )));
+            // As OpenSSH: the real cookie from xauth (for -X, a fresh
+            // untrusted one that expires ForwardX11Timeout after), a fake one
+            // of the same length to the server, swapped on each X11
+            // connection.
+            let display = std::env::var("DISPLAY").ok().filter(|d| !d.is_empty());
+            let timeout = cfg_block.forward_x11_timeout.unwrap_or(1200);
+            let xauth = cfg_block.xauth_location.as_deref().unwrap_or(DEFAULT_XAUTH);
+            match display {
+                None => vlog(1, "X11 forwarding requested but DISPLAY not set"),
+                Some(d) if !x11_display_valid(&d) => {
+                    warn!("DISPLAY \"{d}\" invalid; disabling X11 forwarding")
+                }
+                Some(d) => {
+                    let trusted = mode == X11Forward::Trusted;
+                    if let Some((proto, real, refuse_at)) =
+                        x11_get_proto(&d, xauth, trusted, timeout)
+                    {
+                        let fake = random_bytes(real.len().max(1))?;
+                        let hex: String = fake.iter().map(|b| format!("{b:02x}")).collect();
+                        let screen = d
+                            .rsplit_once(':')
+                            .and_then(|(_, n)| n.split_once('.'))
+                            .and_then(|(_, s)| s.parse::<u32>().ok())
+                            .unwrap_or(0);
+                        handlers = handlers.with_x11(x11_spoofing_callback(
+                            d,
+                            proto.clone(),
+                            fake,
+                            real,
+                            refuse_at,
+                        ));
+                        client.set_request_x11_forwarding(Some((false, proto, hex, screen)));
+                    }
+                }
             }
         }
         #[cfg(not(unix))]
@@ -4710,11 +4720,15 @@ fn bind_local_forwards(
                     let () = listener;
                 }
                 Err(e) => {
-                    let msg = format!("unix_listener: cannot bind to path {path}: {e}");
+                    let msg = format!(
+                        "unix_listener: cannot bind to path {path}: {}",
+                        common::io_reason(&e)
+                    );
                     if exit_on_forward_failure {
                         return Err(msg);
                     }
                     warn!("{msg}");
+                    warn!("Could not request local forwarding.");
                 }
             }
             continue;
@@ -7602,15 +7616,35 @@ fn open_local_forward_channel(
 }
 
 /// Listen on a Unix socket for `-L /path:…`, owner-only as OpenSSH's
-/// (StreamLocalBindMask 0177). An existing file is not replaced
-/// (StreamLocalBindUnlink no).
+/// (StreamLocalBindMask, default 0177). An existing file is replaced only
+/// with StreamLocalBindUnlink yes.
 #[cfg(unix)]
 fn bind_unix_listener(path: &str) -> std::io::Result<std::os::unix::net::UnixListener> {
     use std::os::unix::fs::PermissionsExt;
-    let l = std::os::unix::net::UnixListener::bind(path)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    let (mask, unlink) = STREAMLOCAL_BIND.get().copied().unwrap_or((0o177, false));
+    if unlink {
+        match std::fs::remove_file(path) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                eprintln!("unlink({path}): {}", common::io_reason(&e));
+            }
+            _ => {}
+        }
+    }
+    // SAFETY: umask(2) only swaps the process's file-creation mask; the
+    // old one is put back right after the bind.
+    let old = unsafe { libc::umask(mask as libc::mode_t) };
+    let bound = std::os::unix::net::UnixListener::bind(path);
+    // SAFETY: as above.
+    unsafe { libc::umask(old) };
+    let l = bound?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o777 & !mask))?;
     Ok(l)
 }
+
+/// `StreamLocalBindMask` and `StreamLocalBindUnlink`, for the Unix-socket
+/// listeners of local forwards.
+#[cfg(unix)]
+static STREAMLOCAL_BIND: std::sync::OnceLock<(u32, bool)> = std::sync::OnceLock::new();
 
 #[cfg(not(unix))]
 fn bind_unix_listener(_path: &str) -> std::io::Result<()> {
@@ -7679,38 +7713,258 @@ fn spawn_dynamic_forward_listener(
     });
 }
 
-/// Mint a fresh MIT-MAGIC-COOKIE-1 value (32 hex chars from 16 random bytes).
-/// OpenSSH normally reads the real cookie out of `$XAUTHORITY` via `xauth
-/// list`; we don't yet, so untrusted (`-X`) and trusted (`-Y`) currently
-/// share the same generated cookie.
-///
-/// Security: this is a credential. We seed it strictly from purecrypto's
-/// `OsRng` (the same CSPRNG the rest of the crate uses for session keys).
-/// We deliberately do NOT mix in PID + wall-clock nanoseconds as a fallback
-/// — those are low-entropy and would mask an underlying RNG fault. If the
-/// OS RNG isn't available `OsRng::fill_bytes` panics, which is the only
-/// safe behaviour: we cannot forward X11 with a guessable cookie.
-///
-/// X11 forwarding is Unix-only (the channel handlers depend on Unix-domain
-/// sockets), so this helper is too — gating keeps Windows builds clean.
+/// `n` random bytes (an X11 cookie), from the OS RNG only: a credential
+/// must not fall back to guessable seeds, and an RNG that returned nothing
+/// at all is refused.
 #[cfg(unix)]
-fn mint_x11_cookie() -> Result<String, String> {
+fn random_bytes(n: usize) -> Result<Vec<u8>, String> {
     use purecrypto::rng::{OsRng, RngCore};
-    let mut bytes = [0u8; 16];
+    let mut bytes = vec![0u8; n];
     OsRng.fill_bytes(&mut bytes);
-    // Defence in depth: if for some reason `fill_bytes` returned a buffer
-    // of all-zero bytes (i.e. the OS RNG produced nothing observable), bail
-    // rather than emit a known-weak cookie. A 16-byte all-zero read from a
-    // healthy CSPRNG has probability 2^-128, so this only catches "RNG is
-    // returning a fixed value" type faults, not legitimate output.
     if bytes.iter().all(|&b| b == 0) {
         return Err("x11 cookie: OS RNG returned all-zero entropy; refusing to forward".into());
     }
-    let mut s = String::with_capacity(32);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
+    Ok(bytes)
+}
+
+/// OpenSSH's `client_x11_display_valid`: only the characters a display
+/// name has.
+#[cfg(unix)]
+fn x11_display_valid(d: &str) -> bool {
+    d.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'/' | b'.' | b'-' | b'_'))
+}
+
+/// OpenSSH's `client_x11_get_proto`: the authorisation protocol and real
+/// cookie for `display`, from `xauth` (`XAuthLocation`). Untrusted (`-X`):
+/// a cookie `xauth generate` makes untrusted, expiring a minute after
+/// `timeout` (`ForwardX11Timeout`, 0: never), with the time after which X11
+/// connections are refused; failing that, no forwarding. Trusted (`-Y`):
+/// the display's own cookie, else made-up data (the X server then uses
+/// whatever else it trusts).
+#[cfg(unix)]
+fn x11_get_proto(
+    display: &str,
+    xauth: &str,
+    trusted: bool,
+    timeout: u32,
+) -> Option<(String, Vec<u8>, Option<std::time::Instant>)> {
+    use std::process::{Command, Stdio};
+    const PROTO: &str = "MIT-MAGIC-COOKIE-1";
+    let xauth = std::path::Path::new(xauth)
+        .exists()
+        .then_some(xauth)
+        .or_else(|| {
+            vlog(1, "No xauth program.");
+            None
+        });
+    // FamilyLocal: `localhost:N` is listed as `unix:N`.
+    let display = match display.strip_prefix("localhost:") {
+        Some(rest) => format!("unix:{rest}"),
+        None => display.to_string(),
+    };
+    let mut refuse_at = None;
+    let mut got: Option<(String, Vec<u8>)> = None;
+    if let Some(xauth) = xauth {
+        let list = |file: Option<&std::path::Path>| -> Option<(String, Vec<u8>)> {
+            let mut cmd = Command::new(xauth);
+            if let Some(f) = file {
+                cmd.arg("-f").arg(f);
+            }
+            let out = cmd
+                .args(["list", &display])
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut words = text.lines().next()?.split_whitespace().skip(1);
+            let proto = words.next()?.to_string();
+            let hex = words.next()?;
+            let data = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(hex.get(i..i + 2)?, 16).ok())
+                .collect::<Option<Vec<u8>>>()?;
+            Some((proto, data))
+        };
+        if trusted {
+            got = list(None);
+        } else {
+            let dir = std::env::temp_dir().join(format!(
+                "ssh-{}",
+                random_bytes(6)
+                    .ok()?
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            ));
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(&dir) {
+                    eprintln!("mkdtemp: {}", common::io_reason(&e));
+                    return None;
+                }
+            }
+            let file = dir.join("xauthfile");
+            let mut cmd = Command::new(xauth);
+            cmd.arg("-f")
+                .arg(&file)
+                .args(["generate", &display, PROTO, "untrusted"]);
+            if timeout != 0 {
+                // Some slack, so the cookie outlives ssh's own refusal.
+                cmd.args(["timeout", &timeout.saturating_add(60).to_string()]);
+                refuse_at = Some(
+                    std::time::Instant::now()
+                        + std::time::Duration::from_secs(u64::from(timeout) + 1),
+                );
+            }
+            vlog(2, &format!("xauth command: {cmd:?}"));
+            let generated = cmd
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success());
+            if generated {
+                got = list(Some(&file));
+            }
+            let _ = std::fs::remove_file(&file);
+            let _ = std::fs::remove_dir(&dir);
+        }
     }
-    Ok(s)
+    match got {
+        Some((proto, data)) => Some((proto, data, refuse_at)),
+        None if !trusted => {
+            eprintln!(
+                "Warning: untrusted X11 forwarding setup failed: xauth key data not generated"
+            );
+            None
+        }
+        None => {
+            warn!("Warning: No xauth data; using fake authentication data for X11 forwarding.");
+            let data = random_bytes(16).ok()?;
+            Some((PROTO.to_string(), data, refuse_at))
+        }
+    }
+}
+
+/// Connect to the local X server of `display`: `:N` / `unix:N` is the
+/// `/tmp/.X11-unix/XN` socket, a path before the `:` (XQuartz's) that
+/// socket, `host:N` TCP port 6000+N.
+#[cfg(unix)]
+fn x11_connect_display(display: &str) -> std::io::Result<LocalConn> {
+    let bad = || std::io::Error::new(ErrorKind::InvalidInput, "bad DISPLAY");
+    let (host, rest) = display.rsplit_once(':').ok_or_else(bad)?;
+    let n: u16 = rest
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .parse()
+        .map_err(|_| bad())?;
+    if host.starts_with('/') {
+        return LocalConn::connect_path(display);
+    }
+    if host.is_empty() || host == "unix" {
+        return LocalConn::connect_path(&format!("/tmp/.X11-unix/X{n}"));
+    }
+    TcpStream::connect((host, 6000u16.saturating_add(n))).map(LocalConn::Tcp)
+}
+
+/// Read an X11 connection's setup packet from `stream` and give it back
+/// with the `real` cookie in place of the `fake` one the server was given
+/// (OpenSSH's `x11_open_helper`), or why it is refused.
+#[cfg(unix)]
+fn x11_rewrite_setup(
+    stream: &mut ChannelStream,
+    proto: &str,
+    fake: &[u8],
+    real: &[u8],
+) -> Result<Vec<u8>, &'static str> {
+    let mut head = [0u8; 12];
+    stream
+        .read_exact(&mut head)
+        .map_err(|_| "Initial X11 packet contains bad byte order byte.")?;
+    let be = match head[0] {
+        0x42 => true,
+        0x6c => false,
+        _ => return Err("Initial X11 packet contains bad byte order byte."),
+    };
+    let u16_at = |i: usize| {
+        if be {
+            u16::from_be_bytes([head[i], head[i + 1]])
+        } else {
+            u16::from_le_bytes([head[i], head[i + 1]])
+        }
+    };
+    let (name_len, data_len) = (usize::from(u16_at(6)), usize::from(u16_at(8)));
+    let pad = |n: usize| (n + 3) & !3;
+    let mut body = vec![0u8; pad(name_len) + pad(data_len)];
+    stream
+        .read_exact(&mut body)
+        .map_err(|_| "X11 connection closed before its setup packet.")?;
+    if &body[..name_len] != proto.as_bytes() || data_len != fake.len() {
+        return Err("X11 connection uses different authentication protocol.");
+    }
+    let data_at = pad(name_len);
+    if &body[data_at..data_at + data_len] != fake {
+        return Err("X11 auth data does not match fake data.");
+    }
+    if real.len() == fake.len() {
+        body[data_at..data_at + data_len].copy_from_slice(real);
+    }
+    let mut out = head.to_vec();
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// The handler for the server's `x11` channels: refuse them after
+/// `refuse_at` (ForwardX11Timeout), check and swap the cookie, then splice
+/// each against the local display.
+#[cfg(unix)]
+fn x11_spoofing_callback(
+    display: String,
+    proto: String,
+    fake: Vec<u8>,
+    real: Vec<u8>,
+    refuse_at: Option<std::time::Instant>,
+) -> Arc<puressh::client::X11Callback> {
+    Arc::new(move |mut stream: ChannelStream| {
+        if refuse_at.is_some_and(|t| std::time::Instant::now() >= t) {
+            warn!("Rejected X11 connection after ForwardX11Timeout expired");
+            return;
+        }
+        let (display, proto, fake, real) =
+            (display.clone(), proto.clone(), fake.clone(), real.clone());
+        // The setup packet may be slow to come: not on the dispatcher.
+        thread::spawn(move || {
+            let setup = match x11_rewrite_setup(&mut stream, &proto, &fake, &real) {
+                Ok(s) => s,
+                Err(why) => {
+                    vlog(1, why);
+                    return;
+                }
+            };
+            let mut conn = match x11_connect_display(&display) {
+                Ok(c) => c,
+                Err(e) => {
+                    vlog(
+                        1,
+                        &format!("X11 display {display}: {}", common::io_reason(&e)),
+                    );
+                    return;
+                }
+            };
+            let early = stream.take_buffered();
+            if conn
+                .write_all(&setup)
+                .and_then(|()| conn.write_all(&early))
+                .is_err()
+            {
+                return;
+            }
+            spawn_splice_to_tcp(stream, conn);
+        });
+    })
 }
 
 /// `LogLevel QUIET` (`-q`): not even the fatal error ending ssh is shown.

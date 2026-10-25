@@ -1127,18 +1127,29 @@ mod tests {
             SSH_AGENT_SUCCESS
         );
         let unlock = |s: &mut AgentState, p: &[u8]| s.handle(&msg(SSH_AGENTC_UNLOCK, &pass(p)))[0];
+        // The penalty set by the failure that started at `before`. Checked
+        // and expired by hand, not with sleeps, so a stalled CI runner
+        // cannot outlast it mid-test.
+        let penalty = |s: &AgentState, before: Instant| s.unlock_after.unwrap() - before;
+        let expire = |s: &mut AgentState| s.unlock_after = Some(Instant::now());
+        let before = Instant::now();
         assert_eq!(unlock(&mut s, b"bad"), SSH_AGENT_FAILURE);
+        assert!(penalty(&s, before) >= UNLOCK_DELAY_STEP);
         assert_eq!(
             unlock(&mut s, b"pw"),
             SSH_AGENT_FAILURE,
             "within the penalty"
         );
-        std::thread::sleep(UNLOCK_DELAY_STEP);
+        expire(&mut s);
+        let before = Instant::now();
         assert_eq!(unlock(&mut s, b"bad"), SSH_AGENT_FAILURE);
         assert_eq!(s.unlock_failures, 2);
-        std::thread::sleep(UNLOCK_DELAY_STEP);
-        assert_eq!(unlock(&mut s, b"pw"), SSH_AGENT_FAILURE, "penalty grows");
-        std::thread::sleep(UNLOCK_DELAY_STEP);
+        assert!(
+            penalty(&s, before) >= UNLOCK_DELAY_STEP * 2,
+            "penalty grows"
+        );
+        assert_eq!(unlock(&mut s, b"pw"), SSH_AGENT_FAILURE);
+        expire(&mut s);
         assert_eq!(unlock(&mut s, b"pw"), SSH_AGENT_SUCCESS);
         assert_eq!(s.unlock_failures, 0);
         // A new lock salts afresh.

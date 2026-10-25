@@ -193,6 +193,8 @@ pub struct AgentState {
     websafe_allowlist: Option<String>,
     #[cfg(feature = "security-key")]
     sk_prompt: Option<alloc::sync::Arc<dyn crate::sk::Prompt>>,
+    /// Show MD5 rather than SHA-256 fingerprints (`ssh-agent -E md5`).
+    md5_fingerprints: bool,
 }
 
 /// The providers `ssh-agent` loads by default (`-P`).
@@ -253,6 +255,7 @@ impl AgentState {
             websafe_allowlist: Some("ssh:*".into()),
             #[cfg(feature = "security-key")]
             sk_prompt: None,
+            md5_fingerprints: false,
         }
     }
 
@@ -299,6 +302,12 @@ impl AgentState {
     /// (`ssh-agent -t`).
     pub fn set_default_lifetime(&mut self, lifetime: Option<Duration>) {
         self.default_lifetime = lifetime;
+    }
+
+    /// Fingerprints in confirmation prompts as `MD5:xx:xx:…` rather than
+    /// `SHA256:…` (`ssh-agent -E md5`).
+    pub fn set_md5_fingerprints(&mut self, md5: bool) {
+        self.md5_fingerprints = md5;
     }
 
     /// Number of keys held (expired ones excluded).
@@ -482,11 +491,15 @@ impl AgentState {
             ));
         }
         if held.confirm {
-            let mut prompt = format!(
-                "Allow use of key {}?\nKey fingerprint {}.",
-                held.comment,
-                held.key.public_key().sha256_fingerprint()
-            );
+            let pk = held.key.public_key();
+            let fp = if self.md5_fingerprints {
+                let digest = purecrypto::hash::Md5::digest(&pk.wire_blob());
+                let hex: Vec<String> = digest.iter().map(|b| format!("{b:02x}")).collect();
+                format!("MD5:{}", hex.join(":"))
+            } else {
+                pk.sha256_fingerprint()
+            };
+            let mut prompt = format!("Allow use of key {}?\nKey fingerprint {fp}.", held.comment);
             if let Some(d) = sig_dest {
                 prompt.push('\n');
                 prompt.push_str(&d);
@@ -1584,5 +1597,39 @@ mod tests {
         a.remove_all_identities().unwrap();
         assert!(a.identities().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn confirm_prompt_fingerprint_hash() {
+        let ed = fixture("u_ed25519");
+        let blob = ed.public_key().wire_blob();
+        let mut body = ed.to_agent_add_body();
+        body.push(SSH_AGENT_CONSTRAIN_CONFIRM);
+        for (md5, want) in [
+            (false, ed.public_key().sha256_fingerprint()),
+            (
+                true,
+                "MD5:05:cf:97:c7:22:3d:df:5b:87:d6:93:67:f8:60:25:79".into(),
+            ),
+        ] {
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+            let mut s = AgentState::new();
+            let log = seen.clone();
+            s.set_confirm(Box::new(move |p| {
+                *log.lock().unwrap() = p.to_string();
+                true
+            }));
+            s.set_md5_fingerprints(md5);
+            assert_eq!(
+                s.handle(&msg(SSH_AGENTC_ADD_ID_CONSTRAINED, &body))[0],
+                SSH_AGENT_SUCCESS
+            );
+            assert!(sign(&mut s, &blob, b"data", 0).is_some());
+            let prompt = seen.lock().unwrap().clone();
+            assert!(
+                prompt.contains(&format!("Key fingerprint {want}.")),
+                "{prompt}"
+            );
+        }
     }
 }

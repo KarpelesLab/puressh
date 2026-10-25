@@ -234,6 +234,10 @@ required-features = ["std", "client"]
 # to have it built (it is off by default); without it they are skipped.
 
 [[test]]
+name = "agent_cli"
+required-features = ["agent"]
+
+[[test]]
 name = "e2e_auth_command"
 required-features = ["server"]
 

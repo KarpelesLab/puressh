@@ -141,9 +141,11 @@ pub struct DefaultX11ForwardHandler {
     max_display: u16,
     /// Per-user `X11DisplayOffset` / `X11UseLocalhost` (see
     /// [`Self::with_display_policy`]).
-    display_policy: Option<X11DisplayPolicyFn>,
-    /// Run on each accepted X client connection.
-    socket_hook: Option<super::SocketHook>,
+    // Called, never mutated through: holding it keeps the handler
+    // unwind-safe whatever the closure captures.
+    display_policy: Option<core::panic::AssertUnwindSafe<X11DisplayPolicyFn>>,
+    /// Run on each accepted X client connection (unwind-safe as above).
+    socket_hook: Option<core::panic::AssertUnwindSafe<super::SocketHook>>,
     /// When `true`, accepted local connections are spliced straight through
     /// without validating the X11 authorisation cookie. This is the legacy
     /// "trust loopback" behaviour and is OPT-IN: a local user on the server
@@ -238,13 +240,13 @@ impl DefaultX11ForwardHandler {
     /// `policy` (OpenSSH's `X11DisplayOffset`, `X11UseLocalhost`). Displays
     /// still end at the configured maximum.
     pub fn with_display_policy(mut self, policy: X11DisplayPolicyFn) -> Self {
-        self.display_policy = Some(policy);
+        self.display_policy = Some(core::panic::AssertUnwindSafe(policy));
         self
     }
 
     /// Run `hook` on each accepted X client connection.
     pub fn with_socket_hook(mut self, hook: super::SocketHook) -> Self {
-        self.socket_hook = Some(hook);
+        self.socket_hook = Some(core::panic::AssertUnwindSafe(hook));
         self
     }
 
@@ -366,7 +368,7 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
             Some(p) => self.bind_first_free(p.offset)?,
             None => self.bind_first_free(self.min_display)?,
         };
-        let socket_hook = self.socket_hook.clone();
+        let socket_hook = self.socket_hook.as_deref().cloned();
         for listener in &listeners {
             listener.set_nonblocking(true)?;
         }

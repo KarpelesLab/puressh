@@ -4689,9 +4689,9 @@ mod imp {
     impl AttemptNote {
         fn of(attempt: &AuthAttempt) -> Self {
             let (method, user, probe, key) = match attempt {
-                AuthAttempt::None { user } => ("none", user, false, String::new()),
+                AuthAttempt::None { user, .. } => ("none", user, false, String::new()),
                 AuthAttempt::Password { user, .. } => ("password", user, false, String::new()),
-                AuthAttempt::KeyboardInteractive { user } => {
+                AuthAttempt::KeyboardInteractive { user, .. } => {
                     ("keyboard-interactive/pam", user, false, String::new())
                 }
                 AuthAttempt::PublicKey {
@@ -4829,7 +4829,7 @@ mod imp {
                     return AuthDecision::Reject;
                 }
                 match attempt {
-                    AuthAttempt::None { user } => {
+                    AuthAttempt::None { user, .. } => {
                         if self.debug {
                             eprintln!("sshd: auth none rejected for user {}", sanitize_log(&user));
                         }
@@ -4843,6 +4843,7 @@ mod imp {
                         verified,
                         cert,
                         security_key,
+                        ..
                     } => {
                         // An invalid username, or a username switched
                         // mid-userauth, is refused before anything else. Both
@@ -5015,7 +5016,7 @@ mod imp {
                         // chain it may PartialAccept and ask for the next factor.
                         self.record_and_decide("publickey")
                     }
-                    AuthAttempt::Password { user, password } => {
+                    AuthAttempt::Password { user, password, .. } => {
                         if !self.password_enabled {
                             if self.debug {
                                 eprintln!(
@@ -5030,7 +5031,7 @@ mod imp {
                         let pw = purecrypto::zeroize::Zeroizing::new(password.as_bytes().to_vec());
                         self.verify_password(&user, "password", pw)
                     }
-                    AuthAttempt::KeyboardInteractive { user } => {
+                    AuthAttempt::KeyboardInteractive { user, .. } => {
                         if !self.kbd_interactive_enabled {
                             if self.debug {
                                 eprintln!(
@@ -10140,15 +10141,11 @@ mod imp {
             assert!(!a.check_user_binding("eve\x1b[2J"));
             assert!(a.bound_user.is_none(), "an invalid name must not bind");
             // A publickey attempt with such a name is refused outright.
-            let decision = a.evaluate(AuthAttempt::PublicKey {
-                user: "eve\r\nforged: line".into(),
-                algorithm: "ssh-ed25519".into(),
-                public_blob: vec![1, 2, 3],
-                probe_only: true,
-                verified: false,
-                cert: None,
-                security_key: None,
-            });
+            let decision = a.evaluate(AuthAttempt::public_key(
+                "eve\r\nforged: line",
+                "ssh-ed25519",
+                vec![1, 2, 3],
+            ));
             assert!(matches!(decision, AuthDecision::Reject));
         }
 
@@ -10864,28 +10861,13 @@ mod imp {
 
             // A verified publickey attempt for an authorized-but-revoked key is
             // rejected.
-            let decision = a.evaluate(AuthAttempt::PublicKey {
-                user: "alice".into(),
-                algorithm: "ssh-ed25519".into(),
-                public_blob: blob.clone(),
-                probe_only: false,
-                verified: true,
-                cert: None,
-                security_key: None,
-            });
+            let decision = a
+                .evaluate(AuthAttempt::public_key("alice", "ssh-ed25519", blob.clone()).verified());
             assert!(matches!(decision, AuthDecision::Reject));
         }
 
         fn verified_attempt(alg: &str, blob: &[u8]) -> AuthAttempt {
-            AuthAttempt::PublicKey {
-                user: "alice".into(),
-                algorithm: alg.into(),
-                public_blob: blob.to_vec(),
-                probe_only: false,
-                verified: true,
-                cert: None,
-                security_key: None,
-            }
+            AuthAttempt::public_key("alice", alg, blob.to_vec()).verified()
         }
 
         fn authorizing(blob: &[u8]) -> LocalAuthenticator {
@@ -10981,29 +10963,25 @@ mod imp {
             let mut a = auth_with(&["*"], &[], &[], &[], Default::default());
             a.trusted_user_ca_blobs = vec![ca_blob.clone()];
             // Sanity: without a KRL the certificate is accepted.
-            let ok = a.evaluate(AuthAttempt::PublicKey {
-                user: "alice".into(),
-                algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
-                public_blob: cert_blob.clone(),
-                probe_only: false,
-                verified: true,
-                cert: Some(ci.clone()),
-                security_key: None,
-            });
+            let ok = a.evaluate(
+                AuthAttempt::public_key(
+                    "alice",
+                    "ssh-ed25519-cert-v01@openssh.com",
+                    cert_blob.clone(),
+                )
+                .verified()
+                .with_cert(ci.clone()),
+            );
             assert!(matches!(ok, AuthDecision::Accept), "{ok:?}");
 
             let mut b = auth_with(&["*"], &[], &[], &[], Default::default());
             b.trusted_user_ca_blobs = vec![ca_blob];
             b.revoked_keys = Some(std::sync::Arc::new(krl));
-            let decision = b.evaluate(AuthAttempt::PublicKey {
-                user: "alice".into(),
-                algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
-                public_blob: cert_blob,
-                probe_only: false,
-                verified: true,
-                cert: Some(ci),
-                security_key: None,
-            });
+            let decision = b.evaluate(
+                AuthAttempt::public_key("alice", "ssh-ed25519-cert-v01@openssh.com", cert_blob)
+                    .verified()
+                    .with_cert(ci),
+            );
             assert!(matches!(decision, AuthDecision::Reject), "{decision:?}");
         }
 
@@ -11012,15 +10990,13 @@ mod imp {
             "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINrIw2f/9CPMdm0gq/9PJiCID0Iep+LFikcQCJLkkFR/ test";
 
         fn cert_attempt(user: &str, ci: &puressh::auth::CertInfo) -> AuthAttempt {
-            AuthAttempt::PublicKey {
-                user: user.into(),
-                algorithm: "ssh-ed25519-cert-v01@openssh.com".into(),
-                public_blob: b"cert-blob".to_vec(),
-                probe_only: false,
-                verified: true,
-                cert: Some(ci.clone()),
-                security_key: None,
-            }
+            AuthAttempt::public_key(
+                user,
+                "ssh-ed25519-cert-v01@openssh.com",
+                b"cert-blob".to_vec(),
+            )
+            .verified()
+            .with_cert(ci.clone())
         }
 
         // ---- S7: principals= on cert-authority lines ------------------------
@@ -11230,15 +11206,10 @@ mod imp {
             assert_eq!(set.blobs, vec![unhex(USERKEY_BLOB_HEX)]);
 
             // The key authorizes that user…
-            let decision = a.evaluate(AuthAttempt::PublicKey {
-                user: info.name.clone(),
-                algorithm: "ssh-ed25519".into(),
-                public_blob: unhex(USERKEY_BLOB_HEX),
-                probe_only: false,
-                verified: true,
-                cert: None,
-                security_key: None,
-            });
+            let decision = a.evaluate(
+                AuthAttempt::public_key(info.name.clone(), "ssh-ed25519", unhex(USERKEY_BLOB_HEX))
+                    .verified(),
+            );
             assert!(matches!(decision, AuthDecision::Accept), "{decision:?}");
 
             // …and nobody else: a different (nonexistent-file) user gets an
@@ -11439,15 +11410,9 @@ mod imp {
             a.policy = Some(pol);
             a.on_user_resolved("alice", &[]);
             assert!(a.policy_broken);
-            let decision = a.evaluate(AuthAttempt::PublicKey {
-                user: "alice".into(),
-                algorithm: "ssh-ed25519".into(),
-                public_blob: unhex(USERKEY_BLOB_HEX),
-                probe_only: false,
-                verified: true,
-                cert: None,
-                security_key: None,
-            });
+            let decision = a.evaluate(
+                AuthAttempt::public_key("alice", "ssh-ed25519", unhex(USERKEY_BLOB_HEX)).verified(),
+            );
             assert!(matches!(decision, AuthDecision::Reject));
         }
 
@@ -11754,15 +11719,8 @@ mod imp {
                 cas: Vec::new(),
                 ..Default::default()
             });
-            let decision = a.evaluate(AuthAttempt::PublicKey {
-                user: "alice".into(),
-                algorithm: "ssh-ed25519".into(),
-                public_blob: blob,
-                probe_only: false,
-                verified: true,
-                cert: None,
-                security_key: None,
-            });
+            let decision =
+                a.evaluate(AuthAttempt::public_key("alice", "ssh-ed25519", blob).verified());
             assert!(matches!(decision, AuthDecision::Accept));
         }
     }

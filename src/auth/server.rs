@@ -33,11 +33,13 @@ fn account_name(user: &str) -> &str {
 #[non_exhaustive]
 pub enum AuthAttempt {
     /// `none` — bare probe.
+    #[non_exhaustive]
     None {
         /// Requested user name.
         user: String,
     },
     /// `password` authentication.
+    #[non_exhaustive]
     Password {
         /// Requested user name.
         user: String,
@@ -47,6 +49,7 @@ pub enum AuthAttempt {
         password: SecretString,
     },
     /// `publickey` authentication.
+    #[non_exhaustive]
     PublicKey {
         /// Requested user name.
         user: String,
@@ -77,6 +80,7 @@ pub enum AuthAttempt {
         security_key: Option<SkSignature>,
     },
     /// `keyboard-interactive` request.
+    #[non_exhaustive]
     KeyboardInteractive {
         /// Requested user name.
         user: String,
@@ -127,6 +131,79 @@ impl SkSignature {
             return Err(SkRequirement::UserVerification);
         }
         Ok(())
+    }
+}
+
+impl AuthAttempt {
+    /// A `none` attempt.
+    pub fn none(user: impl Into<String>) -> Self {
+        AuthAttempt::None { user: user.into() }
+    }
+
+    /// A `password` attempt.
+    pub fn password(user: impl Into<String>, password: SecretString) -> Self {
+        AuthAttempt::Password {
+            user: user.into(),
+            password,
+        }
+    }
+
+    /// A `keyboard-interactive` request.
+    pub fn keyboard_interactive(user: impl Into<String>) -> Self {
+        AuthAttempt::KeyboardInteractive { user: user.into() }
+    }
+
+    /// A `publickey` probe: no signature, no certificate. Chain
+    /// [`verified`](Self::verified), [`with_cert`](Self::with_cert) and
+    /// [`with_security_key`](Self::with_security_key) to describe a signed
+    /// attempt.
+    pub fn public_key(
+        user: impl Into<String>,
+        algorithm: impl Into<String>,
+        public_blob: impl Into<Vec<u8>>,
+    ) -> Self {
+        AuthAttempt::PublicKey {
+            user: user.into(),
+            algorithm: algorithm.into(),
+            public_blob: public_blob.into(),
+            probe_only: true,
+            verified: false,
+            cert: None,
+            security_key: None,
+        }
+    }
+
+    /// A `publickey` attempt whose signature was present and verified.
+    /// Other attempts are returned unchanged.
+    pub fn verified(mut self) -> Self {
+        if let AuthAttempt::PublicKey {
+            probe_only,
+            verified,
+            ..
+        } = &mut self
+        {
+            *probe_only = false;
+            *verified = true;
+        }
+        self
+    }
+
+    /// A `publickey` attempt made with the certificate `cert`. Other
+    /// attempts are returned unchanged.
+    pub fn with_cert(mut self, cert: CertInfo) -> Self {
+        if let AuthAttempt::PublicKey { cert: c, .. } = &mut self {
+            *c = Some(cert);
+        }
+        self
+    }
+
+    /// A `publickey` attempt signed by a security key. Other attempts are
+    /// returned unchanged.
+    pub fn with_security_key(mut self, sk: SkSignature) -> Self {
+        if let AuthAttempt::PublicKey { security_key, .. } = &mut self {
+            *security_key = Some(sk);
+        }
+        self
     }
 }
 

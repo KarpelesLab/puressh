@@ -205,7 +205,9 @@ pub struct DefaultAgentForwardHandler {
     /// scratch directory.
     parent_dir: Option<PathBuf>,
     /// Per-user socket placement (`AgentSocketPath`), over `parent_dir`.
-    location: Option<AgentSocketLocationFn>,
+    // Called, never mutated through: holding it keeps the handler
+    // unwind-safe whatever the closure captures.
+    location: Option<core::panic::AssertUnwindSafe<AgentSocketLocationFn>>,
 }
 
 #[cfg(feature = "server")]
@@ -229,7 +231,7 @@ impl DefaultAgentForwardHandler {
     /// Place each user's socket where `location` says (OpenSSH 10's
     /// `AgentSocketPath`), instead of under the parent directory.
     pub fn with_socket_location(mut self, location: AgentSocketLocationFn) -> Self {
-        self.location = Some(location);
+        self.location = Some(core::panic::AssertUnwindSafe(location));
         self
     }
 

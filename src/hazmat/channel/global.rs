@@ -41,10 +41,6 @@ pub enum GlobalRequest {
     },
     /// OpenSSH's `"keepalive@openssh.com"` heartbeat.
     Keepalive,
-    /// OpenSSH's `"no-more-sessions@openssh.com"` (PROTOCOL §2.2): the
-    /// client will open no further `session` channels, and a server that
-    /// honours it ends the connection if one is opened anyway.
-    NoMoreSessions,
     /// Any request type we don't recognise.
     Other {
         /// Request name as advertised on the wire.
@@ -52,6 +48,10 @@ pub enum GlobalRequest {
         /// Type-specific body verbatim.
         raw: Vec<u8>,
     },
+    /// OpenSSH's `"no-more-sessions@openssh.com"` (PROTOCOL §2.2): the
+    /// client will open no further `session` channels, and a server that
+    /// honours it ends the connection if one is opened anyway.
+    NoMoreSessions,
 }
 
 impl GlobalRequest {

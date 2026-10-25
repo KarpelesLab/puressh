@@ -343,7 +343,9 @@ pub struct KexRunner {
     gex_sizes: Option<GexSizes>,
     /// The server's group-exchange group selection (`ModuliFile`); the
     /// built-in RFC 3526 groups without one.
-    gex_selector: Option<GexGroupSelector>,
+    // Called, never mutated through: holding it keeps the runner
+    // unwind-safe whatever the closure captures.
+    gex_selector: Option<core::panic::AssertUnwindSafe<GexGroupSelector>>,
 }
 
 /// Picks the Diffie-Hellman group a server's group exchange offers for a
@@ -388,7 +390,7 @@ impl KexRunner {
     /// Server side: choose group-exchange groups with `selector` instead of
     /// the built-in fixed groups.
     pub fn set_gex_selector(&mut self, selector: Option<GexGroupSelector>) {
-        self.gex_selector = selector;
+        self.gex_selector = selector.map(core::panic::AssertUnwindSafe);
     }
 
     /// Strict-kex (Terrapin / CVE-2023-48795) enabled on this connection,
@@ -1170,7 +1172,7 @@ impl KexRunner {
     /// `GEX_GROUP`, and park in [`Phase::GexServerAwaitInit`].
     fn handle_gex_request(&mut self, payload: &[u8]) -> Result<KexAdvance> {
         let mut refused = false;
-        let (request, group, out) = match &self.gex_selector {
+        let (request, group, out) = match self.gex_selector.as_deref() {
             None => GexSha256::server_group(payload, default_gex_group)?,
             Some(select) => GexSha256::server_group(payload, |req| {
                 select(req).unwrap_or_else(|| {

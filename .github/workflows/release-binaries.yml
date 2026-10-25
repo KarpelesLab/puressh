@@ -196,9 +196,9 @@ jobs:
         run: gh release upload "${TAG}" out/* --clobber
 
   # Upload Ubuntu source packages to ppa:karpeleslab/puressh; Launchpad builds
-  # them (see packaging/launchpad/README.md). Skips itself (no failure) until
-  # the LAUNCHPAD_GPG_PRIVATE_KEY secret is set: a key registered on the
-  # Launchpad account that may upload to the PPA.
+  # them (see packaging/launchpad/README.md). Signed with the apt repository's
+  # key (APT_GPG_PRIVATE_KEY), which has to be registered on the Launchpad
+  # account that may upload to the PPA; skips itself without that secret.
   publish-launchpad:
     name: upload to Launchpad
     runs-on: ubuntu-latest
@@ -206,12 +206,12 @@ jobs:
       - name: Check for signing key
         id: check
         env:
-          LAUNCHPAD_GPG_PRIVATE_KEY: ${{ secrets.LAUNCHPAD_GPG_PRIVATE_KEY }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
         run: |
-          if [ -n "$LAUNCHPAD_GPG_PRIVATE_KEY" ]; then
+          if [ -n "$APT_GPG_PRIVATE_KEY" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
-            echo "LAUNCHPAD_GPG_PRIVATE_KEY is not set; skipping the Launchpad upload." >&2
+            echo "APT_GPG_PRIVATE_KEY is not set; skipping the Launchpad upload." >&2
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
@@ -231,17 +231,17 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         id: gpg
         env:
-          LAUNCHPAD_GPG_PRIVATE_KEY: ${{ secrets.LAUNCHPAD_GPG_PRIVATE_KEY }}
-          LAUNCHPAD_GPG_PASSPHRASE: ${{ secrets.LAUNCHPAD_GPG_PASSPHRASE }}
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
         run: |
           set -euo pipefail
           export GNUPGHOME="$RUNNER_TEMP/gnupg"
           mkdir -p "$GNUPGHOME" && chmod 700 "$GNUPGHOME"
-          printf '%s' "$LAUNCHPAD_GPG_PRIVATE_KEY" | gpg --batch --import
+          printf '%s' "$APT_GPG_PRIVATE_KEY" | gpg --batch --import
           keyid=$(gpg --list-secret-keys --with-colons | awk -F: '/^fpr:/{print $10; exit}')
           # debsign runs this instead of gpg, so a protected key signs
-          # unattended (LAUNCHPAD_GPG_PASSPHRASE, optional).
-          printf '%s' "${LAUNCHPAD_GPG_PASSPHRASE:-}" > "$RUNNER_TEMP/passphrase"
+          # unattended (APT_GPG_PASSPHRASE, optional).
+          printf '%s' "${APT_GPG_PASSPHRASE:-}" > "$RUNNER_TEMP/passphrase"
           cat > "$RUNNER_TEMP/gpg-batch" <<SH
           #!/bin/sh
           exec gpg --batch --pinentry-mode loopback --passphrase-file "$RUNNER_TEMP/passphrase" "\$@"

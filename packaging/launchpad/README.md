@@ -47,13 +47,28 @@ them.
 ## Uploading
 
 The `publish-launchpad` job of the release workflow builds, signs and
-uploads the four source packages when a release is published. It needs:
+uploads the four source packages when a release is published. It signs with
+the apt repository's key (`APT_GPG_PRIVATE_KEY`, and `APT_GPG_PASSPHRASE` if
+it has one; see [`../apt/README.md`](../apt/README.md)), which Launchpad only
+accepts once it is registered on an account that may upload to the PPA:
 
-- `LAUNCHPAD_GPG_PRIVATE_KEY`: an ASCII-armoured secret key (`gpg --armor
-  --export-secret-keys KEYID`) whose public key is registered on a Launchpad
-  account (https://launchpad.net/~/+editpgpkeys) that may upload to the
-  PPA. Launchpad mails a challenge to decrypt when the key is added.
-- `LAUNCHPAD_GPG_PASSPHRASE` if the key has a passphrase.
+1. Launchpad confirms a key by mailing a challenge encrypted to it, and the
+   apt key is sign-only. Give it an encryption subkey (this leaves the
+   signing key, and so every apt user's keyring, unchanged):
+
+   ```
+   gpg --import apt-signing-key.asc
+   gpg --quick-add-key FINGERPRINT cv25519 encr never
+   gpg --keyserver keyserver.ubuntu.com --send-keys FINGERPRINT
+   ```
+
+2. Add FINGERPRINT at https://launchpad.net/~/+editpgpkeys and open the
+   link in the encrypted mail (`gpg --decrypt`).
+
+The CI secret needs no update: the subkey only has to exist on the
+keyserver, and signing uses the primary key. Uploads signed by a key
+Launchpad doesn't know are dropped without any mail, so register it before
+the next release.
 
 The PPA must build for amd64 and arm64: enable arm64 under "Change details"
 → "Processors" on the PPA's page.

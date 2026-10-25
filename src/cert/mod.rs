@@ -80,6 +80,13 @@ impl CertType {
 const MLDSA: &str = "ssh-mldsa44-ed25519@openssh.com";
 const MLDSA_CERT: &str = "ssh-mldsa44-ed25519-cert-v01@openssh.com";
 
+/// Security-key certificates (the WebAuthn name is a signature name for an
+/// `sk-ecdsa` certificate, never a blob type).
+const SK_ED25519_CERT: &str = "sk-ssh-ed25519-cert-v01@openssh.com";
+const SK_ECDSA_CERT: &str = "sk-ecdsa-sha2-nistp256-cert-v01@openssh.com";
+const WEBAUTHN_SK_ECDSA_CERT: &str = "webauthn-sk-ecdsa-sha2-nistp256-cert-v01@openssh.com";
+use crate::hostkey::sk::{SK_ECDSA, SK_ED25519, WEBAUTHN_SK_ECDSA};
+
 /// The certificate key-type names this build understands.
 ///
 /// These are the names OpenSSH puts on the wire (KEX host-key list,
@@ -94,6 +101,9 @@ pub const CERT_KEY_NAMES: &[&str] = &[
     "ecdsa-sha2-nistp256-cert-v01@openssh.com",
     "ecdsa-sha2-nistp384-cert-v01@openssh.com",
     "ecdsa-sha2-nistp521-cert-v01@openssh.com",
+    SK_ED25519_CERT,
+    SK_ECDSA_CERT,
+    WEBAUTHN_SK_ECDSA_CERT,
     "rsa-sha2-512-cert-v01@openssh.com",
     "rsa-sha2-256-cert-v01@openssh.com",
 ];
@@ -124,6 +134,9 @@ pub fn cert_name_to_plain(name: &str) -> Option<&'static str> {
         "rsa-sha2-256-cert-v01@openssh.com" => Some("rsa-sha2-256"),
         "ssh-rsa-cert-v01@openssh.com" => Some("ssh-rsa"),
         MLDSA_CERT => Some(MLDSA),
+        SK_ED25519_CERT => Some(SK_ED25519),
+        SK_ECDSA_CERT => Some(SK_ECDSA),
+        WEBAUTHN_SK_ECDSA_CERT => Some(WEBAUTHN_SK_ECDSA),
         _ => None,
     }
 }
@@ -157,6 +170,8 @@ fn blob_type_to_plain(name: &str) -> Option<&'static str> {
         "ecdsa-sha2-nistp521-cert-v01@openssh.com" => Some("ecdsa-sha2-nistp521"),
         "ssh-rsa-cert-v01@openssh.com" => Some("ssh-rsa"),
         MLDSA_CERT => Some(MLDSA),
+        SK_ED25519_CERT => Some(SK_ED25519),
+        SK_ECDSA_CERT => Some(SK_ECDSA),
         _ => None,
     }
 }
@@ -306,6 +321,27 @@ fn read_embedded_pubkey(key_type: &str, r: &mut Reader<'_>) -> Result<Vec<u8>> {
             crate::hostkey::MlDsa44Ed25519HostKey::from_public(pk)?;
             w.write_string(MLDSA.as_bytes());
             w.write_string(pk);
+        }
+        // The plain key's fields, then its FIDO application.
+        SK_ED25519_CERT => {
+            let pk = r.read_string()?;
+            if pk.len() != 32 {
+                return Err(Error::Format("cert: ed25519 key length"));
+            }
+            w.write_string(SK_ED25519.as_bytes());
+            w.write_string(pk);
+            w.write_string(r.read_string()?);
+        }
+        SK_ECDSA_CERT => {
+            let curve = r.read_string()?;
+            if curve != b"nistp256" {
+                return Err(Error::Format("cert: ecdsa curve mismatch"));
+            }
+            let point = r.read_string()?;
+            w.write_string(SK_ECDSA.as_bytes());
+            w.write_string(curve);
+            w.write_string(point);
+            w.write_string(r.read_string()?);
         }
         "ssh-rsa-cert-v01@openssh.com" => {
             // RSA cert public fields are `mpint e, mpint n` — note the order
@@ -497,6 +533,8 @@ impl Certificate {
                 matches!(sig_algo, "ssh-rsa" | "rsa-sha2-256" | "rsa-sha2-512")
             }
             MLDSA => sig_algo == MLDSA,
+            SK_ED25519 => sig_algo == SK_ED25519,
+            SK_ECDSA => matches!(sig_algo, SK_ECDSA | WEBAUTHN_SK_ECDSA),
             _ => false,
         };
         if !compatible {
@@ -596,7 +634,12 @@ impl Certificate {
     pub fn unknown_critical_options(&self) -> Vec<&str> {
         self.critical_options
             .iter()
-            .filter(|(name, _)| !matches!(name.as_str(), "force-command" | "source-address"))
+            .filter(|(name, _)| {
+                !matches!(
+                    name.as_str(),
+                    "force-command" | "source-address" | "verify-required"
+                )
+            })
             .map(|(name, _)| name.as_str())
             .collect()
     }
@@ -764,6 +807,8 @@ impl CertificateBuilder {
             b"ecdsa-sha2-nistp521" => "ecdsa-sha2-nistp521-cert-v01@openssh.com",
             b"ssh-rsa" => "ssh-rsa-cert-v01@openssh.com",
             b"ssh-mldsa44-ed25519@openssh.com" => MLDSA_CERT,
+            b"sk-ssh-ed25519@openssh.com" => SK_ED25519_CERT,
+            b"sk-ecdsa-sha2-nistp256@openssh.com" => SK_ECDSA_CERT,
             _ => return Err(Error::Unsupported("cert: key type")),
         };
         if self.valid_after > self.valid_before {

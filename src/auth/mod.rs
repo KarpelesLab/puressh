@@ -33,7 +33,9 @@ pub use client::{ClientCredential, KeyboardInteractiveResponder};
 #[cfg(feature = "alloc")]
 pub use message::SecretString;
 #[cfg(feature = "alloc")]
-pub use server::{AuthAttempt, AuthCertCaps, AuthDecision, Authenticator, CertInfo};
+pub use server::{
+    AuthAttempt, AuthCertCaps, AuthDecision, Authenticator, CertInfo, SkRequirement, SkSignature,
+};
 
 // The sans-IO step machines are plumbing the drivers are built from. They
 // stay `pub` here because `client::Client::new_auth_driver` / `run_auth`

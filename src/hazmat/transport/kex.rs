@@ -142,6 +142,9 @@ pub mod defaults {
         "ecdsa-sha2-nistp256",
         "ecdsa-sha2-nistp384",
         "ecdsa-sha2-nistp521",
+        "sk-ssh-ed25519@openssh.com",
+        "sk-ecdsa-sha2-nistp256@openssh.com",
+        "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
         "rsa-sha2-512",
         "rsa-sha2-256",
     ];

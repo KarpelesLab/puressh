@@ -1409,6 +1409,9 @@ pub struct Config {
     /// (`config::algos::CA_SIGNATURE_DEFAULTS`). Threaded into the
     /// per-connection [`ServerAuth`] for certificate verification.
     pub ca_signature_algorithms: Vec<String>,
+    /// `PubkeyAuthOptions` outside any `Match` block: `(touch-required,
+    /// verify-required)` for security-key signatures.
+    pub pubkey_auth_options: (bool, bool),
 }
 
 /// Resolver from a user name to its supplementary group names. Boxed so the
@@ -1766,6 +1769,7 @@ impl Config {
             compression: None,
             default_auth_methods: Vec::new(),
             ca_signature_algorithms: Vec::new(),
+            pubkey_auth_options: (false, false),
         }
     }
 
@@ -2530,6 +2534,7 @@ fn do_server_auth(
     // CASignatureAlgorithms. `now` is read from the wall clock at the std edge.
     server_auth.set_now(unix_now());
     server_auth.set_ca_signature_algorithms(cfg.ca_signature_algorithms.clone());
+    server_auth.set_pubkey_auth_options(cfg.pubkey_auth_options.0, cfg.pubkey_auth_options.1);
     // The host key the key exchange presented, which a hostbound publickey
     // request must name.
     if let Some(neg) = driver.negotiated()
@@ -2562,6 +2567,10 @@ fn do_server_auth(
                     local_port,
                 );
                 server_auth.set_accepted_methods(reres.methods);
+                server_auth.set_pubkey_auth_options(
+                    reres.pubkey_auth_options.0,
+                    reres.pubkey_auth_options.1,
+                );
                 // Let the authenticator install per-user multi-factor chains
                 // (resolved from `AuthenticationMethods` in any matched block)
                 // before the first attempt is evaluated.
@@ -2634,6 +2643,8 @@ struct ReResolvedUserPolicy {
     /// Resolved `AuthenticationMethods` for this user (space-separated
     /// alternatives, each a comma-chain). Empty ⇒ single-factor.
     auth_methods: Vec<String>,
+    /// `PubkeyAuthOptions` for this user.
+    pubkey_auth_options: (bool, bool),
 }
 
 /// Re-resolve the policy with the full user/groups context (the first
@@ -2654,6 +2665,7 @@ fn reresolve_user_policy(
             methods: base_methods.to_vec(),
             banner: None,
             auth_methods: cfg.default_auth_methods.clone(),
+            pubkey_auth_options: cfg.pubkey_auth_options,
         };
     };
     let groups = resolve_user_groups(cfg, user);
@@ -2685,6 +2697,7 @@ fn reresolve_user_policy(
         methods,
         banner,
         auth_methods,
+        pubkey_auth_options: opts.pubkey_auth_options.unwrap_or(cfg.pubkey_auth_options),
     }
 }
 
@@ -8175,6 +8188,8 @@ mod tests {
             permit_open: None,
             permit_listen: None,
             force_tun_device: None,
+            no_touch_required: false,
+            verify_required: false,
         }
     }
 
@@ -8192,6 +8207,8 @@ mod tests {
             permit_open: None,
             permit_listen: None,
             force_tun_device: None,
+            no_touch_required: false,
+            verify_required: false,
         }
     }
 
@@ -8273,6 +8290,8 @@ mod tests {
             permit_open: None,
             permit_listen: None,
             force_tun_device: None,
+            no_touch_required: false,
+            verify_required: false,
         });
         assert!(eff.pty_allowed());
         assert!(!eff.agent_forwarding_allowed());

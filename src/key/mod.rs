@@ -126,6 +126,9 @@ impl AuthorizedKeyOptions {
             && self.allows_x11_forwarding()
             && self.allows_user_rc()
             && self.environment.is_empty()
+            && self.tunnel.is_none()
+            && !self.no_touch_required
+            && !self.verify_required
     }
 
     /// Parse a comma-separated option list (the leading field of an
@@ -341,6 +344,24 @@ pub enum PublicKey {
         /// Trailing comment.
         comment: String,
     },
+    /// `sk-ecdsa-sha2-nistp256@openssh.com` — a FIDO security key.
+    SkEcdsaP256 {
+        /// Uncompressed EC point.
+        point: Vec<u8>,
+        /// FIDO application (relying party), normally `ssh:`.
+        application: String,
+        /// Trailing comment.
+        comment: String,
+    },
+    /// `sk-ssh-ed25519@openssh.com` — a FIDO security key.
+    SkEd25519 {
+        /// Raw 32-byte public key.
+        raw: [u8; 32],
+        /// FIDO application (relying party), normally `ssh:`.
+        application: String,
+        /// Trailing comment.
+        comment: String,
+    },
 }
 
 /// SSH private key, tagged by algorithm.
@@ -414,6 +435,86 @@ pub enum PrivateKey {
         /// Trailing comment.
         comment: String,
     },
+    /// `sk-ecdsa-sha2-nistp256@openssh.com`: a handle to a key held by a
+    /// FIDO authenticator, which alone can sign with it.
+    SkEcdsaP256 {
+        /// Uncompressed EC point.
+        point: Vec<u8>,
+        /// The authenticator's credential for the key.
+        sk: SkCredential,
+        /// Trailing comment.
+        comment: String,
+    },
+    /// `sk-ssh-ed25519@openssh.com`: a FIDO-held Ed25519 key.
+    SkEd25519 {
+        /// Raw 32-byte public key.
+        public: [u8; 32],
+        /// The authenticator's credential for the key.
+        sk: SkCredential,
+        /// Trailing comment.
+        comment: String,
+    },
+}
+
+/// What a security-key private key file holds instead of a secret: the
+/// FIDO application, the enrolment flags and the authenticator's opaque
+/// key handle (OpenSSH `PROTOCOL.u2f`).
+#[derive(Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SkCredential {
+    /// FIDO application (relying party), normally `ssh:`.
+    pub application: String,
+    /// Enrolment flags: `0x01` user presence required (cleared by
+    /// `no-touch-required`), `0x04` user verification required, `0x20`
+    /// resident (discoverable) credential.
+    pub flags: u8,
+    /// The authenticator's key handle (credential ID).
+    pub key_handle: Vec<u8>,
+    /// Reserved; empty in keys OpenSSH writes.
+    pub reserved: Vec<u8>,
+}
+
+impl SkCredential {
+    /// A credential for `application` with `flags` and `key_handle`.
+    pub fn new(application: String, flags: u8, key_handle: Vec<u8>) -> Self {
+        Self {
+            application,
+            flags,
+            key_handle,
+            reserved: Vec::new(),
+        }
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self> {
+        let application = core::str::from_utf8(r.read_string()?)
+            .map_err(|_| Error::Format("sk: application is not utf-8"))?
+            .to_string();
+        let flags = r.read_u8()?;
+        let key_handle = r.read_string()?.to_vec();
+        let reserved = r.read_string()?.to_vec();
+        Ok(Self {
+            application,
+            flags,
+            key_handle,
+            reserved,
+        })
+    }
+
+    pub(crate) fn write(&self, w: &mut Writer) {
+        w.write_string(self.application.as_bytes());
+        w.write_u8(self.flags);
+        w.write_string(&self.key_handle);
+        w.write_string(&self.reserved);
+    }
+}
+
+impl core::fmt::Debug for SkCredential {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SkCredential")
+            .field("application", &self.application)
+            .field("flags", &self.flags)
+            .finish_non_exhaustive()
+    }
 }
 
 impl core::fmt::Debug for PrivateKey {
@@ -433,6 +534,8 @@ const ECDSA_P384: &str = "ecdsa-sha2-nistp384";
 const ECDSA_P521: &str = "ecdsa-sha2-nistp521";
 const RSA: &str = "ssh-rsa";
 const MLDSA44_ED25519: &str = "ssh-mldsa44-ed25519@openssh.com";
+const SK_ECDSA: &str = crate::hostkey::sk::SK_ECDSA;
+const SK_ED25519: &str = crate::hostkey::sk::SK_ED25519;
 
 const NISTP256: &str = "nistp256";
 const NISTP384: &str = "nistp384";
@@ -455,6 +558,8 @@ fn is_known_algorithm_name(s: &str) -> bool {
             | "rsa-sha2-256"
             | "rsa-sha2-512"
             | MLDSA44_ED25519
+            | SK_ECDSA
+            | SK_ED25519
     )
 }
 
@@ -468,6 +573,8 @@ impl PublicKey {
             PublicKey::EcdsaP521 { .. } => ECDSA_P521,
             PublicKey::Rsa { .. } => RSA,
             PublicKey::MlDsa44Ed25519 { .. } => MLDSA44_ED25519,
+            PublicKey::SkEcdsaP256 { .. } => SK_ECDSA,
+            PublicKey::SkEd25519 { .. } => SK_ED25519,
         }
     }
 
@@ -479,7 +586,9 @@ impl PublicKey {
             | PublicKey::EcdsaP384 { comment, .. }
             | PublicKey::EcdsaP521 { comment, .. }
             | PublicKey::Rsa { comment, .. }
-            | PublicKey::MlDsa44Ed25519 { comment, .. } => comment,
+            | PublicKey::MlDsa44Ed25519 { comment, .. }
+            | PublicKey::SkEcdsaP256 { comment, .. }
+            | PublicKey::SkEd25519 { comment, .. } => comment,
         }
     }
 
@@ -516,6 +625,21 @@ impl PublicKey {
                 w.write_string(RSA.as_bytes());
                 write_mpint(&mut w, e);
                 write_mpint(&mut w, n);
+            }
+            PublicKey::SkEcdsaP256 {
+                point, application, ..
+            } => {
+                w.write_string(SK_ECDSA.as_bytes());
+                w.write_string(NISTP256.as_bytes());
+                w.write_string(point);
+                w.write_string(application.as_bytes());
+            }
+            PublicKey::SkEd25519 {
+                raw, application, ..
+            } => {
+                w.write_string(SK_ED25519.as_bytes());
+                w.write_string(raw);
+                w.write_string(application.as_bytes());
             }
         }
         w.into_vec()
@@ -567,7 +691,9 @@ impl PublicKey {
             | PublicKey::EcdsaP384 { comment: c, .. }
             | PublicKey::EcdsaP521 { comment: c, .. }
             | PublicKey::Rsa { comment: c, .. }
-            | PublicKey::MlDsa44Ed25519 { comment: c, .. } => *c = comment,
+            | PublicKey::MlDsa44Ed25519 { comment: c, .. }
+            | PublicKey::SkEcdsaP256 { comment: c, .. }
+            | PublicKey::SkEd25519 { comment: c, .. } => *c = comment,
         }
         if pk.algorithm() != algo {
             return Err(Error::Format("authorized_keys: algorithm tag mismatch"));
@@ -706,6 +832,34 @@ impl PublicKey {
                     comment: String::new(),
                 }
             }
+            b if b == SK_ECDSA.as_bytes() => {
+                let PublicKey::EcdsaP256 { point, .. } =
+                    parse_ecdsa_public(&mut r, NISTP256, CurveId::P256, |p, c| {
+                        PublicKey::EcdsaP256 {
+                            point: p,
+                            comment: c,
+                        }
+                    })?
+                else {
+                    unreachable!()
+                };
+                PublicKey::SkEcdsaP256 {
+                    point,
+                    application: read_application(&mut r)?,
+                    comment: String::new(),
+                }
+            }
+            b if b == SK_ED25519.as_bytes() => {
+                let raw: [u8; 32] = r
+                    .read_string()?
+                    .try_into()
+                    .map_err(|_| Error::Format("ed25519: public key length"))?;
+                PublicKey::SkEd25519 {
+                    raw,
+                    application: read_application(&mut r)?,
+                    comment: String::new(),
+                }
+            }
             _ => return Err(Error::Unsupported("openssh public key algorithm")),
         };
         if !r.is_empty() {
@@ -713,6 +867,13 @@ impl PublicKey {
         }
         Ok(key)
     }
+}
+
+/// The FIDO application string of a security-key public blob.
+fn read_application(r: &mut Reader<'_>) -> Result<String> {
+    core::str::from_utf8(r.read_string()?)
+        .map(String::from)
+        .map_err(|_| Error::Format("sk: application is not utf-8"))
 }
 
 fn parse_ecdsa_public<F>(
@@ -750,6 +911,16 @@ impl PrivateKey {
             PrivateKey::EcdsaP521 { .. } => ECDSA_P521,
             PrivateKey::Rsa { .. } => RSA,
             PrivateKey::MlDsa44Ed25519 { .. } => MLDSA44_ED25519,
+            PrivateKey::SkEcdsaP256 { .. } => SK_ECDSA,
+            PrivateKey::SkEd25519 { .. } => SK_ED25519,
+        }
+    }
+
+    /// The security-key credential, for a key held by an authenticator.
+    pub fn sk_credential(&self) -> Option<&SkCredential> {
+        match self {
+            PrivateKey::SkEcdsaP256 { sk, .. } | PrivateKey::SkEd25519 { sk, .. } => Some(sk),
+            _ => None,
         }
     }
 
@@ -761,7 +932,9 @@ impl PrivateKey {
             | PrivateKey::EcdsaP384 { comment: c, .. }
             | PrivateKey::EcdsaP521 { comment: c, .. }
             | PrivateKey::Rsa { comment: c, .. }
-            | PrivateKey::MlDsa44Ed25519 { comment: c, .. } => *c = comment.into(),
+            | PrivateKey::MlDsa44Ed25519 { comment: c, .. }
+            | PrivateKey::SkEcdsaP256 { comment: c, .. }
+            | PrivateKey::SkEd25519 { comment: c, .. } => *c = comment.into(),
         }
     }
 
@@ -773,7 +946,9 @@ impl PrivateKey {
             | PrivateKey::EcdsaP384 { comment, .. }
             | PrivateKey::EcdsaP521 { comment, .. }
             | PrivateKey::Rsa { comment, .. }
-            | PrivateKey::MlDsa44Ed25519 { comment, .. } => comment,
+            | PrivateKey::MlDsa44Ed25519 { comment, .. }
+            | PrivateKey::SkEcdsaP256 { comment, .. }
+            | PrivateKey::SkEd25519 { comment, .. } => comment,
         }
     }
 
@@ -821,6 +996,11 @@ impl PrivateKey {
             PrivateKey::MlDsa44Ed25519 { seeds, .. } => Ok(alloc::boxed::Box::new(
                 crate::hostkey::MlDsa44Ed25519HostKey::from_seeds(*seeds),
             )),
+            // Only the authenticator holds the secret: signing goes through
+            // a security-key provider.
+            PrivateKey::SkEcdsaP256 { .. } | PrivateKey::SkEd25519 { .. } => Err(
+                Error::Unsupported("security key: signing needs the authenticator"),
+            ),
         }
     }
 
@@ -842,6 +1022,10 @@ impl PrivateKey {
                 iqmp.zeroize();
             }
             PrivateKey::MlDsa44Ed25519 { seeds, .. } => seeds.zeroize(),
+            // Not a secret by itself, but OpenSSH treats it as one.
+            PrivateKey::SkEcdsaP256 { sk, .. } | PrivateKey::SkEd25519 { sk, .. } => {
+                sk.key_handle.zeroize()
+            }
         }
     }
 
@@ -878,6 +1062,12 @@ impl PrivateKey {
                     ));
                 }
             }
+            // Nothing to derive from: the secret is on the authenticator.
+            PrivateKey::SkEcdsaP256 { point, .. } => {
+                BoxedEcdsaPublicKey::from_sec1(CurveId::P256, point)
+                    .map_err(|_| Error::Format("ecdsa: invalid SEC1 point"))?;
+            }
+            PrivateKey::SkEd25519 { .. } => {}
         }
         Ok(())
     }
@@ -912,6 +1102,20 @@ impl PrivateKey {
                 public, comment, ..
             } => PublicKey::MlDsa44Ed25519 {
                 raw: public.clone(),
+                comment: comment.clone(),
+            },
+            PrivateKey::SkEcdsaP256 { point, sk, comment } => PublicKey::SkEcdsaP256 {
+                point: point.clone(),
+                application: sk.application.clone(),
+                comment: comment.clone(),
+            },
+            PrivateKey::SkEd25519 {
+                public,
+                sk,
+                comment,
+            } => PublicKey::SkEd25519 {
+                raw: *public,
+                application: sk.application.clone(),
                 comment: comment.clone(),
             },
         }
@@ -1119,7 +1323,9 @@ fn attach_comment(mut pk: PrivateKey, comment: String) -> PrivateKey {
         | PrivateKey::EcdsaP384 { comment: c, .. }
         | PrivateKey::EcdsaP521 { comment: c, .. }
         | PrivateKey::Rsa { comment: c, .. }
-        | PrivateKey::MlDsa44Ed25519 { comment: c, .. } => *c = comment,
+        | PrivateKey::MlDsa44Ed25519 { comment: c, .. }
+        | PrivateKey::SkEcdsaP256 { comment: c, .. }
+        | PrivateKey::SkEd25519 { comment: c, .. } => *c = comment,
     }
     pk
 }
@@ -1137,6 +1343,30 @@ fn public_parts_match(a: &PublicKey, b: &PublicKey) -> bool {
             trim_leading_zeros(e1) == trim_leading_zeros(e2)
                 && trim_leading_zeros(n1) == trim_leading_zeros(n2)
         }
+        (
+            PublicKey::SkEcdsaP256 {
+                point: x,
+                application: a,
+                ..
+            },
+            PublicKey::SkEcdsaP256 {
+                point: y,
+                application: b,
+                ..
+            },
+        ) => x == y && a == b,
+        (
+            PublicKey::SkEd25519 {
+                raw: x,
+                application: a,
+                ..
+            },
+            PublicKey::SkEd25519 {
+                raw: y,
+                application: b,
+                ..
+            },
+        ) => x == y && a == b,
         _ => false,
     }
 }
@@ -1234,6 +1464,17 @@ impl PrivateKey {
                     comment: String::new(),
                 }
             }
+            // A security-key certificate: only the credential follows.
+            PublicKey::SkEcdsaP256 { point, .. } => PrivateKey::SkEcdsaP256 {
+                point,
+                sk: SkCredential::read(r)?,
+                comment: String::new(),
+            },
+            PublicKey::SkEd25519 { raw, .. } => PrivateKey::SkEd25519 {
+                public: raw,
+                sk: SkCredential::read(r)?,
+                comment: String::new(),
+            },
         };
         let comment = String::from_utf8_lossy(r.read_string()?).into_owned();
         let pk = attach_comment(pk, comment);
@@ -1322,6 +1563,28 @@ fn parse_private_fields(r: &mut Reader<'_>) -> Result<PrivateKey> {
                 p,
                 q,
                 iqmp,
+                comment: String::new(),
+            })
+        }
+        b if b == SK_ECDSA.as_bytes() => {
+            if r.read_string()? != NISTP256.as_bytes() {
+                return Err(Error::Format("ecdsa: curve mismatch"));
+            }
+            let point = r.read_string()?.to_vec();
+            Ok(PrivateKey::SkEcdsaP256 {
+                point,
+                sk: SkCredential::read(r)?,
+                comment: String::new(),
+            })
+        }
+        b if b == SK_ED25519.as_bytes() => {
+            let public: [u8; 32] = r
+                .read_string()?
+                .try_into()
+                .map_err(|_| Error::Format("ed25519: public length"))?;
+            Ok(PrivateKey::SkEd25519 {
+                public,
+                sk: SkCredential::read(r)?,
                 comment: String::new(),
             })
         }

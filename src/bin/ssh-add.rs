@@ -201,6 +201,8 @@ mod imp {
             PublicKey::Ed25519 { .. } => "ED25519",
             PublicKey::Rsa { .. } => "RSA",
             PublicKey::MlDsa44Ed25519 { .. } => "MLDSA44-ED25519",
+            PublicKey::SkEcdsaP256 { .. } => "ECDSA-SK",
+            PublicKey::SkEd25519 { .. } => "ED25519-SK",
             _ => "ECDSA",
         }
     }

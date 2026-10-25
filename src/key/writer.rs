@@ -76,7 +76,9 @@ impl PublicKey {
             | PublicKey::EcdsaP384 { .. }
             | PublicKey::EcdsaP521 { .. } => Some(3),
             PublicKey::Ed25519 { .. } => Some(4),
-            PublicKey::MlDsa44Ed25519 { .. } => None,
+            PublicKey::MlDsa44Ed25519 { .. }
+            | PublicKey::SkEcdsaP256 { .. }
+            | PublicKey::SkEd25519 { .. } => None,
         }
     }
 
@@ -90,6 +92,7 @@ impl PublicKey {
             PublicKey::EcdsaP521 { .. } => 521,
             PublicKey::Rsa { n, .. } => modulus_bit_len(n),
             PublicKey::MlDsa44Ed25519 { .. } => 256,
+            PublicKey::SkEcdsaP256 { .. } | PublicKey::SkEd25519 { .. } => 256,
         }
     }
 }
@@ -367,6 +370,9 @@ impl PrivateKey {
                 write_mpint(&mut w, q);
                 w.write_string(comment.as_bytes());
             }
+            PrivateKey::SkEcdsaP256 { .. } | PrivateKey::SkEd25519 { .. } => {
+                write_sk_private_fields(&mut w, self);
+            }
         }
         w.into_vec()
     }
@@ -421,10 +427,42 @@ impl PrivateKey {
                 write_mpint(&mut w, q);
                 comment
             }
+            // The certificate carries the public fields; only the
+            // credential follows.
+            PrivateKey::SkEcdsaP256 { sk, comment, .. }
+            | PrivateKey::SkEd25519 { sk, comment, .. } => {
+                sk.write(&mut w);
+                comment
+            }
         };
         w.write_string(comment.as_bytes());
         w.into_vec()
     }
+}
+
+/// The private fields of a security-key key (OpenSSH's layout): its
+/// public fields without the application, the credential, the comment.
+fn write_sk_private_fields(w: &mut Writer, pk: &PrivateKey) {
+    let (sk, comment) = match pk {
+        PrivateKey::SkEcdsaP256 { point, sk, comment } => {
+            w.write_string(crate::hostkey::sk::SK_ECDSA.as_bytes());
+            w.write_string(b"nistp256");
+            w.write_string(point);
+            (sk, comment)
+        }
+        PrivateKey::SkEd25519 {
+            public,
+            sk,
+            comment,
+        } => {
+            w.write_string(crate::hostkey::sk::SK_ED25519.as_bytes());
+            w.write_string(public);
+            (sk, comment)
+        }
+        _ => unreachable!("security-key keys only"),
+    };
+    sk.write(w);
+    w.write_string(comment.as_bytes());
 }
 
 /// Encode the cleartext inner block (check-ints, private fields, comment,
@@ -504,6 +542,9 @@ fn encode_inner_block<R: CryptoRng + RngCore>(
             write_mpint(&mut w, p);
             write_mpint(&mut w, q);
             w.write_string(comment.as_bytes());
+        }
+        PrivateKey::SkEcdsaP256 { .. } | PrivateKey::SkEd25519 { .. } => {
+            write_sk_private_fields(&mut w, pk);
         }
     }
     let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(w.into_vec());

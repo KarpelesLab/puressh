@@ -169,6 +169,34 @@ fn verify_with(
     .map_err(|_| Error::BadSignature)
 }
 
+/// A P-256 public key from its SEC1 point (for the security-key types,
+/// whose blobs carry one after their own fields).
+#[cfg(feature = "alloc")]
+pub(super) fn p256_from_sec1(sec1: &[u8]) -> Result<BoxedEcdsaPublicKey> {
+    BoxedEcdsaPublicKey::from_sec1(CurveId::P256, sec1)
+        .map_err(|_| Error::Format("ecdsa: invalid SEC1 point"))
+}
+
+/// Verify an ECDSA-P256/SHA-256 signature over `msg` given as the inner
+/// signature blob (`mpint r, mpint s`).
+#[cfg(feature = "alloc")]
+pub(super) fn verify_p256_inner(
+    pub_key: &BoxedEcdsaPublicKey,
+    msg: &[u8],
+    inner: &[u8],
+) -> Result<()> {
+    let mut ir = Reader::new(inner);
+    let r_raw = read_mpint(&mut ir)?;
+    let s_raw = read_mpint(&mut ir)?;
+    if !ir.is_empty() {
+        return Err(Error::Format("ecdsa: signature blob trailing data"));
+    }
+    let sig = BoxedEcdsaSignature::from_components(mpint_to_uint(r_raw)?, mpint_to_uint(s_raw)?);
+    pub_key
+        .verify::<Sha256>(msg, &sig)
+        .map_err(|_| Error::BadSignature)
+}
+
 #[cfg(feature = "alloc")]
 fn mpint_to_uint(bytes: &[u8]) -> Result<BoxedUint> {
     if bytes.is_empty() {

@@ -363,6 +363,9 @@ pub struct ServerOptions {
     /// True iff a `PidFile` line was seen (so the binary can tell `none`
     /// (`pid_file == None`, `pid_file_set == true`) from "unset").
     pub pid_file_set: bool,
+    /// `PubkeyAuthOptions`: `(touch-required, verify-required)` for every
+    /// security-key signature. Valid in a `Match` block.
+    pub pubkey_auth_options: Option<(bool, bool)>,
     /// `Subsystem sftp internal-sftp` ⇒ enables the in-process SFTP handler
     /// (the standard `sshd_config` spelling; `SftpEnabled` remains a working
     /// alias). Other subsystems are in [`Self::subsystems`].
@@ -776,6 +779,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(host_key_agent);
     take_scalar!(subsystem_sftp);
     take_scalar!(subsystem_sftp_args);
+    take_scalar!(pubkey_auth_options);
     take_scalar!(use_pam);
     take_scalar!(permit_tty);
     take_scalar!(disable_forwarding);
@@ -1274,6 +1278,25 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         "pubkeyauthentication" => {
             opts.pubkey_authentication = Some(parse_yes_no(line)?);
         }
+        "pubkeyauthoptions" => {
+            // `none`, or any of `touch-required` / `verify-required`.
+            let mut v = (false, false);
+            for a in &line.args {
+                match a.as_str() {
+                    "none" => {}
+                    "touch-required" => v.0 = true,
+                    "verify-required" => v.1 = true,
+                    other => {
+                        return Err(ConfigError::BadValue {
+                            line: line.line_no,
+                            keyword: kw.to_string(),
+                            msg: format!("unsupported option {other:?}"),
+                        });
+                    }
+                }
+            }
+            opts.pubkey_auth_options = Some(v);
+        }
         "passwordauthentication" => {
             opts.password_authentication = Some(parse_yes_no(line)?);
         }
@@ -1608,7 +1631,6 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("StreamLocalBindUnlink", &["*"], ""),
     // Features this server does not have: ignoring them fails closed.
     ("SecurityKeyProvider", &["*"], ""),
-    ("PubkeyAuthOptions", &["*"], ""),
     (
         "GSSAPIAuthentication",
         &["no"],

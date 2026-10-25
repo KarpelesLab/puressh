@@ -101,6 +101,7 @@ cargo add puressh --features server
 | Host key    | `ssh-ed25519`                            |
 | Host key    | `ecdsa-sha2-nistp{256,384,521}`          |
 | Host key    | `rsa-sha2-256`, `rsa-sha2-512`, `ssh-rsa` (with auto-upgrade via `server-sig-algs`) |
+| Public key  | `sk-ssh-ed25519@openssh.com`, `sk-ecdsa-sha2-nistp256@openssh.com`, `webauthn-sk-ecdsa-sha2-nistp256@openssh.com` (FIDO security keys) |
 | Host key (PQ) | `ssh-mldsa44-ed25519@openssh.com` (ML-DSA-44 + Ed25519 composite; opt-in, as in OpenSSH) |
 | Cipher      | `chacha20-poly1305@openssh.com`          |
 | Cipher      | `aes{128,256}-gcm@openssh.com`           |

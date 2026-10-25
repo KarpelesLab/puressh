@@ -21,6 +21,8 @@ mod ed25519;
 #[cfg(feature = "alloc")]
 mod mldsa;
 pub(crate) mod rsa;
+#[cfg(feature = "alloc")]
+pub mod sk;
 
 /// Process-wide opt-in for the legacy `ssh-rsa` (SHA-1) signature algorithm.
 ///
@@ -62,6 +64,8 @@ pub use mldsa::MlDsa44Ed25519HostKey;
 pub(crate) use mldsa::public_from_seeds as mldsa44_ed25519_public;
 #[cfg(feature = "alloc")]
 pub use rsa::{RsaSha1HostKey, RsaSha2_256HostKey, RsaSha2_512HostKey};
+#[cfg(feature = "alloc")]
+pub use sk::{SkEcdsaP256Key, SkEd25519Key};
 
 /// Host-key / public-key signature algorithm names this build can verify
 /// (host-key signatures, publickey userauth, certificate CA signatures), in
@@ -76,6 +80,9 @@ pub const HOST_KEY_VERIFY_NAMES: &[&str] = &[
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
     "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+    "webauthn-sk-ecdsa-sha2-nistp256@openssh.com",
     "rsa-sha2-512",
     "rsa-sha2-256",
 ];
@@ -160,6 +167,11 @@ pub(crate) fn host_key_verify_by_name(
         "ecdsa-sha2-nistp256" => Ok(Box::new(EcdsaP256HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp384" => Ok(Box::new(EcdsaP384HostKey::from_public_blob(blob)?)),
         "ecdsa-sha2-nistp521" => Ok(Box::new(EcdsaP521HostKey::from_public_blob(blob)?)),
+        // A WebAuthn signature is made by an `sk-ecdsa` key, whose blob it is.
+        sk::SK_ECDSA | sk::WEBAUTHN_SK_ECDSA => {
+            Ok(Box::new(SkEcdsaP256Key::from_public_blob(blob)?))
+        }
+        sk::SK_ED25519 => Ok(Box::new(SkEd25519Key::from_public_blob(blob)?)),
         "ssh-rsa" => {
             if !allow_rsa_sha1() {
                 return Err(crate::Error::Unsupported(

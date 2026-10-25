@@ -70,12 +70,64 @@ pub enum AuthAttempt {
         /// principals, critical options, …). `None` for a plain public key, so
         /// existing plain-key authenticators are unaffected.
         cert: Option<CertInfo>,
+        /// `Some` for a verified security-key signature: its flags, and
+        /// what the server requires of them. An authenticator that accepts
+        /// the key should check them against the key's own options with
+        /// [`SkSignature::check`] (the server re-checks either way).
+        security_key: Option<SkSignature>,
     },
     /// `keyboard-interactive` request.
     KeyboardInteractive {
         /// Requested user name.
         user: String,
     },
+}
+
+/// A verified FIDO security-key signature's details (OpenSSH
+/// `PROTOCOL.u2f`), with the server-wide requirements on them
+/// (`PubkeyAuthOptions`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SkSignature {
+    /// The authenticator's flags: `0x01` user presence, `0x04` user
+    /// verification.
+    pub flags: u8,
+    /// The authenticator's signature counter.
+    pub counter: u32,
+    /// `PubkeyAuthOptions touch-required`.
+    pub server_touch_required: bool,
+    /// `PubkeyAuthOptions verify-required`.
+    pub server_verify_required: bool,
+}
+
+/// A requirement a security-key signature failed to meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SkRequirement {
+    /// User presence (an authenticator touch).
+    UserPresence,
+    /// User verification (PIN, biometric).
+    UserVerification,
+}
+
+impl SkSignature {
+    /// Check the flags as OpenSSH's sshd does, given the restrictions of
+    /// the key that accepted the attempt (`caps`: its `authorized_keys`
+    /// options and, for a certificate, its extensions): user presence
+    /// unless the key waives it with `no-touch-required` and the server
+    /// doesn't insist, user verification if either asks for it.
+    pub fn check(&self, caps: Option<&AuthCertCaps>) -> core::result::Result<(), SkRequirement> {
+        use crate::hostkey::sk::{SK_USER_PRESENCE, SK_USER_VERIFICATION};
+        let no_touch = caps.is_some_and(|c| c.no_touch_required);
+        let verify = caps.is_some_and(|c| c.verify_required);
+        if (self.server_touch_required || !no_touch) && self.flags & SK_USER_PRESENCE == 0 {
+            return Err(SkRequirement::UserPresence);
+        }
+        if (self.server_verify_required || verify) && self.flags & SK_USER_VERIFICATION == 0 {
+            return Err(SkRequirement::UserVerification);
+        }
+        Ok(())
+    }
 }
 
 impl core::fmt::Debug for AuthAttempt {
@@ -94,6 +146,7 @@ impl core::fmt::Debug for AuthAttempt {
                 probe_only,
                 verified,
                 cert,
+                security_key,
             } => f
                 .debug_struct("PublicKey")
                 .field("user", user)
@@ -102,6 +155,7 @@ impl core::fmt::Debug for AuthAttempt {
                 .field("probe_only", probe_only)
                 .field("verified", verified)
                 .field("cert", cert)
+                .field("security_key", security_key)
                 .finish(),
             AuthAttempt::KeyboardInteractive { user } => f
                 .debug_struct("KeyboardInteractive")
@@ -323,6 +377,13 @@ pub struct AuthCertCaps {
     /// `tunnel="n"` (authorized_keys): the only tun device unit a client may
     /// forward (`0x7fffffff` for any). `None` ⇒ the client's choice.
     pub force_tun_device: Option<u32>,
+    /// A security-key signature may omit user presence (no touch): the
+    /// `no-touch-required` key option or certificate extension. Both must
+    /// grant it when a certificate is trusted through `authorized_keys`.
+    pub no_touch_required: bool,
+    /// A security-key signature must carry user verification (PIN,
+    /// biometric): the `verify-required` key option or critical option.
+    pub verify_required: bool,
 }
 
 #[cfg(feature = "alloc")]
@@ -352,6 +413,8 @@ impl AuthCertCaps {
             permit_open: None,
             permit_listen: None,
             force_tun_device: None,
+            no_touch_required: ci.has_extension("no-touch-required"),
+            verify_required: ci.critical_option("verify-required").is_some(),
         }
     }
 
@@ -369,6 +432,8 @@ impl AuthCertCaps {
             permit_open: None,
             permit_listen: None,
             force_tun_device: None,
+            no_touch_required: true,
+            verify_required: false,
         }
     }
 
@@ -395,6 +460,8 @@ impl AuthCertCaps {
                     t.parse().ok()
                 }
             }),
+            no_touch_required: o.no_touch_required,
+            verify_required: o.verify_required,
         }
     }
 
@@ -423,6 +490,8 @@ impl AuthCertCaps {
             permit_open: both(self.permit_open, other.permit_open),
             permit_listen: both(self.permit_listen, other.permit_listen),
             force_tun_device: self.force_tun_device.or(other.force_tun_device),
+            no_touch_required: self.no_touch_required && other.no_touch_required,
+            verify_required: self.verify_required || other.verify_required,
         })
     }
 }
@@ -545,6 +614,12 @@ pub struct ServerAuth {
     /// multi-factor PartialAccept so the eventual `Authenticated` step can carry
     /// it. `None` until a verified cert attempt is seen.
     pending_cert_caps: Option<AuthCertCaps>,
+    /// `PubkeyAuthOptions touch-required`: every security-key signature must
+    /// show user presence, whatever the key's options say.
+    sk_touch_required: bool,
+    /// `PubkeyAuthOptions verify-required`: every security-key signature
+    /// must show user verification.
+    sk_verify_required: bool,
 }
 
 impl ServerAuth {
@@ -576,6 +651,8 @@ impl ServerAuth {
             now: 0,
             ca_signature_algorithms: Vec::new(),
             pending_cert_caps: None,
+            sk_touch_required: false,
+            sk_verify_required: false,
         }
     }
 
@@ -593,6 +670,20 @@ impl ServerAuth {
     /// default set (`config::algos::CA_SIGNATURE_DEFAULTS`).
     pub fn set_ca_signature_algorithms(&mut self, algos: Vec<String>) -> &mut Self {
         self.ca_signature_algorithms = algos;
+        self
+    }
+
+    /// `PubkeyAuthOptions`: require user presence (`touch-required`) and/or
+    /// user verification (`verify-required`) on every security-key
+    /// signature, on top of what each key's options require. Without them a
+    /// touch is still required unless the key allows `no-touch-required`.
+    pub fn set_pubkey_auth_options(
+        &mut self,
+        touch_required: bool,
+        verify_required: bool,
+    ) -> &mut Self {
+        self.sk_touch_required = touch_required;
+        self.sk_verify_required = verify_required;
         self
     }
 
@@ -905,6 +996,7 @@ impl ServerAuth {
                 probe_only: true,
                 verified: false,
                 cert: cert_info,
+                security_key: None,
             });
             return match decision {
                 AuthDecision::Accept | AuthDecision::PartialAccept { .. } => {
@@ -949,7 +1041,10 @@ impl ServerAuth {
                 Some(p) => p,
                 None => return self.emit_failure(),
             };
-            if signature_algorithm(&sig) != Some(plain) {
+            let sig_alg = signature_algorithm(&sig);
+            let webauthn = plain == crate::hostkey::sk::SK_ECDSA
+                && sig_alg == Some(crate::hostkey::sk::WEBAUTHN_SK_ECDSA);
+            if sig_alg != Some(plain) && !webauthn {
                 return self.emit_failure();
             }
             if !self.user_cert_valid(&cert) {
@@ -985,6 +1080,13 @@ impl ServerAuth {
         // restrictions an earlier factor recorded.
         let cert_caps = cert_info.as_ref().map(AuthCertCaps::from_cert_info);
 
+        let security_key =
+            crate::hostkey::sk::sk_signature_details(&sig).map(|(flags, counter)| SkSignature {
+                flags,
+                counter,
+                server_touch_required: self.sk_touch_required,
+                server_verify_required: self.sk_verify_required,
+            });
         let decision = self.auth.evaluate(AuthAttempt::PublicKey {
             user: user.clone(),
             algorithm,
@@ -992,6 +1094,7 @@ impl ServerAuth {
             probe_only: false,
             verified: true,
             cert: cert_info,
+            security_key,
         });
         // The accepted key's own restrictions (authorized_keys options),
         // on top of a certificate's, on top of whatever earlier factors of a
@@ -1000,9 +1103,11 @@ impl ServerAuth {
         let decision = match decision {
             d @ (AuthDecision::Accept | AuthDecision::PartialAccept { .. }) => {
                 let key_caps = self.auth.key_restrictions(&user, &public_blob);
-                let merged = merge_caps(cert_caps, key_caps)
-                    .and_then(|c| merge_caps(self.pending_cert_caps.clone(), c));
-                match merged {
+                let attempt = merge_caps(cert_caps, key_caps);
+                let sk_ok = security_key
+                    .is_none_or(|sk| sk.check(attempt.as_ref().and_then(Option::as_ref)).is_ok());
+                let merged = attempt.and_then(|c| merge_caps(self.pending_cert_caps.clone(), c));
+                match merged.filter(|_| sk_ok) {
                     Some(c) => {
                         self.pending_cert_caps = c;
                         d
@@ -1162,6 +1267,50 @@ mod tests {
         fn evaluate(&mut self, _attempt: AuthAttempt) -> AuthDecision {
             AuthDecision::Reject
         }
+    }
+
+    /// The security-key policy, as OpenSSH's sshd applies it: a touch
+    /// unless both the key and its certificate waive it (and the server
+    /// doesn't insist), user verification if anything asks for it.
+    #[test]
+    fn sk_signature_policy() {
+        use crate::hostkey::sk::{SK_USER_PRESENCE as UP, SK_USER_VERIFICATION as UV};
+        let sig = |flags, touch, verify| SkSignature {
+            flags,
+            counter: 0,
+            server_touch_required: touch,
+            server_verify_required: verify,
+        };
+        let caps = |no_touch, verify| {
+            let mut c = AuthCertCaps::unrestricted();
+            c.no_touch_required = no_touch;
+            c.verify_required = verify;
+            c
+        };
+        let ok = |s: SkSignature, c: Option<&AuthCertCaps>| s.check(c).is_ok();
+        // No key options at all: touch required, no verification.
+        assert!(ok(sig(UP, false, false), None));
+        assert_eq!(
+            sig(0, false, false).check(None),
+            Err(SkRequirement::UserPresence)
+        );
+        assert!(!ok(sig(UV, false, false), None));
+        // `no-touch-required`.
+        assert!(ok(sig(0, false, false), Some(&caps(true, false))));
+        // A certificate waiving it on a key that doesn't: still required.
+        let both = caps(true, false).intersect(caps(false, false)).unwrap();
+        assert!(!ok(sig(0, false, false), Some(&both)));
+        // `verify-required` from either side.
+        let v = caps(false, false).intersect(caps(false, true)).unwrap();
+        assert_eq!(
+            sig(UP, false, false).check(Some(&v)),
+            Err(SkRequirement::UserVerification)
+        );
+        assert!(ok(sig(UP | UV, false, false), Some(&v)));
+        // `PubkeyAuthOptions` overrides the key.
+        assert!(!ok(sig(0, true, false), Some(&caps(true, false))));
+        assert!(!ok(sig(UP, false, true), None));
+        assert!(ok(sig(UP | UV, false, true), None));
     }
 
     fn service_req() -> Vec<u8> {

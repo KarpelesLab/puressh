@@ -831,6 +831,7 @@ fn pem_with_swapped_public(sk: &PrivateKey, evil_pub: &PublicKey) -> String {
         | PrivateKey::EcdsaP521 { point, .. } => point.clone(),
         PrivateKey::MlDsa44Ed25519 { public, .. } => public.clone(),
         PrivateKey::Rsa { .. } => panic!("RSA handled separately"),
+        _ => panic!("not a software key"),
     };
     let evil_field: Vec<u8> = match evil_pub {
         PublicKey::Ed25519 { raw, .. } => raw.to_vec(),
@@ -839,6 +840,7 @@ fn pem_with_swapped_public(sk: &PrivateKey, evil_pub: &PublicKey) -> String {
         | PublicKey::EcdsaP521 { point, .. } => point.clone(),
         PublicKey::MlDsa44Ed25519 { raw, .. } => raw.clone(),
         PublicKey::Rsa { .. } => panic!("RSA handled separately"),
+        _ => panic!("not a software key"),
     };
     assert_eq!(inner_field.len(), evil_field.len());
     let pos = priv_section

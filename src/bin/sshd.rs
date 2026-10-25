@@ -1246,6 +1246,15 @@ mod imp {
             yn(opts.pubkey_authentication != Some(false)),
         );
         line(
+            "pubkeyauthoptions",
+            match opts.pubkey_auth_options.unwrap_or_default() {
+                (false, false) => "none",
+                (true, false) => "touch-required",
+                (false, true) => "verify-required",
+                (true, true) => "touch-required verify-required",
+            },
+        );
+        line(
             "passwordauthentication",
             yn(opts.password_authentication != Some(false)),
         );
@@ -4323,6 +4332,44 @@ mod imp {
         }
     }
 
+    impl LocalAuthenticator {
+        /// A security-key signature against the accepting key's options
+        /// (and its certificate's), logged as OpenSSH's sshd logs a refusal.
+        fn check_security_key(
+            &self,
+            sk: &puressh::auth::SkSignature,
+            cert: Option<&puressh::auth::CertInfo>,
+            public_blob: &[u8],
+            user: &str,
+        ) -> Result<(), puressh::auth::SkRequirement> {
+            use puressh::auth::{AuthCertCaps, SkRequirement};
+            let key = self
+                .accepted_options
+                .as_deref()
+                .map(AuthCertCaps::from_key_options);
+            let caps = match (cert.map(AuthCertCaps::from_cert_info), key) {
+                (Some(c), Some(k)) => c.intersect(k),
+                (c, k) => c.or(k),
+            };
+            sk.check(caps.as_ref()).inspect_err(|unmet| {
+                let blob = cert.map_or(public_blob, |ci| ci.embedded_pubkey_blob.as_slice());
+                let key = key_description(blob, None);
+                let what = match unmet {
+                    SkRequirement::UserPresence => "user presence (authenticator touch)",
+                    _ => "user verification",
+                };
+                sshd_log::with_conn(|c| {
+                    sshd_log::error(&format!(
+                        "public key {} signature for {}{user} from {} rejected: {what} requirement not met ",
+                        key.trim_start_matches(": "),
+                        c.invalid_prefix(),
+                        c.peer()
+                    ));
+                });
+            })
+        }
+    }
+
     impl Authenticator for LocalAuthenticator {
         fn continuable_methods(&self, offered: &[&'static str]) -> Vec<String> {
             if self.chains.is_empty() {
@@ -4374,6 +4421,7 @@ mod imp {
                         probe_only,
                         verified,
                         cert,
+                        security_key,
                     } => {
                         // An invalid username, or a username switched
                         // mid-userauth, is refused before anything else. Both
@@ -4516,6 +4564,17 @@ mod imp {
                                         "sshd: auth publickey: signature missing or unverified for {user}"
                                     );
                                 }
+                            }
+                            return AuthDecision::Reject;
+                        }
+                        if let Some(sk) = security_key
+                            && let Err(unmet) =
+                                self.check_security_key(&sk, cert.as_ref(), &public_blob, &user)
+                        {
+                            if self.debug {
+                                eprintln!(
+                                    "sshd: auth publickey: {unmet:?} requirement not met for {user}"
+                                );
                             }
                             return AuthDecision::Reject;
                         }
@@ -8575,6 +8634,9 @@ mod imp {
             }));
 
         // Resolved CASignatureAlgorithms for user-certificate verification.
+        if let Some(o) = sshd_cfg.global.pubkey_auth_options {
+            config.pubkey_auth_options = o;
+        }
         if let Some(ca) = sshd_cfg.global.ca_signature_algorithms.clone() {
             config.ca_signature_algorithms = ca;
         }
@@ -9288,6 +9350,7 @@ mod imp {
                 probe_only: true,
                 verified: false,
                 cert: None,
+                security_key: None,
             });
             assert!(matches!(decision, AuthDecision::Reject));
         }
@@ -9963,6 +10026,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: None,
+                security_key: None,
             });
             assert!(matches!(decision, AuthDecision::Reject));
         }
@@ -9975,6 +10039,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: None,
+                security_key: None,
             }
         }
 
@@ -10078,6 +10143,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: Some(ci.clone()),
+                security_key: None,
             });
             assert!(matches!(ok, AuthDecision::Accept), "{ok:?}");
 
@@ -10091,6 +10157,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: Some(ci),
+                security_key: None,
             });
             assert!(matches!(decision, AuthDecision::Reject), "{decision:?}");
         }
@@ -10107,6 +10174,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: Some(ci.clone()),
+                security_key: None,
             }
         }
 
@@ -10324,6 +10392,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: None,
+                security_key: None,
             });
             assert!(matches!(decision, AuthDecision::Accept), "{decision:?}");
 
@@ -10532,6 +10601,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: None,
+                security_key: None,
             });
             assert!(matches!(decision, AuthDecision::Reject));
         }
@@ -10846,6 +10916,7 @@ mod imp {
                 probe_only: false,
                 verified: true,
                 cert: None,
+                security_key: None,
             });
             assert!(matches!(decision, AuthDecision::Accept));
         }

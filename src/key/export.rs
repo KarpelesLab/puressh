@@ -213,6 +213,8 @@ fn type_label(pk: &PublicKey) -> &'static str {
         PublicKey::Ed25519 { .. } => "ED25519",
         PublicKey::Rsa { .. } => "RSA",
         PublicKey::MlDsa44Ed25519 { .. } => "MLDSA44-ED25519",
+        PublicKey::SkEcdsaP256 { .. } => "ECDSA-SK",
+        PublicKey::SkEd25519 { .. } => "ED25519-SK",
         _ => "ECDSA",
     }
 }
@@ -255,7 +257,9 @@ impl PublicKey {
                 seq(&[&oid(OID_EC_PUBLIC_KEY), &oid(OID_P521)]),
                 point.clone(),
             ),
-            PublicKey::MlDsa44Ed25519 { .. } => return None,
+            PublicKey::MlDsa44Ed25519 { .. }
+            | PublicKey::SkEcdsaP256 { .. }
+            | PublicKey::SkEd25519 { .. } => return None,
         };
         Some(seq(&[&alg, &encode_bit_string(&key)]))
     }

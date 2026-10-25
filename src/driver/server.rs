@@ -142,7 +142,9 @@ impl ServerDriver {
     /// until it has itself spoken SSH.
     pub fn start(&mut self, now: Instant) -> Result<()> {
         self.last_activity = now;
-        self.outbox.push_back(VersionExchange::outgoing_bytes());
+        let mut line = self.cfg.local_version().into_bytes();
+        line.extend_from_slice(b"\r\n");
+        self.outbox.push_back(line);
         Ok(())
     }
 
@@ -152,6 +154,8 @@ impl ServerDriver {
         let advert =
             build_server_kexinit(&mut self.rng, &self.cfg).with_ext_info_marker(Role::Server);
         self.runner = KexRunner::new(Role::Server, advert);
+        self.runner
+            .set_gex_selector(self.cfg.gex_group_selector.clone());
         // Queue our outbound EXT_INFO; the runner emits it after NEWKEYS iff
         // the client also advertised the marker.
         self.runner
@@ -376,6 +380,9 @@ impl ServerDriver {
                 }
                 self.route_kex(payload)?;
                 if self.runner.is_completed() {
+                    if let (Some(hook), Some(neg)) = (&self.cfg.on_kex, self.runner.negotiated()) {
+                        hook(&neg, self.phase != Phase::Kex);
+                    }
                     if self.phase == Phase::Kex {
                         self.session_id = self
                             .runner
@@ -438,7 +445,7 @@ impl ServerDriver {
             None => hk_owned.map(|k| k as &dyn HostKey),
         };
         let v_c = self.v_c.clone();
-        let v_s = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
+        let v_s = self.cfg.local_version().into_bytes();
         let adv = self.runner.on_packet(
             &mut self.rng,
             &mut self.codec,

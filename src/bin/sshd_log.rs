@@ -62,6 +62,45 @@ impl Level {
 }
 
 static LEVEL: AtomicU8 = AtomicU8::new(Level::Info as u8);
+/// `LogVerbose`: pattern lists, each matched against a message's
+/// `file:function():line (bin=sshd, pid=N)` tag; a match logs the message
+/// whatever the level, tagged.
+static VERBOSE: Mutex<Vec<Vec<puressh::config::HostPattern>>> = Mutex::new(Vec::new());
+
+/// Set the `LogVerbose` overrides (replacing any: a connection's `Match`
+/// blocks may name others). `none` matches nothing.
+pub fn set_log_verbose(lists: &[String]) {
+    let parsed = lists
+        .iter()
+        .filter(|l| !l.eq_ignore_ascii_case("none"))
+        .map(|l| {
+            let pats: Vec<String> = l.split(',').map(str::to_string).collect();
+            puressh::config::HostPattern::parse_all(&pats)
+        })
+        .collect();
+    if let Ok(mut g) = VERBOSE.lock() {
+        *g = parsed;
+    }
+}
+
+/// The `LogVerbose` tag of a message logged at `at`, when an override
+/// matches it. Rust has no caller function name: that field is empty.
+fn verbose_tag(at: &std::panic::Location<'_>) -> Option<String> {
+    let lists = VERBOSE.lock().ok()?;
+    if lists.is_empty() {
+        return None;
+    }
+    let file = at.file().rsplit('/').next().unwrap_or(at.file());
+    let tag = format!(
+        "{file}:():{} (bin=sshd, pid={})",
+        at.line(),
+        std::process::id()
+    );
+    lists
+        .iter()
+        .any(|l| puressh::config::host_matches(l, &tag))
+        .then_some(tag)
+}
 /// `MaxAuthTries`: failures past half of it are logged at INFO.
 static MAX_AUTH_TRIES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(6);
 
@@ -118,11 +157,25 @@ pub fn enabled(level: Level) -> bool {
 
 /// Log `msg` at `level`, worded as OpenSSH words it: syslog lines carry an
 /// `error: ` / `fatal: ` prefix, debug lines `debugN: ` everywhere. Control
-/// characters (peer-supplied names) are shown as `?`.
+/// characters (peer-supplied names) are shown as `?`. A `LogVerbose` match
+/// on the caller logs it whatever the level.
+#[track_caller]
 pub fn log(level: Level, msg: &str) {
-    if level == Level::Quiet || !enabled(level) {
+    if level == Level::Quiet {
         return;
     }
+    let forced = if enabled(level) {
+        None
+    } else {
+        match verbose_tag(std::panic::Location::caller()) {
+            Some(tag) => Some(tag),
+            None => return,
+        }
+    };
+    let msg = match forced {
+        Some(tag) => format!("{tag}: {msg}"),
+        None => msg.to_string(),
+    };
     let msg: String = msg
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
@@ -152,14 +205,17 @@ pub fn log(level: Level, msg: &str) {
     }
 }
 
+#[track_caller]
 pub fn info(msg: &str) {
     log(Level::Info, msg);
 }
 
+#[track_caller]
 pub fn verbose(msg: &str) {
     log(Level::Verbose, msg);
 }
 
+#[track_caller]
 pub fn error(msg: &str) {
     log(Level::Error, msg);
 }
@@ -329,5 +385,25 @@ pub fn conn_end(end: End<'_>) {
         }
         _ if c.authenticated => info(&format!("Disconnected from {who}{peer}")),
         _ => info(&format!("Connection closed by {who}{peer}{preauth}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_verbose_matches_the_callers_tag() {
+        let here = std::panic::Location::caller();
+        set_log_verbose(&["kex.c:*:1000".to_string()]);
+        assert_eq!(verbose_tag(here), None);
+        set_log_verbose(&[format!("kex.c:*:*,sshd_log.rs:*:{}*", here.line())]);
+        let tag = verbose_tag(here).expect("matches");
+        assert!(
+            tag.starts_with(&format!("sshd_log.rs:():{} (bin=sshd, pid=", here.line())),
+            "{tag}"
+        );
+        set_log_verbose(&["none".to_string()]);
+        assert_eq!(verbose_tag(here), None);
     }
 }

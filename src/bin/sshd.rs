@@ -968,6 +968,83 @@ mod imp {
     /// The `sshd_config` read when `-f` is not given (OpenSSH's default).
     const DEFAULT_CONFIG: &str = "/etc/ssh/sshd_config";
 
+    /// `moduli(5)` as this connection process read it, at its first group
+    /// exchange (before any chroot): `None` when it could not be read.
+    static MODULI: std::sync::OnceLock<Option<Vec<puressh::hazmat::kex::dh::ModuliEntry>>> =
+        std::sync::OnceLock::new();
+
+    /// OpenSSH's `choose_dh`: a group from `path` (`ModuliFile`) for a
+    /// group-exchange request, or its fixed fallback group when the file
+    /// cannot be read. `None` (no suitable group in a file that could be
+    /// read) refuses the exchange.
+    fn choose_dh(
+        path: &str,
+        req: puressh::hazmat::kex::dh::GexRequest,
+    ) -> Option<purecrypto::dh::DhGroup> {
+        use puressh::hazmat::kex::dh::{choose_moduli, fallback_gex_group, parse_moduli};
+        let entries = MODULI.get_or_init(|| match std::fs::read_to_string(path) {
+            Ok(text) => Some(parse_moduli(&text)),
+            Err(e) => {
+                sshd_log::info(&format!(
+                    "WARNING: could not open {path} ({}), using fixed modulus",
+                    strip_os_error(&e)
+                ));
+                None
+            }
+        });
+        let Some(entries) = entries else {
+            return Some(fallback_gex_group(req.max));
+        };
+        let pick = |n: usize| {
+            use purecrypto::rng::RngCore;
+            (purecrypto::rng::OsRng.next_u64() % n as u64) as usize
+        };
+        match choose_moduli(entries, req, pick).and_then(|e| e.group()) {
+            Some(group) => Some(group),
+            None => {
+                sshd_log::info(&format!(
+                    "WARNING: no suitable primes (size {}/{}/{}) in {path}",
+                    req.min, req.n, req.max
+                ));
+                None
+            }
+        }
+    }
+
+    /// An `io::Error` as OpenSSH's `strerror` would word it (without Rust's
+    /// ` (os error N)` suffix).
+    fn strip_os_error(e: &std::io::Error) -> String {
+        let s = e.to_string();
+        match s.find(" (os error ") {
+            Some(i) => s[..i].to_string(),
+            None => s,
+        }
+    }
+
+    /// `WarnWeakCrypto`: OpenSSH's warning for a key exchange that is not
+    /// post-quantum — the initial one, or a re-key away from a post-quantum
+    /// one.
+    fn warn_weak_kex(neg: &puressh::hazmat::transport::Negotiated, rekey: bool) {
+        static PQ_SEEN: AtomicBool = AtomicBool::new(false);
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        let pq = neg.kex.starts_with("mlkem") || neg.kex.starts_with("sntrup");
+        if pq {
+            PQ_SEEN.store(true, Ordering::Relaxed);
+            return;
+        }
+        let rekeyed = rekey && PQ_SEEN.load(Ordering::Relaxed);
+        if (rekey && !rekeyed) || WARNED.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let peer = sshd_log::with_conn(|c| c.peer()).unwrap_or_default();
+        sshd_log::info(&format!(
+            "WARNING: {}connection from {peer} is not using a post-quantum key exchange \
+             algorithm: \"{}\"",
+            if rekeyed { "rekeyed " } else { "" },
+            neg.kex
+        ));
+    }
+
     /// `ModuliFile`'s default: where Debian / Ubuntu ship `moduli(5)`.
     const DEFAULT_MODULI_FILE: &str = "/etc/ssh/moduli";
 
@@ -2912,12 +2989,39 @@ mod imp {
         Ok(out)
     }
 
-    /// A key or certificate blob as command tokens: its SHA256 fingerprint,
+    /// `FingerprintHash`: the digest key fingerprints are logged (and `%f`
+    /// expanded) with. SHA256 until the configuration says otherwise.
+    static FINGERPRINT_HASH: std::sync::OnceLock<puressh::config::server::FingerprintHash> =
+        std::sync::OnceLock::new();
+
+    /// A key blob's fingerprint as OpenSSH prints it with `FingerprintHash`:
+    /// `MD5:` and colon-separated hex, or the digest's name and unpadded
+    /// base64 (`SHA256:…`).
+    fn fingerprint(blob: &[u8]) -> String {
+        use purecrypto::hash::{Digest, Md5, Sha1, Sha256, Sha384, Sha512};
+        use puressh::config::server::FingerprintHash as H;
+        let hash = *FINGERPRINT_HASH.get().unwrap_or(&H::Sha256);
+        let digest = match hash {
+            H::Md5 => {
+                let hex: Vec<String> = Md5::digest(blob)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                return format!("MD5:{}", hex.join(":"));
+            }
+            H::Sha1 => Sha1::digest(blob).to_vec(),
+            H::Sha384 => Sha384::digest(blob).to_vec(),
+            H::Sha512 => Sha512::digest(blob).to_vec(),
+            _ => Sha256::digest(blob).to_vec(),
+        };
+        let b64 = purecrypto::der::base64_encode(&digest);
+        format!("{}:{}", hash.name(), b64.trim_end_matches('='))
+    }
+
+    /// A key or certificate blob as command tokens: its fingerprint,
     /// base64 encoding and type name.
     fn blob_tokens(blob: &[u8]) -> (String, String, String) {
-        use purecrypto::hash::{Digest, Sha256};
-        let b64 = purecrypto::der::base64_encode(&Sha256::digest(blob));
-        let fp = format!("SHA256:{}", b64.trim_end_matches('='));
+        let fp = fingerprint(blob);
         let kind = blob
             .get(..4)
             .map(|l| u32::from_be_bytes([l[0], l[1], l[2], l[3]]) as usize)
@@ -4084,6 +4188,27 @@ mod imp {
                 }
             };
             let opts = resolve_conn_options(&pol.config, user, &groups, self.peer.as_deref());
+            // `LogVerbose` as the connection's `Match` blocks have it.
+            if let Some(lists) = &opts.log_verbose {
+                sshd_log::set_log_verbose(lists);
+            }
+            // `RefuseConnection`: OpenSSH drops the connection as soon as the
+            // user (and so every `Match` criterion) is known.
+            if opts.refuse_connection == Some(true) {
+                let invalid = if lookup_user(user).is_ok() {
+                    ""
+                } else {
+                    "invalid user "
+                };
+                let peer = sshd_log::with_conn(|c| c.peer()).unwrap_or_default();
+                sshd_log::info(&format!(
+                    "administratively prohibited connection for {invalid}{} from {peer}",
+                    sanitize_log(user)
+                ));
+                // SAFETY: _exit ends the process at once, as OpenSSH's
+                // cleanup_exit: nothing else is torn down or flushed.
+                unsafe { libc::_exit(EXIT_CONFIG_REFUSED) };
+            }
 
             self.allow_users = UserHostPattern::parse_all(&effective_allow_users(
                 &pol.cli_allow_users,
@@ -8034,6 +8159,7 @@ mod imp {
         InvalidUser,
         NoAuth,
         GraceExceeded,
+        RefuseConnection,
     }
 
     /// Exit codes a connection process ends with before authenticating,
@@ -8041,6 +8167,8 @@ mod imp {
     const EXIT_LOGIN_GRACE: i32 = 3;
     const EXIT_AUTH_ATTEMPTED: i32 = 5;
     const EXIT_INVALID_USER: i32 = 7;
+    /// `RefuseConnection` refused it.
+    const EXIT_CONFIG_REFUSED: i32 = 6;
 
     /// This connection attempted authentication (not just `none`).
     static AUTH_ATTEMPTED: AtomicBool = AtomicBool::new(false);
@@ -8083,6 +8211,7 @@ mod imp {
             WaitStatus::Exited(_, EXIT_LOGIN_GRACE) => Some(PenaltyKind::GraceExceeded),
             WaitStatus::Exited(_, EXIT_AUTH_ATTEMPTED) => Some(PenaltyKind::AuthFail),
             WaitStatus::Exited(_, EXIT_INVALID_USER) => Some(PenaltyKind::InvalidUser),
+            WaitStatus::Exited(_, EXIT_CONFIG_REFUSED) => Some(PenaltyKind::RefuseConnection),
             WaitStatus::Exited(..) => Some(PenaltyKind::NoAuth),
             _ => None,
         }
@@ -8190,6 +8319,10 @@ mod imp {
                 PenaltyKind::GraceExceeded => {
                     (self.cfg.grace_exceeded, "penalty: exceeded LoginGraceTime")
                 }
+                PenaltyKind::RefuseConnection => (
+                    self.cfg.refuse_connection,
+                    "penalty: connection prohibited by RefuseConnection",
+                ),
             };
             if secs == 0 {
                 return;
@@ -8531,6 +8664,12 @@ mod imp {
                     .max_auth_tries
                     .unwrap_or(puressh::server::DEFAULT_MAX_AUTH_TRIES),
             );
+            if let Some(lists) = &sshd_cfg.global.log_verbose {
+                sshd_log::set_log_verbose(lists);
+            }
+            if let Some(h) = sshd_cfg.global.fingerprint_hash {
+                let _ = FINGERPRINT_HASH.set(h);
+            }
         }
         // `-d` itself (not LogLevel DEBUG) keeps the daemon in the foreground.
         let debug_flag = cli.debug;
@@ -9106,6 +9245,27 @@ mod imp {
 
         // Compression (startup-only): `no` strips zlib from the KEXINIT advert.
         config.compression = sshd_cfg.global.compression;
+
+        // VersionAddendum: after the version in the banner.
+        config.version_addendum = sshd_cfg.global.version_addendum.clone().unwrap_or_default();
+
+        // ModuliFile: group exchange picks its groups from moduli(5), as
+        // OpenSSH's choose_dh.
+        let moduli_file = sshd_cfg
+            .global
+            .moduli_file
+            .as_deref()
+            .map(|p| {
+                std::path::absolute(p).map_or_else(|_| p.to_string(), |a| a.display().to_string())
+            })
+            .unwrap_or_else(|| DEFAULT_MODULI_FILE.to_string());
+        config.gex_group_selector = Some(Arc::new(move |req| choose_dh(&moduli_file, req)));
+
+        // WarnWeakCrypto: say so when a connection's key exchange is not
+        // post-quantum (as OpenSSH's kex_check_warn_weak_crypto).
+        if sshd_cfg.global.warn_weak_crypto != Some(false) {
+            config.on_kex = Some(Arc::new(warn_weak_kex));
+        }
 
         // AddressFamily (startup-only): `-4`/`-6` > config; restricts the
         // listener family.

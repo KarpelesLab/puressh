@@ -305,11 +305,15 @@ struct ShellRuntime {
     /// Stdout bytes held over from a previous poll because the remote
     /// window was full or a re-KEX was in flight.
     pending_stdout: Vec<u8>,
+    /// A `pty-req` was granted on the channel (`IPQoS`: an interactive
+    /// session).
+    has_pty: bool,
 }
 
 impl ShellRuntime {
     fn new() -> Self {
         Self {
+            has_pty: false,
             pending_pty: None,
             session: None,
             exited: None,
@@ -1418,7 +1422,53 @@ pub struct Config {
     /// `PubkeyAuthOptions` outside any `Match` block: `(touch-required,
     /// verify-required)` for security-key signatures.
     pub pubkey_auth_options: (bool, bool),
+    /// `VersionAddendum` — text appended (after a space) to the
+    /// identification string the server sends. Empty ⇒ none.
+    pub version_addendum: String,
+    /// `ModuliFile` — picks the group a group-exchange key exchange offers.
+    /// `None` ⇒ the built-in RFC 3526 groups.
+    pub gex_group_selector: Option<crate::transport::GexGroupSelector>,
+    /// Called after each completed key exchange with what it negotiated and
+    /// whether it was a re-key (`WarnWeakCrypto` logging).
+    pub on_kex: Option<KexCallback>,
+    /// Looked up once per connection (after the key exchange): the peer's
+    /// host name and the connection's routing domain, for `Match Host`
+    /// (`UseDNS`) and `Match RDomain`. `None` ⇒ the host is the address and
+    /// there is no routing domain.
+    pub peer_names: Option<PeerNamesResolver>,
+    /// `IPQoS`: told `true` when the connection is interactive (no channel,
+    /// or only sessions with a pty), `false` once it carries bulk traffic
+    /// (anything else), so it can set the socket's DSCP. Called with the
+    /// first state once channels can open, then on every change.
+    pub on_qos: Option<QosCallback>,
 }
+
+/// See [`Config::on_kex`].
+pub type KexCallback = Arc<dyn Fn(&crate::transport::Negotiated, bool) + Send + Sync>;
+
+/// See [`Config::on_qos`].
+pub type QosCallback = Arc<dyn Fn(bool) + Send + Sync>;
+
+/// What a [`PeerNamesResolver`] found out about a connection.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct PeerNames {
+    /// The peer's host name (`UseDNS yes`, forward-confirmed), `None` to
+    /// use its address.
+    pub host: Option<String>,
+    /// The routing domain the connection arrived in, if any.
+    pub rdomain: Option<String>,
+}
+
+impl PeerNames {
+    /// Names for a connection.
+    pub fn new(host: Option<String>, rdomain: Option<String>) -> Self {
+        PeerNames { host, rdomain }
+    }
+}
+
+/// See [`Config::peer_names`]: given the connection's socket and peer.
+pub type PeerNamesResolver = Arc<dyn Fn(&TcpStream, SocketAddr) -> PeerNames + Send + Sync>;
 
 /// Resolver from a user name to its supplementary group names. Boxed so the
 /// binary can plug in an OS-backed implementation (e.g. `getgrouplist`)
@@ -1776,6 +1826,23 @@ impl Config {
             default_auth_methods: Vec::new(),
             ca_signature_algorithms: Vec::new(),
             pubkey_auth_options: (false, false),
+            version_addendum: String::new(),
+            gex_group_selector: None,
+            on_kex: None,
+            peer_names: None,
+            on_qos: None,
+        }
+    }
+
+    /// The identification string this server sends (without CR LF):
+    /// [`crate::transport::version::LOCAL_VERSION`], plus the
+    /// `VersionAddendum`.
+    pub fn local_version(&self) -> String {
+        let base = crate::transport::version::LOCAL_VERSION;
+        if self.version_addendum.is_empty() {
+            base.to_string()
+        } else {
+            alloc::format!("{base} {}", self.version_addendum)
         }
     }
 
@@ -2214,6 +2281,14 @@ fn handle_connection_inner(
     map_preauth_timeout(srv_drive_handshake(&mut stream, &mut driver, deadline))?;
     let session_id = driver.session_id().to_vec();
 
+    // The peer's host name (`UseDNS`) and routing domain, for `Match`.
+    let names = cfg
+        .peer_names
+        .as_ref()
+        .map(|resolve| resolve(&stream, peer))
+        .unwrap_or_default();
+    let _names = ConnNamesGuard::set(names);
+
     // Phase 1 (pre-auth): resolve the policy with an address-only context.
     // This yields the auth method set advertised to the client. `None`
     // policy ⇒ fall back to the static `allowed_auth_methods`.
@@ -2382,6 +2457,35 @@ fn fold_cert_caps(effective: &mut EffectivePolicy, caps: crate::auth::AuthCertCa
     effective.cert_caps = Some(caps);
 }
 
+std::thread_local! {
+    /// The [`PeerNames`] of the connection this thread is serving (one
+    /// connection's handshake, authentication and policy resolution run on
+    /// one thread).
+    static CONN_NAMES: core::cell::RefCell<PeerNames> =
+        core::cell::RefCell::new(PeerNames::default());
+}
+
+/// This thread's connection's [`PeerNames`].
+fn conn_names() -> PeerNames {
+    CONN_NAMES.with(|n| n.borrow().clone())
+}
+
+/// Holds a connection's [`PeerNames`] in [`CONN_NAMES`] while it is served.
+struct ConnNamesGuard;
+
+impl ConnNamesGuard {
+    fn set(names: PeerNames) -> Self {
+        CONN_NAMES.with(|n| *n.borrow_mut() = names);
+        ConnNamesGuard
+    }
+}
+
+impl Drop for ConnNamesGuard {
+    fn drop(&mut self) {
+        CONN_NAMES.with(|n| *n.borrow_mut() = PeerNames::default());
+    }
+}
+
 /// Pre-auth (Phase 1) resolution result: the auth method set to advertise.
 /// (The banner waits for the first request: see [`ReResolvedUserPolicy`].)
 struct PreAuthPolicy {
@@ -2408,13 +2512,15 @@ fn resolve_preauth_policy(
             max_auth_tries: cfg.max_auth_tries,
         };
     };
+    let rdomain = conn_names().rdomain;
     let ctx = crate::config::MatchContext {
-        // `Match host`: the client's host — its address, as OpenSSH's with
-        // `UseDNS no` (its default).
+        // `Match host`: the client's address, as OpenSSH's before the user
+        // is known (it looks the name up, with `UseDNS yes`, only then).
         host: address.unwrap_or("UNKNOWN"),
         address,
         local_address,
         local_port,
+        rdomain: rdomain.as_deref(),
         ..crate::config::MatchContext::default()
     };
     let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
@@ -2476,15 +2582,17 @@ fn resolve_effective_policy(
     let Some(policy) = cfg.policy.as_ref() else {
         return EffectivePolicy::unrestricted();
     };
+    let names = conn_names();
     let ctx = crate::config::MatchContext {
-        // `Match host`: the client's host — its address, as OpenSSH's with
-        // `UseDNS no` (its default).
-        host: address.unwrap_or("UNKNOWN"),
+        // `Match host`: the client's host name (`UseDNS yes`), else its
+        // address.
+        host: names.host.as_deref().or(address).unwrap_or("UNKNOWN"),
         user: Some(user),
         groups,
         address,
         local_address,
         local_port,
+        rdomain: names.rdomain.as_deref(),
         ..crate::config::MatchContext::default()
     };
     let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
@@ -2675,15 +2783,17 @@ fn reresolve_user_policy(
         };
     };
     let groups = resolve_user_groups(cfg, user);
+    let names = conn_names();
     let ctx = crate::config::MatchContext {
-        // `Match host`: the client's host — its address, as OpenSSH's with
-        // `UseDNS no` (its default).
-        host: address.unwrap_or("UNKNOWN"),
+        // `Match host`: the client's host name (`UseDNS yes`), else its
+        // address.
+        host: names.host.as_deref().or(address).unwrap_or("UNKNOWN"),
         user: Some(user),
         groups: groups.as_deref(),
         address,
         local_address,
         local_port,
+        rdomain: names.rdomain.as_deref(),
         ..crate::config::MatchContext::default()
     };
     let opts = policy.resolve(&ctx, crate::config::match_block::ExecPolicy::Deny);
@@ -3072,6 +3182,8 @@ struct ConnExtras {
     channel_idle: BTreeMap<u32, (u64, Instant)>,
     /// The same for all channels together (the `global` timeout).
     global_idle: (u64, Instant),
+    /// What [`Config::on_qos`] was last told: interactive or not.
+    qos_interactive: Option<bool>,
     /// Interfaces of the tunnels opened so far, for sessions'
     /// `SSH_TUNNEL`.
     tun_ifnames: Vec<String>,
@@ -3098,6 +3210,7 @@ impl ConnExtras {
             unused_since: Some(now),
             channel_idle: BTreeMap::new(),
             global_idle: (0, now),
+            qos_interactive: None,
             last_keepalive: now,
             missed_keepalives: 0,
             tun_ifnames: Vec::new(),
@@ -3268,6 +3381,18 @@ fn do_connection_loop(
         // it, as with OpenSSH, unless UnusedConnectionTimeout says otherwise.
         // Forwarding listeners do not count (OpenSSH's), only channels.
         let unused = !conn.channels().any(|c| !c.is_fully_closed());
+        // IPQoS, as OpenSSH classifies channels: the connection is
+        // interactive while every open channel is a session with a pty.
+        if let Some(qos) = &cfg.on_qos {
+            let interactive = conn.channels().filter(|c| !c.is_fully_closed()).all(|c| {
+                extras.session_channels.contains(&c.local_id)
+                    && shells.get(&c.local_id).is_some_and(|rt| rt.has_pty)
+            });
+            if extras.qos_interactive != Some(interactive) {
+                extras.qos_interactive = Some(interactive);
+                qos(interactive);
+            }
+        }
         let unused_timeout = effective
             .unused_connection_timeout
             .filter(|t| *t > 0)
@@ -4707,6 +4832,7 @@ fn handle_channel_request(
             // Plain-key / password auth is unaffected.
             if cfg.shell_handler.is_some() && effective.pty_allowed() {
                 let rt = shells.entry(channel).or_insert_with(ShellRuntime::new);
+                rt.has_pty = true;
                 rt.pending_pty = Some(PtySpec {
                     term,
                     cols,
@@ -7872,6 +7998,45 @@ mod tests {
             Arc::new(StaticHandler { out: Vec::new() }),
         )
         .with_policy(Arc::new(policy))
+    }
+
+    #[test]
+    fn version_addendum_follows_the_version() {
+        use crate::transport::version::LOCAL_VERSION;
+        let mut cfg = policy_cfg("");
+        assert_eq!(cfg.local_version(), LOCAL_VERSION);
+        cfg.version_addendum = "hello world".into();
+        assert_eq!(cfg.local_version(), format!("{LOCAL_VERSION} hello world"));
+    }
+
+    #[test]
+    fn peer_names_feed_match_host_and_rdomain() {
+        let cfg = policy_cfg(
+            "Match Host *.example.com\n  MaxAuthTries 2\nMatch RDomain vrf-blue\n  \
+             MaxSessions 1\n",
+        );
+        let _names = ConnNamesGuard::set(PeerNames::new(
+            Some("client.example.com".into()),
+            Some("vrf-blue".into()),
+        ));
+        // Before the user is known the host is the address (OpenSSH looks
+        // the name up only then); the routing domain applies from the start.
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), None, None);
+        assert_eq!(pre.max_auth_tries, cfg.max_auth_tries);
+        let eff = resolve_effective_policy(&cfg, "alice", None, Some("203.0.113.5"), None, None);
+        assert_eq!(eff.max_sessions, Some(1));
+        let r = reresolve_user_policy(
+            &cfg,
+            &["publickey"],
+            "alice",
+            Some("203.0.113.5"),
+            None,
+            None,
+        );
+        assert_eq!(r.methods, ["publickey"]);
+        drop(_names);
+        let eff = resolve_effective_policy(&cfg, "alice", None, Some("203.0.113.5"), None, None);
+        assert_eq!(eff.max_sessions, None);
     }
 
     #[test]

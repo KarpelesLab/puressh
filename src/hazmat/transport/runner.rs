@@ -341,7 +341,15 @@ pub struct KexRunner {
     accept_ext_info_now: bool,
     /// The sizes of the last group exchange this client ran.
     gex_sizes: Option<GexSizes>,
+    /// The server's group-exchange group selection (`ModuliFile`); the
+    /// built-in RFC 3526 groups without one.
+    gex_selector: Option<GexGroupSelector>,
 }
+
+/// Picks the Diffie-Hellman group a server's group exchange offers for a
+/// client's request (OpenSSH's `choose_dh` over `moduli(5)`); `None` refuses
+/// the exchange (`no matching DH grp found`).
+pub type GexGroupSelector = alloc::sync::Arc<dyn Fn(GexRequest) -> Option<DhGroup> + Send + Sync>;
 
 impl KexRunner {
     /// Build a new runner. `advert` is the KEXINIT message this side will send;
@@ -373,7 +381,14 @@ impl KexRunner {
             peer_ext_info: None,
             accept_ext_info_now: false,
             gex_sizes: None,
+            gex_selector: None,
         }
+    }
+
+    /// Server side: choose group-exchange groups with `selector` instead of
+    /// the built-in fixed groups.
+    pub fn set_gex_selector(&mut self, selector: Option<GexGroupSelector>) {
+        self.gex_selector = selector;
     }
 
     /// Strict-kex (Terrapin / CVE-2023-48795) enabled on this connection,
@@ -1154,7 +1169,19 @@ impl KexRunner {
     /// `_OLD` form). Pick a group with [`default_gex_group`], emit
     /// `GEX_GROUP`, and park in [`Phase::GexServerAwaitInit`].
     fn handle_gex_request(&mut self, payload: &[u8]) -> Result<KexAdvance> {
-        let (request, group, out) = GexSha256::server_group(payload, default_gex_group)?;
+        let mut refused = false;
+        let (request, group, out) = match &self.gex_selector {
+            None => GexSha256::server_group(payload, default_gex_group)?,
+            Some(select) => GexSha256::server_group(payload, |req| {
+                select(req).unwrap_or_else(|| {
+                    refused = true;
+                    default_gex_group(req)
+                })
+            })?,
+        };
+        if refused {
+            return Err(Error::Protocol("no matching DH grp found"));
+        }
         self.phase = Phase::GexServerAwaitInit { request, group };
         Ok(KexAdvance {
             outbound: vec![out.payload],

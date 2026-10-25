@@ -688,9 +688,229 @@ impl GexSha1 {
     }
 }
 
+// -----------------------------------------------------------------------------
+// moduli(5): the server's group-exchange groups.
+// -----------------------------------------------------------------------------
+
+/// One safe prime from a `moduli(5)` file (OpenSSH's `struct dhgroup`). The
+/// group itself is built only for the entry a key exchange picks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuliEntry {
+    /// The prime's size in bits (the file lists one less).
+    pub bits: u32,
+    /// The generator, big-endian.
+    pub g: Vec<u8>,
+    /// The prime, big-endian.
+    pub p: Vec<u8>,
+}
+
+impl ModuliEntry {
+    /// The Diffie-Hellman group, with a private exponent sized as for the
+    /// RFC 3526 groups.
+    pub fn group(&self) -> Option<DhGroup> {
+        let p = BoxedUint::from_be_bytes(&self.p);
+        let g = BoxedUint::from_be_bytes(&self.g);
+        DhGroup::from_custom_unchecked(p, g, 512).ok()
+    }
+}
+
+fn hex_bytes(s: &str) -> Option<Vec<u8>> {
+    let digit = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len().div_ceil(2));
+    // An odd count of digits: the first stands alone.
+    let (head, rest) = b.split_at(b.len() % 2);
+    for &c in head {
+        out.push(digit(c)?);
+    }
+    for pair in rest.chunks(2) {
+        out.push((digit(pair[0])? << 4) | digit(pair[1])?);
+    }
+    Some(out)
+}
+
+/// Bits in a big-endian magnitude.
+fn bit_len(b: &[u8]) -> u32 {
+    let b = strip_leading_zero(b);
+    match b.first() {
+        None => 0,
+        Some(lead) => (b.len() as u32 - 1) * 8 + (8 - lead.leading_zeros()),
+    }
+}
+
+/// Parse a `moduli(5)` file as OpenSSH's `parse_prime` does: fields `time
+/// type tests tries size generator modulus`; only tested (not composite)
+/// safe primes whose stated size matches the modulus count. Comments, blank
+/// and malformed lines are skipped.
+pub fn parse_moduli(text: &str) -> Vec<ModuliEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_start();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let [_time, kind, tests, tries, size, g, p] = f[..] else {
+            continue;
+        };
+        const MODULI_TYPE_SAFE: u32 = 2;
+        const MODULI_TESTS_COMPOSITE: u32 = 0x01;
+        let (Ok(kind), Ok(tests), Ok(tries), Ok(size)) = (
+            kind.parse::<u32>(),
+            tests.parse::<u32>(),
+            tries.parse::<u32>(),
+            size.parse::<u32>(),
+        ) else {
+            continue;
+        };
+        if kind != MODULI_TYPE_SAFE
+            || tests > 0x1f
+            || tests & MODULI_TESTS_COMPOSITE != 0
+            || tests & !MODULI_TESTS_COMPOSITE == 0
+            || tries == 0
+            || tries > 1 << 30
+            || size == 0
+            || size > 64 * 1024
+        {
+            continue;
+        }
+        let (Some(g), Some(p)) = (hex_bytes(g), hex_bytes(p)) else {
+            continue;
+        };
+        // The whole group is one bit larger than the listed size.
+        let bits = size + 1;
+        if bit_len(&p) != bits || bit_len(&g) < 2 {
+            continue;
+        }
+        out.push(ModuliEntry {
+            bits,
+            g: strip_leading_zero(&g).to_vec(),
+            p: strip_leading_zero(&p).to_vec(),
+        });
+    }
+    out
+}
+
+/// Smallest and largest group sizes OpenSSH's server agrees to
+/// (`DH_GRP_MIN`, `DH_GRP_MAX`).
+pub const GEX_GROUP_MIN: u32 = 2048;
+/// See [`GEX_GROUP_MIN`].
+pub const GEX_GROUP_MAX: u32 = 8192;
+
+/// OpenSSH's `choose_dh`: of the entries within the client's `[min, max]`
+/// (clamped to [`GEX_GROUP_MIN`]..=[`GEX_GROUP_MAX`]), the size closest to
+/// `n` from above (else the largest below it), and one of that size chosen
+/// by `pick(count)` (a uniform index below `count`). `None` when no entry
+/// fits, or the request is inconsistent (OpenSSH then refuses the exchange).
+pub fn choose_moduli(
+    entries: &[ModuliEntry],
+    req: GexRequest,
+    pick: impl FnOnce(usize) -> usize,
+) -> Option<&ModuliEntry> {
+    if req.max < req.min || req.n < req.min || req.max < req.n || req.max < GEX_GROUP_MIN {
+        return None;
+    }
+    let min = req.min.max(GEX_GROUP_MIN);
+    let max = req.max.min(GEX_GROUP_MAX);
+    let want = req.n.clamp(GEX_GROUP_MIN, GEX_GROUP_MAX);
+    let mut best = 0u32;
+    let mut count = 0usize;
+    for e in entries {
+        if e.bits > max || e.bits < min {
+            continue;
+        }
+        if (e.bits > want && e.bits < best) || (e.bits > best && best < want) {
+            best = e.bits;
+            count = 0;
+        }
+        if e.bits == best {
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    let which = pick(count).min(count - 1);
+    entries
+        .iter()
+        .filter(|e| e.bits >= min && e.bits <= max && e.bits == best)
+        .nth(which)
+}
+
+/// OpenSSH's `dh_new_group_fallback`: the fixed group a server without a
+/// usable `moduli(5)` file offers for a request up to `max` bits.
+pub fn fallback_gex_group(max: u32) -> DhGroup {
+    let max = max.min(GEX_GROUP_MAX);
+    if max < 3072 {
+        group14()
+    } else if max < 6144 {
+        group16()
+    } else {
+        group18()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moduli_parse_and_choose_as_openssh() {
+        // group14's prime, listed as OpenSSH's moduli lists it.
+        let p14 = group14().p().to_be_bytes(group14().byte_size());
+        let hex: alloc::string::String = p14.iter().map(|b| alloc::format!("{b:02X}")).collect();
+        let text = alloc::format!(
+            "# Time Type Tests Tries Size Generator Modulus\n\
+             20260511084302 2 6 100 2047 2 {hex}\n\
+             20260511084303 2 6 100 2047 5 {hex}\n\
+             20260511084304 1 6 100 2047 2 {hex}\n\
+             20260511084305 2 7 100 2047 2 {hex}\n\
+             20260511084306 2 6 100 2048 2 {hex}\n\
+             20260511084307 2 6 100 2047 1 {hex}\n\
+             garbage\n"
+        );
+        let entries = parse_moduli(&text);
+        // Not safe, composite, wrong size and g = 1 are all dropped.
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].bits, 2048);
+        assert_eq!(entries[1].g, [5]);
+        let req = |min, n, max| GexRequest { min, n, max };
+        let chosen = choose_moduli(&entries, req(2048, 3072, 8192), |n| n - 1).unwrap();
+        assert_eq!(chosen.g, [5]);
+        let g = chosen.group().unwrap();
+        assert_eq!(g.bit_size(), 2048);
+        assert!(choose_moduli(&entries, req(3072, 4096, 8192), |_| 0).is_none());
+        assert!(choose_moduli(&entries, req(4096, 2048, 8192), |_| 0).is_none());
+        // Below the floor, but the floor itself fits.
+        assert!(choose_moduli(&entries, req(1024, 1024, 2048), |_| 0).is_some());
+
+        // Closest above `n` wins over closer below it.
+        let mk = |bits| ModuliEntry {
+            bits,
+            g: alloc::vec![2],
+            p: alloc::vec![],
+        };
+        let set = [mk(2048), mk(3072), mk(4096), mk(8192)];
+        assert_eq!(
+            choose_moduli(&set, req(2048, 3500, 8192), |_| 0).map(|e| e.bits),
+            Some(4096)
+        );
+        assert_eq!(
+            choose_moduli(&set, req(2048, 8192, 8192), |_| 0).map(|e| e.bits),
+            Some(8192)
+        );
+        assert_eq!(
+            choose_moduli(&set, req(2048, 7000, 8000), |_| 0).map(|e| e.bits),
+            Some(4096)
+        );
+        assert_eq!(
+            choose_moduli(&set, req(2048, 3072, 3500), |_| 0).map(|e| e.bits),
+            Some(3072)
+        );
+        assert_eq!(fallback_gex_group(2048).bit_size(), 2048);
+        assert_eq!(fallback_gex_group(4096).bit_size(), 4096);
+        assert_eq!(fallback_gex_group(8192).bit_size(), 8192);
+    }
 
     #[test]
     fn algorithm_names() {

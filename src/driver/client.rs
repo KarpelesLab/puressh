@@ -173,7 +173,9 @@ impl ClientDriver {
     /// keepalive activity clock. Call exactly once, before pumping.
     pub fn start(&mut self, now: Instant) -> Result<()> {
         self.last_activity = now;
-        self.outbox.push_back(VersionExchange::outgoing_bytes());
+        let mut line = self.local_version()?;
+        line.extend_from_slice(b"\r\n");
+        self.outbox.push_back(line);
         let advert = crate::client::build_default_kexinit(&mut self.rng, &self.algo_overrides)
             .with_ext_info_marker(Role::Client);
         self.runner = KexRunner::new(Role::Client, advert);
@@ -189,6 +191,24 @@ impl ClientDriver {
             self.enqueue_payload(&p)?;
         }
         Ok(())
+    }
+
+    /// Our identification string (without CR LF): the library's, with the
+    /// [`AlgoOverrides::version_addendum`] after a space.
+    fn local_version(&self) -> Result<Vec<u8>> {
+        let base = crate::transport::version::LOCAL_VERSION;
+        match self.algo_overrides.version_addendum.as_deref() {
+            None | Some("") => Ok(base.as_bytes().to_vec()),
+            Some(a) => {
+                let line = alloc::format!("{base} {a}");
+                if line.contains(['\r', '\n']) || line.len() > 253 {
+                    return Err(Error::Config(
+                        "VersionAddendum: invalid identification string",
+                    ));
+                }
+                Ok(line.into_bytes())
+            }
+        }
     }
 
     // --- accessors ---
@@ -511,7 +531,7 @@ impl ClientDriver {
         } else {
             None
         };
-        let v_c = crate::transport::version::LOCAL_VERSION.as_bytes().to_vec();
+        let v_c = self.local_version()?;
         let v_s = self.v_s.clone();
         let adv = self.runner.on_packet(
             &mut self.rng,

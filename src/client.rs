@@ -672,6 +672,11 @@ pub struct AlgoOverrides {
     /// and the builder degrades to `none` defensively if it somehow slips
     /// through.
     pub compression: Option<bool>,
+    /// `VersionAddendum` — text appended to the identification string this
+    /// side sends (`SSH-2.0-puressh_X <addendum>`). `None` or empty: none.
+    /// One with a line break, or that would take the line past RFC 4253's
+    /// 255 bytes, fails the connection.
+    pub version_addendum: Option<String>,
 }
 
 impl Config {

@@ -1054,11 +1054,29 @@ fn collect_credentials(
     credentials
 }
 
+/// Whether a key exchange is post-quantum (OpenSSH's `KEX_IS_PQ` ones).
+fn is_pq_kex(name: &str) -> bool {
+    matches!(
+        name,
+        "mlkem768x25519-sha256"
+            | "mlkem768nistp256-sha256"
+            | "sntrup761x25519-sha512"
+            | "sntrup761x25519-sha512@openssh.com"
+    )
+}
+
 /// A keyboard-interactive responder (RFC 4256) backed by the terminal: prints
 /// the server's title/instruction once, then reads one answer per prompt,
 /// honoring each prompt's echo flag via [`read_kbdint_response`].
-struct StdinKbdResponder;
+struct StdinKbdResponder {
+    /// `KbdInteractiveDevices`.
+    devices: String,
+}
 impl KeyboardInteractiveResponder for StdinKbdResponder {
+    fn submethods(&self) -> String {
+        self.devices.clone()
+    }
+
     fn respond(
         &mut self,
         name: &str,
@@ -1156,6 +1174,17 @@ fn authenticate_client(
     // Each key exchange in OpenSSH's debug words (the first has already run).
     if let Some(n) = client.negotiated() {
         log_kex(&n);
+        // WarnWeakCrypto (default yes): a key exchange that is not
+        // post-quantum, unless KexAlgorithms chose the list.
+        if cfg_block.warn_weak_crypto != Some(false)
+            && cfg_block.kex_algorithms.is_none()
+            && !is_pq_kex(&n.kex)
+            && !common::is_quiet()
+        {
+            eprintln!("** WARNING: connection is not using a post-quantum key exchange algorithm.");
+            eprintln!("** This session may be vulnerable to \"store now, decrypt later\" attacks.");
+            eprintln!("** The server may need to be upgraded. See https://openssh.com/pq.html");
+        }
     }
     // Agent keys sign for this session only (destination constraints).
     #[cfg(unix)]
@@ -1273,7 +1302,12 @@ fn authenticate_client(
     // for these two), gated on PreferredAuthentications and BatchMode.
     if kbdint_enabled {
         auth.add_credential(ClientCredential::KeyboardInteractive(Box::new(
-            StdinKbdResponder,
+            StdinKbdResponder {
+                devices: cfg_block
+                    .kbd_interactive_devices
+                    .clone()
+                    .unwrap_or_default(),
+            },
         )));
     }
 
@@ -1417,6 +1451,7 @@ fn config_for_host(
     // up front (in run()) when the `compress` feature is absent, so
     // by the time we get here Some(true) is honourable.
     algorithms.compression = cli.compression.or(cfg_block.compression);
+    algorithms.version_addendum = cfg_block.version_addendum.clone();
     Ok(Config::new(policy).with_algorithms(algorithms))
 }
 
@@ -4921,6 +4956,9 @@ impl Tokens {
         }
         if let Some(c) = &mut cfg.remote_command {
             *c = self.expand(c);
+        }
+        if let Some(v) = &mut cfg.version_addendum {
+            *v = self.expand(&expand_env(v));
         }
         // SetEnv values (not the names).
         for (_, v) in cfg.set_env.iter_mut() {

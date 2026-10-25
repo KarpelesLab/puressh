@@ -19,6 +19,13 @@ pub trait KeyboardInteractiveResponder: Send {
     /// Produce one response per prompt in `prompts`.
     fn respond(&mut self, name: &str, instruction: &str, prompts: &[(String, bool)])
     -> Vec<String>;
+
+    /// The `submethods` field of the request: the comma-separated devices
+    /// the server should prefer (OpenSSH's `KbdInteractiveDevices`). Empty
+    /// by default: the server's choice.
+    fn submethods(&self) -> String {
+        String::new()
+    }
 }
 
 /// A credential the client offers in turn.
@@ -421,10 +428,10 @@ impl ClientAuth {
                 },
                 State::AwaitingPkOk,
             ),
-            ClientCredential::KeyboardInteractive(_) => (
+            ClientCredential::KeyboardInteractive(r) => (
                 AuthMethodPayload::KeyboardInteractive {
                     language_tag: String::new(),
-                    submethods: String::new(),
+                    submethods: r.submethods(),
                 },
                 State::AwaitingKbdintResult,
             ),

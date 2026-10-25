@@ -418,10 +418,170 @@ pub struct ServerOptions {
     /// Every `Port` line, in order (OpenSSH listens on all of them; `port`
     /// keeps only the first, as `Match LocalPort` and older callers expect).
     pub ports: Vec<u16>,
+    /// `TCPKeepAlive all`: `SO_KEEPALIVE` on the X11 and port-forwarding
+    /// sockets too, not only on the client's connection
+    /// ([`Self::tcp_keep_alive`]). Set (to `false` for `yes` / `transport` /
+    /// `no`) by every `TCPKeepAlive` line.
+    pub tcp_keep_alive_forwarded: Option<bool>,
+    /// `X11DisplayOffset` — the first display number X11 forwarding may use
+    /// (10 by default).
+    pub x11_display_offset: Option<u32>,
+    /// `X11UseLocalhost` (yes by default): bind forwarded displays to the
+    /// loopback address (`DISPLAY=localhost:N`) rather than the wildcard
+    /// address (`DISPLAY=<hostname>:N`).
+    pub x11_use_localhost: Option<bool>,
+    /// `StreamLocalBindMask` — the umask a forwarded Unix-domain socket is
+    /// created with (`0177` by default).
+    pub stream_local_bind_mask: Option<u32>,
+    /// `StreamLocalBindUnlink` (no by default): remove a stale socket file
+    /// before binding a forwarded Unix-domain socket over it.
+    pub stream_local_bind_unlink: Option<bool>,
+    /// `IPQoS` — the `(interactive, other)` DSCP / ToS bytes for the
+    /// connection, `None` for `none` (the system default). OpenSSH's
+    /// default is `ef cs0`.
+    pub ip_qos: Option<(Option<u8>, Option<u8>)>,
+    /// `VersionAddendum` — text after the software version in the protocol
+    /// banner; `Some("")` for `none`.
+    pub version_addendum: Option<String>,
+    /// `UseDNS` (no by default): look the client's address up, and use the
+    /// name for `Match Host`, `from=` and `AllowUsers user@host` once it
+    /// resolves back to that same address.
+    pub use_dns: Option<bool>,
+    /// `ModuliFile` — the `moduli(5)` file group-exchange key exchange picks
+    /// its Diffie-Hellman groups from (`/etc/ssh/moduli` by default).
+    pub moduli_file: Option<String>,
+    /// `LogVerbose` — `file:function:line` pattern lists whose log messages
+    /// are shown at `DEBUG3` whatever the `LogLevel`. `["none"]` turns the
+    /// list off.
+    pub log_verbose: Option<Vec<String>>,
+    /// `FingerprintHash` — the hash key fingerprints are logged with.
+    pub fingerprint_hash: Option<FingerprintHash>,
+    /// `AgentSocketPath` — where a forwarded agent's socket is created:
+    /// `user:<dir>` (a directory of the user's, `.ssh/agent` under the home
+    /// directory by default) or `shared:<absolute dir>` (a fresh private
+    /// subdirectory of it), or `none`, which disables agent forwarding.
+    /// `%u`, `%U` and `%h` are expanded.
+    pub agent_socket_path: Option<String>,
+    /// `WarnWeakCrypto` (yes by default): log a warning when a connection
+    /// does not use a post-quantum key exchange. `no-pq-kex` (like `no`)
+    /// turns it off.
+    pub warn_weak_crypto: Option<bool>,
+    /// `RefuseConnection`: refuse the connection outright once the `Match`
+    /// blocks it selects are known (with a `refuseconnection` penalty).
+    pub refuse_connection: Option<bool>,
+    /// `SshdSessionPath` — OpenSSH's per-connection helper binary; accepted
+    /// and shown by `sshd -T`, unused (this sshd is one program).
+    pub sshd_session_path: Option<String>,
+    /// `SshdAuthPath` — likewise.
+    pub sshd_auth_path: Option<String>,
     /// Non-fatal diagnostics from parsing this block: OpenSSH keywords that
     /// are accepted but not implemented, or arguments that are ignored. Never
     /// merged across blocks; see [`SshServerConfig::warnings`].
     pub warnings: Vec<String>,
+}
+
+/// `FingerprintHash`: the digest key fingerprints are shown with (any of
+/// OpenSSH's digests, as its sshd accepts).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum FingerprintHash {
+    /// `md5`: colon-separated hex, `MD5:…`.
+    Md5,
+    /// `sha1`: unpadded base64, `SHA1:…`.
+    Sha1,
+    /// `sha256` (the default): unpadded base64, `SHA256:…`.
+    Sha256,
+    /// `sha384`.
+    Sha384,
+    /// `sha512`.
+    Sha512,
+}
+
+impl FingerprintHash {
+    /// The digest's name as OpenSSH prints it (`MD5`, `SHA256`, …).
+    pub fn name(self) -> &'static str {
+        match self {
+            FingerprintHash::Md5 => "MD5",
+            FingerprintHash::Sha1 => "SHA1",
+            FingerprintHash::Sha256 => "SHA256",
+            FingerprintHash::Sha384 => "SHA384",
+            FingerprintHash::Sha512 => "SHA512",
+        }
+    }
+
+    /// Parse a digest name, in any case.
+    // An explicit loop: rustc --release once hung on `[…].into_iter().find(…)`.
+    #[allow(clippy::manual_find)]
+    pub fn parse(s: &str) -> Option<Self> {
+        let all = [
+            FingerprintHash::Md5,
+            FingerprintHash::Sha1,
+            FingerprintHash::Sha256,
+            FingerprintHash::Sha384,
+            FingerprintHash::Sha512,
+        ];
+        for h in all {
+            if h.name().eq_ignore_ascii_case(s) {
+                return Some(h);
+            }
+        }
+        None
+    }
+}
+
+/// `IPQoS` names and the DSCP / ToS byte each stands for (OpenSSH's
+/// `ipqos[]`). `none` and the deprecated ToS names map to `None`: the system
+/// default.
+const IPQOS_NAMES: &[(&str, Option<u8>)] = &[
+    ("none", None),
+    ("af11", Some(0x28)),
+    ("af12", Some(0x30)),
+    ("af13", Some(0x38)),
+    ("af21", Some(0x48)),
+    ("af22", Some(0x50)),
+    ("af23", Some(0x58)),
+    ("af31", Some(0x68)),
+    ("af32", Some(0x70)),
+    ("af33", Some(0x78)),
+    ("af41", Some(0x88)),
+    ("af42", Some(0x90)),
+    ("af43", Some(0x98)),
+    ("cs0", Some(0x00)),
+    ("cs1", Some(0x20)),
+    ("cs2", Some(0x40)),
+    ("cs3", Some(0x60)),
+    ("cs4", Some(0x80)),
+    ("cs5", Some(0xa0)),
+    ("cs6", Some(0xc0)),
+    ("cs7", Some(0xe0)),
+    ("ef", Some(0xb8)),
+    ("le", Some(0x04)),
+    ("va", Some(0xb0)),
+    ("lowdelay", None),
+    ("throughput", None),
+    ("reliability", None),
+];
+
+/// Parse one `IPQoS` value: a name from [`IPQOS_NAMES`] (any case) or a
+/// number `0..=255`. `Some(None)` is `none` (or a deprecated ToS name, which
+/// OpenSSH also turns into the system default).
+pub fn parse_ipqos(s: &str) -> Option<Option<u8>> {
+    for (name, v) in IPQOS_NAMES {
+        if name.eq_ignore_ascii_case(s) {
+            return Some(*v);
+        }
+    }
+    s.parse::<u8>().ok().map(Some)
+}
+
+/// An `IPQoS` value as `sshd -T` prints it: its name, `none`, or `0x%02x`.
+pub fn ipqos_name(v: Option<u8>) -> String {
+    for (name, n) in IPQOS_NAMES {
+        if *n == v {
+            return (*name).to_string();
+        }
+    }
+    format!("0x{:02x}", v.unwrap_or(0))
 }
 
 /// `AllowTcpForwarding` policy: which forwarding directions are permitted.
@@ -659,6 +819,10 @@ impl SshServerConfig {
         // drop-in or line cannot override an earlier one.
         let mut one = ServerOptions::default();
         apply_keyword(&mut one, line)?;
+        // OpenSSH takes the last `FingerprintHash`, not the first.
+        if one.fingerprint_hash.is_some() {
+            target.fingerprint_hash = None;
+        }
         target.warnings.append(&mut one.warnings);
         merge_server_options(target, &one);
         Ok(())
@@ -792,6 +956,22 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(knock_window);
     take_scalar!(knock_clock_skew);
     take_scalar!(knock_max_pending);
+    take_scalar!(tcp_keep_alive_forwarded);
+    take_scalar!(x11_display_offset);
+    take_scalar!(x11_use_localhost);
+    take_scalar!(stream_local_bind_mask);
+    take_scalar!(stream_local_bind_unlink);
+    take_scalar!(ip_qos);
+    take_scalar!(version_addendum);
+    take_scalar!(use_dns);
+    take_scalar!(moduli_file);
+    take_scalar!(log_verbose);
+    take_scalar!(fingerprint_hash);
+    take_scalar!(agent_socket_path);
+    take_scalar!(warn_weak_crypto);
+    take_scalar!(refuse_connection);
+    take_scalar!(sshd_session_path);
+    take_scalar!(sshd_auth_path);
     dst.knock_listen.extend(src.knock_listen.iter().cloned());
     dst.ports.extend(src.ports.iter().copied());
     dst.knock_users.extend(src.knock_users.iter().cloned());
@@ -866,6 +1046,29 @@ fn reject_invalid_in_match(line: &ParsedLine) -> Result<(), ConfigError> {
         "knockwindow",
         "knockclockskew",
         "knockmaxpending",
+        // Global-only in OpenSSH too.
+        "tcpkeepalive",
+        "keepalive",
+        "usedns",
+        "versionaddendum",
+        "modulifile",
+        "fingerprinthash",
+        "warnweakcrypto",
+        "sshdsessionpath",
+        "sshdauthpath",
+        "hostdsakey",
+        "dsaauthentication",
+        "serverkeybits",
+        "keyregenerationinterval",
+        "rhostsauthentication",
+        "checkmail",
+        "uselogin",
+        "verifyreversemapping",
+        "reversemappingcheck",
+        "useprivilegeseparation",
+        "kerberostgtpassing",
+        "afstokenpassing",
+        "protocol",
     ];
     if INVALID_IN_MATCH.contains(&line.keyword.as_str()) {
         return Err(ConfigError::Unsupported {
@@ -885,9 +1088,19 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             opts.ports.push(port);
         }
         "listenaddress" => {
-            opts.listen_addresses.push(one_arg(line)?);
+            // `ListenAddress addr [rdomain name]`: the routing domain (a VRF
+            // device on Linux) the listener is bound to.
+            match line.args.as_slice() {
+                [addr] => opts.listen_addresses.push(addr.clone()),
+                [addr, rd, name] if rd == "rdomain" && !name.is_empty() => {
+                    opts.listen_addresses.push(format!("{addr} rdomain {name}"));
+                }
+                [] => return Err(bad_value(line, "missing address")),
+                _ => return Err(bad_value(line, "bad ListenAddress syntax")),
+            }
         }
-        "hostkey" => {
+        // `HostDSAKey`: OpenSSH's old name for `HostKey`.
+        "hostkey" | "hostdsakey" => {
             opts.host_key_files.push(one_arg(line)?);
         }
         "hostcertificate" => {
@@ -1170,8 +1383,22 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         "x11forwarding" => {
             opts.x11_forwarding = Some(parse_yes_no(line)?);
         }
-        "tcpkeepalive" => {
-            opts.tcp_keep_alive = Some(parse_yes_no(line)?);
+        // `KeepAlive`: OpenSSH's old name for `TCPKeepAlive`.
+        "tcpkeepalive" | "keepalive" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            let (transport, forwarded) = match v.as_str() {
+                "yes" | "true" | "transport" => (true, false),
+                "no" | "false" => (false, false),
+                "all" => (true, true),
+                _ => {
+                    return Err(bad_value(
+                        line,
+                        &format!("expected yes, no, transport or all, got {v:?}"),
+                    ));
+                }
+            };
+            opts.tcp_keep_alive = Some(transport);
+            opts.tcp_keep_alive_forwarded = Some(forwarded);
         }
         "permituserrc" => {
             opts.permit_user_rc = Some(parse_yes_no(line)?);
@@ -1275,7 +1502,9 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                 "CASignatureAlgorithms",
             )?);
         }
-        "pubkeyauthentication" => {
+        // `DSAAuthentication`: OpenSSH still maps it onto
+        // `PubkeyAuthentication`.
+        "pubkeyauthentication" | "dsaauthentication" => {
             opts.pubkey_authentication = Some(parse_yes_no(line)?);
         }
         "pubkeyauthoptions" => {
@@ -1300,7 +1529,10 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
         "passwordauthentication" => {
             opts.password_authentication = Some(parse_yes_no(line)?);
         }
-        "kbdinteractiveauthentication" | "challengeresponseauthentication" => {
+        // OpenSSH's old names for it.
+        "kbdinteractiveauthentication"
+        | "challengeresponseauthentication"
+        | "skeyauthentication" => {
             opts.kbd_interactive_authentication = Some(parse_yes_no(line)?);
         }
         "authenticationmethods" => {
@@ -1575,6 +1807,147 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
                     })?
             });
         }
+        "x11displayoffset" => {
+            let s = one_arg(line)?;
+            opts.x11_display_offset = Some(
+                s.parse::<u32>()
+                    .ok()
+                    .filter(|n| *n <= i32::MAX as u32)
+                    .ok_or_else(|| bad_value(line, &format!("bad integer value {s:?}")))?,
+            );
+        }
+        "x11uselocalhost" => {
+            opts.x11_use_localhost = Some(parse_yes_no(line)?);
+        }
+        "streamlocalbindmask" => {
+            // OpenSSH's strtol(…, 8): leading octal digits, the rest ignored.
+            let s = one_arg(line)?;
+            let end = s
+                .find(|c: char| !('0'..='7').contains(&c))
+                .unwrap_or(s.len());
+            let mask = u32::from_str_radix(&s[..end], 8)
+                .ok()
+                .filter(|m| *m <= 0o777)
+                .ok_or_else(|| bad_value(line, &format!("invalid mask {s:?}")))?;
+            opts.stream_local_bind_mask = Some(mask);
+        }
+        "streamlocalbindunlink" => {
+            opts.stream_local_bind_unlink = Some(parse_yes_no(line)?);
+        }
+        "ipqos" => {
+            let parse = |s: &String| {
+                parse_ipqos(s).ok_or_else(|| bad_value(line, &format!("bad IPQoS value {s:?}")))
+            };
+            opts.ip_qos = Some(match line.args.as_slice() {
+                [one] => {
+                    let v = parse(one)?;
+                    (v, v)
+                }
+                [interactive, bulk] => (parse(interactive)?, parse(bulk)?),
+                [] => return Err(bad_value(line, "missing argument")),
+                _ => return Err(bad_value(line, "extra arguments at end of line")),
+            });
+        }
+        "versionaddendum" => {
+            // The rest of the line, as written (`#` comments are already
+            // gone); `none` for no addendum.
+            let v = line.rest.trim();
+            if v.is_empty() {
+                return Err(bad_value(line, "missing argument"));
+            }
+            if v.contains('\r') {
+                return Err(bad_value(line, "invalid argument"));
+            }
+            opts.version_addendum = Some(if v.eq_ignore_ascii_case("none") {
+                String::new()
+            } else {
+                v.to_string()
+            });
+        }
+        "usedns" => {
+            opts.use_dns = Some(parse_yes_no(line)?);
+        }
+        "modulifile" => {
+            opts.moduli_file = Some(one_arg(line)?);
+        }
+        "logverbose" => {
+            if line.args.is_empty() {
+                return Err(bad_value(line, "no LogVerbose specified"));
+            }
+            if line.args.len() > 1 && line.args.iter().any(|a| a.eq_ignore_ascii_case("none")) {
+                return Err(bad_value(line, "\"none\" argument must appear alone"));
+            }
+            opts.log_verbose = Some(line.args.clone());
+        }
+        "fingerprinthash" => {
+            let v = one_arg(line)?;
+            opts.fingerprint_hash = Some(
+                FingerprintHash::parse(&v)
+                    .ok_or_else(|| bad_value(line, &format!("invalid algorithm \"{v}\"")))?,
+            );
+        }
+        "agentsocketpath" => {
+            let v = one_arg(line)?;
+            let ok = match (v.strip_prefix("shared:"), v.strip_prefix("user:")) {
+                (Some(dir), _) => dir.starts_with('/'),
+                (None, Some(dir)) => !dir.is_empty(),
+                (None, None) => v == "none",
+            };
+            if !ok {
+                return Err(bad_value(
+                    line,
+                    &format!("invalid path {v:?} (expected user:DIR, shared:/DIR or none)"),
+                ));
+            }
+            opts.agent_socket_path = Some(v);
+        }
+        "warnweakcrypto" => {
+            let v = one_arg(line)?.to_ascii_lowercase();
+            opts.warn_weak_crypto = Some(match v.as_str() {
+                "yes" | "true" => true,
+                "no" | "false" | "no-pq-kex" => false,
+                _ => {
+                    return Err(bad_value(
+                        line,
+                        &format!("expected yes, no or no-pq-kex, got {v:?}"),
+                    ));
+                }
+            });
+        }
+        "refuseconnection" => {
+            opts.refuse_connection = Some(parse_yes_no(line)?);
+        }
+        "sshdsessionpath" => {
+            opts.sshd_session_path = Some(one_arg(line)?);
+        }
+        "sshdauthpath" => {
+            opts.sshd_auth_path = Some(one_arg(line)?);
+        }
+        // OpenSSH portable sets a routing domain only on OpenBSD; elsewhere
+        // the keyword is a fatal error there too.
+        "rdomain" => {
+            return Err(ConfigError::Unsupported {
+                line: line.line_no,
+                msg: "setting RDomain not supported on this platform".into(),
+            });
+        }
+        kw if DEPRECATED_KEYWORDS
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case(kw)) =>
+        {
+            // OpenSSH logs these (`Protocol` only at debug level) and
+            // otherwise ignores them.
+            let mut name = kw;
+            for k in DEPRECATED_KEYWORDS {
+                if k.eq_ignore_ascii_case(kw) {
+                    name = k;
+                }
+            }
+            if name != "Protocol" {
+                opts.warnings
+                    .push(format!("{}: Deprecated option {name}", line.location()));
+            }
+        }
         kw if IGNORED_KEYWORDS
             .iter()
             .any(|(k, _, _)| k.eq_ignore_ascii_case(kw)) =>
@@ -1614,21 +1987,8 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
 /// `AuthorizedKeysCommand` logins are simply unavailable). Keywords that
 /// *restrict* access are implemented or rejected, never listed here.
 const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
-    // Logging, DNS, network tuning, cosmetics.
-    ("UseDNS", &["*"], ""),
-    ("LogVerbose", &["*"], ""),
-    ("IPQoS", &["*"], ""),
-    ("VersionAddendum", &["*"], ""),
+    // Debian's patch: the distribution suffix of the version banner.
     ("DebianBanner", &["*"], ""),
-    ("FingerprintHash", &["*"], ""),
-    ("ModuliFile", &["*"], ""),
-    // OpenSSH 10's helper binaries: this sshd is one program.
-    ("SshdSessionPath", &["*"], ""),
-    ("SshdAuthPath", &["*"], ""),
-    ("X11DisplayOffset", &["*"], ""),
-    ("X11UseLocalhost", &["*"], ""),
-    ("StreamLocalBindMask", &["*"], ""),
-    ("StreamLocalBindUnlink", &["*"], ""),
     // Features this server does not have: ignoring them fails closed.
     ("SecurityKeyProvider", &["*"], ""),
     (
@@ -1663,22 +2023,26 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
     ("HostbasedUsesNameFromPacketOnly", &["*"], ""),
     ("IgnoreRhosts", &["*"], ""),
     ("IgnoreUserKnownHosts", &["*"], ""),
-    ("KbdInteractiveDevices", &["*"], ""),
-    // Deprecated / removed in OpenSSH itself (it ignores them too).
-    ("Protocol", &["*"], ""),
-    ("UsePrivilegeSeparation", &["*"], ""),
-    ("KeyRegenerationInterval", &["*"], ""),
-    ("ServerKeyBits", &["*"], ""),
-    ("RSAAuthentication", &["*"], ""),
-    ("RhostsRSAAuthentication", &["*"], ""),
-    ("DSAAuthentication", &["*"], ""),
-    ("UseLogin", &["*"], ""),
-    ("PAMAuthenticationViaKbdInt", &["*"], ""),
-    ("SkeyAuthentication", &["*"], ""),
-    ("KerberosTgtPassing", &["*"], ""),
-    ("AFSTokenPassing", &["*"], ""),
-    ("VerifyReverseMapping", &["*"], ""),
-    ("ReverseMappingCheck", &["*"], ""),
+];
+
+/// Keywords OpenSSH 10.6 still accepts but ignores (`SSHCONF_DEPRECATE`),
+/// as it spells them: each logs `Deprecated option <keyword>`, except
+/// `Protocol`, which is ignored quietly.
+const DEPRECATED_KEYWORDS: &[&str] = &[
+    "ServerKeyBits",
+    "KeyRegenerationInterval",
+    "RHostsAuthentication",
+    "RhostsRSAAuthentication",
+    "RSAAuthentication",
+    "CheckMail",
+    "UseLogin",
+    "VerifyReverseMapping",
+    "ReverseMappingCheck",
+    "AuthorizedKeysFile2",
+    "UsePrivilegeSeparation",
+    "KerberosTgtPassing",
+    "AFSTokenPassing",
+    "Protocol",
 ];
 
 /// Arguments after the program in `Subsystem sftp …`, as accepted by
@@ -1931,6 +2295,14 @@ fn command_args(line: &ParsedLine) -> Result<Vec<String>, ConfigError> {
             keyword: line.keyword.clone(),
             msg: "expected none, or an absolute path to a program".into(),
         }),
+    }
+}
+
+fn bad_value(line: &ParsedLine, msg: &str) -> ConfigError {
+    ConfigError::BadValue {
+        line: line.line_no,
+        keyword: line.keyword.clone(),
+        msg: msg.to_string(),
     }
 }
 
@@ -3090,12 +3462,226 @@ UsePrivilegeSeparation sandbox
 ";
         let cfg = SshServerConfig::parse(src).unwrap();
         assert_eq!(cfg.global.permit_tty, Some(true));
+        // Only what OpenSSH itself warns about.
         assert_eq!(
-            cfg.warnings().count(),
-            0,
-            "{:?}",
-            cfg.warnings().collect::<Vec<_>>()
+            cfg.warnings().collect::<Vec<_>>(),
+            ["line 54: Deprecated option UsePrivilegeSeparation"]
         );
+    }
+
+    #[test]
+    fn deprecated_keywords_warn_as_openssh_does() {
+        let cfg = SshServerConfig::parse(
+            "CheckMail no\nrsaauthentication yes\nAuthorizedKeysFile2 x\nProtocol 2\n\
+             RHostsAuthentication no\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.warnings().collect::<Vec<_>>(),
+            [
+                "line 1: Deprecated option CheckMail",
+                "line 2: Deprecated option RSAAuthentication",
+                "line 3: Deprecated option AuthorizedKeysFile2",
+                "line 5: Deprecated option RHostsAuthentication",
+            ]
+        );
+        // Ignored: `AuthorizedKeysFile2` is not `AuthorizedKeysFile`.
+        assert_eq!(cfg.global.authorized_keys_file, None);
+        // Global-only, as in OpenSSH; `AuthorizedKeysFile2` may be anywhere.
+        assert!(SshServerConfig::parse("Match User a\n Protocol 2\n").is_err());
+        assert!(SshServerConfig::parse("Match User a\n CheckMail no\n").is_err());
+        assert!(SshServerConfig::parse("Match User a\n AuthorizedKeysFile2 x\n").is_ok());
+        // Long gone from OpenSSH: rejected like any unknown keyword.
+        for bad in [
+            "PAMAuthenticationViaKbdInt no\n",
+            "KbdInteractiveDevices pam\n",
+        ] {
+            assert!(
+                matches!(
+                    SshServerConfig::parse(bad),
+                    Err(ConfigError::UnknownKeyword { .. })
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn aliases_map_as_openssh_does() {
+        let cfg = SshServerConfig::parse(
+            "HostDSAKey /k1\nHostKey /k2\nKeepAlive no\nDSAAuthentication no\n\
+             SKeyAuthentication no\nPubkeyAcceptedKeyTypes ssh-ed25519\n",
+        )
+        .unwrap();
+        let g = &cfg.global;
+        assert_eq!(g.host_key_files, ["/k1", "/k2"]);
+        assert_eq!(g.tcp_keep_alive, Some(false));
+        // `DSAAuthentication` *is* `PubkeyAuthentication`, in OpenSSH 10.6.
+        assert_eq!(g.pubkey_authentication, Some(false));
+        assert_eq!(g.kbd_interactive_authentication, Some(false));
+        assert_eq!(
+            g.pubkey_accepted_algorithms.as_deref(),
+            Some(&["ssh-ed25519".to_string()][..])
+        );
+        assert_eq!(cfg.warnings().count(), 0);
+        let cfg = SshServerConfig::parse("ChallengeResponseAuthentication yes\n").unwrap();
+        assert_eq!(cfg.global.kbd_interactive_authentication, Some(true));
+        // Aliases of global-only keywords are global-only.
+        for bad in [
+            "Match User a\n HostDSAKey /k\n",
+            "Match User a\n KeepAlive no\n",
+            "Match User a\n DSAAuthentication no\n",
+        ] {
+            assert!(SshServerConfig::parse(bad).is_err(), "{bad}");
+        }
+        assert!(SshServerConfig::parse("Match User a\n SKeyAuthentication no\n").is_ok());
+    }
+
+    #[test]
+    fn tcp_keep_alive_modes() {
+        for (v, transport, forwarded) in [
+            ("yes", true, false),
+            ("transport", true, false),
+            ("true", true, false),
+            ("all", true, true),
+            ("no", false, false),
+            ("false", false, false),
+        ] {
+            let cfg = SshServerConfig::parse(&format!("TCPKeepAlive {v}\n")).unwrap();
+            assert_eq!(cfg.global.tcp_keep_alive, Some(transport), "{v}");
+            assert_eq!(cfg.global.tcp_keep_alive_forwarded, Some(forwarded), "{v}");
+        }
+        assert!(SshServerConfig::parse("TCPKeepAlive sometimes\n").is_err());
+    }
+
+    #[test]
+    fn x11_and_streamlocal_options() {
+        let cfg = SshServerConfig::parse(
+            "X11DisplayOffset 20\nX11UseLocalhost no\nStreamLocalBindMask 0117\n\
+             StreamLocalBindUnlink yes\n",
+        )
+        .unwrap();
+        let g = &cfg.global;
+        assert_eq!(g.x11_display_offset, Some(20));
+        assert_eq!(g.x11_use_localhost, Some(false));
+        assert_eq!(g.stream_local_bind_mask, Some(0o117));
+        assert_eq!(g.stream_local_bind_unlink, Some(true));
+        assert_eq!(cfg.warnings().count(), 0);
+        // strtol(…, 8) semantics: trailing junk after the digits is ignored.
+        let cfg = SshServerConfig::parse("StreamLocalBindMask 0177xyz\n").unwrap();
+        assert_eq!(cfg.global.stream_local_bind_mask, Some(0o177));
+        for bad in [
+            "StreamLocalBindMask 1777\n",
+            "StreamLocalBindMask 9\n",
+            "X11DisplayOffset -3\n",
+            "X11UseLocalhost maybe\n",
+        ] {
+            assert!(SshServerConfig::parse(bad).is_err(), "{bad}");
+        }
+        // Valid in Match blocks.
+        let cfg = SshServerConfig::parse("Match User a\n X11UseLocalhost no\n").unwrap();
+        assert_eq!(cfg.match_blocks[0].opts.x11_use_localhost, Some(false));
+    }
+
+    #[test]
+    fn ipqos_values() {
+        let one = |src: &str| SshServerConfig::parse(src).map(|c| c.global.ip_qos);
+        assert_eq!(
+            one("IPQoS af21 cs1\n").unwrap(),
+            Some((Some(0x48), Some(0x20)))
+        );
+        assert_eq!(one("IPQoS EF\n").unwrap(), Some((Some(0xb8), Some(0xb8))));
+        assert_eq!(one("IPQoS none 7\n").unwrap(), Some((None, Some(7))));
+        // Deprecated ToS names are the system default, as in OpenSSH.
+        assert_eq!(one("IPQoS lowdelay cs0\n").unwrap(), Some((None, Some(0))));
+        assert!(one("IPQoS af11 cs1 cs2\n").is_err());
+        assert!(one("IPQoS bogus\n").is_err());
+        assert!(one("IPQoS 256\n").is_err());
+        assert_eq!(ipqos_name(Some(0xb8)), "ef");
+        assert_eq!(ipqos_name(Some(0)), "cs0");
+        assert_eq!(ipqos_name(None), "none");
+        assert_eq!(ipqos_name(Some(7)), "0x07");
+    }
+
+    #[test]
+    fn version_addendum_takes_the_rest_of_the_line() {
+        let one = |src: &str| SshServerConfig::parse(src).map(|c| c.global.version_addendum);
+        assert_eq!(
+            one("VersionAddendum  hello world # note\n")
+                .unwrap()
+                .as_deref(),
+            Some("hello world")
+        );
+        assert_eq!(one("VersionAddendum None\n").unwrap().as_deref(), Some(""));
+        assert!(one("VersionAddendum\n").is_err());
+        assert!(SshServerConfig::parse("Match User a\n VersionAddendum x\n").is_err());
+    }
+
+    #[test]
+    fn logging_and_dns_options() {
+        let cfg = SshServerConfig::parse(
+            "UseDNS yes\nLogVerbose kex.c:*:1000 *:kex_exchange_identification():*\n\
+             FingerprintHash md5\nFingerprintHash SHA512\nModuliFile /etc/moduli\n\
+             WarnWeakCrypto no-pq-kex\nAgentSocketPath shared:/run/agents\n",
+        )
+        .unwrap();
+        let g = &cfg.global;
+        assert_eq!(g.use_dns, Some(true));
+        assert_eq!(
+            g.log_verbose.as_deref(),
+            Some(
+                &[
+                    "kex.c:*:1000".to_string(),
+                    "*:kex_exchange_identification():*".into()
+                ][..]
+            )
+        );
+        // The last `FingerprintHash` wins, as in OpenSSH.
+        assert_eq!(g.fingerprint_hash, Some(FingerprintHash::Sha512));
+        assert_eq!(g.moduli_file.as_deref(), Some("/etc/moduli"));
+        assert_eq!(g.warn_weak_crypto, Some(false));
+        assert_eq!(g.agent_socket_path.as_deref(), Some("shared:/run/agents"));
+        assert_eq!(cfg.warnings().count(), 0);
+        for bad in [
+            "LogVerbose none kex.c:*:*\n",
+            "FingerprintHash crc32\n",
+            "AgentSocketPath shared:relative\n",
+            "AgentSocketPath user:\n",
+            "AgentSocketPath /plain/path\n",
+            "WarnWeakCrypto sometimes\n",
+            "Match User a\n UseDNS yes\n",
+            "Match User a\n FingerprintHash md5\n",
+            "Match User a\n WarnWeakCrypto no\n",
+            "Match User a\n ModuliFile /x\n",
+        ] {
+            assert!(SshServerConfig::parse(bad).is_err(), "{bad}");
+        }
+        let cfg = SshServerConfig::parse(
+            "Match User a\n AgentSocketPath none\n LogVerbose none\n RefuseConnection yes\n",
+        )
+        .unwrap();
+        let m = &cfg.match_blocks[0].opts;
+        assert_eq!(m.agent_socket_path.as_deref(), Some("none"));
+        assert_eq!(m.log_verbose.as_deref(), Some(&["none".to_string()][..]));
+        assert_eq!(m.refuse_connection, Some(true));
+    }
+
+    #[test]
+    fn rdomain_is_refused_and_listen_address_takes_one() {
+        let err = SshServerConfig::parse("RDomain %D\n").unwrap_err();
+        assert!(err.to_string().contains("RDomain not supported"), "{err}");
+        let cfg =
+            SshServerConfig::parse("ListenAddress 127.0.0.1:2222 rdomain vrf-blue\n").unwrap();
+        assert_eq!(
+            cfg.global.listen_addresses,
+            ["127.0.0.1:2222 rdomain vrf-blue"]
+        );
+        for bad in [
+            "ListenAddress 127.0.0.1 rdomain\n",
+            "ListenAddress 127.0.0.1 vrf x\n",
+        ] {
+            assert!(SshServerConfig::parse(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -215,6 +215,7 @@ fn sign_round_trip_via_host_key() {
 }
 
 #[test]
+#[allow(unsafe_code)] // env::set_var
 fn connect_env_returns_none_when_unset() {
     // Make sure no SSH_AUTH_SOCK leaks in from the test environment.
     let saved = std::env::var_os("SSH_AUTH_SOCK");

@@ -435,6 +435,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)] // env::set_var
     fn expand_tilde_replaces_leading_tilde() {
         // SAFETY: single-threaded unit test; no other thread reads the env
         // concurrently. `set_var` is `unsafe` as of edition 2024.

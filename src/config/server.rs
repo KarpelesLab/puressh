@@ -2025,6 +2025,7 @@ const IGNORED_KEYWORDS: &[(&str, &[&str], &str)] = &[
         "GSSAPI key exchange is unavailable",
     ),
     ("GSSAPICleanupCredentials", &["*"], ""),
+    ("GSSAPIDelegateCredentials", &["*"], ""),
     ("GSSAPIStrictAcceptorCheck", &["*"], ""),
     ("GSSAPIStoreCredentialsOnRekey", &["*"], ""),
     ("GSSAPIKexAlgorithms", &["*"], ""),

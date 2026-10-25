@@ -644,119 +644,194 @@ impl<W: Write> Write for Limited<W> {
     }
 }
 
-/// OpenSSH's progress meter, on stdout when it is a terminal.
+/// OpenSSH's progress meter (progressmeter.c), on stdout when it is a
+/// terminal: drawn at the start, about once a second, and at the end.
 pub struct Progress {
     name: String,
-    total: u64,
+    start_pos: u64,
+    end_pos: u64,
+    cur_pos: u64,
+    /// The position last reported to [`Progress::update`].
+    counter: u64,
     start: Instant,
-    last: Option<Instant>,
+    last_update: Instant,
+    bytes_per_second: i64,
+    stalled: i64,
     enabled: bool,
 }
 
+/// The meter's width: stdout's columns (80 when unknown, at most 512).
 fn terminal_width() -> usize {
     #[cfg(unix)]
     {
         // SAFETY: TIOCGWINSZ fills a plain struct; failure leaves it zeroed.
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
-            return ws.ws_col as usize;
+            return (ws.ws_col as usize).min(512);
         }
     }
     80
 }
 
-fn human(n: f64) -> String {
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut v = n;
-    let mut u = 0;
-    while v >= 1024.0 * 10.0 && u + 1 < UNITS.len() {
-        v /= 1024.0;
-        u += 1;
+const UNITS: &[u8; 5] = b" KMGT";
+
+/// progressmeter.c's `format_size`: `1000 `, `3072KB`.
+fn format_size(mut bytes: u64) -> String {
+    let mut i = 0;
+    while bytes >= 10000 && UNITS[i] != b'T' {
+        bytes = (bytes + 512) / 1024;
+        i += 1;
     }
-    format!("{:.0}{}", v, UNITS[u])
+    format!(
+        "{bytes:4}{}{}",
+        UNITS[i] as char,
+        if i > 0 { "B" } else { " " }
+    )
 }
 
-fn human_rate(n: f64) -> String {
-    const UNITS: [&str; 6] = ["B", "KB", "MB", "GB", "TB", "PB"];
-    let mut v = n;
-    let mut u = 0;
-    while v >= 1000.0 && u + 1 < UNITS.len() {
-        v /= 1024.0;
-        u += 1;
+/// progressmeter.c's `format_rate`: at least KB, one decimal (`  7.7MB`).
+fn format_rate(bytes: i64) -> String {
+    let mut bytes = bytes.max(0) as u64 * 100;
+    let mut i = 0;
+    while bytes >= 100 * 1000 && UNITS[i] != b'T' {
+        bytes = (bytes + 512) / 1024;
+        i += 1;
     }
-    format!("{v:.1}{}", UNITS[u])
+    if i == 0 {
+        i = 1;
+        bytes = (bytes + 512) / 1024;
+    }
+    format!(
+        "{:3}.{}{}B",
+        (bytes + 5) / 100,
+        (bytes + 5) / 10 % 10,
+        UNITS[i] as char
+    )
 }
 
 impl Progress {
-    pub fn new(name: &str, total: u64, enabled: bool) -> Self {
-        Self {
+    /// A meter for `name`, `total` bytes long, the transfer starting at
+    /// `start` (a resumed one past 0).
+    pub fn new(name: &str, total: u64, start: u64, enabled: bool) -> Self {
+        let now = Instant::now();
+        let mut p = Self {
             name: name.to_string(),
-            total,
-            start: Instant::now(),
-            last: None,
+            start_pos: start,
+            end_pos: total,
+            cur_pos: 0,
+            counter: start,
+            start: now,
+            last_update: now,
+            bytes_per_second: 0,
+            stalled: 0,
             enabled: enabled && io::stdout().is_terminal(),
+        };
+        if p.enabled {
+            p.refresh();
         }
+        p
     }
 
+    /// The transfer has reached `done`.
     pub fn update(&mut self, done: u64) {
-        if !self.enabled {
-            return;
+        self.counter = done;
+        if self.enabled && self.last_update.elapsed() >= Duration::from_secs(1) {
+            self.refresh();
         }
-        if self
-            .last
-            .is_some_and(|l| l.elapsed() < Duration::from_secs(1))
-            && done < self.total
-        {
-            return;
-        }
-        self.last = Some(Instant::now());
-        self.draw(done, false);
     }
 
+    /// The transfer stopped at `done`: complete the meter.
     pub fn finish(&mut self, done: u64) {
+        self.counter = done;
         if self.enabled {
-            self.draw(done, true);
+            if self.cur_pos != self.end_pos {
+                self.refresh();
+            }
             println!();
         }
     }
 
-    fn draw(&self, done: u64, end: bool) {
-        let elapsed = self.start.elapsed().as_secs_f64().max(0.001);
-        let rate = done as f64 / elapsed;
-        let pct = done
-            .saturating_mul(100)
-            .checked_div(self.total)
-            .map_or(100, |p| p.min(100));
-        let secs = if end || done >= self.total {
-            elapsed as u64
-        } else if rate > 0.0 {
-            ((self.total - done) as f64 / rate) as u64
+    fn refresh(&mut self) {
+        let base = if self.cur_pos != 0 {
+            self.cur_pos
         } else {
-            0
+            self.start_pos
         };
-        let time = if secs >= 3600 {
-            format!("{}:{:02}:{:02}", secs / 3600, secs / 60 % 60, secs % 60)
+        let mut transferred = self.counter as i64 - base as i64;
+        self.cur_pos = self.counter;
+        let now = Instant::now();
+        let bytes_left = self.end_pos as i64 - self.cur_pos as i64;
+        let elapsed = if bytes_left > 0 {
+            now.duration_since(self.last_update).as_secs_f64()
         } else {
-            format!("{:02}:{:02}", secs / 60, secs % 60)
+            // The true total speed when done.
+            transferred = self.end_pos as i64 - self.start_pos as i64;
+            self.bytes_per_second = 0;
+            now.duration_since(self.start).as_secs_f64()
         };
-        let eta = if end || done >= self.total {
-            "    "
+        let cur_speed = if elapsed != 0.0 {
+            (transferred as f64 / elapsed) as i64
         } else {
-            " ETA"
+            transferred
         };
-        let stats = format!(
-            "{pct:3}% {:>6} {:>8}/s {:>8}{eta}",
-            human(done as f64),
-            human_rate(rate),
-            time
-        );
-        let width = terminal_width().saturating_sub(stats.len() + 2).max(10);
-        let mut name: String = self.name.chars().take(width).collect();
-        while name.chars().count() < width {
-            name.push(' ');
+        self.bytes_per_second = if self.bytes_per_second != 0 {
+            (self.bytes_per_second as f64 * 0.9 + cur_speed as f64 * 0.1) as i64
+        } else {
+            cur_speed
+        };
+        self.last_update = now;
+
+        let win_size = terminal_width() + 1;
+        let file_len = win_size as i64 - 36;
+        let mut buf = String::new();
+        if file_len > 0 {
+            let file_len = file_len as usize;
+            let mut name: String = self.name.chars().take(file_len).collect();
+            while name.chars().count() < file_len {
+                name.push(' ');
+            }
+            buf.push_str(&name);
         }
+        let percent = if self.end_pos == 0 || self.cur_pos == self.end_pos {
+            100
+        } else {
+            ((self.cur_pos as f32 / self.end_pos as f32) * 100.0) as i32
+        };
+        buf.push_str(&format!(
+            " {percent:3}% {} {}/s ",
+            format_size(self.cur_pos),
+            format_rate(self.bytes_per_second)
+        ));
+        if transferred == 0 {
+            self.stalled += elapsed as i64;
+        } else {
+            self.stalled = 0;
+        }
+        if self.stalled >= 5 {
+            buf.push_str("- stalled -");
+        } else if self.bytes_per_second == 0 && bytes_left != 0 {
+            buf.push_str("  --:-- ETA");
+        } else {
+            let mut seconds = if bytes_left > 0 {
+                bytes_left / self.bytes_per_second
+            } else {
+                elapsed as i64
+            };
+            let hours = seconds / 3600;
+            seconds -= hours * 3600;
+            let minutes = seconds / 60;
+            seconds -= minutes * 60;
+            if hours != 0 {
+                buf.push_str(&format!("{hours}:{minutes:02}:{seconds:02}"));
+            } else {
+                buf.push_str(&format!("  {minutes:02}:{seconds:02}"));
+            }
+            buf.push_str(if bytes_left > 0 { " ETA" } else { "    " });
+        }
+        // `\r` and the line, cut at the window width.
+        let line: String = buf.chars().take(win_size.saturating_sub(2)).collect();
         let mut out = io::stdout().lock();
-        let _ = write!(out, "\r{name} {stats}");
+        let _ = write!(out, "\r{line}");
         let _ = out.flush();
     }
 }
@@ -966,7 +1041,7 @@ fn download_at<T: Read + Write>(
         let _ = file.inner.seek(io::SeekFrom::Start(start));
     }
     let name = String::from_utf8_lossy(remote_basename(remote)).into_owned();
-    let mut meter = Progress::new(&name, total, opts.progress);
+    let mut meter = Progress::new(&name, total, start, opts.progress);
     let res = sftp.read_to(&h, start, opts.chunk, opts.depth, &mut file, |n| {
         meter.update(start + n)
     });
@@ -1085,7 +1160,7 @@ fn upload_at<T: Read + Write>(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| shown.clone());
-    let mut meter = Progress::new(&name, md.len(), opts.progress);
+    let mut meter = Progress::new(&name, md.len(), start, opts.progress);
     let res = sftp.write_from(&h, start, opts.chunk, opts.depth, &mut src, |n| {
         meter.update(start + n)
     });
@@ -1148,6 +1223,17 @@ mod tests {
         assert!(!glob_match(b"a\\*", b"ab"));
         assert!(glob_match(b"*", b""));
         assert!(!glob_match(b"abc", b"abcd"));
+    }
+
+    #[test]
+    fn meter_units() {
+        // As OpenSSH's progressmeter.c prints them.
+        assert_eq!(format_size(1000), "1000  ");
+        assert_eq!(format_size(3 * 1024 * 1024), "3072KB");
+        assert_eq!(format_size(0), "   0  ");
+        assert_eq!(format_rate(0), "  0.0KB");
+        assert_eq!(format_rate(8_100_000), "  7.7MB");
+        assert_eq!(format_rate(2_000_000_000), "  1.9GB");
     }
 
     #[test]

@@ -96,6 +96,33 @@ const LEGACY_KEX: &[&str] = &[
     "diffie-hellman-group1-sha1",
 ];
 
+/// Modern key exchanges OpenSSH 10.6 supports but leaves out of its default
+/// `KexAlgorithms` (`myproposal.h`): likewise only used when configured
+/// (`KexAlgorithms +mlkem768nistp256-sha256`).
+const OPT_IN_KEX: &[&str] = &["mlkem768nistp256-sha256"];
+
+/// Every key exchange OpenSSH 10.6 knows, in the order its `ssh -Q kex`
+/// lists them (`kex-names.c`). Gives `-Q kex` the same order here, and
+/// names the ones a config may mention that this build lacks.
+const OPENSSH_KEX: &[&str] = &[
+    "diffie-hellman-group1-sha1",
+    "diffie-hellman-group14-sha1",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+    "diffie-hellman-group-exchange-sha1",
+    "diffie-hellman-group-exchange-sha256",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "mlkem768nistp256-sha256",
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "sntrup761x25519-sha512",
+    "sntrup761x25519-sha512@openssh.com",
+    "mlkem768x25519-sha256",
+];
+
 /// The set of valid algorithm names for `cat`, derived from the live
 /// catalogues (so it can never drift from what the crypto layer implements).
 ///
@@ -110,9 +137,22 @@ pub fn known_names(cat: AlgoCategory) -> Vec<&'static str> {
     match cat {
         AlgoCategory::Cipher => crate::cipher::ALL.iter().map(|c| c.name).collect(),
         AlgoCategory::Mac => crate::mac::ALL.iter().map(|m| m.name).collect(),
+        // In OpenSSH's `-Q kex` order, then any it does not list.
         AlgoCategory::Kex => {
-            let mut v = kex_names();
-            v.extend_from_slice(LEGACY_KEX);
+            let mut ours = kex_names();
+            ours.extend_from_slice(LEGACY_KEX);
+            ours.extend_from_slice(OPT_IN_KEX);
+            let mut v = Vec::with_capacity(ours.len());
+            for &name in OPENSSH_KEX {
+                if ours.contains(&name) {
+                    v.push(name);
+                }
+            }
+            for name in ours {
+                if !v.contains(&name) {
+                    v.push(name);
+                }
+            }
             v
         }
         // The defaults (certificate types included), plus legacy `ssh-rsa`
@@ -178,23 +218,6 @@ fn openssh_only(cat: AlgoCategory) -> &'static [&'static str] {
         "umac-64-etm@openssh.com",
         "umac-128-etm@openssh.com",
     ];
-    const KEX: &[&str] = &[
-        "diffie-hellman-group1-sha1",
-        "diffie-hellman-group14-sha1",
-        "diffie-hellman-group14-sha256",
-        "diffie-hellman-group16-sha512",
-        "diffie-hellman-group18-sha512",
-        "diffie-hellman-group-exchange-sha1",
-        "diffie-hellman-group-exchange-sha256",
-        "ecdh-sha2-nistp256",
-        "ecdh-sha2-nistp384",
-        "ecdh-sha2-nistp521",
-        "curve25519-sha256",
-        "curve25519-sha256@libssh.org",
-        "sntrup761x25519-sha512",
-        "sntrup761x25519-sha512@openssh.com",
-        "mlkem768x25519-sha256",
-    ];
     const KEYS: &[&str] = &[
         "ssh-ed25519",
         "ssh-ed25519-cert-v01@openssh.com",
@@ -224,7 +247,7 @@ fn openssh_only(cat: AlgoCategory) -> &'static [&'static str] {
     match cat {
         AlgoCategory::Cipher => CIPHERS,
         AlgoCategory::Mac => MACS,
-        AlgoCategory::Kex => KEX,
+        AlgoCategory::Kex => OPENSSH_KEX,
         AlgoCategory::HostKey | AlgoCategory::PubkeyAccepted | AlgoCategory::CaSignature => KEYS,
     }
 }
@@ -619,6 +642,32 @@ mod tests {
         let mut want = default_list(AlgoCategory::PubkeyAccepted);
         want.push("ssh-rsa");
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn mlkem768nistp256_is_opt_in() {
+        // As in OpenSSH 10.6: supported, never a default.
+        let name = "mlkem768nistp256-sha256";
+        assert!(known_names(AlgoCategory::Kex).contains(&name));
+        assert!(!default_list(AlgoCategory::Kex).contains(&name));
+        let kex = |a: &str| resolve_algo_list(AlgoCategory::Kex, &args(a), 1, "KexAlgorithms");
+        let got = kex("+mlkem768nistp256-sha256").unwrap();
+        assert_eq!(got.last().map(String::as_str), Some(name));
+        assert_eq!(got.len(), default_list(AlgoCategory::Kex).len() + 1);
+        let got = kex("^mlkem768nistp256-sha256").unwrap();
+        assert_eq!(got[0], name);
+        assert_eq!(kex(name).unwrap(), vec![name]);
+        // `-mlkem*` strips the default X25519 hybrid; there is no P-256 one
+        // to remove.
+        let got = kex("-mlkem*").unwrap();
+        assert!(!got.iter().any(|n| n.starts_with("mlkem")));
+        assert_eq!(got.len(), default_list(AlgoCategory::Kex).len() - 1);
+    }
+
+    #[test]
+    fn kex_names_listed_in_openssh_order() {
+        // `ssh -Q kex` of OpenSSH 10.6 (all of which are implemented).
+        assert_eq!(known_names(AlgoCategory::Kex), OPENSSH_KEX);
     }
 
     #[test]

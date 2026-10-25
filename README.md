@@ -93,7 +93,7 @@ cargo add puressh --features server
 
 | Category    | Algorithm                                |
 |-------------|------------------------------------------|
-| KEX (PQ)    | `mlkem768x25519-sha256` (ML-KEM-768 + X25519 hybrid), `sntrup761x25519-sha512` (+ its `@openssh.com` name; Streamlined NTRU Prime + X25519) |
+| KEX (PQ)    | `mlkem768x25519-sha256` (ML-KEM-768 + X25519 hybrid), `sntrup761x25519-sha512` (+ its `@openssh.com` name; Streamlined NTRU Prime + X25519), `mlkem768nistp256-sha256` (ML-KEM-768 + P-256 hybrid; not a default, as in OpenSSH 10.6) |
 | KEX         | `curve25519-sha256`, `curve25519-sha256@libssh.org` |
 | KEX         | `ecdh-sha2-nistp{256,384,521}`           |
 | KEX         | `diffie-hellman-group{14,16,18}-sha{256,512}` |
@@ -235,7 +235,7 @@ src/
 ├── hazmat/          low-level sans-I/O protocol layers (no stability promise)
 │   ├── format/      SSH wire format (Reader, Writer, mpint, name-list)
 │   ├── transport/   binary packet protocol, version exchange, KEX runner
-│   ├── kex/         curve25519, ecdh-nistp*, group-DH, GEX, mlkem768x25519, sntrup761x25519
+│   ├── kex/         curve25519, ecdh-nistp*, group-DH, GEX, mlkem768x25519, mlkem768nistp256, sntrup761x25519
 │   ├── cipher/      aes-ctr, aes-gcm, chacha20-poly1305
 │   ├── mac/         hmac-sha2-* (incl. -etm)
 │   ├── channel/     RFC 4254 channels

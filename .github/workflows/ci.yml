@@ -225,7 +225,7 @@ jobs:
         run: packaging/deb/test/client-lifecycle.sh out-client/*.deb
 
   interop-mlkem:
-    name: OpenSSH interop (ML-KEM + strict KEX, built sshd 10.4p1)
+    name: OpenSSH interop (ML-KEM + strict KEX, built sshd 10.6p1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -248,14 +248,15 @@ jobs:
       # enforces RFC 4253 §7.1 strictly, aborting the connection on any
       # non-transport message received mid-KEX; 10.0 tolerated it. That
       # enforcement is what caught us emitting CHANNEL_WINDOW_ADJUST during a
-      # re-key, so this job only has teeth if the built sshd is strict.
+      # re-key, so this job only has teeth if the built sshd is strict. 10.6
+      # also adds `mlkem768nistp256-sha256`, which the distro OpenSSH lacks.
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y build-essential zlib1g-dev libssl-dev libpam0g-dev
 
       - name: Build OpenSSH (ML-KEM capable) into a local prefix
         run: |
           set -euo pipefail
-          ver=openssh-10.4p1
+          ver=openssh-10.6p1
           curl -sSL -o "$ver.tar.gz" "https://cdn.openbsd.org/pub/OpenBSD/OpenSSH/portable/$ver.tar.gz"
           tar xzf "$ver.tar.gz"
           cd "$ver"
@@ -280,6 +281,14 @@ jobs:
             gcm_rekey_against_real_sshd \
             compressed_rekey_against_real_sshd \
             concurrent_write_during_rekey_against_real_sshd
+
+      # The non-default algorithms both ways against the built OpenSSH, so
+      # the KEXes only it has (`mlkem768nistp256-sha256`) are exercised too.
+      - name: Run algorithm interop against the built OpenSSH
+        run: |
+          export PATH="$PWD/ossh/sbin:$PWD/ossh/bin:$PATH"
+          cargo test --features server,pam,agent --test e2e_legacy_algos -- \
+            --ignored --test-threads=1 --nocapture
 
   msrv:
     name: MSRV (Rust 1.95)

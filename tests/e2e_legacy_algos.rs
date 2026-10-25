@@ -134,7 +134,8 @@ const LEGACY: &str = "Ciphers +aes128-cbc,aes192-cbc,aes256-cbc,3des-cbc\n\
     MACs +hmac-sha1-96,hmac-md5,hmac-md5-96,hmac-sha1-96-etm@openssh.com,\
     hmac-md5-etm@openssh.com,hmac-md5-96-etm@openssh.com\n\
     KexAlgorithms +diffie-hellman-group1-sha1,diffie-hellman-group14-sha1,\
-    diffie-hellman-group-exchange-sha1,diffie-hellman-group-exchange-sha256\n\
+    diffie-hellman-group-exchange-sha1,diffie-hellman-group-exchange-sha256,\
+    mlkem768nistp256-sha256\n\
     PubkeyAcceptedAlgorithms +ssh-rsa\n";
 
 fn setup() -> Option<Setup> {
@@ -376,9 +377,11 @@ fn legacy_algorithms_interoperate_with_openssh() {
         failures.push(format!("sshd negotiation log: {log}"));
     }
 
-    // The post-quantum hybrids, both names of sntrup761.
+    // The post-quantum hybrids, both names of sntrup761 (and the P-256 one
+    // OpenSSH 10.6 added, outside its defaults).
     for k in [
         "mlkem768x25519-sha256",
+        "mlkem768nistp256-sha256",
         "sntrup761x25519-sha512",
         "sntrup761x25519-sha512@openssh.com",
     ] {

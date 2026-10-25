@@ -34,7 +34,8 @@ pub use client::{ClientCredential, KeyboardInteractiveResponder};
 pub use message::SecretString;
 #[cfg(feature = "alloc")]
 pub use server::{
-    AuthAttempt, AuthCertCaps, AuthDecision, Authenticator, CertInfo, SkRequirement, SkSignature,
+    AuthAttempt, AuthCertCaps, AuthDecision, Authenticator, CertInfo, DEFAULT_MAX_PK_OK,
+    SkRequirement, SkSignature,
 };
 
 // The sans-IO step machines are plumbing the drivers are built from. They

@@ -155,6 +155,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncServerConnection<S> {
         // `MaxAuthTries`: the async front-end has no per-address policy
         // resolution, so the config-level fallback applies directly.
         auth.set_max_auth_tries(self.cfg.max_auth_tries);
+        auth.set_pubkey_auth_options(
+            self.cfg.pubkey_auth_options.0,
+            self.cfg.pubkey_auth_options.1,
+        );
+        auth.set_max_pk_ok(self.cfg.max_pk_ok);
         for _ in 0..MAX_AUTH_STEPS {
             let payload = self.next_packet().await?;
             match auth.on_packet(&payload)? {

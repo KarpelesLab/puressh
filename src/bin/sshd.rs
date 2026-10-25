@@ -1753,7 +1753,15 @@ mod imp {
             if verify {
                 v.push_str(" verify-required");
             }
-            v.push_str(" max-pk-ok:6");
+            // The default when the keyword is absent; nothing when it is
+            // given without `max-pk-ok`.
+            let max = match opts.pubkey_auth_options {
+                None => Some(puressh::auth::DEFAULT_MAX_PK_OK),
+                Some(_) => opts.max_pk_ok,
+            };
+            if let Some(n) = max {
+                v.push_str(&format!(" max-pk-ok:{n}"));
+            }
             v.trim_start().to_string()
         });
         let p = opts.per_source_penalties.clone().unwrap_or_default();
@@ -9320,6 +9328,8 @@ mod imp {
         // Resolved CASignatureAlgorithms for user-certificate verification.
         if let Some(o) = sshd_cfg.global.pubkey_auth_options {
             config.pubkey_auth_options = o;
+            // Without `max-pk-ok`, no free queries (OpenSSH's -1).
+            config.max_pk_ok = sshd_cfg.global.max_pk_ok.unwrap_or(0);
         }
         if let Some(ca) = sshd_cfg.global.ca_signature_algorithms.clone() {
             config.ca_signature_algorithms = ca;

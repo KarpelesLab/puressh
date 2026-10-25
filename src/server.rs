@@ -1422,6 +1422,9 @@ pub struct Config {
     /// `PubkeyAuthOptions` outside any `Match` block: `(touch-required,
     /// verify-required)` for security-key signatures.
     pub pubkey_auth_options: (bool, bool),
+    /// `PubkeyAuthOptions max-pk-ok:N` outside any `Match` block: rejected
+    /// public key queries that do not count against `MaxAuthTries`.
+    pub max_pk_ok: u32,
     /// `VersionAddendum` — text appended (after a space) to the
     /// identification string the server sends. Empty ⇒ none.
     pub version_addendum: String,
@@ -1826,6 +1829,7 @@ impl Config {
             default_auth_methods: Vec::new(),
             ca_signature_algorithms: Vec::new(),
             pubkey_auth_options: (false, false),
+            max_pk_ok: crate::auth::DEFAULT_MAX_PK_OK,
             version_addendum: String::new(),
             gex_group_selector: None,
             on_kex: None,
@@ -2649,6 +2653,7 @@ fn do_server_auth(
     server_auth.set_now(unix_now());
     server_auth.set_ca_signature_algorithms(cfg.ca_signature_algorithms.clone());
     server_auth.set_pubkey_auth_options(cfg.pubkey_auth_options.0, cfg.pubkey_auth_options.1);
+    server_auth.set_max_pk_ok(cfg.max_pk_ok);
     // The host key the key exchange presented, which a hostbound publickey
     // request must name.
     if let Some(neg) = driver.negotiated()
@@ -2681,6 +2686,7 @@ fn do_server_auth(
                     local_port,
                 );
                 server_auth.set_accepted_methods(reres.methods);
+                server_auth.set_max_pk_ok(reres.max_pk_ok);
                 server_auth.set_pubkey_auth_options(
                     reres.pubkey_auth_options.0,
                     reres.pubkey_auth_options.1,
@@ -2759,6 +2765,8 @@ struct ReResolvedUserPolicy {
     auth_methods: Vec<String>,
     /// `PubkeyAuthOptions` for this user.
     pubkey_auth_options: (bool, bool),
+    /// `PubkeyAuthOptions max-pk-ok:N` for this user.
+    max_pk_ok: u32,
 }
 
 /// Re-resolve the policy with the full user/groups context (the first
@@ -2780,6 +2788,7 @@ fn reresolve_user_policy(
             banner: None,
             auth_methods: cfg.default_auth_methods.clone(),
             pubkey_auth_options: cfg.pubkey_auth_options,
+            max_pk_ok: cfg.max_pk_ok,
         };
     };
     let groups = resolve_user_groups(cfg, user);
@@ -2814,6 +2823,12 @@ fn reresolve_user_policy(
         banner,
         auth_methods,
         pubkey_auth_options: opts.pubkey_auth_options.unwrap_or(cfg.pubkey_auth_options),
+        // A `PubkeyAuthOptions` line without `max-pk-ok` leaves no free
+        // queries, as OpenSSH's (its -1); without the keyword the default.
+        max_pk_ok: match opts.pubkey_auth_options {
+            Some(_) => opts.max_pk_ok.unwrap_or(0),
+            None => cfg.max_pk_ok,
+        },
     }
 }
 

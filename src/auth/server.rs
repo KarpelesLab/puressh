@@ -620,7 +620,14 @@ pub struct ServerAuth {
     /// `PubkeyAuthOptions verify-required`: every security-key signature
     /// must show user verification.
     sk_verify_required: bool,
+    /// `PubkeyAuthOptions max-pk-ok`: rejected public key queries that do
+    /// not count against `MaxAuthTries`, and how many there were.
+    max_pk_ok: u32,
+    pk_ok_failures: u32,
 }
+
+/// OpenSSH's default `max-pk-ok` (its `DEFAULT_AUTH_FAIL_MAX`).
+pub const DEFAULT_MAX_PK_OK: u32 = 6;
 
 impl ServerAuth {
     /// Build a new server-side driver. `methods` advertises what we accept in
@@ -653,6 +660,8 @@ impl ServerAuth {
             pending_cert_caps: None,
             sk_touch_required: false,
             sk_verify_required: false,
+            max_pk_ok: DEFAULT_MAX_PK_OK,
+            pk_ok_failures: 0,
         }
     }
 
@@ -684,6 +693,15 @@ impl ServerAuth {
     ) -> &mut Self {
         self.sk_touch_required = touch_required;
         self.sk_verify_required = verify_required;
+        self
+    }
+
+    /// `PubkeyAuthOptions max-pk-ok:N`: the first `n` rejected public key
+    /// queries (a key offered without a signature) are answered without
+    /// counting against `MaxAuthTries`, as OpenSSH 10.6 does; later ones
+    /// count. [`DEFAULT_MAX_PK_OK`] by default.
+    pub fn set_max_pk_ok(&mut self, n: u32) -> &mut Self {
+        self.max_pk_ok = n;
         self
     }
 
@@ -984,7 +1002,7 @@ impl ServerAuth {
                         Some(CertInfo::from_certificate(&c)?)
                     }
                     // A malformed cert blob is not a probe we can honour.
-                    _ => return self.emit_failure(),
+                    _ => return self.emit_probe_failure(),
                 }
             } else {
                 None
@@ -1006,7 +1024,7 @@ impl ServerAuth {
                     };
                     Ok(ServerStep::Send(pk_ok.encode()))
                 }
-                AuthDecision::Reject => self.emit_failure(),
+                AuthDecision::Reject => self.emit_probe_failure(),
                 AuthDecision::InteractiveRequest { .. } => {
                     Err(Error::Protocol("auth: interactive on publickey probe"))
                 }
@@ -1215,6 +1233,20 @@ impl ServerAuth {
         self.first_user.as_deref()
     }
 
+    /// A rejected public key query: a failure that counts against
+    /// `MaxAuthTries` only once the `max-pk-ok` budget is spent.
+    fn emit_probe_failure(&mut self) -> Result<ServerStep> {
+        self.pk_ok_failures = self.pk_ok_failures.saturating_add(1);
+        if self.pk_ok_failures > self.max_pk_ok {
+            return self.emit_failure();
+        }
+        let failure = UserauthFailure {
+            continuations: self.auth.continuable_methods(&self.accepted_methods),
+            partial_success: false,
+        };
+        Ok(ServerStep::Send(failure.encode()))
+    }
+
     fn emit_failure(&mut self) -> Result<ServerStep> {
         // A USERAUTH_FAILURE (without partial success) is a failed attempt;
         // count it and disconnect once MaxAuthTries is exceeded. OpenSSH
@@ -1354,6 +1386,44 @@ mod tests {
         // Third failure exceeds the limit ⇒ Disconnect.
         assert!(matches!(
             sa.on_packet(&password_req()).unwrap(),
+            ServerStep::Disconnect(_)
+        ));
+    }
+
+    /// OpenSSH 10.6's `max-pk-ok`: rejected public key queries are free
+    /// up to the budget, then count against `MaxAuthTries` like any other
+    /// failure.
+    #[test]
+    fn rejected_probes_spend_max_pk_ok_first() {
+        let probe = UserauthRequest {
+            user: "alice".into(),
+            service: "ssh-connection".into(),
+            method: AuthMethodPayload::PublicKey {
+                signature_present: false,
+                algorithm: "ssh-ed25519".into(),
+                public_blob: crate::hostkey::HostKey::public_blob(
+                    &crate::hostkey::Ed25519HostKey::from_seed([3; 32]),
+                ),
+                signature: None,
+                host_key: None,
+            },
+        }
+        .encode();
+        let mut sa = ServerAuth::new(vec![1, 2, 3], vec!["publickey"], Box::new(RejectAll));
+        sa.set_max_auth_tries(Some(1)).set_max_pk_ok(3);
+        assert!(matches!(
+            sa.on_packet(&service_req()).unwrap(),
+            ServerStep::Send(_)
+        ));
+        for _ in 0..3 {
+            assert!(matches!(sa.on_packet(&probe).unwrap(), ServerStep::Send(_)));
+        }
+        assert_eq!(sa.failed_attempts(), 0, "within max-pk-ok");
+        // The fourth counts (MaxAuthTries 1), the fifth disconnects.
+        assert!(matches!(sa.on_packet(&probe).unwrap(), ServerStep::Send(_)));
+        assert_eq!(sa.failed_attempts(), 1);
+        assert!(matches!(
+            sa.on_packet(&probe).unwrap(),
             ServerStep::Disconnect(_)
         ));
     }

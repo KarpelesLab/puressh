@@ -366,6 +366,10 @@ pub struct ServerOptions {
     /// `PubkeyAuthOptions`: `(touch-required, verify-required)` for every
     /// security-key signature. Valid in a `Match` block.
     pub pubkey_auth_options: Option<(bool, bool)>,
+    /// `PubkeyAuthOptions max-pk-ok:N`: rejected public key queries that
+    /// do not count against `MaxAuthTries` (6 by default). Set with
+    /// [`Self::pubkey_auth_options`].
+    pub max_pk_ok: Option<u32>,
     /// `Subsystem sftp internal-sftp` ⇒ enables the in-process SFTP handler
     /// (the standard `sshd_config` spelling; `SftpEnabled` remains a working
     /// alias). Other subsystems are in [`Self::subsystems`].
@@ -944,6 +948,7 @@ fn merge_server_options(dst: &mut ServerOptions, src: &ServerOptions) {
     take_scalar!(subsystem_sftp);
     take_scalar!(subsystem_sftp_args);
     take_scalar!(pubkey_auth_options);
+    take_scalar!(max_pk_ok);
     take_scalar!(use_pam);
     take_scalar!(permit_tty);
     take_scalar!(disable_forwarding);
@@ -1508,23 +1513,41 @@ fn apply_keyword(opts: &mut ServerOptions, line: &ParsedLine) -> Result<(), Conf
             opts.pubkey_authentication = Some(parse_yes_no(line)?);
         }
         "pubkeyauthoptions" => {
-            // `none`, or any of `touch-required` / `verify-required`.
+            // `none`, or any of `touch-required`, `verify-required` and
+            // `max-pk-ok:N` (0-255), case-insensitively.
             let mut v = (false, false);
+            let mut max = None;
             for a in &line.args {
-                match a.as_str() {
+                let lower = a.to_ascii_lowercase();
+                match lower.as_str() {
                     "none" => {}
                     "touch-required" => v.0 = true,
                     "verify-required" => v.1 = true,
-                    other => {
-                        return Err(ConfigError::BadValue {
-                            line: line.line_no,
-                            keyword: kw.to_string(),
-                            msg: format!("unsupported option {other:?}"),
-                        });
-                    }
+                    other => match other.strip_prefix("max-pk-ok:") {
+                        Some(n) => {
+                            max = Some(n.parse::<u8>().map(u32::from).map_err(|_| {
+                                ConfigError::BadValue {
+                                    line: line.line_no,
+                                    keyword: kw.to_string(),
+                                    msg: format!("bad max-pk-ok value: {n}"),
+                                }
+                            })?);
+                        }
+                        None => {
+                            return Err(ConfigError::BadValue {
+                                line: line.line_no,
+                                keyword: kw.to_string(),
+                                msg: format!("unsupported option {a:?}"),
+                            });
+                        }
+                    },
                 }
             }
-            opts.pubkey_auth_options = Some(v);
+            // First value wins for both, as one keyword.
+            if opts.pubkey_auth_options.is_none() {
+                opts.pubkey_auth_options = Some(v);
+                opts.max_pk_ok = max;
+            }
         }
         "passwordauthentication" => {
             opts.password_authentication = Some(parse_yes_no(line)?);
@@ -2444,6 +2467,26 @@ fn parse_duration_str(s: &str, line: &ParsedLine) -> Result<u32, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `PubkeyAuthOptions`, as OpenSSH 10.6 parses it: keywords in any
+    /// case, `max-pk-ok:N` up to 255, the first line winning.
+    #[test]
+    fn pubkey_auth_options() {
+        let g = SshServerConfig::parse(
+            "PubkeyAuthOptions TOUCH-required max-pk-ok:3\nPubkeyAuthOptions verify-required\n",
+        )
+        .unwrap()
+        .global;
+        assert_eq!(g.pubkey_auth_options, Some((true, false)));
+        assert_eq!(g.max_pk_ok, Some(3));
+        let g = SshServerConfig::parse("PubkeyAuthOptions verify-required\n")
+            .unwrap()
+            .global;
+        assert_eq!(g.pubkey_auth_options, Some((false, true)));
+        assert_eq!(g.max_pk_ok, None);
+        assert!(SshServerConfig::parse("PubkeyAuthOptions max-pk-ok:256\n").is_err());
+        assert!(SshServerConfig::parse("PubkeyAuthOptions tap-required\n").is_err());
+    }
 
     #[test]
     fn parse_minimal() {

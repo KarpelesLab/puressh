@@ -21,6 +21,11 @@ on:
         required: false
         default: "1"
         type: string
+      launchpad_only:
+        description: "Only (re-)upload to Launchpad, leave the release's assets alone"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   # gh release upload needs to attach assets.
@@ -35,6 +40,7 @@ env:
 jobs:
   build:
     name: build ${{ matrix.target }}
+    if: ${{ !inputs.launchpad_only }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -118,6 +124,7 @@ jobs:
   # The container has no gh CLI; `publish-linux` packs and uploads.
   build-linux:
     name: build linux ${{ matrix.arch }}
+    if: ${{ !inputs.launchpad_only }}
     runs-on: ${{ matrix.os }}
     container: ubuntu:20.04
     strategy:
@@ -277,7 +284,25 @@ jobs:
         run: |
           set -euo pipefail
           debsign -p"$RUNNER_TEMP/gpg-batch" -k"$KEYID" --re-sign lp/*_source.changes
-          dput ppa:karpeleslab/puressh lp/*_source.changes
+          api="https://api.launchpad.net/1.0/~karpeleslab/+archive/ubuntu/puressh"
+          for changes in lp/*_source.changes; do
+            ver=$(basename "$changes" _source.changes); ver=${ver#puressh_}
+            # A re-run skips what Launchpad already has.
+            if curl -fsS "$api?ws.op=getPublishedSources&source_name=puressh&exact_match=true&version=$ver" |
+              grep -q '"total_size": [1-9]'; then
+              echo "$ver is already in the PPA"
+              continue
+            fi
+            # One upload at a time, retried: Launchpad's FTP server sometimes
+            # answers 550 (internal server error). -u: the runner's keyring
+            # can't check our own signature, and Launchpad does anyway.
+            for try in 1 2 3; do
+              dput -u ppa:karpeleslab/puressh "$changes" && break
+              [ "$try" = 3 ] && exit 1
+              rm -f "${changes%.changes}.ppa.upload"
+              sleep 60
+            done
+          done
 
   # Rebuild the GitHub Pages apt repository from the .deb assets publish-linux
   # just uploaded, so `apt install puressh-server` works on Ubuntu. Skips
@@ -434,6 +459,7 @@ jobs:
 
   build-macos-universal:
     name: build macos universal
+    if: ${{ !inputs.launchpad_only }}
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v6

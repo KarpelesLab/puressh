@@ -2639,6 +2639,8 @@ fn dump_pubkeys(cli: &Cli, cfg_block: &puressh::config::ClientOptions, identitie
         }
         out.extend(others);
     }
+    #[cfg(not(unix))]
+    let _ = identities_only;
     for (p, key, user) in files {
         match key {
             Some(blob) => out.push(format!(

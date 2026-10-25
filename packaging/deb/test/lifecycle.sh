@@ -49,8 +49,8 @@ step "baseline: stock openssh-server"
 apt-get update -qq
 apt-get install -y -qq openssh-server >/dev/null
 # Enabled at boot the way a stock install is (CI images ship it disabled):
-# through ssh.socket on 24.04, ssh.service before.
-if grep -q VERSION_CODENAME=noble /etc/os-release; then
+# through ssh.socket from 24.04 on, ssh.service before.
+if ! grep -qE 'VERSION_CODENAME=(focal|jammy)$' /etc/os-release; then
 	systemctl enable --now ssh.socket
 	systemctl restart ssh.socket
 	ls -la /etc/systemd/system/sockets.target.wants/ /etc/systemd/system/ssh.service.requires/ || true
@@ -89,18 +89,21 @@ echo "$out" | grep -q puressh-ok
 echo "$out" | grep -qx tester
 # A PTY session goes through PAM sessions and the privilege drop, and is
 # recorded as OpenSSH records it: utmp (who) while it lasts, wtmp (last)
-# and lastlog ("Last login:" at the next interactive login) after.
+# and lastlog ("Last login:" at the next interactive login) after. From
+# 26.04 on there is no utmp (systemd dropped it) and no last(1).
 try_ssh -tt tester@localhost 'tty; sleep 1; who' >/tmp/pty.out
 grep -q /dev/pts/ /tmp/pty.out
-grep -q '^tester  *pts/' /tmp/pty.out
-last -w tester | grep -q '^tester  *pts/'
+if [ -e /run/utmp ]; then grep -q '^tester  *pts/' /tmp/pty.out; fi
+if command -v last >/dev/null; then last -w tester | grep -q '^tester  *pts/'; fi
 # One attempt (stdin is consumed), typing `exit` once the shell is up: input
 # typed ahead may be eaten by the image's login scripts.
 (sleep 5; printf 'exit\n') | timeout 60 ssh -tt -F /dev/null -i /root/tester_key -o BatchMode=yes \
 	-o StrictHostKeyChecking=yes -o UserKnownHostsFile=/root/known_hosts tester@localhost \
 	>/tmp/login.out 2>&1 && rc=0 || rc=$?
 # (Ubuntu's ~/.bash_logout ends with a failing clear_console: exit 1.)
-if [ "$rc" = 124 ] || ! tr -d '\r' </tmp/login.out | grep -q '^Last login: .* from '; then
+# 26.10 has no lastlog left, and neither daemon prints a last login there.
+if [ -e /var/log/lastlog ]; then lastlog='^Last login: .* from '; else lastlog='^tester@'; fi
+if [ "$rc" = 124 ] || ! tr -d '\r' </tmp/login.out | grep -q "$lastlog"; then
 	echo "interactive login: exit $rc"; cat -A /tmp/login.out; exit 1
 fi
 # ~/.ssh/rc runs at session start, as the user, in the home directory; and
@@ -180,6 +183,28 @@ out=$(timeout 60 ssh -F /dev/null -i /root/tester_key -o BatchMode=yes -o Strict
 	-o UserKnownHostsFile=/root/known_hosts jailed@localhost 'echo shell-ok' </dev/null 2>&1 || true)
 if echo "$out" | grep -q shell-ok; then echo "jailed user got a shell"; exit 1; fi
 rm -f /etc/ssh/sshd_config.d/50-jail.conf
+
+if [ -e /usr/lib/systemd/system/sshd@.service ]; then
+	step "sshd@.service serves a connection from an Accept=yes socket"
+	# What systemd-ssh-generator's AF_VSOCK / AF_UNIX sockets do (26.04 on),
+	# on a TCP port the test can reach. Without the ephemeral-key
+	# credential, ${CREDENTIALS_DIRECTORY} expands to nothing: a missing
+	# file, which the daemon must skip.
+	printf '%s\n' '[Socket]' 'ListenStream=127.0.0.1:2223' 'Accept=yes' \
+		>/run/systemd/system/sshd.socket
+	systemctl daemon-reload
+	systemctl start sshd.socket
+	echo "[localhost]:2223 $(cut -d' ' -f1,2 /etc/ssh/ssh_host_ed25519_key.pub)" >>/root/known_hosts
+	try_ssh -p 2223 tester@localhost 'echo per-connection-ok' | grep -q per-connection-ok
+	systemctl stop sshd.socket
+	rm -f /run/systemd/system/sshd.socket
+	systemctl daemon-reload
+	systemctl is-active ssh.service
+	# sshd.service is a unit of its own, as openssh-server's is.
+	systemctl restart sshd.service
+	systemctl is-active sshd.service
+	try_ssh tester@localhost 'echo sshd-unit-ok' | grep -q sshd-unit-ok
+fi
 
 step "purging openssh-server deletes host keys; ssh.service restores them"
 apt-get purge -y -qq openssh-server >/dev/null 2>&1 || true

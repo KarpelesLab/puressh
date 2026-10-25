@@ -29,7 +29,7 @@ Copyright: 1995 Tatu Ylonen, Espoo, Finland, and the OpenSSH and Debian
  openssh package authors
 License: BSD-2-clause
  These configuration files are copied unchanged from Ubuntu's openssh-server
- package (20.04, 22.04 and 24.04) so the replacement keeps the same files.
+ package (20.04, 22.04, 24.04, 26.04 and 26.10) so the replacement keeps the same files.
  See /usr/share/doc/openssh-client/copyright for the full OpenSSH licence.
 
 Files: vendor/*

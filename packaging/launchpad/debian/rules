@@ -24,6 +24,10 @@ CLIENT_BINS := ssh scp sftp ssh-add ssh-agent ssh-keygen ssh-keyscan
 BINS := $(CLIENT_BINS) $(if $(filter yes,$(SERVER)),sshd)
 
 DEB := packaging/deb
+# From 26.04 on, openssh-server also ships sshd.service as a unit of its
+# own, sshd@.service and sshd-keygen.service, and its own /etc/pam.d/sshd.
+NEWUNITS := $(filter-out jammy noble,$(SERIES))
+PAM := $(firstword $(wildcard $(DEB)/files/pam-sshd-$(SERIES)) $(DEB)/files/pam-sshd)
 OUT := $(CARGO_TARGET_DIR)/release
 CLIENT := debian/puressh-client
 SRV := debian/puressh-server
@@ -56,7 +60,11 @@ ifeq ($(SERVER),yes)
 	install -m 0755 $(DEB)/files/sshd-prepare $(SRV)/usr/lib/puressh/sshd-prepare
 	install -m 0644 $(DEB)/sshd_config/$(SERIES) $(SRV)/usr/share/puressh/sshd_config
 	install -m 0644 $(DEB)/files/ssh.service $(SRV)/$(UNITDIR)/ssh.service
-	install -m 0644 $(DEB)/files/pam-sshd $(SRV)/etc/pam.d/sshd
+ifneq ($(NEWUNITS),)
+	install -m 0644 $(DEB)/files/ssh.service $(SRV)/$(UNITDIR)/sshd.service
+	install -m 0644 $(DEB)/files/sshd@.service $(DEB)/files/sshd-keygen.service $(SRV)/$(UNITDIR)/
+endif
+	install -m 0644 $(PAM) $(SRV)/etc/pam.d/sshd
 	install -m 0644 $(DEB)/files/default-ssh $(SRV)/etc/default/ssh
 	install -m 0644 $(DEB)/files/ufw-openssh-server $(SRV)/etc/ufw/applications.d/openssh-server
 endif

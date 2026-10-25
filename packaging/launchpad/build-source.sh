@@ -7,7 +7,7 @@
 #            or REF=<git ref> to package another commit
 #   OUTDIR   where the orig tarball, .dsc, .debian.tar.xz and _source.changes
 #            files are written
-#   SERIES   jammy, noble (server and client), resolute, stonking (client)
+#   SERIES   jammy, noble, resolute or stonking
 #
 # environment: REV (default 1) the PPA revision, bumped to re-upload the same
 # upstream version; DEBFULLNAME/DEBEMAIL for the changelog entry.
@@ -51,10 +51,15 @@ fi
 
 for SERIES; do
 	case "$SERIES" in
-	jammy) NUM=22.04 SERVER=yes UNITDIR=lib/systemd/system TOOL=1.91 ;;
-	noble) NUM=24.04 SERVER=yes UNITDIR=usr/lib/systemd/system TOOL=1.91 ;;
-	resolute) NUM=26.04 SERVER=no UNITDIR= TOOL=1.91 ;;
-	stonking) NUM=26.10 SERVER=no UNITDIR= TOOL= ;;
+	# OPENSSH: the openssh-server version puressh-server provides, at
+	# least what the series' packages depend on (the ssh metapackage
+	# wants its own release's version or later; 26.10's openssh-client
+	# Breaks anything below 1:10.3p1-6~), above any update of that
+	# upstream release.
+	jammy) NUM=22.04 SERVER=yes UNITDIR=lib/systemd/system TOOL=1.91 OPENSSH=1:9.9p1-0puressh1 ;;
+	noble) NUM=24.04 SERVER=yes UNITDIR=usr/lib/systemd/system TOOL=1.91 OPENSSH=1:9.9p1-0puressh1 ;;
+	resolute) NUM=26.04 SERVER=yes UNITDIR=usr/lib/systemd/system TOOL=1.91 OPENSSH=1:10.2p1-99puressh1 ;;
+	stonking) NUM=26.10 SERVER=yes UNITDIR=usr/lib/systemd/system TOOL= OPENSSH=1:10.5p1-99puressh1 ;;
 	*) echo "unknown series: $SERIES" >&2; exit 2 ;;
 	esac
 	if [ -n "$TOOL" ]; then
@@ -80,7 +85,7 @@ for SERIES; do
 	install -m 0755 "$TOP/packaging/deb/client/preinst" "$d/puressh-client.preinst"
 	install -m 0755 "$TOP/packaging/deb/client/postrm" "$d/puressh-client.postrm"
 	if [ "$SERVER" = yes ]; then
-		cat "$HERE/debian/control-server.in" >>"$d/control"
+		sed "s/@OPENSSH_VERSION@/$OPENSSH/" "$HERE/debian/control-server.in" >>"$d/control"
 		for s in postinst prerm postrm; do
 			install -m 0755 "$TOP/packaging/deb/scripts/$s" "$d/puressh-server.$s"
 		done

@@ -4,7 +4,7 @@ Architecture: amd64 arm64
 Depends: ${shlibs:Depends}, ${misc:Depends}, libpam0g (>= 0.99.7.1),
  libpam-modules, libpam-runtime
 Recommends: libpam-systemd
-Provides: openssh-server (= 1:9.9p1-0puressh1), ssh-server
+Provides: openssh-server (= @OPENSSH_VERSION@), ssh-server
 Conflicts: openssh-server
 Replaces: openssh-server
 Description: puressh secure shell (SSH) server, replacing OpenSSH's

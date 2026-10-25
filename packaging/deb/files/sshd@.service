@@ -1,0 +1,16 @@
+[Unit]
+Description=puressh Secure Shell server per-connection daemon
+Documentation=https://github.com/KarpelesLab/puressh man:sshd(8)
+After=nss-user-lookup.target auditd.service
+
+# One connection on the socket systemd passes in (Accept=yes sockets, such
+# as the ones systemd-ssh-generator sets up for AF_VSOCK and AF_UNIX), as
+# Ubuntu's openssh-server serves them from 26.04 on.
+[Service]
+EnvironmentFile=-/etc/default/ssh
+ExecStart=-/usr/sbin/sshd -i $SSHD_OPTS -o "AuthorizedKeysFile ${CREDENTIALS_DIRECTORY}/ssh.ephemeral-authorized_keys-all .ssh/authorized_keys"
+StandardInput=socket
+RuntimeDirectory=sshd
+RuntimeDirectoryPreserve=yes
+RuntimeDirectoryMode=0755
+ImportCredential=ssh.ephemeral-authorized_keys-all

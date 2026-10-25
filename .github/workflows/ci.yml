@@ -157,6 +157,8 @@ jobs:
           - { os: ubuntu-22.04, release: jammy, arch: amd64 }
           - { os: ubuntu-24.04, release: noble, arch: amd64 }
           - { os: ubuntu-24.04-arm, release: noble, arch: arm64 }
+          - { os: ubuntu-26.04, release: resolute, arch: amd64 }
+          - { os: ubuntu-26.04-arm, release: resolute, arch: arm64 }
     steps:
       - uses: actions/checkout@v6
 
@@ -186,39 +188,47 @@ jobs:
       - name: Client package lifecycle
         run: sudo packaging/deb/test/client-lifecycle.sh out-client/*.deb
 
-  # The series Launchpad gets only puressh-client for. Containers, so
-  # privileged: OpenSSH's sshd (the test's server) needs pam_loginuid.
-  deb-client:
-    name: Ubuntu client package (${{ matrix.release }}, container)
+  # 26.10 has no GitHub runner: the same build and lifecycle tests in a
+  # container booting systemd, privileged, on the disposable runner VM.
+  deb-container:
+    name: Ubuntu package (${{ matrix.release }} amd64, systemd container)
     runs-on: ubuntu-24.04
-    container:
-      image: ubuntu:${{ matrix.release }}
-      options: --privileged
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { release: resolute, cargo: cargo-1.91, deps: cargo-1.91 rustc-1.91 }
-          - { release: stonking, cargo: cargo, deps: cargo rustc }
+          - { release: stonking }
     steps:
-      - name: Install Ubuntu's toolchain and debhelper
-        run: >
-          apt-get update &&
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends
-          ca-certificates git build-essential debhelper dpkg-dev fakeroot ${{ matrix.deps }}
-
       - uses: actions/checkout@v6
+
+      - name: Boot the container
+        run: |
+          printf '%s\n' "FROM ubuntu:${{ matrix.release }}" \
+            'RUN rm -f /usr/sbin/policy-rc.d && apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends systemd systemd-sysv dbus ubuntu-server git ca-certificates build-essential debhelper dpkg-dev fakeroot cargo rustc' \
+            'STOPSIGNAL SIGRTMIN+3' 'CMD ["/sbin/init"]' > "$RUNNER_TEMP/Dockerfile"
+          docker build -q -t ubuntu-systemd -f "$RUNNER_TEMP/Dockerfile" "$RUNNER_TEMP"
+          docker run -d --name ub --privileged --cgroupns=private --tmpfs /run --tmpfs /run/lock \
+            -v "$PWD:/src:ro" ubuntu-systemd
+          for _ in $(seq 1 60); do
+            case "$(docker exec ub systemctl is-system-running 2>/dev/null)" in running | degraded) break ;; esac
+            sleep 1
+          done
+          docker exec ub systemctl is-system-running || true
 
       - name: Build the source and binary packages
         run: |
-          git config --global --add safe.directory "$PWD"
-          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          REF=HEAD CARGO=${{ matrix.cargo }} packaging/launchpad/build-source.sh "$version" src ${{ matrix.release }}
-          dpkg-source -x src/puressh_*.dsc build
-          (cd build && dpkg-buildpackage -b -us -uc)
+          docker exec ub sh -euc '
+            git config --global --add safe.directory /src
+            version="$(sed -n "s/^version = \"\(.*\)\"$/\1/p" /src/Cargo.toml | head -n 1)"
+            REF=HEAD /src/packaging/launchpad/build-source.sh "$version" /tmp/src ${{ matrix.release }}
+            cd /tmp && dpkg-source -x src/puressh_*.dsc build && cd build && dpkg-buildpackage -b -us -uc'
+
+      - name: Package lifecycle (replace OpenSSH and back)
+        timeout-minutes: 20
+        run: docker exec ub sh -c 'sh /src/packaging/deb/test/lifecycle.sh /tmp/puressh-server_*.deb'
 
       - name: Client package lifecycle
-        run: packaging/deb/test/client-lifecycle.sh puressh-client_*.deb
+        run: docker exec ub sh -c 'sh /src/packaging/deb/test/client-lifecycle.sh /tmp/puressh-client_*.deb'
 
   # GitHub has no Ubuntu 20.04 VM runners any more: build and install inside
   # an ubuntu:20.04 container (glibc 2.31, dpkg 1.19), without systemd.

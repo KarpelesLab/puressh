@@ -8,19 +8,20 @@ sudo add-apt-repository ppa:karpeleslab/puressh
 sudo apt install puressh-server   # and/or puressh-client
 ```
 
-| Series         | Packages                          | Toolchain                     |
-|----------------|-----------------------------------|-------------------------------|
-| jammy (22.04)  | `puressh-server`, `puressh-client` | `cargo-1.91`, `rustc-1.91`   |
-| noble (24.04)  | `puressh-server`, `puressh-client` | `cargo-1.91`, `rustc-1.91`   |
-| resolute (26.04) | `puressh-client`                | `cargo-1.91`, `rustc-1.91`   |
-| stonking (26.10) | `puressh-client`                | `cargo`, `rustc` (1.97)      |
+| Series           | Toolchain                   |
+|------------------|-----------------------------|
+| jammy (22.04)    | `cargo-1.91`, `rustc-1.91`  |
+| noble (24.04)    | `cargo-1.91`, `rustc-1.91`  |
+| resolute (26.04) | `cargo-1.91`, `rustc-1.91`  |
+| stonking (26.10) | `cargo`, `rustc` (1.97)     |
 
-`puressh-server` is only built where its takeover of `openssh-server` has
-been worked out and tested. From 26.04 on, openssh-server also ships
-`sshd.service`, `sshd@.service`, `sshd-keygen.service`, sysusers and tmpfiles
-snippets and a different `/etc/pam.d/sshd`, which the server package does
-not handle yet. Focal (20.04) has no rustc that can build edition 2024 (its
-newest is 1.80), so it is not on Launchpad.
+Each series gets `puressh-server` and `puressh-client`. From 26.04 on,
+`puressh-server` also takes over openssh-server's `sshd.service`,
+`sshd@.service` (one connection per instance, for systemd's `Accept=yes`
+sockets) and `sshd-keygen.service`, and provides a newer `openssh-server`
+version, as those releases' packages depend on. Focal (20.04) has no rustc
+that can build edition 2024 (its newest is 1.80), so it is not on
+Launchpad.
 
 ## How it is built
 

@@ -16,8 +16,10 @@ What the package does:
   server package but keeps everything that depends on it.
 - Installs `/usr/sbin/sshd` and its own `ssh.service` (alias `sshd.service`,
   `Type=notify` like Ubuntu's, `KillMode=process` so restarts never drop
-  open sessions). On 24.04 the
-  socket-activated `ssh.socket` is retired; the daemon listens itself.
+  open sessions). From 24.04 on the
+  socket-activated `ssh.socket` is retired; the daemon listens itself. From
+  26.04 on (the Launchpad packages) it also ships `sshd.service`,
+  `sshd@.service` and `sshd-keygen.service`, as openssh-server does there.
 - Takes over `/etc/pam.d/sshd`, `/etc/default/ssh` and the ufw `OpenSSH`
   profile, byte-identical to Ubuntu's copies.
 - Keeps `/etc/ssh/sshd_config`, `sshd_config.d/` and the host keys. A backup
@@ -52,10 +54,9 @@ OpenSSH's programs their names back.
 
 ## Tests
 
-CI installs both packages on real 22.04 and 24.04 machines (amd64, arm64),
-built as the Launchpad PPA builds them (see
-[`../launchpad/README.md`](../launchpad/README.md)), the client package in
-26.04 and 26.10 containers, and the `build-deb.sh` packages in 20.04
-containers: `test/lifecycle.sh` (server: replace OpenSSH,
-reload, purge, back), `test/no-systemd.sh` (server without systemd) and
+CI installs both packages on real 22.04, 24.04 and 26.04 machines (amd64,
+arm64) and in a 26.10 container booting systemd, built as the Launchpad PPA
+builds them (see [`../launchpad/README.md`](../launchpad/README.md)), and
+the `build-deb.sh` packages in 20.04 containers: `test/lifecycle.sh` (server: replace OpenSSH,
+reload, per-connection units, purge, back), `test/no-systemd.sh` (server without systemd) and
 `test/client-lifecycle.sh` (client: divert, use, restore).

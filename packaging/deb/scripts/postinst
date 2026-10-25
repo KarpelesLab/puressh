@@ -65,7 +65,22 @@ MSG
 		# would make our ssh.service require a unit that no longer exists.
 		rm -f /etc/systemd/system/ssh.service.requires/ssh.socket
 		rmdir /etc/systemd/system/ssh.service.requires 2>/dev/null || true
+		# From 26.04 on, openssh-server's sshd-keygen.service (host keys on
+		# first boot) is also wanted by ssh.socket.
+		rm -f /etc/systemd/system/ssh.socket.wants/sshd-keygen.service
+		rmdir /etc/systemd/system/ssh.socket.wants 2>/dev/null || true
 		systemctl daemon-reload || true
+
+		# Our sshd-keygen.service (26.04 on) takes over openssh-server's,
+		# enabled unless an administrator disabled it, as debhelper does.
+		if [ -e /usr/lib/systemd/system/sshd-keygen.service ]; then
+			deb-systemd-helper unmask sshd-keygen.service >/dev/null || true
+			if deb-systemd-helper --quiet was-enabled sshd-keygen.service; then
+				deb-systemd-helper enable sshd-keygen.service >/dev/null || true
+			else
+				deb-systemd-helper update-state sshd-keygen.service >/dev/null || true
+			fi
+		fi
 
 		if [ -n "$wanted" ]; then
 			# SSH was enabled before: keep it enabled.

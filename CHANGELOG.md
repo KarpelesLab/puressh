@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.6](https://github.com/KarpelesLab/puressh/compare/v0.2.5...v0.2.6) - 2026-10-25
+
+### Added
+
+- *(sshd)* PubkeyAuthOptions max-pk-ok, as OpenSSH 10.6
+- *(ssh)* ProxyUseFdpass
+- *(ssh)* X11 cookies through xauth, and StreamLocalBind*
+- *(ssh)* -Z, -O channels and the client's ChannelTimeout
+- *(ssh)* WarnWeakCrypto, VersionAddendum and KbdInteractiveDevices
+- *(scp)* -v notes the commands it runs, as OpenSSH's
+- *(ssh-keygen)* OpenSSH 10.6 options: -c, -Z, -X, -o, -m hexdump, -v
+- *(key)* every OpenSSH private-key cipher, and -E fingerprint hashes
+- *(ssh-add)* -v debug output and OpenSSH's option errors
+- *(ssh-agent)* OpenSSH 10.6 socket placement and options
+- *(ssh)* -y (syslog), SyslogFacility and LogVerbose
+- *(ssh)* BindInterface (-B) and IPQoS
+- *(ssh)* host-key checks of OpenSSH's around known_hosts
+- *(config)* parse the remaining client keywords as OpenSSH 10.6 does
+- *(pkcs11)* PKCS#11 tokens for ssh, ssh-keygen, ssh-add and ssh-agent
+- *(sk)* internal provider for USB authenticators through libfido2
+- *(sshd)* UseDNS, Match RDomain, -u, IPQoS, TCPKeepAlive all, X11 and StreamLocal options, AgentSocketPath
+- *(sshd)* VersionAddendum, ModuliFile, WarnWeakCrypto, RefuseConnection, FingerprintHash, LogVerbose
+- *(sshd)* -G and -T print OpenSSH 10.6's configuration dump; its option set
+- *(config)* parse the remaining OpenSSH 10.6 sshd_config keywords
+- *(sftp)* accept a service name for -P, as OpenSSH's a2port
+- *(sftp)* expand {a,b} braces in ls patterns, as OpenSSH's GLOB_BRACE
+- *(sftp)* handle Ctrl-C as OpenSSH's sftp does
+- *(sftp)* follow OpenSSH 10.6 sftp(1) command by command
+- *(sftp)* add SftpClient::lsetstat for lsetstat@openssh.com
+- *(sk)* sign with FIDO security keys through a SecurityKeyProvider
+- support no-more-sessions@openssh.com on both sides
+- *(kex)* add mlkem768nistp256-sha256 hybrid key exchange
+- *(auth)* [**breaking**] FIDO security-key public keys, signatures and policy
+
+### Fixed
+
+- *(api)* keep 0.2's auto traits and discriminants; non_exhaustive AuthAttempt variants
+- *(packaging)* don't kill stray sshd processes on install
+- *(hostkey)* [**breaking**] ML-DSA under its IANA names, and a default, as OpenSSH 10.6
+- *(config)* accept GSSAPIDelegateCredentials in sshd_config
+- *(ci)* byte-exact test fixtures on Windows; no doc link to a private item
+- *(ssh)* -Z builds without warnings on Windows
+- *(config)* first value wins within a block for the new client keywords
+- *(ssh-agent, ssh-add)* -E takes every hash OpenSSH's does
+- *(scp)* match OpenSSH's option checks and errors
+- *(sftp)* word single-file transfer errors as OpenSSH's sftp-client
+- *(sftp)* draw the progress meter as OpenSSH's progressmeter.c
+- *(server)* send the initial KEXINIT after the client's version line
+
+### Other
+
+- run the security-key provider and PKCS#11 token tests
+- *(config)* EnableSSHKeysign is the one refused client value left
+- *(sftp)* end-to-end check of the OpenSSH command behaviours
+
 ## [0.2.5](https://github.com/KarpelesLab/puressh/compare/v0.2.4...v0.2.5) - 2026-10-25
 
 ### Other

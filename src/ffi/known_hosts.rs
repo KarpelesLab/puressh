@@ -597,6 +597,11 @@ pub unsafe extern "C" fn pcssh_client_connect_known_hosts(
                     host_key_alias: None,
                     revoked: None,
                     command: None,
+                    check_host_ip: None,
+                    on_address_change: TofuAction::Reject,
+                    pre_check: None,
+                    on_known: None,
+                    notice: None,
                 };
                 Config {
                     host_key_policy: HostKeyPolicy::KnownHosts(policy),

@@ -26,6 +26,9 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+#[path = "fingerprint.rs"]
+#[allow(dead_code)] // ssh shares it, using more of it
+mod fingerprint;
 #[cfg(unix)]
 #[path = "unix_sys.rs"]
 mod unix_sys;
@@ -1034,49 +1037,12 @@ fn bubblebabble(d: &[u8]) -> String {
 
 /// OpenSSH's "drunken bishop" randomart for a key's digest.
 fn randomart(pk: &PublicKey, digest: &[u8], hash_name: &str) -> String {
-    const AUG: &[u8] = b" .o+=*BOX@%&#/^SE";
-    const W: usize = 17;
-    const H: usize = 9;
-    // As in OpenSSH: the last two symbols mark the start and end.
-    let len = AUG.len() - 1;
-    let mut field = [[0usize; H]; W];
-    let (mut x, mut y) = (W as isize / 2, H as isize / 2);
-    for byte in digest {
-        let mut input = *byte;
-        for _ in 0..4 {
-            x += if input & 1 != 0 { 1 } else { -1 };
-            y += if input & 2 != 0 { 1 } else { -1 };
-            x = x.clamp(0, W as isize - 1);
-            y = y.clamp(0, H as isize - 1);
-            let cell = &mut field[x as usize][y as usize];
-            if *cell < len - 2 {
-                *cell += 1;
-            }
-            input >>= 2;
-        }
-    }
-    field[W / 2][H / 2] = len - 1;
-    field[x as usize][y as usize] = len;
-    let border = |label: &str| {
-        let mut line = String::from("+");
-        let pad = W.saturating_sub(label.len()) / 2;
-        line.push_str(&"-".repeat(pad));
-        line.push_str(label);
-        line.push_str(&"-".repeat(W.saturating_sub(pad + label.len())));
-        line.push('+');
-        line
-    };
-    let mut out = border(&format!("[{} {}]", algorithm_label(pk), pk.bit_length()));
-    out.push('\n');
-    for row in 0..H {
-        out.push('|');
-        for col in field.iter() {
-            out.push(AUG[col[row].min(len)] as char);
-        }
-        out.push_str("|\n");
-    }
-    out.push_str(&border(&format!("[{hash_name}]")));
-    out
+    fingerprint::randomart(
+        algorithm_label(pk),
+        pk.bit_length() as usize,
+        digest,
+        hash_name,
+    )
 }
 
 fn run_fingerprint(args: &Args) -> Result<i32, String> {

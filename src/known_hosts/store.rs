@@ -423,6 +423,36 @@ impl KnownHosts {
         Ok(())
     }
 
+    /// Append one unhashed entry naming several hosts (`host,addr`, each
+    /// `[name]:port` off port 22), as OpenSSH records a new host with its
+    /// address. Each name is checked as [`Self::try_add`] checks its host.
+    pub fn try_add_names(
+        &mut self,
+        names: &[(&str, u16)],
+        key_type: &str,
+        key_blob: &[u8],
+    ) -> crate::Result<()> {
+        if !safe_field(key_type) {
+            return Err(crate::Error::Format("known_hosts: invalid key type"));
+        }
+        if names.is_empty() || names.iter().any(|(h, _)| !safe_field(h)) {
+            return Err(crate::Error::Format("known_hosts: invalid host name"));
+        }
+        let patterns = names
+            .iter()
+            .map(|(h, p)| format_host_pattern(h, *p))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.lines.push(Slot::Entry(Entry {
+            marker: None,
+            host_spec: HostSpec::Patterns(patterns.split(',').map(String::from).collect()),
+            key_type: key_type.to_string(),
+            key_blob: key_blob.to_vec(),
+            comment: String::new(),
+        }));
+        Ok(())
+    }
+
     /// Remove only the plain entries that name **exactly** `host[:port]`:
     /// marker-less lines whose host field is the single literal pattern
     /// `format_host_pattern(host, port)` (compared ASCII

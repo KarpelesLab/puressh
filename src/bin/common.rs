@@ -1264,11 +1264,67 @@ pub fn base64_no_pad(bytes: &[u8]) -> String {
 /// (address)'`: set once the TCP connection is up.
 static PEER_ADDR: Mutex<Option<std::net::SocketAddr>> = Mutex::new(None);
 
+/// The peer of the connection being set up, once known.
+#[allow(dead_code)] // ssh only
+pub fn peer_addr() -> Option<std::net::SocketAddr> {
+    PEER_ADDR.lock().ok().and_then(|g| *g)
+}
+
+/// OpenSSH's `warn_changed_key`: the changed-key banner for the key in
+/// `blob`, up to the advice that follows it.
+pub fn warn_changed_key(blob: &[u8]) {
+    let label = puressh::client::host_key_type_label(blob);
+    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+    eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
+    eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+    eprintln!("IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!");
+    eprintln!("Someone could be eavesdropping on you right now (man-in-the-middle attack)!");
+    eprintln!("It is also possible that a host key has just been changed.");
+    eprintln!(
+        "The fingerprint for the {label} key sent by the remote host is\n{}.",
+        show_host_key(blob).0
+    );
+    eprintln!("Please contact your system administrator.");
+}
+
 /// Record the peer of the connection being set up (see [`PEER_ADDR`]).
 #[allow(dead_code)] // ssh only
 pub fn set_peer_addr(addr: Option<std::net::SocketAddr>) {
     if let Ok(mut g) = PEER_ADDR.lock() {
         *g = addr;
+    }
+}
+
+/// How `ssh` shows a host key: its fingerprint (`FingerprintHash`) and,
+/// with `VisualHostKey`, its randomart.
+pub type HostKeyShowFn = dyn Fn(&[u8]) -> (String, Option<String>) + Send + Sync;
+
+static HOST_KEY_SHOW: std::sync::OnceLock<Box<HostKeyShowFn>> = std::sync::OnceLock::new();
+
+/// Set how host keys are shown (see [`HostKeyShowFn`]); SHA-256 without
+/// randomart until then.
+#[allow(dead_code)] // ssh only
+pub fn set_host_key_show(f: Box<HostKeyShowFn>) {
+    let _ = HOST_KEY_SHOW.set(f);
+}
+
+/// A host key's fingerprint and randomart, as [`set_host_key_show`] says.
+pub fn show_host_key(blob: &[u8]) -> (String, Option<String>) {
+    match HOST_KEY_SHOW.get() {
+        Some(f) => f(blob),
+        None => (fingerprint_b64_sha256(blob), None),
+    }
+}
+
+/// `VerifyHostKeyDNS`: whether the host's SSHFP records matched the key
+/// (`None`: not looked up), for the first-contact question.
+static DNS_MATCH: Mutex<Option<bool>> = Mutex::new(None);
+
+/// Record the SSHFP outcome (see [`DNS_MATCH`]).
+#[allow(dead_code)] // ssh only
+pub fn set_dns_match(matched: Option<bool>) {
+    if let Ok(mut g) = DNS_MATCH.lock() {
+        *g = matched;
     }
 }
 
@@ -1325,9 +1381,14 @@ fn openssh_host_key_actions(strict: StrictMode, files: Vec<PathBuf>) -> (TofuAct
                 // A keyword value this binary predates: fail closed.
                 _ => false,
             };
+            // `CheckHostIP`: an unknown address is recorded with the name.
+            let added = match p.address {
+                Some((ip, puressh::client::AddressStatus::Unknown)) => format!("{target},{ip}"),
+                _ => target.clone(),
+            };
             if accepted && !is_quiet() {
                 eprintln!(
-                    "Warning: Permanently added '{target}' ({label}) to the list of known hosts."
+                    "Warning: Permanently added '{added}' ({label}) to the list of known hosts."
                 );
             }
             accepted
@@ -1336,19 +1397,33 @@ fn openssh_host_key_actions(strict: StrictMode, files: Vec<PathBuf>) -> (TofuAct
         TofuAction::PromptDetailed(Arc::new(move |p: &puressh::client::HostKeyPrompt| {
             let label = puressh::client::host_key_type_label(p.key_blob);
             let target = host_target(p.host, p.port);
-            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-            eprintln!("@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @");
-            eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
-            eprintln!("IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!");
-            eprintln!(
-                "Someone could be eavesdropping on you right now (man-in-the-middle attack)!"
-            );
-            eprintln!("It is also possible that a host key has just been changed.");
-            eprintln!(
-                "The fingerprint for the {label} key sent by the remote host is\n{}.",
-                p.fingerprint
-            );
-            eprintln!("Please contact your system administrator.");
+            // `CheckHostIP`: the address does not back the change up.
+            if let Some((ip, status)) = p.address
+                && status != puressh::client::AddressStatus::Changed
+            {
+                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                eprintln!("@       WARNING: POSSIBLE DNS SPOOFING DETECTED!          @");
+                eprintln!("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@");
+                eprintln!("The {label} host key for {target} has changed,");
+                eprintln!("and the key for the corresponding IP address {ip}");
+                eprintln!(
+                    "{}. This could either mean that",
+                    if status == puressh::client::AddressStatus::Unknown {
+                        "is unknown"
+                    } else {
+                        "is unchanged"
+                    }
+                );
+                eprintln!("DNS SPOOFING is happening or the IP address for the host");
+                eprintln!("and its host key have changed at the same time.");
+                if status == puressh::client::AddressStatus::Known {
+                    let (ip, port) = split_target(ip);
+                    for (file, line) in key_lines(&files, ip, port, p.key_blob) {
+                        eprintln!("Offending key for IP in {}:{line}", file.display());
+                    }
+                }
+            }
+            warn_changed_key(p.key_blob);
             if let Some(first) = files.first() {
                 eprintln!(
                     "Add correct host key in {} to get rid of this message.",
@@ -1377,6 +1452,110 @@ fn openssh_host_key_actions(strict: StrictMode, files: Vec<PathBuf>) -> (TofuAct
     (unknown, changed)
 }
 
+/// `CheckHostIP`: the host key is trusted but the server's address is
+/// recorded with another key. OpenSSH asks (`ask`), refuses (`yes`,
+/// `accept-new`) or only warns (`no`).
+#[allow(dead_code)] // ssh only
+pub fn openssh_address_change_action(strict: StrictMode, files: Vec<PathBuf>) -> TofuAction {
+    TofuAction::PromptDetailed(Arc::new(move |p: &puressh::client::HostKeyPrompt| {
+        let label = puressh::client::host_key_type_label(p.key_blob);
+        let target = host_target(p.host, p.port);
+        let ip = p.address.map_or("", |(ip, _)| ip);
+        let mut msg = format!(
+            "Warning: the {label} host key for '{target}' differs from the key for the IP \
+             address '{ip}'"
+        );
+        let (ip, ip_port) = split_target(ip);
+        for (file, line) in known_hosts_lines(&files)
+            .into_iter()
+            .filter(|(_, _, store)| {
+                store
+                    .find(ip, ip_port)
+                    .iter()
+                    .any(|e| e.marker.is_none() && e.key_blob != p.key_blob)
+            })
+            .map(|(f, l, _)| (f, l))
+        {
+            msg.push_str(&format!(
+                "\nOffending key for IP in {}:{line}",
+                file.display()
+            ));
+        }
+        for (file, line) in key_lines(&files, p.host, p.port, p.key_blob) {
+            msg.push_str(&format!("\nMatching host key in {}:{line}", file.display()));
+        }
+        match strict {
+            StrictMode::Ask => confirm_on_tty(&format!(
+                "{msg}\nAre you sure you want to continue connecting (yes/no)? "
+            )),
+            StrictMode::No => {
+                if !is_quiet() {
+                    eprintln!("{msg}");
+                }
+                true
+            }
+            _ => {
+                eprintln!("{msg}");
+                eprintln!("Exiting, you have requested strict checking.");
+                false
+            }
+        }
+    }))
+}
+
+/// `host` and port from OpenSSH's `host` / `[host]:port` spelling.
+fn split_target(name: &str) -> (&str, u16) {
+    if let Some(rest) = name.strip_prefix('[')
+        && let Some((host, port)) = rest.split_once("]:")
+        && let Ok(port) = port.parse()
+    {
+        return (host, port);
+    }
+    (name, 22)
+}
+
+/// The known_hosts lines (file, 1-based line) recording `blob` for `host`.
+fn key_lines(files: &[PathBuf], host: &str, port: u16, blob: &[u8]) -> Vec<(PathBuf, usize)> {
+    known_hosts_lines(files)
+        .into_iter()
+        .filter(|(_, _, store)| {
+            store
+                .find(host, port)
+                .iter()
+                .any(|e| e.marker.is_none() && e.key_blob == blob)
+        })
+        .map(|(f, l, _)| (f, l))
+        .collect()
+}
+
+/// Ask `question` on the terminal until `yes` or `no` (no terminal: no).
+fn confirm_on_tty(question: &str) -> bool {
+    let Some(mut tty) = open_prompt_tty() else {
+        eprint!("{question}");
+        return false;
+    };
+    let mut question = question.to_string();
+    loop {
+        if tty
+            .output
+            .write_all(question.as_bytes())
+            .and_then(|()| tty.output.flush())
+            .is_err()
+        {
+            return false;
+        }
+        let mut line = String::new();
+        if read_one_line(&mut tty.input, &mut line, 256).is_err() || line.is_empty() {
+            return false;
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "yes" => return true,
+            "no" => return false,
+            _ => question = "Please type 'yes' or 'no': ".to_string(),
+        }
+    }
+}
+
 /// OpenSSH's first-contact question; `yes` or the key's fingerprint
 /// accepts, `no` refuses, anything else asks again. No terminal: refused.
 fn ask_unknown_host(
@@ -1391,11 +1570,22 @@ fn ask_unknown_host(
         .and_then(|g| *g)
         .map(|a| host_target(&a.ip().to_canonical().to_string(), a.port()))
         .unwrap_or_else(|| target.to_string());
+    let (fingerprint, art) = show_host_key(p.key_blob);
     let mut banner = format!(
         "The authenticity of host '{target} ({addr})' can't be established.\n\
-         {label} key fingerprint is {}.\n",
-        p.fingerprint
+         {label} key fingerprint is: {fingerprint}\n",
     );
+    if let Some(art) = art {
+        banner.push_str(&art);
+        banner.push('\n');
+    }
+    if let Some(matched) = DNS_MATCH.lock().ok().and_then(|g| *g) {
+        banner.push_str(if matched {
+            "Matching host key fingerprint found in DNS.\n"
+        } else {
+            "No matching host key fingerprint found in DNS.\n"
+        });
+    }
     let others: Vec<String> = known_hosts_lines(files)
         .into_iter()
         .flat_map(|(file, line, store)| {
@@ -1437,7 +1627,7 @@ fn ask_unknown_host(
             return false;
         }
         let answer = line.trim();
-        if answer.eq_ignore_ascii_case("yes") || answer == p.fingerprint {
+        if answer.eq_ignore_ascii_case("yes") || answer == fingerprint {
             return true;
         }
         if answer.eq_ignore_ascii_case("no") {

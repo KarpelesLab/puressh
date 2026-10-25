@@ -28,6 +28,10 @@ use puressh::client::{
 #[path = "common.rs"]
 mod common;
 
+#[path = "dns.rs"]
+mod dns;
+#[path = "fingerprint.rs"]
+mod fingerprint;
 #[path = "tundev.rs"]
 mod tundev;
 
@@ -1021,6 +1025,27 @@ fn collect_credentials(
             }
         }
     }
+    // RequiredRSASize: smaller RSA keys are not offered (this library has a
+    // 2048-bit floor of its own).
+    let min_rsa = cfg_block.required_rsa_size.unwrap_or(1024);
+    if min_rsa > 2048 {
+        credentials.retain(|c| {
+            let ClientCredential::PublicKey(k) = c else {
+                return true;
+            };
+            let blob = k.public_blob();
+            match puressh::key::PublicKey::parse_wire_blob(&blob) {
+                Ok(pk @ puressh::key::PublicKey::Rsa { .. }) if pk.bit_length() < min_rsa => {
+                    eprintln!(
+                        "RSA key {} is shorter than RequiredRSASize: Invalid key length",
+                        common::fingerprint_b64_sha256(&blob)
+                    );
+                    false
+                }
+                _ => true,
+            }
+        });
+    }
     credentials
 }
 
@@ -1301,6 +1326,7 @@ fn transport_fatal(err: &str, peer: &str) -> Option<String> {
 fn config_for_host(
     cfg_block: &puressh::config::ClientOptions,
     cli: &Cli,
+    connect_host: &str,
 ) -> Result<Config, String> {
     let mut strict = common::pick(cli.strict, cfg_block.strict_host_key, StrictMode::Ask);
     // BatchMode never prompts. An interactive `ask` would block forever
@@ -1329,6 +1355,13 @@ fn config_for_host(
                 Err(e) => vlog(1, &format!("known_hosts {}: {e}", path.display())),
             }
         }
+        install_host_key_checks(
+            kh,
+            cfg_block,
+            connect_host,
+            strict,
+            user_known_hosts_files(cli, cfg_block),
+        );
     }
 
     // HostKeyAlgorithms +ssh-rsa opt-in: if the resolved host-key list names
@@ -1382,6 +1415,139 @@ fn config_for_host(
     Ok(Config::new(policy).with_algorithms(algorithms))
 }
 
+/// The host-key checks OpenSSH makes around known_hosts: `RequiredRSASize`,
+/// `NoHostAuthenticationForLocalhost` and `VerifyHostKeyDNS` before it,
+/// `VisualHostKey` and `CheckHostIP`'s address check after, with
+/// fingerprints in `FingerprintHash`.
+fn install_host_key_checks(
+    kh: &mut puressh::client::KnownHostsPolicy,
+    cfg_block: &puressh::config::ClientOptions,
+    connect_host: &str,
+    strict: StrictMode,
+    files: Vec<PathBuf>,
+) {
+    use puressh::config::VerifyHostKeyDns;
+    let hash = cfg_block
+        .fingerprint_hash
+        .clone()
+        .unwrap_or_else(|| "SHA256".into());
+    let visual = cfg_block.visual_host_key == Some(true);
+    {
+        let hash = hash.clone();
+        common::set_host_key_show(Box::new(move |blob: &[u8]| {
+            (
+                fingerprint::fingerprint(blob, &hash),
+                visual
+                    .then(|| fingerprint::randomart_of_blob(blob, &hash))
+                    .flatten(),
+            )
+        }));
+    }
+    kh.notice = Some(Arc::new(|msg: &str| {
+        if !common::is_quiet() {
+            eprintln!("{msg}");
+        }
+    }));
+    if visual {
+        let hash = hash.clone();
+        kh.on_known = Some(Arc::new(move |_key_type: &str, blob: &[u8]| {
+            if !common::is_quiet() {
+                eprintln!(
+                    "Host key fingerprint is: {}\n{}",
+                    fingerprint::fingerprint(blob, &hash),
+                    fingerprint::randomart_of_blob(blob, &hash).unwrap_or_default()
+                );
+            }
+        }));
+    }
+    kh.on_address_change = common::openssh_address_change_action(strict, files);
+    let min_rsa = cfg_block.required_rsa_size.unwrap_or(1024);
+    let localhost = cfg_block.no_host_authentication_for_localhost == Some(true)
+        && cfg_block.host_key_alias.is_none();
+    let dns_mode = cfg_block
+        .verify_host_key_dns
+        .unwrap_or(VerifyHostKeyDns::No);
+    let host = connect_host.to_string();
+    kh.pre_check = Some(Arc::new(move |key_type: &str, blob: &[u8]| {
+        // This library refuses RSA keys under 2048 bits whatever the floor.
+        if key_type == "ssh-rsa"
+            && min_rsa > 2048
+            && let Ok(pk) = puressh::key::PublicKey::parse_wire_blob(blob)
+            && pk.bit_length() < min_rsa
+        {
+            eprintln!("Bad server host key: Invalid key length");
+            std::process::exit(255);
+        }
+        if localhost && common::peer_addr().is_some_and(|a| a.ip().to_canonical().is_loopback()) {
+            vlog(1, "Forcing accepting of host key for loopback/localhost.");
+            HOST_KEY_FORCED.store(true, std::sync::atomic::Ordering::Relaxed);
+            return Some(true);
+        }
+        if dns_mode != VerifyHostKeyDns::No {
+            let mut matched = false;
+            match verify_host_key_dns(&host, key_type, blob) {
+                Some(v)
+                    if v.found && v.matched && v.secure && dns_mode == VerifyHostKeyDns::Yes =>
+                {
+                    return Some(true);
+                }
+                Some(v) if v.found && v.matched => matched = true,
+                Some(v) if v.found => {
+                    common::warn_changed_key(blob);
+                    eprintln!(
+                        "Update the SSHFP RR in DNS with the new host key to get rid of this \
+                         message."
+                    );
+                }
+                _ => {}
+            }
+            common::set_dns_match(Some(matched));
+        }
+        None
+    }));
+}
+
+/// OpenSSH's `verify_host_key_dns`: what `host`'s SSHFP records say about
+/// the key, `None` when they could not be looked up or compared.
+fn verify_host_key_dns(host: &str, key_type: &str, blob: &[u8]) -> Option<dns::SshfpVerdict> {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        vlog(1, "skipped DNS lookup for numerical hostname");
+        return None;
+    }
+    let set = match dns::lookup(host, dns::TYPE_SSHFP) {
+        Ok(set) => set,
+        Err(e) => {
+            vlog(1, &format!("DNS lookup error: {}", e.text()));
+            return None;
+        }
+    };
+    vlog(
+        1,
+        &format!(
+            "found {} {} fingerprints in DNS",
+            set.rdatas.len(),
+            if set.validated { "secure" } else { "insecure" }
+        ),
+    );
+    let Some(v) = dns::check_sshfp(&set, key_type, blob) else {
+        eprintln!("Error calculating key fingerprint.");
+        return None;
+    };
+    vlog(
+        1,
+        match (v.found, v.matched) {
+            (true, true) => "matching host key fingerprint found in DNS",
+            (true, false) => "mismatching host key fingerprint found in DNS",
+            _ => "no host key fingerprint found in DNS",
+        },
+    );
+    Some(v)
+}
+
+/// The host key was accepted without known_hosts
+/// (`NoHostAuthenticationForLocalhost`): UpdateHostKeys stays off.
+static HOST_KEY_FORCED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Walk the ProxyJump chain, returning the `SharedClient` for the *last*
 /// jump host. The caller opens a `direct-tcpip` channel from it to the final
 /// target and runs the real session over that. Each hop re-runs
@@ -1404,7 +1570,7 @@ fn connect_jump_chain(
         // Hop user: `user@` in the hop spec wins over the hop's config User,
         // then the local user. CLI `-l` targets the final host, not hops.
         let user = resolve_user(hop.user.as_deref(), block.user.as_deref())?;
-        let cfg = config_for_host(&block, cli)?;
+        let cfg = config_for_host(&block, cli, &connect_host)?;
 
         vlog(
             1,
@@ -1574,6 +1740,37 @@ fn user_known_hosts_files(cli: &Cli, cfg_block: &puressh::config::ClientOptions)
     }
 }
 
+/// `CanonicalizePermittedCNAMEs`: the name `name` is an alias to, when a
+/// rule lets canonicalisation follow it there (OpenSSH's
+/// `check_follow_cname`).
+fn follow_cname(cfg_block: &puressh::config::ClientOptions, name: &str) -> Option<String> {
+    let rules = cfg_block
+        .canonicalize_permitted_cnames
+        .as_deref()
+        .filter(|r| !r.is_empty())?;
+    let cname = dns::canonical_name(name)?.to_ascii_lowercase();
+    if cname == name {
+        return None;
+    }
+    let matches = |list: &str, n: &str| {
+        let patterns: Vec<puressh::config::HostPattern> = list
+            .split(',')
+            .map(puressh::config::HostPattern::parse)
+            .collect();
+        puressh::config::host_matches(&patterns, n)
+    };
+    for (from, to) in rules {
+        if matches(from, name) && matches(to, &cname) {
+            vlog(
+                1,
+                &format!("Canonicalized DNS aliased hostname \"{name}\" => \"{cname}\""),
+            );
+            return Some(cname);
+        }
+    }
+    None
+}
+
 /// `CanonicalizeHostname`, then the final pass over the configuration, as
 /// OpenSSH: with canonicalisation on, or a `Match final`, the
 /// configuration is read again for the final host name (`Host` patterns
@@ -1628,6 +1825,9 @@ fn final_config_pass(
             // An anchored name is already fully qualified.
             host = anchored.to_string();
             canonical = true;
+            if let Some(alias) = follow_cname(cfg_block, &host) {
+                host = alias;
+            }
         } else if host.matches('.').count() as u32 <= cfg_block.canonicalize_max_dots.unwrap_or(1) {
             let domains = cfg_block.canonical_domains.clone().unwrap_or_default();
             if let Some(full) = domains
@@ -1635,11 +1835,16 @@ fn final_config_pass(
                 .map(|d| format!("{host}.{d}"))
                 .find(|full| resolves(full))
             {
-                vlog(
-                    1,
-                    &format!("Canonicalized hostname \"{host}\" => \"{full}\""),
-                );
-                host = full;
+                match follow_cname(cfg_block, &full) {
+                    Some(alias) => host = alias,
+                    None => {
+                        vlog(
+                            1,
+                            &format!("Canonicalized hostname \"{host}\" => \"{full}\""),
+                        );
+                        host = full;
+                    }
+                }
                 canonical = true;
             } else if cfg_block.canonicalize_fallback_local == Some(false) {
                 return Err(format!("Could not resolve host \"{host}\""));
@@ -2727,7 +2932,7 @@ fn run() -> Result<i32, String> {
         .iter()
         .map(|p| tokens.expand_path(p))
         .collect();
-    let mut cfg = config_for_host(&cfg_block, &cli)?;
+    let mut cfg = config_for_host(&cfg_block, &cli, &connect_host)?;
     // KnownHostsCommand: its output joins the global known_hosts files.
     if let Some(template) = cfg_block
         .known_hosts_command
@@ -2980,6 +3185,17 @@ fn run() -> Result<i32, String> {
         if let (Ok(l), Ok(r)) = (sock.local_addr(), sock.peer_addr()) {
             let _ = CONN_ADDRS.set((l.to_string(), r.to_string()));
         }
+        // CheckHostIP: the address too, unless it is loopback or the name
+        // given was the address (OpenSSH; never through a proxy).
+        if cfg_block.check_host_ip == Some(true)
+            && let Ok(peer) = sock.peer_addr()
+            && let puressh::client::HostKeyPolicy::KnownHosts(kh) = &mut cfg.host_key_policy
+        {
+            let ip = peer.ip().to_canonical();
+            if !ip.is_loopback() && ip.to_string() != connect_host {
+                kh.check_host_ip = Some(ip.to_string());
+            }
+        }
         let peer_ip = sock
             .peer_addr()
             .map(|a| a.ip().to_canonical().to_string())
@@ -3039,6 +3255,8 @@ fn run() -> Result<i32, String> {
             1,
             "UpdateHostkeys is disabled because the host key is not trusted.",
         );
+        None
+    } else if HOST_KEY_FORCED.load(std::sync::atomic::Ordering::Relaxed) {
         None
     } else {
         HostKeysUpdater::for_connection(&cli, &cfg_block, &connect_host, port)

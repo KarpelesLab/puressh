@@ -333,6 +333,7 @@ pub(crate) fn unsolicited_reply(
 
 /// Policy for accepting (or rejecting) a server's host key.
 #[non_exhaustive]
+#[allow(clippy::large_enum_variant)] // built once per connection
 pub enum HostKeyPolicy {
     /// Trust whatever the server presents — equivalent to OpenSSH's
     /// `StrictHostKeyChecking=no`. Insecure; do not use against untrusted peers.
@@ -391,7 +392,40 @@ pub struct KnownHostsPolicy {
     /// `known_hosts` lines to trust for it (read with the global files), or
     /// `None` when the command failed.
     pub command: Option<Arc<KnownHostsCommandFn>>,
+    /// `CheckHostIP`: the server's address, looked up in known_hosts too (on
+    /// the connection's port) and recorded with the host's key when it is
+    /// not there, as OpenSSH does. Not used for certificates.
+    pub check_host_ip: Option<String>,
+    /// [`Self::check_host_ip`]: what to do when the host key is trusted but
+    /// the address is recorded with another key (OpenSSH asks under
+    /// `StrictHostKeyChecking ask`, refuses under `yes` / `accept-new`, and
+    /// only warns under `no`). A [`TofuAction::PromptDetailed`] callback gets
+    /// [`HostKeyChange::AddressChanged`].
+    pub on_address_change: TofuAction,
+    /// Consulted before known_hosts with the key type and blob (for a
+    /// certificate, the key it certifies): `Some(true)` trusts the key
+    /// outright (OpenSSH's `VerifyHostKeyDNS` with a validated SSHFP match,
+    /// `NoHostAuthenticationForLocalhost`), `Some(false)` refuses it, and
+    /// `None` goes on to known_hosts.
+    pub pre_check: Option<Arc<HostKeyPreCheckFn>>,
+    /// Called with the key type and blob when known_hosts already trusts the
+    /// key (OpenSSH shows `VisualHostKey`'s randomart then).
+    pub on_known: Option<Arc<HostKeyKnownFn>>,
+    /// Where the informational messages go (`Warning: Permanently added the
+    /// … host key for IP address …`); stderr when unset.
+    pub notice: Option<Arc<NoticeFn>>,
 }
+
+/// Callback type for [`KnownHostsPolicy::on_known`] — `(key_type,
+/// key_blob)`.
+pub type HostKeyKnownFn = dyn Fn(&str, &[u8]) + Send + Sync;
+
+/// Callback type for [`KnownHostsPolicy::notice`].
+pub type NoticeFn = dyn Fn(&str) + Send + Sync;
+
+/// Callback type for [`KnownHostsPolicy::pre_check`] — `(key_type,
+/// key_blob) → trust`.
+pub type HostKeyPreCheckFn = dyn Fn(&str, &[u8]) -> Option<bool> + Send + Sync;
 
 /// Callback type for [`KnownHostsPolicy::command`] — `(key_type,
 /// key_blob) → known_hosts text`.
@@ -411,8 +445,34 @@ impl KnownHostsPolicy {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         }
     }
+
+    /// An informational message, through [`Self::notice`].
+    fn notify(&self, msg: &str) {
+        match &self.notice {
+            Some(f) => f(msg),
+            None => eprintln!("{msg}"),
+        }
+    }
+}
+
+/// What known_hosts says about the server's address ([`KnownHostsPolicy::
+/// check_host_ip`]), passed in [`HostKeyPrompt::address`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AddressStatus {
+    /// The address is not recorded.
+    Unknown,
+    /// The address is recorded with the key presented.
+    Known,
+    /// The address is recorded with other keys.
+    Changed,
 }
 
 /// See [`Client::session_binding`].
@@ -440,6 +500,9 @@ pub enum HostKeyChange {
     /// The host **is** known but presented a key that matches no stored
     /// entry — an override of an existing trust record.
     Changed,
+    /// `CheckHostIP`: the host key is trusted, but the server's address is
+    /// recorded with other keys ([`HostKeyPrompt::existing`]).
+    AddressChanged,
 }
 
 /// Full context handed to a [`TofuAction::PromptDetailed`] callback so it can
@@ -466,6 +529,9 @@ pub struct HostKeyPrompt<'a> {
     /// Previously-stored `(key_type, key_blob)` entries for this host.
     /// Empty when [`change`](Self::change) is [`HostKeyChange::Unknown`].
     pub existing: &'a [(String, Vec<u8>)],
+    /// `CheckHostIP`: the server's address (`[addr]:port` off port 22) and
+    /// what known_hosts says about it; `None` when not checked.
+    pub address: Option<(&'a str, AddressStatus)>,
 }
 
 impl HostKeyPrompt<'_> {
@@ -4058,6 +4124,34 @@ pub(crate) fn build_verifier(
     // family the KEX agreed on, never raw attacker-chosen bytes.
     let verifier = host_key_verify_by_name(&neg.host_key, k_s)?;
 
+    // `KnownHostsPolicy::pre_check` decides first, after the
+    // `RevokedHostKeys` file, on the key itself (a certificate's embedded
+    // one), as OpenSSH's DNS and loopback checks do.
+    if let HostKeyPolicy::KnownHosts(kh) = policy
+        && let Some(pre) = &kh.pre_check
+    {
+        let key_type = known_hosts_key_type(&neg.host_key);
+        let (plain, revoked) = if crate::cert::is_cert_name(&neg.host_key) {
+            let cert = crate::cert::Certificate::parse(k_s)?;
+            let revoked = kh.revoked.as_ref().is_some_and(|r| {
+                r.is_revoked_cert(&cert) || r.is_revoked_key(&cert.embedded_pubkey_blob)
+            });
+            (cert.embedded_pubkey_blob.clone(), revoked)
+        } else {
+            let revoked = kh.revoked.as_ref().is_some_and(|r| r.is_revoked_key(k_s));
+            (k_s.to_vec(), revoked)
+        };
+        if revoked {
+            print_revoked_banner(key_type, target_host, target_port);
+            return Err(Error::HostKeyRejected);
+        }
+        match pre(key_type, &plain) {
+            Some(true) => return Ok(verifier),
+            Some(false) => return Err(Error::HostKeyRejected),
+            None => {}
+        }
+    }
+
     // Certificate host keys: `k_s` is an OpenSSH certificate, not a plain key.
     // Parse it, enforce type/validity/critical-options, then make the trust
     // decision per policy. The signature over `H` is verified against the
@@ -4186,6 +4280,13 @@ pub(crate) fn build_verifier(
             if crate::format::Reader::new(k_s).read_string().ok() != Some(key_type.as_bytes()) {
                 return Err(Error::HostKeyRejected);
             }
+            // `CheckHostIP`: the address, on the connection's own port (a
+            // certificate's key is not checked by address).
+            let address = kh
+                .check_host_ip
+                .as_deref()
+                .filter(|_| plain_from_cert.is_none())
+                .map(|ip| (ip, target_port));
             // Host-empty / port-zero already rejected above. Past this
             // point we have a real (host, port) pair, so the lookup can
             // proceed. `HostKeyAlias` replaces both for the lookup.
@@ -4203,8 +4304,53 @@ pub(crate) fn build_verifier(
                 lookup =
                     combine_lookups(lookup, g.lookup(target_host, target_port, &key_type, k_s));
             }
+            // The address's own lookup, and its known_hosts spelling.
+            let (ip_lookup, ip_name) = match address {
+                Some((ip, port)) => {
+                    let mut l = store.lookup(ip, port, &key_type, k_s);
+                    for g in &kh.global {
+                        l = combine_lookups(l, g.lookup(ip, port, &key_type, k_s));
+                    }
+                    (
+                        Some(l),
+                        crate::known_hosts::format::format_host_pattern(ip, port),
+                    )
+                }
+                None => (None, String::new()),
+            };
+            let ip_status = ip_lookup.as_ref().map(|l| match l {
+                LookupResult::Match => AddressStatus::Known,
+                LookupResult::Unknown => AddressStatus::Unknown,
+                _ => AddressStatus::Changed,
+            });
+            let ip_prompt = ip_status.map(|st| (ip_name.as_str(), st));
+            let label = host_key_type_label(k_s);
+            let host_changed = matches!(lookup, LookupResult::Mismatch { .. });
             match lookup {
-                LookupResult::Match => {}
+                LookupResult::Match => {
+                    // OpenSSH records a trusted host's new address.
+                    if let (Some(AddressStatus::Unknown), Some((ip, port))) = (ip_status, address) {
+                        match &kh.save_path {
+                            Some(path)
+                                if path != std::path::Path::new("/dev/null")
+                                    && store.try_add(ip, port, &key_type, k_s, kh.hash_new).is_ok() =>
+                            {
+                                save_known_hosts(&store, path);
+                                kh.notify(&format!(
+                                    "Warning: Permanently added the {label} host key for IP address \
+                                     '{ip_name}' to the list of known hosts."
+                                ));
+                            }
+                            _ => kh.notify(&format!(
+                                "{label} host key for IP address '{ip_name}' not in list of known hosts."
+                            )),
+                        }
+                    } else if let Some(f) = &kh.on_known {
+                        drop(store);
+                        f(&key_type, k_s);
+                        store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
+                    }
+                }
                 LookupResult::Revoked => {
                     // A `@revoked` host key is a hard failure regardless of
                     // `on_mismatch` — no `StrictHostKeyChecking=no` accept,
@@ -4277,6 +4423,7 @@ pub(crate) fn build_verifier(
                                 key_blob: k_s,
                                 fingerprint: host_key_fingerprint(k_s),
                                 existing: &expected,
+                                address: ip_prompt,
                             };
                             let ok = cb(&prompt);
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
@@ -4341,6 +4488,7 @@ pub(crate) fn build_verifier(
                                 key_blob: k_s,
                                 fingerprint: host_key_fingerprint(k_s),
                                 existing: &[],
+                                address: ip_prompt,
                             };
                             let ok = cb(&prompt);
                             store = kh.store.lock().map_err(|_| Error::HostKeyRejected)?;
@@ -4350,12 +4498,51 @@ pub(crate) fn build_verifier(
                     if !accept {
                         return Err(Error::HostKeyRejected);
                     }
-                    store
-                        .try_add(target_host, target_port, &key_type, k_s, kh.hash_new)
-                        .map_err(|_| Error::HostKeyRejected)?;
+                    match (ip_status, address) {
+                        // The address goes in with the name: on the same
+                        // line (`host,addr`), or hashed on its own.
+                        (Some(AddressStatus::Unknown), Some((ip, port))) if kh.hash_new => {
+                            store
+                                .try_add(target_host, target_port, &key_type, k_s, true)
+                                .and_then(|()| store.try_add(ip, port, &key_type, k_s, true))
+                                .map_err(|_| Error::HostKeyRejected)?;
+                        }
+                        (Some(AddressStatus::Unknown), Some((ip, port))) => store
+                            .try_add_names(
+                                &[(target_host, target_port), (ip, port)],
+                                &key_type,
+                                k_s,
+                            )
+                            .map_err(|_| Error::HostKeyRejected)?,
+                        _ => store
+                            .try_add(target_host, target_port, &key_type, k_s, kh.hash_new)
+                            .map_err(|_| Error::HostKeyRejected)?,
+                    }
                     if let Some(path) = &kh.save_path {
                         save_known_hosts(&store, path);
                     }
+                }
+            }
+            // A trusted host whose address is recorded with another key.
+            if !host_changed && let Some(LookupResult::Mismatch { expected }) = &ip_lookup {
+                drop(store);
+                let accept = match &kh.on_address_change {
+                    TofuAction::Accept | TofuAction::AcceptWithWarning => true,
+                    TofuAction::Prompt(cb) => cb(target_host, target_port, &key_type, k_s),
+                    TofuAction::PromptDetailed(cb) => cb(&HostKeyPrompt {
+                        change: HostKeyChange::AddressChanged,
+                        host: target_host,
+                        port: target_port,
+                        key_type: &key_type,
+                        key_blob: k_s,
+                        fingerprint: host_key_fingerprint(k_s),
+                        existing: expected.as_slice(),
+                        address: ip_prompt,
+                    }),
+                    _ => false,
+                };
+                if !accept {
+                    return Err(Error::HostKeyRejected);
                 }
             }
         }
@@ -5657,6 +5844,11 @@ mod tests {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5685,6 +5877,129 @@ mod tests {
         ));
     }
 
+    /// A policy over `store` for the CheckHostIP / pre-check tests.
+    fn address_policy(store: &Arc<Mutex<KnownHosts>>, on_unknown: TofuAction) -> KnownHostsPolicy {
+        let mut kh = KnownHostsPolicy::strict(store.clone());
+        kh.on_unknown = on_unknown;
+        kh.check_host_ip = Some("10.9.8.7".into());
+        kh.notice = Some(Arc::new(|_: &str| {}));
+        kh
+    }
+
+    /// `CheckHostIP`: a new host goes in with its address on one line; a
+    /// known host's address is recorded the first time.
+    #[test]
+    fn check_host_ip_records_the_address() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut seed = [0u8; 32];
+        OsRng.fill_bytes(&mut seed);
+        let server = run_server(listener, seed);
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        let cfg = Config::new(HostKeyPolicy::KnownHosts(address_policy(
+            &store,
+            TofuAction::Accept,
+        )));
+        let _client = Client::connect_to_host("127.0.0.1", addr.port(), cfg).expect("connect");
+        let _ = server.join();
+        let blob = Ed25519HostKey::from_seed(seed).public_blob();
+        let text = String::from_utf8(store.lock().unwrap().to_bytes()).unwrap();
+        assert!(
+            text.starts_with(&format!(
+                "[127.0.0.1]:{p},[10.9.8.7]:{p} ssh-ed25519 ",
+                p = addr.port()
+            )),
+            "{text}"
+        );
+
+        // Known by name only: the address is added on its own.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = run_server(listener, seed);
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        store
+            .lock()
+            .unwrap()
+            .add("127.0.0.1", addr.port(), "ssh-ed25519", &blob, false);
+        // Only recorded where it can be saved.
+        let path = std::env::temp_dir().join(format!("puressh-checkip-{}", std::process::id()));
+        let mut kh = address_policy(&store, TofuAction::Reject);
+        kh.save_path = Some(path.clone());
+        let cfg = Config::new(HostKeyPolicy::KnownHosts(kh));
+        let _client = Client::connect_to_host("127.0.0.1", addr.port(), cfg).expect("connect");
+        let _ = server.join();
+        let saved = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            saved.contains(&format!("[10.9.8.7]:{} ", addr.port())),
+            "{saved}"
+        );
+        assert!(matches!(
+            store
+                .lock()
+                .unwrap()
+                .lookup("10.9.8.7", addr.port(), "ssh-ed25519", &blob),
+            LookupResult::Match
+        ));
+    }
+
+    /// `CheckHostIP`: an address recorded with another key goes to
+    /// `on_address_change`.
+    #[test]
+    fn check_host_ip_address_with_another_key() {
+        for (action, ok) in [(TofuAction::Reject, false), (TofuAction::Accept, true)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let server = run_server(listener, seed);
+            let blob = Ed25519HostKey::from_seed(seed).public_blob();
+            let other = Ed25519HostKey::from_seed([7u8; 32]).public_blob();
+            let store = Arc::new(Mutex::new(KnownHosts::new()));
+            {
+                let mut s = store.lock().unwrap();
+                s.add("127.0.0.1", addr.port(), "ssh-ed25519", &blob, false);
+                s.add("10.9.8.7", addr.port(), "ssh-ed25519", &other, false);
+            }
+            let mut kh = address_policy(&store, TofuAction::Reject);
+            kh.on_address_change = action;
+            let cfg = Config::new(HostKeyPolicy::KnownHosts(kh));
+            let r = Client::connect_to_host("127.0.0.1", addr.port(), cfg);
+            assert_eq!(r.is_ok(), ok);
+            let _ = server.join();
+        }
+    }
+
+    /// `pre_check` decides before known_hosts.
+    #[test]
+    fn host_key_pre_check_decides_first() {
+        for (verdict, ok) in [(Some(true), true), (Some(false), false), (None, false)] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut seed = [0u8; 32];
+            OsRng.fill_bytes(&mut seed);
+            let server = run_server(listener, seed);
+            let store = Arc::new(Mutex::new(KnownHosts::new()));
+            let mut kh = KnownHostsPolicy::strict(store.clone());
+            kh.pre_check = Some(Arc::new(move |t: &str, _: &[u8]| {
+                assert_eq!(t, "ssh-ed25519");
+                verdict
+            }));
+            let cfg = Config::new(HostKeyPolicy::KnownHosts(kh));
+            let r = Client::connect_to_host("127.0.0.1", addr.port(), cfg);
+            assert_eq!(r.is_ok(), ok);
+            let _ = server.join();
+            // A key trusted up front is not recorded.
+            assert!(
+                store
+                    .lock()
+                    .unwrap()
+                    .find("127.0.0.1", addr.port())
+                    .is_empty()
+            );
+        }
+    }
+
     /// `PromptDetailed` returning `false` refuses the connection and adds
     /// nothing to the store.
     #[test]
@@ -5707,6 +6022,11 @@ mod tests {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5769,6 +6089,11 @@ mod tests {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5826,6 +6151,11 @@ mod tests {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5883,6 +6213,11 @@ mod tests {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),
@@ -5934,6 +6269,11 @@ mod tests {
             host_key_alias: None,
             revoked: None,
             command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
         };
         let cfg = Config {
             host_key_policy: HostKeyPolicy::KnownHosts(policy),

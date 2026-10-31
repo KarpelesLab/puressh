@@ -1,19 +1,19 @@
 Package: puressh-client
-Version: 0.2.7-1
+Version: 0.2.8-1
 Architecture: arm64
 Maintainer: Mark Karpeles <mark@klb.jp>
-Installed-Size: 15424
+Installed-Size: 16000
 Depends: libc6 (>= 2.31)
 Recommends: openssh-client
 Provides: ssh-client
 Homepage: https://github.com/KarpelesLab/puressh
 Priority: optional
 Section: net
-Filename: pool/main/p/puressh-client/puressh-client_0.2.7-1_arm64.deb
-Size: 2464216
-SHA256: 2a1de56b57b95f4811df54f9bba000b06b51c0412dbf48fe0e7cb9fa0fb33cd9
-SHA1: 1c69f8bff41900ef04864ad1552abaf7ae4aca5d
-MD5sum: 1d43047803a17268e659239bedf92f96
+Filename: pool/main/p/puressh-client/puressh-client_0.2.8-1_arm64.deb
+Size: 2541076
+SHA256: 9c26ae65d61e6c419d6ba2187bdee26ab13d9001e7263f68dae046d66c60899a
+SHA1: c7f8f283637eab7568c21c38542e03b1a564dfd3
+MD5sum: a1dcb34bf8218de825062e714932bd3b
 Description: puressh secure shell (SSH) client programs, in place of OpenSSH's
  ssh, scp, sftp, ssh-add, ssh-agent, ssh-keygen, ssh-keyscan and ssh-copy-id
  from puressh, a pure-Rust SSH implementation, as drop-in replacements for
@@ -24,10 +24,10 @@ Description: puressh secure shell (SSH) client programs, in place of OpenSSH's
  is installed and get their names back when it is removed.
 
 Package: puressh-server
-Version: 0.2.7-1~ubuntu20.04
+Version: 0.2.8-1~ubuntu20.04
 Architecture: arm64
 Maintainer: Mark Karpeles <mark@klb.jp>
-Installed-Size: 7384
+Installed-Size: 7644
 Depends: libc6 (>= 2.31), libpam0g (>= 0.99.7.1), libpam-modules, libpam-runtime
 Recommends: libpam-systemd
 Provides: openssh-server (= 1:9.9p1-0puressh1), ssh-server
@@ -36,11 +36,11 @@ Replaces: openssh-server
 Homepage: https://github.com/KarpelesLab/puressh
 Priority: optional
 Section: net
-Filename: pool/main/p/puressh-server/puressh-server_0.2.7-1~ubuntu20.04_arm64.deb
-Size: 1662368
-SHA256: 4161c908b77bbb826ddce397d61ddca34906e8ee3e460e675895fc1b5bcec2f3
-SHA1: 90f7647c95e8ad47da2c0cfb8599a3f5c19ffd52
-MD5sum: 78b31847c805367d68f0eb5b44a19c1a
+Filename: pool/main/p/puressh-server/puressh-server_0.2.8-1~ubuntu20.04_arm64.deb
+Size: 1728656
+SHA256: 0dd02054837eeb407ef0c45a8d47dd8528627241ddbc08cc1ee8aa2d7b9ef20f
+SHA1: ac3f5208298108c0f507d1bddceaa182fed3432a
+MD5sum: 147dc8c2df66243ca45ba5cac7730bd5
 Description: puressh secure shell (SSH) server, replacing OpenSSH's
  sshd from puressh, a pure-Rust SSH implementation, packaged as a drop-in
  replacement for openssh-server: it reads /etc/ssh/sshd_config, uses the

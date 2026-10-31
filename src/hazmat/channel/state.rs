@@ -745,10 +745,14 @@ impl ConnectionState {
     /// against an internal counter; once the counter crosses half the channel's
     /// initial window we flush a `CHANNEL_WINDOW_ADJUST` payload and reset.
     /// Returns the payload to send, or `None` if the threshold wasn't reached.
+    ///
+    /// Once we have sent `SSH_MSG_CHANNEL_CLOSE` this is a no-op returning
+    /// `None`: the peer may legitimately keep sending data until it sees our
+    /// close (RFC 4254 §5.3), and there is no window left to grant.
     pub fn replenish_window(&mut self, channel: u32, by: u32) -> Result<Option<Vec<u8>>> {
         let ch = self.get_mut(channel)?;
         if ch.local_closed {
-            return Err(Error::BadChannelState);
+            return Ok(None);
         }
         if by == 0 {
             return Ok(None);

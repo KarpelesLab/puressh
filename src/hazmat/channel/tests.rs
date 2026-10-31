@@ -148,6 +148,27 @@ fn window_adjust_increases_remote_window() {
     assert_eq!(client.channel(client_local).unwrap().remote_window, 16);
 }
 
+/// Data the peer sent before it saw our CLOSE (a command that exited while
+/// the client was still uploading) is legal; crediting it must not fail.
+#[test]
+fn data_after_local_close_is_accepted_and_credit_is_a_noop() {
+    let (mut client, mut server) = pair();
+    let (client_local, server_local) = fully_open(&mut client, &mut server);
+
+    let (wire, _) = client.send_data(client_local, b"still uploading").unwrap();
+    let _close = server.send_close(server_local).unwrap();
+    match server.on_packet(&wire).unwrap() {
+        ChannelEvent::Data { channel, .. } => assert_eq!(channel, server_local),
+        other => panic!("expected Data, got {:?}", other),
+    }
+    assert!(
+        server
+            .replenish_window(server_local, u32::MAX)
+            .unwrap()
+            .is_none()
+    );
+}
+
 #[test]
 fn replenish_threshold_holds_then_releases() {
     let (mut client, mut server) = pair();

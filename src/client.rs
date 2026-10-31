@@ -225,9 +225,6 @@ const SERVE_INGRESS_BACKLOG: usize = 32;
 /// (which would stall the channel forever on a chatty stderr) the buffer
 /// keeps only the most recent `STREAM_STDERR_CAP` bytes.
 const STREAM_STDERR_CAP: usize = 1024 * 1024;
-/// Outer-loop step cap for [`Client::serve`] — generous because each step is
-/// either one packet or one 50 ms timeout tick.
-const MAX_SERVE_STEPS: usize = 100_000_000;
 /// Read timeout the serve loop installs on the socket while it has at least
 /// one live channel runtime to drain. Reverts to blocking when idle.
 const SERVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -2963,18 +2960,12 @@ impl Client {
         // `handlers.stop` even when no channels are open (e.g. between
         // forwarded connections). Reverted on return.
         let _ = self.stream.set_read_timeout(Some(SERVE_POLL_INTERVAL));
-        let mut steps = 0usize;
         // Keepalive bookkeeping (ServerAliveInterval / ServerAliveCountMax).
         // `last_activity` advances on every inbound packet; `probes_pending`
         // counts unanswered keepalives. Both are inert when keepalive is off.
         let mut last_activity = Instant::now();
         let mut probes_pending: u32 = 0;
         let result = loop {
-            steps += 1;
-            if steps > MAX_SERVE_STEPS {
-                break Err(Error::Protocol("serve: step cap exceeded"));
-            }
-
             // Keepalive: after `interval` of silence, probe the peer. After
             // `count_max` unanswered probes, treat the connection as dead.
             if let Some((interval, count_max)) = self.keepalive

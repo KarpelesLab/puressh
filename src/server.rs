@@ -63,7 +63,6 @@ pub const DEFAULT_MAX_AUTH_TRIES: u32 = 6;
 /// accept thread, so an authenticated peer must not be able to request an
 /// unbounded number of them.
 pub const DEFAULT_MAX_FORWARD_BINDINGS: usize = 64;
-const MAX_CONNECTION_STEPS: usize = 10_000_000;
 const MAX_DRAIN_STEPS: usize = 1_000_000;
 
 /// Bound on the per-subsystem egress queue. Handlers self-throttle when
@@ -3076,7 +3075,6 @@ fn do_connection_phase(
         srv_send(stream, driver, &p)?;
     }
     let mut any_channel_opened = false;
-    let mut steps = 0usize;
     // Per-channel interactive-shell state. Empty when no `shell` request
     // has been served — in that case the loop stays in pure blocking-read
     // mode and behaves exactly like the historical exec-only path.
@@ -3110,7 +3108,6 @@ fn do_connection_phase(
         effective,
         &mut conn,
         &mut any_channel_opened,
-        &mut steps,
         &mut shells,
         &mut subsystems,
         &mut envs,
@@ -3352,7 +3349,6 @@ fn do_connection_loop(
     effective: &EffectivePolicy,
     conn: &mut ConnectionState,
     any_channel_opened: &mut bool,
-    steps: &mut usize,
     shells: &mut BTreeMap<u32, ShellRuntime>,
     subsystems: &mut BTreeMap<u32, SubsystemRuntime>,
     envs: &mut BTreeMap<u32, SessionEnv>,
@@ -3364,11 +3360,6 @@ fn do_connection_loop(
     extras: &mut ConnExtras,
 ) -> Result<()> {
     loop {
-        *steps += 1;
-        if *steps > MAX_CONNECTION_STEPS {
-            return Err(Error::Protocol("connection: step cap exceeded"));
-        }
-
         // Shells, subsystems, and live `tcpip-forward` bindings all need
         // the loop to spin: switch the socket to a 50 ms read timeout so
         // we can interleave their I/O with packet reads. Revert when

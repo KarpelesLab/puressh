@@ -2054,10 +2054,9 @@ impl Client {
         let mut local_close_sent = false;
         let mut remote_close_seen = false;
 
-        for _ in 0..MAX_EXEC_ITER {
-            if remote_close_seen && local_close_sent {
-                break;
-            }
+        // Runs until the channel closes: a long-running command may send any
+        // number of packets (MAX_EXEC_OUTPUT bounds what is kept).
+        while !(remote_close_seen && local_close_sent) {
             let payload = self.read_one_packet()?;
             let ev = self.conn.on_packet(&payload)?;
             match ev {
@@ -2122,9 +2121,6 @@ impl Client {
             }
         }
 
-        if !(remote_close_seen && local_close_sent) {
-            return Err(Error::Protocol("exec: drain loop exceeded iteration cap"));
-        }
         Ok(out)
     }
 
@@ -2233,10 +2229,9 @@ impl Client {
         let mut local_close_sent = false;
         let mut remote_close_seen = false;
 
-        for _ in 0..MAX_EXEC_ITER {
-            if remote_close_seen && local_close_sent {
-                break;
-            }
+        // Runs until the channel closes: a long-running command may send any
+        // number of packets (MAX_EXEC_OUTPUT bounds what is kept).
+        while !(remote_close_seen && local_close_sent) {
             let payload = self.read_one_packet()?;
             let ev = self.conn.on_packet(&payload)?;
             match ev {
@@ -2297,9 +2292,6 @@ impl Client {
             }
         }
 
-        if !(remote_close_seen && local_close_sent) {
-            return Err(Error::Protocol("shell: drain loop exceeded iteration cap"));
-        }
         Ok(out)
     }
 
@@ -2380,10 +2372,9 @@ impl Client {
         let mut local_close_sent = false;
         let mut remote_close_seen = false;
 
-        for _ in 0..MAX_EXEC_ITER {
-            if remote_close_seen && local_close_sent {
-                break;
-            }
+        // Runs until the channel closes: a long-running command may send any
+        // number of packets (MAX_EXEC_OUTPUT bounds what is kept).
+        while !(remote_close_seen && local_close_sent) {
             let payload = self.read_one_packet()?;
             let ev = self.conn.on_packet(&payload)?;
             match ev {
@@ -2423,11 +2414,6 @@ impl Client {
             }
         }
 
-        if !(remote_close_seen && local_close_sent) {
-            return Err(Error::Protocol(
-                "subsystem: drain loop exceeded iteration cap",
-            ));
-        }
         Ok(out)
     }
 

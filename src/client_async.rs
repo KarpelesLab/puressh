@@ -227,10 +227,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
             exit_signal: None,
         };
         let (mut eof_sent, mut close_sent, mut remote_close) = (false, false, false);
-        for _ in 0..MAX_EXEC_ITER {
-            if remote_close && close_sent {
-                break;
-            }
+        // Runs until the channel closes: a long-running command may send any
+        // number of packets (MAX_EXEC_OUTPUT bounds what is kept).
+        while !(remote_close && close_sent) {
             let payload = self.read_one_packet().await?;
             match self.conn.on_packet(&payload)? {
                 ChannelEvent::Data { channel, data } if channel == local_id => {
@@ -285,9 +284,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
                 }
                 other => self.handle_unsolicited(&other).await?,
             }
-        }
-        if !(remote_close && close_sent) {
-            return Err(Error::Protocol("exec: drain loop did not converge"));
         }
         Ok(out)
     }

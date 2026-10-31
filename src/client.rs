@@ -152,7 +152,7 @@ impl SplitReader {
         if !s.pending.is_empty() || s.eof {
             return Ok(());
         }
-        let mut tmp = [0u8; 16 * 1024];
+        let mut tmp = [0u8; 64 * 1024];
         match s.src.read_within(&mut tmp, Some(timeout)) {
             Ok(0) => s.eof = true,
             Ok(n) => s.pending.extend_from_slice(&tmp[..n]),
@@ -3181,7 +3181,7 @@ impl Client {
     /// the socket's `WouldBlock`/`TimedOut` error so timeout-aware callers can
     /// convert it to `Ok(None)`.
     fn read_into_driver(&mut self, stashed_only: bool) -> Result<()> {
-        let mut tmp = [0u8; 16 * 1024];
+        let mut tmp = [0u8; 64 * 1024];
         #[cfg(feature = "multichannel")]
         let n = match &self.split_reader {
             Some(r) => r.read(&mut tmp, self.read_timeout, stashed_only)?,

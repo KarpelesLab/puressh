@@ -208,6 +208,10 @@ struct Inner {
     /// global requests in order, so these come before the reply to any
     /// request sent after them.
     pending_keepalives: u32,
+    /// Set by `dispatch_event` when it filed an event without waking a
+    /// specific channel's notifier (window adjust, exit status, request
+    /// reply, ...): the pumper then wakes every waiter once.
+    wake_all: bool,
 }
 
 /// The parts of a [`SharedClient`] needed to rebuild one from inside the
@@ -275,6 +279,7 @@ impl From<Client> for SharedClient {
                 last_rx: std::time::Instant::now(),
                 disconnect: None,
                 pending_keepalives: 0,
+                wake_all: false,
                 self_ref: Some(SelfRef {
                     inner: weak.clone(),
                     lock_waiters: waiters,
@@ -314,7 +319,76 @@ impl Drop for LockTicket<'_> {
     }
 }
 
+/// Hands a [`LockTicket`] back while its thread is parked on a channel
+/// notifier, and takes it again on wake-up. A parked thread is not competing
+/// for the mutex: counting it made the pumper sleep 1 ms after every packet
+/// whenever any other channel reader was idle (e.g. `ssh`'s stderr thread),
+/// capping a download at about one packet per millisecond.
+struct Parked<'a> {
+    counter: &'a core::sync::atomic::AtomicUsize,
+}
+
+impl<'a> Parked<'a> {
+    fn new(counter: &'a core::sync::atomic::AtomicUsize) -> Self {
+        counter.fetch_sub(1, core::sync::atomic::Ordering::SeqCst);
+        Self { counter }
+    }
+}
+
+impl Drop for Parked<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl SharedClient {
+    /// Take the pumper role and keep it until `ready` holds (data or EOF for
+    /// the calling reader) or the wire fails. The lock is released between
+    /// steps — and inside each step while waiting on the socket — so writers
+    /// and other readers get through; readers whose data lands are woken by
+    /// their notifier. Keeping the role, instead of handing it back after
+    /// every packet, lets an idle sibling reader park rather than fight for
+    /// it, and needs no sleep unless a thread is actually waiting on the lock
+    /// (parked threads don't count, see [`Parked`]).
+    fn pump_until<'a>(
+        &'a self,
+        mut g: std::sync::MutexGuard<'a, Inner>,
+        ready: impl Fn(&Inner) -> bool,
+    ) -> std::io::Result<()> {
+        g.pumping = true;
+        let res = loop {
+            let (g2, res) = self.pump_step(g)?;
+            g = g2;
+            // Data, EOF and close already woke their channel inside
+            // dispatch_event; anything else (window credit for a writer, an
+            // exit status, a request reply) wakes every waiter. Waking all of
+            // them after every data packet only had them re-park, and made
+            // them count as lock contenders.
+            if core::mem::take(&mut g.wake_all) {
+                for cv in g.notifiers.values() {
+                    cv.notify_one();
+                }
+            }
+            if res.is_err() || ready(&g) {
+                break res;
+            }
+            drop(g);
+            // std::sync::Mutex is unfair on Linux: give a thread blocked on
+            // it (the counter includes this one) time to be scheduled onto
+            // the freshly released lock before re-acquiring.
+            if self.lock_waiters.load(core::sync::atomic::Ordering::SeqCst) > 1 {
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            g = lock_or_poison_io(&self.inner)?;
+        };
+        g.pumping = false;
+        for cv in g.notifiers.values() {
+            cv.notify_one();
+        }
+        res
+    }
+
     /// One pump step for a pumper holding `g` (with `g.pumping` set): unless
     /// a packet is already decoded, release the lock and wait for input on
     /// the split-off reader, so writers get through meanwhile; then dispatch
@@ -709,6 +783,7 @@ impl SharedClient {
                 res?;
             } else {
                 let cv = notifier_for(&mut g, channel);
+                let _parked = Parked::new(&self.lock_waiters);
                 let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -748,28 +823,15 @@ impl SharedClient {
                 return Ok(0);
             }
             if !g.pumping {
-                g.pumping = true;
-                let (mut g, res) = self.pump_step(g)?;
-                g.pumping = false;
-                for cv in g.notifiers.values() {
-                    cv.notify_one();
-                }
-                drop(g);
-                res?;
-                // Symmetric with `read_stream`'s pump branch: yield CPU
-                // long enough for any sibling thread that's also waiting
-                // for the lock (other reader half of this channel, or a
-                // writer) to actually be scheduled onto the freshly
-                // released mutex. Without this, t_err's tight
-                // pump→re-acquire loop monopolises the lock and starves
-                // the data-side reader of the interactive shell.
-                if self.lock_waiters.load(core::sync::atomic::Ordering::SeqCst) > 1 {
-                    std::thread::sleep(Duration::from_millis(1));
-                } else {
-                    std::thread::sleep(Duration::from_micros(100));
-                }
+                self.pump_until(g, |inner| {
+                    inner
+                        .queues
+                        .get(&channel)
+                        .is_some_and(|q| q.remote_eof || !q.stderr.is_empty())
+                })?;
             } else {
                 let cv = notifier_for(&mut g, channel);
+                let _parked = Parked::new(&self.lock_waiters);
                 let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -1205,21 +1267,15 @@ impl SharedClient {
         channel: u32,
     ) -> std::io::Result<()> {
         if !g.pumping {
-            g.pumping = true;
-            let (mut g, res) = self.pump_step(g)?;
-            g.pumping = false;
-            for cv in g.notifiers.values() {
-                cv.notify_one();
-            }
-            drop(g);
-            res?;
-            if self.lock_waiters.load(core::sync::atomic::Ordering::SeqCst) > 1 {
-                std::thread::sleep(Duration::from_millis(1));
-            } else {
-                std::thread::sleep(Duration::from_micros(100));
-            }
+            self.pump_until(g, |inner| {
+                inner
+                    .queues
+                    .get(&channel)
+                    .is_some_and(|q| q.remote_eof || q.remote_close || !q.packets.is_empty())
+            })?;
         } else {
             let cv = notifier_for(&mut g, channel);
+            let _parked = Parked::new(&self.lock_waiters);
             let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
@@ -1687,10 +1743,13 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
         _ => None,
     };
     stash_event(&mut g.queues, ev);
-    if let Some(ch) = target
-        && let Some(cv) = g.notifiers.get(&ch)
-    {
-        cv.notify_all();
+    match target {
+        Some(ch) => {
+            if let Some(cv) = g.notifiers.get(&ch) {
+                cv.notify_all();
+            }
+        }
+        None => g.wake_all = true,
     }
 }
 
@@ -1925,6 +1984,7 @@ impl OwnedChannelStream {
                 }
             } else {
                 let cv = notifier_for(&mut g, self.channel);
+                let _parked = Parked::new(&self.shared.lock_waiters);
                 let _ = cv.wait_timeout(g, WAIT_TIMEOUT);
             }
         }
@@ -2007,49 +2067,24 @@ impl OwnedChannelStream {
             //    additionally yields the lock every timeout interval even
             //    while no bytes are arriving.
             if !g.pumping {
-                g.pumping = true;
-                let (mut g, res) = self.shared.pump_step(g)?;
-                g.pumping = false;
-                // Wake one waiter per registered channel. The pumper
-                // already notified the target channel's CV inside
-                // dispatch_event; this catches any waiter that was
-                // sleeping on a *different* channel and now has a chance
-                // to become the next pumper.
-                for cv in g.notifiers.values() {
-                    cv.notify_one();
-                }
-                drop(g);
-                res?;
-                // std::sync::Mutex on Linux is not fair: a thread that
-                // releases and immediately re-acquires can starve a
-                // contended waiter (writers, or sibling readers on the
-                // same / a different channel). Check the lock-waiters
-                // counter (bumped by every read/write entry point via
-                // [`LockTicket`]) and, if more than just self is
-                // contending, sleep long enough for the kernel to
-                // schedule the waiter onto the freshly-released mutex
-                // before we re-acquire. When no one else is waiting we
-                // keep the short 100 µs yield — it's enough for sibling
-                // channels' read paths to grab the lock without
-                // measurably hurting bulk throughput.
-                if self
-                    .shared
-                    .lock_waiters
-                    .load(core::sync::atomic::Ordering::SeqCst)
-                    > 1
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                } else {
-                    std::thread::sleep(Duration::from_micros(100));
-                }
-                // Loop: drop above released the lock so siblings can
-                // squeeze in; we'll re-acquire at the top.
+                let channel = self.channel;
+                self.shared.pump_until(g, |inner| {
+                    inner.queues.get(&channel).is_some_and(|q| {
+                        q.remote_eof
+                            || match stream {
+                                Stream::Data => !q.data.is_empty(),
+                                Stream::Stderr => !q.stderr.is_empty(),
+                            }
+                    })
+                })?;
+                // Loop: drain at the top.
             } else {
                 let cv = notifier_for(&mut g, self.channel);
                 // Bounded wait so a missed notify (e.g. pumper panicked
                 // and unwound through the mutex guard) cannot strand us.
                 // Explicitly drop the re-acquired guard so the next loop
                 // iteration starts clean.
+                let _parked = Parked::new(&self.shared.lock_waiters);
                 let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
@@ -2165,6 +2200,7 @@ impl Write for OwnedChannelStream {
                 res?;
             } else {
                 let cv = notifier_for(&mut g, self.channel);
+                let _parked = Parked::new(&self.shared.lock_waiters);
                 let waited = cv.wait_timeout(g, WAIT_TIMEOUT).map_err(|_| {
                     std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,

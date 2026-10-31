@@ -143,6 +143,10 @@ pub fn by_name(name: &str) -> Option<&'static CipherSpec> {
 ///   produce or check the Poly1305 tag, and [`SshCipher::cp_xor_payload`] to
 ///   apply the payload keystream once the tag has been verified.
 #[non_exhaustive]
+// Two of these live per connection (one per direction), built once per key
+// exchange, so the GCM state's size (purecrypto 0.10.4's GHASH tables) is not
+// worth an allocation and a change to this public type.
+#[allow(clippy::large_enum_variant)]
 pub enum SshCipher {
     /// `aes128-ctr` / `aes192-ctr` / `aes256-ctr`.
     Ctr(AesCtr),

@@ -115,7 +115,7 @@ dlsym = { version = "0.0.2", optional = true }
 # `BlockCipher::{encrypt,decrypt}_blocks` (our CBC path goes through the `Cbc`
 # mode, which already errors on misaligned input) and keeping secret bignum
 # limbs off the heap in RSA blinding; the MSRV stays at Rust 1.89.
-purecrypto = { version = "0.10", default-features = false, features = [
+purecrypto = { version = "0.10.4", default-features = false, features = [
     "hash", "cipher", "mac", "kdf", "rng", "rsa", "dh", "ec", "der", "mlkem", "mldsa",
 ] }
 # 0.6.10 minimum, not just 0.6: 0.6.9 fixed the zlib/deflate decoder reporting

@@ -742,8 +742,10 @@ impl ConnectionState {
 
     /// Credit `by` bytes back to the peer's send window after the caller has
     /// consumed that many inbound payload bytes. The bytes are accumulated
-    /// against an internal counter; once the counter crosses half the channel's
-    /// initial window we flush a `CHANNEL_WINDOW_ADJUST` payload and reset.
+    /// against an internal counter; once it reaches three max-size packets or
+    /// half the channel's initial window, whichever is smaller (OpenSSH's
+    /// rule), we flush a `CHANNEL_WINDOW_ADJUST` payload and reset. Waiting
+    /// for half a large window left the peer idle on a high-latency link.
     /// Returns the payload to send, or `None` if the threshold wasn't reached.
     ///
     /// Once we have sent `SSH_MSG_CHANNEL_CLOSE` this is a no-op returning
@@ -758,7 +760,9 @@ impl ConnectionState {
             return Ok(None);
         }
         ch.pending_replenish = ch.pending_replenish.saturating_add(by);
-        let threshold = (ch.initial_local_window / 2).max(1);
+        let threshold = (ch.initial_local_window / 2)
+            .min(ch.local_max_packet.saturating_mul(3))
+            .max(1);
         if ch.pending_replenish < threshold {
             return Ok(None);
         }

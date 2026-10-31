@@ -51,13 +51,14 @@ pub(crate) const SSH_MSG_EXT_INFO: u8 = 7;
 pub(crate) const MAX_INBOX_BYTES: usize = 8 * 1024 * 1024;
 /// Cap on egress buffered while a key exchange is in flight. A re-key settles
 /// in milliseconds, so anything approaching this means the KEX has wedged and
-/// we would rather fail than grow without bound.
-pub(crate) const MAX_DEFERRED_OUT_BYTES: usize = 8 * 1024 * 1024;
+/// we would rather fail than grow without bound. Each busy channel may queue
+/// up to its window (2 MiB by default), so this leaves room for 16 of them.
+pub(crate) const MAX_DEFERRED_OUT_BYTES: usize = 32 * 1024 * 1024;
 /// Cap on inbound application packets buffered while a re-key is in flight
 /// (traffic the peer put on the wire before it saw our KEXINIT). Same
 /// reasoning as [`MAX_DEFERRED_OUT_BYTES`]: the window is short, and a peer
 /// that keeps streaming past it is not going to finish the exchange.
-pub(crate) const MAX_DEFERRED_IN_BYTES: usize = 8 * 1024 * 1024;
+pub(crate) const MAX_DEFERRED_IN_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_BANNER_LINE: usize = 1024;
 pub(crate) const MAX_BANNER_LINES: usize = 32;
 pub(crate) const MAX_BANNER_TOTAL_BYTES: usize = 64 * 1024;

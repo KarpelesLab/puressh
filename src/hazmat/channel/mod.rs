@@ -45,8 +45,11 @@ pub use state::{
     ChannelEvent, ChannelOpen, ChannelState, ConnectionState, DEFAULT_MAX_CHANNELS_PER_CONNECTION,
 };
 
-/// Default initial window advertised for new local channels (256 KiB).
-pub const DEFAULT_WINDOW: u32 = 256 * 1024;
+/// Default initial window advertised for new local channels (2 MiB, as
+/// OpenSSH's session channels). The window bounds how much the peer may have
+/// in flight, so it caps a channel's throughput at about window / round-trip
+/// time: 256 KiB held a 50 ms link to ~5 MB/s.
+pub const DEFAULT_WINDOW: u32 = 2 * 1024 * 1024;
 
 /// Default maximum SSH packet payload we're willing to receive (32 KiB).
 pub const DEFAULT_MAX_PACKET: u32 = 32 * 1024;

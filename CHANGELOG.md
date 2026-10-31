@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.8](https://github.com/KarpelesLab/puressh/compare/v0.2.7...v0.2.8) - 2026-10-31
+
+### Added
+
+- *(packaging)* puressh-server on Ubuntu 26.04 and 26.10
+
+### Fixed
+
+- *(client)* a long-running exec, shell or subsystem no longer fails after a million packets
+- long sessions no longer die after a fixed number of loop iterations
+- *(server)* a client still sending after the command exits no longer drops the connection
+- *(ci)* the 26.10 systemd container's image installs recommends, and keeps policy-rc.d until the install is done
+
+### Other
+
+- require purecrypto 0.10.4
+- 2 MiB channel windows, credited OpenSSH's way
+- *(shared)* stop sleeping after every packet in SharedClient readers
+- *(release)* upload to Launchpad one series at a time, with retries, skipping what it has
+
 ## [0.2.7](https://github.com/KarpelesLab/puressh/compare/v0.2.6...v0.2.7) - 2026-10-25
 
 ### Added

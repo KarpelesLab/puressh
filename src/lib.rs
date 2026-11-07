@@ -1,14 +1,21 @@
 #![cfg_attr(not(feature = "std"), no_std)]
+// No `unsafe` outside the C ABI (`ffi`) and the two run-time loader modules
+// (`sk`, `pkcs11`), which carry their own `#[allow(unsafe_code)]`. With
+// none of the three features on, the whole crate is `forbid`den. Tests
+// are `deny` rather than `forbid`: `std::env::set_var` is `unsafe` since
+// edition 2024 and a test may `allow` it locally, which `forbid` would
+// refuse (E0453) and so break `cargo test` in the minimal configuration.
 #![cfg_attr(
-    not(any(feature = "ffi", feature = "security-key", feature = "pkcs11")),
+    all(
+        not(test),
+        not(any(feature = "ffi", feature = "security-key", feature = "pkcs11"))
+    ),
     forbid(unsafe_code)
 )]
-// Loading a security-key provider or PKCS#11 module is FFI: `unsafe` is
-// allowed in those modules alone.
 #![cfg_attr(
     all(
         not(feature = "ffi"),
-        any(feature = "security-key", feature = "pkcs11")
+        any(test, feature = "security-key", feature = "pkcs11")
     ),
     deny(unsafe_code)
 )]

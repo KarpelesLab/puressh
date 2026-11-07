@@ -241,6 +241,11 @@ required-features = ["agent"]
 name = "e2e_auth_command"
 required-features = ["server"]
 
+# Drives a `SharedClient` against the system sshd.
+[[test]]
+name = "e2e_real_sshd"
+required-features = ["multichannel"]
+
 [[test]]
 name = "e2e_forwarding"
 required-features = ["server"]

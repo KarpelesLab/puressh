@@ -1774,12 +1774,32 @@ fn env_glob_match(pattern: &str, name: &str) -> bool {
     rec(pb, nb)
 }
 
+/// True when `name` is a well-formed environment variable name:
+/// `[A-Za-z_][A-Za-z0-9_]*`.
+///
+/// A name is never taken on trust from the peer: `Command::env` and
+/// `execve` build `name=value` by concatenation, so a name containing `=`
+/// (say `LD_PRELOAD=/x`) would reach the child as a variable called
+/// `LD_PRELOAD`, a name that [`HARD_BLOCKED_ENV_NAMES`] compares against
+/// as a whole string and never sees. OpenSSH refuses such names in
+/// `child_set_env` ("Invalid environment variable"); we refuse every
+/// character outside the portable charset of IEEE Std 1003.1.
+pub fn valid_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Decide whether a client-supplied `(name, _)` env pair should be
 /// honoured. Returns `true` only when:
+/// - `name` is well formed ([`valid_env_name`]), AND
 /// - `name` is not in [`HARD_BLOCKED_ENV_NAMES`], AND
 /// - at least one pattern in `accept_env` matches it.
 pub(crate) fn env_name_accepted(name: &str, accept_env: &[String]) -> bool {
-    if HARD_BLOCKED_ENV_NAMES.contains(&name) {
+    if !valid_env_name(name) || HARD_BLOCKED_ENV_NAMES.contains(&name) {
         return false;
     }
     accept_env.iter().any(|pat| env_glob_match(pat, name))
@@ -7957,6 +7977,33 @@ mod tests {
         assert!(env_name_accepted("LANG", &allow));
         assert!(env_name_accepted("LC_ALL", &allow));
         assert!(env_name_accepted("TERM", &allow));
+    }
+
+    #[test]
+    fn env_filter_rejects_malformed_names() {
+        // `Command::env("LD_PRELOAD=/x", "y")` reaches the child as
+        // `LD_PRELOAD=/x=y`, a variable called LD_PRELOAD: an `=` in the
+        // name hides a blocked name from the exact-match list. Reject it
+        // and everything else outside `[A-Za-z_][A-Za-z0-9_]*`.
+        let allow = vec!["*".to_string()];
+        assert!(!env_name_accepted("LD_PRELOAD=/tmp/x.so", &allow));
+        assert!(!env_name_accepted("PATH=/tmp", &allow));
+        assert!(!env_name_accepted("=x", &allow));
+        assert!(!env_name_accepted("", &allow));
+        assert!(!env_name_accepted("1ABC", &allow));
+        assert!(!env_name_accepted("A B", &allow));
+        assert!(!env_name_accepted("A\0B", &allow));
+        assert!(!env_name_accepted("A\nB", &allow));
+        assert!(!env_name_accepted("LANG\u{e9}", &allow));
+        assert!(valid_env_name("_x"));
+        assert!(valid_env_name("LC_ALL"));
+        assert!(valid_env_name("a1"));
+        assert!(!valid_env_name("a-b"));
+        assert!(!valid_env_name("a.b"));
+        // Specific-name allowlists do not change the rule.
+        let narrow = vec!["LC_*".to_string()];
+        assert!(env_name_accepted("LC_ALL", &narrow));
+        assert!(!env_name_accepted("LC_X=PATH", &narrow));
     }
 
     #[test]

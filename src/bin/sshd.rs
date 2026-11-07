@@ -126,7 +126,7 @@ mod imp {
         AuthenticatorFactory, ChannelStream, CommandHandler, Config, ExecResult, ExecStreamHandler,
         HARD_BLOCKED_ENV_NAMES, PtySpec, SessionEnv, SessionOpenContext, ShellExitStatus,
         ShellHandler, ShellSession, SubsystemHandler, handle_session_with_addrs,
-        handle_session_with_peer,
+        handle_session_with_peer, valid_env_name,
     };
     use puressh::sftp::{SftpServerOptions, SftpServerSession};
 
@@ -6153,12 +6153,14 @@ mod imp {
     /// bypasses the server layer must not be able to slip
     /// LD_PRELOAD/IFS/PATH/etc. into the user's shell.
     ///
-    /// Names with embedded NUL are dropped too — they can't safely make
-    /// it into a `setenv`/`Command::env` call anyway.
+    /// Malformed names (anything outside `[A-Za-z_][A-Za-z0-9_]*`, so
+    /// also `=` and NUL) are dropped too: `Command::env` concatenates
+    /// `name=value`, and a name like `LD_PRELOAD=/x` would otherwise reach
+    /// the child as the blocked variable the exact-match list never saw.
     fn safe_session_env(env: &SessionEnv) -> Vec<(&str, &str)> {
         env.iter()
             .filter(|(k, v)| {
-                !k.contains('\0') && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
+                valid_env_name(k) && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
             })
             .collect()
     }
@@ -6212,7 +6214,7 @@ mod imp {
     fn safe_owned_env(env: &[(String, String)]) -> Vec<(String, String)> {
         env.iter()
             .filter(|(k, v)| {
-                !k.contains('\0')
+                valid_env_name(k)
                     && !v.contains('\0')
                     && !HARD_BLOCKED_ENV_NAMES.contains(&k.as_str())
             })

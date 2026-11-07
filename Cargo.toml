@@ -288,3 +288,12 @@ required-features = ["server"]
 [[test]]
 name = "sshd_dump"
 required-features = ["server"]
+
+[profile.release]
+# A protocol implementation does arithmetic on peer-supplied lengths and
+# counters everywhere. Tests and debug builds panic on a wrapped integer;
+# the shipped binaries must not silently compute with one instead. A
+# panic closes the connection (the per-connection sshd process), which is
+# the failure mode we want. The cost is a few percent on arithmetic-heavy
+# paths.
+overflow-checks = true

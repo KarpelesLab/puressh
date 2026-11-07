@@ -3480,7 +3480,14 @@ fn run() -> Result<i32, String> {
     if let Some(u) = &hostkeys_updater {
         let u = u.clone();
         let negotiated = client.negotiated().map(|n| n.host_key);
-        u.state.lock().map(|mut g| g.host_key_alg = negotiated).ok();
+        let session_host_key = client.session_binding().map(|b| b.host_key);
+        u.state
+            .lock()
+            .map(|mut g| {
+                g.host_key_alg = negotiated;
+                g.session_host_key = session_host_key;
+            })
+            .ok();
         client.set_global_request_hook(move |name, raw| {
             if name == "hostkeys-00@openssh.com" {
                 u.received(raw.to_vec());
@@ -3841,6 +3848,9 @@ struct HostKeysUpdateState {
     offered: Option<Vec<u8>>,
     shared: Option<puressh::shared::SharedClient>,
     host_key_alg: Option<String>,
+    /// The host key this session verified: it must be among the offered
+    /// keys, and no update is made when it is a certificate.
+    session_host_key: Option<Vec<u8>>,
     started: bool,
     finished: bool,
 }
@@ -3938,8 +3948,14 @@ impl HostKeysUpdater {
         g.started = true;
         let me = self.clone();
         let host_key_alg = g.host_key_alg.clone();
+        let session_host_key = g.session_host_key.clone();
         thread::spawn(move || {
-            me.update(&shared, &raw, host_key_alg.as_deref());
+            me.update(
+                &shared,
+                &raw,
+                host_key_alg.as_deref(),
+                session_host_key.as_deref(),
+            );
             if let Ok(mut g) = me.state.lock() {
                 g.finished = true;
             }
@@ -3978,6 +3994,7 @@ impl HostKeysUpdater {
         shared: &puressh::shared::SharedClient,
         raw: &[u8],
         host_key_alg: Option<&str>,
+        session_host_key: Option<&[u8]>,
     ) {
         if !self.trusted() {
             vlog(
@@ -4013,6 +4030,24 @@ impl HostKeysUpdater {
             offered.push(blob);
         }
         if offered.is_empty() {
+            return;
+        }
+        // As OpenSSH: a session authenticated by a certificate makes no
+        // update (the CA, not the key list, is the trust anchor), and the
+        // key this connection verified must be among the offered ones, or
+        // the server could have the very key the user trusts replaced.
+        let Some(session_key) = session_host_key else {
+            return;
+        };
+        if key_blob_type(session_key).is_some_and(|t| puressh::cert::is_cert_name(&t)) {
+            vlog(
+                1,
+                "UpdateHostKeys: the host key is a certificate; skipping known_hosts update",
+            );
+            return;
+        }
+        if !offered.iter().any(|k| k == session_key) {
+            warn!("server sent hostkeys but did not include the one used in this connection");
             return;
         }
         let mut kh = match std::fs::read(&self.file) {
@@ -4405,13 +4440,8 @@ fn spawn_keepalive(
                 Ok(_) => {}
                 Err(_) => return,
             }
-            if unanswered >= count_max {
-                eprintln!("Timeout, server {host} not responding.");
-                std::process::exit(255);
-            }
-            if s.send_keepalive().is_err() {
-                eprintln!("Timeout, server {host} not responding.");
-                std::process::exit(255);
+            if unanswered >= count_max || s.send_keepalive().is_err() {
+                exit_server_not_responding(&host);
             }
             unanswered += 1;
         }
@@ -6596,6 +6626,21 @@ impl EscapeFilter {
 /// an escape sequence (set while a raw-mode session runs).
 #[cfg(unix)]
 static ORIGINAL_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+/// End the client on a `ServerAliveCountMax` timeout the way every other
+/// exit does: the terminal taken out of raw mode first, then status 255.
+fn exit_server_not_responding(host: &str) -> ! {
+    eprintln!("Timeout, server {host} not responding.");
+    #[cfg(unix)]
+    if let Ok(g) = ORIGINAL_TERMIOS.lock()
+        && let Some(t) = g.as_ref()
+    {
+        // SAFETY: restoring a termios captured from fd 0.
+        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
+    }
+    common::finish_log();
+    std::process::exit(255);
+}
 
 /// Carry out an escape action on behalf of the stdin thread, for the
 /// session `channel` of `shared`.

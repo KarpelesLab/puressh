@@ -233,6 +233,31 @@ fn jail_blocks_traversal_escape() {
     h.join().unwrap();
 }
 
+/// What every SFTP client does: `realpath` first, then absolute paths
+/// built from the answer. Under the jail those must resolve.
+#[test]
+fn jail_realpath_round_trips() {
+    let tmp = TempDir::new("jail-rt");
+    let jail = tmp.path().to_path_buf();
+    fs::create_dir(jail.join("d")).unwrap();
+    fs::write(jail.join("d/file"), b"x").unwrap();
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.join("d")).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    assert_eq!(client.realpath(b".").unwrap(), b"/d");
+    assert_eq!(client.realpath(b"/").unwrap(), b"/");
+    assert!(client.stat(b"/d/file").is_ok());
+    assert!(client.stat(b"/d/../d/file").is_ok());
+    assert_eq!(client.realpath(b"/d/file").unwrap(), b"/d/file");
+    // Absolute paths cannot name anything outside the jail: `..` past the
+    // root stays at the root, as in a chroot.
+    assert_eq!(client.realpath(b"/../../etc").unwrap(), b"/etc");
+    assert!(client.stat(b"/../../etc/passwd").is_err());
+    drop(client);
+    h.join().unwrap();
+}
+
 #[test]
 fn read_only_refuses_writes() {
     let tmp = TempDir::new("readonly");

@@ -45,6 +45,9 @@ pub fn lexically_clean(p: &Path) -> PathBuf {
     out
 }
 
+/// [`resolve_in`] with absolute client paths taken as host paths (the
+/// historical behaviour; the server uses `resolve_in` directly).
+///
 /// Resolve `raw` (which the SFTP peer sent as bytes) against `cwd`, returning
 /// an absolute lexically-clean path. If `root` is set, the resolved path
 /// must lie inside it; otherwise this returns [`FxpStatus::PermissionDenied`].
@@ -53,12 +56,36 @@ pub fn lexically_clean(p: &Path) -> PathBuf {
 /// SFTP v3 itself is byte-oriented, but `std::path` on Unix is `OsStr`-based;
 /// supporting non-UTF-8 bytes here would need `OsStrExt::from_bytes` and a
 /// `cfg(unix)` gate. We'll add that when we need it.
-pub fn resolve(cwd: &Path, raw: &[u8], root: Option<&Path>) -> Result<PathBuf, SftpError> {
+#[cfg(test)]
+fn resolve(cwd: &Path, raw: &[u8], root: Option<&Path>) -> Result<PathBuf, SftpError> {
+    resolve_in(cwd, raw, root, false)
+}
+
+/// [`resolve`], and with `jail_relative` an absolute client path is taken
+/// relative to `root`, as under a `chroot(2)`: `/a/b` is `root/a/b`, and
+/// `/../x` is `root/x`. That is the view `op_realpath` presents under
+/// `hide_jail_in_realpath`, so the paths a client builds from its answers
+/// resolve again. Without it, an absolute client path is a host path.
+pub fn resolve_in(
+    cwd: &Path,
+    raw: &[u8],
+    root: Option<&Path>,
+    jail_relative: bool,
+) -> Result<PathBuf, SftpError> {
     let s = std::str::from_utf8(raw).map_err(|_| SftpError::status(FxpStatus::BadMessage))?;
     let p = Path::new(s);
 
     let joined = if p.is_absolute() {
-        p.to_path_buf()
+        match root {
+            Some(jail) if jail_relative => {
+                let clean = lexically_clean(p);
+                match clean.strip_prefix("/") {
+                    Ok(rel) => jail.join(rel),
+                    Err(_) => jail.to_path_buf(),
+                }
+            }
+            _ => p.to_path_buf(),
+        }
     } else {
         cwd.join(p)
     };
@@ -150,6 +177,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(p, Path::new("/srv/jail/u/file.txt"));
+    }
+
+    #[test]
+    fn resolve_in_jail_relative_maps_absolute_paths_into_the_jail() {
+        let jail = Some(Path::new("/srv/jail"));
+        let cwd = Path::new("/srv/jail/u");
+        // What a client does with realpath's `/` answer under the jail.
+        assert_eq!(
+            resolve_in(cwd, b"/etc/passwd", jail, true).unwrap(),
+            Path::new("/srv/jail/etc/passwd")
+        );
+        assert_eq!(
+            resolve_in(cwd, b"/", jail, true).unwrap(),
+            Path::new("/srv/jail")
+        );
+        // `..` from the jail's root stays at the jail's root, as in a chroot.
+        assert_eq!(
+            resolve_in(cwd, b"/../../etc/passwd", jail, true).unwrap(),
+            Path::new("/srv/jail/etc/passwd")
+        );
+        // Relative paths are unchanged.
+        assert_eq!(
+            resolve_in(cwd, b"f", jail, true).unwrap(),
+            Path::new("/srv/jail/u/f")
+        );
+        // Without the flag (host paths shown), an absolute path is a host
+        // path and is still confined.
+        assert_eq!(
+            resolve_in(cwd, b"/srv/jail/f", jail, false).unwrap(),
+            Path::new("/srv/jail/f")
+        );
+        assert!(resolve_in(cwd, b"/etc/passwd", jail, false).is_err());
+        // No jail: the flag is meaningless.
+        assert_eq!(
+            resolve_in(cwd, b"/etc/passwd", None, true).unwrap(),
+            Path::new("/etc/passwd")
+        );
     }
 
     #[test]

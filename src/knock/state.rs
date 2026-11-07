@@ -36,10 +36,6 @@ pub struct KnockServerConfig {
     pub knock_burst: u32,
     /// Knock bucket: ms per refilled token.
     pub knock_refill_ms: u64,
-    /// Uncached-sig1 bucket per (user, key): burst size.
-    pub newsig1_burst: u32,
-    /// Uncached-sig1 bucket: ms per refilled token.
-    pub newsig1_refill_ms: u64,
     /// Global public-key verifications per second.
     pub verify_per_sec: u32,
     /// Source prefixes tracked per (user, key) before LRU eviction. Once
@@ -47,10 +43,11 @@ pub struct KnockServerConfig {
     /// a valid knock (if any) and starts with a near-empty bucket, so
     /// rotating (spoofed) source addresses earns no fresh bursts.
     pub max_prefixes_per_key: usize,
-    /// sig2 verifications per (user, key) for knocks from source prefixes
-    /// that have not yet sent a valid knock for it: burst size. Bounds the
-    /// share of [`Self::verify_per_sec`] one leaked sig1 can consume,
-    /// whatever source addresses it is sent from.
+    /// Signature verifications (an uncached sig1, or sig2) per (user, key)
+    /// for knocks from source prefixes that have not yet sent a valid knock
+    /// for it: burst size. Bounds the share of [`Self::verify_per_sec`] one
+    /// leaked sig1, or a flood of forged ones, can consume, whatever source
+    /// addresses it is sent from.
     pub newprefix_burst: u32,
     /// New-prefix sig2 bucket: ms per refilled token.
     pub newprefix_refill_ms: u64,
@@ -87,8 +84,6 @@ impl Default for KnockServerConfig {
             max_pending: 2,
             knock_burst: 5,
             knock_refill_ms: 10_000,
-            newsig1_burst: 3,
-            newsig1_refill_ms: 60_000,
             verify_per_sec: 1000,
             max_prefixes_per_key: 64,
             newprefix_burst: 10,
@@ -264,8 +259,8 @@ struct PrefixSlot {
 #[derive(Debug)]
 struct Entry {
     sig1_cache: Vec<Vec<u8>>,
-    newsig1: Bucket,
-    /// sig2 verifications for knocks from prefixes that are not `good`.
+    /// Signature verifications (uncached sig1, sig2) for knocks from
+    /// prefixes that are not `good`.
     newprefix: Bucket,
     last_nonce: u64,
     last_knock_hash: [u8; 32],
@@ -561,7 +556,6 @@ impl KnockState {
             .entry((k.user.to_string(), k.key_fp))
             .or_insert_with(|| Entry {
                 sig1_cache: Vec::new(),
-                newsig1: Bucket::new(cfg.newsig1_burst, cfg.newsig1_refill_ms, now_ms),
                 newprefix: Bucket::new(cfg.newprefix_burst, cfg.newprefix_refill_ms, now_ms),
                 last_nonce: 0,
                 last_knock_hash: [0u8; 32],
@@ -569,14 +563,26 @@ impl KnockState {
                 knock_buckets: Vec::new(),
                 pending: 0,
             });
-        // 4. sig1: byte compare against the cache, verify only on a miss
+        // 4. sig1: byte compare against the cache, verify only on a miss.
+        // A miss is charged like a sig2 check (step 7): the source prefix's
+        // knock bucket, the key's new-prefix bucket unless the prefix is
+        // good, and the global verify bucket. `user` and `key_fp` are
+        // plaintext, so a budget keyed by them alone would let anyone who
+        // knows a user name and a key fingerprint lock that key out with a
+        // trickle of forged sig1s from spoofed addresses; charging the
+        // sender's prefix (and only non-good prefixes' shared budget) keeps
+        // the user's established prefixes knocking through such a flood.
+        let mut charged_slot = None;
         if let Some(pos) = entry.sig1_cache.iter().position(|s| s == k.sig1) {
             let hit = entry.sig1_cache.remove(pos);
             entry.sig1_cache.insert(0, hit);
         } else {
-            if !entry.newsig1.take(now_ms) || !self.verify.take(now_ms) {
+            let (ok, slot) = Self::take_knock_bucket(&self.cfg, entry, src, now_ms);
+            let good = entry.knock_buckets[slot].good;
+            if !ok || (!good && !entry.newprefix.take(now_ms)) || !self.verify.take(now_ms) {
                 return Verdict::Drop(DropReason::RateLimited);
             }
+            charged_slot = Some(slot);
             let msg = wire::knock_id_message(k.user, &k.key_fp);
             if wire::verify(key_blob, wire::NS_KNOCK_ID, &msg, k.sig1).is_err() {
                 return Verdict::Drop(DropReason::BadSig1);
@@ -603,12 +609,26 @@ impl KnockState {
             return Verdict::Drop(DropReason::Replay);
         }
         // 7. rate limits: the prefix's bucket, then the key's new-prefix
-        // bucket unless this prefix already sent a valid knock, then global
-        let (ok, slot) = Self::take_knock_bucket(&self.cfg, entry, src, now_ms);
-        let good = entry.knock_buckets[slot].good;
-        if !ok || (!good && !entry.newprefix.take(now_ms)) || !self.verify.take(now_ms) {
-            return Verdict::Drop(DropReason::RateLimited);
-        }
+        // bucket unless this prefix already sent a valid knock, then global.
+        // A knock whose sig1 was verified in step 4 has paid the first two
+        // already (one knock, one token each), so only the verification is
+        // charged again.
+        let slot = match charged_slot {
+            Some(slot) => {
+                if !self.verify.take(now_ms) {
+                    return Verdict::Drop(DropReason::RateLimited);
+                }
+                slot
+            }
+            None => {
+                let (ok, slot) = Self::take_knock_bucket(&self.cfg, entry, src, now_ms);
+                let good = entry.knock_buckets[slot].good;
+                if !ok || (!good && !entry.newprefix.take(now_ms)) || !self.verify.take(now_ms) {
+                    return Verdict::Drop(DropReason::RateLimited);
+                }
+                slot
+            }
+        };
         // 8. sig2
         if wire::verify(key_blob, wire::NS_KNOCK, k.signed, k.sig2).is_err() {
             return Verdict::Drop(DropReason::BadSig2);

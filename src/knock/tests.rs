@@ -260,14 +260,19 @@ fn forged_signatures_are_dropped() {
     expect_drop(f.state.handle(NOW, ip(1), &d), DropReason::BadSig2);
 }
 
+/// A forged sig1 is charged to its sender's source prefix (and the key's
+/// new-prefix budget), never to a budget keyed by the plaintext
+/// (user, key_fp) alone: an attacker who knows a user name and a key
+/// fingerprint cannot lock that key out of first contact from elsewhere.
 #[test]
-fn uncached_sig1_verification_is_rate_limited() {
+fn forged_sig1_exhausts_only_the_senders_prefix() {
     let mut f = setup();
     let attacker = ed25519();
     let fp = wire::key_fp(&f.host_blob);
     let s1 = sig1(&attacker, USER);
     let eph = X25519PrivateKey::generate(&mut OsRng);
-    for i in 0..5u64 {
+    let burst = KnockServerConfig::default().knock_burst as u64;
+    for i in 0..burst + 2 {
         let d = KnockFields {
             user: USER,
             key_fp: wire::key_fp(&f.user_key.public_blob()),
@@ -278,19 +283,73 @@ fn uncached_sig1_verification_is_rate_limited() {
         }
         .build(&attacker, 0)
         .unwrap();
-        let expected = if i < 3 {
+        let expected = if i < burst {
             DropReason::BadSig1
         } else {
             DropReason::RateLimited
         };
         expect_drop(f.state.handle(NOW, ip(1), &d), expected);
     }
-    // The real key's cached sig1 is unaffected once cached... but the
-    // bucket is empty, so a first-ever sig1 must wait for a refill.
+    // The attacker's own prefix is spent, so the real user shares its fate
+    // there (an attacker on the user's own prefix is on-path anyway)...
     let d = f.knock(NOW + 10);
     expect_drop(f.state.handle(NOW, ip(1), &d), DropReason::RateLimited);
-    let d = f.knock(NOW + 60_000);
-    expect_accept(f.state.handle(NOW + 60_000, ip(1), &d));
+    // ...but a first-ever knock from any other prefix goes straight through.
+    let p = expect_accept(f.state.handle(NOW, ip(2), &d));
+    f.state.release_pending(&p.user, &p.key_fp);
+    // ip(1) is back once its bucket refills.
+    let refill = KnockServerConfig::default().knock_refill_ms;
+    let d = f.knock(NOW + refill + 1);
+    expect_accept(f.state.handle(NOW + refill + 1, ip(1), &d));
+}
+
+/// Forged sig1s from ever-new spoofed prefixes drain the key's new-prefix
+/// budget, but a prefix that already sent a valid knock is exempt from
+/// that budget, so the user's established clients keep getting verified.
+#[test]
+fn good_prefix_sig1_is_exempt_from_new_prefix_budget() {
+    let mut f = setup();
+    let p = expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+    f.state.release_pending(&p.user, &p.key_fp);
+
+    let attacker = ed25519();
+    let fp = wire::key_fp(&f.host_blob);
+    let s1 = sig1(&attacker, USER);
+    let eph = X25519PrivateKey::generate(&mut OsRng);
+    let forged = |nonce: u64| {
+        KnockFields {
+            user: USER,
+            key_fp: wire::key_fp(&f.user_key.public_blob()),
+            sig1: &s1,
+            nonce,
+            eph_c: eph.public_key(),
+            host_fp: Some(fp),
+        }
+        .build(&attacker, 0)
+        .unwrap()
+    };
+    let mut verified = 0;
+    for i in 0..200u64 {
+        let src = IpAddr::V4(Ipv4Addr::new(10, (i >> 8) as u8, i as u8, 1));
+        match f.state.handle(NOW, src, &forged(NOW + 1 + i)) {
+            Verdict::Drop(DropReason::BadSig1) => verified += 1,
+            Verdict::Drop(DropReason::RateLimited) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // The real knock from ip(1) took one new-prefix token.
+    assert_eq!(verified, KnockServerConfig::default().newprefix_burst - 1);
+    // A prefix never seen before is now held to the exhausted budget...
+    expect_drop(
+        f.state.handle(NOW, ip(99), &forged(NOW + 500)),
+        DropReason::RateLimited,
+    );
+    // ...while ip(1), which has knocked validly, still gets its sig1
+    // verified (a new client there with its own sig1 would be accepted).
+    expect_drop(
+        f.state.handle(NOW, ip(1), &forged(NOW + 501)),
+        DropReason::BadSig1,
+    );
 }
 
 #[test]

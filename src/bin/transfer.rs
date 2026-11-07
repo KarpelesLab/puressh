@@ -426,10 +426,23 @@ pub fn remote_basename(p: &[u8]) -> &[u8] {
     }
 }
 
-/// A file name from the server is used as a local path component: refuse
-/// anything that is not a plain name.
+/// A file name from the server is used as a local path component and is
+/// shown on the terminal: refuse anything that is not a plain name, and
+/// any control byte (C0, DEL, or a C1 control in UTF-8), which could
+/// redraw or hide terminal output (the CVE-2019-6109 class).
 pub fn safe_name(name: &[u8]) -> bool {
-    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+    !name.is_empty()
+        && name != b"."
+        && name != b".."
+        && !name.contains(&b'/')
+        && !has_control_bytes(name)
+}
+
+/// C0 controls, DEL, or the two-byte UTF-8 form of a C1 control.
+fn has_control_bytes(b: &[u8]) -> bool {
+    b.iter().any(|&c| c < 0x20 || c == 0x7f)
+        || b.windows(2)
+            .any(|w| w[0] == 0xc2 && (0x80..=0x9f).contains(&w[1]))
 }
 
 /// Expand a remote glob (relative to `cwd`). A pattern without glob
@@ -989,7 +1002,9 @@ fn download_at<T: Read + Write>(
     opts: &XferOpts,
     depth: usize,
 ) -> Result<(), String> {
-    let shown = String::from_utf8_lossy(remote).into_owned();
+    // Shown only (never used as a path): make it safe for the terminal,
+    // because below the top level it was named by the server.
+    let shown = sanitize(&String::from_utf8_lossy(remote));
     let attrs = sftp
         .stat(remote)
         .map_err(|e| format!("{shown}: {}", sftp_err(e)))?;
@@ -1091,7 +1106,7 @@ fn download_at<T: Read + Write>(
         use std::io::Seek;
         let _ = file.inner.seek(io::SeekFrom::Start(start));
     }
-    let name = String::from_utf8_lossy(remote_basename(remote)).into_owned();
+    let name = sanitize(&String::from_utf8_lossy(remote_basename(remote)));
     let mut meter = Progress::new(&name, total, start, opts.progress);
     let res = sftp.read_to(&h, start, opts.chunk, opts.depth, &mut file, |n| {
         meter.update(start + n)
@@ -1302,5 +1317,14 @@ mod tests {
         assert!(!safe_name(b"../x"));
         assert!(!safe_name(b".."));
         assert!(safe_name(b"ok"));
+        assert!(safe_name("caf\u{e9}".as_bytes()));
+        // Control bytes could redraw the terminal through the progress
+        // meter or an error line.
+        assert!(!safe_name(b"\x1b[2Kx"));
+        assert!(!safe_name(b"a\rb"));
+        assert!(!safe_name(b"a\x7fb"));
+        assert!(!safe_name(b"a\0b"));
+        assert!(!safe_name("a\u{9b}b".as_bytes()));
+        assert_eq!(sanitize("a\u{1b}[1Ab\u{9b}c"), "a?[1Ab?c");
     }
 }

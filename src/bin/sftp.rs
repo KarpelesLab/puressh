@@ -2128,10 +2128,12 @@ impl Session {
                 None => filename,
             };
             if !self.quiet {
+                // `abs_dst` carries a glob-matched, server-chosen name.
                 println!(
-                    "{} {} to {abs_dst}",
+                    "{} {} to {}",
                     if resume { "Resuming" } else { "Fetching" },
-                    safe_display(path)
+                    safe_display(path),
+                    safe_display(abs_dst.as_bytes())
                 );
             }
             let ok = if path.ends_with(b"/") && recurse {

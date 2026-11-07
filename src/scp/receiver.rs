@@ -298,7 +298,10 @@ impl<S: Read + Write> Receiver<S> {
                 .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
                 .open(&target)
             {
-                let _ = dir.set_permissions(fs::Permissions::from_mode(mode & 0o7777));
+                // Permission bits only: the peer does not get to set
+                // setuid/setgid/sticky on what it sends (OpenSSH's sink
+                // applies `mode & 0777` too).
+                let _ = dir.set_permissions(fs::Permissions::from_mode(mode & 0o777));
             }
         }
         #[cfg(not(unix))]
@@ -412,7 +415,8 @@ impl<S: Read + Write> Receiver<S> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = f.set_permissions(fs::Permissions::from_mode(mode & 0o7777));
+            // Permission bits only, never setuid/setgid/sticky from the peer.
+            let _ = f.set_permissions(fs::Permissions::from_mode(mode & 0o777));
         }
         #[cfg(not(unix))]
         let _ = mode;

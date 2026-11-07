@@ -924,7 +924,9 @@ fn apply_local_attrs(path: &Path, attrs: &Attrs, preserve: bool) {
     #[cfg(unix)]
     if let Some(perm) = attrs.permissions {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(perm & 0o7777));
+        // Permission bits only: a server does not get to make a download
+        // setuid or setgid (OpenSSH's sftp applies `perm & 0777`).
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(perm & 0o777));
     }
     if let Some((atime, mtime)) = attrs.atime_mtime {
         let at = UNIX_EPOCH + Duration::from_secs(atime.into());

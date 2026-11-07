@@ -3373,15 +3373,17 @@ fn run() -> Result<i32, String> {
         // over the configured socket via connect_via (which still threads
         // connect_host through so KnownHosts looks the host up by name).
         //
-        // Unless `KnockMode no`, a refused or slow connect falls back to the
-        // puressh UDP knock (docs/knock.md), which needs the publickey
-        // identities up front to sign the knock.
+        // With `KnockMode auto` or `always`, a refused or slow connect
+        // falls back to the puressh UDP knock (docs/knock.md), which needs
+        // the publickey identities up front to sign the knock. Off unless
+        // configured: a knock sends the user name, key fingerprint and sig1
+        // in the clear, and a refused or slow connect is anyone's to cause.
         vlog(1, &format!("connecting to {connect_host}:{port}"));
         #[cfg_attr(not(feature = "knock"), allow(unused_mut))]
         let mut cfg = cfg;
         let knock_mode = cfg_block
             .knock_mode
-            .unwrap_or(puressh::config::KnockSetting::Auto);
+            .unwrap_or(puressh::config::KnockSetting::No);
         // Without the `knock` feature the keywords parse but do nothing.
         let use_knock = cfg!(feature = "knock") && knock_mode != puressh::config::KnockSetting::No;
         let sock = if !use_knock {

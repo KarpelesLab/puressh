@@ -225,8 +225,10 @@ All of them understand `ssh_config` (including `Match` blocks and `Include`),
 ([`docs/knock.md`](docs/knock.md)). With `KnockListen` set, `sshd` keeps no TCP port visibly open: an authorized key sends one signed UDP
 datagram, and the server opens a one-shot TCP listener for that client only.
 The SSH session that follows is ordinary, including full user
-authentication. `ssh` knocks automatically when the TCP connect is refused or
-slow (`KnockMode auto`).
+authentication. `ssh` knocks only for hosts configured with `KnockMode auto`
+(when the TCP connect is refused or slow) or `KnockMode always`: a knock
+carries the user name and key fingerprint in the clear, so it is never sent
+to a host that was not set up for it.
 
 ## Module layout
 

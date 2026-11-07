@@ -305,13 +305,20 @@ fn check_accept(
 }
 
 /// When the connect helper knocks.
+///
+/// The default is [`KnockMode::Never`]: a KNOCK carries the user name, the
+/// key fingerprint and sig1 (a bearer token valid on every server where
+/// the key is authorized) in plaintext UDP, so knocking must be a choice
+/// made for a host that is known to expect it, not something a refused or
+/// slow TCP connect, which anyone on the path can cause, triggers towards
+/// an arbitrary server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum KnockMode {
-    /// Plain TCP only.
-    Never,
-    /// Plain TCP first; knock if it is refused or slow (default).
+    /// Plain TCP only (default).
     #[default]
+    Never,
+    /// Plain TCP first; knock if it is refused or slow.
     Auto,
     /// Knock straight away; never try plain TCP.
     Always,
@@ -338,7 +345,7 @@ pub struct KnockConnectOptions {
 impl Default for KnockConnectOptions {
     fn default() -> Self {
         Self {
-            mode: KnockMode::Auto,
+            mode: KnockMode::Never,
             fallback_delay: Duration::from_millis(1500),
             connect_timeout: None,
             knock_port: None,

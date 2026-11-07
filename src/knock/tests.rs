@@ -822,7 +822,11 @@ fn connect_or_knock_falls_back_when_tcp_is_refused() {
         }],
         known_host_keys: vec![host_blob.clone()],
     };
-    let c = connect_or_knock("127.0.0.1", port, &mut req, &KnockConnectOptions::default()).unwrap();
+    let opts = KnockConnectOptions {
+        mode: KnockMode::Auto,
+        ..KnockConnectOptions::default()
+    };
+    let c = connect_or_knock("127.0.0.1", port, &mut req, &opts).unwrap();
     match c {
         Connected::Knocked { accepted, .. } => {
             assert!(accepted.host_key_known);

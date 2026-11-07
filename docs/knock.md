@@ -264,7 +264,12 @@ retransmits recover.
 
 Setting `KnockMode`:
 
-- `auto` (default): connect TCP to `host:22` (or the configured port) as
+- `no` (default): never knock. The default is off because a KNOCK carries
+  `user`, `key_fp` and sig1 in plaintext (§8) and the triggers of `auto`,
+  a refused or slow TCP connect, are anyone's to cause: with `auto` as the
+  default, delaying port 22 of any host would have made a puressh client
+  volunteer those to that host.
+- `auto`: connect TCP to `host:22` (or the configured port) as
   usual. If that attempt is **refused**, gets ICMP unreachable, or does not
   complete within `KnockFallbackDelay` (default **1500 ms**), start the knock
   (§6.2) to the **same IP**. The TCP attempt keeps running. Whichever path
@@ -272,8 +277,6 @@ Setting `KnockMode`:
 - `always`: knock immediately and skip TCP 22. The client may also switch to
   this for a host it has in its knock-hosts cache (§6.5), which skips the
   fallback delay.
-- `never`: never knock.
-
 With several resolved addresses, the client knocks each address it falls back
 on, following the normal address order.
 
@@ -447,7 +450,7 @@ other UDP, and open `KnockPorts` in the firewall.
 
 | `ssh_config` keyword | Meaning |
 |----------------------|---------|
-| `KnockMode no\|auto\|always` | Default `auto` (§6.1). |
+| `KnockMode no\|auto\|always` | Default `no` (§6.1). |
 | `KnockFallbackDelay ms` | Default 1500. |
 | `KnockPort port` | UDP port to knock (default: the SSH port). |
 

@@ -73,6 +73,10 @@ impl Env {
                 "UserKnownHostsFile={}",
                 self.dir.join("known_hosts").display()
             ))
+            // Off by default (the knock discloses the identity); the host
+            // under test expects it. Before `extra`, so a test's own
+            // `KnockMode` wins.
+            .args(["-o", "KnockMode=auto"])
             .args(extra)
             .arg(format!("{user}@127.0.0.1"))
             .arg(cmd)

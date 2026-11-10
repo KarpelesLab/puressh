@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10](https://github.com/KarpelesLab/puressh/compare/v0.2.9...v0.2.10) - 2026-11-10
+
+### Fixed
+
+- *(ssh-agent)* hold signals across the daemonizing fork
+
 ## [0.2.9](https://github.com/KarpelesLab/puressh/compare/v0.2.8...v0.2.9) - 2026-11-10
 
 ### Added

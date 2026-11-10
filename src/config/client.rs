@@ -450,6 +450,10 @@ pub struct ClientOptions {
     /// entry removes the patterns obtained before it that PATTERN matches,
     /// as in OpenSSH; a looked-up list holds the patterns left.
     pub send_env: Vec<String>,
+    /// The `SendEnv -PATTERN` removals applied so far. Kept so that options
+    /// obtained earlier and merged in later (`ssh -o SendEnv=…` over the
+    /// files, [`Self::merge_lower`]) lose the entries they match too.
+    pub send_env_removed: Vec<String>,
     /// `ConnectTimeout` — TCP connect timeout in seconds. `0` is rejected.
     pub connect_timeout: Option<u32>,
     /// `ServerAliveInterval` — seconds between keepalive probes when the
@@ -2072,11 +2076,20 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     // `SendEnv` adds up, in the order obtained; a `-PATTERN` entry takes
     // out the patterns obtained before it whose text PATTERN matches
     // (OpenSSH's rm_env), and is not kept itself.
+    // `src` may itself be a resolved set (`merge_lower`): what it removed
+    // was obtained after everything `dst` holds.
+    for remove in &src.send_env_removed {
+        dst.send_env
+            .retain(|have| !super::glob::glob_match(remove, have));
+        dst.send_env_removed.push(remove.clone());
+    }
     for pat in &src.send_env {
         match pat.strip_prefix('-') {
-            Some(remove) => dst
-                .send_env
-                .retain(|have| !super::glob::glob_match(remove, have)),
+            Some(remove) => {
+                dst.send_env
+                    .retain(|have| !super::glob::glob_match(remove, have));
+                dst.send_env_removed.push(remove.to_string());
+            }
             None => dst.send_env.push(pat.clone()),
         }
     }
@@ -3333,6 +3346,21 @@ Host *.example.com !secret.example.com
     /// `SendEnv -PATTERN` removes the patterns obtained before it (OpenSSH's
     /// rm_env: PATTERN is a glob over their text), not the ones after.
     #[test]
+    fn send_env_removal_reaches_options_merged_in_above() {
+        // `ssh -o SendEnv=FOO -o SendEnv=BAR` over a file saying
+        // `SendEnv -FOO` then `SendEnv BAZ FOO2`.
+        let mut o = SshClientConfig::parse("SendEnv FOO\nSendEnv BAR")
+            .unwrap()
+            .lookup("*");
+        let file = SshClientConfig::parse("SendEnv -FOO\nSendEnv BAZ FOO")
+            .unwrap()
+            .lookup("h");
+        assert_eq!(file.send_env, ["BAZ", "FOO"]);
+        o.merge_lower(&file);
+        assert_eq!(o.send_env, ["BAR", "BAZ", "FOO"]);
+    }
+
+    #[test]
     fn send_env_minus_pattern_removes_earlier_entries() {
         let send =
             |src: &str, host: &str| SshClientConfig::parse(src).unwrap().lookup(host).send_env;
@@ -3357,7 +3385,8 @@ Host *.example.com !secret.example.com
         let src = "Host *\n  SendEnv -LANG\nHost h\n  SendEnv LANG\n";
         assert_eq!(send(src, "h"), ["LANG"]);
         // Two looked-up lists merged (`ssh -o` options over the files'):
-        // each had its removals applied already, the entries add up.
+        // as one sequence, so the lower one's removals reach the upper's
+        // entries (-FOO, BAR, FOO, -BAR).
         let mut first = SshClientConfig::parse("SendEnv -FOO\nSendEnv BAR\n")
             .unwrap()
             .lookup("h");
@@ -3366,7 +3395,7 @@ Host *.example.com !secret.example.com
                 .unwrap()
                 .lookup("h"),
         );
-        assert_eq!(first.send_env, ["BAR", "FOO"]);
+        assert_eq!(first.send_env, ["FOO"]);
     }
 
     #[test]

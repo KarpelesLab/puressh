@@ -932,6 +932,17 @@ fn sftp_err(e: puressh::sftp::SftpError) -> String {
     }
 }
 
+/// The part of a server-supplied mode `-p` applies to a local file or
+/// directory, as OpenSSH's sftp: never setuid or setgid, the sticky bit
+/// on directories only.
+fn local_mode(perm: u32) -> u32 {
+    perm & if perm & S_IFMT == S_IFDIR {
+        0o1777
+    } else {
+        0o777
+    }
+}
+
 /// Mode/times of a remote file applied to a local one (`-p`).
 fn apply_local_attrs(path: &Path, attrs: &Attrs, preserve: bool) {
     if !preserve {
@@ -940,7 +951,7 @@ fn apply_local_attrs(path: &Path, attrs: &Attrs, preserve: bool) {
     #[cfg(unix)]
     if let Some(perm) = attrs.permissions {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(perm & 0o7777));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(local_mode(perm)));
     }
     if let Some((atime, mtime)) = attrs.atime_mtime {
         let at = UNIX_EPOCH + Duration::from_secs(atime.into());
@@ -1318,6 +1329,14 @@ mod tests {
         assert!(!safe_name(b"../x"));
         assert!(!safe_name(b".."));
         assert!(safe_name(b"ok"));
+    }
+
+    #[test]
+    fn preserved_modes_drop_setuid_and_setgid() {
+        // XFER-12.
+        assert_eq!(local_mode(S_IFREG | 0o7755), 0o755);
+        assert_eq!(local_mode(0o6644), 0o644);
+        assert_eq!(local_mode(S_IFDIR | 0o7755), 0o1755);
     }
 
     #[test]

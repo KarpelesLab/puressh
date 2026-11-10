@@ -677,11 +677,12 @@ fn undo_glob_escape(s: &str) -> String {
     out
 }
 
-/// OpenSSH's `escape_glob`: the working directory, made literal for a glob.
+/// OpenSSH's `escape_glob`: the working directory, made literal for a glob
+/// (and for [`brace_expand`]: the server names that directory).
 fn escape_glob(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len() * 2);
     for c in s {
-        if b"[]?*\\".contains(c) {
+        if b"[]?*\\{},".contains(c) {
             out.push(b'\\');
         }
         out.push(*c);
@@ -754,21 +755,58 @@ fn class_end(p: &[u8], i: usize) -> Option<usize> {
         .map(|k| j + k)
 }
 
+/// Most patterns one `ls` argument's braces may expand to.
+const MAX_BRACE_EXPANSIONS: usize = 1024;
+
 /// `glob(3)`'s `GLOB_BRACE`: `a{b,c{d,e}}f` as `abf`, `acdf`, `acef`
-/// (unbalanced braces and `{}` stay literal).
-fn brace_expand(p: &[u8]) -> Vec<Vec<u8>> {
+/// (unbalanced braces and `{}` stay literal). `None` past
+/// [`MAX_BRACE_EXPANSIONS`].
+fn brace_expand(p: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let mut out = Vec::new();
+    // Patterns still to expand, the next one last.
+    let mut todo = vec![p.to_vec()];
+    while let Some(p) = todo.pop() {
+        match first_brace_group(&p) {
+            Some((open, commas, close)) => {
+                let mut alts = Vec::with_capacity(commas.len() + 1);
+                let mut from = open + 1;
+                for end in commas.into_iter().chain([close]) {
+                    let mut alt = p[..open].to_vec();
+                    alt.extend_from_slice(&p[from..end]);
+                    alt.extend_from_slice(&p[close + 1..]);
+                    alts.push(alt);
+                    from = end + 1;
+                }
+                if todo.len() + alts.len() > MAX_BRACE_EXPANSIONS {
+                    return None;
+                }
+                todo.extend(alts.into_iter().rev());
+            }
+            None => {
+                if out.len() >= MAX_BRACE_EXPANSIONS {
+                    return None;
+                }
+                out.push(p);
+            }
+        }
+    }
+    Some(out)
+}
+
+/// The first `{…}` of `p` to expand: its `{`, the top-level commas inside
+/// and its `}`.
+fn first_brace_group(p: &[u8]) -> Option<(usize, Vec<usize>, usize)> {
     if p == b"{}" {
-        return vec![p.to_vec()];
+        return None;
     }
     let mut i = 0;
     while i < p.len() && p[i] != b'{' {
         i += if p[i] == b'\\' { 2 } else { 1 };
     }
     if i >= p.len() {
-        return vec![p.to_vec()];
+        return None;
     }
-    // The matching `}` and the top-level commas between.
-    let (open, mut depth, mut commas, mut close) = (i, 0, Vec::new(), None);
+    let (open, mut depth, mut commas) = (i, 0, Vec::new());
     let mut j = i;
     while j < p.len() {
         match p[j] {
@@ -779,27 +817,14 @@ fn brace_expand(p: &[u8]) -> Vec<Vec<u8>> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    close = Some(j);
-                    break;
+                    return Some((open, commas, j));
                 }
             }
             _ => {}
         }
         j += 1;
     }
-    let Some(close) = close else {
-        return vec![p.to_vec()];
-    };
-    let mut out = Vec::new();
-    let mut from = open + 1;
-    for end in commas.into_iter().chain([close]) {
-        let mut alt = p[..open].to_vec();
-        alt.extend_from_slice(&p[from..end]);
-        alt.extend_from_slice(&p[close + 1..]);
-        out.extend(brace_expand(&alt));
-        from = end + 1;
-    }
-    out
+    None
 }
 
 /// OpenSSH's `argv_split` for `-D`: words with `'`/`"` quoting and `\`
@@ -1380,15 +1405,21 @@ impl Session {
 
     /// `ls`'s glob, which also expands `{a,b}` (`GLOB_BRACE`): each
     /// alternative is a pattern of its own.
-    fn glob_brace(&mut self, pattern: &[u8]) -> Glob {
+    fn glob_brace(&mut self, pattern: &[u8]) -> Result<Glob, String> {
+        let patterns = brace_expand(pattern).ok_or_else(|| {
+            format!(
+                "Can't ls: \"{}\": too many brace alternatives",
+                lossy(pattern)
+            )
+        })?;
         let mut g = Glob::default();
-        for p in brace_expand(pattern) {
+        for p in patterns {
             let one = self.glob(&p, true, true);
             g.matched += one.matched;
             g.paths.extend(one.paths);
             g.stats.extend(one.stats);
         }
-        g
+        Ok(g)
     }
 
     /// Transfer options for one file.
@@ -1978,7 +2009,7 @@ impl Session {
     /// `ls path` (OpenSSH's `do_globbed_ls`): the matches of a pattern, or
     /// a single directory's contents.
     fn do_globbed_ls(&mut self, path: &[u8], strip: Option<&[u8]>, lflag: u32) -> Res {
-        let g = self.glob_brace(path);
+        let g = self.glob_brace(path)?;
         if g.matched == 0 {
             return Err(format!("Can't ls: \"{}\" not found", lossy(path)));
         }
@@ -3246,6 +3277,7 @@ mod tests {
         assert_eq!(basename(b"/r/dir/"), b"dir");
         assert_eq!(basename(b"/"), b"/");
         assert_eq!(escape_glob(b"/a*b"), b"/a\\*b");
+        assert_eq!(escape_glob(b"/{a,b}"), b"/\\{a\\,b\\}");
         assert_eq!(make_absolute(b"x", b"/h"), b"/h/x");
         assert_eq!(
             argv_split("srv -d '/a b' x\\ y #c"),
@@ -3258,6 +3290,7 @@ mod tests {
     fn braces() {
         let e = |p: &str| -> Vec<String> {
             brace_expand(p.as_bytes())
+                .unwrap()
                 .iter()
                 .map(|v| lossy(v))
                 .collect()
@@ -3268,6 +3301,35 @@ mod tests {
         assert_eq!(e("{}"), ["{}"]);
         assert_eq!(e("a{b"), ["a{b"]);
         assert_eq!(e("a\\{b,c}"), ["a\\{b,c}"]);
+    }
+
+    /// XFER-14: the server names the working directory that a pattern is
+    /// put under; its braces are not ours to expand, and no pattern may
+    /// expand without end.
+    #[test]
+    fn braces_are_bounded_and_not_the_servers() {
+        let pwd = "/{a,a}".repeat(40);
+        let pattern = make_absolute(b"x{1,2}", &escape_glob(pwd.as_bytes()));
+        let expanded = brace_expand(&pattern).unwrap();
+        assert_eq!(expanded.len(), 2);
+        // What is globbed is still the directory's real name.
+        assert_eq!(
+            transfer::unescape(&expanded[0]),
+            format!("{pwd}/x1").into_bytes()
+        );
+        assert!(!transfer::has_glob(&expanded[0]));
+
+        assert_eq!(
+            brace_expand("{a,b}".repeat(10).as_bytes()).unwrap().len(),
+            1024
+        );
+        assert!(brace_expand("{a,b}".repeat(11).as_bytes()).is_none());
+        assert!(brace_expand("{a,a}".repeat(40).as_bytes()).is_none());
+        // Deep, but not many.
+        assert_eq!(
+            brace_expand("{a}".repeat(5000).as_bytes()).unwrap(),
+            ["a".repeat(5000).into_bytes()]
+        );
     }
 
     #[test]

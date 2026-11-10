@@ -308,7 +308,10 @@ pub fn parse_match_line(
 /// `group`, `address`, `localaddress`, and `localport` criteria, and rejects
 /// the client-only criteria (`host`, `originalhost`, `localuser`) plus
 /// `rdomain` / `connection` as [`ConfigError::Unsupported`] — they have no
-/// server-side meaning in puressh.
+/// server-side meaning in puressh. `exec`, `canonical` and `final`, which
+/// could never be true there, are refused the same way, and so is an
+/// `address` / `localaddress` entry of the form `addr/len` that is not a
+/// CIDR: none of them may leave a block silently unenforced.
 pub fn parse_match_line_server(
     args: &[String],
     line_no: usize,
@@ -400,6 +403,17 @@ fn parse_match_line_impl(
                 out.push(MatchCondition::All);
                 i += 1;
             }
+            // Client criteria that could never be true in the daemon: `exec`
+            // is not run there, and it has no canonicalisation or final
+            // pass. Accepting them would leave the block they guard silently
+            // unenforced, so they are refused, as OpenSSH's sshd refuses
+            // them.
+            "exec" | "canonical" | "final" if server => {
+                return Err(ConfigError::Unsupported {
+                    line: line_no,
+                    msg: alloc::format!("Match {kw} is not valid in sshd_config"),
+                });
+            }
             "canonical" => {
                 out.push(MatchCondition::Canonical);
                 i += 1;
@@ -454,6 +468,24 @@ fn parse_match_line_impl(
             "address" | "localaddress" if server => {
                 let raw = take_raw_arg(args, &mut i, &kw, line_no)?;
                 let patterns = parse_address_list(&raw);
+                // `addr/len` that is not a CIDR (`10.0.0.0/33`,
+                // `10.0.0.0/255.0.0.0`) would otherwise become a glob over
+                // the address text that matches nothing: the block it
+                // guards would silently never apply. OpenSSH refuses the
+                // configuration.
+                if let Some(bad) = raw
+                    .split(',')
+                    .filter(|t| !t.is_empty())
+                    .zip(&patterns)
+                    .find(|(t, p)| t.contains('/') && matches!(p.kind, AddressKind::Glob(_)))
+                    .map(|(t, _)| t)
+                {
+                    return Err(ConfigError::BadValue {
+                        line: line_no,
+                        keyword: "match".to_string(),
+                        msg: alloc::format!("Match {kw}: invalid address/mask {bad:?}"),
+                    });
+                }
                 if kw == "address" {
                     out.push(MatchCondition::Address(patterns));
                 } else {
@@ -839,6 +871,86 @@ mod tests {
                 "{kw}: got {err:?}"
             );
         }
+    }
+
+    #[test]
+    fn server_rejects_never_true_criteria() {
+        // SSHD-17: `exec`, `canonical` and `final` can never hold in sshd;
+        // a block guarded by one must not be accepted and then ignored.
+        for args in [
+            vec!["exec", "true"],
+            vec!["exec=true"],
+            vec!["canonical"],
+            vec!["final"],
+            vec!["user", "alice", "final"],
+            vec!["all", "canonical"],
+            vec!["address", "10.0.0.0/8", "exec", "/bin/true"],
+        ] {
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            let err = parse_match_line_server(&args, 9).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Unsupported { line: 9, .. })
+                    || matches!(err, ConfigError::BadValue { line: 9, .. }),
+                "{args:?}: got {err:?}"
+            );
+        }
+        // The client keeps all three.
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_match_line(&s(&["canonical"]), 1).unwrap(),
+            vec![MatchCondition::Canonical]
+        );
+        assert_eq!(
+            parse_match_line(&s(&["final"]), 1).unwrap(),
+            vec![MatchCondition::Final]
+        );
+        assert_eq!(
+            parse_match_line(&s(&["exec", "true"]), 1).unwrap(),
+            vec![MatchCondition::Exec("true".to_string())]
+        );
+    }
+
+    #[test]
+    fn server_rejects_malformed_address_masks() {
+        // SSHD-17: not a CIDR, and not to be taken for a glob.
+        for kw in ["address", "localaddress"] {
+            for bad in [
+                "10.0.0.0/33",
+                "10.0.0.0/255.0.0.0",
+                "2001:db8::/129",
+                "10.0.0.0/",
+                "/8",
+                "10.0.0.0/8,10.1.0.0/40",
+                "!10.0.0.0/99",
+                "10.0.0.*/8",
+            ] {
+                let err =
+                    parse_match_line_server(&[kw.to_string(), bad.to_string()], 6).unwrap_err();
+                assert!(
+                    matches!(err, ConfigError::BadValue { line: 6, .. }),
+                    "{kw} {bad}: got {err:?}"
+                );
+            }
+            // CIDRs, bare addresses, globs and negations are as before.
+            for good in [
+                "10.0.0.0/8",
+                "10.0.0.0/0",
+                "192.0.2.7",
+                "2001:db8::/32",
+                "::1",
+                "192.0.2.*",
+                "10.0.0.0/8,!10.1.2.3,192.0.2.?",
+                "!10.0.0.0/8,*",
+            ] {
+                parse_match_line_server(&[kw.to_string(), good.to_string()], 6)
+                    .unwrap_or_else(|e| panic!("{kw} {good}: {e:?}"));
+            }
+        }
+        // The lenient parser itself is unchanged.
+        assert!(matches!(
+            AddressPattern::parse("10.0.0.0/33").kind,
+            AddressKind::Glob(_)
+        ));
     }
 
     #[test]

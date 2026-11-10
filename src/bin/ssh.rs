@@ -5887,15 +5887,16 @@ fn run_mux_forwarding(
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("ssh: -D accept on :{listen_port}: {e}");
+                        thread::sleep(ACCEPT_RETRY_DELAY);
                         continue;
                     }
                 };
                 let mux_path = mux_path.clone();
                 thread::spawn(move || {
-                    let target = match socks::handshake(&mut tcp) {
+                    let target = match socks_handshake_tcp(&mut tcp) {
                         Ok(t) => t,
                         Err(e) => {
-                            eprintln!("ssh: -D handshake: {e}");
+                            report_socks_handshake_error(&e);
                             return;
                         }
                     };
@@ -7833,6 +7834,77 @@ fn bind_unix_listener(_path: &str) -> std::io::Result<()> {
     ))
 }
 
+/// How long a client of a `-D` listener has to send its whole SOCKS
+/// request. Without a bound, a connection that says nothing holds its
+/// thread and descriptor for as long as it likes.
+const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The pause after a failed `accept` on a forwarding listener: the usual
+/// cause (no descriptors left) does not go away by retrying at once, which
+/// would spin and flood stderr.
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A TCP stream whose reads fail once a deadline has passed, however the
+/// peer spaces its bytes (a per-read timeout alone restarts with each one).
+struct DeadlineStream<'a> {
+    tcp: &'a mut TcpStream,
+    until: std::time::Instant,
+}
+
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self
+            .until
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::from(ErrorKind::TimedOut))?;
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// [`puressh::forwarding::socks::handshake`] on an accepted connection,
+/// given [`SOCKS_HANDSHAKE_TIMEOUT`] in all; the stream is left without a
+/// read timeout for the splice that follows.
+fn socks_handshake_tcp(
+    tcp: &mut TcpStream,
+) -> Result<puressh::forwarding::socks::SocksTarget, puressh::forwarding::socks::SocksError> {
+    socks_handshake_within(tcp, SOCKS_HANDSHAKE_TIMEOUT)
+}
+
+fn socks_handshake_within(
+    tcp: &mut TcpStream,
+    limit: std::time::Duration,
+) -> Result<puressh::forwarding::socks::SocksTarget, puressh::forwarding::socks::SocksError> {
+    let result = puressh::forwarding::socks::handshake(&mut DeadlineStream {
+        tcp: &mut *tcp,
+        until: std::time::Instant::now() + limit,
+    });
+    tcp.set_read_timeout(None)?;
+    result
+}
+
+/// Report a failed `-D` SOCKS handshake. A client that merely never sent
+/// its request is only worth a debug line.
+fn report_socks_handshake_error(e: &puressh::forwarding::socks::SocksError) {
+    use puressh::forwarding::socks::SocksError;
+    match e {
+        SocksError::Io(io) if matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            vlog(1, "-D handshake: timed out waiting for the SOCKS request")
+        }
+        _ => eprintln!("ssh: -D handshake: {e}"),
+    }
+}
+
 /// Per-`-D` SOCKS accept loop. Each accepted TCP connection runs the SOCKS
 /// handshake ([`puressh::forwarding::socks::handshake`]) to learn the CONNECT
 /// target, opens a `direct-tcpip` channel to it on the shared connection,
@@ -7855,6 +7927,7 @@ fn spawn_dynamic_forward_listener(
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("ssh: -D accept on :{listen_port}: {e}");
+                    thread::sleep(ACCEPT_RETRY_DELAY);
                     continue;
                 }
             };
@@ -7862,12 +7935,12 @@ fn spawn_dynamic_forward_listener(
             // One thread per connection: the SOCKS handshake reads from the
             // socket and must not block the accept loop.
             thread::spawn(move || {
-                let target = match socks::handshake(&mut tcp) {
+                let target = match socks_handshake_tcp(&mut tcp) {
                     Ok(t) => t,
                     Err(e) => {
                         // Unsupported/protocol errors already wrote any reply
                         // the protocol allows; just log and drop.
-                        eprintln!("ssh: -D handshake: {e}");
+                        report_socks_handshake_error(&e);
                         return;
                     }
                 };
@@ -8861,6 +8934,62 @@ mod extra_o_tests {
         assert_eq!(cli.proxy_jump.as_deref(), Some("a"));
         assert_eq!(o.proxy_jump.as_deref(), Some("a"));
         assert_eq!(o.proxy_command, None);
+    }
+
+    /// A `-D` client gets a bounded time for its whole SOCKS request,
+    /// silent or trickling, and a served one is left without a timeout.
+    #[test]
+    fn socks_handshake_is_bounded() {
+        use puressh::forwarding::socks::SocksError;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let timed_out = |r: Result<_, SocksError>| match r {
+            Err(SocksError::Io(e)) => {
+                matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+            }
+            Ok::<puressh::forwarding::socks::SocksTarget, _>(_) | Err(_) => false,
+        };
+        // Says nothing.
+        let _silent = TcpStream::connect(addr).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        let start = Instant::now();
+        assert!(timed_out(socks_handshake_within(
+            &mut tcp,
+            Duration::from_millis(150)
+        )));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Sends a byte now and then, never the whole request: the bound is
+        // on the handshake, not on each read.
+        let mut slow = TcpStream::connect(addr).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        let feeder = thread::spawn(move || {
+            // SOCKS5, 255 methods, then method bytes one at a time.
+            let _ = slow.write_all(&[5, 255]);
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(40));
+                if slow.write_all(&[9]).is_err() {
+                    break;
+                }
+            }
+        });
+        let start = Instant::now();
+        assert!(timed_out(socks_handshake_within(
+            &mut tcp,
+            Duration::from_millis(300)
+        )));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        drop(tcp);
+        let _ = feeder.join();
+        // A proper request is served, and the timeout is gone afterwards.
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        client
+            .write_all(&[5, 1, 0, 5, 1, 0, 1, 192, 0, 2, 7, 0, 80])
+            .unwrap();
+        let target = socks_handshake_within(&mut tcp, Duration::from_secs(10)).unwrap();
+        assert_eq!((target.host.as_str(), target.port), ("192.0.2.7", 80));
+        assert_eq!(tcp.read_timeout().unwrap(), None);
     }
 
     #[test]

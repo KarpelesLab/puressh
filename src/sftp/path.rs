@@ -75,7 +75,9 @@ pub fn resolve_in(
     let s = std::str::from_utf8(raw).map_err(|_| SftpError::status(FxpStatus::BadMessage))?;
     let p = Path::new(s);
 
-    let joined = if p.is_absolute() {
+    // `has_root`, not `is_absolute`: SFTP paths are POSIX paths, and on
+    // Windows `/a/b` has a root but, lacking a drive, is not "absolute".
+    let joined = if p.has_root() {
         match root {
             Some(jail) if jail_relative => {
                 let clean = lexically_clean(p);

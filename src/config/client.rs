@@ -98,13 +98,15 @@ pub enum AddressFamily {
 }
 
 /// `KnockMode` value — when the client falls back to the puressh UDP knock
-/// (`docs/knock.md`).
+/// (`docs/knock.md`). Unset means `no`: a knock discloses the user name,
+/// key fingerprint and sig1 to whoever is listening, so it is sent only to
+/// hosts configured for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum KnockSetting {
-    /// `no`: plain TCP only.
+    /// `no` (default): plain TCP only.
     No,
-    /// `auto` (default): knock when the TCP connect is refused or slow.
+    /// `auto`: knock when the TCP connect is refused or slow.
     Auto,
     /// `always`: knock straight away, no plain TCP attempt.
     Always,

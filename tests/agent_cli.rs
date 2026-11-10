@@ -111,6 +111,52 @@ fn user_directory_socket() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// A daemonized agent signalled as soon as its pid is announced still
+/// removes its socket: the signal must not land before its handlers.
+#[test]
+fn daemonized_agent_killed_at_once_removes_its_socket() {
+    let base = tempdir("daemon");
+    let spec = format!("user:{}", base.display());
+    for _ in 0..20 {
+        let out = Command::new(AGENT)
+            .args(["-A", &spec])
+            .env_remove("SHELL")
+            .stdin(Stdio::null())
+            .stderr(Stdio::inherit())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        let mut lines = text.lines();
+        let sock = sock_of(lines.next().unwrap());
+        let pid = lines
+            .next()
+            .and_then(|l| l.strip_prefix("SSH_AGENT_PID="))
+            .and_then(|l| l.split(';').next())
+            .expect("SSH_AGENT_PID line")
+            .to_string();
+        let killed = Command::new("kill").arg(&pid).status().unwrap();
+        assert!(killed.success());
+        // The agent is not our child; wait for it to be gone.
+        let mut gone = false;
+        for _ in 0..100 {
+            let probe = Command::new("kill")
+                .args(["-0", &pid])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap();
+            if !probe.success() {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(gone, "agent {pid} did not exit");
+        assert!(!sock.exists(), "{} left behind", sock.display());
+    }
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 /// Backdate `path` by two hours (sockets cannot be opened to set it).
 fn age(path: &Path) {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();

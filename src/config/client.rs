@@ -446,7 +446,9 @@ pub struct ClientOptions {
     /// honoring time, first wins).
     pub set_env: Vec<(String, String)>,
     /// `SendEnv` — environment-variable name patterns; matching local env
-    /// vars are forwarded via `env` requests (cumulative).
+    /// vars are forwarded via `env` requests (cumulative). A `-PATTERN`
+    /// entry removes the patterns obtained before it that PATTERN matches,
+    /// as in OpenSSH; a looked-up list holds the patterns left.
     pub send_env: Vec<String>,
     /// `ConnectTimeout` — TCP connect timeout in seconds. `0` is rejected.
     pub connect_timeout: Option<u32>,
@@ -1027,7 +1029,12 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
                     let applied = apply_keyword(&mut parsed, &line);
                     if applied.is_ok() {
                         let current = blocks.last_mut().expect("global block always present");
+                        // A block keeps its `SendEnv` entries as written:
+                        // what a `-PATTERN` removes depends on the blocks
+                        // matched before this one, known at lookup only.
+                        let send_env = core::mem::take(&mut parsed.send_env);
                         merge_into(current.opts_mut(), &parsed);
+                        current.opts_mut().send_env.extend(send_env);
                     }
                     match applied {
                         // `IgnoreUnknown`: unknown keywords matching its
@@ -2062,7 +2069,17 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     if dst.set_env.is_empty() {
         dst.set_env.extend(src.set_env.iter().cloned());
     }
-    dst.send_env.extend(src.send_env.iter().cloned());
+    // `SendEnv` adds up, in the order obtained; a `-PATTERN` entry takes
+    // out the patterns obtained before it whose text PATTERN matches
+    // (OpenSSH's rm_env), and is not kept itself.
+    for pat in &src.send_env {
+        match pat.strip_prefix('-') {
+            Some(remove) => dst
+                .send_env
+                .retain(|have| !super::glob::glob_match(remove, have)),
+            None => dst.send_env.push(pat.clone()),
+        }
+    }
 }
 
 fn one_arg(line: &ParsedLine) -> Result<String, ConfigError> {
@@ -3311,6 +3328,45 @@ Host *.example.com !secret.example.com
         let src = "Host gw\n  SendEnv LANG LC_*\n  SendEnv TERM\n";
         let cfg = SshClientConfig::parse(src).unwrap();
         assert_eq!(cfg.lookup("gw").send_env, vec!["LANG", "LC_*", "TERM"]);
+    }
+
+    /// `SendEnv -PATTERN` removes the patterns obtained before it (OpenSSH's
+    /// rm_env: PATTERN is a glob over their text), not the ones after.
+    #[test]
+    fn send_env_minus_pattern_removes_earlier_entries() {
+        let send =
+            |src: &str, host: &str| SshClientConfig::parse(src).unwrap().lookup(host).send_env;
+        // Within a block, and on one line.
+        assert_eq!(
+            send("SendEnv LANG LC_* TERM\nSendEnv -LC_*\n", "h"),
+            ["LANG", "TERM"]
+        );
+        assert_eq!(send("SendEnv LANG LC_ALL -L* TERM\n", "h"), ["TERM"]);
+        // `-*` stops everything obtained so far.
+        assert!(send("SendEnv LANG LC_*\nSendEnv -*\n", "h").is_empty());
+        // A later entry is not affected: only what was accumulated is.
+        assert_eq!(send("SendEnv -*\nSendEnv LANG\n", "h"), ["LANG"]);
+        assert_eq!(send("SendEnv -LANG\nSendEnv LANG\n", "h"), ["LANG"]);
+        // PATTERN is matched against the entries' text, not the other way.
+        assert_eq!(send("SendEnv LC_*\nSendEnv -LC_ALL\n", "h"), ["LC_*"]);
+        assert_eq!(send("SendEnv LC_ALL\nSendEnv -LC_?LL\n", "h"), [""; 0]);
+        // Across blocks, in the order they are matched.
+        let src = "Host h\n  SendEnv AWS_* LANG\nHost *\n  SendEnv -AWS_* -NOPE\n  SendEnv TERM\n";
+        assert_eq!(send(src, "h"), ["LANG", "TERM"]);
+        assert_eq!(send(src, "other"), ["TERM"]);
+        let src = "Host *\n  SendEnv -LANG\nHost h\n  SendEnv LANG\n";
+        assert_eq!(send(src, "h"), ["LANG"]);
+        // Two looked-up lists merged (`ssh -o` options over the files'):
+        // each had its removals applied already, the entries add up.
+        let mut first = SshClientConfig::parse("SendEnv -FOO\nSendEnv BAR\n")
+            .unwrap()
+            .lookup("h");
+        first.merge_lower(
+            &SshClientConfig::parse("SendEnv FOO -BAR\n")
+                .unwrap()
+                .lookup("h"),
+        );
+        assert_eq!(first.send_env, ["BAR", "FOO"]);
     }
 
     #[test]

@@ -778,7 +778,9 @@ impl Progress {
     pub fn new(name: &str, total: u64, start: u64, enabled: bool) -> Self {
         let now = Instant::now();
         let mut p = Self {
-            name: name.to_string(),
+            // Often the server's name for the file: no control characters
+            // on the terminal.
+            name: sanitize(name),
             start_pos: start,
             end_pos: total,
             cur_pos: 0,
@@ -1065,7 +1067,7 @@ fn download_at<T: Read + Write>(
             let child_remote = remote_join(remote, &name);
             let child_local = local.join(String::from_utf8_lossy(&name).as_ref());
             if let Err(e) = download_at(sftp, &child_remote, &child_local, opts, depth + 1) {
-                eprintln!("{e}");
+                eprintln!("{}", sanitize(&e));
                 first_err.get_or_insert(e);
             }
         }
@@ -1329,6 +1331,13 @@ mod tests {
         assert!(!safe_name(b"../x"));
         assert!(!safe_name(b".."));
         assert!(safe_name(b"ok"));
+    }
+
+    #[test]
+    fn meter_name_has_no_control_characters() {
+        // XFER-13: the name is the server's.
+        let p = Progress::new("a\x1b[2J\rb\u{9b}c", 1, 0, false);
+        assert_eq!(p.name, "a?[2J?b?c");
     }
 
     #[test]

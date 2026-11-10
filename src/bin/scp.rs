@@ -392,15 +392,21 @@ fn local_target(target: &Path, name: &str, many: bool) -> Result<PathBuf, String
 
 /// Report an error OpenSSH-style and remember that one happened.
 fn fail(errs: &mut u32, msg: impl std::fmt::Display) {
+    eprintln!("scp: {}", fail_text(&msg.to_string()));
+    *errs += 1;
+}
+
+/// An error message as [`fail`] prints it.
+fn fail_text(msg: &str) -> String {
     // Without Rust's ` (os error N)`: OpenSSH says `No such file or
     // directory`.
-    let msg = msg.to_string();
     let msg = match msg.find(" (os error ") {
         Some(i) if msg.ends_with(')') => &msg[..i],
-        _ => &msg,
+        _ => msg,
     };
-    eprintln!("scp: {msg}");
-    *errs += 1;
+    // Status messages, remote paths and the legacy protocol's error text
+    // are the server's: no control characters on the terminal.
+    transfer::sanitize(msg)
 }
 
 fn upload_sftp(cli: &Cli, sources: &[String], to: &Remote, errs: &mut u32) {
@@ -1041,6 +1047,19 @@ mod tests {
         assert_eq!(strtonum("0", 1, 9), Err("too small"));
         assert_eq!(strtonum("10", 1, 9), Err("too large"));
         assert_eq!(strtonum("x", 1, 9), Err("invalid"));
+    }
+
+    #[test]
+    fn error_messages_have_no_control_characters() {
+        // XFER-13.
+        assert_eq!(
+            super::fail_text("scp: remote error: x\x1b[2J\r\u{9b}y"),
+            "scp: remote error: x?[2J??y"
+        );
+        assert_eq!(
+            super::fail_text("f: No such file or directory (os error 2)"),
+            "f: No such file or directory"
+        );
     }
 
     fn pats(p: &str) -> Option<Vec<String>> {

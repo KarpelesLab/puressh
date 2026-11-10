@@ -545,6 +545,12 @@ fn safe_display(b: &[u8]) -> String {
     lossy(&scrubbed)
 }
 
+/// A user or group name the server gave for an id, for `ls -l`: it goes to
+/// the terminal, so without control characters.
+fn owner_name(b: &[u8]) -> String {
+    transfer::sanitize(&safe_display(b))
+}
+
 /// Split a command line as OpenSSH's sftp (`makeargv`): whitespace
 /// separates words, `'…'` and `"…"` quote, `\` escapes, `#` starts a
 /// comment outside quotes. Glob characters stay escaped (`\*`) where they
@@ -1874,12 +1880,12 @@ impl Session {
             Ok((un, gn)) => {
                 for (id, n) in uids.iter().zip(un) {
                     if !n.is_empty() {
-                        self.users.insert(*id, lossy(&n));
+                        self.users.insert(*id, owner_name(&n));
                     }
                 }
                 for (id, n) in gids.iter().zip(gn) {
                     if !n.is_empty() {
-                        self.groups.insert(*id, lossy(&n));
+                        self.groups.insert(*id, owner_name(&n));
                     }
                 }
             }
@@ -2142,9 +2148,10 @@ impl Session {
             };
             if !self.quiet {
                 println!(
-                    "{} {} to {abs_dst}",
+                    "{} {} to {}",
                     if resume { "Resuming" } else { "Fetching" },
-                    safe_display(path)
+                    safe_display(path),
+                    safe_display(abs_dst.as_bytes())
                 );
             }
             let ok = if path.ends_with(b"/") && recurse {
@@ -3266,6 +3273,10 @@ mod tests {
     #[test]
     fn scrubs_control_bytes() {
         assert_eq!(safe_display(b"a\x1b[31mb\n"), "a?[31mb?");
+        // XFER-13: owner names from users-groups-by-id, C1 controls too.
+        assert_eq!(owner_name(b"ro\x1b]0;x\x07ot"), "ro?]0;x?ot");
+        assert_eq!(owner_name("a\u{9b}31mb".as_bytes()), "a?31mb");
+        assert_eq!(owner_name(b"daemon"), "daemon");
     }
 
     #[test]

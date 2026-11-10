@@ -182,3 +182,68 @@ fn test_mode_checks_the_host_keys() {
     assert!(!out.status.success());
     assert!(out.stdout.is_empty());
 }
+
+/// `sshd -i` with the client's socket as stdin, stdout and stderr (as a
+/// classic inetd hands it over), failing on `config`: what the client reads.
+fn inetd_on_one_socket(config: &str, extra: &[&str]) -> Vec<u8> {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    let dir = std::env::temp_dir().join(format!("puressh-sshd-dump-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    static N: AtomicUsize = AtomicUsize::new(0);
+    let path = dir.join(format!(
+        "inetd_config.{}",
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, config).unwrap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let fd = || std::process::Stdio::from(std::os::fd::OwnedFd::from(server.try_clone().unwrap()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_sshd"))
+        .arg("-i")
+        .args(extra)
+        .arg("-f")
+        .arg(&path)
+        .stdin(fd())
+        .stdout(fd())
+        .stderr(fd())
+        .spawn()
+        .unwrap();
+    drop(server);
+    assert!(!child.wait().unwrap().success());
+    let mut seen = Vec::new();
+    client.read_to_end(&mut seen).unwrap();
+    seen
+}
+
+#[test]
+fn inetd_keeps_diagnostics_off_the_client_socket() {
+    // SSHD-15: in `-i` mode stderr may be the client's connection. A fatal
+    // error must not be written to it.
+    let bad = "NoSuchKeywordAtAll yes\n";
+    let seen = inetd_on_one_socket(bad, &[]);
+    assert!(
+        seen.is_empty(),
+        "the client was sent {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // A bad command line is caught just the same.
+    let seen = inetd_on_one_socket("", &["--no-such-flag"]);
+    assert!(
+        seen.is_empty(),
+        "the client was sent {:?}",
+        String::from_utf8_lossy(&seen)
+    );
+    // Asked for with `-e`, stderr is used wherever it points.
+    let seen = inetd_on_one_socket(bad, &["-e"]);
+    assert!(!seen.is_empty());
+}
+
+#[test]
+fn inetd_leaves_a_separate_stderr_alone() {
+    // Stderr that is not the client's connection (a pipe here; a terminal,
+    // or the journal under systemd) still gets the error.
+    let out = run("NoSuchKeywordAtAll yes\n", &["-i"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(!out.stderr.is_empty());
+}

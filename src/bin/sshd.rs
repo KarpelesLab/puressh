@@ -9035,6 +9035,48 @@ mod imp {
         }
     }
 
+    /// Whether fds `a` and `b` are one and the same socket (the same
+    /// device and inode), as when inetd hands the client's connection to a
+    /// server as its stdin, stdout and stderr.
+    fn same_socket(a: std::os::fd::RawFd, b: std::os::fd::RawFd) -> bool {
+        let stat = |fd: std::os::fd::RawFd| {
+            // SAFETY: fstat fills a local, zero-initialised struct; a bad fd
+            // is reported as an error.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                (libc::fstat(fd, &mut st) == 0).then_some(st)
+            }
+        };
+        match (stat(a), stat(b)) {
+            (Some(x), Some(y)) => {
+                x.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                    && y.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                    && x.st_dev == y.st_dev
+                    && x.st_ino == y.st_ino
+            }
+            _ => false,
+        }
+    }
+
+    /// Stderr was pointed at /dev/null ([`mute_stderr`]): a fatal error is
+    /// reported to syslog instead.
+    static STDERR_MUTED: AtomicBool = AtomicBool::new(false);
+
+    /// Point stderr at /dev/null for the rest of the process's life. If
+    /// that cannot be done the process ends: it must not go on to write to
+    /// what stderr was.
+    fn mute_stderr() {
+        let muted = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .is_ok_and(|null| nix::unistd::dup2_stderr(&null).is_ok());
+        if !muted {
+            // SAFETY: _exit ends the process at once, writing nothing.
+            unsafe { libc::_exit(255) };
+        }
+        STDERR_MUTED.store(true, Ordering::Relaxed);
+    }
+
     fn run() -> Result<i32, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.iter().any(|a| a == "-?" || a == "--help") {
@@ -9048,7 +9090,21 @@ mod imp {
             return Ok(0);
         }
 
-        let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+        let cli = parse_args(&args);
+        // `-i` from a classic inetd: stderr is the client's connection, as
+        // stdin and stdout are. Nothing may be written there but the
+        // protocol (a diagnostic would both corrupt the stream and tell the
+        // peer about this host), so stderr goes to /dev/null unless it was
+        // asked for (`-d`, `-e`, `-t`). A stderr that is anything else (a
+        // terminal, a pipe, the journal's own socket) is left alone.
+        let (inetd, wants_stderr) = match &cli {
+            Ok(cli) => (cli.inetd, cli.debug || cli.log_stderr || cli.test_only),
+            Err(_) => (args.iter().any(|a| a == "-i"), false),
+        };
+        if inetd && !wants_stderr && same_socket(0, 2) {
+            mute_stderr();
+        }
+        let cli = cli.map_err(|e| format!("{e}\n{USAGE}"))?;
 
         // `-E file`: append diagnostics to `file` from here on.
         if let Some(path) = cli.log_file.as_deref() {
@@ -10279,6 +10335,21 @@ mod imp {
             }
             Err(msg) => {
                 eprintln!("sshd: {msg}");
+                // Stderr was the client's connection (`-i`): the system log
+                // is where the administrator will look.
+                if STDERR_MUTED.load(Ordering::Relaxed)
+                    && let Ok(line) = std::ffi::CString::new(format!("fatal: {msg}"))
+                {
+                    // SAFETY: a constant "%s" format with one NUL-terminated
+                    // argument.
+                    unsafe {
+                        libc::syslog(
+                            libc::LOG_AUTH | libc::LOG_CRIT,
+                            c"%s".as_ptr(),
+                            line.as_ptr(),
+                        )
+                    };
+                }
                 ExitCode::from(2)
             }
         }
@@ -10733,6 +10804,27 @@ mod imp {
                 AuthDecision::PartialAccept { .. }
             ));
             assert_eq!(forced(&b).as_deref(), Some("A"));
+        }
+
+        /// SSHD-15: only a stderr that is the very socket on stdin is the
+        /// client's connection.
+        #[test]
+        fn same_socket_tells_the_client_connection_apart() {
+            use std::os::unix::net::UnixStream;
+            let (a, b) = UnixStream::pair().unwrap();
+            let a2 = a.try_clone().unwrap();
+            assert!(same_socket(a.as_raw_fd(), a2.as_raw_fd()));
+            assert!(same_socket(a.as_raw_fd(), a.as_raw_fd()));
+            // The other end is another socket (as the journal's is).
+            assert!(!same_socket(a.as_raw_fd(), b.as_raw_fd()));
+            // Not sockets at all.
+            let (rx, tx) = pipe_cloexec().unwrap();
+            let rx2 = rx.try_clone().unwrap();
+            assert!(!same_socket(rx.as_raw_fd(), rx2.as_raw_fd()));
+            assert!(!same_socket(a.as_raw_fd(), tx.as_raw_fd()));
+            let null = std::fs::File::open("/dev/null").unwrap();
+            assert!(!same_socket(null.as_raw_fd(), null.as_raw_fd()));
+            assert!(!same_socket(a.as_raw_fd(), -1));
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------

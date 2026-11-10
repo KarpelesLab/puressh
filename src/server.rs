@@ -5570,7 +5570,19 @@ fn drain_send(
             data = &data[taken..];
             continue;
         }
-        let pkt = srv_read(stream, driver, None)?;
+        // Out of window: wait for the peer's WINDOW_ADJUST. The connection
+        // loop may have left its polling read timeout armed on the socket;
+        // its expiry only means the peer has not answered yet (as in
+        // `srv_read_maybe_timeout`), not that the connection failed.
+        let pkt = match srv_read(stream, driver, None) {
+            Ok(pkt) => pkt,
+            Err(Error::Io(e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let ev = conn.on_packet(&pkt)?;
         match ev {
             ChannelEvent::WindowAdjust { channel: c, .. } if c == channel => continue,

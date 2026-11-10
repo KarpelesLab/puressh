@@ -63,7 +63,8 @@ pub const DEFAULT_MAX_AUTH_TRIES: u32 = 6;
 /// accept thread, so an authenticated peer must not be able to request an
 /// unbounded number of them.
 pub const DEFAULT_MAX_FORWARD_BINDINGS: usize = 64;
-const MAX_DRAIN_STEPS: usize = 1_000_000;
+/// Largest stderr piece a buffered exec result queues at once.
+const EXEC_STDERR_CHUNK: usize = 32 * 1024;
 
 /// Bound on the per-subsystem egress queue. Handlers self-throttle when
 /// the dispatcher can't ship `CHANNEL_DATA` fast enough (remote window
@@ -5465,27 +5466,20 @@ fn run_exec_command(
         let p = conn.send_request_success(channel)?;
         srv_send(stream, driver, &p)?;
     }
-    drain_send(stream, driver, conn, channel, &result.stdout, None)?;
-    drain_send(
-        stream,
-        driver,
-        conn,
-        channel,
-        &result.stderr,
-        Some(SSH_EXTENDED_DATA_STDERR),
-    )?;
-    let p = conn.send_request(
-        channel,
-        ChannelRequest::ExitStatus {
-            code: result.exit_status,
-        },
-        false,
-    )?;
-    srv_send(stream, driver, &p)?;
-    let p = conn.send_eof(channel)?;
-    srv_send(stream, driver, &p)?;
-    let p = conn.send_close(channel)?;
-    srv_send(stream, driver, &p)?;
+    // The output goes out through the connection loop like any stream
+    // handler's, paced by the peer's window, so nothing else on the
+    // connection (other channels, requests, keepalives) waits behind it.
+    start_stream_handler(subsystems, channel, move |mut cs| {
+        // Errors mean the channel is gone; dropping the stream sends EOF
+        // and close either way.
+        let _ = (|| -> std::io::Result<()> {
+            cs.write_all(&result.stdout)?;
+            for chunk in result.stderr.chunks(EXEC_STDERR_CHUNK) {
+                cs.write_stderr(chunk)?;
+            }
+            cs.send_exit_status(result.exit_status)
+        })();
+    });
     Ok(())
 }
 
@@ -5540,57 +5534,6 @@ fn route_internal_sftp(
     } else if want_reply {
         let p = conn.send_request_failure(channel)?;
         srv_send(stream, driver, &p)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn drain_send(
-    stream: &mut TcpStream,
-    driver: &mut ServerDriver,
-    conn: &mut ConnectionState,
-    channel: u32,
-    mut data: &[u8],
-    extended: Option<u32>,
-) -> Result<()> {
-    let mut iter = 0usize;
-    while !data.is_empty() {
-        iter += 1;
-        if iter > MAX_DRAIN_STEPS {
-            return Err(Error::Protocol("drain_send did not converge"));
-        }
-        let (payload, taken) = if let Some(code) = extended {
-            conn.send_extended_data(channel, code, data)?
-        } else {
-            conn.send_data(channel, data)?
-        };
-
-        if taken > 0 {
-            srv_send(stream, driver, &payload)?;
-            data = &data[taken..];
-            continue;
-        }
-        // Out of window: wait for the peer's WINDOW_ADJUST. The connection
-        // loop may have left its polling read timeout armed on the socket;
-        // its expiry only means the peer has not answered yet (as in
-        // `srv_read_maybe_timeout`), not that the connection failed.
-        let pkt = match srv_read(stream, driver, None) {
-            Ok(pkt) => pkt,
-            Err(Error::Io(e))
-                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-            {
-                continue;
-            }
-            Err(e) => return Err(e),
-        };
-        let ev = conn.on_packet(&pkt)?;
-        match ev {
-            ChannelEvent::WindowAdjust { channel: c, .. } if c == channel => continue,
-            ChannelEvent::Close { channel: c } if c == channel => {
-                return Err(Error::BadChannelState);
-            }
-            _ => continue,
-        }
     }
     Ok(())
 }

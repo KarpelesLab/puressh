@@ -19,6 +19,24 @@ USAGE
 	exit 1
 }
 
+# Quote one word for the eval that rebuilds the ssh options below: wrapped in
+# single quotes, each embedded one written as '\''. Done in the shell rather
+# than with sed so that newlines and empty values survive as they are.
+quote() {
+	q_rest=$1
+	q_out=
+	while :; do
+		case "$q_rest" in
+		*\'*)
+			q_out="$q_out${q_rest%%\'*}'\\''"
+			q_rest=${q_rest#*\'}
+			;;
+		*) break ;;
+		esac
+	done
+	printf %s "'$q_out$q_rest'"
+}
+
 ID_FILE=
 DRY_RUN=
 TARGET_PATH=.ssh/authorized_keys
@@ -35,8 +53,8 @@ while [ "$1" != --end-- ]; do
 		esac
 		;;
 	-i*) ID_FILE=${1#-i} ;;
-	-p | -F | -o) OPTS="$OPTS $1 $(printf %s "$2" | sed "s/'/'\\\\''/g; s/^/'/; s/\$/'/")"; shift ;;
-	-p* | -F* | -o*) OPTS="$OPTS '$1'" ;;
+	-p | -F | -o) OPTS="$OPTS $1 $(quote "$2")"; shift ;;
+	-p* | -F* | -o*) OPTS="$OPTS $(quote "$1")" ;;
 	-t) TARGET_PATH=$2; shift ;;
 	-f) ;; # remote de-duplication makes force mode the same as normal
 	-n) DRY_RUN=1 ;;
@@ -93,7 +111,7 @@ mkdir -p "$d" && touch "$t" || exit 1
 n=0
 while IFS= read -r k; do
 	[ -n "$k" ] || continue
-	grep -qxF "$k" "$t" && continue
+	grep -qxF -e "$k" "$t" && continue
 	[ -z "$(tail -c1 "$t")" ] || echo >> "$t"
 	printf '%s\n' "$k" >> "$t" || exit 1
 	n=$((n + 1))

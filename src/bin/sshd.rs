@@ -8848,6 +8848,53 @@ mod imp {
         }
     }
 
+    /// How long the accept loop pauses after an `accept()` that failed for
+    /// want of a resource (OpenSSH's 100 ms).
+    const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// The least time between two `accept` error lines in the log.
+    const ACCEPT_ERROR_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// An `accept()` error that says nothing is wrong with the listener and
+    /// leaves nothing queued: interrupted, nothing to accept after all, or
+    /// a connection its peer gave up before it was accepted.
+    fn accept_error_is_transient(e: &std::io::Error) -> bool {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionAborted
+        )
+    }
+
+    /// Rate limit for the accept loop's error line: a condition that lasts
+    /// (EMFILE, ENFILE) fails every pass.
+    #[derive(Default)]
+    struct AcceptErrors {
+        last_logged: Option<std::time::Instant>,
+        suppressed: u64,
+    }
+
+    impl AcceptErrors {
+        /// Note a failed `accept()` at `now`: the line to log, at most one
+        /// per [`ACCEPT_ERROR_LOG_INTERVAL`], saying how many were not.
+        fn note(&mut self, e: &std::io::Error, now: std::time::Instant) -> Option<String> {
+            if self
+                .last_logged
+                .is_some_and(|t| now.saturating_duration_since(t) < ACCEPT_ERROR_LOG_INTERVAL)
+            {
+                self.suppressed += 1;
+                return None;
+            }
+            let more = match std::mem::take(&mut self.suppressed) {
+                0 => String::new(),
+                n => format!(" ({n} more like it not logged)"),
+            };
+            self.last_logged = Some(now);
+            Some(format!("accept: {e}{more}"))
+        }
+    }
+
     /// The daemon parent's table of live connection children, keyed by pid.
     /// Owned by the accept loop; never touched from signal context.
     #[derive(Default)]
@@ -10008,6 +10055,7 @@ mod imp {
         const FORK_BACKOFF_MIN_MS: u64 = 10;
         const FORK_BACKOFF_MAX_MS: u64 = 1_000;
         let mut fork_backoff_ms: u64 = FORK_BACKOFF_MIN_MS;
+        let mut accept_errors = AcceptErrors::default();
 
         // Live connection children: per-IP accounting for `--per-source-max`
         // and the unauthenticated count for `MaxStartups`. Reconciled at the
@@ -10093,16 +10141,25 @@ mod imp {
                 }
                 incoming.push((stream, peer, Some(user)));
             }
+            let mut accept_failed = false;
             for i in ready_listeners {
                 match listeners[i].accept() {
                     Ok((stream, peer)) => incoming.push((stream, peer, None)),
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                        ) => {}
-                    Err(e) => eprintln!("sshd: accept: {e}"),
+                    Err(e) if accept_error_is_transient(&e) => {}
+                    Err(e) => {
+                        accept_failed = true;
+                        if let Some(line) = accept_errors.note(&e, std::time::Instant::now()) {
+                            eprintln!("sshd: {line}");
+                        }
+                    }
                 }
+            }
+            // The connection that could not be accepted (no file
+            // descriptors left, typically) is still queued, and the poll
+            // above is level-triggered: without a pause this loop would
+            // spin, and log, until the condition clears.
+            if accept_failed {
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
             }
 
             // TCPKeepAlive (default yes, as OpenSSH): a peer that vanished
@@ -12111,6 +12168,35 @@ mod imp {
             rec.message(pid, format!("L\t{me}\t/dev/pts/0\troot\t{euid}").as_bytes());
             assert!(rec.logins.is_empty());
             assert_eq!(rec.logins_total, MAX_LOGINS_PER_CONNECTION);
+        }
+
+        /// SSHD-16: a lasting accept() failure is logged at a bounded rate.
+        #[test]
+        fn accept_errors_are_rate_limited() {
+            let emfile = || std::io::Error::from_raw_os_error(libc::EMFILE);
+            assert!(!accept_error_is_transient(&emfile()));
+            assert!(!accept_error_is_transient(
+                &std::io::Error::from_raw_os_error(libc::ENFILE)
+            ));
+            for errno in [libc::EINTR, libc::EAGAIN, libc::ECONNABORTED] {
+                assert!(accept_error_is_transient(
+                    &std::io::Error::from_raw_os_error(errno)
+                ));
+            }
+            let t0 = std::time::Instant::now();
+            let mut errs = AcceptErrors::default();
+            let first = errs.note(&emfile(), t0).expect("first is logged");
+            assert!(first.starts_with("accept: "), "{first}");
+            assert!(!first.contains("more"), "{first}");
+            for ms in 1..=50 {
+                let at = t0 + std::time::Duration::from_millis(ms * 100);
+                assert_eq!(errs.note(&emfile(), at), None);
+            }
+            let later = errs
+                .note(&emfile(), t0 + ACCEPT_ERROR_LOG_INTERVAL)
+                .expect("logged again after the interval");
+            assert!(later.contains("(50 more like it not logged)"), "{later}");
+            assert_eq!(errs.note(&emfile(), t0 + ACCEPT_ERROR_LOG_INTERVAL), None);
         }
 
         #[test]

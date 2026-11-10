@@ -604,30 +604,26 @@ fn decode_stream(
         first_block[3],
     ]);
     let body_len = packet_length as usize;
-    let length_err = if packet_length > MAX_PACKET_LEN {
-        Some("packet length exceeds limit")
-    } else if !(4 + body_len).is_multiple_of(block_size) {
-        Some("packet not block-aligned")
-    } else if 4 + body_len < MIN_TOTAL_LEN {
-        Some("packet too short")
-    } else {
-        None
-    };
-    if let Some(msg) = length_err {
-        // CBC with encrypt-and-MAC: failing at once on a bad decrypted
-        // length is a plaintext-recovery oracle (CVE-2008-5161). Like
-        // OpenSSH, keep reading until MAX_PACKET_LEN bytes have arrived and
-        // only then fail, as a MAC error, so the bad length looks like any
+    let bad_length = packet_length > MAX_PACKET_LEN
+        || !(4 + body_len).is_multiple_of(block_size)
+        || 4 + body_len < MIN_TOTAL_LEN;
+    if bad_length {
+        // Encrypt-and-MAC: failing at once on a bad decrypted length tells
+        // the peer something about the plaintext before the MAC was ever
+        // checked. For CBC that is a plaintext-recovery oracle
+        // (CVE-2008-5161); for CTR, where a flipped ciphertext bit flips
+        // the same plaintext bit, it lets an on-path attacker test guesses
+        // about the encrypted length field one connection at a time. Like
+        // OpenSSH (ssh_packet_start_discard, for every non-ETM, non-AEAD
+        // cipher), keep reading until MAX_PACKET_LEN bytes have arrived and
+        // only then fail, as a MAC error, so a bad length looks like any
         // other forged packet. The first block stays cached, so each call
-        // lands here again without touching the CBC state.
-        if matches!(cipher, SshCipher::Cbc(_)) {
-            if buf.len() < MAX_PACKET_LEN as usize {
-                *pending = Some(first_block);
-                return Ok(None);
-            }
-            return Err(Error::BadMac);
+        // lands here again without touching the cipher state.
+        if buf.len() < MAX_PACKET_LEN as usize {
+            *pending = Some(first_block);
+            return Ok(None);
         }
-        return Err(Error::Protocol(msg));
+        return Err(Error::BadMac);
     }
     let total = 4 + body_len + tag_len;
     if buf.len() < total {
@@ -1059,6 +1055,28 @@ mod tests {
         let mut b = PacketCodec::new();
         b.install_inbound(cipher, Some(mac)).unwrap();
         let wire = vec![0u8; MAX_PACKET_LEN as usize];
+        for cut in [16usize, 17, 4096, MAX_PACKET_LEN as usize - 1] {
+            assert!(b.decode(&wire[..cut]).unwrap().is_none(), "cut={cut}");
+        }
+        assert!(matches!(b.decode(&wire), Err(Error::BadMac)));
+    }
+
+    #[test]
+    fn ctr_eam_bad_length_is_not_an_early_oracle() {
+        // Same for CTR: a forged first block decrypts to a bad length, and
+        // the failure must be deferred and indistinguishable from a MAC
+        // failure, or the attacker learns about the encrypted length.
+        let cipher = cipher_by_name("aes256-ctr", &[0x11u8; 32], &[0x22u8; 16])
+            .unwrap()
+            .unwrap();
+        let mac = mac_by_name("hmac-sha2-256", &[0x55u8; 32]).unwrap();
+        let mut b = PacketCodec::new();
+        b.install_inbound(cipher, Some(mac)).unwrap();
+        // Any ciphertext whose first block decrypts to an over-long length:
+        // with a 0xff.. first block the decrypted length is huge unless the
+        // keystream happens to start with 0xff.. too.
+        let mut wire = vec![0u8; MAX_PACKET_LEN as usize];
+        wire[..4].fill(0xff);
         for cut in [16usize, 17, 4096, MAX_PACKET_LEN as usize - 1] {
             assert!(b.decode(&wire[..cut]).unwrap().is_none(), "cut={cut}");
         }

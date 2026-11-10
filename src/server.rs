@@ -1713,6 +1713,14 @@ impl EffectivePolicy {
         ok(&self.permit_open) && self.cert_caps.as_ref().is_none_or(|c| ok(&c.permit_open))
     }
 
+    /// True iff a `direct-tcpip` open to `(host, port)`, with the port as it
+    /// came off the wire (a uint32), is permitted. A port that is not a TCP
+    /// port (above 65535) never is — not even with `PermitOpen` unset, where
+    /// the key's or certificate's `permitopen=` would otherwise go unasked.
+    fn direct_tcpip_allows(&self, host: &str, port: u32) -> bool {
+        u16::try_from(port).is_ok_and(|p| self.permit_open_allows(host, p))
+    }
+
     /// True iff a `tcpip-forward` bind to `(host, port)` is permitted by
     /// `PermitListen`. Unset ⇒ any; empty list ⇒ none.
     fn permit_listen_allows(&self, host: &str, port: u16) -> bool {
@@ -4155,15 +4163,16 @@ fn dispatch_app_packet(
                 // list excludes this destination, rejects the open even when
                 // a direct-tcpip handler is attached.
                 let forwarding_ok = effective.local_forwarding_allowed();
-                // PermitOpen entries carry u16 ports; a dest_port outside that
-                // range can never match a configured entry (and is only
-                // permitted when PermitOpen is unset / `any`).
-                let dest_ok = u16::try_from(dest_port)
-                    .map(|p| effective.permit_open_allows(&dest_host, p))
-                    .unwrap_or_else(|_| effective.permit_open.is_none());
+                // The port is a uint32 on the wire but only 0..=65535 name a
+                // TCP port: anything else is refused outright, before (and
+                // whatever) `PermitOpen` and the key's `permitopen=` say.
+                let port_ok = u16::try_from(dest_port).is_ok();
+                let dest_ok = effective.direct_tcpip_allows(&dest_host, dest_port);
                 if !forwarding_ok || !dest_ok {
                     let reason = if !forwarding_ok {
                         "local forwarding administratively prohibited"
+                    } else if !port_ok {
+                        "direct-tcpip destination port out of range"
                     } else {
                         "direct-tcpip destination not permitted by PermitOpen"
                     };
@@ -8646,6 +8655,32 @@ mod tests {
         let eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
         assert!(!eff.permit_open_allows("127.0.0.1", 22));
         assert!(!eff.permit_open_allows("anything", 1));
+    }
+
+    /// SRV-15: a `direct-tcpip` port that does not fit a TCP port is refused
+    /// whatever the policy — in particular with `PermitOpen` unset and a
+    /// key-level `permitopen=`, which the out-of-range fallback never asked.
+    #[test]
+    fn direct_tcpip_port_out_of_range_is_refused() {
+        let cfg = policy_cfg("Port 22\n");
+        let mut eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert!(eff.direct_tcpip_allows("127.0.0.1", 80));
+        assert!(eff.direct_tcpip_allows("127.0.0.1", 65535));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536 + 80));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", u32::MAX));
+
+        let mut caps = crate::auth::AuthCertCaps::unrestricted();
+        caps.permit_open = Some(vec![crate::config::HostPort {
+            host: "127.0.0.1".into(),
+            port: Some(80),
+        }]);
+        fold_cert_caps(&mut eff, caps);
+        assert!(eff.permit_open.is_none(), "config PermitOpen stays unset");
+        assert!(eff.direct_tcpip_allows("127.0.0.1", 80));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 81));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536 + 80));
     }
 
     #[test]

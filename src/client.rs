@@ -225,6 +225,13 @@ const SERVE_INGRESS_BACKLOG: usize = 32;
 /// (which would stall the channel forever on a chatty stderr) the buffer
 /// keeps only the most recent `STREAM_STDERR_CAP` bytes.
 const STREAM_STDERR_CAP: usize = 1024 * 1024;
+/// Floor of the cap on the unread channel data a [`ClientChannelStream`]
+/// buffers while a `write` waits for send window; the cap is this or twice
+/// the receive window, whichever is larger. Inbound data is credited back
+/// as it is queued, so a peer that streams data while withholding its own
+/// `WINDOW_ADJUST` would otherwise grow that buffer without limit; past the
+/// cap the write fails instead.
+const STREAM_WRITE_WAIT_READ_CAP: usize = 16 * 1024 * 1024;
 /// Read timeout the serve loop installs on the socket while it has at least
 /// one live channel runtime to drain. Reverts to blocking when idle.
 const SERVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -3417,6 +3424,15 @@ impl Write for ClientChannelStream<'_> {
                 ));
             }
             self.pump_one()?;
+            // Nothing reads `read_buf` while we wait here, and `pump_one`
+            // keeps crediting the peer for what it queues: bound it.
+            let cap = STREAM_WRITE_WAIT_READ_CAP
+                .max((self.client.conn.default_window as usize).saturating_mul(2));
+            if self.read_buf.len() > cap {
+                return Err(std::io::Error::other(
+                    "peer kept sending channel data without opening its window for our write",
+                ));
+            }
         }
     }
 

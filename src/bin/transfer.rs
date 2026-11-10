@@ -432,11 +432,7 @@ pub fn remote_basename(p: &[u8]) -> &[u8] {
 /// blanks are dropped (`.. ` is `..`). Whatever the platform's rules, the
 /// name must be one normal component of a local path, itself.
 pub fn safe_name(name: &[u8]) -> bool {
-    if name.is_empty()
-        || name == b"."
-        || name == b".."
-        || name.contains(&b'/')
-        || name.contains(&0)
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') || name.contains(&0)
     {
         return false;
     }

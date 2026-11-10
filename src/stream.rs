@@ -66,6 +66,8 @@ pub struct ChannelStream {
     tx: Option<SyncSender<ChannelEgress>>,
     buf: Vec<u8>,
     rx_eof: bool,
+    /// Reads fail with `TimedOut` once this has passed.
+    read_deadline: Option<std::time::Instant>,
 }
 
 impl ChannelStream {
@@ -76,7 +78,16 @@ impl ChannelStream {
             tx: Some(tx),
             buf: Vec::new(),
             rx_eof: false,
+            read_deadline: None,
         }
+    }
+
+    /// Bound the reads that follow: one that would wait past `deadline`
+    /// fails with [`ErrorKind::TimedOut`], however the peer spaces its
+    /// bytes. `None` (the default) waits indefinitely. Data already
+    /// received is still returned after the deadline.
+    pub fn set_read_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.read_deadline = deadline;
     }
 
     /// Queue `data` as stderr (`CHANNEL_EXTENDED_DATA`). Only session
@@ -194,9 +205,22 @@ impl Read for ChannelStream {
                 .rx
                 .as_ref()
                 .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
-            match rx.recv() {
-                Ok(Some(chunk)) => self.buf = chunk,
-                Ok(None) | Err(_) => {
+            let got = match self.read_deadline {
+                None => rx.recv().ok(),
+                Some(until) => {
+                    let left = until.saturating_duration_since(std::time::Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(m) => Some(m),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            return Err(ErrorKind::TimedOut.into());
+                        }
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                    }
+                }
+            };
+            match got {
+                Some(Some(chunk)) => self.buf = chunk,
+                Some(None) | None => {
                     self.rx_eof = true;
                     return Ok(0);
                 }
@@ -241,6 +265,29 @@ impl Drop for ChannelStream {
 mod tests {
     use super::*;
     use std::sync::mpsc;
+
+    /// A read deadline bounds the wait as a whole; data already there is
+    /// still handed out, and lifting the deadline restores blocking reads.
+    #[test]
+    fn read_deadline_times_out_a_silent_peer() {
+        let (in_tx, in_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(4);
+        let (out_tx, _out_rx) = mpsc::sync_channel::<ChannelEgress>(4);
+        let mut cs = ChannelStream::new(in_rx, out_tx);
+        in_tx.send(Some(b"ab".to_vec())).unwrap();
+        cs.set_read_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        ));
+        let mut buf = [0u8; 1];
+        assert_eq!(cs.read(&mut buf).unwrap(), 1);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(cs.read(&mut buf).unwrap(), 1);
+        let err = cs.read(&mut buf).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
+        cs.set_read_deadline(None);
+        in_tx.send(Some(b"c".to_vec())).unwrap();
+        assert_eq!(cs.read(&mut buf).unwrap(), 1);
+        assert_eq!(&buf, b"c");
+    }
 
     /// Zero-length chunks must be skipped iteratively: the old recursive
     /// `read` overflowed the stack (a process abort) after a few thousand

@@ -133,8 +133,26 @@ impl From<io::Error> for SocksError {
     }
 }
 
+/// A requested domain name as text. Whoever can reach the listener picks
+/// these bytes, and the name ends up in diagnostics and in the
+/// `direct-tcpip` request: control characters (C0, DEL and C1, which a
+/// terminal would act on) are refused, as is anything that is not UTF-8.
+fn domain_name(raw: Vec<u8>) -> Result<String, SocksError> {
+    let name =
+        String::from_utf8(raw).map_err(|_| SocksError::Protocol("SOCKS: non-UTF8 domain name"))?;
+    if name.chars().any(char::is_control) {
+        return Err(SocksError::Protocol(
+            "SOCKS: control character in domain name",
+        ));
+    }
+    Ok(name)
+}
+
 /// Read and parse a SOCKS `CONNECT` request from `s`, returning the
 /// destination target.
+///
+/// The reads block: a caller serving untrusted peers should put a read
+/// timeout on `s` for the duration of the call.
 ///
 /// Dispatches on the first byte (the version). For SOCKS5 this performs the
 /// method-negotiation sub-handshake first (selecting "no auth"), then reads
@@ -204,8 +222,7 @@ fn handshake_v5<S: Read + Write>(s: &mut S) -> Result<SocksTarget, SocksError> {
             }
             let mut name = vec![0u8; n];
             s.read_exact(&mut name)?;
-            String::from_utf8(name)
-                .map_err(|_| SocksError::Protocol("SOCKS5: non-UTF8 domain name"))?
+            domain_name(name)?
         }
         _ => {
             write_v5_reply(s, REP_GENERAL_FAILURE);
@@ -251,7 +268,7 @@ fn handshake_v4<S: Read + Write>(s: &mut S) -> Result<SocksTarget, SocksError> {
         if name.is_empty() {
             return Err(SocksError::Protocol("SOCKS4a: empty domain name"));
         }
-        String::from_utf8(name).map_err(|_| SocksError::Protocol("SOCKS4a: non-UTF8 domain"))?
+        domain_name(name)?
     } else {
         format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3])
     };
@@ -514,6 +531,58 @@ mod tests {
         let mut s = MockStream::new(req);
         assert!(matches!(handshake(&mut s), Err(SocksError::Unsupported(_))));
         assert_eq!(s.output[1], SOCKS4_REJECTED);
+    }
+
+    /// A domain name with terminal control characters is refused on both
+    /// protocol versions (it would be printed in diagnostics).
+    #[test]
+    fn domain_names_with_control_characters_are_rejected() {
+        let v5 = |host: &[u8]| {
+            let mut req = vec![
+                SOCKS5,
+                1,
+                METHOD_NO_AUTH,
+                SOCKS5,
+                CMD_CONNECT,
+                0,
+                ATYP_DOMAIN,
+            ];
+            req.push(host.len() as u8);
+            req.extend_from_slice(host);
+            req.extend_from_slice(&443u16.to_be_bytes());
+            handshake(&mut MockStream::new(req))
+        };
+        let v4a = |host: &[u8]| {
+            let mut req = vec![SOCKS4, CMD_CONNECT];
+            req.extend_from_slice(&443u16.to_be_bytes());
+            req.extend_from_slice(&[0, 0, 0, 1]);
+            req.extend_from_slice(b"me\0");
+            req.extend_from_slice(host);
+            req.push(0);
+            handshake(&mut MockStream::new(req))
+        };
+        for bad in [
+            &b"evil\x1b[2J.example"[..],
+            b"a\nb",
+            b"a\rb",
+            b"a\tb",
+            b"a\x7fb",
+            b"a\x07b",
+            // C1 controls (CSI, OSC) in UTF-8.
+            b"a\xc2\x9b2Jb",
+            b"a\xc2\x9db",
+            // Not UTF-8.
+            b"a\xffb",
+        ] {
+            assert!(matches!(v5(bad), Err(SocksError::Protocol(_))), "{bad:?}");
+            assert!(matches!(v4a(bad), Err(SocksError::Protocol(_))), "{bad:?}");
+        }
+        assert!(matches!(v5(b"a\0b"), Err(SocksError::Protocol(_))));
+        for ok in [&b"example.com"[..], "b\u{fc}cher.example".as_bytes()] {
+            let want = String::from_utf8(ok.to_vec()).unwrap();
+            assert_eq!(v5(ok).unwrap().host, want);
+            assert_eq!(v4a(ok).unwrap().host, want);
+        }
     }
 
     #[test]

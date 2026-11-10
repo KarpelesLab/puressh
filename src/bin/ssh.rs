@@ -4546,7 +4546,8 @@ impl RemoteRoutes {
                     Some(dest) => serve_remote_dest(stream, dest, me.permit.clone()),
                     None => warn!(
                         "Warning: forwarded connection for unknown listener {}:{}; dropping",
-                        origin.bound_address, origin.bound_port
+                        sanitize_terminal_str(&origin.bound_address),
+                        origin.bound_port
                     ),
                 }
             });
@@ -4562,7 +4563,7 @@ impl RemoteRoutes {
                     Some(dest) => serve_remote_dest(stream, dest, me.permit.clone()),
                     None => warn!(
                         "Warning: forwarded connection for unknown listener {}; dropping",
-                        origin.socket_path
+                        sanitize_terminal_str(&origin.socket_path)
                     ),
                 }
             },
@@ -4774,7 +4775,8 @@ fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
     if !remote_open_permitted(permit, &target.host, target.port) {
         warn!(
             "Rejected connection to {} port {}: not permitted by PermitRemoteOpen",
-            target.host, target.port
+            sanitize_terminal_str(&target.host),
+            target.port
         );
         let _ = socks::write_reply(&mut stream, target.version, false);
         return;
@@ -4794,7 +4796,8 @@ fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
         Err(e) => {
             warn!(
                 "connect to {} port {} failed: {e}",
-                target.host, target.port
+                sanitize_terminal_str(&target.host),
+                target.port
             );
             let _ = socks::write_reply(&mut stream, target.version, false);
         }
@@ -5915,8 +5918,11 @@ fn run_mux_forwarding(
                         }
                         Err(e) => {
                             eprintln!(
-                                "ssh: -D direct-tcpip {}:{} over mux: {e}",
-                                target.host, target.port
+                                "{}",
+                                sanitize_terminal_str(&format!(
+                                    "ssh: -D direct-tcpip {}:{} over mux: {e}",
+                                    target.host, target.port
+                                ))
                             );
                             let _ = socks::write_reply(&mut tcp, target.version, false);
                         }
@@ -7877,7 +7883,15 @@ fn spawn_dynamic_forward_listener(
                         splice_shared_with_tcp(ctx, stream, tcp);
                     }
                     Err(e) => {
-                        eprintln!("ssh: -D direct-tcpip {}:{}: {e}", target.host, target.port);
+                        // The name is the SOCKS client's, the reason may be
+                        // the server's: neither goes to the terminal raw.
+                        eprintln!(
+                            "{}",
+                            sanitize_terminal_str(&format!(
+                                "ssh: -D direct-tcpip {}:{}: {e}",
+                                target.host, target.port
+                            ))
+                        );
                         let _ = socks::write_reply(&mut tcp, target.version, false);
                     }
                 }

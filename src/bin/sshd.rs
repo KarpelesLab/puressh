@@ -3516,7 +3516,16 @@ mod imp {
                     // globs are always positive patterns.
                     user: puressh::config::HostPattern::parse(user),
                     host: Some(puressh::config::HostPattern::parse(host)),
-                    host_cidr: host.contains('/').then(|| host.to_string()),
+                    // A literal address is compared as an address too: a
+                    // glob over its text would miss any other spelling of
+                    // the same one (`2001:DB8::1`, `2001:db8:0::1`).
+                    host_cidr: if host.contains('/') {
+                        Some(host.to_string())
+                    } else {
+                        host.parse::<IpAddr>()
+                            .ok()
+                            .map(|ip| ip.to_canonical().to_string())
+                    },
                 },
                 None => UserHostPattern {
                     negated,
@@ -3591,6 +3600,41 @@ mod imp {
             }
             _ => false,
         })
+    }
+
+    /// The account name as the passwd database spells it (`pw_name`) for
+    /// the login name the client sent, when it names an account. The two
+    /// differ under a case-insensitive or aliasing NSS backend.
+    fn canonical_user_name(user: &str) -> Option<String> {
+        nix::unistd::User::from_name(user)
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+    }
+
+    /// DenyUsers, then AllowUsers, for the login name `wire` whose account
+    /// is really named `account` (when it exists): why the user is refused,
+    /// if they are. OpenSSH matches both lists against `pw_name`, so
+    /// `DenyUsers bob` holds for a login as `Bob` that NSS maps to `bob`.
+    /// DenyUsers is also matched against the name as sent, so resolving it
+    /// can only ever refuse more.
+    fn user_lists_refusal(
+        deny: &[UserHostPattern],
+        allow: &[UserHostPattern],
+        wire: &str,
+        account: Option<&str>,
+        peer: Option<&str>,
+    ) -> Option<&'static str> {
+        let denied = !deny.is_empty()
+            && (user_host_list_matches(deny, wire, peer)
+                || account.is_some_and(|a| a != wire && user_host_list_matches(deny, a, peer)));
+        if denied {
+            return Some("listed in DenyUsers");
+        }
+        if !allow.is_empty() && !user_host_list_matches(allow, account.unwrap_or(wire), peer) {
+            return Some("not listed in AllowUsers");
+        }
+        None
     }
 
     struct LocalAuthenticator {
@@ -3809,6 +3853,8 @@ mod imp {
         /// user exists via timing.
         fn access_allowed(&mut self, user: &str) -> bool {
             let peer = self.peer.as_deref();
+            // The account's own name, resolved for every user alike.
+            let account = canonical_user_name(user);
             // Resolve groups up front (uniform cost) so every branch below
             // sees the same work regardless of which check decides.
             let groups = match self.group_cache.get(user) {
@@ -3864,15 +3910,16 @@ mod imp {
                     None => {}
                 }
             }
-            // 1. DenyUsers wins outright.
-            if !self.deny_users.is_empty() && user_host_list_matches(&self.deny_users, user, peer) {
-                return refuse("listed in DenyUsers");
-            }
-            // 2. AllowUsers: if set, the user must match one.
-            if !self.allow_users.is_empty()
-                && !user_host_list_matches(&self.allow_users, user, peer)
-            {
-                return refuse("not listed in AllowUsers");
+            // 1. DenyUsers wins outright. 2. AllowUsers: if set, the user
+            //    must match one. Both against the account's own name.
+            if let Some(why) = user_lists_refusal(
+                &self.deny_users,
+                &self.allow_users,
+                user,
+                account.as_deref(),
+                peer,
+            ) {
+                return refuse(why);
             }
             // 3. DenyGroups: a matching group refuses.
             if !self.deny_groups.is_empty() && in_group(&self.deny_groups) {
@@ -6605,7 +6652,9 @@ mod imp {
         // on platforms that expose it; fall back to just the primary group if
         // it fails or is unavailable (macOS / Solaris / AIX don't have it in
         // nix). The primary group still feeds AllowGroups/DenyGroups there.
-        let gids: Vec<Gid> = group_gids(name, user.gid);
+        // By the account's own name: group databases list members under it,
+        // whatever spelling the client logged in with.
+        let gids: Vec<Gid> = group_gids(&user.name, user.gid);
         let mut names: Vec<String> = Vec::new();
         for gid in gids {
             if let Ok(Some(g)) = Group::from_gid(gid)
@@ -10335,6 +10384,107 @@ mod imp {
             assert!(d.access_allowed("alice"));
             assert!(!d.access_allowed("carol"));
             assert!(!d.access_allowed("dave"));
+        }
+
+        /// SSHD-12: the user lists are matched against the account's own
+        /// name, so an aliasing NSS spelling cannot step around DenyUsers.
+        #[test]
+        fn user_lists_match_the_account_name() {
+            let pats = |xs: &[&str]| {
+                UserHostPattern::parse_all(&xs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            };
+            // `Bob` on the wire, account `bob`.
+            assert_eq!(
+                user_lists_refusal(&pats(&["bob"]), &[], "Bob", Some("bob"), None),
+                Some("listed in DenyUsers")
+            );
+            // The name as sent still counts for DenyUsers.
+            assert_eq!(
+                user_lists_refusal(&pats(&["Bob"]), &[], "Bob", Some("bob"), None),
+                Some("listed in DenyUsers")
+            );
+            // AllowUsers follows the account, as OpenSSH's pw_name.
+            assert_eq!(
+                user_lists_refusal(&[], &pats(&["bob"]), "Bob", Some("bob"), None),
+                None
+            );
+            assert_eq!(
+                user_lists_refusal(&[], &pats(&["Bob"]), "Bob", Some("bob"), None),
+                Some("not listed in AllowUsers")
+            );
+            assert_eq!(
+                user_lists_refusal(&[], &pats(&["*", "!bob"]), "Bob", Some("bob"), None),
+                Some("not listed in AllowUsers")
+            );
+            // No such account: the name as sent is all there is.
+            assert_eq!(
+                user_lists_refusal(&pats(&["bob"]), &pats(&["*"]), "Bob", None, None),
+                None
+            );
+            assert_eq!(
+                user_lists_refusal(&pats(&["bob"]), &pats(&["*"]), "bob", None, None),
+                Some("listed in DenyUsers")
+            );
+        }
+
+        /// SSHD-12: a `user@address` token matches the address, however it
+        /// is spelled.
+        #[test]
+        fn user_at_address_literal_matches_any_spelling() {
+            for token in [
+                "eve@2001:db8::1",
+                "eve@2001:DB8::1",
+                "eve@2001:db8:0:0:0:0:0:1",
+                "eve@2001:0db8::0001",
+            ] {
+                let mut a = auth_with_peer(
+                    &["*"],
+                    &[token],
+                    &[],
+                    &[],
+                    Default::default(),
+                    Some("2001:db8::1"),
+                );
+                assert!(!a.access_allowed("eve"), "{token}");
+                let mut b = auth_with_peer(
+                    &["*"],
+                    &[token],
+                    &[],
+                    &[],
+                    Default::default(),
+                    Some("2001:db8::2"),
+                );
+                assert!(b.access_allowed("eve"), "{token}");
+            }
+            // An IPv4-mapped spelling is the IPv4 address.
+            let mut a = auth_with_peer(
+                &["*"],
+                &["eve@::ffff:192.0.2.7"],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.0.2.7"),
+            );
+            assert!(!a.access_allowed("eve"));
+            // IPv4 literals and globs behave as before.
+            let mut a = auth_with_peer(
+                &["alice@192.0.2.7"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.0.2.7"),
+            );
+            assert!(a.access_allowed("alice"));
+            let mut a = auth_with_peer(
+                &["alice@192.0.2.7"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.0.2.8"),
+            );
+            assert!(!a.access_allowed("alice"));
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------

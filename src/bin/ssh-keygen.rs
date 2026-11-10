@@ -2421,16 +2421,27 @@ mod sig {
     /// key or its CA.
     fn revoked(path: &str, key: &[u8]) -> Result<bool, String> {
         let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        revoked_in(&data, key).map_err(|e| format!("{path}: {e}"))
+    }
+
+    /// [`revoked`] over the revocation file's contents.
+    ///
+    /// A file that starts with the KRL magic is a KRL and nothing else: one
+    /// that does not parse (truncated, unknown critical section, ...) is an
+    /// error, never an empty key list that revokes nothing.
+    fn revoked_in(data: &[u8], key: &[u8]) -> Result<bool, String> {
         let cert = puressh::cert::Certificate::parse(key).ok();
         let plain = cert.as_ref().map_or(key, |c| c.embedded_pubkey_blob());
-        if let Ok(krl) = puressh::krl::Krl::parse(&data) {
+        if data.starts_with(b"SSHKRL\n\0") {
+            let krl = puressh::krl::Krl::parse(data)
+                .map_err(|e| format!("invalid key revocation list: {e}"))?;
             return Ok(krl.is_revoked_key(plain)
                 || cert.as_ref().is_some_and(|c| {
                     krl.is_revoked_cert(&c.signature_key_blob, c.serial, &c.key_id)
                         || krl.is_revoked_key(&c.signature_key_blob)
                 }));
         }
-        let text = String::from_utf8_lossy(&data);
+        let text = String::from_utf8_lossy(data);
         for line in text.lines().map(str::trim) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -2488,6 +2499,37 @@ mod sig {
             Ok(0)
         } else {
             Err("No principal matched.".into())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::revoked_in;
+
+        /// A binary KRL that fails to parse must fail the check; it used to
+        /// fall through to the text key-list reader, which found no keys
+        /// and reported the key as not revoked.
+        #[test]
+        fn unparsable_binary_krl_is_an_error_not_an_empty_list() {
+            let key = b"\0\0\0\x0bssh-ed25519\0\0\0\x04abcd".to_vec();
+            let mut krl = puressh::krl::Krl::new();
+            krl.revoke_key(&key);
+            let good = krl.to_bytes(0);
+            assert_eq!(revoked_in(&good, &key), Ok(true));
+            assert_eq!(revoked_in(&good, b"some other key"), Ok(false));
+
+            // Truncated inside the section that revokes the key.
+            let truncated = &good[..good.len() - 1];
+            assert!(revoked_in(truncated, &key).is_err());
+            // Trailing garbage / an unknown section.
+            let mut extended = good.clone();
+            extended.extend_from_slice(&[0xff, 0, 0, 0, 0]);
+            assert!(revoked_in(&extended, &key).is_err());
+            // Just the magic.
+            assert!(revoked_in(b"SSHKRL\n\0", &key).is_err());
+
+            // A text key list is still read as one.
+            assert_eq!(revoked_in(b"# nothing revoked\n", &key), Ok(false));
         }
     }
 }

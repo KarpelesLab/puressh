@@ -572,6 +572,11 @@ fn upload_legacy(cli: &Cli, sources: &[String], to: &Remote, errs: &mut u32) {
     for src in sources {
         if let Err(e) = sender.send_path(Path::new(src), &opts) {
             fail(errs, format!("{src}: {e}"));
+            // The remote sink is no longer in step: a further file would
+            // be taken for the rest of this one.
+            if sender.is_desynced() {
+                break;
+            }
         }
     }
 }
@@ -880,6 +885,10 @@ fn remote_end(cli: &Cli) -> u32 {
         for src in &cli.operands {
             if sender.send_path(Path::new(src), &opts).is_err() {
                 errs += 1;
+                // The sink is no longer in step: nothing more can go.
+                if sender.is_desynced() {
+                    break;
+                }
             }
         }
         errs

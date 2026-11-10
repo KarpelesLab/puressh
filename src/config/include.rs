@@ -73,30 +73,56 @@ pub fn tokenize_file_with_includes_expanding(
     depth: usize,
     expand: &dyn Fn(&str) -> String,
 ) -> Result<Vec<ParsedLine>, ConfigError> {
-    if depth >= MAX_INCLUDE_DEPTH {
-        return Err(ConfigError::Syntax {
-            line: 0,
-            msg: "Include: max depth exceeded".into(),
-        });
-    }
-    let src = fs::read_to_string(path).map_err(|e| ConfigError::Syntax {
-        line: 0,
-        msg: alloc::format!("Include: cannot read {}: {e}", path.display()),
-    })?;
-    let base_dir = path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .to_path_buf();
-    expand_includes_expanding(tokenize(&src)?, &base_dir, depth, expand)
+    tokenize_top_level(path, depth, expand, None)
 }
 
-/// Same as [`tokenize_file_with_includes`] but treats "file not found" / any
-/// I/O failure as a silent skip (returning `Ok(empty)`). Used for the
-/// recursive Include path, where ssh_config(5) says to warn and continue.
-fn tokenize_included_file(
+/// Says whether a configuration file may be read, given its path and the
+/// file as opened — so the answer (its owner, its mode: `File::metadata`)
+/// is about what is read, not about whatever the path names a moment
+/// later. `false` refuses the file with [`ConfigError::BadPermissions`].
+pub type FileCheck<'a> = &'a dyn Fn(&Path, &fs::File) -> bool;
+
+/// [`tokenize_file_with_includes_expanding`], with `check` asked about
+/// `path` and about every file an `Include` brings in, at any depth: a
+/// file it refuses is an error, not a skipped file. This is OpenSSH's rule
+/// for the user's configuration (`Bad owner or permissions on <file>`),
+/// which holds for the files it includes as for `~/.ssh/config` itself.
+pub fn tokenize_file_with_includes_checked(
+    path: &Path,
+    expand: &dyn Fn(&str) -> String,
+    check: FileCheck<'_>,
+) -> Result<Vec<ParsedLine>, ConfigError> {
+    tokenize_top_level(path, 0, expand, Some(check))
+}
+
+/// Open and read `path`, asking `check` (if any) about the opened file
+/// first. The outer error is a refusal; the inner one an I/O failure,
+/// which the caller may take as "no such file".
+fn read_config_file(
+    path: &Path,
+    check: Option<FileCheck<'_>>,
+) -> Result<std::io::Result<String>, ConfigError> {
+    use std::io::Read;
+    let mut file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Ok(Err(e)),
+    };
+    if let Some(check) = check
+        && !check(path, &file)
+    {
+        return Err(ConfigError::BadPermissions {
+            file: path.display().to_string(),
+        });
+    }
+    let mut src = String::new();
+    Ok(file.read_to_string(&mut src).map(|_| src))
+}
+
+fn tokenize_top_level(
     path: &Path,
     depth: usize,
     expand: &dyn Fn(&str) -> String,
+    check: Option<FileCheck<'_>>,
 ) -> Result<Vec<ParsedLine>, ConfigError> {
     if depth >= MAX_INCLUDE_DEPTH {
         return Err(ConfigError::Syntax {
@@ -104,7 +130,34 @@ fn tokenize_included_file(
             msg: "Include: max depth exceeded".into(),
         });
     }
-    let src = match fs::read_to_string(path) {
+    let src = read_config_file(path, check)?.map_err(|e| ConfigError::Syntax {
+        line: 0,
+        msg: alloc::format!("Include: cannot read {}: {e}", path.display()),
+    })?;
+    let base_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    expand_includes_inner(tokenize(&src)?, &base_dir, depth, expand, check)
+}
+
+/// Same as [`tokenize_file_with_includes`] but treats "file not found" / any
+/// I/O failure as a silent skip (returning `Ok(empty)`). Used for the
+/// recursive Include path, where ssh_config(5) says to warn and continue.
+/// A file `check` refuses is an error all the same.
+fn tokenize_included_file(
+    path: &Path,
+    depth: usize,
+    expand: &dyn Fn(&str) -> String,
+    check: Option<FileCheck<'_>>,
+) -> Result<Vec<ParsedLine>, ConfigError> {
+    if depth >= MAX_INCLUDE_DEPTH {
+        return Err(ConfigError::Syntax {
+            line: 0,
+            msg: "Include: max depth exceeded".into(),
+        });
+    }
+    let src = match read_config_file(path, check)? {
         Ok(s) => s,
         Err(_) => return Ok(Vec::new()), // warn-and-continue
     };
@@ -117,7 +170,8 @@ fn tokenize_included_file(
     for l in &mut lines {
         l.file = Some(name.clone());
     }
-    expand_includes_expanding(lines, &base_dir, depth, expand).map_err(|e| e.in_file(Some(&name)))
+    expand_includes_inner(lines, &base_dir, depth, expand, check)
+        .map_err(|e| e.in_file(Some(&name)))
 }
 
 /// Walk a token stream and replace every `include` line in-place with the
@@ -143,6 +197,16 @@ pub fn expand_includes_expanding(
     base_dir: &Path,
     depth: usize,
     expand: &dyn Fn(&str) -> String,
+) -> Result<Vec<ParsedLine>, ConfigError> {
+    expand_includes_inner(lines, base_dir, depth, expand, None)
+}
+
+fn expand_includes_inner(
+    lines: Vec<ParsedLine>,
+    base_dir: &Path,
+    depth: usize,
+    expand: &dyn Fn(&str) -> String,
+    check: Option<FileCheck<'_>>,
 ) -> Result<Vec<ParsedLine>, ConfigError> {
     let mut out = Vec::with_capacity(lines.len());
     for line in lines {
@@ -171,7 +235,7 @@ pub fn expand_includes_expanding(
                         msg: "Include: max depth exceeded".into(),
                     });
                 }
-                let child_lines = tokenize_included_file(&matched, depth + 1, expand)?;
+                let child_lines = tokenize_included_file(&matched, depth + 1, expand, check)?;
                 let marker = |keyword: &str| ParsedLine {
                     line_no: line.line_no,
                     keyword: keyword.to_string(),

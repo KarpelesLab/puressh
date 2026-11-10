@@ -720,6 +720,28 @@ impl SshClientConfig {
         })
     }
 
+    /// [`Self::load_expanding`], with `check` asked about `path` and about
+    /// every file an `Include` brings in (see
+    /// [`FileCheck`](super::FileCheck)): one it refuses fails the load with
+    /// [`ConfigError::BadPermissions`]. For a configuration that must not
+    /// be writable by anyone but its owner — the user's `~/.ssh/config` —
+    /// which a file it includes must not be either.
+    #[cfg(feature = "std")]
+    pub fn load_checked<P: AsRef<std::path::Path>>(
+        path: P,
+        expand: &dyn Fn(&str) -> String,
+        check: super::FileCheck<'_>,
+    ) -> Result<Self, ConfigError> {
+        let lines =
+            super::include::tokenize_file_with_includes_checked(path.as_ref(), expand, check)?;
+        let mut blocks = parse_blocks(lines)?;
+        name_source(&mut blocks, path.as_ref());
+        Ok(SshClientConfig {
+            blocks,
+            enable_match_exec: false,
+        })
+    }
+
     /// Like [`Self::load`] but parses an in-memory `src` while still
     /// honouring `Include` directives relative to `base_dir`. Useful when
     /// the config has been pre-read (e.g. from a memfd) but you still want
@@ -4011,6 +4033,45 @@ Match host gw
             // Include is inside the `Host gw` block — its Port applies to gw.
             assert_eq!(cfg.lookup("gw").port, Some(4242));
             assert_eq!(cfg.lookup("gw").host_name.as_deref(), Some("10.0.0.1"));
+        }
+
+        /// `load_checked` asks about the file loaded and every file
+        /// included, and a refusal fails the load.
+        #[test]
+        fn load_checked_asks_about_every_file() {
+            let dir = TempDir::new("checked");
+            let leaf = dir.write("leaf.cfg", "Port 4242\n");
+            let mid = dir.write("mid.cfg", &format!("Include {}\n", leaf.display()));
+            let root = dir.write(
+                "root.cfg",
+                &format!("Include {} {}/missing\n", mid.display(), dir.path.display()),
+            );
+            let seen = std::cell::RefCell::new(Vec::new());
+            let plain = |p: &str| p.to_string();
+            let cfg = SshClientConfig::load_checked(&root, &plain, &|p, f| {
+                assert!(f.metadata().is_ok());
+                seen.borrow_mut().push(p.to_path_buf());
+                true
+            })
+            .unwrap();
+            assert_eq!(cfg.lookup("h").port, Some(4242));
+            assert_eq!(*seen.borrow(), [root.clone(), mid.clone(), leaf.clone()]);
+            for refused in [&root, &mid, &leaf] {
+                let err = SshClientConfig::load_checked(&root, &plain, &|p, _| p != *refused)
+                    .unwrap_err();
+                assert_eq!(
+                    err,
+                    ConfigError::BadPermissions {
+                        file: refused.display().to_string()
+                    }
+                );
+                assert!(err.to_string().contains("Bad owner or permissions on "));
+            }
+            // Unchecked loads are as before.
+            assert_eq!(
+                SshClientConfig::load(&root).unwrap().lookup("h").port,
+                Some(4242)
+            );
         }
 
         /// An included file that opens no block of its own adds to the

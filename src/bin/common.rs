@@ -2040,9 +2040,9 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
 /// scalar options and both contribute to cumulative lists.
 ///
 /// A missing file is silently skipped. Errors: a file that exists but won't
-/// parse, or a `~/.ssh/config` with bad ownership / permissions (see
-/// [`check_user_config_perms`]). `Include` paths get their `%` tokens from
-/// `expand`.
+/// parse, or a `~/.ssh/config` — or a file it includes — with bad ownership
+/// / permissions (see [`load_user_config`]). `Include` paths get their `%`
+/// tokens from `expand`.
 pub fn load_client_config(
     explicit: Option<&Path>,
     expand: &dyn Fn(&str) -> String,
@@ -2065,11 +2065,7 @@ pub fn load_client_config(
     if let Some(home) = std::env::var_os("HOME") {
         let user = PathBuf::from(home).join(".ssh").join("config");
         if user.exists() {
-            check_user_config_perms(&user)?;
-            cfg = Some(
-                SshClientConfig::load_expanding(&user, expand)
-                    .map_err(|e| format!("{}: {e}", user.display()))?,
-            );
+            cfg = Some(load_user_config(&user, expand)?);
         }
     }
     let system = Path::new("/etc/ssh/ssh_config");
@@ -2091,25 +2087,37 @@ pub fn load_client_config(
 /// (arbitrary command execution), `IdentityFile`, `StrictHostKeyChecking no`,
 /// and friends into every session the victim starts.
 ///
-/// Only `~/.ssh/config` is checked, exactly like OpenSSH: `-F file` is an
-/// explicit user choice and `/etc/ssh/ssh_config` is root-managed. Files
-/// pulled in via `Include` are *not* checked because the config loader does
-/// not expose the list of files it read. No-op on non-Unix.
-fn check_user_config_perms(path: &Path) -> Result<(), String> {
+/// The rule holds for `~/.ssh/config` and for every file it brings in with
+/// `Include`, at any depth, exactly like OpenSSH (an included file that
+/// another user can write is the same injection); `-F file` is an explicit
+/// user choice and `/etc/ssh/ssh_config` (with its includes) is
+/// root-managed, so neither is checked. Each file is checked as opened
+/// (`fstat`), not by path. No check on non-Unix.
+fn load_user_config(
+    path: &Path,
+    expand: &dyn Fn(&str) -> String,
+) -> Result<puressh::config::SshClientConfig, String> {
+    use puressh::config::{ConfigError, SshClientConfig};
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let euid = unix_sys::geteuid();
-        if (md.uid() != 0 && md.uid() != euid) || (md.mode() & 0o022) != 0 {
-            return Err(format!("Bad owner or permissions on {}", path.display()));
-        }
-    }
+    let loaded = SshClientConfig::load_checked(path, expand, &user_config_file_ok);
     #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    let loaded = SshClientConfig::load_expanding(path, expand);
+    loaded.map_err(|e| match e {
+        ConfigError::BadPermissions { file } => format!("Bad owner or permissions on {file}"),
+        e => format!("{}: {e}", path.display()),
+    })
+}
+
+/// Whether an opened file of the user's configuration is owned by the
+/// calling user or root and not writable by group or others (see
+/// [`load_user_config`]).
+#[cfg(unix)]
+fn user_config_file_ok(_path: &Path, file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = file.metadata() else {
+        return false;
+    };
+    (md.uid() == 0 || md.uid() == unix_sys::geteuid()) && md.mode() & 0o022 == 0
 }
 
 /// Load an `sshd_config(5)` for the `sshd` binary. Returns an error if the
@@ -2400,6 +2408,19 @@ mod perm_tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
             p
         }
+        /// A configuration file holding `body`, with `mode` set explicitly
+        /// (whatever the umask).
+        fn config(&self, name: &str, mode: u32, body: &str) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        }
+    }
+
+    /// No `%` tokens to expand in `Include` paths.
+    fn plain(p: &str) -> String {
+        p.to_string()
     }
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -2447,23 +2468,82 @@ mod perm_tests {
     fn user_config_group_or_world_writable_is_refused() {
         let s = Scratch::new("cfg");
         for mode in [0o664, 0o646, 0o666, 0o622] {
-            let p = s.file(&format!("config-{mode:o}"), mode);
-            let err = check_user_config_perms(&p).unwrap_err();
-            assert!(
-                err.starts_with("Bad owner or permissions on "),
-                "{mode:o}: {err}"
+            let p = s.config(&format!("config-{mode:o}"), mode, "Port 2200\n");
+            let err = load_user_config(&p, &plain).unwrap_err();
+            assert_eq!(
+                err,
+                format!("Bad owner or permissions on {}", p.display()),
+                "{mode:o}"
             );
         }
         for mode in [0o644, 0o600, 0o444, 0o755] {
-            let p = s.file(&format!("config-{mode:o}"), mode);
-            assert!(check_user_config_perms(&p).is_ok(), "{mode:o}");
+            let p = s.config(&format!("config-{mode:o}"), mode, "Port 2200\n");
+            let cfg = load_user_config(&p, &plain).unwrap();
+            assert_eq!(cfg.lookup("h").port, Some(2200), "{mode:o}");
         }
     }
 
     #[test]
     fn user_config_missing_is_an_error() {
         let s = Scratch::new("cfgmissing");
-        assert!(check_user_config_perms(&s.0.join("config")).is_err());
+        assert!(load_user_config(&s.0.join("config"), &plain).is_err());
+    }
+
+    /// A file the user's configuration includes is held to the same rule,
+    /// at any depth; one that is fine is read.
+    #[test]
+    fn user_config_include_group_or_world_writable_is_refused() {
+        let s = Scratch::new("cfginc");
+        let including = |name: &str, target: &Path| {
+            s.config(name, 0o600, &format!("Include {}\n", target.display()))
+        };
+        for mode in [0o664, 0o646, 0o666, 0o622] {
+            let leaf = s.config(
+                &format!("leaf-{mode:o}"),
+                mode,
+                "ProxyCommand touch /tmp/pwned\n",
+            );
+            let bad = format!("Bad owner or permissions on {}", leaf.display());
+            let root = including(&format!("root-{mode:o}"), &leaf);
+            assert_eq!(
+                load_user_config(&root, &plain).unwrap_err(),
+                bad,
+                "{mode:o}"
+            );
+            // Through another (well-kept) file as well.
+            let outer = including(&format!("outer-{mode:o}"), &root);
+            assert_eq!(
+                load_user_config(&outer, &plain).unwrap_err(),
+                bad,
+                "{mode:o}"
+            );
+            // A glob that reaches it too.
+            let glob = s.config(
+                &format!("glob-{mode:o}"),
+                0o600,
+                &format!("Include {}/leaf-{mode:o}*\n", s.0.display()),
+            );
+            assert_eq!(
+                load_user_config(&glob, &plain).unwrap_err(),
+                bad,
+                "{mode:o}"
+            );
+        }
+        for mode in [0o644, 0o600, 0o444] {
+            let leaf = s.config(&format!("ok-{mode:o}"), mode, "Port 2200\n");
+            let root = including(&format!("okroot-{mode:o}"), &leaf);
+            let cfg = load_user_config(&root, &plain).unwrap();
+            assert_eq!(cfg.lookup("h").port, Some(2200), "{mode:o}");
+        }
+        // An included file that does not exist is still just skipped.
+        let root = including("dangling", &s.0.join("nope"));
+        assert!(load_user_config(&root, &plain).is_ok());
+        // `-F file` is the user's explicit choice: read as it is, with
+        // what it includes.
+        let leaf = s.config("f-leaf", 0o666, "Port 2201\n");
+        let root = s.config("f-root", 0o666, &format!("Include {}\n", leaf.display()));
+        let cfg = load_client_config(Some(&root), &plain).unwrap();
+        assert_eq!(cfg.lookup("h").port, Some(2201));
     }
 }
 

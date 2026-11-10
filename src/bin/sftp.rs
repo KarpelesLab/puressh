@@ -1822,8 +1822,12 @@ impl Session {
             match self.sftp.readdir(&h) {
                 Ok(Some(batch)) => {
                     for e in batch {
-                        // Names with a `/` could steer recursive transfers.
-                        if e.filename.is_empty() || e.filename.contains(&b'/') {
+                        // Names with a `/` (or whatever else is not one
+                        // plain local name) could steer recursive transfers.
+                        if e.filename != b"."
+                            && e.filename != b".."
+                            && !transfer::safe_name(&e.filename)
+                        {
                             error!(
                                 "Server sent suspect path \"{}\" during readdir of \"{}\"",
                                 lossy(&e.filename),
@@ -2124,6 +2128,15 @@ impl Session {
             }
             let abs_dst = match dst {
                 Some(d) if g.matched == 1 && !Path::new(d).is_dir() => d.to_string(),
+                // The remote name becomes a local one: it must be plain.
+                _ if filename != "." && !transfer::safe_name(filename.as_bytes()) => {
+                    error!(
+                        "Refusing to fetch \"{}\": \"{filename}\" is not a valid local file name",
+                        lossy(path)
+                    );
+                    failed = true;
+                    continue;
+                }
                 Some(d) => lossy(&path_append(d.as_bytes(), filename.as_bytes())),
                 None => filename,
             };
@@ -2321,6 +2334,20 @@ impl Session {
             if interrupted() {
                 break;
             }
+            if e.filename == b"." || e.filename == b".." {
+                continue;
+            }
+            // `readdir` already dropped these; the name is joined to a
+            // local directory here, so check where it is used too.
+            if !transfer::safe_name(&e.filename) {
+                error!(
+                    "Server sent suspect path \"{}\" during readdir of \"{}\"",
+                    lossy(&e.filename),
+                    lossy(src)
+                );
+                ok = false;
+                continue;
+            }
             let new_dst = lossy(&path_append(dst.as_bytes(), &e.filename));
             let new_src = path_append(src, &e.filename);
             let a = e.attrs;
@@ -2329,9 +2356,6 @@ impl Session {
                     error!("download \"{}\": not a regular file", lossy(&new_src));
                 }
             } else if is_dir(&a) {
-                if e.filename == b"." || e.filename == b".." {
-                    continue;
-                }
                 ok &= self.download_dir_at(
                     &new_src,
                     &new_dst,

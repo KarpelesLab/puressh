@@ -427,9 +427,29 @@ pub fn remote_basename(p: &[u8]) -> &[u8] {
 }
 
 /// A file name from the server is used as a local path component: refuse
-/// anything that is not a plain name.
+/// anything that is not a plain name. On Windows `\` separates components
+/// too, `:` makes a drive (`C:x`) or a stream (`f:s`), and trailing dots and
+/// blanks are dropped (`.. ` is `..`). Whatever the platform's rules, the
+/// name must be one normal component of a local path, itself.
 pub fn safe_name(name: &[u8]) -> bool {
-    !name.is_empty() && name != b"." && name != b".." && !name.contains(&b'/') && !name.contains(&0)
+    if name.is_empty()
+        || name == b"."
+        || name == b".."
+        || name.contains(&b'/')
+        || name.contains(&0)
+    {
+        return false;
+    }
+    #[cfg(windows)]
+    if name.contains(&b'\\') || name.contains(&b':') || matches!(name.last(), Some(b'.' | b' ')) {
+        return false;
+    }
+    let s = String::from_utf8_lossy(name);
+    let mut parts = Path::new(s.as_ref()).components();
+    matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(s.as_ref())
+    )
 }
 
 /// Expand a remote glob (relative to `cwd`). A pattern without glob
@@ -1302,5 +1322,36 @@ mod tests {
         assert!(!safe_name(b"../x"));
         assert!(!safe_name(b".."));
         assert!(safe_name(b"ok"));
+    }
+
+    #[test]
+    fn server_names_stay_one_local_component() {
+        // XFER-10.
+        for bad in [&b""[..], b".", b"..", b"a/b", b"/a", b"a/", b"a\0b"] {
+            assert!(!safe_name(bad), "{bad:?}");
+        }
+        for good in [&b"a"[..], b".bashrc", b"a b", b"a..b", b"\xff"] {
+            assert!(safe_name(good), "{good:?}");
+        }
+        // Separators, drives and streams where the local system has them.
+        for name in [
+            &b"..\\x"[..],
+            b"\\x",
+            b"a\\b",
+            b"C:x",
+            b"C:\\x",
+            b"\\\\host\\share",
+            b"f:stream",
+        ] {
+            assert_eq!(safe_name(name), !cfg!(windows), "{name:?}");
+            if safe_name(name) {
+                let joined = Path::new("base").join(String::from_utf8_lossy(name).as_ref());
+                assert_eq!(joined.parent(), Some(Path::new("base")), "{name:?}");
+            }
+        }
+        #[cfg(windows)]
+        for name in [&b".. "[..], b"a.", b"a "] {
+            assert!(!safe_name(name), "{name:?}");
+        }
     }
 }

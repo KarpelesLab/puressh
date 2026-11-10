@@ -130,6 +130,22 @@ pub fn validate_name(name: &str) -> Result<(), ScpError> {
     if name == "." || name == ".." || name.contains('/') {
         return Err(ScpError::BadName("path component"));
     }
+    // On Windows `\` separates components too, `:` makes a drive (`C:x`,
+    // which replaces the directory it is joined to) or a stream, and
+    // trailing dots and blanks are dropped (`.. ` is `..`).
+    #[cfg(windows)]
+    if name.contains(['\\', ':']) || name.ends_with(['.', ' ']) {
+        return Err(ScpError::BadName("path component"));
+    }
+    // Whatever the platform's rules: one normal component of a local path,
+    // itself.
+    let mut parts = std::path::Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(name)
+    ) {
+        return Err(ScpError::BadName("path component"));
+    }
     Ok(())
 }
 
@@ -465,6 +481,21 @@ mod unit {
     #[test]
     fn reject_slash_in_name() {
         assert!(matches!(validate_name("a/b"), Err(ScpError::BadName(_))));
+    }
+
+    #[test]
+    fn names_stay_one_local_component() {
+        // XFER-10: a name the peer sends is joined to a local directory.
+        for good in ["a", ".bashrc", "a b", "a..b"] {
+            assert!(validate_name(good).is_ok(), "{good}");
+        }
+        for name in ["..\\x", "\\x", "a\\b", "C:x", "C:\\x", "f:stream"] {
+            assert_eq!(validate_name(name).is_ok(), !cfg!(windows), "{name}");
+        }
+        #[cfg(windows)]
+        for name in [".. ", "a.", "a "] {
+            assert!(validate_name(name).is_err(), "{name}");
+        }
     }
 
     #[test]

@@ -452,7 +452,9 @@ fn download_sftp(cli: &Cli, from: &Remote, target: &Path, many: bool, errs: &mut
         if name == ".." {
             name = ".".into();
         }
-        if !transfer::safe_name(name.as_bytes()) && name != "." {
+        // The name is only used under a directory target; it must then be
+        // a plain local name (the server's, for a glob).
+        if !transfer::safe_name(name.as_bytes()) && name != "." && (many || target.is_dir()) {
             fail(errs, format!("{name}: invalid file name"));
             continue;
         }

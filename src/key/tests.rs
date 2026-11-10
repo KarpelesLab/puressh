@@ -981,6 +981,38 @@ fn parse_rejects_rsa_with_inconsistent_private_components() {
     ));
 }
 
+/// Options apply left to right: `restrict` clears what came before it, and
+/// only an option after it re-enables a facility.
+#[test]
+fn authorized_keys_restrict_clears_earlier_enables() {
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGDqLCQkO+7NDJTeuHvKqEGRpz+o1cEdQqN8hHRPPSVt c";
+    let parse = |opts: &str| {
+        PublicKey::parse_authorized_keys_line_with_options(&format!("{opts} {key}"))
+            .unwrap()
+            .1
+    };
+
+    let o = parse("pty,restrict");
+    assert!(o.restrict && !o.allows_pty());
+    let o = parse("restrict,pty");
+    assert!(o.restrict && o.allows_pty());
+
+    let o = parse(
+        "pty,port-forwarding,agent-forwarding,X11-forwarding,user-rc,restrict,command=\"true\"",
+    );
+    assert!(!o.allows_pty());
+    assert!(!o.allows_port_forwarding());
+    assert!(!o.allows_agent_forwarding());
+    assert!(!o.allows_x11_forwarding());
+    assert!(!o.allows_user_rc());
+
+    // A second `restrict` clears again; a later `no-` still disables.
+    let o = parse("restrict,port-forwarding,restrict,agent-forwarding");
+    assert!(!o.allows_port_forwarding() && o.allows_agent_forwarding());
+    let o = parse("restrict,pty,no-pty");
+    assert!(!o.allows_pty());
+}
+
 #[test]
 fn authorized_keys_options_full_set() {
     let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGDqLCQkO+7NDJTeuHvKqEGRpz+o1cEdQqN8hHRPPSVt c";

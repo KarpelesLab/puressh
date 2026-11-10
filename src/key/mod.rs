@@ -206,6 +206,14 @@ impl AuthorizedKeyOptions {
                 "restrict" => {
                     flag(&value)?;
                     out.restrict = true;
+                    // Options apply left to right, as in OpenSSH:
+                    // `restrict` turns everything off, including what an
+                    // earlier option enabled; only a later one re-enables.
+                    out.pty = None;
+                    out.port_forwarding = None;
+                    out.agent_forwarding = None;
+                    out.x11_forwarding = None;
+                    out.user_rc = None;
                 }
                 other => {
                     flag(&value)?;

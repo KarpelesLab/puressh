@@ -182,8 +182,7 @@ Per entry (user, key):
 |-------|---------|
 | `pubkey` | for verification |
 | `sig1_cache` | accepted sig1 values (LRU, max 4) |
-| `newsig1_bucket` | token bucket for verifying a sig1 that is not cached |
-| `newprefix_bucket` | token bucket for verifying sig2 from a source prefix that never sent a valid knock for this key |
+| `newprefix_bucket` | token bucket for signature verifications (an uncached sig1, or sig2) from a source prefix that never sent a valid knock for this key |
 | `last_nonce` | highest accepted nonce |
 | `last_knock_hash`, `last_accept`, `accept_expiry` | used to resend for retransmitted knocks |
 | `knock_buckets` | per source prefix (/32 IPv4, /64 IPv6), LRU max 64; each marked *good* once a knock from it passes sig2 |
@@ -193,7 +192,7 @@ Per user, shared by all of the user's keys:
 
 | Field | Purpose |
 |-------|---------|
-| `user_verify_bucket` | token bucket for verifying sig2, whatever the key and source prefix |
+| `user_verify_bucket` | token bucket for signature verifications (an uncached sig1, or sig2), whatever the key and source prefix |
 | `user_pending` | listeners currently open, over all keys |
 
 Per-user state is created only for a user with an authorized key (never from
@@ -212,9 +211,16 @@ Every *drop* is silent. Every step is cheaper than the next one.
 3. Look up `user` (loading its keys if not cached), then `key_fp`. If either
    is missing, drop.
 4. **sig1:** if it is byte-equal to an entry in `sig1_cache`, continue.
-   Otherwise take one token from `newsig1_bucket` and one from
-   `verify_bucket` (drop if either is empty), verify sig1, add it to the
-   cache on success, and drop on failure.
+   Otherwise, if `verify_bucket` or `user_verify_bucket` is empty, drop,
+   taking nothing; take one token from the source prefix's knock bucket,
+   one from `newprefix_bucket` unless the prefix is *good*, then one from
+   `user_verify_bucket` and one from `verify_bucket` (drop if any is
+   empty), verify sig1, add it to the cache on success, and drop on
+   failure. The knock then skips the knock-bucket and `newprefix_bucket`
+   charges of step 7 (one knock, one token each).
+   `user` and `key_fp` are plaintext, so a budget keyed by them alone would
+   let anyone who knows a user name and a key fingerprint lock the key out
+   of first contact with a trickle of forged sig1s from spoofed addresses.
 5. **Retransmit:** if `nonce == last_nonce`, `H(datagram) == last_knock_hash`,
    and the stored accept has not expired, take one token from the source
    prefix's knock bucket and resend `last_accept` unchanged. Stop here.
@@ -358,7 +364,6 @@ has an invalid `sig_host`. Then:
 | `MaxPending` | 2 per (user, key); 4 × that (8) per user across keys |
 | open listeners | 256, global |
 | knock bucket | burst 5, +1 / 10 s, per (user, key, source prefix) |
-| `newsig1_bucket` | burst 3, +1 / 60 s, per (user, key) |
 | `newprefix_bucket` | burst 10, +1 / s, per (user, key) |
 | `user_verify_bucket` | burst 80, +1 / 125 ms, per user |
 | key lookups | 50 / s global; burst 10, +1 / 200 ms per source prefix |
@@ -383,6 +388,13 @@ has an invalid `sig_host`. Then:
   victim's exact prefix can still exhaust that prefix's bucket, but such an
   attacker is effectively on-path and could drop the victim's packets
   anyway.
+- **Forged sig1.** A sig1 that is not cached costs a verification, charged
+  to the sender's prefix and, unless that prefix has knocked validly, to the
+  key's `newprefix_bucket`, exactly like sig2. So a flood of forged sig1s
+  from spoofed addresses has the same effect as a flooded leaked sig1 above:
+  first contact from a *new* prefix may be rate limited while the flood
+  lasts, prefixes the user has knocked from keep working, and other keys
+  are unaffected. It cannot lock a key out with a few packets a minute.
 - **Address binding.** The client cannot sign its own address because of NAT.
   The listener therefore relies on the source-IP check plus the DH token. An
   on-path observer can read the port but cannot complete the token step, and

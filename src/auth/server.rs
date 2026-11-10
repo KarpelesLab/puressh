@@ -369,6 +369,18 @@ pub enum AuthDecision {
 /// Pluggable policy: a server-side credential checker.
 pub trait Authenticator: Send {
     /// Evaluate a one-shot attempt (none/password/publickey/keyboard-interactive request).
+    ///
+    /// Accepting a verified publickey attempt (fully or as one factor) is
+    /// not the last word: the server then combines the certificate's
+    /// restrictions with [`Self::key_restrictions`] and with those of the
+    /// factors accepted before, and re-checks a security key's flags
+    /// ([`SkSignature::check`]). If that fails (conflicting forced
+    /// commands, a missing touch or PIN) the accepted attempt is vetoed.
+    /// The authenticator has by then counted it, and there is no way to
+    /// take that back, so the server does not answer with a failure the
+    /// client could retry after: it ends authentication and closes the
+    /// connection. An authenticator that wants such a key to fail like
+    /// any other must return [`AuthDecision::Reject`] for it here.
     fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision;
 
     /// Restrictions for the session from the key that was just accepted
@@ -1195,6 +1207,13 @@ impl ServerAuth {
         // on top of a certificate's, on top of whatever earlier factors of a
         // multi-factor chain recorded — the most restrictive wins, and
         // conflicting forced commands refuse the attempt.
+        //
+        // Refusing here comes after the authenticator accepted: a stateful
+        // one (an `AuthenticationMethods publickey,password` chain) has
+        // already counted this key as a satisfied factor, and nothing can
+        // make it forget. Answering with an ordinary failure would let the
+        // next factor complete authentication with this key's restrictions
+        // dropped, so a veto ends authentication instead.
         let decision = match decision {
             d @ (AuthDecision::Accept | AuthDecision::PartialAccept { .. }) => {
                 let key_caps = self.auth.key_restrictions(&user, &public_blob);
@@ -1207,7 +1226,14 @@ impl ServerAuth {
                         self.pending_cert_caps = c;
                         d
                     }
-                    None => AuthDecision::Reject,
+                    None => {
+                        self.state = State::Done;
+                        return Ok(ServerStep::Disconnect(if sk_ok {
+                            "conflicting key restrictions"
+                        } else {
+                            "security key signature does not meet the requirements"
+                        }));
+                    }
                 }
             }
             other => other,

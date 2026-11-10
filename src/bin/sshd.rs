@@ -3516,7 +3516,16 @@ mod imp {
                     // globs are always positive patterns.
                     user: puressh::config::HostPattern::parse(user),
                     host: Some(puressh::config::HostPattern::parse(host)),
-                    host_cidr: host.contains('/').then(|| host.to_string()),
+                    // A literal address is compared as an address too: a
+                    // glob over its text would miss any other spelling of
+                    // the same one (`2001:DB8::1`, `2001:db8:0::1`).
+                    host_cidr: if host.contains('/') {
+                        Some(host.to_string())
+                    } else {
+                        host.parse::<IpAddr>()
+                            .ok()
+                            .map(|ip| ip.to_canonical().to_string())
+                    },
                 },
                 None => UserHostPattern {
                     negated,
@@ -3583,6 +3592,51 @@ mod imp {
         any_positive && positive_hit
     }
 
+    /// Whether a negated (`!`) entry of `pats` matches `name`.
+    fn negated_pattern_hits(pats: &[puressh::config::HostPattern], name: &str) -> bool {
+        pats.iter().any(|p| match p {
+            puressh::config::HostPattern::Negative(g) => {
+                puressh::config::host_matches(&[puressh::config::HostPattern::parse(g)], name)
+            }
+            _ => false,
+        })
+    }
+
+    /// The account name as the passwd database spells it (`pw_name`) for
+    /// the login name the client sent, when it names an account. The two
+    /// differ under a case-insensitive or aliasing NSS backend.
+    fn canonical_user_name(user: &str) -> Option<String> {
+        nix::unistd::User::from_name(user)
+            .ok()
+            .flatten()
+            .map(|u| u.name)
+    }
+
+    /// DenyUsers, then AllowUsers, for the login name `wire` whose account
+    /// is really named `account` (when it exists): why the user is refused,
+    /// if they are. OpenSSH matches both lists against `pw_name`, so
+    /// `DenyUsers bob` holds for a login as `Bob` that NSS maps to `bob`.
+    /// DenyUsers is also matched against the name as sent, so resolving it
+    /// can only ever refuse more.
+    fn user_lists_refusal(
+        deny: &[UserHostPattern],
+        allow: &[UserHostPattern],
+        wire: &str,
+        account: Option<&str>,
+        peer: Option<&str>,
+    ) -> Option<&'static str> {
+        let denied = !deny.is_empty()
+            && (user_host_list_matches(deny, wire, peer)
+                || account.is_some_and(|a| a != wire && user_host_list_matches(deny, a, peer)));
+        if denied {
+            return Some("listed in DenyUsers");
+        }
+        if !allow.is_empty() && !user_host_list_matches(allow, account.unwrap_or(wire), peer) {
+            return Some("not listed in AllowUsers");
+        }
+        None
+    }
+
     struct LocalAuthenticator {
         /// No PAM: refuse locked or expired accounts ([`account_refusal`]).
         native_account_checks: bool,
@@ -3611,6 +3665,10 @@ mod imp {
         /// The options of the `authorized_keys` line that accepted the last
         /// publickey attempt, for [`Authenticator::key_restrictions`].
         accepted_options: Option<Arc<puressh::key::AuthorizedKeyOptions>>,
+        /// The restrictions of the public-key factors recorded so far (the
+        /// auth layer's own tally, mirrored): a later factor that cannot
+        /// hold together with them is refused before it is recorded.
+        recorded_caps: Option<puressh::auth::AuthCertCaps>,
         /// CA public-key blobs from `TrustedUserCAKeys` (the file in force for
         /// this connection). A user cert signed by one of these is CA-trusted;
         /// principal authorization is checked separately. CAs from the user's
@@ -3799,6 +3857,8 @@ mod imp {
         /// user exists via timing.
         fn access_allowed(&mut self, user: &str) -> bool {
             let peer = self.peer.as_deref();
+            // The account's own name, resolved for every user alike.
+            let account = canonical_user_name(user);
             // Resolve groups up front (uniform cost) so every branch below
             // sees the same work regardless of which check decides.
             let groups = match self.group_cache.get(user) {
@@ -3809,10 +3869,17 @@ mod imp {
                     g
                 }
             };
+            // DenyGroups: any one group the list matches refuses.
             let in_group = |pats: &[puressh::config::HostPattern]| {
                 groups
                     .iter()
                     .any(|g| puressh::config::host_matches(pats, g))
+            };
+            // AllowGroups: some group must match, and a negated entry
+            // (`staff !contractors`) excludes the user through any of their
+            // groups, not only the group it names.
+            let allowed_group = |pats: &[puressh::config::HostPattern]| {
+                in_group(pats) && !groups.iter().any(|g| negated_pattern_hits(pats, g))
             };
 
             // 0. A knocked connection is bound to the knock's user.
@@ -3847,22 +3914,23 @@ mod imp {
                     None => {}
                 }
             }
-            // 1. DenyUsers wins outright.
-            if !self.deny_users.is_empty() && user_host_list_matches(&self.deny_users, user, peer) {
-                return refuse("listed in DenyUsers");
-            }
-            // 2. AllowUsers: if set, the user must match one.
-            if !self.allow_users.is_empty()
-                && !user_host_list_matches(&self.allow_users, user, peer)
-            {
-                return refuse("not listed in AllowUsers");
+            // 1. DenyUsers wins outright. 2. AllowUsers: if set, the user
+            //    must match one. Both against the account's own name.
+            if let Some(why) = user_lists_refusal(
+                &self.deny_users,
+                &self.allow_users,
+                user,
+                account.as_deref(),
+                peer,
+            ) {
+                return refuse(why);
             }
             // 3. DenyGroups: a matching group refuses.
             if !self.deny_groups.is_empty() && in_group(&self.deny_groups) {
                 return refuse("a group is listed in DenyGroups");
             }
             // 4. AllowGroups: if set, the user must be in a matching group.
-            if !self.allow_groups.is_empty() && !in_group(&self.allow_groups) {
+            if !self.allow_groups.is_empty() && !allowed_group(&self.allow_groups) {
                 return refuse("none of user's groups are listed in AllowGroups");
             }
             true
@@ -3940,8 +4008,12 @@ mod imp {
             //      / AuthorizedPrincipalsCommand output when either is
             //      configured, otherwise the login name must be.
             //
-            // Both routes are evaluated unconditionally so the cost does not
-            // depend on which one decides.
+            // The authorized_keys route is always evaluated. The principals
+            // file and AuthorizedPrincipalsCommand belong to route (b) alone:
+            // they are consulted only for a CA in `TrustedUserCAKeys`, as in
+            // OpenSSH. A certificate signed by any other CA comes from a peer
+            // that has proven nothing, and must not get the command run with
+            // its key id and serial as arguments.
             let peer = self.peer.clone();
             let debug = self.debug;
             let mut set = self.resolved_authorized_keys(user).clone();
@@ -3963,7 +4035,11 @@ mod imp {
             });
             let ca_opts = ca_line.map(|(i, _)| set.ca_options.get(i).cloned().unwrap_or_default());
             let global_trusted = self.trusted_user_ca_blobs.contains(&ci.ca_key_blob);
-            let principal = self.cert_principal_line(ci, user, cert_blob);
+            let principal = if global_trusted {
+                self.cert_principal_line(ci, user, cert_blob)
+            } else {
+                None
+            };
             let global_ok = global_trusted && principal.is_some();
             if ca_opts.is_none() && !global_trusted {
                 if self.debug {
@@ -4759,20 +4835,13 @@ mod imp {
         fn check_security_key(
             &self,
             sk: &puressh::auth::SkSignature,
+            caps: Option<&puressh::auth::AuthCertCaps>,
             cert: Option<&puressh::auth::CertInfo>,
             public_blob: &[u8],
             user: &str,
         ) -> Result<(), puressh::auth::SkRequirement> {
-            use puressh::auth::{AuthCertCaps, SkRequirement};
-            let key = self
-                .accepted_options
-                .as_deref()
-                .map(AuthCertCaps::from_key_options);
-            let caps = match (cert.map(AuthCertCaps::from_cert_info), key) {
-                (Some(c), Some(k)) => c.intersect(k),
-                (c, k) => c.or(k),
-            };
-            sk.check(caps.as_ref()).inspect_err(|unmet| {
+            use puressh::auth::SkRequirement;
+            sk.check(caps).inspect_err(|unmet| {
                 let blob = cert.map_or(public_blob, |ci| ci.embedded_pubkey_blob.as_slice());
                 let key = key_description(blob, None);
                 let what = match unmet {
@@ -4788,6 +4857,89 @@ mod imp {
                     ));
                 });
             })
+        }
+
+        /// The restrictions a public-key attempt that passed every other
+        /// check would log in under: the certificate's with those of the
+        /// `authorized_keys` / principals line that accepted it (`.0`), and
+        /// those with what the earlier public-key factors of a multi-factor
+        /// chain recorded (`.1`). An inner `None` is "unrestricted".
+        ///
+        /// `None` when they cannot all hold at once (different forced
+        /// commands), which OpenSSH refuses. The auth layer computes the
+        /// same thing after `evaluate` returns and refuses the attempt
+        /// then; it has to be refused *here* as well, before the factor is
+        /// recorded, or the chain would have advanced past a factor whose
+        /// restrictions were never applied.
+        #[allow(clippy::type_complexity)]
+        fn publickey_restrictions(
+            &self,
+            cert: Option<&puressh::auth::CertInfo>,
+        ) -> Option<(
+            Option<puressh::auth::AuthCertCaps>,
+            Option<puressh::auth::AuthCertCaps>,
+        )> {
+            use puressh::auth::AuthCertCaps;
+            let merge = |a: Option<AuthCertCaps>, b: Option<AuthCertCaps>| match (a, b) {
+                (Some(a), Some(b)) => a.intersect(b).map(Some),
+                (a, b) => Some(a.or(b)),
+            };
+            let key = self
+                .accepted_options
+                .as_deref()
+                .map(AuthCertCaps::from_key_options);
+            let attempt = merge(cert.map(AuthCertCaps::from_cert_info), key)?;
+            let chain = merge(self.recorded_caps.clone(), attempt.clone())?;
+            Some((attempt, chain))
+        }
+
+        /// The last step of a public-key attempt whose user, key and
+        /// signature are all acceptable: check that its restrictions are
+        /// consistent and that a security-key signature meets them, then
+        /// record the `publickey` factor.
+        fn accept_publickey(
+            &mut self,
+            user: &str,
+            public_blob: &[u8],
+            cert: Option<&puressh::auth::CertInfo>,
+            security_key: Option<puressh::auth::SkSignature>,
+        ) -> AuthDecision {
+            let Some((attempt_caps, chain_caps)) = self.publickey_restrictions(cert) else {
+                if self.debug {
+                    eprintln!(
+                        "sshd: auth publickey: conflicting forced commands for {user}, rejecting"
+                    );
+                }
+                self.accepted_options = None;
+                return AuthDecision::Reject;
+            };
+            if let Some(sk) = security_key
+                && let Err(unmet) =
+                    self.check_security_key(&sk, attempt_caps.as_ref(), cert, public_blob, user)
+            {
+                if self.debug {
+                    eprintln!("sshd: auth publickey: {unmet:?} requirement not met for {user}");
+                }
+                return AuthDecision::Reject;
+            }
+            if self.debug {
+                eprintln!("sshd: auth publickey: verified user {user}");
+            }
+            // A verified user certificate's `force-command` critical
+            // option (and its default-deny extensions) are captured by
+            // the auth layer into `AuthCertCaps`, folded into the
+            // per-connection `EffectivePolicy`, and enforced by the
+            // server connection-phase dispatcher uniformly with the
+            // config `ForceCommand` / forwarding gates.
+            //
+            // A verified signature satisfies the `publickey` factor. In
+            // single-factor mode this Accepts; under a multi-factor
+            // chain it may PartialAccept and ask for the next factor.
+            let decision = self.record_and_decide("publickey");
+            if !matches!(decision, AuthDecision::Reject) {
+                self.recorded_caps = chain_caps;
+            }
+            decision
         }
     }
 
@@ -4989,32 +5141,7 @@ mod imp {
                             }
                             return AuthDecision::Reject;
                         }
-                        if let Some(sk) = security_key
-                            && let Err(unmet) =
-                                self.check_security_key(&sk, cert.as_ref(), &public_blob, &user)
-                        {
-                            if self.debug {
-                                eprintln!(
-                                    "sshd: auth publickey: {unmet:?} requirement not met for {user}"
-                                );
-                            }
-                            return AuthDecision::Reject;
-                        }
-                        if self.debug {
-                            eprintln!("sshd: auth publickey: verified user {user}");
-                        }
-                        // A verified user certificate's `force-command` critical
-                        // option (and its default-deny extensions) are captured by
-                        // the auth layer into `AuthCertCaps`, folded into the
-                        // per-connection `EffectivePolicy`, and enforced by the
-                        // server connection-phase dispatcher uniformly with the
-                        // config `ForceCommand` / forwarding gates. Nothing to
-                        // record here.
-                        //
-                        // A verified signature satisfies the `publickey` factor. In
-                        // single-factor mode this Accepts; under a multi-factor
-                        // chain it may PartialAccept and ask for the next factor.
-                        self.record_and_decide("publickey")
+                        self.accept_publickey(&user, &public_blob, cert.as_ref(), security_key)
                     }
                     AuthAttempt::Password { user, password, .. } => {
                         if !self.password_enabled {
@@ -5640,6 +5767,7 @@ mod imp {
                 authorized_keys_files: self.authorized_keys_files.clone(),
                 authorized_keys: None,
                 accepted_options: None,
+                recorded_caps: None,
                 trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
                 revoked_keys: self.revoked_keys.clone(),
                 policy: self.policy.clone(),
@@ -6154,13 +6282,23 @@ mod imp {
     /// LD_PRELOAD/IFS/PATH/etc. into the user's shell.
     ///
     /// Names with embedded NUL are dropped too — they can't safely make
-    /// it into a `setenv`/`Command::env` call anyway.
+    /// it into a `setenv`/`Command::env` call anyway — and so is any name
+    /// [`env_name_ok`] refuses.
     fn safe_session_env(env: &SessionEnv) -> Vec<(&str, &str)> {
         env.iter()
             .filter(|(k, v)| {
-                !k.contains('\0') && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
+                env_name_ok(k) && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
             })
             .collect()
+    }
+
+    /// Whether `name` can name an environment variable at all: not empty,
+    /// no NUL and no `=`. A name such as `LD_PRELOAD=/tmp/x.so` is not on
+    /// any blocklist, yet handed to the child as it stands it *is* the
+    /// variable `LD_PRELOAD` (an environment entry is split at its first
+    /// `=`).
+    fn env_name_ok(name: &str) -> bool {
+        !name.is_empty() && !name.contains(['=', '\0'])
     }
 
     /// The session's variables, layered as OpenSSH does: the client's
@@ -6173,7 +6311,7 @@ mod imp {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let mut set = |k: &str, v: &str| {
-            if k.is_empty() || k.contains('\0') || v.contains('\0') {
+            if !env_name_ok(k) || v.contains('\0') {
                 return;
             }
             match vars.iter_mut().find(|(n, _)| n == k) {
@@ -6212,9 +6350,7 @@ mod imp {
     fn safe_owned_env(env: &[(String, String)]) -> Vec<(String, String)> {
         env.iter()
             .filter(|(k, v)| {
-                !k.contains('\0')
-                    && !v.contains('\0')
-                    && !HARD_BLOCKED_ENV_NAMES.contains(&k.as_str())
+                env_name_ok(k) && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(&k.as_str())
             })
             .cloned()
             .collect()
@@ -6580,7 +6716,9 @@ mod imp {
         // on platforms that expose it; fall back to just the primary group if
         // it fails or is unavailable (macOS / Solaris / AIX don't have it in
         // nix). The primary group still feeds AllowGroups/DenyGroups there.
-        let gids: Vec<Gid> = group_gids(name, user.gid);
+        // By the account's own name: group databases list members under it,
+        // whatever spelling the client logged in with.
+        let gids: Vec<Gid> = group_gids(&user.name, user.gid);
         let mut names: Vec<String> = Vec::new();
         for gid in gids {
             if let Ok(Some(g)) = Group::from_gid(gid)
@@ -8336,11 +8474,30 @@ mod imp {
         /// when it is reaped.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         logins: Vec<sshd_login::Session>,
+        /// Every login this child has had recorded, open or closed: bounded
+        /// by [`MAX_LOGINS_PER_CONNECTION`].
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        logins_total: u32,
     }
 
+    /// Pty logins recorded at once for one connection.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const MAX_OPEN_LOGINS: usize = 64;
+
+    /// Pty logins recorded over one connection's life. Without it a child
+    /// alternating login and logout messages could append to wtmp without
+    /// end; a real connection opening this many ptys just stops being
+    /// recorded.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const MAX_LOGINS_PER_CONNECTION: u32 = 512;
+
     impl ChildRecord {
-        /// Handle one message line from the child (see `tell_parent`).
-        fn message(&mut self, line: &[u8]) {
+        /// Handle one message line from the child `pid` (see `tell_parent`).
+        #[cfg_attr(
+            not(all(target_os = "linux", target_env = "gnu")),
+            allow(unused_variables)
+        )]
+        fn message(&mut self, pid: Pid, line: &[u8]) {
             if line == [AUTH_OK_BYTE] {
                 self.authenticated = true;
             } else if let Some(name) = line.strip_prefix(b"H\t") {
@@ -8358,26 +8515,40 @@ mod imp {
                 }
             } else {
                 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                self.login_message(line);
+                self.login_message(pid, line);
             }
         }
 
-        /// `L …` / `O …`: record a pty login or logout.
+        /// `L …` / `O …` from the connection process `child`: record a pty
+        /// login or logout.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        fn login_message(&mut self, line: &[u8]) {
+        fn login_message(&mut self, child: Pid, line: &[u8]) {
             {
                 let Ok(line) = std::str::from_utf8(line) else {
                     return;
                 };
                 let f: Vec<&str> = line.split('\t').collect();
                 match f.as_slice() {
-                    ["L", pid, tty, user, uid] if self.authenticated && self.logins.len() < 64 => {
+                    ["L", pid, tty, user, uid]
+                        if self.authenticated
+                            && self.logins.len() < MAX_OPEN_LOGINS
+                            && self.logins_total < MAX_LOGINS_PER_CONNECTION =>
+                    {
                         let (Ok(pid), Ok(uid)) = (pid.parse::<i32>(), uid.parse::<u32>()) else {
                             return;
                         };
+                        // The claim must be about the user the child itself
+                        // runs as: it dropped to that user before it could
+                        // open any channel, so a child that says otherwise
+                        // is not one to believe (it could otherwise rewrite
+                        // another user's utmp / lastlog entries).
+                        if process_euid(child.as_raw()) != Some(uid) {
+                            return;
+                        }
                         if !login_claim_ok(tty, user, uid) {
                             return;
                         }
+                        self.logins_total += 1;
                         // The peer as this parent knows it, not as claimed.
                         let host = utmp_host(
                             self.ip,
@@ -8413,6 +8584,34 @@ mod imp {
                 sshd_login::logout(&l);
             }
         }
+    }
+
+    /// The effective uid of process `pid`, from `/proc/<pid>/status` (which
+    /// still answers for a process that has exited and is not yet reaped).
+    /// `None` when it cannot be told.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn process_euid(pid: i32) -> Option<u32> {
+        use std::io::Read;
+        let mut status = String::new();
+        std::fs::File::open(format!("/proc/{pid}/status"))
+            .ok()?
+            .take(64 * 1024)
+            .read_to_string(&mut status)
+            .ok()?;
+        parse_status_euid(&status)
+    }
+
+    /// The effective uid in a `/proc/<pid>/status` body: the second field
+    /// of its `Uid:` line (real, effective, saved, filesystem).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn parse_status_euid(status: &str) -> Option<u32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))?
+            .split_ascii_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
     }
 
     /// A child's login claim holds: `tty` is a pty owned by `uid`, which is
@@ -8649,6 +8848,53 @@ mod imp {
         }
     }
 
+    /// How long the accept loop pauses after an `accept()` that failed for
+    /// want of a resource (OpenSSH's 100 ms).
+    const ACCEPT_ERROR_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+
+    /// The least time between two `accept` error lines in the log.
+    const ACCEPT_ERROR_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// An `accept()` error that says nothing is wrong with the listener and
+    /// leaves nothing queued: interrupted, nothing to accept after all, or
+    /// a connection its peer gave up before it was accepted.
+    fn accept_error_is_transient(e: &std::io::Error) -> bool {
+        matches!(
+            e.kind(),
+            std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+                | std::io::ErrorKind::ConnectionAborted
+        )
+    }
+
+    /// Rate limit for the accept loop's error line: a condition that lasts
+    /// (EMFILE, ENFILE) fails every pass.
+    #[derive(Default)]
+    struct AcceptErrors {
+        last_logged: Option<std::time::Instant>,
+        suppressed: u64,
+    }
+
+    impl AcceptErrors {
+        /// Note a failed `accept()` at `now`: the line to log, at most one
+        /// per [`ACCEPT_ERROR_LOG_INTERVAL`], saying how many were not.
+        fn note(&mut self, e: &std::io::Error, now: std::time::Instant) -> Option<String> {
+            if self
+                .last_logged
+                .is_some_and(|t| now.saturating_duration_since(t) < ACCEPT_ERROR_LOG_INTERVAL)
+            {
+                self.suppressed += 1;
+                return None;
+            }
+            let more = match std::mem::take(&mut self.suppressed) {
+                0 => String::new(),
+                n => format!(" ({n} more like it not logged)"),
+            };
+            self.last_logged = Some(now);
+            Some(format!("accept: {e}{more}"))
+        }
+    }
+
     /// The daemon parent's table of live connection children, keyed by pid.
     /// Owned by the accept loop; never touched from signal context.
     #[derive(Default)]
@@ -8683,6 +8929,8 @@ mod imp {
                     host_name: None,
                     #[cfg(all(target_os = "linux", target_env = "gnu"))]
                     logins: Vec::new(),
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    logins_total: 0,
                 },
             );
         }
@@ -8775,7 +9023,7 @@ mod imp {
                 }
                 while let Some(i) = rec.buf.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = rec.buf.drain(..=i).collect();
-                    rec.message(&line[..line.len() - 1]);
+                    rec.message(pid, &line[..line.len() - 1]);
                 }
                 // A child that will not end its lines gets no more hearing.
                 if rec.buf.len() > 4096 {
@@ -8834,6 +9082,48 @@ mod imp {
         }
     }
 
+    /// Whether fds `a` and `b` are one and the same socket (the same
+    /// device and inode), as when inetd hands the client's connection to a
+    /// server as its stdin, stdout and stderr.
+    fn same_socket(a: std::os::fd::RawFd, b: std::os::fd::RawFd) -> bool {
+        let stat = |fd: std::os::fd::RawFd| {
+            // SAFETY: fstat fills a local, zero-initialised struct; a bad fd
+            // is reported as an error.
+            unsafe {
+                let mut st: libc::stat = std::mem::zeroed();
+                (libc::fstat(fd, &mut st) == 0).then_some(st)
+            }
+        };
+        match (stat(a), stat(b)) {
+            (Some(x), Some(y)) => {
+                x.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                    && y.st_mode & libc::S_IFMT == libc::S_IFSOCK
+                    && x.st_dev == y.st_dev
+                    && x.st_ino == y.st_ino
+            }
+            _ => false,
+        }
+    }
+
+    /// Stderr was pointed at /dev/null ([`mute_stderr`]): a fatal error is
+    /// reported to syslog instead.
+    static STDERR_MUTED: AtomicBool = AtomicBool::new(false);
+
+    /// Point stderr at /dev/null for the rest of the process's life. If
+    /// that cannot be done the process ends: it must not go on to write to
+    /// what stderr was.
+    fn mute_stderr() {
+        let muted = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .is_ok_and(|null| nix::unistd::dup2_stderr(&null).is_ok());
+        if !muted {
+            // SAFETY: _exit ends the process at once, writing nothing.
+            unsafe { libc::_exit(255) };
+        }
+        STDERR_MUTED.store(true, Ordering::Relaxed);
+    }
+
     fn run() -> Result<i32, String> {
         let args: Vec<String> = std::env::args().skip(1).collect();
         if args.iter().any(|a| a == "-?" || a == "--help") {
@@ -8847,7 +9137,21 @@ mod imp {
             return Ok(0);
         }
 
-        let cli = parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))?;
+        let cli = parse_args(&args);
+        // `-i` from a classic inetd: stderr is the client's connection, as
+        // stdin and stdout are. Nothing may be written there but the
+        // protocol (a diagnostic would both corrupt the stream and tell the
+        // peer about this host), so stderr goes to /dev/null unless it was
+        // asked for (`-d`, `-e`, `-t`). A stderr that is anything else (a
+        // terminal, a pipe, the journal's own socket) is left alone.
+        let (inetd, wants_stderr) = match &cli {
+            Ok(cli) => (cli.inetd, cli.debug || cli.log_stderr || cli.test_only),
+            Err(_) => (args.iter().any(|a| a == "-i"), false),
+        };
+        if inetd && !wants_stderr && same_socket(0, 2) {
+            mute_stderr();
+        }
+        let cli = cli.map_err(|e| format!("{e}\n{USAGE}"))?;
 
         // `-E file`: append diagnostics to `file` from here on.
         if let Some(path) = cli.log_file.as_deref() {
@@ -9751,6 +10055,7 @@ mod imp {
         const FORK_BACKOFF_MIN_MS: u64 = 10;
         const FORK_BACKOFF_MAX_MS: u64 = 1_000;
         let mut fork_backoff_ms: u64 = FORK_BACKOFF_MIN_MS;
+        let mut accept_errors = AcceptErrors::default();
 
         // Live connection children: per-IP accounting for `--per-source-max`
         // and the unauthenticated count for `MaxStartups`. Reconciled at the
@@ -9836,16 +10141,25 @@ mod imp {
                 }
                 incoming.push((stream, peer, Some(user)));
             }
+            let mut accept_failed = false;
             for i in ready_listeners {
                 match listeners[i].accept() {
                     Ok((stream, peer)) => incoming.push((stream, peer, None)),
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                        ) => {}
-                    Err(e) => eprintln!("sshd: accept: {e}"),
+                    Err(e) if accept_error_is_transient(&e) => {}
+                    Err(e) => {
+                        accept_failed = true;
+                        if let Some(line) = accept_errors.note(&e, std::time::Instant::now()) {
+                            eprintln!("sshd: {line}");
+                        }
+                    }
                 }
+            }
+            // The connection that could not be accepted (no file
+            // descriptors left, typically) is still queued, and the poll
+            // above is level-triggered: without a pause this loop would
+            // spin, and log, until the condition clears.
+            if accept_failed {
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
             }
 
             // TCPKeepAlive (default yes, as OpenSSH): a peer that vanished
@@ -10078,6 +10392,21 @@ mod imp {
             }
             Err(msg) => {
                 eprintln!("sshd: {msg}");
+                // Stderr was the client's connection (`-i`): the system log
+                // is where the administrator will look.
+                if STDERR_MUTED.load(Ordering::Relaxed)
+                    && let Ok(line) = std::ffi::CString::new(format!("fatal: {msg}"))
+                {
+                    // SAFETY: a constant "%s" format with one NUL-terminated
+                    // argument.
+                    unsafe {
+                        libc::syslog(
+                            libc::LOG_AUTH | libc::LOG_CRIT,
+                            c"%s".as_ptr(),
+                            line.as_ptr(),
+                        )
+                    };
+                }
                 ExitCode::from(2)
             }
         }
@@ -10235,6 +10564,7 @@ mod imp {
                 peer: peer.map(str::to_string),
                 debug: false,
                 accepted_options: None,
+                recorded_caps: None,
             }
         }
 
@@ -10244,6 +10574,314 @@ mod imp {
             assert!(a.access_allowed("alice"));
             // bob is allowed *and* denied — DenyUsers has higher precedence.
             assert!(!a.access_allowed("bob"));
+        }
+
+        /// SSHD-10: a certificate signed by a CA outside `TrustedUserCAKeys`
+        /// must not get AuthorizedPrincipalsCommand run for it (its key id and
+        /// serial are the unauthenticated peer's choice).
+        #[test]
+        fn principals_command_runs_only_for_a_trusted_ca() {
+            let user = current_user().expect("current user");
+            let dir = std::env::temp_dir().join(format!("puressh-sshd10-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let marker = dir.join("ran");
+            let ca = b"untrusted-ca-blob".to_vec();
+            let cert_blob = b"cert-blob".to_vec();
+            let ci = puressh::auth::CertInfo::new(
+                ca.clone(),
+                b"embedded".to_vec(),
+                "ssh-ed25519",
+                "attacker chosen id",
+                7,
+                vec![user.clone()],
+            );
+            let mut a = auth_with(&[], &[], &[], &[], Default::default());
+            a.auth_commands = AuthCommands {
+                keys: Vec::new(),
+                keys_user: None,
+                principals: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    format!("echo ran > {}; echo {user}", marker.display()),
+                ],
+                principals_user: Some(user.clone()),
+            };
+            // Untrusted CA: refused, and the command never ran.
+            assert!(!a.cert_trusted(&ci, &user, &cert_blob));
+            assert!(!marker.exists(), "command ran for an untrusted CA");
+            // The same certificate once its CA is trusted: the command runs
+            // and its output authorizes the principal.
+            a.trusted_user_ca_blobs = vec![ca];
+            assert!(a.cert_trusted(&ci, &user, &cert_blob));
+            assert!(marker.exists(), "command did not run for a trusted CA");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// SSHD-11: `AllowGroups staff !contractors` refuses a member of
+        /// both; DenyGroups keeps refusing on any one matching group.
+        #[test]
+        fn allow_groups_negation_vetoes_across_groups() {
+            let mut groups = std::collections::HashMap::new();
+            groups.insert("alice".to_string(), vec!["staff".to_string()]);
+            groups.insert(
+                "carol".to_string(),
+                vec!["staff".to_string(), "contractors".to_string()],
+            );
+            groups.insert(
+                "dave".to_string(),
+                vec!["contractors".to_string(), "staff".to_string()],
+            );
+            let mut a = auth_with(&["*"], &[], &["staff", "!contractors"], &[], groups.clone());
+            assert!(a.access_allowed("alice"));
+            assert!(!a.access_allowed("carol"));
+            assert!(!a.access_allowed("dave"));
+            let mut d = auth_with(&["*"], &[], &[], &["contractors"], groups);
+            assert!(d.access_allowed("alice"));
+            assert!(!d.access_allowed("carol"));
+            assert!(!d.access_allowed("dave"));
+        }
+
+        /// SSHD-12: the user lists are matched against the account's own
+        /// name, so an aliasing NSS spelling cannot step around DenyUsers.
+        #[test]
+        fn user_lists_match_the_account_name() {
+            let pats = |xs: &[&str]| {
+                UserHostPattern::parse_all(&xs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+            };
+            // `Bob` on the wire, account `bob`.
+            assert_eq!(
+                user_lists_refusal(&pats(&["bob"]), &[], "Bob", Some("bob"), None),
+                Some("listed in DenyUsers")
+            );
+            // The name as sent still counts for DenyUsers.
+            assert_eq!(
+                user_lists_refusal(&pats(&["Bob"]), &[], "Bob", Some("bob"), None),
+                Some("listed in DenyUsers")
+            );
+            // AllowUsers follows the account, as OpenSSH's pw_name.
+            assert_eq!(
+                user_lists_refusal(&[], &pats(&["bob"]), "Bob", Some("bob"), None),
+                None
+            );
+            assert_eq!(
+                user_lists_refusal(&[], &pats(&["Bob"]), "Bob", Some("bob"), None),
+                Some("not listed in AllowUsers")
+            );
+            assert_eq!(
+                user_lists_refusal(&[], &pats(&["*", "!bob"]), "Bob", Some("bob"), None),
+                Some("not listed in AllowUsers")
+            );
+            // No such account: the name as sent is all there is.
+            assert_eq!(
+                user_lists_refusal(&pats(&["bob"]), &pats(&["*"]), "Bob", None, None),
+                None
+            );
+            assert_eq!(
+                user_lists_refusal(&pats(&["bob"]), &pats(&["*"]), "bob", None, None),
+                Some("listed in DenyUsers")
+            );
+        }
+
+        /// SSHD-12: a `user@address` token matches the address, however it
+        /// is spelled.
+        #[test]
+        fn user_at_address_literal_matches_any_spelling() {
+            for token in [
+                "eve@2001:db8::1",
+                "eve@2001:DB8::1",
+                "eve@2001:db8:0:0:0:0:0:1",
+                "eve@2001:0db8::0001",
+            ] {
+                let mut a = auth_with_peer(
+                    &["*"],
+                    &[token],
+                    &[],
+                    &[],
+                    Default::default(),
+                    Some("2001:db8::1"),
+                );
+                assert!(!a.access_allowed("eve"), "{token}");
+                let mut b = auth_with_peer(
+                    &["*"],
+                    &[token],
+                    &[],
+                    &[],
+                    Default::default(),
+                    Some("2001:db8::2"),
+                );
+                assert!(b.access_allowed("eve"), "{token}");
+            }
+            // An IPv4-mapped spelling is the IPv4 address.
+            let mut a = auth_with_peer(
+                &["*"],
+                &["eve@::ffff:192.0.2.7"],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.0.2.7"),
+            );
+            assert!(!a.access_allowed("eve"));
+            // IPv4 literals and globs behave as before.
+            let mut a = auth_with_peer(
+                &["alice@192.0.2.7"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.0.2.7"),
+            );
+            assert!(a.access_allowed("alice"));
+            let mut a = auth_with_peer(
+                &["alice@192.0.2.7"],
+                &[],
+                &[],
+                &[],
+                Default::default(),
+                Some("192.0.2.8"),
+            );
+            assert!(!a.access_allowed("alice"));
+        }
+
+        /// SSHD-14: a client variable whose *name* carries `=` would reach
+        /// the child as a different variable than the one the blocklist saw.
+        #[test]
+        fn session_env_drops_names_that_are_not_names() {
+            let mut env = SessionEnv::new();
+            env.insert("LANG", "C");
+            env.insert("LD_PRELOAD=/tmp/x.so", "1");
+            env.insert("=x", "1");
+            env.insert("", "1");
+            env.insert("A\0B", "1");
+            env.insert("OK", "a\0b");
+            env.insert("LD_PRELOAD", "/tmp/y.so");
+            assert_eq!(safe_session_env(&env), vec![("LANG", "C")]);
+            let vars = session_vars(&env, "/nonexistent");
+            assert!(vars.contains(&("LANG".to_string(), "C".to_string())));
+            assert!(vars.iter().all(|(k, _)| env_name_ok(k)), "{vars:?}");
+            assert!(
+                vars.iter().all(|(k, _)| !k.starts_with("LD_PRELOAD")),
+                "{vars:?}"
+            );
+
+            let owned: Vec<(String, String)> = [
+                ("TERM", "xterm"),
+                ("LD_PRELOAD=/tmp/x.so", "1"),
+                ("LD_LIBRARY_PATH=/tmp", ""),
+                ("", "1"),
+                ("A\0B", "1"),
+                ("LD_PRELOAD", "/tmp/y.so"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            assert_eq!(
+                safe_owned_env(&owned),
+                vec![("TERM".to_string(), "xterm".to_string())]
+            );
+        }
+
+        /// AUTH-1: a public-key factor whose certificate and key line force
+        /// different commands is refused *before* it is recorded, so a
+        /// `publickey,password` chain cannot be completed past it with no
+        /// restriction applied.
+        #[test]
+        fn conflicting_forced_commands_do_not_advance_the_chain() {
+            let cert_forcing = |cmd: &str| {
+                let mut ci = puressh::auth::CertInfo::new(
+                    b"ca".to_vec(),
+                    b"key".to_vec(),
+                    "ssh-ed25519",
+                    "id",
+                    1,
+                    vec!["alice".into()],
+                );
+                let mut data = (cmd.len() as u32).to_be_bytes().to_vec();
+                data.extend_from_slice(cmd.as_bytes());
+                ci.critical_options.push(("force-command".into(), data));
+                ci
+            };
+            let line_forcing = |cmd: &str| {
+                let mut o = puressh::key::AuthorizedKeyOptions::default();
+                o.cert_authority = true;
+                o.command = Some(cmd.into());
+                Some(Arc::new(o))
+            };
+            let forced = |a: &LocalAuthenticator| {
+                a.recorded_caps
+                    .as_ref()
+                    .and_then(|c| c.force_command.clone())
+            };
+            let mut a = auth_with(&["alice"], &[], &[], &[], Default::default());
+            a.chains = vec![vec!["publickey", "password"]];
+
+            // Certificate forces A, the cert-authority line forces B.
+            a.accepted_options = line_forcing("B");
+            assert!(a.publickey_restrictions(Some(&cert_forcing("A"))).is_none());
+            assert!(matches!(
+                a.accept_publickey("alice", b"blob", Some(&cert_forcing("A")), None),
+                AuthDecision::Reject
+            ));
+            assert!(a.satisfied.is_empty(), "the factor was recorded");
+            assert!(a.recorded_caps.is_none());
+            // So the password alone does not complete the chain.
+            assert!(matches!(
+                a.record_and_decide("password"),
+                AuthDecision::Reject
+            ));
+
+            // Agreeing commands: recorded, and the restriction is kept.
+            a.accepted_options = line_forcing("A");
+            assert!(matches!(
+                a.accept_publickey("alice", b"blob", Some(&cert_forcing("A")), None),
+                AuthDecision::PartialAccept { .. }
+            ));
+            assert_eq!(a.satisfied, vec!["publickey"]);
+            assert_eq!(forced(&a).as_deref(), Some("A"));
+
+            // A second public-key factor that forces another command than
+            // the first is refused as well.
+            let mut b = auth_with(&["alice"], &[], &[], &[], Default::default());
+            b.chains = vec![vec!["publickey", "publickey", "password"]];
+            b.accepted_options = line_forcing("A");
+            assert!(matches!(
+                b.accept_publickey("alice", b"k1", None, None),
+                AuthDecision::PartialAccept { .. }
+            ));
+            b.accepted_options = line_forcing("B");
+            assert!(matches!(
+                b.accept_publickey("alice", b"k2", None, None),
+                AuthDecision::Reject
+            ));
+            assert_eq!(b.satisfied, vec!["publickey"]);
+            // A plain, unrestricted key still passes and keeps A in force.
+            b.accepted_options = Some(Default::default());
+            assert!(matches!(
+                b.accept_publickey("alice", b"k3", None, None),
+                AuthDecision::PartialAccept { .. }
+            ));
+            assert_eq!(forced(&b).as_deref(), Some("A"));
+        }
+
+        /// SSHD-15: only a stderr that is the very socket on stdin is the
+        /// client's connection.
+        #[test]
+        fn same_socket_tells_the_client_connection_apart() {
+            use std::os::unix::net::UnixStream;
+            let (a, b) = UnixStream::pair().unwrap();
+            let a2 = a.try_clone().unwrap();
+            assert!(same_socket(a.as_raw_fd(), a2.as_raw_fd()));
+            assert!(same_socket(a.as_raw_fd(), a.as_raw_fd()));
+            // The other end is another socket (as the journal's is).
+            assert!(!same_socket(a.as_raw_fd(), b.as_raw_fd()));
+            // Not sockets at all.
+            let (rx, tx) = pipe_cloexec().unwrap();
+            let rx2 = rx.try_clone().unwrap();
+            assert!(!same_socket(rx.as_raw_fd(), rx2.as_raw_fd()));
+            assert!(!same_socket(a.as_raw_fd(), tx.as_raw_fd()));
+            let null = std::fs::File::open("/dev/null").unwrap();
+            assert!(!same_socket(null.as_raw_fd(), null.as_raw_fd()));
+            assert!(!same_socket(a.as_raw_fd(), -1));
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------
@@ -11492,6 +12130,73 @@ mod imp {
             }
             assert_eq!(t.len(), 0, "exited child not reaped");
             assert_eq!(t.count_from_ip(ip), 0);
+        }
+
+        /// SSHD-13: the parent ties a login claim to the uid the claiming
+        /// connection process really runs as.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        #[test]
+        fn login_claim_is_tied_to_the_child_uid() {
+            assert_eq!(
+                parse_status_euid("Name:\tsshd\nUid:\t1000\t1001\t1002\t1003\nGid:\t5\t6\t7\t8\n"),
+                Some(1001)
+            );
+            assert_eq!(parse_status_euid("Name:\tsshd\n"), None);
+            assert_eq!(parse_status_euid("Uid:\t1000\n"), None);
+            assert_eq!(parse_status_euid("Uid:\tx\ty\n"), None);
+            let me = std::process::id() as i32;
+            let euid = nix::unistd::geteuid().as_raw();
+            assert_eq!(process_euid(me), Some(euid));
+            assert_eq!(process_euid(i32::MAX), None);
+
+            // A claim for another uid than the sender's is dropped before
+            // anything is recorded, and does not count against the caps.
+            let mut t = ChildTable::default();
+            let pid = Pid::from_raw(me);
+            t.insert(pid, "192.0.2.7".parse().unwrap(), None);
+            let rec = t.children.get_mut(&pid).unwrap();
+            rec.authenticated = true;
+            let other = if euid == 0 { 1 } else { 0 };
+            rec.message(
+                pid,
+                format!("L\t{me}\t/dev/pts/0\troot\t{other}").as_bytes(),
+            );
+            assert!(rec.logins.is_empty());
+            assert_eq!(rec.logins_total, 0);
+            // Past the per-connection total, nothing more is recorded.
+            rec.logins_total = MAX_LOGINS_PER_CONNECTION;
+            rec.message(pid, format!("L\t{me}\t/dev/pts/0\troot\t{euid}").as_bytes());
+            assert!(rec.logins.is_empty());
+            assert_eq!(rec.logins_total, MAX_LOGINS_PER_CONNECTION);
+        }
+
+        /// SSHD-16: a lasting accept() failure is logged at a bounded rate.
+        #[test]
+        fn accept_errors_are_rate_limited() {
+            let emfile = || std::io::Error::from_raw_os_error(libc::EMFILE);
+            assert!(!accept_error_is_transient(&emfile()));
+            assert!(!accept_error_is_transient(
+                &std::io::Error::from_raw_os_error(libc::ENFILE)
+            ));
+            for errno in [libc::EINTR, libc::EAGAIN, libc::ECONNABORTED] {
+                assert!(accept_error_is_transient(
+                    &std::io::Error::from_raw_os_error(errno)
+                ));
+            }
+            let t0 = std::time::Instant::now();
+            let mut errs = AcceptErrors::default();
+            let first = errs.note(&emfile(), t0).expect("first is logged");
+            assert!(first.starts_with("accept: "), "{first}");
+            assert!(!first.contains("more"), "{first}");
+            for ms in 1..=50 {
+                let at = t0 + std::time::Duration::from_millis(ms * 100);
+                assert_eq!(errs.note(&emfile(), at), None);
+            }
+            let later = errs
+                .note(&emfile(), t0 + ACCEPT_ERROR_LOG_INTERVAL)
+                .expect("logged again after the interval");
+            assert!(later.contains("(50 more like it not logged)"), "{later}");
+            assert_eq!(errs.note(&emfile(), t0 + ACCEPT_ERROR_LOG_INTERVAL), None);
         }
 
         #[test]

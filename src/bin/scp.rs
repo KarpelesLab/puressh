@@ -392,15 +392,21 @@ fn local_target(target: &Path, name: &str, many: bool) -> Result<PathBuf, String
 
 /// Report an error OpenSSH-style and remember that one happened.
 fn fail(errs: &mut u32, msg: impl std::fmt::Display) {
+    eprintln!("scp: {}", fail_text(&msg.to_string()));
+    *errs += 1;
+}
+
+/// An error message as [`fail`] prints it.
+fn fail_text(msg: &str) -> String {
     // Without Rust's ` (os error N)`: OpenSSH says `No such file or
     // directory`.
-    let msg = msg.to_string();
     let msg = match msg.find(" (os error ") {
         Some(i) if msg.ends_with(')') => &msg[..i],
-        _ => &msg,
+        _ => msg,
     };
-    eprintln!("scp: {msg}");
-    *errs += 1;
+    // Status messages, remote paths and the legacy protocol's error text
+    // are the server's: no control characters on the terminal.
+    transfer::sanitize(msg)
 }
 
 fn upload_sftp(cli: &Cli, sources: &[String], to: &Remote, errs: &mut u32) {
@@ -452,7 +458,9 @@ fn download_sftp(cli: &Cli, from: &Remote, target: &Path, many: bool, errs: &mut
         if name == ".." {
             name = ".".into();
         }
-        if !transfer::safe_name(name.as_bytes()) && name != "." {
+        // The name is only used under a directory target; it must then be
+        // a plain local name (the server's, for a glob).
+        if !transfer::safe_name(name.as_bytes()) && name != "." && (many || target.is_dir()) {
             fail(errs, format!("{name}: invalid file name"));
             continue;
         }
@@ -564,6 +572,11 @@ fn upload_legacy(cli: &Cli, sources: &[String], to: &Remote, errs: &mut u32) {
     for src in sources {
         if let Err(e) = sender.send_path(Path::new(src), &opts) {
             fail(errs, format!("{src}: {e}"));
+            // The remote sink is no longer in step: a further file would
+            // be taken for the rest of this one.
+            if sender.is_desynced() {
+                break;
+            }
         }
     }
 }
@@ -615,10 +628,16 @@ const MAX_BRACE_EXPANSIONS: usize = 1024;
 
 /// The basename patterns a legacy `scp -f` request for `path` may answer
 /// with, braces expanded, or `None` when they cannot be predicted: an
-/// empty, `.` or `..` basename, or one the remote shell rewrites
-/// (`~`, `$`, backquotes, quotes).
+/// empty, `.` or `..` basename, or one the remote shell rewrites. Only
+/// the last component counts: `~/dir/*` and `$HOME/*.c` are as checkable
+/// as `dir/*`, while `~`, `~user`, `dir/$x` and `` dir/`cmd` `` are not.
+/// A path in one pair of quotes is the literal name between them; quotes
+/// used any other way are not understood.
 fn requested_patterns(path: &str) -> Option<Vec<String>> {
-    if path.contains(['~', '$', '`', '\'', '"']) {
+    if let Some(literal) = quoted_literal(path) {
+        return checkable_basename(literal).map(|base| vec![glob_escape(base)]);
+    }
+    if path.contains(['\'', '"']) {
         return None;
     }
     let mut expanded = Vec::new();
@@ -628,11 +647,49 @@ fn requested_patterns(path: &str) -> Option<Vec<String>> {
     expanded
         .into_iter()
         .map(|p| {
-            let p = p.trim_end_matches('/');
-            let base = p.rsplit('/').next().unwrap_or(p);
-            (!matches!(base, "" | "." | "..")).then(|| base.to_string())
+            // `~/x` and `~user/x`: a home directory, then `x`. Alone, the
+            // home directory's own name is what comes back.
+            let p = match p.strip_prefix('~') {
+                Some(rest) => &rest[rest.find('/')? + 1..],
+                None => p.as_str(),
+            };
+            checkable_basename(p)
+                .filter(|base| !base.contains(['$', '`']))
+                .map(str::to_string)
         })
         .collect()
+}
+
+/// The last component of `path`, unless it is empty, `.` or `..` (the
+/// name then sent is the directory's own, which the request does not say).
+fn checkable_basename(path: &str) -> Option<&str> {
+    let p = path.trim_end_matches('/');
+    let base = p.rsplit('/').next().unwrap_or(p);
+    (!matches!(base, "" | "." | "..")).then_some(base)
+}
+
+/// What a path wholly inside one pair of quotes names, when the remote
+/// shell takes all of it literally: anything in `'…'`, and in `"…"`
+/// anything without `$`, a backquote or a backslash.
+fn quoted_literal(path: &str) -> Option<&str> {
+    let quote = path.chars().next().filter(|c| matches!(c, '\'' | '"'))?;
+    let inner = path.strip_prefix(quote)?.strip_suffix(quote)?;
+    if inner.contains(['\'', '"']) || (quote == '"' && inner.contains(['$', '`', '\\'])) {
+        return None;
+    }
+    Some(inner)
+}
+
+/// `name` as a pattern matching only itself.
+fn glob_escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '*' | '?' | '[' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Expand `{a,b}` alternatives in `s` (from byte `from` on) into `out`,
@@ -828,6 +885,10 @@ fn remote_end(cli: &Cli) -> u32 {
         for src in &cli.operands {
             if sender.send_path(Path::new(src), &opts).is_err() {
                 errs += 1;
+                // The sink is no longer in step: nothing more can go.
+                if sender.is_desynced() {
+                    break;
+                }
             }
         }
         errs
@@ -997,6 +1058,19 @@ mod tests {
         assert_eq!(strtonum("x", 1, 9), Err("invalid"));
     }
 
+    #[test]
+    fn error_messages_have_no_control_characters() {
+        // XFER-13.
+        assert_eq!(
+            super::fail_text("scp: remote error: x\x1b[2J\r\u{9b}y"),
+            "scp: remote error: x?[2J??y"
+        );
+        assert_eq!(
+            super::fail_text("f: No such file or directory (os error 2)"),
+            "f: No such file or directory"
+        );
+    }
+
     fn pats(p: &str) -> Option<Vec<String>> {
         requested_patterns(p)
     }
@@ -1012,9 +1086,44 @@ mod tests {
 
     #[test]
     fn requested_patterns_unpredictable_requests_are_not_checked() {
-        for p in ["", ".", "a/..", "~", "~/x", "$HOME", "`f`", "'q'", "{a,.}"] {
+        for p in [
+            "", ".", "a/..", "{a,.}", "~", "~user", "~/", "~/.", "{~/a,~}", "$HOME", "d/$x",
+            "d/*$x", "`f`", "d/`f`", "a'b'", "'a'/*", "'a''b'", "\"$x\"", "\"`f`\"", "\"a\\b\"",
+            "'", "''", "'/'", "'..'",
+        ] {
             assert!(pats(p).is_none(), "{p}");
         }
         assert!(pats(&"{a,b}".repeat(11)).is_none());
+    }
+
+    /// XFER-11: what the remote shell rewrites only matters in the last
+    /// component; elsewhere the name filter stays (CVE-2019-6111).
+    #[test]
+    fn requested_patterns_keep_the_filter_for_tilde_variable_and_quoted_paths() {
+        assert_eq!(pats("~/x").unwrap(), ["x"]);
+        assert_eq!(pats("~/dir/*.txt").unwrap(), ["*.txt"]);
+        assert_eq!(pats("~user/dir/").unwrap(), ["dir"]);
+        assert_eq!(pats("~/{a,b}").unwrap(), ["a", "b"]);
+        assert_eq!(pats("d/~x").unwrap(), ["~x"]);
+        assert_eq!(pats("$HOME/*.c").unwrap(), ["*.c"]);
+        assert_eq!(pats("`pwd`/tree").unwrap(), ["tree"]);
+        assert_eq!(pats("'q'").unwrap(), ["q"]);
+        assert_eq!(pats("\"my dir/a b\"").unwrap(), ["a b"]);
+        assert_eq!(pats("'~/$x/a*[b]'").unwrap(), ["a\\*\\[b]"]);
+        assert_eq!(pats("'{a,b}'").unwrap(), ["{a,b}"]);
+        // The filter these give refuses what was not asked for.
+        let allows = |req: &str, name: &str| {
+            pats(req)
+                .unwrap()
+                .iter()
+                .any(|p| super::transfer::glob_match(p.as_bytes(), name.as_bytes()))
+        };
+        for req in ["~/dir/*", "$HOME/*", "'a*'", "~/tree"] {
+            assert!(!allows(req, ".bashrc"), "{req}");
+            assert!(!allows(req, ".ssh"), "{req}");
+        }
+        assert!(allows("~/dir/*", "file"));
+        assert!(allows("'a*'", "a*"));
+        assert!(!allows("'a*'", "ab"));
     }
 }

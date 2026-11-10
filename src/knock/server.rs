@@ -22,6 +22,12 @@ const MAX_CONNS_PER_RENDEZVOUS: usize = 4;
 const MAX_STRIKES: u8 = 3;
 /// Datagrams read per [`KnockServer::process`] call.
 const MAX_DATAGRAMS_PER_PROCESS: usize = 1024;
+/// Rendezvous listeners open at once, over all users and keys, unless
+/// [`KnockServer::set_max_rendezvous`] says otherwise. Each one is a
+/// listening socket (plus up to [`MAX_CONNS_PER_RENDEZVOUS`] connections) in
+/// the process running the knock server, so the total has to stay well
+/// inside its descriptor limit whatever the number of users and keys.
+const MAX_RENDEZVOUS: usize = 256;
 /// Random ports tried in a configured range before giving up.
 const PORT_ATTEMPTS: u32 = 64;
 
@@ -121,6 +127,7 @@ pub struct KnockServer {
     state: KnockState,
     ports: Option<(u16, u16)>,
     rendezvous: Vec<Rendezvous>,
+    max_rendezvous: usize,
     logger: Option<Box<KnockLogger>>,
 }
 
@@ -148,8 +155,17 @@ impl KnockServer {
             state,
             ports: None,
             rendezvous: Vec::new(),
+            max_rendezvous: MAX_RENDEZVOUS,
             logger: None,
         })
+    }
+
+    /// Allow at most `n` (at least 1) rendezvous listeners open at once,
+    /// over all users and keys; 256 by default. A valid knock arriving while
+    /// that many are open is dropped as
+    /// [`DropReason::TooManyPending`], like one over the per-key limit.
+    pub fn set_max_rendezvous(&mut self, n: usize) {
+        self.max_rendezvous = n.max(1);
     }
 
     /// Open rendezvous listeners on a random port in `lo..=hi` instead of a
@@ -275,6 +291,16 @@ impl KnockServer {
                 self.log(KnockEvent::Resent { src });
             }
             Verdict::Accept(pending) => {
+                // Global cap, before a socket is opened: the per-key and
+                // per-user caps bound one account, this bounds them all.
+                if self.rendezvous.len() >= self.max_rendezvous {
+                    self.state.release_pending(&pending.user, &pending.key_fp);
+                    self.log(KnockEvent::Dropped {
+                        src,
+                        reason: DropReason::TooManyPending,
+                    });
+                    return;
+                }
                 let listener = match self.bind_listener().and_then(|l| {
                     l.set_nonblocking(true)?;
                     let port = l.local_addr()?.port();

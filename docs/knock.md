@@ -188,8 +188,18 @@ Per entry (user, key):
 | `knock_buckets` | per source prefix (/32 IPv4, /64 IPv6), LRU max 64; each marked *good* once a knock from it passes sig2 |
 | `pending` | listeners currently open |
 
+Per user, shared by all of the user's keys:
+
+| Field | Purpose |
+|-------|---------|
+| `user_verify_bucket` | token bucket for signature verifications (an uncached sig1, or sig2), whatever the key and source prefix |
+| `user_pending` | listeners currently open, over all keys |
+
+Per-user state is created only for a user with an authorized key (never from
+the name in a knock alone) and is dropped with the user's per-key state.
+
 Global: `verify_bucket` (all public-key verifications), the key-lookup
-buckets (§5.1) and `nonce_floor` (§5.3).
+buckets (§5.1), the number of open listeners (§5.4) and `nonce_floor` (§5.3).
 
 ### 5.2 Processing order
 
@@ -201,11 +211,13 @@ Every *drop* is silent. Every step is cheaper than the next one.
 3. Look up `user` (loading its keys if not cached), then `key_fp`. If either
    is missing, drop.
 4. **sig1:** if it is byte-equal to an entry in `sig1_cache`, continue.
-   Otherwise take one token from the source prefix's knock bucket, one from
-   `newprefix_bucket` unless the prefix is *good*, and one from
-   `verify_bucket` (drop if any is empty), verify sig1, add it to the cache
-   on success, and drop on failure. The knock then skips the knock-bucket
-   and `newprefix_bucket` charges of step 7 (one knock, one token each).
+   Otherwise, if `verify_bucket` or `user_verify_bucket` is empty, drop,
+   taking nothing; take one token from the source prefix's knock bucket,
+   one from `newprefix_bucket` unless the prefix is *good*, then one from
+   `user_verify_bucket` and one from `verify_bucket` (drop if any is
+   empty), verify sig1, add it to the cache on success, and drop on
+   failure. The knock then skips the knock-bucket and `newprefix_bucket`
+   charges of step 7 (one knock, one token each).
    `user` and `key_fp` are plaintext, so a budget keyed by them alone would
    let anyone who knows a user name and a key fingerprint lock the key out
    of first contact with a trickle of forged sig1s from spoofed addresses.
@@ -213,20 +225,26 @@ Every *drop* is silent. Every step is cheaper than the next one.
    and the stored accept has not expired, take one token from the source
    prefix's knock bucket and resend `last_accept` unchanged. Stop here.
 6. If `nonce ≤ last_nonce` or `nonce < nonce_floor`, drop.
-7. Take one token from the source prefix's knock bucket, one from
-   `newprefix_bucket` unless the prefix is *good*, and one from
-   `verify_bucket`. If any is empty, drop. When the prefix table is full, a
+7. If `verify_bucket` or `user_verify_bucket` is empty, drop, taking
+   nothing. Otherwise take one token from the source prefix's knock bucket
+   and one from `newprefix_bucket` unless the prefix is *good* (drop if
+   either is empty), then one from `user_verify_bucket` and one from
+   `verify_bucket`. A knock refused because a shared budget is empty thus
+   costs its sender no per-key token. When the prefix table is full, a
    new prefix evicts the least recently used non-*good* one (if any) and
    starts with only 2 tokens, so rotating source addresses earns no fresh
    bursts.
 8. Verify sig2. On failure, drop. On success, mark the prefix *good*.
 9. Set `last_nonce = nonce`.
-10. If `pending ≥ MaxPending`, drop.
+10. If `pending ≥ MaxPending`, or `user_pending` has reached the per-user
+    cap (4 × `MaxPending`), drop.
 11. Choose the host key: the one matching `host_fp`, or with `NEED_HOSTKEY`
     the server's preferred key (Ed25519 > ECDSA > RSA) that satisfies §3.3.
     If none fits, drop.
-12. Generate `eph_s`, open the listener (§5.4), derive `token`, build and sign
-    the ACCEPT, store it in `last_accept`, and send it.
+12. If the server already has its maximum number of listeners open (§5.4),
+    drop. Otherwise generate `eph_s`, open the listener (§5.4), derive
+    `token`, build and sign the ACCEPT, store it in `last_accept`, and send
+    it.
 
 Note on malleable signatures (ECDSA): a modified copy of a valid KNOCK hashes
 differently, so step 5 does not resend for it and step 6 drops it. An on-path
@@ -257,6 +275,9 @@ retransmits recover.
   the knock context `(user, key_fp, host key)`. The server then sends its SSH
   identification string as usual.
 - When `window` expires, close the listener and decrement `pending`.
+- At most 256 listeners are open at once, over all users and keys. A valid
+  knock arriving while that many are open is dropped like one over
+  `MaxPending`.
 - `KnockBindUser` (default **yes**): SSH userauth must use the knock's `user`.
   `KnockBindKey` (default no): userauth must use the knock's key.
 - Implementation choice (fork, thread, or event loop) is not part of the
@@ -268,7 +289,12 @@ retransmits recover.
 
 Setting `KnockMode`:
 
-- `auto` (default): connect TCP to `host:22` (or the configured port) as
+- `no` (default): never knock. The default is off because a KNOCK carries
+  `user`, `key_fp` and sig1 in plaintext (§8) and the triggers of `auto`,
+  a refused or slow TCP connect, are anyone's to cause: with `auto` as the
+  default, delaying port 22 of any host would have made a puressh client
+  volunteer those to that host.
+- `auto`: connect TCP to `host:22` (or the configured port) as
   usual. If that attempt is **refused**, gets ICMP unreachable, or does not
   complete within `KnockFallbackDelay` (default **1500 ms**), start the knock
   (§6.2) to the **same IP**. The TCP attempt keeps running. Whichever path
@@ -276,8 +302,6 @@ Setting `KnockMode`:
 - `always`: knock immediately and skip TCP 22. The client may also switch to
   this for a host it has in its knock-hosts cache (§6.5), which skips the
   fallback delay.
-- `never`: never knock.
-
 With several resolved addresses, the client knocks each address it falls back
 on, following the normal address order.
 
@@ -337,9 +361,11 @@ has an invalid `sig_host`. Then:
 | `ClockSkew` | 30 s |
 | `window` | 60 s |
 | `TokenTimeout` | 5 s |
-| `MaxPending` | 2 per (user, key) |
+| `MaxPending` | 2 per (user, key); 4 × that (8) per user across keys |
+| open listeners | 256, global |
 | knock bucket | burst 5, +1 / 10 s, per (user, key, source prefix) |
 | `newprefix_bucket` | burst 10, +1 / s, per (user, key) |
+| `user_verify_bucket` | burst 80, +1 / 125 ms, per user |
 | key lookups | 50 / s global; burst 10, +1 / 200 ms per source prefix |
 | `verify_bucket` | 1000 / s, global |
 | client `KnockFallbackDelay` | 1500 ms |
@@ -382,10 +408,16 @@ has an invalid `sig_host`. Then:
   with UDP that is not answered, or that is silently dropped, host-wide.
 - **Not a login.** The knock is defence in depth only. SSH authentication and
   host key checking are unchanged and mandatory.
-- **Resource bounds.** All per-key state is bounded by the key table.
-  Per-prefix buckets are LRU-capped, and listeners are capped per key and
-  short-lived. The key cache holds only names that pass the pre-check
-  (§5.1).
+- **Many keys per user.** The per-key limits alone would scale with the
+  number of keys a user lists. sig2 verifications and open listeners are
+  therefore also limited per user across keys, so listing more keys earns
+  neither a larger share of the global `verify_bucket` nor more listeners,
+  and other users are unaffected. The per-user budgets sit well above what
+  the per-key limits allow a user with a few keys.
+- **Resource bounds.** All per-key and per-user state is bounded by the key
+  table. Per-prefix buckets are LRU-capped, and listeners are capped per
+  key, per user and globally, and short-lived. The key cache holds only
+  names that pass the pre-check (§5.1).
 
 ## 9. Open questions
 
@@ -428,7 +460,7 @@ Global-only `sshd_config` keywords (refused inside `Match`):
 | `KnockPorts lo-hi` | Rendezvous TCP port range (default: kernel ephemeral). |
 | `KnockWindow secs` | Rendezvous listener lifetime (default 60). |
 | `KnockClockSkew secs` | Accepted client clock offset (default 30). |
-| `KnockMaxPending n` | Open listeners per (user, key) (default 2). |
+| `KnockMaxPending n` | Open listeners per (user, key) (default 2); a user's keys together may hold four times as many. |
 
 With TCP hidden, the knock is the only way in, so by default any user may
 knock. Who may log in is still decided by `AllowUsers` / `DenyUsers` /
@@ -457,7 +489,7 @@ other UDP, and open `KnockPorts` in the firewall.
 
 | `ssh_config` keyword | Meaning |
 |----------------------|---------|
-| `KnockMode no\|auto\|always` | Default `auto` (§6.1). |
+| `KnockMode no\|auto\|always` | Default `no` (§6.1). |
 | `KnockFallbackDelay ms` | Default 1500. |
 | `KnockPort port` | UDP port to knock (default: the SSH port). |
 

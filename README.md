@@ -8,9 +8,11 @@
 A pure-Rust [SSH](https://datatracker.ietf.org/doc/html/rfc4251) (Secure Shell)
 protocol library and CLI suite, in the spirit of [libssh](https://www.libssh.org/),
 built on [`purecrypto`](https://crates.io/crates/purecrypto) for every
-cryptographic primitive. No C dependencies, no FFI in the dependency tree, and
-no `unsafe` in the library itself (the optional `ffi` feature is the only place
-`unsafe` appears, for the C ABI surface).
+cryptographic primitive. No C dependencies and no FFI in the dependency tree.
+`unsafe` appears in the library only where it talks to foreign code: the
+optional `ffi` feature (the C ABI surface) and the `security-key` and `pkcs11`
+modules, which load a FIDO provider or a PKCS#11 module at run time. With
+those three features off, the crate is `#![forbid(unsafe_code)]`.
 
 > **Status: functional, pre-1.0.** Client, server, SFTP, SCP, port/agent/X11
 > and Unix-socket (StreamLocal) forwarding, `known_hosts`, and `ssh_config`
@@ -225,8 +227,10 @@ All of them understand `ssh_config` (including `Match` blocks and `Include`),
 ([`docs/knock.md`](docs/knock.md)). With `KnockListen` set, `sshd` keeps no TCP port visibly open: an authorized key sends one signed UDP
 datagram, and the server opens a one-shot TCP listener for that client only.
 The SSH session that follows is ordinary, including full user
-authentication. `ssh` knocks automatically when the TCP connect is refused or
-slow (`KnockMode auto`).
+authentication. `ssh` knocks only for hosts configured with `KnockMode auto`
+(when the TCP connect is refused or slow) or `KnockMode always`: a knock
+carries the user name and key fingerprint in the clear, so it is never sent
+to a host that was not set up for it.
 
 ## Module layout
 

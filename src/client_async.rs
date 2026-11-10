@@ -36,10 +36,9 @@ use crate::channel::{
 };
 use crate::client::{
     AlgoOverrides, Config, ExecOutput, HOST_KEY_MISMATCH_DISABLED,
-    auth_packet_blocked_after_mismatch, build_verifier, filter_credentials_after_mismatch,
-    unix_now, unsolicited_reply,
+    auth_packet_blocked_after_mismatch, filter_credentials_after_mismatch,
+    host_key_verifier_factory, unsolicited_reply,
 };
-use crate::driver::client::VerifierFactory;
 use crate::driver::{ClientDriver, Event};
 use crate::error::{Error, Result};
 use crate::hostkey::HostKey;
@@ -73,30 +72,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
     pub async fn connect(stream: S, host: &str, port: u16, cfg: Config) -> Result<Self> {
         // Same host-key verification seam as the blocking client: policy +
         // prompting + known-hosts stay out of the sans-IO driver.
-        let host_key_policy = cfg.host_key_policy;
+        // The shared helper also enforces `Config::pinned_host_key`.
         let mut algo_overrides = cfg.algorithms;
-        crate::client::prioritize_known_host_key_algorithms(
+        let (verifier_factory, host_key_mismatched) = host_key_verifier_factory(
+            cfg.host_key_policy,
+            cfg.pinned_host_key,
             &mut algo_overrides,
-            &host_key_policy,
             host,
             port,
-        );
-        let target_host = host.to_string();
-        let ca_sig_algos = algo_overrides.ca_signature_algorithms.clone();
-        let host_key_mismatched = Arc::new(AtomicBool::new(false));
-        let mismatched_flag = host_key_mismatched.clone();
-        let verifier_factory: VerifierFactory = Box::new(move |reply, runner| {
-            build_verifier(
-                reply,
-                &host_key_policy,
-                runner,
-                &target_host,
-                port,
-                ca_sig_algos.as_deref(),
-                unix_now(),
-                &mismatched_flag,
-            )
-        });
+        )?;
         let driver = ClientDriver::new(algo_overrides.clone(), verifier_factory);
         let mut me = Self {
             stream,
@@ -291,6 +275,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
     /// Open a `direct-streamlocal`/`direct-tcpip`-style raw byte channel and
     /// return an [`AsyncChannel`] for streaming. Here: `direct-tcpip`.
     pub async fn open_direct_tcpip(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<AsyncChannel<'_, S>> {
+        // Port forwarding is refused after a changed host key was accepted;
+        // see `host_key_mismatched`.
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
+        self.open_direct_tcpip_channel(dest_host, dest_port, orig_host, orig_port)
+            .await
+    }
+
+    /// Open a `direct-tcpip` channel to `dest_host:dest_port` to carry the
+    /// caller's own stdio (`ssh -W`) or a further SSH connection (a jump
+    /// host). Unlike [`Self::open_direct_tcpip`] it stays available after a
+    /// changed host key was accepted (see [`Self::host_key_mismatched`]), as
+    /// in OpenSSH: nothing local is exposed to the server through it.
+    pub async fn open_stdio_forward(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+    ) -> Result<AsyncChannel<'_, S>> {
+        self.open_direct_tcpip_channel(dest_host, dest_port, "127.0.0.1", 0)
+            .await
+    }
+
+    async fn open_direct_tcpip_channel(
         &mut self,
         dest_host: &str,
         dest_port: u16,
@@ -691,6 +705,145 @@ mod tests {
                 panic!("server did not finish");
             }
             thread::sleep(Duration::from_millis(20));
+        }
+        let _ = server_thread.join();
+    }
+
+    /// A server presenting a fresh host key, for the pin tests: returns its
+    /// address, its host key blob and the accept thread.
+    fn spawn_pin_server() -> (std::net::SocketAddr, Vec<u8>, thread::JoinHandle<()>) {
+        let host_seed = fresh_seed();
+        let host_blob = Ed25519HostKey::from_seed(host_seed).public_blob();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || {
+            Box::new(OneKeyAuth {
+                user: String::new(),
+                blob: Vec::new(),
+            }) as Box<dyn Authenticator>
+        });
+        let cfg = ServerConfig::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        );
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let t = thread::spawn(move || {
+            let _ = server.accept_one();
+        });
+        (addr, host_blob, t)
+    }
+
+    /// `Config::pinned_host_key` is enforced in addition to the host-key
+    /// policy: a server presenting another key is refused even under
+    /// `AcceptAny`, and the matching pin still connects.
+    #[test]
+    fn async_pinned_host_key_mismatch_is_rejected() {
+        let (addr, _host_blob, server_thread) = spawn_pin_server();
+        let mut cfg = Config::insecure();
+        cfg.pinned_host_key = Some(Ed25519HostKey::from_seed(fresh_seed()).public_blob());
+        let sock = TcpStream::connect(addr).expect("connect");
+        let res = block_on(AsyncClient::connect(
+            BlockingAsync(sock),
+            "localhost",
+            addr.port(),
+            cfg,
+        ));
+        match res {
+            Err(Error::HostKeyRejected) => {}
+            Err(e) => panic!("expected HostKeyRejected, got {e:?}"),
+            Ok(_) => panic!("a mismatching pin must fail the handshake"),
+        }
+        let _ = server_thread.join();
+
+        let (addr, host_blob, server_thread) = spawn_pin_server();
+        let mut cfg = Config::insecure();
+        cfg.pinned_host_key = Some(host_blob);
+        let sock = TcpStream::connect(addr).expect("connect");
+        let client = block_on(AsyncClient::connect(
+            BlockingAsync(sock),
+            "localhost",
+            addr.port(),
+            cfg,
+        ))
+        .expect("the matching pin connects");
+        drop(client);
+        let _ = server_thread.join();
+    }
+
+    /// After a changed host key was let through with a warning, the async
+    /// client refuses to open a `direct-tcpip` forward (before anything
+    /// reaches the wire), like the other frontends.
+    #[test]
+    fn async_direct_tcpip_refused_after_host_key_mismatch() {
+        use crate::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
+        use crate::known_hosts::KnownHosts;
+
+        let (addr, _host_blob, server_thread) = spawn_pin_server();
+        let bogus_blob = Ed25519HostKey::from_seed([0x33u8; 32]).public_blob();
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        store
+            .lock()
+            .unwrap()
+            .add("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob, false);
+        let policy = KnownHostsPolicy {
+            store,
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Reject,
+            on_mismatch: TofuAction::AcceptWithWarning,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
+            command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+            pinned_host_key: None,
+        };
+        let sock = TcpStream::connect(addr).expect("connect");
+        block_on(async {
+            let mut client =
+                AsyncClient::connect(BlockingAsync(sock), "127.0.0.1", addr.port(), cfg)
+                    .await
+                    .expect("connect succeeds with a warning");
+            assert!(client.host_key_mismatched());
+            match client.open_direct_tcpip("h", 1, "127.0.0.1", 0).await {
+                Err(Error::Config(m)) => assert_eq!(m, HOST_KEY_MISMATCH_DISABLED),
+                Err(e) => panic!("expected the mismatch refusal, got {e:?}"),
+                Ok(_) => panic!("direct-tcpip must be refused after a mismatch"),
+            }
+        });
+        let _ = server_thread.join();
+    }
+
+    #[test]
+    #[cfg(feature = "tokio")]
+    fn tokio_pinned_host_key_mismatch_is_rejected() {
+        let (addr, _host_blob, server_thread) = spawn_pin_server();
+        let mut cfg = Config::insecure();
+        cfg.pinned_host_key = Some(Ed25519HostKey::from_seed(fresh_seed()).public_blob());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .expect("tokio runtime");
+        let res = rt.block_on(async {
+            let tcp = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            AsyncClient::connect_tokio(tcp, "localhost", addr.port(), cfg).await
+        });
+        match res {
+            Err(Error::HostKeyRejected) => {}
+            Err(e) => panic!("expected HostKeyRejected, got {e:?}"),
+            Ok(_) => panic!("a mismatching pin must fail the handshake"),
         }
         let _ = server_thread.join();
     }

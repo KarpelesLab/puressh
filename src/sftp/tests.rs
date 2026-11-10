@@ -233,6 +233,31 @@ fn jail_blocks_traversal_escape() {
     h.join().unwrap();
 }
 
+/// What every SFTP client does: `realpath` first, then absolute paths
+/// built from the answer. Under the jail those must resolve.
+#[test]
+fn jail_realpath_round_trips() {
+    let tmp = TempDir::new("jail-rt");
+    let jail = tmp.path().to_path_buf();
+    fs::create_dir(jail.join("d")).unwrap();
+    fs::write(jail.join("d/file"), b"x").unwrap();
+    let (a, b) = pair();
+    let opts = SftpServerOptions::new(jail.join("d")).with_root(jail);
+    let h = spawn_server(opts, a);
+    let mut client = SftpClient::new(b).unwrap();
+    assert_eq!(client.realpath(b".").unwrap(), b"/d");
+    assert_eq!(client.realpath(b"/").unwrap(), b"/");
+    assert!(client.stat(b"/d/file").is_ok());
+    assert!(client.stat(b"/d/../d/file").is_ok());
+    assert_eq!(client.realpath(b"/d/file").unwrap(), b"/d/file");
+    // Absolute paths cannot name anything outside the jail: `..` past the
+    // root stays at the root, as in a chroot.
+    assert_eq!(client.realpath(b"/../../etc").unwrap(), b"/etc");
+    assert!(client.stat(b"/../../etc/passwd").is_err());
+    drop(client);
+    h.join().unwrap();
+}
+
 #[test]
 fn read_only_refuses_writes() {
     let tmp = TempDir::new("readonly");
@@ -1285,6 +1310,31 @@ fn jailed_home_lookups_hide_outside_homes() {
         ));
     }
     drop(b);
+    h.join().unwrap();
+}
+
+#[test]
+fn jailed_users_groups_by_id_names_nobody() {
+    // XFER-16: a jailed session must not enumerate the host's accounts;
+    // the reply keeps its shape, with an empty name for every id.
+    let tmp = TempDir::new("ids-jail");
+    let jail = tmp.path().to_path_buf();
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(jail.clone()).with_root(jail), a);
+    let mut client = SftpClient::new(b).unwrap();
+    let (users, groups) = client.users_groups_by_id(&[0, 1, 65534], &[0, 1]).unwrap();
+    assert_eq!(users, vec![Vec::<u8>::new(); 3]);
+    assert_eq!(groups, vec![Vec::<u8>::new(); 2]);
+    drop(client);
+    h.join().unwrap();
+
+    // Not jailed: uid 0 has a name.
+    let (a, b) = pair();
+    let h = spawn_server(SftpServerOptions::new(tmp.path()), a);
+    let mut client = SftpClient::new(b).unwrap();
+    let (users, _) = client.users_groups_by_id(&[0], &[]).unwrap();
+    assert!(!users[0].is_empty());
+    drop(client);
     h.join().unwrap();
 }
 

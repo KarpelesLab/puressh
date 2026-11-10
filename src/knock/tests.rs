@@ -881,7 +881,11 @@ fn connect_or_knock_falls_back_when_tcp_is_refused() {
         }],
         known_host_keys: vec![host_blob.clone()],
     };
-    let c = connect_or_knock("127.0.0.1", port, &mut req, &KnockConnectOptions::default()).unwrap();
+    let opts = KnockConnectOptions {
+        mode: KnockMode::Auto,
+        ..KnockConnectOptions::default()
+    };
+    let c = connect_or_knock("127.0.0.1", port, &mut req, &opts).unwrap();
     match c {
         Connected::Knocked { accepted, .. } => {
             assert!(accepted.host_key_known);
@@ -891,4 +895,296 @@ fn connect_or_knock_falls_back_when_tcp_is_refused() {
     }
     let got = srv.join().unwrap();
     assert_eq!(got.len(), 1);
+}
+
+// --- KNK-2: limits shared across a user's keys, and across users ---
+
+const OTHER: &str = "bob";
+
+/// A state serving `alice` with `alice_keys` keys and `bob` with one.
+struct MultiKey {
+    state: KnockState,
+    alice: Vec<Ed25519HostKey>,
+    bob: Ed25519HostKey,
+    host_fp: [u8; 32],
+}
+
+fn multi_key(cfg: KnockServerConfig, alice_keys: usize) -> MultiKey {
+    let alice: Vec<Ed25519HostKey> = (0..alice_keys).map(|_| ed25519()).collect();
+    let bob = ed25519();
+    let mut table = KnockKeyTable::new();
+    for k in &alice {
+        assert!(table.insert(USER, k.public_blob()));
+    }
+    assert!(table.insert(OTHER, bob.public_blob()));
+    let host: KnockHostKey = Arc::new(ed25519());
+    let host_fp = wire::key_fp(&host.public_blob());
+    MultiKey {
+        state: KnockState::new(cfg, table, vec![host], NOW - 60_000),
+        alice,
+        bob,
+        host_fp,
+    }
+}
+
+impl MultiKey {
+    fn knock(&self, key: &Ed25519HostKey, user: &str, nonce: u64) -> Vec<u8> {
+        make_knock(key, user, nonce, Some(self.host_fp), 0).0
+    }
+
+    /// A knock for `key` with its real sig1 and a sig2 that does not verify.
+    fn bad_sig2(&self, key: &Ed25519HostKey, user: &str, nonce: u64) -> Vec<u8> {
+        let s1 = sig1(key, user);
+        let eph = X25519PrivateKey::generate(&mut OsRng);
+        KnockFields {
+            user,
+            key_fp: wire::key_fp(&key.public_blob()),
+            sig1: &s1,
+            nonce,
+            eph_c: eph.public_key(),
+            host_fp: Some(self.host_fp),
+        }
+        .build(&ed25519(), 0)
+        .unwrap()
+    }
+}
+
+/// Signature verifications are budgeted per user across keys: listing more
+/// keys buys no more verifications, and another user is not affected.
+#[test]
+fn sig2_verifications_are_capped_per_user_across_keys() {
+    let cfg = KnockServerConfig {
+        user_verify_burst: 6,
+        user_verify_refill_ms: 60_000,
+        ..Default::default()
+    };
+    let mut m = multi_key(cfg, 5);
+    // Two knocks per key, well inside every per-key limit. The budget of
+    // six goes on a key's first sig1 as well as on each sig2: three for the
+    // first key (sig1, sig2, sig2), three for the second, none left.
+    let mut verified = 0;
+    for (i, key) in m.alice[..4].iter().enumerate() {
+        for j in 0..2u64 {
+            let d = m.bad_sig2(key, USER, NOW + j);
+            match m.state.handle(NOW, ip(i as u8), &d) {
+                Verdict::Drop(DropReason::BadSig2) => verified += 1,
+                Verdict::Drop(DropReason::RateLimited) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+    assert_eq!(verified, 4);
+    // The budget is the user's: a key that has not knocked yet is refused
+    // too, even with a valid knock…
+    let d = m.knock(&m.alice[4], USER, NOW);
+    expect_drop(m.state.handle(NOW, ip(9), &d), DropReason::RateLimited);
+    // …while another user knocks as usual.
+    let d = m.knock(&m.bob, OTHER, NOW);
+    expect_accept(m.state.handle(NOW, ip(9), &d));
+    // The user's budget refills by itself: two tokens for a first knock
+    // with this key (its sig1, then sig2).
+    let later = NOW + 120_000;
+    let d = m.knock(&m.alice[4], USER, later);
+    expect_accept(m.state.handle(later, ip(9), &d));
+}
+
+/// With the default budgets, a user knocking with a handful of keys at once
+/// (the client sends up to four) never meets the per-user limit.
+#[test]
+fn default_per_user_budget_is_invisible_to_a_normal_user() {
+    let mut m = multi_key(KnockServerConfig::default(), 4);
+    // Five connection attempts in a row from one address: the per-prefix
+    // knock bucket (burst 5) is what a sixth would meet, not the user's.
+    for attempt in 0..5u64 {
+        for i in 0..4 {
+            let d = m.knock(&m.alice[i], USER, NOW + attempt);
+            let p = expect_accept(m.state.handle(NOW, ip(1), &d));
+            m.state.release_pending(&p.user, &p.key_fp);
+        }
+    }
+}
+
+/// Open listeners are capped per user across keys, independently of other
+/// users.
+#[test]
+fn pending_listeners_are_capped_per_user_across_keys() {
+    let cfg = KnockServerConfig {
+        user_pending_factor: 2,
+        ..Default::default()
+    };
+    // max_pending 2 per key, so 4 for the user.
+    let mut m = multi_key(cfg, 3);
+    let mut open = Vec::new();
+    for key in &m.alice[..2] {
+        for j in 0..2u64 {
+            let d = m.knock(key, USER, NOW + j);
+            open.push(expect_accept(m.state.handle(NOW, ip(1), &d)));
+        }
+    }
+    // A third key has no listener of its own, but the user has four.
+    let d = m.knock(&m.alice[2], USER, NOW);
+    expect_drop(m.state.handle(NOW, ip(1), &d), DropReason::TooManyPending);
+    // Another user is unaffected.
+    let d = m.knock(&m.bob, OTHER, NOW);
+    expect_accept(m.state.handle(NOW, ip(1), &d));
+    // Closing one of the user's listeners frees a slot for any key.
+    let p = open.pop().unwrap();
+    m.state.release_pending(&p.user, &p.key_fp);
+    let d = m.knock(&m.alice[2], USER, NOW + 1);
+    expect_accept(m.state.handle(NOW, ip(1), &d));
+    // …which is then taken again.
+    let d = m.knock(&m.alice[2], USER, NOW + 2);
+    expect_drop(m.state.handle(NOW, ip(1), &d), DropReason::TooManyPending);
+}
+
+/// A knock refused because the global verification budget is empty costs
+/// its sender no per-prefix token.
+#[test]
+fn empty_global_verify_budget_does_not_cost_prefix_tokens() {
+    let cfg = KnockServerConfig {
+        verify_per_sec: 2,
+        ..Default::default()
+    };
+    let mut f = setup_with(cfg, Box::new(ed25519()), Arc::new(ed25519()));
+    // sig1 + sig2 of the first knock use up the global budget.
+    let p = expect_accept(f.state.handle(NOW, ip(1), &f.knock(NOW)));
+    f.state.release_pending(&p.user, &p.key_fp);
+    // More knocks than the prefix's bucket holds, all refused globally.
+    for i in 1..=8u64 {
+        expect_drop(
+            f.state.handle(NOW, ip(1), &f.knock(NOW + i)),
+            DropReason::RateLimited,
+        );
+    }
+    // The prefix still has the four tokens it had left: they are usable as
+    // soon as the global budget refills (two per second here).
+    let mut accepted = 0;
+    for (step, t) in [NOW + 1000, NOW + 1001, NOW + 2000, NOW + 2001]
+        .into_iter()
+        .enumerate()
+    {
+        let d = f.knock(NOW + 100 + step as u64);
+        let p = expect_accept(f.state.handle(t, ip(1), &d));
+        f.state.release_pending(&p.user, &p.key_fp);
+        accepted += 1;
+    }
+    assert_eq!(accepted, 4);
+}
+
+/// A key source whose keys can be changed from the test.
+struct SharedSource(Arc<std::sync::Mutex<UserKeys>>);
+
+/// (user, key blob) pairs.
+type UserKeys = Vec<(String, Vec<u8>)>;
+
+impl KnockKeySource for SharedSource {
+    fn keys_for(&mut self, user: &str) -> Vec<Vec<u8>> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(u, _)| u == user)
+            .map(|(_, b)| b.clone())
+            .collect()
+    }
+}
+
+/// Per-user state exists only for users with an authorized key, and goes
+/// away with the user's keys once no listener is left.
+#[test]
+fn per_user_state_is_bounded_by_the_key_table() {
+    let key = ed25519();
+    let keys = Arc::new(std::sync::Mutex::new(vec![(
+        USER.to_string(),
+        key.public_blob(),
+    )]));
+    let host: KnockHostKey = Arc::new(ed25519());
+    let fp = wire::key_fp(&host.public_blob());
+    let mut state = KnockState::new(
+        KnockServerConfig::default(),
+        SharedSource(keys.clone()),
+        vec![host],
+        NOW - 60_000,
+    );
+    // Made-up names, and a real name with a key that is not authorized,
+    // allocate nothing.
+    for i in 0..8u64 {
+        let (d, _) = make_knock(&key, &format!("fake{i}"), NOW + i, Some(fp), 0);
+        expect_drop(state.handle(NOW, ip(1), &d), DropReason::UnknownKey);
+    }
+    let (d, _) = make_knock(&ed25519(), USER, NOW, Some(fp), 0);
+    expect_drop(state.handle(NOW, ip(1), &d), DropReason::UnknownKey);
+    assert_eq!(state.tracked_users(), 0);
+
+    let (d, _) = make_knock(&key, USER, NOW, Some(fp), 0);
+    let p = expect_accept(state.handle(NOW, ip(1), &d));
+    assert_eq!(state.tracked_users(), 1);
+
+    // The key is withdrawn; the next knock after the cache TTL notices.
+    keys.lock().unwrap().clear();
+    let later = NOW + 61_000;
+    let (d, _) = make_knock(&key, USER, later, Some(fp), 0);
+    expect_drop(state.handle(later, ip(1), &d), DropReason::UnknownKey);
+    // The listener opened earlier is still counted against the user…
+    assert_eq!(state.tracked_users(), 1);
+    // …and the state goes once it closes.
+    state.release_pending(&p.user, &p.key_fp);
+    assert_eq!(state.tracked_users(), 0);
+}
+
+/// The server refuses to open more rendezvous listeners than its global
+/// cap, whatever the number of keys knocking.
+#[test]
+fn open_rendezvous_listeners_are_capped_globally() {
+    let alice: Vec<Ed25519HostKey> = (0..3).map(|_| ed25519()).collect();
+    let mut table = KnockKeyTable::new();
+    for k in &alice {
+        assert!(table.insert(USER, k.public_blob()));
+    }
+    let host: KnockHostKey = Arc::new(ed25519());
+    let host_fp = wire::key_fp(&host.public_blob());
+    // Knock nonces are wall-clock here.
+    let now = unix_ms();
+    let state = KnockState::new(KnockServerConfig::default(), table, vec![host], now - 1000);
+    let mut server = KnockServer::bind("127.0.0.1:0", state).unwrap();
+    server.set_max_rendezvous(2);
+    let addr = server.local_addr().unwrap();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let events2 = events.clone();
+    server.set_logger(move |ev| {
+        events2.lock().unwrap().push(match ev {
+            KnockEvent::Accepted { .. } => "accepted".to_string(),
+            KnockEvent::Dropped { reason, .. } => format!("dropped {reason:?}"),
+            other => format!("{other:?}"),
+        });
+    });
+
+    let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let pump = |server: &mut KnockServer, want: usize| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while events.lock().unwrap().len() < want && std::time::Instant::now() < deadline {
+            let _ = server.process();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    };
+    // One datagram at a time, so the order of events is the order sent.
+    for (i, key) in alice.iter().enumerate() {
+        let (d, _) = make_knock(key, USER, now + i as u64, Some(host_fp), 0);
+        client.send_to(&d, addr).unwrap();
+        pump(&mut server, i + 1);
+    }
+    assert_eq!(
+        *events.lock().unwrap(),
+        ["accepted", "accepted", "dropped TooManyPending"]
+    );
+    assert_eq!(server.open_rendezvous(), 2);
+
+    // The refused knock holds no pending slot: with room again, the same
+    // key gets its listener.
+    server.set_max_rendezvous(3);
+    let (d, _) = make_knock(&alice[2], USER, now + 10, Some(host_fp), 0);
+    client.send_to(&d, addr).unwrap();
+    pump(&mut server, 4);
+    assert_eq!(events.lock().unwrap().last().unwrap(), "accepted");
+    assert_eq!(server.open_rendezvous(), 3);
 }

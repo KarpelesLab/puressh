@@ -8,7 +8,7 @@ use purecrypto::rng::{OsRng, RngCore};
 
 use super::format::{
     Entry, HostSpec, Marker, ParsedLine, format_entry, format_host_pattern, parse_line,
-    patterns_match,
+    patterns_match, patterns_match_literal,
 };
 use super::hash::{check_hashed, hash_new, parse_hashed};
 
@@ -224,7 +224,7 @@ impl KnownHosts {
         // Pass 1: any `@revoked` line whose host AND key matches refuses
         // the candidate unconditionally.
         for e in self.revoked_entries() {
-            if host_field_matches(&e.host_spec, host, port)
+            if revoked_host_field_matches(&e.host_spec, host, port)
                 && e.key_type == key_type
                 && e.key_blob == key_blob
             {
@@ -354,7 +354,7 @@ impl KnownHosts {
     /// CA key or its embedded key (revoking either kills the cert).
     pub fn revokes_cert(&self, host: &str, port: u16, cert: &crate::cert::Certificate) -> bool {
         self.revoked_entries().any(|e| {
-            host_field_matches(&e.host_spec, host, port)
+            revoked_host_field_matches(&e.host_spec, host, port)
                 && (e.key_blob == cert.signature_key_blob
                     || e.key_blob == cert.embedded_pubkey_blob)
         })
@@ -739,6 +739,31 @@ fn host_field_matches(spec: &HostSpec, host: &str, port: u16) -> bool {
             Some((salt, hash)) => check_hashed(&salt, &hash, host, port),
             None => false,
         },
+    }
+}
+
+/// Does an `@revoked` entry's host field cover `host[:port]`?
+///
+/// Revocation must be at least as wide as trust. On a non-default port the
+/// trust paths ([`KnownHosts::lookup`], [`KnownHosts::has_ca_for`]) fall
+/// back to entries recorded under the bare host name, so a `@revoked` line
+/// written for the bare name (`host`, `*.example.com`, `*`) has to apply
+/// there too; otherwise a revoked key or CA would be accepted on every port
+/// but 22. As in OpenSSH, an un-bracketed pattern is also tried against the
+/// literal `[host]:port` name, which is how `@revoked *` covers every port.
+fn revoked_host_field_matches(spec: &HostSpec, host: &str, port: u16) -> bool {
+    if host_field_matches(spec, host, port) {
+        return true;
+    }
+    if port == 22 {
+        return false;
+    }
+    if host_field_matches(spec, host, 22) {
+        return true;
+    }
+    match spec {
+        HostSpec::Patterns(pats) => patterns_match_literal(pats, &format_host_pattern(host, port)),
+        HostSpec::Hashed(_) => false,
     }
 }
 

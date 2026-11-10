@@ -684,14 +684,10 @@ mod tests {
 
     fn accept_any_factory() -> VerifierFactory {
         Box::new(|reply: &[u8], runner: &KexRunner| {
-            if reply.len() < 5 {
-                return Err(Error::Format("kex-ecdh-reply too short"));
-            }
-            let k_s_len = u32::from_be_bytes([reply[1], reply[2], reply[3], reply[4]]) as usize;
-            if reply.len() < 5 + k_s_len {
-                return Err(Error::Format("kex-ecdh-reply truncated"));
-            }
-            let k_s = &reply[5..5 + k_s_len];
+            // Bounds-checked parse: message byte, then `string K_S`.
+            let mut r = crate::format::Reader::new(reply);
+            r.read_u8()?;
+            let k_s = r.read_string()?;
             let neg = runner
                 .negotiated()
                 .ok_or(Error::Protocol("kex: no negotiated algorithms"))?;

@@ -28,9 +28,12 @@ pub struct ScpRecvOptions {
     /// Accept `D`/`E` headers (`scp -r`). When false, any `D`/`E` is a
     /// protocol violation.
     pub recursive: bool,
-    /// Apply `T` time preambles to the next file/dir via `utimes`
-    /// (`scp -p`). When false, `T` preambles are still accepted but
-    /// silently ignored.
+    /// `scp -p`: apply `T` time preambles to the next file/dir, and give
+    /// every file and directory exactly the mode the peer sent, existing
+    /// ones included. When false, `T` preambles are still accepted but
+    /// silently ignored, and as with OpenSSH's sink the peer's mode only
+    /// applies to what the transfer creates, reduced by the process umask
+    /// and without setuid, setgid or sticky bits.
     pub preserve_times: bool,
     /// Treat `base_path` as the target *file path* for the first
     /// (non-directory) header rather than the destination directory.
@@ -51,7 +54,7 @@ pub struct Receiver<S: Read + Write> {
     /// Directory stack pushed by `D` and popped by `E`. The current
     /// directory for an incoming `C` is `stack.last()` when non-empty,
     /// else `base` (top level).
-    stack: Vec<PathBuf>,
+    stack: Vec<DirLevel>,
     /// Pending `T` preamble for the next `C`/`D`. Cleared after use.
     pending_times: Option<(i64, i64)>,
     opts: ScpRecvOptions,
@@ -86,6 +89,23 @@ pub struct Receiver<S: Read + Write> {
     /// entered) must satisfy this predicate, typically "matches one of the
     /// requested basename patterns", as OpenSSH's sink does.
     top_level_filter: Option<NameFilter>,
+}
+
+/// A directory the receiver has entered.
+struct DirLevel {
+    path: PathBuf,
+    /// What to do to its mode once its `E` arrives: while it is being
+    /// filled, a directory the transfer made stays writable for us.
+    on_end: Option<DirMode>,
+}
+
+#[derive(Clone, Copy)]
+enum DirMode {
+    /// `-p`: exactly this mode.
+    Set(u32),
+    /// A new directory, without `-p`: take back the owner bits that were
+    /// added to the peer's mode so it could be filled.
+    Drop(u32),
 }
 
 /// Predicate on a top-level entry name, see [`Receiver::with_top_level_filter`].
@@ -220,9 +240,12 @@ impl<S: Read + Write> Receiver<S> {
                     self.recv_dir(mode, &name)?;
                 }
                 Header::EndDir => {
-                    if self.stack.pop().is_none() {
+                    let Some(level) = self.stack.pop() else {
                         let _ = write_fatal(&mut self.stream, "E at top level");
                         return Err(ScpError::Unexpected("E at top level"));
+                    };
+                    if let Some(mode) = level.on_end {
+                        finish_dir_mode(&level.path, mode);
                     }
                     // Reset pending_times — they pertained to the dir.
                     self.pending_times = None;
@@ -250,7 +273,7 @@ impl<S: Read + Write> Receiver<S> {
         // symlink (even one pointing into a directory), not a regular file.
         // `symlink_metadata` does not traverse the final component, so we
         // see the link as-is.
-        match fs::symlink_metadata(&target) {
+        let created = match fs::symlink_metadata(&target) {
             Ok(md) => {
                 if md.file_type().is_symlink() {
                     let _ =
@@ -267,53 +290,47 @@ impl<S: Read + Write> Receiver<S> {
                     ));
                 }
                 // Real directory — accept and reuse.
+                false
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // Use `create_dir` (not `create_dir_all`) so we never
                 // silently materialise intermediates that should have
                 // been announced via `D` headers — they'd bypass the
                 // `recv_dir` checks we just performed.
-                if let Err(e) = fs::create_dir(&target) {
+                //
+                // Made with the peer's permission bits, which the kernel
+                // reduces by the umask, plus ours to fill it (as OpenSSH's
+                // sink: `mkdir(np, mode | S_IRWXU)`).
+                if let Err(e) = create_dir_mode(&target, (mode & 0o777) | 0o700) {
                     let _ = write_fatal(&mut self.stream, &e.to_string());
                     return Err(ScpError::Io(e));
                 }
+                true
             }
             Err(e) => {
                 let _ = write_fatal(&mut self.stream, &e.to_string());
                 return Err(ScpError::Io(e));
             }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            // Chmod a descriptor opened with `O_NOFOLLOW` instead of the
-            // path: `fs::set_permissions` does a path-based `chmod(2)` that
-            // *follows* symlinks. The symlink_metadata check above narrows
-            // the race but doesn't close it — a swap between the stat and
-            // the chmod would still let an attacker redirect the chmod onto
-            // an arbitrary file. Opening refuses a symlink, and `fchmod`
-            // then acts on the directory we opened.
-            if let Ok(dir) = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-                .open(&target)
-            {
-                let _ = dir.set_permissions(fs::Permissions::from_mode(mode & 0o7777));
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            // Windows / other non-Unix: we don't apply mode bits, and
-            // `set_permissions` would only translate the read-only bit
-            // anyway. The TOCTOU concern is Unix-specific.
-            let _ = mode;
-        }
+        };
+        // The peer's mode is for what the transfer creates; a directory
+        // that was already there keeps its own unless `-p` asks otherwise.
+        // Either way it is applied when the directory is complete (`E`).
+        let on_end = if self.opts.preserve_times {
+            Some(DirMode::Set(mode & 0o7777))
+        } else if created && mode & 0o700 != 0o700 {
+            Some(DirMode::Drop(0o700 & !mode))
+        } else {
+            None
+        };
         if let Some((mtime, atime)) = self.pending_times.take()
             && self.opts.preserve_times
         {
             let _ = set_times(&target, mtime, atime);
         }
-        self.stack.push(target);
+        self.stack.push(DirLevel {
+            path: target,
+            on_end,
+        });
         write_ok(&mut self.stream)?;
         Ok(())
     }
@@ -383,10 +400,15 @@ impl<S: Read + Write> Receiver<S> {
         // between the stat above and the open below. `O_NOFOLLOW` causes
         // `open(2)` to fail with `ELOOP` if the final component is a
         // symlink, which we surface as a fatal error.
+        //
+        // A file this creates gets the peer's permission bits, which the
+        // kernel reduces by the umask; one that exists keeps its mode
+        // (unless `-p`, below), as with OpenSSH's sink.
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
             open_opts.custom_flags(libc::O_NOFOLLOW);
+            open_opts.mode(mode & 0o777);
         }
         let f = match open_opts.open(&target) {
             Ok(f) => f,
@@ -404,13 +426,14 @@ impl<S: Read + Write> Receiver<S> {
         if f.metadata().is_ok_and(|m| m.is_file()) {
             let _ = f.set_len(size);
         }
-        // Apply mode + times. Chmod the open fd, not the path — the
+        // Apply mode + times. `-p` only: the peer's exact mode, on an
+        // existing file too. Chmod the open fd, not the path — the
         // path-based variant would `chmod(2)` through any symlink
         // raced into place between this point and the call. `fchmod`
         // operates on the inode we already opened with `O_NOFOLLOW`,
         // closing the window entirely.
         #[cfg(unix)]
-        {
+        if self.opts.preserve_times {
             use std::os::unix::fs::PermissionsExt;
             let _ = f.set_permissions(fs::Permissions::from_mode(mode & 0o7777));
         }
@@ -431,7 +454,7 @@ impl<S: Read + Write> Receiver<S> {
 
     fn current_dir(&self) -> PathBuf {
         match self.stack.last() {
-            Some(d) => d.clone(),
+            Some(d) => d.path.clone(),
             None => self.base.clone(),
         }
     }
@@ -500,6 +523,51 @@ fn lexical_normalize(p: &Path) -> PathBuf {
     buf
 }
 
+/// `mkdir(path, mode)`: the umask applies.
+#[cfg(unix)]
+fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(mode).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_dir_mode(path: &Path, _mode: u32) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
+/// Give a received directory its final mode (best effort).
+#[cfg(unix)]
+fn finish_dir_mode(path: &Path, mode: DirMode) {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    // Chmod a descriptor opened with `O_NOFOLLOW` instead of the path:
+    // `fs::set_permissions` does a path-based `chmod(2)` that *follows*
+    // symlinks, so a swap of the directory for a link would redirect the
+    // chmod onto an arbitrary file. Opening refuses a symlink, and
+    // `fchmod` then acts on the directory we opened.
+    let Ok(dir) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(path)
+    else {
+        return;
+    };
+    let mode = match mode {
+        DirMode::Set(mode) => mode,
+        DirMode::Drop(bits) => match dir.metadata() {
+            Ok(md) => md.permissions().mode() & 0o7777 & !bits,
+            Err(_) => return,
+        },
+    };
+    let _ = dir.set_permissions(fs::Permissions::from_mode(mode));
+}
+
+#[cfg(not(unix))]
+fn finish_dir_mode(_path: &Path, mode: DirMode) {
+    // Windows / other non-Unix: mode bits are not applied.
+    let (DirMode::Set(bits) | DirMode::Drop(bits)) = mode;
+    let _ = bits;
+}
+
 #[cfg(unix)]
 fn set_times(path: &Path, mtime: i64, atime: i64) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -523,6 +591,125 @@ fn set_times(path: &Path, mtime: i64, atime: i64) -> std::io::Result<()> {
 #[cfg(not(unix))]
 fn set_times(_path: &Path, _mtime: i64, _atime: i64) -> std::io::Result<()> {
     Ok(())
+}
+
+/// XFER-12: whose mode a received file or directory gets.
+#[cfg(all(test, unix))]
+mod mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A scripted peer: what it sends, and somewhere for the acks.
+    struct Script(std::io::Cursor<Vec<u8>>);
+
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Tmp(PathBuf);
+
+    impl Tmp {
+        fn new(label: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("puressh-recv-mode-{label}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("tmp dir");
+            Tmp(dir)
+        }
+    }
+
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn receive(dir: &Path, preserve: bool, script: &[u8]) {
+        let opts = ScpRecvOptions {
+            recursive: true,
+            preserve_times: preserve,
+            target_is_file: false,
+        };
+        Receiver::new(Script(std::io::Cursor::new(script.to_vec())), dir, opts)
+            .expect("recv new")
+            .run()
+            .expect("recv run");
+    }
+
+    fn mode(p: &Path) -> u32 {
+        fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    fn chmod(p: &Path, mode: u32) {
+        fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[test]
+    fn existing_objects_keep_their_mode_without_preserve() {
+        let tmp = Tmp::new("existing");
+        fs::write(tmp.0.join("f"), b"old contents").unwrap();
+        chmod(&tmp.0.join("f"), 0o600);
+        fs::create_dir(tmp.0.join("d")).unwrap();
+        chmod(&tmp.0.join("d"), 0o700);
+        receive(&tmp.0, false, b"C0666 1 f\nx\0D0777 0 d\nE\n");
+        assert_eq!(fs::read(tmp.0.join("f")).unwrap(), b"x");
+        assert_eq!(mode(&tmp.0.join("f")), 0o600);
+        assert_eq!(mode(&tmp.0.join("d")), 0o700);
+    }
+
+    #[test]
+    fn created_objects_get_the_permission_bits_only_without_preserve() {
+        let tmp = Tmp::new("created");
+        receive(
+            &tmp.0,
+            false,
+            b"C6755 1 f\nx\0D7755 0 d\nE\nD0500 0 ro\nC0400 1 in\nx\0E\n",
+        );
+        // No setuid/setgid/sticky, and nothing the peer did not grant
+        // (the umask may take more away).
+        let f = mode(&tmp.0.join("f"));
+        assert_eq!(f & !0o755, 0, "{f:o}");
+        assert_eq!(f & 0o700, 0o700, "{f:o}");
+        let d = mode(&tmp.0.join("d"));
+        assert_eq!(d & !0o755 & !0o2000, 0, "{d:o}");
+        // A directory the owner may not write to is still filled, then
+        // loses the bits that were added for that.
+        assert_eq!(fs::read(tmp.0.join("ro/in")).unwrap(), b"x");
+        assert_eq!(mode(&tmp.0.join("ro")) & !0o2000, 0o500);
+        assert_eq!(mode(&tmp.0.join("ro/in")), 0o400);
+        chmod(&tmp.0.join("ro"), 0o700);
+    }
+
+    #[test]
+    fn preserve_applies_the_peer_mode_to_everything() {
+        let tmp = Tmp::new("preserve");
+        fs::write(tmp.0.join("f"), b"old").unwrap();
+        chmod(&tmp.0.join("f"), 0o600);
+        fs::create_dir(tmp.0.join("d")).unwrap();
+        chmod(&tmp.0.join("d"), 0o700);
+        receive(
+            &tmp.0,
+            true,
+            b"C0666 1 f\nx\0D0777 0 d\nC0640 1 new\nx\0E\nD0500 0 ro\nC0444 1 in\nx\0E\n",
+        );
+        assert_eq!(mode(&tmp.0.join("f")), 0o666);
+        assert_eq!(mode(&tmp.0.join("d")), 0o777);
+        assert_eq!(mode(&tmp.0.join("d/new")), 0o640);
+        assert_eq!(mode(&tmp.0.join("ro")) & !0o2000, 0o500);
+        assert_eq!(mode(&tmp.0.join("ro/in")), 0o444);
+        chmod(&tmp.0.join("ro"), 0o700);
+    }
 }
 
 #[cfg(all(test, unix))]

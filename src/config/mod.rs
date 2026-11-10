@@ -57,7 +57,7 @@ pub use client::{
 pub use glob::{HostPattern, host_matches};
 pub use host_port::{parse_host_port, parse_host_port_pattern};
 #[cfg(feature = "std")]
-pub use include::{glob_paths, tokenize_file_with_includes};
+pub use include::{FileCheck, glob_paths, tokenize_file_with_includes};
 pub use match_block::{
     AddressKind, AddressPattern, ExecPolicy, MatchCondition, MatchContext, address_matches,
 };
@@ -115,16 +115,31 @@ pub enum ConfigError {
         /// The error, with its line number in that file.
         error: alloc::boxed::Box<ConfigError>,
     },
+    /// A configuration file (the one loaded, or one it includes) that the
+    /// caller's file check refused: owned by someone else, or writable by
+    /// others. OpenSSH's `Bad owner or permissions on <file>`.
+    BadPermissions {
+        /// The refused file's path.
+        file: String,
+    },
 }
 
 impl ConfigError {
     /// `error`, located in the included `file` (no-op for `None`).
     pub(crate) fn in_file(self, file: Option<&str>) -> Self {
         match file {
-            Some(f) if !matches!(self, ConfigError::InFile { .. }) => ConfigError::InFile {
-                file: f.into(),
-                error: alloc::boxed::Box::new(self),
-            },
+            // (A refused file is named by its own error already.)
+            Some(f)
+                if !matches!(
+                    self,
+                    ConfigError::InFile { .. } | ConfigError::BadPermissions { .. }
+                ) =>
+            {
+                ConfigError::InFile {
+                    file: f.into(),
+                    error: alloc::boxed::Box::new(self),
+                }
+            }
             _ => self,
         }
     }
@@ -144,6 +159,9 @@ impl ConfigError {
             ConfigError::InFile { file, error } => {
                 write!(f, "{file} ")?;
                 error.write_located(f)
+            }
+            ConfigError::BadPermissions { file } => {
+                write!(f, "Bad owner or permissions on {file}")
             }
         }
     }

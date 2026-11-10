@@ -5,8 +5,9 @@
 //!
 //! A wrong passphrase is reported as [`Error::Crypto`], like the OpenSSH
 //! container, so callers ask again. Writing uses what OpenSSH asks OpenSSL
-//! for: AES-128-CBC, and for PKCS#8 PBES2 with PBKDF2-HMAC-SHA256 (2048
-//! iterations, 16-byte salt — OpenSSL 3's defaults).
+//! for: AES-128-CBC, and for PKCS#8 PBES2 with PBKDF2-HMAC-SHA256 and a
+//! 16-byte salt. The PBKDF2 iteration count is [`PKCS8_ITERATIONS`], not
+//! OpenSSL's default of 2048, which no longer slows a passphrase search.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -284,26 +285,42 @@ pub(crate) fn encrypt_traditional<R: CryptoRng + RngCore>(
     alloc::format!("{begin}\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,{iv_hex}\n\n{body}")
 }
 
+/// PBKDF2-HMAC-SHA256 iterations for the PKCS#8 keys we write (OWASP's
+/// 2023 figure for this PRF). Well inside what [`decrypt_pkcs8`] and
+/// OpenSSL accept.
+pub(crate) const PKCS8_ITERATIONS: u32 = 600_000;
+
 /// Wrap a PKCS#8 `PrivateKeyInfo` DER into an `EncryptedPrivateKeyInfo`.
 pub(crate) fn encrypt_pkcs8<R: CryptoRng + RngCore>(
     rng: &mut R,
     der_bytes: &[u8],
     passphrase: &[u8],
 ) -> Vec<u8> {
-    const ITERATIONS: u32 = 2048;
+    encrypt_pkcs8_with_iterations(rng, der_bytes, passphrase, PKCS8_ITERATIONS)
+}
+
+/// [`encrypt_pkcs8`] with an explicit PBKDF2 iteration count.
+pub(crate) fn encrypt_pkcs8_with_iterations<R: CryptoRng + RngCore>(
+    rng: &mut R,
+    der_bytes: &[u8],
+    passphrase: &[u8],
+    iterations: u32,
+) -> Vec<u8> {
     let mut salt = [0u8; 16];
     let mut iv = [0u8; 16];
     rng.fill_bytes(&mut salt);
     rng.fill_bytes(&mut iv);
     let mut key = Zeroizing::new([0u8; 16]);
-    purecrypto::kdf::pbkdf2::<Sha256>(passphrase, &salt, ITERATIONS, &mut key[..]);
+    purecrypto::kdf::pbkdf2::<Sha256>(passphrase, &salt, iterations, &mut key[..]);
     let data = aes128_cbc_encrypt(&key[..], &iv, der_bytes);
     let seq = |parts: &[&[u8]]| der::encode_sequence(&parts.concat());
     let kdf = seq(&[
         &der::oid_tlv(&[1, 2, 840, 113549, 1, 5, 12]),
         &seq(&[
             &der::encode_octet_string(&salt),
-            &der::encode_integer(&[(ITERATIONS >> 8) as u8, ITERATIONS as u8]),
+            // The count at its full width: `encode_integer` trims leading
+            // zeros and adds the sign octet a set top bit needs.
+            &der::encode_integer(&iterations.to_be_bytes()),
             &seq(&[
                 &der::oid_tlv(&[1, 2, 840, 113549, 2, 9]),
                 &der::encode_null(),
@@ -334,6 +351,51 @@ mod tests {
         assert_eq!(hex("0é0"), None);
         assert_eq!(hex("+f"), None);
         assert_eq!(hex("zz"), None);
+    }
+
+    /// The iteration count the reader sees in an `EncryptedPrivateKeyInfo`.
+    fn pkcs8_iterations(der_bytes: &[u8]) -> u64 {
+        let mut top = DerReader::new(der_bytes);
+        let mut info = top.read_sequence().unwrap();
+        let mut alg = info.read_sequence().unwrap();
+        alg.read_oid().unwrap();
+        let mut params = alg.read_sequence().unwrap();
+        let mut kdf = params.read_sequence().unwrap();
+        kdf.read_oid().unwrap();
+        let mut kp = kdf.read_sequence().unwrap();
+        kp.read_octet_string().unwrap();
+        kp.read_unsigned_integer_bytes()
+            .unwrap()
+            .iter()
+            .fold(0u64, |a, b| (a << 8) | u64::from(*b))
+    }
+
+    /// The iteration count is DER-encoded at its real width, whatever it
+    /// is: one, two or three octets, with and without a sign octet.
+    #[test]
+    fn pkcs8_iteration_count_is_encoded_at_full_width() {
+        let mut rng = purecrypto::rng::OsRng;
+        let inner = b"not really a PrivateKeyInfo, any bytes will do";
+        for iterations in [
+            1u32, 127, 128, 255, 256, 2048, 32_768, 65_535, 65_536, 70_000,
+        ] {
+            let der_bytes = encrypt_pkcs8_with_iterations(&mut rng, inner, b"pw", iterations);
+            assert_eq!(pkcs8_iterations(&der_bytes), u64::from(iterations));
+            let back = decrypt_pkcs8(&der_bytes, Some(b"pw")).unwrap();
+            assert_eq!(&back[..], inner, "{iterations} iterations");
+        }
+    }
+
+    /// What `ssh-keygen -m PKCS8` writes: the production count, read back
+    /// by our own reader.
+    #[test]
+    fn pkcs8_writer_uses_a_strong_iteration_count() {
+        const { assert!(PKCS8_ITERATIONS >= 600_000) };
+        let mut rng = purecrypto::rng::OsRng;
+        let inner = b"0123456789abcdef0123456789abcdef";
+        let der_bytes = encrypt_pkcs8(&mut rng, inner, b"pw");
+        assert_eq!(pkcs8_iterations(&der_bytes), u64::from(PKCS8_ITERATIONS));
+        assert_eq!(&decrypt_pkcs8(&der_bytes, Some(b"pw")).unwrap()[..], inner);
     }
 
     /// A non-ASCII IV in `DEK-Info` is a format error, not a panic.

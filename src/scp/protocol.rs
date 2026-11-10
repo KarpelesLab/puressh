@@ -130,6 +130,22 @@ pub fn validate_name(name: &str) -> Result<(), ScpError> {
     if name == "." || name == ".." || name.contains('/') {
         return Err(ScpError::BadName("path component"));
     }
+    // On Windows `\` separates components too, `:` makes a drive (`C:x`,
+    // which replaces the directory it is joined to) or a stream, and
+    // trailing dots and blanks are dropped (`.. ` is `..`).
+    #[cfg(windows)]
+    if name.contains(['\\', ':']) || name.ends_with(['.', ' ']) {
+        return Err(ScpError::BadName("path component"));
+    }
+    // Whatever the platform's rules: one normal component of a local path,
+    // itself.
+    let mut parts = std::path::Path::new(name).components();
+    if !matches!(
+        (parts.next(), parts.next()),
+        (Some(std::path::Component::Normal(n)), None) if n == std::ffi::OsStr::new(name)
+    ) {
+        return Err(ScpError::BadName("path component"));
+    }
     Ok(())
 }
 
@@ -348,8 +364,9 @@ pub fn write_payload_term<R: Read, W: Write>(
 
 /// Read exactly `size` payload bytes into `dst`, then the single `0x00`
 /// terminator byte that follows. Returns an error on under-read or if
-/// the terminator is not `0x00` (which would indicate a peer-level
-/// error frame in the wrong place).
+/// the terminator is not `0x00`: a `0x01`/`0x02` error frame there (the
+/// sender's report that the payload is not the file's contents) surfaces
+/// as `Warning`/`Remote` with its message.
 pub fn read_payload_term<R: Read, W: Write>(
     r: &mut R,
     dst: &mut W,
@@ -372,10 +389,14 @@ pub fn read_payload_term<R: Read, W: Write>(
         Ok(_) => {}
         Err(e) => return Err(ScpError::Io(e)),
     }
-    if term[0] != 0x00 {
-        return Err(ScpError::BadHeader("payload terminator was not 0x00"));
+    match term[0] {
+        0x00 => Ok(()),
+        // The sender could not supply the contents it announced (it pads
+        // them, then says why in place of the terminator).
+        0x01 => Err(ScpError::Warning(read_line(r)?)),
+        0x02 => Err(ScpError::Remote(read_line(r)?)),
+        _ => Err(ScpError::BadHeader("payload terminator was not 0x00")),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -468,6 +489,21 @@ mod unit {
     }
 
     #[test]
+    fn names_stay_one_local_component() {
+        // XFER-10: a name the peer sends is joined to a local directory.
+        for good in ["a", ".bashrc", "a b", "a..b"] {
+            assert!(validate_name(good).is_ok(), "{good}");
+        }
+        for name in ["..\\x", "\\x", "a\\b", "C:x", "C:\\x", "f:stream"] {
+            assert_eq!(validate_name(name).is_ok(), !cfg!(windows), "{name}");
+        }
+        #[cfg(windows)]
+        for name in [".. ", "a.", "a "] {
+            assert!(validate_name(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
     fn reject_cr_in_name() {
         // \r alone could split log lines or confuse a terminal renderer.
         assert!(matches!(validate_name("a\rb"), Err(ScpError::BadName(_))));
@@ -505,6 +541,19 @@ mod unit {
             Err(ScpError::Remote(m)) => assert_eq!(m, "boom"),
             other => panic!("unexpected {:?}", other),
         }
+    }
+
+    #[test]
+    fn payload_ended_by_an_error_frame_is_an_error() {
+        let mut cur = std::io::Cursor::new(b"ab\0\x01scp: f: changed\nC".to_vec());
+        let mut got = Vec::new();
+        match read_payload_term(&mut cur, &mut got, 3) {
+            Err(ScpError::Warning(m)) => assert_eq!(m, "scp: f: changed"),
+            other => panic!("unexpected {:?}", other),
+        }
+        assert_eq!(got, b"ab\0");
+        // The frame was consumed whole.
+        assert_eq!(cur.position(), 20);
     }
 
     #[test]

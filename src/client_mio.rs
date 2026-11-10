@@ -57,9 +57,8 @@ use crate::channel::{
 };
 use crate::client::{
     AlgoOverrides, Config, HOST_KEY_MISMATCH_DISABLED, auth_packet_blocked_after_mismatch,
-    build_verifier, filter_credentials_after_mismatch, unix_now, unsolicited_reply,
+    filter_credentials_after_mismatch, host_key_verifier_factory, unsolicited_reply,
 };
-use crate::driver::client::VerifierFactory;
 use crate::driver::{ClientDriver, Event};
 use crate::error::{Error, Result};
 use crate::hostkey::HostKey;
@@ -164,30 +163,16 @@ impl<S: Read + Write> MioClient<S> {
     /// verification. No I/O blocks: outbound bytes are buffered until the first
     /// [`pump_writable`](Self::pump_writable).
     pub fn new(stream: S, host: &str, port: u16, cfg: Config) -> Result<Self> {
-        let host_key_policy = cfg.host_key_policy;
+        // Same host-key verification seam as the blocking client; the shared
+        // helper also enforces `Config::pinned_host_key`.
         let mut algo_overrides = cfg.algorithms;
-        crate::client::prioritize_known_host_key_algorithms(
+        let (verifier_factory, host_key_mismatched) = host_key_verifier_factory(
+            cfg.host_key_policy,
+            cfg.pinned_host_key,
             &mut algo_overrides,
-            &host_key_policy,
             host,
             port,
-        );
-        let target_host = host.to_string();
-        let ca_sig_algos = algo_overrides.ca_signature_algorithms.clone();
-        let host_key_mismatched = Arc::new(AtomicBool::new(false));
-        let mismatched_flag = host_key_mismatched.clone();
-        let verifier_factory: VerifierFactory = Box::new(move |reply, runner| {
-            build_verifier(
-                reply,
-                &host_key_policy,
-                runner,
-                &target_host,
-                port,
-                ca_sig_algos.as_deref(),
-                unix_now(),
-                &mismatched_flag,
-            )
-        });
+        )?;
         let driver = ClientDriver::new(algo_overrides.clone(), verifier_factory);
         let mut me = Self {
             stream,
@@ -606,6 +591,92 @@ mod tests {
         let mut s = [0u8; 32];
         OsRng.fill_bytes(&mut s);
         s
+    }
+
+    /// Drive a `MioClient` against a fresh in-crate server until the
+    /// handshake completes (`Ok`) or a pump fails (`Err`). `pin` picks the
+    /// pinned host key from the server's real one.
+    fn mio_handshake_with_pin(pin: impl FnOnce(Vec<u8>) -> Vec<u8>) -> Result<()> {
+        let host_seed = fresh_seed();
+        let host_blob = Ed25519HostKey::from_seed(host_seed).public_blob();
+        let host_key: Box<dyn HostKey + Send + Sync> =
+            Box::new(Ed25519HostKey::from_seed(host_seed));
+        let factory: Arc<dyn AuthenticatorFactory> = Arc::new(move || {
+            Box::new(OneKeyAuth {
+                user: String::new(),
+                blob: Vec::new(),
+            }) as Box<dyn Authenticator>
+        });
+        let cfg = ServerConfig::new(
+            vec![host_key],
+            factory,
+            vec!["publickey"],
+            Arc::new(StaticHandler { out: Vec::new() }),
+        );
+        let mut server = Server::bind("127.0.0.1:0", cfg).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        let server_thread = thread::spawn(move || {
+            let _ = server.accept_one();
+        });
+
+        let mut cfg = Config::insecure();
+        cfg.pinned_host_key = Some(pin(host_blob));
+
+        const TOK: Token = Token(0);
+        let mut poll = Poll::new().expect("poll");
+        let mut events = Events::with_capacity(16);
+        let sock = MioTcpStream::connect(addr).expect("connect");
+        let mut client = MioClient::new(sock, "localhost", addr.port(), cfg)?;
+        poll.registry()
+            .register(
+                client.get_mut(),
+                TOK,
+                Interest::READABLE | Interest::WRITABLE,
+            )
+            .expect("register");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let res = 'ev: loop {
+            if Instant::now() > deadline {
+                panic!("mio handshake did not finish in time");
+            }
+            poll.poll(&mut events, Some(Duration::from_millis(200)))
+                .expect("poll");
+            for ev in events.iter() {
+                if ev.is_writable()
+                    && let Err(e) = client.pump_writable()
+                {
+                    break 'ev Err(e);
+                }
+                if ev.is_readable()
+                    && let Err(e) = client.pump_readable()
+                {
+                    break 'ev Err(e);
+                }
+            }
+            while let Some(e) = client.poll_event() {
+                match e {
+                    MioEvent::HandshakeComplete => break 'ev Ok(()),
+                    MioEvent::Disconnected => {
+                        panic!("disconnected without a handshake result")
+                    }
+                    _ => {}
+                }
+            }
+        };
+        drop(client);
+        let _ = server_thread.join();
+        res
+    }
+
+    /// `Config::pinned_host_key` is enforced in addition to the host-key
+    /// policy: a server presenting another key is refused even under
+    /// `AcceptAny`, and the matching pin still completes the handshake.
+    #[test]
+    #[cfg(feature = "mio")]
+    fn mio_pinned_host_key_mismatch_is_rejected() {
+        let res = mio_handshake_with_pin(|_| Ed25519HostKey::from_seed(fresh_seed()).public_blob());
+        assert!(matches!(res, Err(Error::HostKeyRejected)), "{res:?}");
+        mio_handshake_with_pin(|real| real).expect("the matching pin connects");
     }
 
     #[test]

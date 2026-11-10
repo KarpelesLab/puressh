@@ -13,6 +13,41 @@ ssh_wanted() {
 		[ -L /etc/systemd/system/sshd.service ]
 }
 
+# ssh.socket (24.04's default) is retired below and the daemon listens on its
+# own, from sshd_config. Restrictions an administrator put on the socket unit
+# are not carried over: say so, loudly, rather than drop them in silence.
+SOCKET_ETC=/etc/systemd/system
+warn_socket_overrides() {
+	found=
+	for f in "$SOCKET_ETC/ssh.socket" "$SOCKET_ETC"/ssh.socket.d/*.conf; do
+		# A masked unit is a link to /dev/null: not a regular file.
+		if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+			continue
+		fi
+		lines=$(grep -E '^[[:space:]]*(ListenStream|BindToDevice|BindIPv6Only|IPAddressAllow|IPAddressDeny|MaxConnections|MaxConnectionsPerSource)[[:space:]]*=' "$f" 2>/dev/null) || continue
+		found="$found
+  $f:
+$(printf '%s\n' "$lines" | sed 's/^[[:space:]]*/      /')"
+	done
+	[ -n "$found" ] || return 0
+	cat >&2 <<MSG
+
+*****************************************************************************
+puressh-server: WARNING: local ssh.socket settings are NOT carried over.
+
+puressh's sshd does not use socket activation: ssh.socket is retired and
+ssh.service listens on its own, on what /etc/ssh/sshd_config says. These
+settings of the socket unit therefore no longer apply:
+$found
+
+Anything they restricted (addresses, ports, interfaces, source networks,
+connection limits) is no longer restricted by them. Express it in
+/etc/ssh/sshd_config (ListenAddress, Port) or in a firewall instead.
+*****************************************************************************
+
+MSG
+}
+
 if [ "$1" = "configure" ]; then
 	/usr/lib/puressh/sshd-prepare
 
@@ -37,6 +72,8 @@ Fix the configuration (check with: sshd -t), then run:
 MSG
 		exit 1
 	fi
+
+	warn_socket_overrides || true
 
 	if [ -d /run/systemd/system ]; then
 		wanted=

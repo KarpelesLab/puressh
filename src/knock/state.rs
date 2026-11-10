@@ -32,6 +32,10 @@ pub struct KnockServerConfig {
     pub token_timeout_secs: u16,
     /// Open rendezvous listeners allowed per (user, key).
     pub max_pending: u32,
+    /// Open rendezvous listeners allowed per user, across all of the user's
+    /// keys, as a multiple of [`Self::max_pending`]. Keeps a user who lists
+    /// many keys from opening [`Self::max_pending`] listeners for each.
+    pub user_pending_factor: u32,
     /// Knock bucket per (user, key, source prefix): burst size.
     pub knock_burst: u32,
     /// Knock bucket: ms per refilled token.
@@ -51,6 +55,14 @@ pub struct KnockServerConfig {
     pub newprefix_burst: u32,
     /// New-prefix sig2 bucket: ms per refilled token.
     pub newprefix_refill_ms: u64,
+    /// sig2 verifications per user, across all of the user's keys and
+    /// source prefixes: burst size. Bounds the share of
+    /// [`Self::verify_per_sec`] one user can consume however many keys they
+    /// list. Sized well above what the per-key limits let a user with a
+    /// handful of keys reach.
+    pub user_verify_burst: u32,
+    /// Per-user sig2 bucket: ms per refilled token.
+    pub user_verify_refill_ms: u64,
     /// Accepted sig1 values cached per (user, key).
     pub sig1_cache_size: usize,
     /// How long a user's keys from the [`KnockKeySource`] are reused before
@@ -82,12 +94,15 @@ impl Default for KnockServerConfig {
             window_secs: 60,
             token_timeout_secs: 5,
             max_pending: 2,
+            user_pending_factor: 4,
             knock_burst: 5,
             knock_refill_ms: 10_000,
             verify_per_sec: 1000,
             max_prefixes_per_key: 64,
             newprefix_burst: 10,
             newprefix_refill_ms: 1000,
+            user_verify_burst: 80,
+            user_verify_refill_ms: 125,
             sig1_cache_size: 4,
             key_cache_ttl_ms: 60_000,
             key_cache_users: 4096,
@@ -210,7 +225,8 @@ impl Bucket {
         b
     }
 
-    fn take(&mut self, now_ms: u64) -> bool {
+    /// Credit the tokens earned up to `now_ms`.
+    fn refill(&mut self, now_ms: u64) {
         if now_ms > self.last_ms {
             let gained = (now_ms - self.last_ms) / self.refill_ms;
             if gained > 0 {
@@ -221,6 +237,16 @@ impl Bucket {
                 self.last_ms = now_ms;
             }
         }
+    }
+
+    /// Whether [`Self::take`] would succeed at `now_ms`, taking nothing.
+    fn has_token(&mut self, now_ms: u64) -> bool {
+        self.refill(now_ms);
+        self.tokens > 0
+    }
+
+    fn take(&mut self, now_ms: u64) -> bool {
+        self.refill(now_ms);
         if self.tokens > 0 {
             self.tokens -= 1;
             true
@@ -270,6 +296,17 @@ struct Entry {
     pending: u32,
 }
 
+/// Limits one user shares across all of their keys. Exists only for users
+/// with per-key state (so never for a name that has no authorized key), and
+/// goes away with it.
+#[derive(Debug)]
+struct UserState {
+    /// sig2 verifications, whatever the key and source prefix.
+    verify: Bucket,
+    /// Listeners currently open, over all keys.
+    pending: u32,
+}
+
 /// Why a datagram was dropped. Never sent on the wire; for debug logs only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -288,7 +325,8 @@ pub enum DropReason {
     Replay,
     /// A rate limit bucket was empty.
     RateLimited,
-    /// Too many open rendezvous listeners for this key.
+    /// Too many open rendezvous listeners: for this key, for this user
+    /// across keys, or on the server as a whole.
     TooManyPending,
     /// No host key yields an ACCEPT that fits the size rule.
     NoHostKey,
@@ -350,6 +388,9 @@ pub struct KnockState {
     source: Box<dyn KnockKeySource>,
     key_cache: HashMap<String, CachedKeys>,
     entries: HashMap<(String, [u8; 32]), Entry>,
+    /// Per-user limits, for users that have at least one entry in `entries`
+    /// (or a listener still open).
+    users: HashMap<String, UserState>,
     host_keys: Vec<(KnockHostKey, Vec<u8>, [u8; 32])>,
     verify: Bucket,
     lookups: Bucket,
@@ -401,6 +442,7 @@ impl KnockState {
             source: Box::new(source),
             key_cache: HashMap::new(),
             entries: HashMap::new(),
+            users: HashMap::new(),
             host_keys: hk,
             verify,
             lookups,
@@ -451,6 +493,7 @@ impl KnockState {
         if !self.source.may_knock(user) {
             if self.key_cache.remove(user).is_some() {
                 self.entries.retain(|(u, _), _| u != user);
+                self.forget_user_if_unused(user);
             }
             return true;
         }
@@ -485,7 +528,30 @@ impl KnockState {
                 keys,
             },
         );
+        self.forget_user_if_unused(user);
         true
+    }
+
+    /// Drop `user`'s per-user limits once nothing refers to them any more:
+    /// no listener open, no cached key and no per-key state. Per-user state
+    /// thus lives exactly as long as the user's per-key state.
+    fn forget_user_if_unused(&mut self, user: &str) {
+        let Some(u) = self.users.get(user) else {
+            return;
+        };
+        if u.pending > 0
+            || self.key_cache.get(user).is_some_and(|c| !c.keys.is_empty())
+            || self.entries.keys().any(|(name, _)| name == user)
+        {
+            return;
+        }
+        self.users.remove(user);
+    }
+
+    /// Users with per-user limit state.
+    #[cfg(test)]
+    pub(super) fn tracked_users(&self) -> usize {
+        self.users.len()
     }
 
     /// One token from the lookup bucket of `src`'s prefix.
@@ -527,6 +593,12 @@ impl KnockState {
         if let Some(e) = self.entries.get_mut(&(user.to_string(), *key_fp)) {
             e.pending = e.pending.saturating_sub(1);
         }
+        if let Some(u) = self.users.get_mut(user) {
+            u.pending = u.pending.saturating_sub(1);
+            if u.pending == 0 {
+                self.forget_user_if_unused(user);
+            }
+        }
     }
 
     /// Process one datagram received at `now_ms` from `src`.
@@ -563,6 +635,15 @@ impl KnockState {
                 knock_buckets: Vec::new(),
                 pending: 0,
             });
+        // Only now, for a user with an authorized key: the name in a knock
+        // is the sender's choice, and must not allocate state by itself.
+        let user_state = self
+            .users
+            .entry(k.user.to_string())
+            .or_insert_with(|| UserState {
+                verify: Bucket::new(cfg.user_verify_burst, cfg.user_verify_refill_ms, now_ms),
+                pending: 0,
+            });
         // 4. sig1: byte compare against the cache, verify only on a miss.
         // A miss is charged like a sig2 check (step 7): the source prefix's
         // knock bucket, the key's new-prefix bucket unless the prefix is
@@ -577,9 +658,17 @@ impl KnockState {
             let hit = entry.sig1_cache.remove(pos);
             entry.sig1_cache.insert(0, hit);
         } else {
+            // The shared budgets (the user's, the global one) are looked at
+            // first and taken last, as in step 7.
+            if !self.verify.has_token(now_ms) || !user_state.verify.has_token(now_ms) {
+                return Verdict::Drop(DropReason::RateLimited);
+            }
             let (ok, slot) = Self::take_knock_bucket(&self.cfg, entry, src, now_ms);
             let good = entry.knock_buckets[slot].good;
-            if !ok || (!good && !entry.newprefix.take(now_ms)) || !self.verify.take(now_ms) {
+            if !ok || (!good && !entry.newprefix.take(now_ms)) {
+                return Verdict::Drop(DropReason::RateLimited);
+            }
+            if !user_state.verify.take(now_ms) || !self.verify.take(now_ms) {
                 return Verdict::Drop(DropReason::RateLimited);
             }
             charged_slot = Some(slot);
@@ -609,26 +698,30 @@ impl KnockState {
             return Verdict::Drop(DropReason::Replay);
         }
         // 7. rate limits: the prefix's bucket, then the key's new-prefix
-        // bucket unless this prefix already sent a valid knock, then global.
-        // A knock whose sig1 was verified in step 4 has paid the first two
-        // already (one knock, one token each), so only the verification is
-        // charged again.
+        // bucket unless this prefix already sent a valid knock, then the
+        // user's bucket, then global. The two shared budgets are looked at
+        // first and taken last: a knock refused because someone else emptied
+        // them costs its sender no per-key token, and a knock refused by its
+        // own per-key limits costs nothing shared. A knock whose sig1 was
+        // verified in step 4 has paid the per-key tokens already (one
+        // knock, one token each), so only the verification is charged again.
+        if !self.verify.has_token(now_ms) || !user_state.verify.has_token(now_ms) {
+            return Verdict::Drop(DropReason::RateLimited);
+        }
         let slot = match charged_slot {
-            Some(slot) => {
-                if !self.verify.take(now_ms) {
-                    return Verdict::Drop(DropReason::RateLimited);
-                }
-                slot
-            }
+            Some(slot) => slot,
             None => {
                 let (ok, slot) = Self::take_knock_bucket(&self.cfg, entry, src, now_ms);
                 let good = entry.knock_buckets[slot].good;
-                if !ok || (!good && !entry.newprefix.take(now_ms)) || !self.verify.take(now_ms) {
+                if !ok || (!good && !entry.newprefix.take(now_ms)) {
                     return Verdict::Drop(DropReason::RateLimited);
                 }
                 slot
             }
         };
+        if !user_state.verify.take(now_ms) || !self.verify.take(now_ms) {
+            return Verdict::Drop(DropReason::RateLimited);
+        }
         // 8. sig2
         if wire::verify(key_blob, wire::NS_KNOCK, k.signed, k.sig2).is_err() {
             return Verdict::Drop(DropReason::BadSig2);
@@ -638,8 +731,12 @@ impl KnockState {
         entry.last_nonce = k.nonce;
         entry.last_knock_hash = hash;
         entry.last_accept = None;
-        // 10. pending cap
-        if entry.pending >= self.cfg.max_pending {
+        // 10. pending caps: per key, then per user across keys
+        let user_cap = self
+            .cfg
+            .max_pending
+            .saturating_mul(self.cfg.user_pending_factor.max(1));
+        if entry.pending >= self.cfg.max_pending || user_state.pending >= user_cap {
             return Verdict::Drop(DropReason::TooManyPending);
         }
         // 11. host key selection under the size rule
@@ -658,6 +755,7 @@ impl KnockState {
             return Verdict::Drop(DropReason::NoHostKey);
         };
         entry.pending += 1;
+        user_state.pending += 1;
         Verdict::Accept(PendingAccept {
             user: k.user.to_string(),
             key_fp: k.key_fp,

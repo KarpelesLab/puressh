@@ -10,6 +10,9 @@ After=nss-user-lookup.target auditd.service
 EnvironmentFile=-/etc/default/ssh
 ExecStart=-/usr/sbin/sshd -i $SSHD_OPTS -o "AuthorizedKeysFile ${CREDENTIALS_DIRECTORY}/ssh.ephemeral-authorized_keys-all .ssh/authorized_keys"
 StandardInput=socket
+# Diagnostics to the journal: without this stderr is the client's socket,
+# which sshd -i mutes.
+StandardError=journal
 RuntimeDirectory=sshd
 RuntimeDirectoryPreserve=yes
 RuntimeDirectoryMode=0755

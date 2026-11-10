@@ -225,6 +225,13 @@ const SERVE_INGRESS_BACKLOG: usize = 32;
 /// (which would stall the channel forever on a chatty stderr) the buffer
 /// keeps only the most recent `STREAM_STDERR_CAP` bytes.
 const STREAM_STDERR_CAP: usize = 1024 * 1024;
+/// Floor of the cap on the unread channel data a [`ClientChannelStream`]
+/// buffers while a `write` waits for send window; the cap is this or twice
+/// the receive window, whichever is larger. Inbound data is credited back
+/// as it is queued, so a peer that streams data while withholding its own
+/// `WINDOW_ADJUST` would otherwise grow that buffer without limit; past the
+/// cap the write fails instead.
+const STREAM_WRITE_WAIT_READ_CAP: usize = 16 * 1024 * 1024;
 /// Read timeout the serve loop installs on the socket while it has at least
 /// one live channel runtime to drain. Reverts to blocking when idle.
 const SERVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1329,43 +1336,14 @@ impl Client {
         // closure, capturing the policy + target so the driver stays free of
         // known-hosts I/O / prompting. Called on each `SSH_MSG_KEX_ECDH_REPLY`
         // (initial and re-key).
-        let host_key_policy = cfg.host_key_policy;
         let mut algorithms = cfg.algorithms;
-        let pinned = cfg.pinned_host_key;
-        if let Some(pin) = &pinned {
-            algorithms.host_key_algorithms = Some(pinned_host_key_algorithms(
-                pin,
-                algorithms.host_key_algorithms.as_deref(),
-            )?);
-        }
-        // Bring the host-key types we already trust in `known_hosts` to the
-        // front of the offer (OpenSSH's `order_hostkeyalgs()`), so a server
-        // with several host keys presents the one we recorded rather than a
-        // higher-preference type that would look like a changed key. Done here,
-        // before the policy is moved into the verifier closure.
-        prioritize_known_host_key_algorithms(&mut algorithms, &host_key_policy, host, port);
-        let target_host = host.to_string();
-        let ca_sig_algos = algorithms.ca_signature_algorithms.clone();
-        let host_key_mismatched = Arc::new(AtomicBool::new(false));
-        let mismatched_flag = host_key_mismatched.clone();
-        let verifier_factory: crate::driver::client::VerifierFactory =
-            Box::new(move |reply: &[u8], runner: &KexRunner| {
-                if let Some(pin) = &pinned
-                    && reply_host_key(reply)? != pin.as_slice()
-                {
-                    return Err(Error::HostKeyRejected);
-                }
-                build_verifier(
-                    reply,
-                    &host_key_policy,
-                    runner,
-                    &target_host,
-                    port,
-                    ca_sig_algos.as_deref(),
-                    unix_now(),
-                    &mismatched_flag,
-                )
-            });
+        let (verifier_factory, host_key_mismatched) = host_key_verifier_factory(
+            cfg.host_key_policy,
+            cfg.pinned_host_key,
+            &mut algorithms,
+            host,
+            port,
+        )?;
         let driver = ClientDriver::new(algorithms.clone(), verifier_factory);
         let mut me = Self {
             stream,
@@ -2576,6 +2554,35 @@ impl Client {
         orig_host: &str,
         orig_port: u16,
     ) -> Result<ClientChannelStream<'_>> {
+        // Port forwarding (`-L`, `-D`) is refused after a changed host key
+        // was accepted; see `host_key_mismatched`.
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
+        self.open_direct_tcpip_channel(dest_host, dest_port, orig_host, orig_port)
+    }
+
+    /// Open a `direct-tcpip` channel to `dest_host:dest_port` to carry the
+    /// caller's own stdio (`ssh -W`) or a further SSH connection (a jump
+    /// host). Unlike [`Self::open_direct_tcpip`] it stays available after a
+    /// changed host key was accepted (see [`Self::host_key_mismatched`]), as
+    /// in OpenSSH: nothing local is exposed to the server through it. The
+    /// multi-channel equivalent is `SharedClient::open_stdio_forward`.
+    pub fn open_stdio_forward(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+    ) -> Result<ClientChannelStream<'_>> {
+        self.open_direct_tcpip_channel(dest_host, dest_port, "127.0.0.1", 0)
+    }
+
+    fn open_direct_tcpip_channel(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<ClientChannelStream<'_>> {
         let (local_id, open_payload) = self.conn.open(ChannelOpen::DirectTcpip {
             dest_host: dest_host.to_string(),
             dest_port: dest_port as u32,
@@ -2630,6 +2637,11 @@ impl Client {
         &mut self,
         socket_path: &str,
     ) -> Result<ClientChannelStream<'_>> {
+        // Port forwarding is refused after a changed host key was accepted;
+        // see `host_key_mismatched`.
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
         let (local_id, open_payload) = self.conn.open(ChannelOpen::DirectStreamlocal {
             socket_path: socket_path.to_string(),
         })?;
@@ -3412,6 +3424,15 @@ impl Write for ClientChannelStream<'_> {
                 ));
             }
             self.pump_one()?;
+            // Nothing reads `read_buf` while we wait here, and `pump_one`
+            // keeps crediting the peer for what it queues: bound it.
+            let cap = STREAM_WRITE_WAIT_READ_CAP
+                .max((self.client.conn.default_window as usize).saturating_mul(2));
+            if self.read_buf.len() > cap {
+                return Err(std::io::Error::other(
+                    "peer kept sending channel data without opening its window for our write",
+                ));
+            }
         }
     }
 
@@ -4036,6 +4057,59 @@ fn pinned_host_key_algorithms(pin: &[u8], over: Option<&[String]>) -> Result<Vec
     Ok(out)
 }
 
+/// The host-key verification seam every client frontend (blocking, async,
+/// mio) hands to its [`ClientDriver`]: one place applies
+/// [`Config::pinned_host_key`] and the [`HostKeyPolicy`], so no frontend can
+/// leave the pin unenforced.
+///
+/// Narrows `algorithms.host_key_algorithms` to the pin's algorithm (if a
+/// pin is set), then brings the types already trusted in `known_hosts` to
+/// the front of the offer (OpenSSH's `order_hostkeyalgs()`, so a server
+/// with several host keys presents the one we recorded rather than a
+/// higher-preference type that would look like a changed key) — call it
+/// before the driver is built from `algorithms`. The returned factory is
+/// called on each KEX reply (initial and re-key): it rejects a host key
+/// that differs from the pin, then defers to [`build_verifier`]. The flag
+/// is the session's [`Client::host_key_mismatched`] state.
+pub(crate) fn host_key_verifier_factory(
+    host_key_policy: HostKeyPolicy,
+    pinned: Option<Vec<u8>>,
+    algorithms: &mut AlgoOverrides,
+    host: &str,
+    port: u16,
+) -> Result<(crate::driver::client::VerifierFactory, Arc<AtomicBool>)> {
+    if let Some(pin) = &pinned {
+        algorithms.host_key_algorithms = Some(pinned_host_key_algorithms(
+            pin,
+            algorithms.host_key_algorithms.as_deref(),
+        )?);
+    }
+    prioritize_known_host_key_algorithms(algorithms, &host_key_policy, host, port);
+    let target_host = host.to_string();
+    let ca_sig_algos = algorithms.ca_signature_algorithms.clone();
+    let host_key_mismatched = Arc::new(AtomicBool::new(false));
+    let mismatched_flag = host_key_mismatched.clone();
+    let factory: crate::driver::client::VerifierFactory =
+        Box::new(move |reply: &[u8], runner: &KexRunner| {
+            if let Some(pin) = &pinned
+                && reply_host_key(reply)? != pin.as_slice()
+            {
+                return Err(Error::HostKeyRejected);
+            }
+            build_verifier(
+                reply,
+                &host_key_policy,
+                runner,
+                &target_host,
+                port,
+                ca_sig_algos.as_deref(),
+                unix_now(),
+                &mismatched_flag,
+            )
+        });
+    Ok((factory, host_key_mismatched))
+}
+
 /// Build the exchange-hash verifier for the host key carried in
 /// `reply_payload`, making the trust decision per `policy` first. On a
 /// re-key (`runner` already holds the first KEX's host key) the policy is
@@ -4056,19 +4130,8 @@ pub(crate) fn build_verifier(
     now: u64,
     host_key_mismatched: &AtomicBool,
 ) -> Result<Box<dyn HostKeyVerify>> {
-    if reply_payload.len() < 5 {
-        return Err(Error::Format("kex-ecdh-reply too short"));
-    }
-    let k_s_len = u32::from_be_bytes([
-        reply_payload[1],
-        reply_payload[2],
-        reply_payload[3],
-        reply_payload[4],
-    ]) as usize;
-    if reply_payload.len() < 5 + k_s_len {
-        return Err(Error::Format("kex-ecdh-reply truncated"));
-    }
-    let k_s = &reply_payload[5..5 + k_s_len];
+    // Bounds-checked: the length prefix is server-supplied and unverified.
+    let k_s = reply_host_key(reply_payload)?;
 
     // Re-key: the host key is pinned to the one the first KEX verified
     // (OpenSSH: "Server host key changed during re-key"). The known_hosts
@@ -5022,11 +5085,17 @@ fn serve_dispatch_packet(
             // when `serve_flush_ingress` later delivers it. Data for a
             // channel with no runtime (already torn down) is dropped and
             // credited so the peer isn't left with a dead window.
-            let delivered = match runtimes.get_mut(&channel) {
-                Some(rt) => rt.offer_ingress(Some(data)),
-                None => data.len(),
-            };
-            serve_credit_window(client, channel, delivered)?;
+            //
+            // Zero-length data is dropped here: it costs the peer no
+            // window, so nothing else would bound how many empty chunks
+            // pile up in the handler's queue and backlog.
+            if !data.is_empty() {
+                let delivered = match runtimes.get_mut(&channel) {
+                    Some(rt) => rt.offer_ingress(Some(data)),
+                    None => data.len(),
+                };
+                serve_credit_window(client, channel, delivered)?;
+            }
         }
         ChannelEvent::ExtendedData { channel, data, .. } => {
             // forwarded-tcpip channels shouldn't carry extended-data, but if
@@ -6285,6 +6354,14 @@ mod tests {
                 .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", "00", 0)
                 .map(drop)
         ));
+        // The borrow-based direct forwards are refused too.
+        #[allow(deprecated)]
+        {
+            assert!(blocked(
+                client.open_direct_tcpip("h", 1, "127.0.0.1", 0).map(drop)
+            ));
+            assert!(blocked(client.open_direct_streamlocal("/x").map(drop)));
+        }
         // The same over a SharedClient (`-L`, `-D`, `ssh -O forward`).
         #[cfg(feature = "multichannel")]
         {

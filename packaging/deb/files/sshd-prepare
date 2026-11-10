@@ -1,7 +1,8 @@
 #!/bin/sh
 # puressh: make sure sshd has a configuration and host keys before it starts.
 #
-# Run as ExecStartPre of ssh.service and from the package's postinst. Purging
+# Run as ExecStartPre and ExecReload of ssh.service and from the package's
+# postinst. Purging
 # the openssh-server package that puressh-server replaced deletes
 # /etc/ssh/sshd_config and /etc/ssh/ssh_host_*_key; this restores them from
 # the copy kept in /var/lib/puressh, so the host keys (and with them every
@@ -17,10 +18,33 @@ TYPES="rsa ecdsa ed25519"
 umask 022
 mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 
+# A refresh interrupted between its two renames leaves the backup under its
+# .old name: put it back before looking for it.
+if [ ! -e "$BACKUP" ] && [ -d "$BACKUP.old" ]; then
+	mv "$BACKUP.old" "$BACKUP" 2>/dev/null || true
+fi
+
+# The backup is as old as the last start or reload of ssh.service: say so
+# loudly whenever something comes back from it.
+mtime() {
+	date -r "$1" '+%Y-%m-%d %H:%M:%S %Z' 2>/dev/null || echo "an unknown date"
+}
+backup_taken=$(mtime "$BACKUP")
+warn_restored() {
+	cat >&2 <<MSG
+sshd-prepare: *** WARNING ***
+sshd-prepare: $1 was missing and has been RESTORED from the backup in
+sshd-prepare: $BACKUP, taken on $backup_taken
+sshd-prepare: (restored file last modified on $(mtime "$2")).
+sshd-prepare: Changes made after the backup was taken are NOT in the restored
+sshd-prepare: copy: review $1 before relying on it.
+MSG
+}
+
 if [ ! -e /etc/ssh/sshd_config ]; then
 	if [ -e "$BACKUP/sshd_config" ]; then
 		cp -p "$BACKUP/sshd_config" /etc/ssh/sshd_config
-		echo "sshd-prepare: restored /etc/ssh/sshd_config from $BACKUP" >&2
+		warn_restored /etc/ssh/sshd_config "$BACKUP/sshd_config"
 	else
 		cp "$TEMPLATE" /etc/ssh/sshd_config
 		echo "sshd-prepare: installed the default /etc/ssh/sshd_config" >&2
@@ -36,7 +60,7 @@ if [ -z "$have_key" ]; then
 		k="ssh_host_${t}_key"
 		if [ -e "$BACKUP/$k" ] && [ -e "$BACKUP/$k.pub" ]; then
 			cp -p "$BACKUP/$k" "$BACKUP/$k.pub" /etc/ssh/
-			echo "sshd-prepare: restored /etc/ssh/$k from $BACKUP" >&2
+			warn_restored "/etc/ssh/$k" "$BACKUP/$k"
 		fi
 	done
 fi
@@ -48,20 +72,40 @@ if [ -z "$have_key" ]; then
 	/usr/lib/puressh/ssh-keygen -A >&2
 fi
 
-# Refresh the backup with what is in place now.
-umask 077
-mkdir -p "$BACKUP"
-chmod 0700 /var/lib/puressh "$BACKUP"
-tmp="$BACKUP.new"
-rm -rf "$tmp"
-mkdir "$tmp"
-cp -p /etc/ssh/sshd_config "$tmp/"
-for t in $TYPES; do
-	k="/etc/ssh/ssh_host_${t}_key"
-	if [ -e "$k" ] && [ -e "$k.pub" ]; then
-		cp -p "$k" "$k.pub" "$tmp/"
+# Refresh the backup with what is in place now. This is best effort: sshd
+# has what it needs in /etc/ssh at this point, so a /var that is full or
+# read-only must not keep it from starting. The new copy is built next to the
+# backup and swapped in only once complete, so a failed refresh leaves the
+# previous backup as it was.
+refresh_backup() {
+	new="$BACKUP.new"
+	old="$BACKUP.old"
+	{ mkdir -p /var/lib/puressh && chmod 0700 /var/lib/puressh; } || return 1
+	{ rm -rf "$new" && mkdir "$new"; } || return 1
+	cp -p /etc/ssh/sshd_config "$new/" || return 1
+	for t in $TYPES; do
+		k="/etc/ssh/ssh_host_${t}_key"
+		if [ -e "$k" ] && [ -e "$k.pub" ]; then
+			cp -p "$k" "$k.pub" "$new/" || return 1
+		fi
+	done
+	rm -rf "$old" || return 1
+	if [ -e "$BACKUP" ]; then
+		mv "$BACKUP" "$old" || return 1
 	fi
-done
-rm -rf "$BACKUP"
-mv "$tmp" "$BACKUP"
+	if ! mv "$new" "$BACKUP"; then
+		# Put the previous backup back.
+		[ ! -e "$old" ] || mv "$old" "$BACKUP" || true
+		return 1
+	fi
+	rm -rf "$old" || true
+	return 0
+}
+
+umask 077
+if ! refresh_backup; then
+	rm -rf "$BACKUP.new" 2>/dev/null || true
+	echo "sshd-prepare: warning: could not refresh the backup in $BACKUP;" \
+		"continuing, /etc/ssh is in place" >&2
+fi
 exit 0

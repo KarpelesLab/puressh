@@ -26,13 +26,14 @@ use super::{Compress, Decompress};
 const CHUNK: usize = 8 * 1024;
 
 /// Default upper bound on the number of bytes a single inflate call may
-/// produce. SSH's per-packet payload limit is `MAX_PACKET_LEN` (256 KiB);
-/// a malicious peer could otherwise hand us a tiny compressed frame that
-/// inflates to gigabytes. Capping at `MAX_PACKET_LEN * 8` (2 MiB) leaves
-/// comfortable headroom for legitimate traffic — even highly-compressible
-/// streams stay well below this — while bounding the allocator and CPU
-/// work a single bad frame can cost us.
-const DEFAULT_MAX_INFLATE_OUTPUT: usize = (MAX_PACKET_LEN as usize) * 8;
+/// produce. A malicious peer could otherwise hand us a tiny compressed
+/// frame that inflates to gigabytes. The cap is `MAX_PACKET_LEN`
+/// (256 KiB): no uncompressed SSH payload may legitimately be larger —
+/// that is the bound on a whole packet without compression, the most our
+/// own encoder accepts, and well above the channel data size any peer is
+/// allowed to send (the max-packet we advertise) — so compression buys a
+/// peer no extra per-packet allocation or CPU work.
+const DEFAULT_MAX_INFLATE_OUTPUT: usize = MAX_PACKET_LEN as usize;
 
 struct ZlibDeflate {
     enc: CcEncoder,
@@ -230,10 +231,10 @@ impl ZlibDecompress {
         }
     }
 
-    /// Override the per-call inflate output cap. The default is roughly
-    /// 2 MiB; lowering it tightens the bomb-resistance guard, raising it
-    /// loosens it. Callers that ship larger SSH payloads (CHANNEL_DATA
-    /// holding tens of MiB) may need to raise this.
+    /// Override the per-call inflate output cap. The default is 256 KiB
+    /// (the largest SSH packet); lowering it tightens the bomb-resistance
+    /// guard, raising it loosens it. Callers that ship larger SSH payloads
+    /// (CHANNEL_DATA holding tens of MiB) may need to raise this.
     pub fn set_max_output_size(&mut self, n: usize) {
         self.inner.set_max_output_size(n);
     }
@@ -556,5 +557,34 @@ mod tests {
             Error::Format(msg) => assert_eq!(msg, "zlib decompressed too large"),
             other => panic!("expected Format(\"...too large\"), got {other:?}"),
         }
+    }
+
+    /// The default cap is the largest uncompressed SSH payload: a packet
+    /// inflating to exactly that still passes, one byte more is refused,
+    /// and the cap can still be raised explicitly.
+    #[test]
+    fn default_cap_is_one_max_packet() {
+        let max = MAX_PACKET_LEN as usize;
+        let mut c = ZlibCompress::new();
+        let fits = c.compress(&vec![b'C'; max]).unwrap();
+        let over = c.compress(&vec![b'C'; max + 1]).unwrap();
+
+        let mut d = ZlibDecompress::new();
+        assert_eq!(d.decompress(&fits).unwrap().len(), max);
+        match d.decompress(&over).unwrap_err() {
+            Error::Format(msg) => assert_eq!(msg, "zlib decompressed too large"),
+            other => panic!("expected Format(\"...too large\"), got {other:?}"),
+        }
+
+        let mut c = ZlibOpenSshCompress::new();
+        c.activate();
+        let over = c.compress(&vec![b'C'; max + 1]).unwrap();
+        let mut d = ZlibOpenSshDecompress::new();
+        d.activate();
+        assert!(d.decompress(&over).is_err());
+        let mut d = ZlibOpenSshDecompress::new();
+        d.set_max_output_size(max + 1);
+        d.activate();
+        assert_eq!(d.decompress(&over).unwrap().len(), max + 1);
     }
 }

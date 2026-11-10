@@ -388,8 +388,18 @@ fn no_tty_error() -> std::io::Error {
 /// Pull one line off `r` into `buf`, stopping at `\n` (which is
 /// consumed but not appended). `\r` is dropped. Capped at `max_len`
 /// bytes to bound memory if the source is unbounded.
+///
+/// The line is text as the terminal sent it: UTF-8 (a password with
+/// non-ASCII characters must reach the server as typed, not with each of
+/// its bytes turned into a character of its own). Input that is not UTF-8
+/// — a terminal in a single-byte locale — is read as Latin-1, one
+/// character per byte. The bytes read are wiped; `buf` is the caller's to
+/// protect.
 fn read_one_line(r: &mut dyn Read, buf: &mut String, max_len: usize) -> std::io::Result<()> {
+    // Sized up front so the secret is never left behind by a reallocation.
+    let mut line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(max_len.min(4096) + 1));
     let mut byte = [0u8; 1];
+    let mut capped = false;
     loop {
         let n = r.read(&mut byte)?;
         if n == 0 || byte[0] == b'\n' {
@@ -398,9 +408,21 @@ fn read_one_line(r: &mut dyn Read, buf: &mut String, max_len: usize) -> std::io:
         if byte[0] == b'\r' {
             continue;
         }
-        buf.push(byte[0] as char);
-        if buf.len() > max_len {
+        line.push(byte[0]);
+        if line.len() > max_len {
+            capped = true;
             break;
+        }
+    }
+    match core::str::from_utf8(&line) {
+        Ok(text) => buf.push_str(text),
+        // The cap fell inside a character: keep what came before it.
+        Err(e) if capped && e.error_len().is_none() => {
+            buf.push_str(&String::from_utf8_lossy(&line[..e.valid_up_to()]));
+        }
+        Err(_) => {
+            buf.reserve(line.len() * 2);
+            buf.extend(line.iter().map(|&b| b as char));
         }
     }
     Ok(())
@@ -1317,7 +1339,9 @@ pub fn show_host_key(blob: &[u8]) -> (String, Option<String>) {
 }
 
 /// `VerifyHostKeyDNS`: whether the host's SSHFP records matched the key
-/// (`None`: not looked up), for the first-contact question.
+/// (`None`: not looked up), for the first-contact question. One host's at
+/// a time: whoever checks a host key sets it afresh (to `None` first) for
+/// each host, so a jump host's verdict is never shown for the next one.
 static DNS_MATCH: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Record the SSHFP outcome (see [`DNS_MATCH`]).
@@ -1326,6 +1350,12 @@ pub fn set_dns_match(matched: Option<bool>) {
     if let Ok(mut g) = DNS_MATCH.lock() {
         *g = matched;
     }
+}
+
+/// The SSHFP outcome recorded for the host being checked (see
+/// [`DNS_MATCH`]).
+pub fn dns_match() -> Option<bool> {
+    DNS_MATCH.lock().ok().and_then(|g| *g)
 }
 
 /// `host`, or `[host]:port` off port 22, as OpenSSH names hosts.
@@ -1579,7 +1609,7 @@ fn ask_unknown_host(
         banner.push_str(&art);
         banner.push('\n');
     }
-    if let Some(matched) = DNS_MATCH.lock().ok().and_then(|g| *g) {
+    if let Some(matched) = dns_match() {
         banner.push_str(if matched {
             "Matching host key fingerprint found in DNS.\n"
         } else {
@@ -2040,9 +2070,9 @@ pub fn try_load_default_identity(path: &Path) -> Result<Option<PrivateKey>, Stri
 /// scalar options and both contribute to cumulative lists.
 ///
 /// A missing file is silently skipped. Errors: a file that exists but won't
-/// parse, or a `~/.ssh/config` with bad ownership / permissions (see
-/// [`check_user_config_perms`]). `Include` paths get their `%` tokens from
-/// `expand`.
+/// parse, or a `~/.ssh/config` — or a file it includes — with bad ownership
+/// / permissions (see [`load_user_config`]). `Include` paths get their `%`
+/// tokens from `expand`.
 pub fn load_client_config(
     explicit: Option<&Path>,
     expand: &dyn Fn(&str) -> String,
@@ -2065,11 +2095,7 @@ pub fn load_client_config(
     if let Some(home) = std::env::var_os("HOME") {
         let user = PathBuf::from(home).join(".ssh").join("config");
         if user.exists() {
-            check_user_config_perms(&user)?;
-            cfg = Some(
-                SshClientConfig::load_expanding(&user, expand)
-                    .map_err(|e| format!("{}: {e}", user.display()))?,
-            );
+            cfg = Some(load_user_config(&user, expand)?);
         }
     }
     let system = Path::new("/etc/ssh/ssh_config");
@@ -2091,25 +2117,37 @@ pub fn load_client_config(
 /// (arbitrary command execution), `IdentityFile`, `StrictHostKeyChecking no`,
 /// and friends into every session the victim starts.
 ///
-/// Only `~/.ssh/config` is checked, exactly like OpenSSH: `-F file` is an
-/// explicit user choice and `/etc/ssh/ssh_config` is root-managed. Files
-/// pulled in via `Include` are *not* checked because the config loader does
-/// not expose the list of files it read. No-op on non-Unix.
-fn check_user_config_perms(path: &Path) -> Result<(), String> {
+/// The rule holds for `~/.ssh/config` and for every file it brings in with
+/// `Include`, at any depth, exactly like OpenSSH (an included file that
+/// another user can write is the same injection); `-F file` is an explicit
+/// user choice and `/etc/ssh/ssh_config` (with its includes) is
+/// root-managed, so neither is checked. Each file is checked as opened
+/// (`fstat`), not by path. No check on non-Unix.
+fn load_user_config(
+    path: &Path,
+    expand: &dyn Fn(&str) -> String,
+) -> Result<puressh::config::SshClientConfig, String> {
+    use puressh::config::{ConfigError, SshClientConfig};
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let md = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let euid = unix_sys::geteuid();
-        if (md.uid() != 0 && md.uid() != euid) || (md.mode() & 0o022) != 0 {
-            return Err(format!("Bad owner or permissions on {}", path.display()));
-        }
-    }
+    let loaded = SshClientConfig::load_checked(path, expand, &user_config_file_ok);
     #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
-    Ok(())
+    let loaded = SshClientConfig::load_expanding(path, expand);
+    loaded.map_err(|e| match e {
+        ConfigError::BadPermissions { file } => format!("Bad owner or permissions on {file}"),
+        e => format!("{}: {e}", path.display()),
+    })
+}
+
+/// Whether an opened file of the user's configuration is owned by the
+/// calling user or root and not writable by group or others (see
+/// [`load_user_config`]).
+#[cfg(unix)]
+fn user_config_file_ok(_path: &Path, file: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(md) = file.metadata() else {
+        return false;
+    };
+    (md.uid() == 0 || md.uid() == unix_sys::geteuid()) && md.mode() & 0o022 == 0
 }
 
 /// Load an `sshd_config(5)` for the `sshd` binary. Returns an error if the
@@ -2400,6 +2438,19 @@ mod perm_tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
             p
         }
+        /// A configuration file holding `body`, with `mode` set explicitly
+        /// (whatever the umask).
+        fn config(&self, name: &str, mode: u32, body: &str) -> PathBuf {
+            let p = self.0.join(name);
+            std::fs::write(&p, body).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            p
+        }
+    }
+
+    /// No `%` tokens to expand in `Include` paths.
+    fn plain(p: &str) -> String {
+        p.to_string()
     }
     impl Drop for Scratch {
         fn drop(&mut self) {
@@ -2447,23 +2498,113 @@ mod perm_tests {
     fn user_config_group_or_world_writable_is_refused() {
         let s = Scratch::new("cfg");
         for mode in [0o664, 0o646, 0o666, 0o622] {
-            let p = s.file(&format!("config-{mode:o}"), mode);
-            let err = check_user_config_perms(&p).unwrap_err();
-            assert!(
-                err.starts_with("Bad owner or permissions on "),
-                "{mode:o}: {err}"
+            let p = s.config(&format!("config-{mode:o}"), mode, "Port 2200\n");
+            let err = load_user_config(&p, &plain).unwrap_err();
+            assert_eq!(
+                err,
+                format!("Bad owner or permissions on {}", p.display()),
+                "{mode:o}"
             );
         }
         for mode in [0o644, 0o600, 0o444, 0o755] {
-            let p = s.file(&format!("config-{mode:o}"), mode);
-            assert!(check_user_config_perms(&p).is_ok(), "{mode:o}");
+            let p = s.config(&format!("config-{mode:o}"), mode, "Port 2200\n");
+            let cfg = load_user_config(&p, &plain).unwrap();
+            assert_eq!(cfg.lookup("h").port, Some(2200), "{mode:o}");
         }
     }
 
     #[test]
     fn user_config_missing_is_an_error() {
         let s = Scratch::new("cfgmissing");
-        assert!(check_user_config_perms(&s.0.join("config")).is_err());
+        assert!(load_user_config(&s.0.join("config"), &plain).is_err());
+    }
+
+    /// A file the user's configuration includes is held to the same rule,
+    /// at any depth; one that is fine is read.
+    #[test]
+    fn user_config_include_group_or_world_writable_is_refused() {
+        let s = Scratch::new("cfginc");
+        let including = |name: &str, target: &Path| {
+            s.config(name, 0o600, &format!("Include {}\n", target.display()))
+        };
+        for mode in [0o664, 0o646, 0o666, 0o622] {
+            let leaf = s.config(
+                &format!("leaf-{mode:o}"),
+                mode,
+                "ProxyCommand touch /tmp/pwned\n",
+            );
+            let bad = format!("Bad owner or permissions on {}", leaf.display());
+            let root = including(&format!("root-{mode:o}"), &leaf);
+            assert_eq!(
+                load_user_config(&root, &plain).unwrap_err(),
+                bad,
+                "{mode:o}"
+            );
+            // Through another (well-kept) file as well.
+            let outer = including(&format!("outer-{mode:o}"), &root);
+            assert_eq!(
+                load_user_config(&outer, &plain).unwrap_err(),
+                bad,
+                "{mode:o}"
+            );
+            // A glob that reaches it too.
+            let glob = s.config(
+                &format!("glob-{mode:o}"),
+                0o600,
+                &format!("Include {}/leaf-{mode:o}*\n", s.0.display()),
+            );
+            assert_eq!(
+                load_user_config(&glob, &plain).unwrap_err(),
+                bad,
+                "{mode:o}"
+            );
+        }
+        for mode in [0o644, 0o600, 0o444] {
+            let leaf = s.config(&format!("ok-{mode:o}"), mode, "Port 2200\n");
+            let root = including(&format!("okroot-{mode:o}"), &leaf);
+            let cfg = load_user_config(&root, &plain).unwrap();
+            assert_eq!(cfg.lookup("h").port, Some(2200), "{mode:o}");
+        }
+        // An included file that does not exist is still just skipped.
+        let root = including("dangling", &s.0.join("nope"));
+        assert!(load_user_config(&root, &plain).is_ok());
+        // `-F file` is the user's explicit choice: read as it is, with
+        // what it includes.
+        let leaf = s.config("f-leaf", 0o666, "Port 2201\n");
+        let root = s.config("f-root", 0o666, &format!("Include {}\n", leaf.display()));
+        let cfg = load_client_config(Some(&root), &plain).unwrap();
+        assert_eq!(cfg.lookup("h").port, Some(2201));
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    //! Lines typed at a prompt (passwords, passphrases, answers).
+    use super::read_one_line;
+
+    fn line(input: &[u8], max: usize) -> String {
+        let mut buf = String::new();
+        read_one_line(&mut &input[..], &mut buf, max).unwrap();
+        buf
+    }
+
+    #[test]
+    fn typed_lines_are_utf8_text() {
+        assert_eq!(line(b"hunter2\r\nnext", 4096), "hunter2");
+        assert_eq!(line(b"no newline", 4096), "no newline");
+        assert_eq!(line(b"\n", 4096), "");
+        // Non-ASCII characters arrive as typed, not one char per byte.
+        let typed = "p\u{e4}ssw\u{f6}rd \u{1f511} \u{30d1}\u{30b9}";
+        assert_eq!(line(format!("{typed}\n").as_bytes(), 4096), typed);
+        assert_eq!(
+            line(format!("{typed}\n").as_bytes(), 4096).len(),
+            typed.len()
+        );
+        // Not UTF-8 (a Latin-1 terminal): one character per byte.
+        assert_eq!(line(b"caf\xe9\n", 4096), "caf\u{e9}");
+        // The cap bounds the read and never splits a character.
+        assert_eq!(line(b"abcdefgh\n", 4), "abcde");
+        assert_eq!(line("ab\u{e9}\u{e9}\u{e9}\n".as_bytes(), 4), "ab\u{e9}");
     }
 }
 

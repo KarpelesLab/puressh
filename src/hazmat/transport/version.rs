@@ -46,9 +46,15 @@ impl VersionExchange {
         if !trimmed.starts_with(b"SSH-2.0-") && !trimmed.starts_with(b"SSH-1.99-") {
             return Err(Error::Protocol("peer is not SSH 2.0"));
         }
-        core::str::from_utf8(trimmed)
-            .map(alloc::string::String::from)
-            .map_err(|_| Error::Protocol("non-ASCII in version string"))
+        let s = core::str::from_utf8(trimmed)
+            .map_err(|_| Error::Protocol("version string is not valid UTF-8"))?;
+        // RFC 4253 §4.2 allows printable characters only. A control
+        // character has no legitimate use there, and the line is logged
+        // and shown by the frontends.
+        if s.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            return Err(Error::Protocol("control character in version string"));
+        }
+        Ok(alloc::string::String::from(s))
     }
 }
 
@@ -60,6 +66,16 @@ mod tests {
     fn parse_remote_accepts_reasonable_line() {
         let v = VersionExchange::parse_remote(b"SSH-2.0-OpenSSH_9.7\r\n").unwrap();
         assert_eq!(v, "SSH-2.0-OpenSSH_9.7");
+    }
+
+    #[test]
+    fn parse_remote_rejects_control_characters() {
+        assert!(VersionExchange::parse_remote(b"SSH-2.0-x\x1b[2J\r\n").is_err());
+        assert!(VersionExchange::parse_remote(b"SSH-2.0-x\x07\n").is_err());
+        assert!(VersionExchange::parse_remote(b"SSH-2.0-x\x7f\n").is_err());
+        assert!(VersionExchange::parse_remote(b"SSH-2.0-x\xff\n").is_err());
+        // Spaces and a comment are fine.
+        assert!(VersionExchange::parse_remote(b"SSH-2.0-x comment here\r\n").is_ok());
     }
 
     #[test]

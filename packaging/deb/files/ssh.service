@@ -11,6 +11,9 @@ EnvironmentFile=-/etc/default/ssh
 ExecStartPre=/usr/lib/puressh/sshd-prepare
 ExecStartPre=/usr/sbin/sshd -t $SSHD_OPTS
 ExecStart=/usr/sbin/sshd -D $SSHD_OPTS
+# On reload too, so that the copy it keeps of the configuration and host keys
+# follows what the administrator just put in place.
+ExecReload=/usr/lib/puressh/sshd-prepare
 ExecReload=/usr/sbin/sshd -t $SSHD_OPTS
 ExecReload=/bin/kill -HUP $MAINPID
 # Only the listener is stopped on restart/upgrade: open sessions are

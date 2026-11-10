@@ -63,7 +63,8 @@ pub const DEFAULT_MAX_AUTH_TRIES: u32 = 6;
 /// accept thread, so an authenticated peer must not be able to request an
 /// unbounded number of them.
 pub const DEFAULT_MAX_FORWARD_BINDINGS: usize = 64;
-const MAX_DRAIN_STEPS: usize = 1_000_000;
+/// Largest stderr piece a buffered exec result queues at once.
+const EXEC_STDERR_CHUNK: usize = 32 * 1024;
 
 /// Bound on the per-subsystem egress queue. Handlers self-throttle when
 /// the dispatcher can't ship `CHANNEL_DATA` fast enough (remote window
@@ -307,12 +308,16 @@ struct ShellRuntime {
     /// A `pty-req` was granted on the channel (`IPQoS`: an interactive
     /// session).
     has_pty: bool,
+    /// The peer's EOF has been passed to the session (`close_stdin`); a
+    /// repeated `CHANNEL_EOF` is not passed on again.
+    stdin_closed: bool,
 }
 
 impl ShellRuntime {
     fn new() -> Self {
         Self {
             has_pty: false,
+            stdin_closed: false,
             pending_pty: None,
             session: None,
             exited: None,
@@ -457,8 +462,13 @@ struct SubsystemRuntime {
     /// Peer-sent chunks (or the EOF marker) not yet accepted by
     /// `ingress_tx`. The receive window for these bytes is replenished only
     /// once they move into the handler's queue, so this is bounded by the
-    /// SSH receive window.
+    /// SSH receive window: only non-empty chunks (which cost the peer
+    /// window) and a single EOF marker are ever queued.
     pending_ingress: VecDeque<Option<Vec<u8>>>,
+    /// The peer's EOF has been queued for the handler. Nothing is queued
+    /// after it: a repeated `CHANNEL_EOF` costs the peer no window, so it
+    /// must not cost the server a queue entry either.
+    eof_queued: bool,
     /// Drain bytes the handler wants to ship out.
     egress_rx: Receiver<ChannelEgress>,
     /// Egress data that didn't fit in the remote window on the last tick;
@@ -483,8 +493,19 @@ impl SubsystemRuntime {
     /// behind anything already waiting, and move what fits into the handler's
     /// queue. Returns the number of data bytes moved — the amount the
     /// channel's receive window may be replenished by.
+    ///
+    /// Only what the peer paid window for takes a queue slot. An empty chunk
+    /// (a zero-length `CHANNEL_DATA` is free to send, and carries nothing
+    /// for the handler) is dropped, and so is anything after the first EOF,
+    /// which is queued once.
     fn push_ingress(&mut self, item: Option<Vec<u8>>) -> usize {
-        self.pending_ingress.push_back(item);
+        let queue = match &item {
+            Some(data) => !data.is_empty() && !self.eof_queued,
+            None => !core::mem::replace(&mut self.eof_queued, true),
+        };
+        if queue {
+            self.pending_ingress.push_back(item);
+        }
         self.flush_ingress()
     }
 
@@ -1693,6 +1714,14 @@ impl EffectivePolicy {
         ok(&self.permit_open) && self.cert_caps.as_ref().is_none_or(|c| ok(&c.permit_open))
     }
 
+    /// True iff a `direct-tcpip` open to `(host, port)`, with the port as it
+    /// came off the wire (a uint32), is permitted. A port that is not a TCP
+    /// port (above 65535) never is — not even with `PermitOpen` unset, where
+    /// the key's or certificate's `permitopen=` would otherwise go unasked.
+    fn direct_tcpip_allows(&self, host: &str, port: u32) -> bool {
+        u16::try_from(port).is_ok_and(|p| self.permit_open_allows(host, p))
+    }
+
     /// True iff a `tcpip-forward` bind to `(host, port)` is permitted by
     /// `PermitListen`. Unset ⇒ any; empty list ⇒ none.
     fn permit_listen_allows(&self, host: &str, port: u16) -> bool {
@@ -1776,9 +1805,17 @@ fn env_glob_match(pattern: &str, name: &str) -> bool {
 
 /// Decide whether a client-supplied `(name, _)` env pair should be
 /// honoured. Returns `true` only when:
+/// - `name` is a well-formed variable name (non-empty, no `=`, no NUL), AND
 /// - `name` is not in [`HARD_BLOCKED_ENV_NAMES`], AND
 /// - at least one pattern in `accept_env` matches it.
+///
+/// A name carrying `=` would otherwise smuggle a different variable into the
+/// child's environment: `LD_PRELOAD=/x.so:FOO` is not the blocked name
+/// `LD_PRELOAD`, yet lands in `environ` as `LD_PRELOAD=/x.so:FOO=<value>`.
 pub(crate) fn env_name_accepted(name: &str, accept_env: &[String]) -> bool {
+    if name.is_empty() || name.bytes().any(|b| b == b'=' || b == 0) {
+        return false;
+    }
     if HARD_BLOCKED_ENV_NAMES.contains(&name) {
         return false;
     }
@@ -2133,11 +2170,27 @@ impl Server {
     ///   thread/PID-exhaustion flood) drops that one connection and continues
     ///   accepting, rather than panicking and killing the whole accept loop.
     ///
+    /// A failed `accept()` ends the loop only when the listener itself is
+    /// unusable (a bad or non-socket descriptor, an invalid argument). A
+    /// connection that went away before it was accepted is skipped, and
+    /// running out of descriptors or memory pauses the loop briefly before it
+    /// tries again, so load on the host cannot stop the server for good.
+    ///
     /// [`accept_one`]: Server::accept_one
     pub fn serve(&mut self) -> Result<()> {
         let live = Arc::new(AtomicUsize::new(0));
         loop {
-            let (stream, peer) = self.listener.accept()?;
+            let (stream, peer) = match self.listener.accept() {
+                Ok(accepted) => accepted,
+                Err(e) => match classify_accept_error(&e) {
+                    AcceptFailure::Retry => continue,
+                    AcceptFailure::Backoff => {
+                        thread::sleep(ACCEPT_BACKOFF);
+                        continue;
+                    }
+                    AcceptFailure::Fatal => return Err(e.into()),
+                },
+            };
 
             // Backpressure: refuse (close) once we're at the concurrency cap.
             // We reserve the slot up front so the check and the increment are a
@@ -2176,6 +2229,64 @@ impl Server {
             }
         }
     }
+}
+
+/// How long [`Server::serve`] waits before retrying `accept()` after an error
+/// that retrying at once would only repeat (descriptor or memory exhaustion).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// What [`Server::serve`] does about a failed `accept()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptFailure {
+    /// The error concerns one connection (or a signal): accept the next.
+    Retry,
+    /// The host is short of a resource, or the error is not one we know:
+    /// wait [`ACCEPT_BACKOFF`], then accept again.
+    Backoff,
+    /// The listener is unusable: stop serving.
+    Fatal,
+}
+
+/// Classify an `accept()` error for [`Server::serve`]. Only errors that mean
+/// the listening socket itself is broken are fatal; anything unrecognised is
+/// retried after a pause, so it can neither stop the server nor spin it.
+fn classify_accept_error(e: &std::io::Error) -> AcceptFailure {
+    match e.kind() {
+        // The peer gave up (or the network dropped it) while the connection
+        // sat in the backlog, or a signal arrived. Each such error uses up a
+        // backlog entry or a signal, so retrying at once cannot spin.
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::Interrupted
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable => return AcceptFailure::Retry,
+        // Nothing to accept on a listener that does not block (or has a
+        // timeout): wait rather than spin.
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::OutOfMemory => {
+            return AcceptFailure::Backoff;
+        }
+        ErrorKind::InvalidInput => return AcceptFailure::Fatal,
+        _ => {}
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error()
+        && (code == libc::EBADF || code == libc::ENOTSOCK || code == libc::EINVAL)
+    {
+        return AcceptFailure::Fatal;
+    }
+    #[cfg(windows)]
+    if let Some(code) = e.raw_os_error() {
+        // WSAEBADF, WSAEINVAL, WSAENOTSOCK, WSANOTINITIALISED.
+        const FATAL: [i32; 4] = [10009, 10022, 10038, 10093];
+        if FATAL.contains(&code) {
+            return AcceptFailure::Fatal;
+        }
+    }
+    // EMFILE / ENFILE / ENOBUFS / ENOMEM and whatever else the platform
+    // reports: the listener is still good, but retrying at once would fail
+    // the same way.
+    AcceptFailure::Backoff
 }
 
 /// RAII slot guard for [`Server::serve`]'s bounded-concurrency counter.
@@ -2283,6 +2394,10 @@ fn handle_connection_inner(
     driver.start(Instant::now())?;
     map_preauth_timeout(srv_drive_handshake(&mut stream, &mut driver, deadline))?;
     let session_id = driver.session_id().to_vec();
+
+    // An IPv4 peer of a dual-stack listener arrives IPv4-mapped; everything
+    // below (name lookup, `Match`, the authenticator) wants the IPv4 form.
+    let peer = canonical_addr(peer);
 
     // The peer's host name (`UseDNS`) and routing domain, for `Match`.
     let names = cfg
@@ -2427,12 +2542,22 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) turned back
+/// into the IPv4 address it stands for; any other address unchanged.
+fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// The textual form of a socket address's IP (no port). Returns `None` for
 /// the unspecified placeholder so a `Match address` never matches a missing
 /// address.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, how an IPv4 peer appears on
+/// a dual-stack listener) is given in its IPv4 form, so that `Match Address
+/// 198.51.100.0/24`, `LocalAddress` and an authenticator's `from=` see the
+/// address they were written for.
 fn ip_string(addr: &SocketAddr) -> Option<String> {
-    let ip = addr.ip();
+    let ip = addr.ip().to_canonical();
     if ip.is_unspecified() {
         None
     } else {
@@ -3866,6 +3991,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3896,6 +4022,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3919,6 +4046,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3943,6 +4071,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -4035,15 +4164,16 @@ fn dispatch_app_packet(
                 // list excludes this destination, rejects the open even when
                 // a direct-tcpip handler is attached.
                 let forwarding_ok = effective.local_forwarding_allowed();
-                // PermitOpen entries carry u16 ports; a dest_port outside that
-                // range can never match a configured entry (and is only
-                // permitted when PermitOpen is unset / `any`).
-                let dest_ok = u16::try_from(dest_port)
-                    .map(|p| effective.permit_open_allows(&dest_host, p))
-                    .unwrap_or_else(|_| effective.permit_open.is_none());
+                // The port is a uint32 on the wire but only 0..=65535 name a
+                // TCP port: anything else is refused outright, before (and
+                // whatever) `PermitOpen` and the key's `permitopen=` say.
+                let port_ok = u16::try_from(dest_port).is_ok();
+                let dest_ok = effective.direct_tcpip_allows(&dest_host, dest_port);
                 if !forwarding_ok || !dest_ok {
                     let reason = if !forwarding_ok {
                         "local forwarding administratively prohibited"
+                    } else if !port_ok {
+                        "direct-tcpip destination port out of range"
                     } else {
                         "direct-tcpip destination not permitted by PermitOpen"
                     };
@@ -4081,6 +4211,7 @@ fn dispatch_app_packet(
                         SubsystemRuntime {
                             ingress_tx,
                             pending_ingress: VecDeque::new(),
+                            eof_queued: false,
                             egress_rx,
                             pending_data: Vec::new(),
                             pending_eof: false,
@@ -4136,6 +4267,7 @@ fn dispatch_app_packet(
                         SubsystemRuntime {
                             ingress_tx,
                             pending_ingress: VecDeque::new(),
+                            eof_queued: false,
                             egress_rx,
                             pending_data: Vec::new(),
                             pending_eof: false,
@@ -4204,6 +4336,7 @@ fn dispatch_app_packet(
                             SubsystemRuntime {
                                 ingress_tx,
                                 pending_ingress: VecDeque::new(),
+                                eof_queued: false,
                                 egress_rx,
                                 pending_data: Vec::new(),
                                 pending_eof: false,
@@ -4288,7 +4421,8 @@ fn dispatch_app_packet(
             // `drain_subsystems` as the handler reads, so a handler that stops
             // reading stalls the peer at the window instead of buffering an
             // unbounded flood. Shell stdin (written synchronously above) and
-            // data for channels with no runtime are credited at once.
+            // data for channels with no runtime are credited at once. A
+            // zero-length chunk is not queued and credits nothing.
             let credit = match subsystems.get_mut(&channel) {
                 Some(rt) => rt.push_ingress(Some(data)),
                 None => data.len(),
@@ -4303,15 +4437,21 @@ fn dispatch_app_packet(
             }
         }
         ChannelEvent::Eof { channel } => {
+            // A peer may repeat CHANNEL_EOF at will (it costs no window), so
+            // only the first one acts: one `close_stdin` (on a PTY that is
+            // a written EOT each time), one queued EOF marker.
             if let Some(rt) = shells.get_mut(&channel)
+                && !rt.stdin_closed
                 && let Some(sess) = rt.session.as_mut()
             {
+                rt.stdin_closed = true;
                 let _ = sess.close_stdin();
             }
             if let Some(rt) = subsystems.get_mut(&channel) {
                 // None = EOF marker; the handler's `Read::read` returns
                 // `Ok(0)` next time it drains its buffer.
-                // Queued behind any data still waiting for the handler.
+                // Queued behind any data still waiting for the handler;
+                // `push_ingress` ignores a second one.
                 let _ = rt.push_ingress(None);
             }
         }
@@ -5082,6 +5222,7 @@ fn handle_channel_request(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -5266,6 +5407,7 @@ fn start_stream_handler(
         SubsystemRuntime {
             ingress_tx,
             pending_ingress: VecDeque::new(),
+            eof_queued: false,
             egress_rx,
             pending_data: Vec::new(),
             pending_eof: false,
@@ -5324,27 +5466,20 @@ fn run_exec_command(
         let p = conn.send_request_success(channel)?;
         srv_send(stream, driver, &p)?;
     }
-    drain_send(stream, driver, conn, channel, &result.stdout, None)?;
-    drain_send(
-        stream,
-        driver,
-        conn,
-        channel,
-        &result.stderr,
-        Some(SSH_EXTENDED_DATA_STDERR),
-    )?;
-    let p = conn.send_request(
-        channel,
-        ChannelRequest::ExitStatus {
-            code: result.exit_status,
-        },
-        false,
-    )?;
-    srv_send(stream, driver, &p)?;
-    let p = conn.send_eof(channel)?;
-    srv_send(stream, driver, &p)?;
-    let p = conn.send_close(channel)?;
-    srv_send(stream, driver, &p)?;
+    // The output goes out through the connection loop like any stream
+    // handler's, paced by the peer's window, so nothing else on the
+    // connection (other channels, requests, keepalives) waits behind it.
+    start_stream_handler(subsystems, channel, move |mut cs| {
+        // Errors mean the channel is gone; dropping the stream sends EOF
+        // and close either way.
+        let _ = (|| -> std::io::Result<()> {
+            cs.write_all(&result.stdout)?;
+            for chunk in result.stderr.chunks(EXEC_STDERR_CHUNK) {
+                cs.write_stderr(chunk)?;
+            }
+            cs.send_exit_status(result.exit_status)
+        })();
+    });
     Ok(())
 }
 
@@ -5381,6 +5516,7 @@ fn route_internal_sftp(
             SubsystemRuntime {
                 ingress_tx,
                 pending_ingress: VecDeque::new(),
+                eof_queued: false,
                 egress_rx,
                 pending_data: Vec::new(),
                 pending_eof: false,
@@ -5398,45 +5534,6 @@ fn route_internal_sftp(
     } else if want_reply {
         let p = conn.send_request_failure(channel)?;
         srv_send(stream, driver, &p)?;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn drain_send(
-    stream: &mut TcpStream,
-    driver: &mut ServerDriver,
-    conn: &mut ConnectionState,
-    channel: u32,
-    mut data: &[u8],
-    extended: Option<u32>,
-) -> Result<()> {
-    let mut iter = 0usize;
-    while !data.is_empty() {
-        iter += 1;
-        if iter > MAX_DRAIN_STEPS {
-            return Err(Error::Protocol("drain_send did not converge"));
-        }
-        let (payload, taken) = if let Some(code) = extended {
-            conn.send_extended_data(channel, code, data)?
-        } else {
-            conn.send_data(channel, data)?
-        };
-
-        if taken > 0 {
-            srv_send(stream, driver, &payload)?;
-            data = &data[taken..];
-            continue;
-        }
-        let pkt = srv_read(stream, driver, None)?;
-        let ev = conn.on_packet(&pkt)?;
-        match ev {
-            ChannelEvent::WindowAdjust { channel: c, .. } if c == channel => continue,
-            ChannelEvent::Close { channel: c } if c == channel => {
-                return Err(Error::BadChannelState);
-            }
-            _ => continue,
-        }
     }
     Ok(())
 }
@@ -5529,7 +5626,7 @@ pub(crate) fn server_ext_info(cfg: &Config) -> ExtInfo {
 
 /// Current wall-clock time as Unix seconds, for certificate validity checks.
 /// Injected at the std edge; falls back to 0 (fail-closed for not-yet-valid).
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -7994,6 +8091,31 @@ mod tests {
         assert!(!env_name_accepted("", &allow));
     }
 
+    /// SRV-10: a name containing `=` is not the blocked name it starts with,
+    /// yet would reach the child's environment as that variable.
+    #[test]
+    fn env_filter_refuses_names_with_equals_or_nul() {
+        for allow in [
+            vec!["*".to_string()],
+            vec!["*_PROXY".to_string()],
+            vec!["LD_PRELOAD=/home/u/x.so:HTTP_PROXY".to_string()],
+        ] {
+            assert!(!env_name_accepted("LD_PRELOAD=/x", &allow));
+            assert!(!env_name_accepted(
+                "LD_PRELOAD=/home/u/x.so:HTTP_PROXY",
+                &allow
+            ));
+            assert!(!env_name_accepted("PATH=/tmp:HTTP_PROXY", &allow));
+            assert!(!env_name_accepted("=HTTP_PROXY", &allow));
+            assert!(!env_name_accepted("FOO=", &allow));
+            assert!(!env_name_accepted("FOO\0HTTP_PROXY", &allow));
+            assert!(!env_name_accepted("", &allow));
+        }
+        // Well-formed names are unaffected.
+        assert!(env_name_accepted("HTTP_PROXY", &["*_PROXY".to_string()]));
+        assert!(env_name_accepted("LANG", &["*".to_string()]));
+    }
+
     // ---- per-connection policy resolution (W5/W6) ------------------------
 
     fn policy_cfg(src: &str) -> Config {
@@ -8052,6 +8174,129 @@ mod tests {
         drop(_names);
         let eff = resolve_effective_policy(&cfg, "alice", None, Some("203.0.113.5"), None, None);
         assert_eq!(eff.max_sessions, None);
+    }
+
+    /// SRV-11: only an unusable listener ends `Server::serve`; a connection
+    /// that vanished from the backlog or a host short of descriptors must
+    /// not.
+    #[test]
+    fn accept_errors_are_fatal_only_for_a_broken_listener() {
+        use std::io::Error as IoError;
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+        ] {
+            assert_eq!(
+                classify_accept_error(&IoError::from(kind)),
+                AcceptFailure::Retry,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::OutOfMemory,
+        ] {
+            assert_eq!(
+                classify_accept_error(&IoError::from(kind)),
+                AcceptFailure::Backoff,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            classify_accept_error(&IoError::from(ErrorKind::InvalidInput)),
+            AcceptFailure::Fatal
+        );
+        // An error we have no opinion on pauses the loop; it does not end it.
+        assert_eq!(
+            classify_accept_error(&IoError::other("unknown")),
+            AcceptFailure::Backoff
+        );
+        #[cfg(unix)]
+        {
+            for code in [libc::ECONNABORTED, libc::EINTR] {
+                assert_eq!(
+                    classify_accept_error(&IoError::from_raw_os_error(code)),
+                    AcceptFailure::Retry,
+                    "errno {code}"
+                );
+            }
+            for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+                assert_eq!(
+                    classify_accept_error(&IoError::from_raw_os_error(code)),
+                    AcceptFailure::Backoff,
+                    "errno {code}"
+                );
+            }
+            for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+                assert_eq!(
+                    classify_accept_error(&IoError::from_raw_os_error(code)),
+                    AcceptFailure::Fatal,
+                    "errno {code}"
+                );
+            }
+        }
+    }
+
+    /// SRV-11, end to end: `serve` rides out failed accepts and takes the
+    /// next connection. (Linux only: elsewhere an accepted socket inherits
+    /// the listener's non-blocking mode, which the session does not expect.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serve_survives_accept_errors() {
+        // A listener that is non-blocking makes every idle `accept` fail
+        // with `WouldBlock` — an accept error on demand, without touching
+        // process-wide limits that other tests share.
+        let mut server = Server::bind("127.0.0.1:0", policy_cfg("")).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        server.listener.set_nonblocking(true).expect("nonblocking");
+        thread::spawn(move || {
+            let _ = server.serve();
+        });
+        // Let the loop see a few failed accepts first.
+        thread::sleep(Duration::from_millis(350));
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut banner = [0u8; 4];
+        s.read_exact(&mut banner)
+            .expect("the server stopped accepting after an accept error");
+        assert_eq!(&banner, b"SSH-");
+    }
+
+    /// SRV-12: an IPv4 peer of a dual-stack listener (`::ffff:a.b.c.d`) must
+    /// match an IPv4 `Match Address` block instead of slipping past it.
+    #[test]
+    fn ipv4_mapped_peer_matches_ipv4_match_address() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:4022".parse().expect("addr");
+        assert_eq!(ip_string(&mapped).as_deref(), Some("192.0.2.9"));
+        assert_eq!(
+            canonical_addr(mapped),
+            "192.0.2.9:4022".parse::<SocketAddr>().expect("addr")
+        );
+        // Real IPv6 and IPv4 addresses are left alone; the unspecified
+        // placeholder (mapped or not) still yields no address.
+        let v6: SocketAddr = "[2001:db8::1]:22".parse().expect("addr");
+        assert_eq!(ip_string(&v6).as_deref(), Some("2001:db8::1"));
+        assert_eq!(canonical_addr(v6), v6);
+        let v4: SocketAddr = "198.51.100.1:22".parse().expect("addr");
+        assert_eq!(ip_string(&v4).as_deref(), Some("198.51.100.1"));
+        let unspec: SocketAddr = "[::ffff:0.0.0.0]:0".parse().expect("addr");
+        assert_eq!(ip_string(&unspec), None);
+
+        let cfg = policy_cfg("Match Address 192.0.2.0/24\n  PubkeyAuthentication no\n");
+        let peer_ip = ip_string(&mapped);
+        let inside = resolve_preauth_policy(&cfg, peer_ip.as_deref(), None, None);
+        assert!(
+            inside.methods.is_empty(),
+            "the restrictive Match block was skipped for an IPv4-mapped peer"
+        );
+
+        let cfg = policy_cfg("Match LocalAddress 192.0.2.9\n  PubkeyAuthentication no\n");
+        let local_ip = ip_string(&mapped);
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), local_ip.as_deref(), None);
+        assert!(pre.methods.is_empty());
     }
 
     #[test]
@@ -8365,6 +8610,32 @@ mod tests {
         let eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
         assert!(!eff.permit_open_allows("127.0.0.1", 22));
         assert!(!eff.permit_open_allows("anything", 1));
+    }
+
+    /// SRV-15: a `direct-tcpip` port that does not fit a TCP port is refused
+    /// whatever the policy — in particular with `PermitOpen` unset and a
+    /// key-level `permitopen=`, which the out-of-range fallback never asked.
+    #[test]
+    fn direct_tcpip_port_out_of_range_is_refused() {
+        let cfg = policy_cfg("Port 22\n");
+        let mut eff = resolve_effective_policy(&cfg, "alice", None, None, None, None);
+        assert!(eff.direct_tcpip_allows("127.0.0.1", 80));
+        assert!(eff.direct_tcpip_allows("127.0.0.1", 65535));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536 + 80));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", u32::MAX));
+
+        let mut caps = crate::auth::AuthCertCaps::unrestricted();
+        caps.permit_open = Some(vec![crate::config::HostPort {
+            host: "127.0.0.1".into(),
+            port: Some(80),
+        }]);
+        fold_cert_caps(&mut eff, caps);
+        assert!(eff.permit_open.is_none(), "config PermitOpen stays unset");
+        assert!(eff.direct_tcpip_allows("127.0.0.1", 80));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 81));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536));
+        assert!(!eff.direct_tcpip_allows("127.0.0.1", 65536 + 80));
     }
 
     #[test]
@@ -9109,6 +9380,7 @@ mod tests {
         let rt = SubsystemRuntime {
             ingress_tx,
             pending_ingress: VecDeque::new(),
+            eof_queued: false,
             egress_rx,
             pending_data: Vec::new(),
             pending_eof: false,
@@ -9142,6 +9414,41 @@ mod tests {
         assert!(rt.pending_ingress.is_empty());
         assert_eq!(rx.recv().unwrap().unwrap().len(), 30);
         assert_eq!(rx.recv().unwrap(), None);
+    }
+
+    /// TRN-1 / SRV-14: zero-length `CHANNEL_DATA` and repeated `CHANNEL_EOF`
+    /// cost the peer no window, so they must not take queue slots either.
+    #[test]
+    fn ingress_holds_no_empty_chunks_and_a_single_eof() {
+        // A handler that never reads, with a one-chunk queue.
+        let (mut rt, rx) = ingress_test_runtime(1);
+        assert_eq!(rt.push_ingress(Some(vec![0; 4])), 4);
+        for _ in 0..1000 {
+            assert_eq!(rt.push_ingress(Some(Vec::new())), 0);
+        }
+        assert!(rt.pending_ingress.is_empty());
+        assert_eq!(rt.push_ingress(Some(vec![0; 6])), 0);
+        for _ in 0..1000 {
+            assert_eq!(rt.push_ingress(None), 0);
+        }
+        // The held chunk and one EOF marker; nothing else.
+        assert_eq!(rt.pending_ingress.len(), 2);
+        // Data is still credited as the handler takes it, and the handler
+        // sees the chunks, then EOF, exactly once.
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 4);
+        assert_eq!(rt.flush_ingress(), 6);
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 6);
+        assert_eq!(rt.flush_ingress(), 0);
+        assert_eq!(rx.recv().unwrap(), None);
+        assert_eq!(rt.push_ingress(None), 0);
+        assert!(rt.pending_ingress.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        // With room in the handler's queue an empty chunk is not handed over
+        // either: it carries nothing for the handler to read.
+        let (mut rt, rx) = ingress_test_runtime(4);
+        assert_eq!(rt.push_ingress(Some(Vec::new())), 0);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

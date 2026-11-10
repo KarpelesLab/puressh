@@ -2012,13 +2012,93 @@ fn accepted_factors_restrictions_are_intersected() {
     }
 
     // Conflicting forced commands across factors: the later one is refused.
+    // The authenticator accepted it before the conflict showed, so this is
+    // not a failure the client may retry after: authentication ends.
     let mut s = server();
     match s.on_packet(&first).unwrap() {
         ServerStep::Send(p) => assert!(UserauthFailure::decode(&p).unwrap().partial_success),
         _ => panic!("expected partial success"),
     }
     let third = signed_pubkey_request("alice", "ssh-ed25519", &k3.public_blob(), &k3);
-    assert_failure(s.on_packet(&third).unwrap());
+    assert!(matches!(
+        s.on_packet(&third).unwrap(),
+        ServerStep::Disconnect("conflicting key restrictions")
+    ));
+}
+
+/// `AuthenticationMethods publickey,publickey,password`-style policy that,
+/// like any stateful authenticator, counts a factor the moment it accepts
+/// it. The keys' restrictions are those of [`TwoRestrictedKeys`].
+struct TwoKeysThenPassword(u32);
+impl Authenticator for TwoKeysThenPassword {
+    fn evaluate(&mut self, attempt: AuthAttempt) -> AuthDecision {
+        match attempt {
+            AuthAttempt::PublicKey {
+                verified: true,
+                probe_only: false,
+                ..
+            } => {
+                self.0 += 1;
+                let next = if self.0 < 2 { "publickey" } else { "password" };
+                AuthDecision::PartialAccept {
+                    still_required: vec![next.into()],
+                }
+            }
+            AuthAttempt::Password { .. } if self.0 >= 2 => AuthDecision::Accept,
+            _ => AuthDecision::Reject,
+        }
+    }
+    fn key_restrictions(&mut self, user: &str, blob: &[u8]) -> Option<super::server::AuthCertCaps> {
+        TwoRestrictedKeys(0).key_restrictions(user, blob)
+    }
+}
+
+/// A publickey factor the authenticator accepted but the server vetoed
+/// (its forced command conflicts with an earlier factor's) must not count:
+/// the authenticator already recorded it, so the next factor would complete
+/// authentication without that key's restrictions. The veto ends
+/// authentication.
+#[test]
+fn vetoed_publickey_factor_cannot_be_completed_by_a_later_factor() {
+    let k1 = Ed25519HostKey::from_seed(TEST_SEED);
+    let k3 = Ed25519HostKey::from_seed([10u8; 32]);
+    let mut s = ServerAuth::new(
+        TEST_SID.to_vec(),
+        vec!["publickey", "password"],
+        Box::new(TwoKeysThenPassword(0)),
+    );
+    userauth_service_started(&mut s);
+
+    // Factor 1: forced command /bin/a.
+    let first = signed_pubkey_request("alice", "ssh-ed25519", &k1.public_blob(), &k1);
+    match s.on_packet(&first).unwrap() {
+        ServerStep::Send(p) => assert!(UserauthFailure::decode(&p).unwrap().partial_success),
+        _ => panic!("expected partial success"),
+    }
+    // Factor 2: forced command /bin/b. Accepted by the authenticator (which
+    // now waits for the password only), vetoed by the server.
+    let second = signed_pubkey_request("alice", "ssh-ed25519", &k3.public_blob(), &k3);
+    assert!(matches!(
+        s.on_packet(&second).unwrap(),
+        ServerStep::Disconnect("conflicting key restrictions")
+    ));
+    // The password that would complete the authenticator's chain.
+    let pw = UserauthRequest {
+        user: "alice".into(),
+        service: "ssh-connection".into(),
+        method: AuthMethodPayload::Password {
+            new_password: None,
+            password: "pw".into(),
+        },
+    }
+    .encode();
+    match s.on_packet(&pw) {
+        Ok(ServerStep::Authenticated { .. }) => {
+            panic!("authenticated with a vetoed publickey factor")
+        }
+        Ok(ServerStep::Disconnect(_)) | Err(_) => {}
+        Ok(_) => panic!("authentication must be over after a veto"),
+    }
 }
 
 // ---------------------------------------------------------------------------

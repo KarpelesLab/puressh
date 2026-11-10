@@ -3665,6 +3665,10 @@ mod imp {
         /// The options of the `authorized_keys` line that accepted the last
         /// publickey attempt, for [`Authenticator::key_restrictions`].
         accepted_options: Option<Arc<puressh::key::AuthorizedKeyOptions>>,
+        /// The restrictions of the public-key factors recorded so far (the
+        /// auth layer's own tally, mirrored): a later factor that cannot
+        /// hold together with them is refused before it is recorded.
+        recorded_caps: Option<puressh::auth::AuthCertCaps>,
         /// CA public-key blobs from `TrustedUserCAKeys` (the file in force for
         /// this connection). A user cert signed by one of these is CA-trusted;
         /// principal authorization is checked separately. CAs from the user's
@@ -4831,20 +4835,13 @@ mod imp {
         fn check_security_key(
             &self,
             sk: &puressh::auth::SkSignature,
+            caps: Option<&puressh::auth::AuthCertCaps>,
             cert: Option<&puressh::auth::CertInfo>,
             public_blob: &[u8],
             user: &str,
         ) -> Result<(), puressh::auth::SkRequirement> {
-            use puressh::auth::{AuthCertCaps, SkRequirement};
-            let key = self
-                .accepted_options
-                .as_deref()
-                .map(AuthCertCaps::from_key_options);
-            let caps = match (cert.map(AuthCertCaps::from_cert_info), key) {
-                (Some(c), Some(k)) => c.intersect(k),
-                (c, k) => c.or(k),
-            };
-            sk.check(caps.as_ref()).inspect_err(|unmet| {
+            use puressh::auth::SkRequirement;
+            sk.check(caps).inspect_err(|unmet| {
                 let blob = cert.map_or(public_blob, |ci| ci.embedded_pubkey_blob.as_slice());
                 let key = key_description(blob, None);
                 let what = match unmet {
@@ -4860,6 +4857,89 @@ mod imp {
                     ));
                 });
             })
+        }
+
+        /// The restrictions a public-key attempt that passed every other
+        /// check would log in under: the certificate's with those of the
+        /// `authorized_keys` / principals line that accepted it (`.0`), and
+        /// those with what the earlier public-key factors of a multi-factor
+        /// chain recorded (`.1`). An inner `None` is "unrestricted".
+        ///
+        /// `None` when they cannot all hold at once (different forced
+        /// commands), which OpenSSH refuses. The auth layer computes the
+        /// same thing after `evaluate` returns and refuses the attempt
+        /// then; it has to be refused *here* as well, before the factor is
+        /// recorded, or the chain would have advanced past a factor whose
+        /// restrictions were never applied.
+        #[allow(clippy::type_complexity)]
+        fn publickey_restrictions(
+            &self,
+            cert: Option<&puressh::auth::CertInfo>,
+        ) -> Option<(
+            Option<puressh::auth::AuthCertCaps>,
+            Option<puressh::auth::AuthCertCaps>,
+        )> {
+            use puressh::auth::AuthCertCaps;
+            let merge = |a: Option<AuthCertCaps>, b: Option<AuthCertCaps>| match (a, b) {
+                (Some(a), Some(b)) => a.intersect(b).map(Some),
+                (a, b) => Some(a.or(b)),
+            };
+            let key = self
+                .accepted_options
+                .as_deref()
+                .map(AuthCertCaps::from_key_options);
+            let attempt = merge(cert.map(AuthCertCaps::from_cert_info), key)?;
+            let chain = merge(self.recorded_caps.clone(), attempt.clone())?;
+            Some((attempt, chain))
+        }
+
+        /// The last step of a public-key attempt whose user, key and
+        /// signature are all acceptable: check that its restrictions are
+        /// consistent and that a security-key signature meets them, then
+        /// record the `publickey` factor.
+        fn accept_publickey(
+            &mut self,
+            user: &str,
+            public_blob: &[u8],
+            cert: Option<&puressh::auth::CertInfo>,
+            security_key: Option<puressh::auth::SkSignature>,
+        ) -> AuthDecision {
+            let Some((attempt_caps, chain_caps)) = self.publickey_restrictions(cert) else {
+                if self.debug {
+                    eprintln!(
+                        "sshd: auth publickey: conflicting forced commands for {user}, rejecting"
+                    );
+                }
+                self.accepted_options = None;
+                return AuthDecision::Reject;
+            };
+            if let Some(sk) = security_key
+                && let Err(unmet) =
+                    self.check_security_key(&sk, attempt_caps.as_ref(), cert, public_blob, user)
+            {
+                if self.debug {
+                    eprintln!("sshd: auth publickey: {unmet:?} requirement not met for {user}");
+                }
+                return AuthDecision::Reject;
+            }
+            if self.debug {
+                eprintln!("sshd: auth publickey: verified user {user}");
+            }
+            // A verified user certificate's `force-command` critical
+            // option (and its default-deny extensions) are captured by
+            // the auth layer into `AuthCertCaps`, folded into the
+            // per-connection `EffectivePolicy`, and enforced by the
+            // server connection-phase dispatcher uniformly with the
+            // config `ForceCommand` / forwarding gates.
+            //
+            // A verified signature satisfies the `publickey` factor. In
+            // single-factor mode this Accepts; under a multi-factor
+            // chain it may PartialAccept and ask for the next factor.
+            let decision = self.record_and_decide("publickey");
+            if !matches!(decision, AuthDecision::Reject) {
+                self.recorded_caps = chain_caps;
+            }
+            decision
         }
     }
 
@@ -5061,32 +5141,7 @@ mod imp {
                             }
                             return AuthDecision::Reject;
                         }
-                        if let Some(sk) = security_key
-                            && let Err(unmet) =
-                                self.check_security_key(&sk, cert.as_ref(), &public_blob, &user)
-                        {
-                            if self.debug {
-                                eprintln!(
-                                    "sshd: auth publickey: {unmet:?} requirement not met for {user}"
-                                );
-                            }
-                            return AuthDecision::Reject;
-                        }
-                        if self.debug {
-                            eprintln!("sshd: auth publickey: verified user {user}");
-                        }
-                        // A verified user certificate's `force-command` critical
-                        // option (and its default-deny extensions) are captured by
-                        // the auth layer into `AuthCertCaps`, folded into the
-                        // per-connection `EffectivePolicy`, and enforced by the
-                        // server connection-phase dispatcher uniformly with the
-                        // config `ForceCommand` / forwarding gates. Nothing to
-                        // record here.
-                        //
-                        // A verified signature satisfies the `publickey` factor. In
-                        // single-factor mode this Accepts; under a multi-factor
-                        // chain it may PartialAccept and ask for the next factor.
-                        self.record_and_decide("publickey")
+                        self.accept_publickey(&user, &public_blob, cert.as_ref(), security_key)
                     }
                     AuthAttempt::Password { user, password, .. } => {
                         if !self.password_enabled {
@@ -5712,6 +5767,7 @@ mod imp {
                 authorized_keys_files: self.authorized_keys_files.clone(),
                 authorized_keys: None,
                 accepted_options: None,
+                recorded_caps: None,
                 trusted_user_ca_blobs: (*self.trusted_user_ca_blobs).clone(),
                 revoked_keys: self.revoked_keys.clone(),
                 policy: self.policy.clone(),
@@ -10380,6 +10436,7 @@ mod imp {
                 peer: peer.map(str::to_string),
                 debug: false,
                 accepted_options: None,
+                recorded_caps: None,
             }
         }
 
@@ -10594,6 +10651,88 @@ mod imp {
                 safe_owned_env(&owned),
                 vec![("TERM".to_string(), "xterm".to_string())]
             );
+        }
+
+        /// AUTH-1: a public-key factor whose certificate and key line force
+        /// different commands is refused *before* it is recorded, so a
+        /// `publickey,password` chain cannot be completed past it with no
+        /// restriction applied.
+        #[test]
+        fn conflicting_forced_commands_do_not_advance_the_chain() {
+            let cert_forcing = |cmd: &str| {
+                let mut ci = puressh::auth::CertInfo::new(
+                    b"ca".to_vec(),
+                    b"key".to_vec(),
+                    "ssh-ed25519",
+                    "id",
+                    1,
+                    vec!["alice".into()],
+                );
+                let mut data = (cmd.len() as u32).to_be_bytes().to_vec();
+                data.extend_from_slice(cmd.as_bytes());
+                ci.critical_options.push(("force-command".into(), data));
+                ci
+            };
+            let line_forcing = |cmd: &str| {
+                let mut o = puressh::key::AuthorizedKeyOptions::default();
+                o.cert_authority = true;
+                o.command = Some(cmd.into());
+                Some(Arc::new(o))
+            };
+            let forced = |a: &LocalAuthenticator| {
+                a.recorded_caps
+                    .as_ref()
+                    .and_then(|c| c.force_command.clone())
+            };
+            let mut a = auth_with(&["alice"], &[], &[], &[], Default::default());
+            a.chains = vec![vec!["publickey", "password"]];
+
+            // Certificate forces A, the cert-authority line forces B.
+            a.accepted_options = line_forcing("B");
+            assert!(a.publickey_restrictions(Some(&cert_forcing("A"))).is_none());
+            assert!(matches!(
+                a.accept_publickey("alice", b"blob", Some(&cert_forcing("A")), None),
+                AuthDecision::Reject
+            ));
+            assert!(a.satisfied.is_empty(), "the factor was recorded");
+            assert!(a.recorded_caps.is_none());
+            // So the password alone does not complete the chain.
+            assert!(matches!(
+                a.record_and_decide("password"),
+                AuthDecision::Reject
+            ));
+
+            // Agreeing commands: recorded, and the restriction is kept.
+            a.accepted_options = line_forcing("A");
+            assert!(matches!(
+                a.accept_publickey("alice", b"blob", Some(&cert_forcing("A")), None),
+                AuthDecision::PartialAccept { .. }
+            ));
+            assert_eq!(a.satisfied, vec!["publickey"]);
+            assert_eq!(forced(&a).as_deref(), Some("A"));
+
+            // A second public-key factor that forces another command than
+            // the first is refused as well.
+            let mut b = auth_with(&["alice"], &[], &[], &[], Default::default());
+            b.chains = vec![vec!["publickey", "publickey", "password"]];
+            b.accepted_options = line_forcing("A");
+            assert!(matches!(
+                b.accept_publickey("alice", b"k1", None, None),
+                AuthDecision::PartialAccept { .. }
+            ));
+            b.accepted_options = line_forcing("B");
+            assert!(matches!(
+                b.accept_publickey("alice", b"k2", None, None),
+                AuthDecision::Reject
+            ));
+            assert_eq!(b.satisfied, vec!["publickey"]);
+            // A plain, unrestricted key still passes and keeps A in force.
+            b.accepted_options = Some(Default::default());
+            assert!(matches!(
+                b.accept_publickey("alice", b"k3", None, None),
+                AuthDecision::PartialAccept { .. }
+            ));
+            assert_eq!(forced(&b).as_deref(), Some("A"));
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------

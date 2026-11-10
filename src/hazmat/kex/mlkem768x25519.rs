@@ -214,9 +214,10 @@ impl MlKem768X25519Sha256 {
         // are wiped when this function returns. Only the combined hash
         // (also Zeroizing while we work with it) is fed into K's string
         // encoding; the raw half-secrets never leave this frame.
-        let mut k_pq_raw = Zeroizing::new([0u8; SHARED_SECRET_BYTES]);
+        // The ML-KEM secret is wrapped as returned: no plain copy of it is
+        // left behind in a named temporary.
         let (ct, k_pq_bytes) = ek.encapsulate(rng);
-        k_pq_raw.copy_from_slice(&k_pq_bytes);
+        let k_pq_raw: Zeroizing<[u8; SHARED_SECRET_BYTES]> = Zeroizing::new(k_pq_bytes);
 
         let k_ecdh_raw: Zeroizing<[u8; 32]> = Zeroizing::new(
             secret
@@ -298,8 +299,8 @@ impl MlKem768X25519Sha256 {
         // The resulting K mismatch surfaces as a signature-verification
         // failure below, which is exactly the contract the spec wants.
         let ct = MlKem768Ciphertext::from_bytes(ct_arr);
-        let mut k_pq_raw = Zeroizing::new([0u8; SHARED_SECRET_BYTES]);
-        k_pq_raw.copy_from_slice(&state.pq_secret.decapsulate(&ct));
+        let k_pq_raw: Zeroizing<[u8; SHARED_SECRET_BYTES]> =
+            Zeroizing::new(state.pq_secret.decapsulate(&ct));
 
         let k_ecdh_raw: Zeroizing<[u8; 32]> = Zeroizing::new(
             state

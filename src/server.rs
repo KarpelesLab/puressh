@@ -307,12 +307,16 @@ struct ShellRuntime {
     /// A `pty-req` was granted on the channel (`IPQoS`: an interactive
     /// session).
     has_pty: bool,
+    /// The peer's EOF has been passed to the session (`close_stdin`); a
+    /// repeated `CHANNEL_EOF` is not passed on again.
+    stdin_closed: bool,
 }
 
 impl ShellRuntime {
     fn new() -> Self {
         Self {
             has_pty: false,
+            stdin_closed: false,
             pending_pty: None,
             session: None,
             exited: None,
@@ -457,8 +461,13 @@ struct SubsystemRuntime {
     /// Peer-sent chunks (or the EOF marker) not yet accepted by
     /// `ingress_tx`. The receive window for these bytes is replenished only
     /// once they move into the handler's queue, so this is bounded by the
-    /// SSH receive window.
+    /// SSH receive window: only non-empty chunks (which cost the peer
+    /// window) and a single EOF marker are ever queued.
     pending_ingress: VecDeque<Option<Vec<u8>>>,
+    /// The peer's EOF has been queued for the handler. Nothing is queued
+    /// after it: a repeated `CHANNEL_EOF` costs the peer no window, so it
+    /// must not cost the server a queue entry either.
+    eof_queued: bool,
     /// Drain bytes the handler wants to ship out.
     egress_rx: Receiver<ChannelEgress>,
     /// Egress data that didn't fit in the remote window on the last tick;
@@ -483,8 +492,19 @@ impl SubsystemRuntime {
     /// behind anything already waiting, and move what fits into the handler's
     /// queue. Returns the number of data bytes moved — the amount the
     /// channel's receive window may be replenished by.
+    ///
+    /// Only what the peer paid window for takes a queue slot. An empty chunk
+    /// (a zero-length `CHANNEL_DATA` is free to send, and carries nothing
+    /// for the handler) is dropped, and so is anything after the first EOF,
+    /// which is queued once.
     fn push_ingress(&mut self, item: Option<Vec<u8>>) -> usize {
-        self.pending_ingress.push_back(item);
+        let queue = match &item {
+            Some(data) => !data.is_empty() && !self.eof_queued,
+            None => !core::mem::replace(&mut self.eof_queued, true),
+        };
+        if queue {
+            self.pending_ingress.push_back(item);
+        }
         self.flush_ingress()
     }
 
@@ -3962,6 +3982,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -3992,6 +4013,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -4015,6 +4037,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -4039,6 +4062,7 @@ fn dispatch_app_packet(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -4177,6 +4201,7 @@ fn dispatch_app_packet(
                         SubsystemRuntime {
                             ingress_tx,
                             pending_ingress: VecDeque::new(),
+                            eof_queued: false,
                             egress_rx,
                             pending_data: Vec::new(),
                             pending_eof: false,
@@ -4232,6 +4257,7 @@ fn dispatch_app_packet(
                         SubsystemRuntime {
                             ingress_tx,
                             pending_ingress: VecDeque::new(),
+                            eof_queued: false,
                             egress_rx,
                             pending_data: Vec::new(),
                             pending_eof: false,
@@ -4300,6 +4326,7 @@ fn dispatch_app_packet(
                             SubsystemRuntime {
                                 ingress_tx,
                                 pending_ingress: VecDeque::new(),
+                                eof_queued: false,
                                 egress_rx,
                                 pending_data: Vec::new(),
                                 pending_eof: false,
@@ -4384,7 +4411,8 @@ fn dispatch_app_packet(
             // `drain_subsystems` as the handler reads, so a handler that stops
             // reading stalls the peer at the window instead of buffering an
             // unbounded flood. Shell stdin (written synchronously above) and
-            // data for channels with no runtime are credited at once.
+            // data for channels with no runtime are credited at once. A
+            // zero-length chunk is not queued and credits nothing.
             let credit = match subsystems.get_mut(&channel) {
                 Some(rt) => rt.push_ingress(Some(data)),
                 None => data.len(),
@@ -4399,15 +4427,21 @@ fn dispatch_app_packet(
             }
         }
         ChannelEvent::Eof { channel } => {
+            // A peer may repeat CHANNEL_EOF at will (it costs no window), so
+            // only the first one acts: one `close_stdin` (on a PTY that is
+            // a written EOT each time), one queued EOF marker.
             if let Some(rt) = shells.get_mut(&channel)
+                && !rt.stdin_closed
                 && let Some(sess) = rt.session.as_mut()
             {
+                rt.stdin_closed = true;
                 let _ = sess.close_stdin();
             }
             if let Some(rt) = subsystems.get_mut(&channel) {
                 // None = EOF marker; the handler's `Read::read` returns
                 // `Ok(0)` next time it drains its buffer.
-                // Queued behind any data still waiting for the handler.
+                // Queued behind any data still waiting for the handler;
+                // `push_ingress` ignores a second one.
                 let _ = rt.push_ingress(None);
             }
         }
@@ -5178,6 +5212,7 @@ fn handle_channel_request(
                     SubsystemRuntime {
                         ingress_tx,
                         pending_ingress: VecDeque::new(),
+                        eof_queued: false,
                         egress_rx,
                         pending_data: Vec::new(),
                         pending_eof: false,
@@ -5362,6 +5397,7 @@ fn start_stream_handler(
         SubsystemRuntime {
             ingress_tx,
             pending_ingress: VecDeque::new(),
+            eof_queued: false,
             egress_rx,
             pending_data: Vec::new(),
             pending_eof: false,
@@ -5477,6 +5513,7 @@ fn route_internal_sftp(
             SubsystemRuntime {
                 ingress_tx,
                 pending_ingress: VecDeque::new(),
+                eof_queued: false,
                 egress_rx,
                 pending_data: Vec::new(),
                 pending_eof: false,
@@ -9353,6 +9390,7 @@ mod tests {
         let rt = SubsystemRuntime {
             ingress_tx,
             pending_ingress: VecDeque::new(),
+            eof_queued: false,
             egress_rx,
             pending_data: Vec::new(),
             pending_eof: false,
@@ -9386,6 +9424,41 @@ mod tests {
         assert!(rt.pending_ingress.is_empty());
         assert_eq!(rx.recv().unwrap().unwrap().len(), 30);
         assert_eq!(rx.recv().unwrap(), None);
+    }
+
+    /// TRN-1 / SRV-14: zero-length `CHANNEL_DATA` and repeated `CHANNEL_EOF`
+    /// cost the peer no window, so they must not take queue slots either.
+    #[test]
+    fn ingress_holds_no_empty_chunks_and_a_single_eof() {
+        // A handler that never reads, with a one-chunk queue.
+        let (mut rt, rx) = ingress_test_runtime(1);
+        assert_eq!(rt.push_ingress(Some(vec![0; 4])), 4);
+        for _ in 0..1000 {
+            assert_eq!(rt.push_ingress(Some(Vec::new())), 0);
+        }
+        assert!(rt.pending_ingress.is_empty());
+        assert_eq!(rt.push_ingress(Some(vec![0; 6])), 0);
+        for _ in 0..1000 {
+            assert_eq!(rt.push_ingress(None), 0);
+        }
+        // The held chunk and one EOF marker; nothing else.
+        assert_eq!(rt.pending_ingress.len(), 2);
+        // Data is still credited as the handler takes it, and the handler
+        // sees the chunks, then EOF, exactly once.
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 4);
+        assert_eq!(rt.flush_ingress(), 6);
+        assert_eq!(rx.recv().unwrap().unwrap().len(), 6);
+        assert_eq!(rt.flush_ingress(), 0);
+        assert_eq!(rx.recv().unwrap(), None);
+        assert_eq!(rt.push_ingress(None), 0);
+        assert!(rt.pending_ingress.is_empty());
+        assert!(rx.try_recv().is_err());
+
+        // With room in the handler's queue an empty chunk is not handed over
+        // either: it carries nothing for the handler to read.
+        let (mut rt, rx) = ingress_test_runtime(4);
+        assert_eq!(rt.push_ingress(Some(Vec::new())), 0);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

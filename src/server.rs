@@ -2292,6 +2292,10 @@ fn handle_connection_inner(
     map_preauth_timeout(srv_drive_handshake(&mut stream, &mut driver, deadline))?;
     let session_id = driver.session_id().to_vec();
 
+    // An IPv4 peer of a dual-stack listener arrives IPv4-mapped; everything
+    // below (name lookup, `Match`, the authenticator) wants the IPv4 form.
+    let peer = canonical_addr(peer);
+
     // The peer's host name (`UseDNS`) and routing domain, for `Match`.
     let names = cfg
         .peer_names
@@ -2435,12 +2439,22 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// `addr` with an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) turned back
+/// into the IPv4 address it stands for; any other address unchanged.
+fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
 /// The textual form of a socket address's IP (no port). Returns `None` for
 /// the unspecified placeholder so a `Match address` never matches a missing
 /// address.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, how an IPv4 peer appears on
+/// a dual-stack listener) is given in its IPv4 form, so that `Match Address
+/// 198.51.100.0/24`, `LocalAddress` and an authenticator's `from=` see the
+/// address they were written for.
 fn ip_string(addr: &SocketAddr) -> Option<String> {
-    let ip = addr.ip();
+    let ip = addr.ip().to_canonical();
     if ip.is_unspecified() {
         None
     } else {
@@ -8085,6 +8099,40 @@ mod tests {
         drop(_names);
         let eff = resolve_effective_policy(&cfg, "alice", None, Some("203.0.113.5"), None, None);
         assert_eq!(eff.max_sessions, None);
+    }
+
+    /// SRV-12: an IPv4 peer of a dual-stack listener (`::ffff:a.b.c.d`) must
+    /// match an IPv4 `Match Address` block instead of slipping past it.
+    #[test]
+    fn ipv4_mapped_peer_matches_ipv4_match_address() {
+        let mapped: SocketAddr = "[::ffff:192.0.2.9]:4022".parse().expect("addr");
+        assert_eq!(ip_string(&mapped).as_deref(), Some("192.0.2.9"));
+        assert_eq!(
+            canonical_addr(mapped),
+            "192.0.2.9:4022".parse::<SocketAddr>().expect("addr")
+        );
+        // Real IPv6 and IPv4 addresses are left alone; the unspecified
+        // placeholder (mapped or not) still yields no address.
+        let v6: SocketAddr = "[2001:db8::1]:22".parse().expect("addr");
+        assert_eq!(ip_string(&v6).as_deref(), Some("2001:db8::1"));
+        assert_eq!(canonical_addr(v6), v6);
+        let v4: SocketAddr = "198.51.100.1:22".parse().expect("addr");
+        assert_eq!(ip_string(&v4).as_deref(), Some("198.51.100.1"));
+        let unspec: SocketAddr = "[::ffff:0.0.0.0]:0".parse().expect("addr");
+        assert_eq!(ip_string(&unspec), None);
+
+        let cfg = policy_cfg("Match Address 192.0.2.0/24\n  PubkeyAuthentication no\n");
+        let peer_ip = ip_string(&mapped);
+        let inside = resolve_preauth_policy(&cfg, peer_ip.as_deref(), None, None);
+        assert!(
+            inside.methods.is_empty(),
+            "the restrictive Match block was skipped for an IPv4-mapped peer"
+        );
+
+        let cfg = policy_cfg("Match LocalAddress 192.0.2.9\n  PubkeyAuthentication no\n");
+        let local_ip = ip_string(&mapped);
+        let pre = resolve_preauth_policy(&cfg, Some("203.0.113.5"), local_ip.as_deref(), None);
+        assert!(pre.methods.is_empty());
     }
 
     #[test]

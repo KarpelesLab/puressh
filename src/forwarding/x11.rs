@@ -11,8 +11,10 @@
 //!   via [`crate::server::X11ForwardHandle::display_env`] as
 //!   `"localhost:<N>.<screen>"`, which the dispatcher injects as the
 //!   `DISPLAY` env var on the session.
-//! - Spawns one accept-loop thread per setup. For each accepted TCP
-//!   connection the worker calls
+//! - Spawns one accept-loop thread per setup. Each accepted TCP connection
+//!   has its cookie validated on a short-lived thread of its own (a bounded
+//!   number at a time), so a silent connection cannot hold up the others.
+//!   For each validated connection the worker calls
 //!   [`crate::server::X11ForwardContext::open_x11`] to ask the
 //!   per-connection server loop to open an `x11` channel back toward the
 //!   client, then splices the local TCP stream against the resulting
@@ -42,6 +44,8 @@ use std::thread;
 use std::net::{SocketAddr, TcpListener};
 #[cfg(feature = "server")]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "server")]
+use std::sync::mpsc;
 #[cfg(feature = "server")]
 use std::thread::JoinHandle;
 #[cfg(feature = "server")]
@@ -80,11 +84,17 @@ const MAX_X11_SETUP_PRELUDE: usize = 1 << 16;
 
 /// Total budget for receiving one connection's X11 setup packet (cookie
 /// handshake). This is an absolute deadline for the whole packet, not a
-/// per-read inactivity window: the handshake runs on the display's accept
-/// thread, so a local peer dribbling one byte per read-timeout would otherwise
-/// stall every other X11 connection of the session for as long as it liked.
+/// per-read inactivity window: a local peer dribbling one byte per
+/// read-timeout would otherwise hold one of the display's
+/// [`MAX_VALIDATING_CONNECTIONS`] validation slots for as long as it liked.
 #[cfg(feature = "server")]
 const X11_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Connections of one display whose cookie is being validated at the same
+/// time, each on its own short-lived thread. When all slots are taken, a new
+/// connection takes the place of the one that has been waiting longest.
+#[cfg(feature = "server")]
+const MAX_VALIDATING_CONNECTIONS: usize = 8;
 
 /// Per-setup decision about how to treat accepted local connections.
 #[cfg(feature = "server")]
@@ -376,24 +386,57 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let handle = thread::spawn(move || {
+            // Cookie validation runs off this thread (one short-lived thread
+            // per connection, at most `MAX_VALIDATING_CONNECTIONS` at once),
+            // so a local peer that connects and stays silent holds one slot
+            // for its setup budget instead of every later X client of the
+            // session. Validated connections come back on this channel and
+            // are handed to the session here, one at a time and in order,
+            // which is also where `single_connection` is honoured.
+            let (validated_tx, validated_rx) = mpsc::channel::<ValidatedConn>();
+            let mut validating: Vec<Validation> = Vec::new();
             // One thread serves both loopback listeners (IPv4 and, when
-            // available, IPv6) of the display: poll each in turn and sleep
+            // available, IPv6) of the display: poll each in turn and wait
             // only once none had a connection waiting.
             let mut idle = false;
             'accept: while !stop_thread.load(Ordering::SeqCst) {
-                if idle {
-                    thread::sleep(ACCEPT_POLL_INTERVAL);
+                // The idle wait doubles as the wait for a validated
+                // connection, so a hand-over is not delayed by the poll
+                // interval.
+                let mut next = if idle {
+                    validated_rx.recv_timeout(ACCEPT_POLL_INTERVAL).ok()
+                } else {
+                    validated_rx.try_recv().ok()
+                };
+                while let Some(validated) = next {
+                    hand_over_x11(&ctx, validated);
+                    // RFC 4254 §6.3.1: when the client set
+                    // `single_connection`, the server MUST refuse any
+                    // further forwarded X11 connections after the first
+                    // is accepted. Drop the listener (by exiting the
+                    // loop) so subsequent connects to `localhost:6000+N`
+                    // see a `ECONNREFUSED`. Only a *validated* connection
+                    // gets here: a rejected (bad-cookie) one never does,
+                    // so a local attacker who races in first with a bogus
+                    // cookie cannot tear the listener down before the
+                    // legitimate client connects.
+                    if single_connection {
+                        break 'accept;
+                    }
+                    next = validated_rx.try_recv().ok();
                 }
+                validating.retain(|v| !v.thread.is_finished());
                 idle = true;
                 for listener in &listeners {
                     match listener.accept() {
-                        Ok((mut conn, peer)) => {
+                        Ok((conn, peer)) => {
                             idle = false;
                             // BSD-family kernels (macOS, the BSDs) hand out accepted
                             // sockets that inherit the listener's O_NONBLOCK; Linux
-                            // does not. The splice threads below do blocking I/O, so
-                            // put the connection back into blocking mode explicitly.
-                            // A failure here leaves a socket we cannot use; drop it.
+                            // does not. The validation and splice threads do
+                            // blocking I/O, so put the connection back into blocking
+                            // mode explicitly. A failure here leaves a socket we
+                            // cannot use; drop it.
                             if conn.set_nonblocking(false).is_err() {
                                 continue;
                             }
@@ -402,58 +445,53 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
                             }
                             // Validate the X11 authorisation cookie on the first
                             // setup packet before doing anything else. On any
-                            // failure, drop the connection without opening a
+                            // failure the connection is dropped without opening a
                             // channel back to the client.
-                            let prelude = match &policy {
-                                CookiePolicy::PermitUnauthenticated => Vec::new(),
-                                CookiePolicy::RequireCookie(cookie) => {
-                                    match read_and_check_cookie(&mut conn, cookie) {
-                                        Ok(bytes) => bytes,
-                                        Err(_) => {
-                                            // A rejected (bad-cookie) connection must
-                                            // NOT consume the `single_connection`
-                                            // allowance: otherwise a local attacker
-                                            // who races in first with a bogus cookie
-                                            // could tear down the listener before the
-                                            // legitimate client connects. Keep
-                                            // looping; only a *validated* connection
-                                            // (below) honours `single_connection`.
-                                            let _ = conn.shutdown(Shutdown::Both);
-                                            continue;
-                                        }
+                            match &policy {
+                                CookiePolicy::PermitUnauthenticated => {
+                                    hand_over_x11(
+                                        &ctx,
+                                        ValidatedConn {
+                                            conn,
+                                            peer,
+                                            prelude: Vec::new(),
+                                        },
+                                    );
+                                    if single_connection {
+                                        break 'accept;
                                     }
                                 }
-                            };
-                            let orig_host = match peer.ip() {
-                                std::net::IpAddr::V4(v4) => v4.to_string(),
-                                std::net::IpAddr::V6(v6) => v6.to_string(),
-                            };
-                            let orig_port = peer.port() as u32;
-                            match ctx.open_x11(orig_host, orig_port) {
-                                Ok(channel_stream) => {
-                                    // Replay the setup packet bytes we consumed
-                                    // during validation, then splice the rest.
-                                    spawn_tcp_splice_with_prelude(conn, channel_stream, prelude);
+                                CookiePolicy::RequireCookie(cookie) => {
+                                    // All slots taken: close the connection
+                                    // that has been silent the longest. A real
+                                    // X client sends its setup packet at once,
+                                    // so the oldest one still unvalidated is
+                                    // the least likely to be one.
+                                    if validating.len() >= MAX_VALIDATING_CONNECTIONS {
+                                        validating.remove(0).cancel();
+                                    }
+                                    if let Some(v) =
+                                        Validation::start(conn, peer, cookie, &validated_tx)
+                                    {
+                                        validating.push(v);
+                                    }
                                 }
-                                Err(_) => {
-                                    let _ = conn.shutdown(Shutdown::Both);
-                                }
-                            }
-                            // RFC 4254 §6.3.1: when the client set
-                            // `single_connection`, the server MUST refuse any
-                            // further forwarded X11 connections after the first
-                            // is accepted. Drop the listener (by exiting the
-                            // loop, which lets `listener` go out of scope) so
-                            // subsequent connects to `localhost:6000+N` see a
-                            // `ECONNREFUSED`.
-                            if single_connection {
-                                break 'accept;
                             }
                         }
                         Err(e) if e.kind() == ErrorKind::WouldBlock => {}
                         Err(_) => break 'accept,
                     }
                 }
+            }
+            // Release the display first, then end the validations still
+            // running: closing their sockets fails the pending reads, so the
+            // joins below return at once rather than after the setup budget.
+            drop(listeners);
+            for v in &validating {
+                v.close();
+            }
+            for v in validating {
+                let _ = v.thread.join();
             }
         });
 
@@ -471,6 +509,113 @@ impl X11ForwardHandler for DefaultX11ForwardHandler {
             display_number,
             stopper: Box::new(binding),
         })
+    }
+}
+
+/// A local connection that passed the cookie gate (or needed none), waiting
+/// to be handed to the session.
+#[cfg(feature = "server")]
+struct ValidatedConn {
+    conn: TcpStream,
+    peer: SocketAddr,
+    /// The setup-packet bytes consumed during validation, to replay.
+    prelude: Vec<u8>,
+}
+
+/// One connection whose cookie is being validated on its own thread.
+#[cfg(feature = "server")]
+struct Validation {
+    /// Second handle on the connection, to close it from the accept thread.
+    closer: TcpStream,
+    /// Set by whichever comes first: the validation thread about to hand a
+    /// validated connection over, or the accept thread cancelling it. The
+    /// loser backs off, so a connection that validated is never closed by a
+    /// cancellation racing it.
+    settled: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+#[cfg(feature = "server")]
+impl Validation {
+    /// Validate `conn`'s cookie on a new thread; a connection that passes is
+    /// sent on `validated`. `None` (connection dropped) when the socket
+    /// cannot be duplicated or the thread cannot be started.
+    fn start(
+        conn: TcpStream,
+        peer: SocketAddr,
+        cookie: &Arc<Vec<u8>>,
+        validated: &mpsc::Sender<ValidatedConn>,
+    ) -> Option<Self> {
+        let closer = conn.try_clone().ok()?;
+        let settled = Arc::new(AtomicBool::new(false));
+        let settled_thread = Arc::clone(&settled);
+        let cookie = Arc::clone(cookie);
+        let validated = validated.clone();
+        let thread = thread::Builder::new()
+            .name("x11-cookie".into())
+            .spawn(move || {
+                let mut conn = conn;
+                match read_and_check_cookie(&mut conn, &cookie) {
+                    Ok(prelude) => {
+                        if !settled_thread.swap(true, Ordering::SeqCst) {
+                            let _ = validated.send(ValidatedConn {
+                                conn,
+                                peer,
+                                prelude,
+                            });
+                        }
+                    }
+                    Err(_) => {
+                        let _ = conn.shutdown(Shutdown::Both);
+                    }
+                }
+            })
+            .ok()?;
+        Some(Validation {
+            closer,
+            settled,
+            thread,
+        })
+    }
+
+    /// Close the connection unless it has already validated. The thread
+    /// ends by itself right after.
+    fn cancel(self) {
+        if !self.settled.swap(true, Ordering::SeqCst) {
+            self.close();
+        }
+    }
+
+    /// Close the connection, whatever its state.
+    fn close(&self) {
+        let _ = self.closer.shutdown(Shutdown::Both);
+    }
+}
+
+/// Open the `x11` channel for a validated local connection and splice the
+/// two, replaying the setup packet consumed during validation. Blocks until
+/// the client confirms or rejects the channel.
+#[cfg(feature = "server")]
+fn hand_over_x11(ctx: &X11ForwardContext, validated: ValidatedConn) {
+    let ValidatedConn {
+        conn,
+        peer,
+        prelude,
+    } = validated;
+    let orig_host = match peer.ip() {
+        std::net::IpAddr::V4(v4) => v4.to_string(),
+        std::net::IpAddr::V6(v6) => v6.to_string(),
+    };
+    let orig_port = peer.port() as u32;
+    match ctx.open_x11(orig_host, orig_port) {
+        Ok(channel_stream) => {
+            // Replay the setup packet bytes we consumed during validation,
+            // then splice the rest.
+            spawn_tcp_splice_with_prelude(conn, channel_stream, prelude);
+        }
+        Err(_) => {
+            let _ = conn.shutdown(Shutdown::Both);
+        }
     }
 }
 
@@ -617,8 +762,8 @@ fn read_and_check_cookie_until(
 ) -> std::io::Result<Vec<u8>> {
     use std::io::{Error as IoError, Read};
 
-    // The deadline keeps a silent/hostile local connection from pinning the
-    // display's accept thread; the prior timeout is restored on the way out.
+    // The deadline keeps a silent/hostile local connection from pinning a
+    // validation slot; the prior timeout is restored on the way out.
     let prev_timeout = conn.read_timeout().ok().flatten();
 
     let result = (|| {
@@ -1132,7 +1277,7 @@ mod tests {
     /// C3: the setup-packet read is bounded by an absolute deadline. A peer
     /// that keeps the socket alive by trickling one byte at a time (each
     /// well inside any per-read timeout) is still cut off once the overall
-    /// budget is spent, so it cannot pin the display's accept thread.
+    /// budget is spent, so it cannot pin a validation slot.
     #[test]
     fn cookie_handshake_enforces_total_deadline_against_trickling_peer() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -1262,5 +1407,125 @@ mod tests {
             "single_connection: listener should be released after the first accept"
         );
         drop(handle);
+    }
+
+    /// FWD-7: connections that never send their setup packet are validated
+    /// off the accept thread, so a valid client arriving after them is
+    /// served at once instead of after their setup budgets. More idle
+    /// connections than validation slots are opened, so the oldest ones are
+    /// closed to make room.
+    #[test]
+    fn idle_connections_do_not_delay_a_valid_one() {
+        let h = DefaultX11ForwardHandler::with_display_range(740, 759);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", false, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
+
+        // Read timeouts are armed while each socket is freshly connected:
+        // macOS refuses `SO_RCVTIMEO` on a socket the peer already closed.
+        let idle: Vec<TcpStream> = (0..MAX_VALIDATING_CONNECTIONS + 4)
+            .map(|_| {
+                let c = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("idle");
+                c.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("read timeout");
+                c
+            })
+            .collect();
+
+        let start = std::time::Instant::now();
+        let mut peer = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        peer.set_read_timeout(Some(X11_SETUP_TIMEOUT))
+            .expect("read timeout");
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
+        peer.write_all(&pkt).expect("write setup packet");
+        // The cookie is good, so the worker reaches `open_x11`, which fails
+        // under `for_test_no_opens`, and closes the connection: the close
+        // is how the test sees that validation completed.
+        let mut buf = [0u8; 1];
+        match peer.read(&mut buf) {
+            Ok(_) => {}
+            Err(e) => assert!(
+                !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+                "valid connection was not served: {e:?}"
+            ),
+        }
+        assert!(
+            start.elapsed() < X11_SETUP_TIMEOUT / 2,
+            "valid connection waited behind idle ones: {:?}",
+            start.elapsed()
+        );
+
+        // The connections beyond the slot limit were closed, oldest first.
+        let mut oldest = &idle[0];
+        match oldest.read(&mut buf) {
+            Ok(n) => assert_eq!(n, 0, "nothing is ever sent to an X client here"),
+            Err(e) => assert!(
+                !matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut),
+                "oldest idle connection should have been closed: {e:?}"
+            ),
+        }
+
+        // Dropping the handle ends the validations still waiting on idle
+        // connections without sitting out their setup budgets.
+        let start = std::time::Instant::now();
+        drop(handle);
+        assert!(
+            start.elapsed() < X11_SETUP_TIMEOUT / 2,
+            "drop waited for idle validations: {:?}",
+            start.elapsed()
+        );
+        drop(idle);
+    }
+
+    /// FWD-7: with `single_connection`, neither idle connections nor a bad
+    /// cookie use up the allowance; the first *validated* connection does,
+    /// and the listener is then released although idle connections are
+    /// still being validated.
+    #[test]
+    fn single_connection_is_consumed_only_by_a_validated_connection() {
+        let h = DefaultX11ForwardHandler::with_display_range(760, 779);
+        let ctx = X11ForwardContext::for_test_no_opens();
+        let handle = h
+            .setup("u", true, "MIT-MAGIC-COOKIE-1", "deadbeef", 0, ctx)
+            .expect("setup");
+        let addr: SocketAddr = ([127u8, 0, 0, 1], 6000 + handle.display_number).into();
+
+        let idle: Vec<TcpStream> = (0..3)
+            .map(|_| TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("idle"))
+            .collect();
+        let mut bad = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        bad.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("read timeout");
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0x00, 0x11, 0x22, 0x33]);
+        bad.write_all(&pkt).expect("write bad packet");
+        let mut buf = [0u8; 1];
+        let _ = bad.read(&mut buf); // closed once the cookie is rejected
+        assert!(
+            TcpListener::bind(addr).is_err(),
+            "a rejected connection must not release the listener"
+        );
+
+        let mut good = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).expect("connect");
+        let pkt = x11_setup_packet(MIT_MAGIC_COOKIE_1.as_bytes(), &[0xde, 0xad, 0xbe, 0xef]);
+        good.write_all(&pkt).expect("write setup packet");
+
+        // Liveness bound, as in the test above.
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut released = false;
+        while std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(50));
+            if TcpListener::bind(addr).is_ok() {
+                released = true;
+                break;
+            }
+        }
+        assert!(
+            released,
+            "single_connection: listener should be released after the validated connection"
+        );
+        drop(handle);
+        drop(idle);
     }
 }

@@ -17,6 +17,12 @@ TYPES="rsa ecdsa ed25519"
 umask 022
 mkdir -p /etc/ssh /etc/ssh/sshd_config.d
 
+# A refresh interrupted between its two renames leaves the backup under its
+# .old name: put it back before looking for it.
+if [ ! -e "$BACKUP" ] && [ -d "$BACKUP.old" ]; then
+	mv "$BACKUP.old" "$BACKUP" 2>/dev/null || true
+fi
+
 if [ ! -e /etc/ssh/sshd_config ]; then
 	if [ -e "$BACKUP/sshd_config" ]; then
 		cp -p "$BACKUP/sshd_config" /etc/ssh/sshd_config
@@ -48,20 +54,40 @@ if [ -z "$have_key" ]; then
 	/usr/lib/puressh/ssh-keygen -A >&2
 fi
 
-# Refresh the backup with what is in place now.
-umask 077
-mkdir -p "$BACKUP"
-chmod 0700 /var/lib/puressh "$BACKUP"
-tmp="$BACKUP.new"
-rm -rf "$tmp"
-mkdir "$tmp"
-cp -p /etc/ssh/sshd_config "$tmp/"
-for t in $TYPES; do
-	k="/etc/ssh/ssh_host_${t}_key"
-	if [ -e "$k" ] && [ -e "$k.pub" ]; then
-		cp -p "$k" "$k.pub" "$tmp/"
+# Refresh the backup with what is in place now. This is best effort: sshd
+# has what it needs in /etc/ssh at this point, so a /var that is full or
+# read-only must not keep it from starting. The new copy is built next to the
+# backup and swapped in only once complete, so a failed refresh leaves the
+# previous backup as it was.
+refresh_backup() {
+	new="$BACKUP.new"
+	old="$BACKUP.old"
+	{ mkdir -p /var/lib/puressh && chmod 0700 /var/lib/puressh; } || return 1
+	{ rm -rf "$new" && mkdir "$new"; } || return 1
+	cp -p /etc/ssh/sshd_config "$new/" || return 1
+	for t in $TYPES; do
+		k="/etc/ssh/ssh_host_${t}_key"
+		if [ -e "$k" ] && [ -e "$k.pub" ]; then
+			cp -p "$k" "$k.pub" "$new/" || return 1
+		fi
+	done
+	rm -rf "$old" || return 1
+	if [ -e "$BACKUP" ]; then
+		mv "$BACKUP" "$old" || return 1
 	fi
-done
-rm -rf "$BACKUP"
-mv "$tmp" "$BACKUP"
+	if ! mv "$new" "$BACKUP"; then
+		# Put the previous backup back.
+		[ ! -e "$old" ] || mv "$old" "$BACKUP" || true
+		return 1
+	fi
+	rm -rf "$old" || true
+	return 0
+}
+
+umask 077
+if ! refresh_backup; then
+	rm -rf "$BACKUP.new" 2>/dev/null || true
+	echo "sshd-prepare: warning: could not refresh the backup in $BACKUP;" \
+		"continuing, /etc/ssh is in place" >&2
+fi
 exit 0

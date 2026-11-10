@@ -5022,11 +5022,17 @@ fn serve_dispatch_packet(
             // when `serve_flush_ingress` later delivers it. Data for a
             // channel with no runtime (already torn down) is dropped and
             // credited so the peer isn't left with a dead window.
-            let delivered = match runtimes.get_mut(&channel) {
-                Some(rt) => rt.offer_ingress(Some(data)),
-                None => data.len(),
-            };
-            serve_credit_window(client, channel, delivered)?;
+            //
+            // Zero-length data is dropped here: it costs the peer no
+            // window, so nothing else would bound how many empty chunks
+            // pile up in the handler's queue and backlog.
+            if !data.is_empty() {
+                let delivered = match runtimes.get_mut(&channel) {
+                    Some(rt) => rt.offer_ingress(Some(data)),
+                    None => data.len(),
+                };
+                serve_credit_window(client, channel, delivered)?;
+            }
         }
         ChannelEvent::ExtendedData { channel, data, .. } => {
             // forwarded-tcpip channels shouldn't carry extended-data, but if

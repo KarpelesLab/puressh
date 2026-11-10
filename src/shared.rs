@@ -1774,6 +1774,11 @@ fn dispatch_event(g: &mut Inner, ev: ChannelEvent) {
 /// requires a real [`Client`]).
 fn stash_event(queues: &mut BTreeMap<u32, ChannelQueue>, ev: ChannelEvent) {
     match ev {
+        // Zero-length data carries nothing and costs the peer no window:
+        // never queue it (an empty entry in a datagram mailbox would
+        // otherwise pile up with no flow-control bound).
+        ChannelEvent::Data { data, .. } | ChannelEvent::ExtendedData { data, .. }
+            if data.is_empty() => {}
         ChannelEvent::Data { channel, data } => {
             if let Some(q) = queues.get_mut(&channel) {
                 if q.datagram {
@@ -2510,6 +2515,48 @@ mod tests {
             b"abcdef"
         );
         assert_eq!(queues[&9].data.iter().copied().collect::<Vec<_>>(), b"x");
+    }
+
+    /// Zero-length data costs the peer no window, so it must never be
+    /// queued — least of all in a datagram mailbox, where each empty
+    /// packet would otherwise be a separate entry.
+    #[test]
+    fn stash_event_drops_zero_length_data() {
+        let mut queues: BTreeMap<u32, ChannelQueue> = BTreeMap::new();
+        queues.insert(
+            4,
+            ChannelQueue {
+                datagram: true,
+                ..ChannelQueue::default()
+            },
+        );
+        for _ in 0..1000 {
+            stash_event(
+                &mut queues,
+                ChannelEvent::Data {
+                    channel: 4,
+                    data: Vec::new(),
+                },
+            );
+            stash_event(
+                &mut queues,
+                ChannelEvent::ExtendedData {
+                    channel: 4,
+                    code: 1,
+                    data: Vec::new(),
+                },
+            );
+        }
+        assert!(queues[&4].packets.is_empty());
+        assert!(queues[&4].stderr.is_empty());
+        stash_event(
+            &mut queues,
+            ChannelEvent::Data {
+                channel: 4,
+                data: b"pkt".to_vec(),
+            },
+        );
+        assert_eq!(queues[&4].packets.len(), 1);
     }
 
     #[test]

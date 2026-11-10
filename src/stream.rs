@@ -177,27 +177,29 @@ impl ChannelStream {
 
 impl Read for ChannelStream {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        if !self.buf.is_empty() {
-            let n = out.len().min(self.buf.len());
-            out[..n].copy_from_slice(&self.buf[..n]);
-            self.buf.drain(..n);
-            return Ok(n);
-        }
-        if self.rx_eof {
-            return Ok(0);
-        }
-        let rx = self
-            .rx
-            .as_ref()
-            .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
-        match rx.recv() {
-            Ok(Some(chunk)) => {
-                self.buf = chunk;
-                self.read(out)
+        // A loop, not recursion: a peer may send any number of zero-length
+        // `CHANNEL_DATA` messages (they cost it no window), and each empty
+        // chunk must be skipped without growing the stack.
+        loop {
+            if !self.buf.is_empty() {
+                let n = out.len().min(self.buf.len());
+                out[..n].copy_from_slice(&self.buf[..n]);
+                self.buf.drain(..n);
+                return Ok(n);
             }
-            Ok(None) | Err(_) => {
-                self.rx_eof = true;
-                Ok(0)
+            if self.rx_eof || out.is_empty() {
+                return Ok(0);
+            }
+            let rx = self
+                .rx
+                .as_ref()
+                .ok_or_else(|| std::io::Error::new(ErrorKind::BrokenPipe, "channel taken"))?;
+            match rx.recv() {
+                Ok(Some(chunk)) => self.buf = chunk,
+                Ok(None) | Err(_) => {
+                    self.rx_eof = true;
+                    return Ok(0);
+                }
             }
         }
     }
@@ -232,5 +234,55 @@ impl Drop for ChannelStream {
             let _ = tx.send(ChannelEgress::Eof);
             let _ = tx.send(ChannelEgress::Close);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Zero-length chunks must be skipped iteratively: the old recursive
+    /// `read` overflowed the stack (a process abort) after a few thousand
+    /// of them.
+    #[test]
+    fn read_skips_many_empty_chunks_without_recursing() {
+        const EMPTY: usize = 100_000;
+        let (in_tx, in_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(EMPTY + 2);
+        let (out_tx, _out_rx) = mpsc::sync_channel::<ChannelEgress>(4);
+        for _ in 0..EMPTY {
+            in_tx.send(Some(Vec::new())).unwrap();
+        }
+        in_tx.send(Some(b"hello".to_vec())).unwrap();
+        in_tx.send(None).unwrap();
+
+        let reader = std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(move || {
+                let mut cs = ChannelStream::new(in_rx, out_tx);
+                let mut buf = [0u8; 16];
+                let n = cs.read(&mut buf).unwrap();
+                assert_eq!(&buf[..n], b"hello");
+                // A zero-length `out` reads nothing and is not EOF.
+                assert_eq!(cs.read(&mut []).unwrap(), 0);
+                // Then the real EOF, which is sticky.
+                assert_eq!(cs.read(&mut buf).unwrap(), 0);
+                assert_eq!(cs.read(&mut buf).unwrap(), 0);
+            })
+            .unwrap();
+        reader.join().unwrap();
+    }
+
+    /// Empty chunks followed by a dropped sender still end in EOF.
+    #[test]
+    fn read_empty_chunks_then_disconnect_is_eof() {
+        let (in_tx, in_rx) = mpsc::sync_channel::<Option<Vec<u8>>>(8);
+        let (out_tx, _out_rx) = mpsc::sync_channel::<ChannelEgress>(4);
+        in_tx.send(Some(Vec::new())).unwrap();
+        in_tx.send(Some(Vec::new())).unwrap();
+        drop(in_tx);
+        let mut cs = ChannelStream::new(in_rx, out_tx);
+        let mut buf = [0u8; 4];
+        assert_eq!(cs.read(&mut buf).unwrap(), 0);
     }
 }

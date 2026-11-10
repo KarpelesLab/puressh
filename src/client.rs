@@ -4080,19 +4080,8 @@ pub(crate) fn build_verifier(
     now: u64,
     host_key_mismatched: &AtomicBool,
 ) -> Result<Box<dyn HostKeyVerify>> {
-    if reply_payload.len() < 5 {
-        return Err(Error::Format("kex-ecdh-reply too short"));
-    }
-    let k_s_len = u32::from_be_bytes([
-        reply_payload[1],
-        reply_payload[2],
-        reply_payload[3],
-        reply_payload[4],
-    ]) as usize;
-    if reply_payload.len() < 5 + k_s_len {
-        return Err(Error::Format("kex-ecdh-reply truncated"));
-    }
-    let k_s = &reply_payload[5..5 + k_s_len];
+    // Bounds-checked: the length prefix is server-supplied and unverified.
+    let k_s = reply_host_key(reply_payload)?;
 
     // Re-key: the host key is pinned to the one the first KEX verified
     // (OpenSSH: "Server host key changed during re-key"). The known_hosts

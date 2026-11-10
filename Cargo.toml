@@ -289,11 +289,14 @@ required-features = ["server"]
 name = "sshd_dump"
 required-features = ["server"]
 
-[profile.release]
 # A protocol implementation does arithmetic on peer-supplied lengths and
 # counters everywhere. Tests and debug builds panic on a wrapped integer;
 # the shipped binaries must not silently compute with one instead. A
 # panic closes the connection (the per-connection sshd process), which is
-# the failure mode we want. The cost is a few percent on arithmetic-heavy
-# paths.
+# the failure mode we want.
+#
+# For this crate only: the dependencies (purecrypto's bignum, hash and
+# cipher loops, compcol's codecs) keep the release default, so the hot
+# cryptographic paths do not pay for the checks.
+[profile.release.package.puressh]
 overflow-checks = true

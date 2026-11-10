@@ -8410,11 +8410,30 @@ mod imp {
         /// when it is reaped.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
         logins: Vec<sshd_login::Session>,
+        /// Every login this child has had recorded, open or closed: bounded
+        /// by [`MAX_LOGINS_PER_CONNECTION`].
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        logins_total: u32,
     }
 
+    /// Pty logins recorded at once for one connection.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const MAX_OPEN_LOGINS: usize = 64;
+
+    /// Pty logins recorded over one connection's life. Without it a child
+    /// alternating login and logout messages could append to wtmp without
+    /// end; a real connection opening this many ptys just stops being
+    /// recorded.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    const MAX_LOGINS_PER_CONNECTION: u32 = 512;
+
     impl ChildRecord {
-        /// Handle one message line from the child (see `tell_parent`).
-        fn message(&mut self, line: &[u8]) {
+        /// Handle one message line from the child `pid` (see `tell_parent`).
+        #[cfg_attr(
+            not(all(target_os = "linux", target_env = "gnu")),
+            allow(unused_variables)
+        )]
+        fn message(&mut self, pid: Pid, line: &[u8]) {
             if line == [AUTH_OK_BYTE] {
                 self.authenticated = true;
             } else if let Some(name) = line.strip_prefix(b"H\t") {
@@ -8432,26 +8451,40 @@ mod imp {
                 }
             } else {
                 #[cfg(all(target_os = "linux", target_env = "gnu"))]
-                self.login_message(line);
+                self.login_message(pid, line);
             }
         }
 
-        /// `L …` / `O …`: record a pty login or logout.
+        /// `L …` / `O …` from the connection process `child`: record a pty
+        /// login or logout.
         #[cfg(all(target_os = "linux", target_env = "gnu"))]
-        fn login_message(&mut self, line: &[u8]) {
+        fn login_message(&mut self, child: Pid, line: &[u8]) {
             {
                 let Ok(line) = std::str::from_utf8(line) else {
                     return;
                 };
                 let f: Vec<&str> = line.split('\t').collect();
                 match f.as_slice() {
-                    ["L", pid, tty, user, uid] if self.authenticated && self.logins.len() < 64 => {
+                    ["L", pid, tty, user, uid]
+                        if self.authenticated
+                            && self.logins.len() < MAX_OPEN_LOGINS
+                            && self.logins_total < MAX_LOGINS_PER_CONNECTION =>
+                    {
                         let (Ok(pid), Ok(uid)) = (pid.parse::<i32>(), uid.parse::<u32>()) else {
                             return;
                         };
+                        // The claim must be about the user the child itself
+                        // runs as: it dropped to that user before it could
+                        // open any channel, so a child that says otherwise
+                        // is not one to believe (it could otherwise rewrite
+                        // another user's utmp / lastlog entries).
+                        if process_euid(child.as_raw()) != Some(uid) {
+                            return;
+                        }
                         if !login_claim_ok(tty, user, uid) {
                             return;
                         }
+                        self.logins_total += 1;
                         // The peer as this parent knows it, not as claimed.
                         let host = utmp_host(
                             self.ip,
@@ -8487,6 +8520,34 @@ mod imp {
                 sshd_login::logout(&l);
             }
         }
+    }
+
+    /// The effective uid of process `pid`, from `/proc/<pid>/status` (which
+    /// still answers for a process that has exited and is not yet reaped).
+    /// `None` when it cannot be told.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn process_euid(pid: i32) -> Option<u32> {
+        use std::io::Read;
+        let mut status = String::new();
+        std::fs::File::open(format!("/proc/{pid}/status"))
+            .ok()?
+            .take(64 * 1024)
+            .read_to_string(&mut status)
+            .ok()?;
+        parse_status_euid(&status)
+    }
+
+    /// The effective uid in a `/proc/<pid>/status` body: the second field
+    /// of its `Uid:` line (real, effective, saved, filesystem).
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn parse_status_euid(status: &str) -> Option<u32> {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix("Uid:"))?
+            .split_ascii_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
     }
 
     /// A child's login claim holds: `tty` is a pty owned by `uid`, which is
@@ -8757,6 +8818,8 @@ mod imp {
                     host_name: None,
                     #[cfg(all(target_os = "linux", target_env = "gnu"))]
                     logins: Vec::new(),
+                    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+                    logins_total: 0,
                 },
             );
         }
@@ -8849,7 +8912,7 @@ mod imp {
                 }
                 while let Some(i) = rec.buf.iter().position(|b| *b == b'\n') {
                     let line: Vec<u8> = rec.buf.drain(..=i).collect();
-                    rec.message(&line[..line.len() - 1]);
+                    rec.message(pid, &line[..line.len() - 1]);
                 }
                 // A child that will not end its lines gets no more hearing.
                 if rec.buf.len() > 4096 {
@@ -11733,6 +11796,44 @@ mod imp {
             }
             assert_eq!(t.len(), 0, "exited child not reaped");
             assert_eq!(t.count_from_ip(ip), 0);
+        }
+
+        /// SSHD-13: the parent ties a login claim to the uid the claiming
+        /// connection process really runs as.
+        #[cfg(all(target_os = "linux", target_env = "gnu"))]
+        #[test]
+        fn login_claim_is_tied_to_the_child_uid() {
+            assert_eq!(
+                parse_status_euid("Name:\tsshd\nUid:\t1000\t1001\t1002\t1003\nGid:\t5\t6\t7\t8\n"),
+                Some(1001)
+            );
+            assert_eq!(parse_status_euid("Name:\tsshd\n"), None);
+            assert_eq!(parse_status_euid("Uid:\t1000\n"), None);
+            assert_eq!(parse_status_euid("Uid:\tx\ty\n"), None);
+            let me = std::process::id() as i32;
+            let euid = nix::unistd::geteuid().as_raw();
+            assert_eq!(process_euid(me), Some(euid));
+            assert_eq!(process_euid(i32::MAX), None);
+
+            // A claim for another uid than the sender's is dropped before
+            // anything is recorded, and does not count against the caps.
+            let mut t = ChildTable::default();
+            let pid = Pid::from_raw(me);
+            t.insert(pid, "192.0.2.7".parse().unwrap(), None);
+            let rec = t.children.get_mut(&pid).unwrap();
+            rec.authenticated = true;
+            let other = if euid == 0 { 1 } else { 0 };
+            rec.message(
+                pid,
+                format!("L\t{me}\t/dev/pts/0\troot\t{other}").as_bytes(),
+            );
+            assert!(rec.logins.is_empty());
+            assert_eq!(rec.logins_total, 0);
+            // Past the per-connection total, nothing more is recorded.
+            rec.logins_total = MAX_LOGINS_PER_CONNECTION;
+            rec.message(pid, format!("L\t{me}\t/dev/pts/0\troot\t{euid}").as_bytes());
+            assert!(rec.logins.is_empty());
+            assert_eq!(rec.logins_total, MAX_LOGINS_PER_CONNECTION);
         }
 
         #[test]

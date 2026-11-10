@@ -17,7 +17,7 @@ use super::extensions::{
     EXT_USERS_GROUPS_BY_ID,
 };
 use super::packet::{self, Packet, read_packet, write_packet};
-use super::path::{is_inside, lexically_clean, resolve};
+use super::path::{is_inside, lexically_clean, resolve_in};
 use super::types::{
     Attrs, FXF_APPEND, FXF_CREAT, FXF_EXCL, FXF_READ, FXF_TRUNC, FXF_WRITE, FxpStatus, NameEntry,
     SFTP_VERSION, SftpError,
@@ -62,13 +62,16 @@ pub struct SftpServerOptions {
     /// sticky bits supplied by an SFTP peer. Set `true` only for trusted
     /// callers that need to upload mode bits verbatim.
     pub allow_special_bits: bool,
-    /// When `true` and a jail is configured, `op_realpath` strips the
-    /// jail prefix from the returned path so the client sees paths
-    /// relative to the jail root (e.g. `/foo/bar` instead of
-    /// `/srv/jail/u/foo/bar`). Defaults to `true` so the host-side
-    /// filesystem layout is not leaked to every client; operators that
-    /// require the historical (leaky) behaviour for back-compat with
-    /// existing clients can opt out by setting this to `false`.
+    /// When `true` and a jail is configured, the client sees the jail as
+    /// its root, as under a `chroot(2)`: `op_realpath` (and `readlink`,
+    /// `expand-path@openssh.com`, `home-directory`) strip the jail prefix
+    /// from what they return (`/foo/bar` rather than `/srv/jail/u/foo/bar`),
+    /// and an absolute path the client sends is taken relative to the jail
+    /// (`/foo/bar` is `/srv/jail/foo/bar`), so the paths a client builds
+    /// from those answers, as every SFTP client does after `realpath`,
+    /// resolve. Defaults to `true` so the host-side filesystem layout is
+    /// not leaked to every client. When `false`, host paths are shown and
+    /// an absolute client path is a host path (still confined to the jail).
     pub hide_jail_in_realpath: bool,
     /// Maximum number of simultaneously open file/dir handles per
     /// session. Once this is exceeded `op_open`/`op_opendir` return
@@ -308,7 +311,12 @@ impl SftpServerSession {
     }
 
     fn resolve(&self, raw: &[u8]) -> Result<PathBuf, SftpError> {
-        resolve(&self.opts.cwd, raw, self.opts.root.as_deref())
+        resolve_in(
+            &self.opts.cwd,
+            raw,
+            self.opts.root.as_deref(),
+            self.opts.hide_jail_in_realpath,
+        )
     }
 
     fn require_writable(&self) -> Result<(), SftpError> {

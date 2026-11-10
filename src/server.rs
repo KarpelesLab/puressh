@@ -2141,11 +2141,27 @@ impl Server {
     ///   thread/PID-exhaustion flood) drops that one connection and continues
     ///   accepting, rather than panicking and killing the whole accept loop.
     ///
+    /// A failed `accept()` ends the loop only when the listener itself is
+    /// unusable (a bad or non-socket descriptor, an invalid argument). A
+    /// connection that went away before it was accepted is skipped, and
+    /// running out of descriptors or memory pauses the loop briefly before it
+    /// tries again, so load on the host cannot stop the server for good.
+    ///
     /// [`accept_one`]: Server::accept_one
     pub fn serve(&mut self) -> Result<()> {
         let live = Arc::new(AtomicUsize::new(0));
         loop {
-            let (stream, peer) = self.listener.accept()?;
+            let (stream, peer) = match self.listener.accept() {
+                Ok(accepted) => accepted,
+                Err(e) => match classify_accept_error(&e) {
+                    AcceptFailure::Retry => continue,
+                    AcceptFailure::Backoff => {
+                        thread::sleep(ACCEPT_BACKOFF);
+                        continue;
+                    }
+                    AcceptFailure::Fatal => return Err(e.into()),
+                },
+            };
 
             // Backpressure: refuse (close) once we're at the concurrency cap.
             // We reserve the slot up front so the check and the increment are a
@@ -2184,6 +2200,64 @@ impl Server {
             }
         }
     }
+}
+
+/// How long [`Server::serve`] waits before retrying `accept()` after an error
+/// that retrying at once would only repeat (descriptor or memory exhaustion).
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
+
+/// What [`Server::serve`] does about a failed `accept()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptFailure {
+    /// The error concerns one connection (or a signal): accept the next.
+    Retry,
+    /// The host is short of a resource, or the error is not one we know:
+    /// wait [`ACCEPT_BACKOFF`], then accept again.
+    Backoff,
+    /// The listener is unusable: stop serving.
+    Fatal,
+}
+
+/// Classify an `accept()` error for [`Server::serve`]. Only errors that mean
+/// the listening socket itself is broken are fatal; anything unrecognised is
+/// retried after a pause, so it can neither stop the server nor spin it.
+fn classify_accept_error(e: &std::io::Error) -> AcceptFailure {
+    match e.kind() {
+        // The peer gave up (or the network dropped it) while the connection
+        // sat in the backlog, or a signal arrived. Each such error uses up a
+        // backlog entry or a signal, so retrying at once cannot spin.
+        ErrorKind::ConnectionAborted
+        | ErrorKind::ConnectionReset
+        | ErrorKind::Interrupted
+        | ErrorKind::NetworkDown
+        | ErrorKind::NetworkUnreachable
+        | ErrorKind::HostUnreachable => return AcceptFailure::Retry,
+        // Nothing to accept on a listener that does not block (or has a
+        // timeout): wait rather than spin.
+        ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::OutOfMemory => {
+            return AcceptFailure::Backoff;
+        }
+        ErrorKind::InvalidInput => return AcceptFailure::Fatal,
+        _ => {}
+    }
+    #[cfg(unix)]
+    if let Some(code) = e.raw_os_error()
+        && (code == libc::EBADF || code == libc::ENOTSOCK || code == libc::EINVAL)
+    {
+        return AcceptFailure::Fatal;
+    }
+    #[cfg(windows)]
+    if let Some(code) = e.raw_os_error() {
+        // WSAEBADF, WSAEINVAL, WSAENOTSOCK, WSANOTINITIALISED.
+        const FATAL: [i32; 4] = [10009, 10022, 10038, 10093];
+        if FATAL.contains(&code) {
+            return AcceptFailure::Fatal;
+        }
+    }
+    // EMFILE / ENFILE / ENOBUFS / ENOMEM and whatever else the platform
+    // reports: the listener is still good, but retrying at once would fail
+    // the same way.
+    AcceptFailure::Backoff
 }
 
 /// RAII slot guard for [`Server::serve`]'s bounded-concurrency counter.
@@ -8099,6 +8173,95 @@ mod tests {
         drop(_names);
         let eff = resolve_effective_policy(&cfg, "alice", None, Some("203.0.113.5"), None, None);
         assert_eq!(eff.max_sessions, None);
+    }
+
+    /// SRV-11: only an unusable listener ends `Server::serve`; a connection
+    /// that vanished from the backlog or a host short of descriptors must
+    /// not.
+    #[test]
+    fn accept_errors_are_fatal_only_for_a_broken_listener() {
+        use std::io::Error as IoError;
+        for kind in [
+            ErrorKind::ConnectionAborted,
+            ErrorKind::ConnectionReset,
+            ErrorKind::Interrupted,
+        ] {
+            assert_eq!(
+                classify_accept_error(&IoError::from(kind)),
+                AcceptFailure::Retry,
+                "{kind:?}"
+            );
+        }
+        for kind in [
+            ErrorKind::WouldBlock,
+            ErrorKind::TimedOut,
+            ErrorKind::OutOfMemory,
+        ] {
+            assert_eq!(
+                classify_accept_error(&IoError::from(kind)),
+                AcceptFailure::Backoff,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            classify_accept_error(&IoError::from(ErrorKind::InvalidInput)),
+            AcceptFailure::Fatal
+        );
+        // An error we have no opinion on pauses the loop; it does not end it.
+        assert_eq!(
+            classify_accept_error(&IoError::other("unknown")),
+            AcceptFailure::Backoff
+        );
+        #[cfg(unix)]
+        {
+            for code in [libc::ECONNABORTED, libc::EINTR] {
+                assert_eq!(
+                    classify_accept_error(&IoError::from_raw_os_error(code)),
+                    AcceptFailure::Retry,
+                    "errno {code}"
+                );
+            }
+            for code in [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM] {
+                assert_eq!(
+                    classify_accept_error(&IoError::from_raw_os_error(code)),
+                    AcceptFailure::Backoff,
+                    "errno {code}"
+                );
+            }
+            for code in [libc::EBADF, libc::EINVAL, libc::ENOTSOCK] {
+                assert_eq!(
+                    classify_accept_error(&IoError::from_raw_os_error(code)),
+                    AcceptFailure::Fatal,
+                    "errno {code}"
+                );
+            }
+        }
+    }
+
+    /// SRV-11, end to end: `serve` rides out failed accepts and takes the
+    /// next connection. (Linux only: elsewhere an accepted socket inherits
+    /// the listener's non-blocking mode, which the session does not expect.)
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn serve_survives_accept_errors() {
+        // A listener that is non-blocking makes every idle `accept` fail
+        // with `WouldBlock` — an accept error on demand, without touching
+        // process-wide limits that other tests share.
+        let mut server = Server::bind("127.0.0.1:0", policy_cfg("")).expect("bind");
+        let addr = server.local_addr().expect("addr");
+        server.listener.set_nonblocking(true).expect("nonblocking");
+        thread::spawn(move || {
+            let _ = server.serve();
+        });
+        // Let the loop see a few failed accepts first.
+        thread::sleep(Duration::from_millis(350));
+        let mut s = TcpStream::connect(addr).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut banner = [0u8; 4];
+        s.read_exact(&mut banner)
+            .expect("the server stopped accepting after an accept error");
+        assert_eq!(&banner, b"SSH-");
     }
 
     /// SRV-12: an IPv4 peer of a dual-stack listener (`::ffff:a.b.c.d`) must

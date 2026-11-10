@@ -3,7 +3,14 @@
 //! never granting window for the client's writes makes the write fail once
 //! the unread backlog passes a hard cap.
 
-#![cfg(all(feature = "client", feature = "server"))]
+//!
+//! Linux only. The test has both ends writing at once over loopback, and
+//! where the loopback socket buffers are small (Windows, macOS) each side
+//! blocks in `write` until the other's timeout expires: the cap is still
+//! reached, but only after minutes of 30-second stalls. The cap itself is
+//! platform-independent code.
+
+#![cfg(all(target_os = "linux", feature = "client", feature = "server"))]
 // The borrow-based `Client::open_direct_tcpip` is the API under test.
 #![allow(deprecated)]
 

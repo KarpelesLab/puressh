@@ -1776,9 +1776,17 @@ fn env_glob_match(pattern: &str, name: &str) -> bool {
 
 /// Decide whether a client-supplied `(name, _)` env pair should be
 /// honoured. Returns `true` only when:
+/// - `name` is a well-formed variable name (non-empty, no `=`, no NUL), AND
 /// - `name` is not in [`HARD_BLOCKED_ENV_NAMES`], AND
 /// - at least one pattern in `accept_env` matches it.
+///
+/// A name carrying `=` would otherwise smuggle a different variable into the
+/// child's environment: `LD_PRELOAD=/x.so:FOO` is not the blocked name
+/// `LD_PRELOAD`, yet lands in `environ` as `LD_PRELOAD=/x.so:FOO=<value>`.
 pub(crate) fn env_name_accepted(name: &str, accept_env: &[String]) -> bool {
+    if name.is_empty() || name.bytes().any(|b| b == b'=' || b == 0) {
+        return false;
+    }
     if HARD_BLOCKED_ENV_NAMES.contains(&name) {
         return false;
     }
@@ -7992,6 +8000,31 @@ mod tests {
         assert!(!env_name_accepted("MC_ALL", &allow));
         // Empty name (defensive).
         assert!(!env_name_accepted("", &allow));
+    }
+
+    /// SRV-10: a name containing `=` is not the blocked name it starts with,
+    /// yet would reach the child's environment as that variable.
+    #[test]
+    fn env_filter_refuses_names_with_equals_or_nul() {
+        for allow in [
+            vec!["*".to_string()],
+            vec!["*_PROXY".to_string()],
+            vec!["LD_PRELOAD=/home/u/x.so:HTTP_PROXY".to_string()],
+        ] {
+            assert!(!env_name_accepted("LD_PRELOAD=/x", &allow));
+            assert!(!env_name_accepted(
+                "LD_PRELOAD=/home/u/x.so:HTTP_PROXY",
+                &allow
+            ));
+            assert!(!env_name_accepted("PATH=/tmp:HTTP_PROXY", &allow));
+            assert!(!env_name_accepted("=HTTP_PROXY", &allow));
+            assert!(!env_name_accepted("FOO=", &allow));
+            assert!(!env_name_accepted("FOO\0HTTP_PROXY", &allow));
+            assert!(!env_name_accepted("", &allow));
+        }
+        // Well-formed names are unaffected.
+        assert!(env_name_accepted("HTTP_PROXY", &["*_PROXY".to_string()]));
+        assert!(env_name_accepted("LANG", &["*".to_string()]));
     }
 
     // ---- per-connection policy resolution (W5/W6) ------------------------

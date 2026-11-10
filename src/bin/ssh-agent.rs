@@ -1042,11 +1042,13 @@ mod imp {
         let state = Arc::new(Mutex::new(state));
 
         if o.foreground {
+            // Before the socket is announced: whoever reads these lines may
+            // signal the agent at once, and it must still remove its socket.
+            install_signals();
             if let Some(s) = &sock {
                 print!("{}", env_lines(&o, s, None, std::process::id()));
                 let _ = std::io::stdout().flush();
             }
-            install_signals();
             serve(listener, state, o.debug, None);
             cleanup_all();
             return Ok(0);

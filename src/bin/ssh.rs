@@ -515,6 +515,10 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     if first_user.is_some() {
         cli_user = first_user;
     }
+    // Whatever option queued them (`-o`, but also `-S path`, `-b addr`,
+    // `-c list`, …), the lines are read as one configuration: none may
+    // carry a second one.
+    check_o_lines(&extra_o)?;
     // `-t` asks for a terminal when stdin is one; `-tt` always.
     match tty_count {
         0 => {}
@@ -625,6 +629,19 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
         user_in_host,
         command,
     })
+}
+
+/// Refuse a queued option line holding a line break (or a NUL): the lines
+/// are joined with `\n` into a synthetic configuration, where a value with
+/// one of its own would smuggle in further directives (`ssh -S "$path"`
+/// with `\nProxyCommand …` in the path).
+fn check_o_lines(extra_o: &[String]) -> Result<(), String> {
+    match extra_o.iter().find(|l| l.contains(['\n', '\r', '\0'])) {
+        Some(l) => Err(format!(
+            "option value must not contain a newline, carriage return or NUL: {l:?}"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// The keyword of a line queued in `extra_o` (`Keyword value`).
@@ -747,6 +764,7 @@ fn apply_extra_o(
     if extra_o.is_empty() {
         return Ok(());
     }
+    check_o_lines(extra_o)?;
     let src = extra_o.join("\n");
     let parsed = puressh::config::SshClientConfig::parse(&src).map_err(|e| format!("-o: {e}"))?;
     // `-o` options are obtained before the files: theirs win, and their
@@ -8634,6 +8652,37 @@ mod extra_o_tests {
         assert!(err.contains("newline"), "{err}");
         // Plain values still parse.
         assert!(parse_args(&args(&["-o", "User=x", "host"])).is_ok());
+    }
+
+    /// The short options rewritten into configuration lines are held to
+    /// the same rule as `-o`.
+    #[test]
+    fn short_options_reject_embedded_newline() {
+        for opt in ["-S", "-b", "-c", "-m", "-B", "-I", "-P", "-J"] {
+            for evil in [
+                "x\nProxyCommand touch /tmp/pwned",
+                "x\rProxyCommand y",
+                "x\0y",
+            ] {
+                let err = parse_args(&args(&[opt, evil, "host"])).err();
+                assert!(
+                    err.as_deref().is_some_and(|e| e.contains("newline")),
+                    "{opt} {evil:?}: {err:?}"
+                );
+            }
+            assert!(parse_args(&args(&[opt, "x", "host"])).is_ok(), "{opt}");
+        }
+        assert!(parse_args(&args(&["-o", "ControlPath=x\0y", "host"])).is_err());
+        // The join site refuses them too, whoever queued the line.
+        let mut block = puressh::config::ClientOptions::default();
+        assert!(
+            apply_extra_o(
+                &mut block,
+                &args(&["ControlPath /tmp/x\nProxyCommand evil"])
+            )
+            .is_err()
+        );
+        assert_eq!(block.proxy_command, None);
     }
 
     /// `Match exec` / `LocalCommand` go to a shell: a `%h` from the DNS (or

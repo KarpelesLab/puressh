@@ -63,10 +63,19 @@ else
 		ID_FILE=$(ls -t "$HOME"/.ssh/id_*.pub 2>/dev/null | head -n 1)
 		[ -n "$ID_FILE" ] || { echo "$0: ERROR: No identities found" >&2; exit 1; }
 	fi
-	case "$ID_FILE" in *.pub) ;; *) [ -r "$ID_FILE.pub" ] && ID_FILE=$ID_FILE.pub ;; esac
+	# Only ever read the public half: a name without .pub is the private key,
+	# which must not be sent when its .pub is missing.
+	case "$ID_FILE" in *.pub) ;; *) ID_FILE=$ID_FILE.pub ;; esac
 	[ -r "$ID_FILE" ] || { echo "$0: ERROR: failed to open ID file '$ID_FILE'" >&2; exit 1; }
 	KEYS=$(grep -v '^[[:space:]]*\(#\|$\)' "$ID_FILE")
 	FROM="\"$ID_FILE\""
+fi
+# Whatever the source, never send something that looks like a private key.
+if printf '%s\n' "$KEYS" | grep -q \
+	-e '^[[:space:]]*-----BEGIN' -e 'PRIVATE KEY' \
+	-e '^PuTTY-User-Key-File' -e '^Private-Lines:'; then
+	echo "$0: ERROR: $FROM holds a private key, not public key(s): nothing was sent" >&2
+	exit 1
 fi
 printf '%s\n' "$0: INFO: Source of key(s) to be installed: $FROM" >&2
 

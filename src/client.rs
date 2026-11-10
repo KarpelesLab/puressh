@@ -1329,43 +1329,14 @@ impl Client {
         // closure, capturing the policy + target so the driver stays free of
         // known-hosts I/O / prompting. Called on each `SSH_MSG_KEX_ECDH_REPLY`
         // (initial and re-key).
-        let host_key_policy = cfg.host_key_policy;
         let mut algorithms = cfg.algorithms;
-        let pinned = cfg.pinned_host_key;
-        if let Some(pin) = &pinned {
-            algorithms.host_key_algorithms = Some(pinned_host_key_algorithms(
-                pin,
-                algorithms.host_key_algorithms.as_deref(),
-            )?);
-        }
-        // Bring the host-key types we already trust in `known_hosts` to the
-        // front of the offer (OpenSSH's `order_hostkeyalgs()`), so a server
-        // with several host keys presents the one we recorded rather than a
-        // higher-preference type that would look like a changed key. Done here,
-        // before the policy is moved into the verifier closure.
-        prioritize_known_host_key_algorithms(&mut algorithms, &host_key_policy, host, port);
-        let target_host = host.to_string();
-        let ca_sig_algos = algorithms.ca_signature_algorithms.clone();
-        let host_key_mismatched = Arc::new(AtomicBool::new(false));
-        let mismatched_flag = host_key_mismatched.clone();
-        let verifier_factory: crate::driver::client::VerifierFactory =
-            Box::new(move |reply: &[u8], runner: &KexRunner| {
-                if let Some(pin) = &pinned
-                    && reply_host_key(reply)? != pin.as_slice()
-                {
-                    return Err(Error::HostKeyRejected);
-                }
-                build_verifier(
-                    reply,
-                    &host_key_policy,
-                    runner,
-                    &target_host,
-                    port,
-                    ca_sig_algos.as_deref(),
-                    unix_now(),
-                    &mismatched_flag,
-                )
-            });
+        let (verifier_factory, host_key_mismatched) = host_key_verifier_factory(
+            cfg.host_key_policy,
+            cfg.pinned_host_key,
+            &mut algorithms,
+            host,
+            port,
+        )?;
         let driver = ClientDriver::new(algorithms.clone(), verifier_factory);
         let mut me = Self {
             stream,
@@ -4034,6 +4005,59 @@ fn pinned_host_key_algorithms(pin: &[u8], over: Option<&[String]>) -> Result<Vec
         ));
     }
     Ok(out)
+}
+
+/// The host-key verification seam every client frontend (blocking, async,
+/// mio) hands to its [`ClientDriver`]: one place applies
+/// [`Config::pinned_host_key`] and the [`HostKeyPolicy`], so no frontend can
+/// leave the pin unenforced.
+///
+/// Narrows `algorithms.host_key_algorithms` to the pin's algorithm (if a
+/// pin is set), then brings the types already trusted in `known_hosts` to
+/// the front of the offer (OpenSSH's `order_hostkeyalgs()`, so a server
+/// with several host keys presents the one we recorded rather than a
+/// higher-preference type that would look like a changed key) — call it
+/// before the driver is built from `algorithms`. The returned factory is
+/// called on each KEX reply (initial and re-key): it rejects a host key
+/// that differs from the pin, then defers to [`build_verifier`]. The flag
+/// is the session's [`Client::host_key_mismatched`] state.
+pub(crate) fn host_key_verifier_factory(
+    host_key_policy: HostKeyPolicy,
+    pinned: Option<Vec<u8>>,
+    algorithms: &mut AlgoOverrides,
+    host: &str,
+    port: u16,
+) -> Result<(crate::driver::client::VerifierFactory, Arc<AtomicBool>)> {
+    if let Some(pin) = &pinned {
+        algorithms.host_key_algorithms = Some(pinned_host_key_algorithms(
+            pin,
+            algorithms.host_key_algorithms.as_deref(),
+        )?);
+    }
+    prioritize_known_host_key_algorithms(algorithms, &host_key_policy, host, port);
+    let target_host = host.to_string();
+    let ca_sig_algos = algorithms.ca_signature_algorithms.clone();
+    let host_key_mismatched = Arc::new(AtomicBool::new(false));
+    let mismatched_flag = host_key_mismatched.clone();
+    let factory: crate::driver::client::VerifierFactory =
+        Box::new(move |reply: &[u8], runner: &KexRunner| {
+            if let Some(pin) = &pinned
+                && reply_host_key(reply)? != pin.as_slice()
+            {
+                return Err(Error::HostKeyRejected);
+            }
+            build_verifier(
+                reply,
+                &host_key_policy,
+                runner,
+                &target_host,
+                port,
+                ca_sig_algos.as_deref(),
+                unix_now(),
+                &mismatched_flag,
+            )
+        });
+    Ok((factory, host_key_mismatched))
 }
 
 /// Build the exchange-hash verifier for the host key carried in

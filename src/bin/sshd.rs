@@ -6226,13 +6226,23 @@ mod imp {
     /// LD_PRELOAD/IFS/PATH/etc. into the user's shell.
     ///
     /// Names with embedded NUL are dropped too — they can't safely make
-    /// it into a `setenv`/`Command::env` call anyway.
+    /// it into a `setenv`/`Command::env` call anyway — and so is any name
+    /// [`env_name_ok`] refuses.
     fn safe_session_env(env: &SessionEnv) -> Vec<(&str, &str)> {
         env.iter()
             .filter(|(k, v)| {
-                !k.contains('\0') && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
+                env_name_ok(k) && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(k)
             })
             .collect()
+    }
+
+    /// Whether `name` can name an environment variable at all: not empty,
+    /// no NUL and no `=`. A name such as `LD_PRELOAD=/tmp/x.so` is not on
+    /// any blocklist, yet handed to the child as it stands it *is* the
+    /// variable `LD_PRELOAD` (an environment entry is split at its first
+    /// `=`).
+    fn env_name_ok(name: &str) -> bool {
+        !name.is_empty() && !name.contains(['=', '\0'])
     }
 
     /// The session's variables, layered as OpenSSH does: the client's
@@ -6245,7 +6255,7 @@ mod imp {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         let mut set = |k: &str, v: &str| {
-            if k.is_empty() || k.contains('\0') || v.contains('\0') {
+            if !env_name_ok(k) || v.contains('\0') {
                 return;
             }
             match vars.iter_mut().find(|(n, _)| n == k) {
@@ -6284,9 +6294,7 @@ mod imp {
     fn safe_owned_env(env: &[(String, String)]) -> Vec<(String, String)> {
         env.iter()
             .filter(|(k, v)| {
-                !k.contains('\0')
-                    && !v.contains('\0')
-                    && !HARD_BLOCKED_ENV_NAMES.contains(&k.as_str())
+                env_name_ok(k) && !v.contains('\0') && !HARD_BLOCKED_ENV_NAMES.contains(&k.as_str())
             })
             .cloned()
             .collect()
@@ -10548,6 +10556,44 @@ mod imp {
                 Some("192.0.2.8"),
             );
             assert!(!a.access_allowed("alice"));
+        }
+
+        /// SSHD-14: a client variable whose *name* carries `=` would reach
+        /// the child as a different variable than the one the blocklist saw.
+        #[test]
+        fn session_env_drops_names_that_are_not_names() {
+            let mut env = SessionEnv::new();
+            env.insert("LANG", "C");
+            env.insert("LD_PRELOAD=/tmp/x.so", "1");
+            env.insert("=x", "1");
+            env.insert("", "1");
+            env.insert("A\0B", "1");
+            env.insert("OK", "a\0b");
+            env.insert("LD_PRELOAD", "/tmp/y.so");
+            assert_eq!(safe_session_env(&env), vec![("LANG", "C")]);
+            let vars = session_vars(&env, "/nonexistent");
+            assert!(vars.contains(&("LANG".to_string(), "C".to_string())));
+            assert!(vars.iter().all(|(k, _)| env_name_ok(k)), "{vars:?}");
+            assert!(
+                vars.iter().all(|(k, _)| !k.starts_with("LD_PRELOAD")),
+                "{vars:?}"
+            );
+
+            let owned: Vec<(String, String)> = [
+                ("TERM", "xterm"),
+                ("LD_PRELOAD=/tmp/x.so", "1"),
+                ("LD_LIBRARY_PATH=/tmp", ""),
+                ("", "1"),
+                ("A\0B", "1"),
+                ("LD_PRELOAD", "/tmp/y.so"),
+            ]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+            assert_eq!(
+                safe_owned_env(&owned),
+                vec![("TERM".to_string(), "xterm".to_string())]
+            );
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------

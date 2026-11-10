@@ -744,3 +744,104 @@ fn non_utf8_lines_preserved_and_revoked_still_revokes() {
         LookupResult::Revoked
     ));
 }
+
+/// A minimal host certificate carrying just the two key blobs the
+/// `@revoked` / `@cert-authority` checks compare.
+fn host_cert(ca_blob: &[u8], key_blob: &[u8]) -> crate::cert::Certificate {
+    crate::cert::Certificate {
+        key_type: "ssh-ed25519-cert-v01@openssh.com".to_string(),
+        nonce: Vec::new(),
+        embedded_pubkey_blob: key_blob.to_vec(),
+        serial: 0,
+        cert_type: crate::cert::CertType::Host,
+        key_id: String::new(),
+        valid_principals: Vec::new(),
+        valid_after: 0,
+        valid_before: u64::MAX,
+        critical_options: Vec::new(),
+        extensions: Vec::new(),
+        signature_key_blob: ca_blob.to_vec(),
+        signature: Vec::new(),
+        signed_len: 0,
+        raw: Vec::new(),
+    }
+}
+
+/// `@revoked` lines written for the bare host name (or a wildcard) are
+/// enforced on a non-default port too: the trust paths fall back to the
+/// bare name there, so revocation has to be at least as wide.
+#[test]
+fn revoked_bare_patterns_apply_on_non_default_port() {
+    let key = ed25519_blob(21);
+    let b64 = crate::key::base64::encode(&key);
+    for pattern in ["*", "example.com", "*.com", "*,!other.example"] {
+        let src = format!("example.com ssh-ed25519 {b64}\n@revoked {pattern} ssh-ed25519 {b64}\n");
+        let kh = KnownHosts::from_bytes(src.as_bytes());
+        for port in [22, 2222] {
+            assert!(
+                matches!(
+                    kh.lookup("example.com", port, "ssh-ed25519", &key),
+                    LookupResult::Revoked
+                ),
+                "@revoked {pattern} must refuse the key on port {port}"
+            );
+        }
+    }
+
+    // Still host-scoped: another host's revocation does not leak, and a
+    // `[host]:port` revocation stays on its port.
+    let src = format!(
+        "example.com ssh-ed25519 {b64}\n\
+         @revoked other.example ssh-ed25519 {b64}\n\
+         @revoked [example.com]:2200 ssh-ed25519 {b64}\n"
+    );
+    let kh = KnownHosts::from_bytes(src.as_bytes());
+    for port in [22, 2222] {
+        assert!(matches!(
+            kh.lookup("example.com", port, "ssh-ed25519", &key),
+            LookupResult::Match
+        ));
+    }
+    assert!(matches!(
+        kh.lookup("example.com", 2200, "ssh-ed25519", &key),
+        LookupResult::Revoked
+    ));
+}
+
+/// The same for certificates: a revoked CA (or certified key) kills the
+/// certificate on a non-default port, where `@cert-authority` for the bare
+/// name is still trusted.
+#[test]
+fn revoked_ca_applies_on_non_default_port() {
+    let ca = ed25519_blob(22);
+    let host_key = ed25519_blob(23);
+    let ca_b64 = crate::key::base64::encode(&ca);
+    let key_b64 = crate::key::base64::encode(&host_key);
+    let cert = host_cert(&ca, &host_key);
+
+    let trusted = format!("@cert-authority *.example.com ssh-ed25519 {ca_b64}\n");
+    let kh = KnownHosts::from_bytes(trusted.as_bytes());
+    assert!(kh.has_ca_for("host.example.com", 2222, &cert));
+    assert!(!kh.revokes_cert("host.example.com", 2222, &cert));
+
+    for pattern in ["*", "host.example.com", "*.example.com"] {
+        for revoked_b64 in [&ca_b64, &key_b64] {
+            let src = format!("{trusted}@revoked {pattern} ssh-ed25519 {revoked_b64}\n");
+            let kh = KnownHosts::from_bytes(src.as_bytes());
+            for port in [22, 2222] {
+                assert!(
+                    kh.revokes_cert("host.example.com", port, &cert),
+                    "@revoked {pattern} must revoke the certificate on port {port}"
+                );
+                assert!(matches!(
+                    kh.verify_host_cert("host.example.com", port, &cert, &["ssh-ed25519"], 1),
+                    Err(crate::Error::HostKeyRejected)
+                ));
+            }
+        }
+    }
+
+    let src = format!("{trusted}@revoked elsewhere.example.com ssh-ed25519 {ca_b64}\n");
+    let kh = KnownHosts::from_bytes(src.as_bytes());
+    assert!(!kh.revokes_cert("host.example.com", 2222, &cert));
+}

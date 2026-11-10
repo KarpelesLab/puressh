@@ -244,6 +244,29 @@ pub fn patterns_match(patterns: &[String], host: &str, port: u16) -> bool {
     any_pos
 }
 
+/// Pattern-list match of the un-bracketed patterns against a literal host
+/// name such as `[host]:2222` (OpenSSH matches `known_hosts` patterns
+/// against that string for a non-default port, so `*` covers it). Bracketed
+/// patterns are left to [`patterns_match`], which compares host and port
+/// separately.
+pub(crate) fn patterns_match_literal(patterns: &[String], name: &str) -> bool {
+    let mut any_pos = false;
+    for p in patterns {
+        let (negated, pat) = match p.strip_prefix('!') {
+            Some(rest) => (true, rest),
+            None => (false, p.as_str()),
+        };
+        if pat.starts_with('[') || !glob_match_ascii_ci(pat, name) {
+            continue;
+        }
+        if negated {
+            return false;
+        }
+        any_pos = true;
+    }
+    any_pos
+}
+
 fn pattern_match_inner(pattern: &str, host: &str, port: u16) -> bool {
     // `[host]:port` style.
     if pattern.starts_with('[') {

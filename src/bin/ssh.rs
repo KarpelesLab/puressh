@@ -1694,8 +1694,10 @@ fn connect_jump_chain(
             // Subsequent hop: tunnel a direct-tcpip channel through the
             // previous hop and run the client over it.
             Some((prev, prev_no_more_sessions)) => {
+                // As `ssh -W` would: the carrier of the next hop's own
+                // encrypted session, not a port forward.
                 let ch = prev
-                    .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
+                    .open_stdio_forward(connect_host.as_str(), port)
                     .map_err(|e| format!("proxyjump hop {}: open channel: {e}", idx + 1))?;
                 if *prev_no_more_sessions {
                     send_no_more_sessions(prev);
@@ -3379,7 +3381,7 @@ fn run() -> Result<i32, String> {
             &format!("proxyjump: opening channel to target {connect_host}:{port}"),
         );
         let ch = last
-            .open_direct_tcpip(connect_host.as_str(), port, "127.0.0.1", 0)
+            .open_stdio_forward(connect_host.as_str(), port)
             .map_err(|e| format!("proxyjump: open channel to target: {e}"))?;
         if last_no_more_sessions {
             send_no_more_sessions(&last);
@@ -4773,7 +4775,10 @@ fn remote_open_permitted(permit: Option<&[String]>, host: &str, port: u16) -> bo
 /// the destination from here, reply, then splice the two.
 fn socks_to_local(mut stream: ChannelStream, permit: Option<&[String]>) {
     use puressh::forwarding::socks;
-    let target = match socks::handshake(&mut stream) {
+    stream.set_read_deadline(Some(std::time::Instant::now() + SOCKS_HANDSHAKE_TIMEOUT));
+    let handshake = socks::handshake(&mut stream);
+    stream.set_read_deadline(None);
+    let target = match handshake {
         Ok(t) => t,
         Err(e) => {
             vlog(1, &format!("-R SOCKS handshake: {e}"));

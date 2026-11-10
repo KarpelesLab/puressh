@@ -440,9 +440,10 @@ pub struct ClientOptions {
     /// `zlib@openssh.com` ahead of `none`. Requires the `compress`
     /// feature at honoring time.
     pub compression: Option<bool>,
-    /// `SetEnv` — literal `NAME=VALUE` pairs to send via `env` requests
-    /// (cumulative across matching blocks; later duplicates of a name are
-    /// dropped at honoring time per first-wins).
+    /// `SetEnv` — literal `NAME=VALUE` pairs to send via `env` requests.
+    /// Not cumulative: the first `SetEnv` line obtained is the whole list,
+    /// as in OpenSSH (duplicates of a name within it are dropped at
+    /// honoring time, first wins).
     pub set_env: Vec<(String, String)>,
     /// `SendEnv` — environment-variable name patterns; matching local env
     /// vars are forwarded via `env` requests (cumulative).
@@ -492,8 +493,10 @@ pub struct ClientOptions {
     /// `ControlMaster` — connection-multiplexing role (no/yes/auto).
     pub control_master: Option<ControlMaster>,
     /// `ControlPath` — Unix-domain control-socket path with `%`-token and
-    /// `~` expansion deferred to the honoring site. The literal `none`
-    /// (case-insensitive) is stored as `None` to disable multiplexing.
+    /// `~` expansion deferred to the honoring site. `none` (in any case)
+    /// is kept as `Some("none")`: multiplexing explicitly disabled, which
+    /// (first value obtained) a later block's `ControlPath` does not undo.
+    /// [`ClientOptions::control_path_enabled`] is the path to use, if any.
     pub control_path: Option<String>,
     /// `ControlPersist` — how long the master lingers after its foreground
     /// session ends (no/yes/`<N>[smh]`).
@@ -991,8 +994,20 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
                     }
                 }
                 _ => {
-                    let current = blocks.last_mut().expect("global block always present");
-                    match apply_keyword(current.opts_mut(), &line) {
+                    // The first value obtained for an option is the one
+                    // kept, within a block as between blocks (OpenSSH): the
+                    // line is parsed on its own, so a bad value is an error
+                    // wherever it stands, then merged under what the block
+                    // already has. That covers a repeated keyword, the
+                    // lines of an `Include`d file that opens no block of
+                    // its own, and repeated `ssh -o` options alike.
+                    let mut parsed = ClientOptions::default();
+                    let applied = apply_keyword(&mut parsed, &line);
+                    if applied.is_ok() {
+                        let current = blocks.last_mut().expect("global block always present");
+                        merge_into(current.opts_mut(), &parsed);
+                    }
+                    match applied {
                         // `IgnoreUnknown`: unknown keywords matching its
                         // patterns (seen earlier in the file) are skipped.
                         Err(ConfigError::UnknownKeyword { .. })
@@ -1014,8 +1029,9 @@ pub(crate) fn parse_blocks(lines: Vec<ParsedLine>) -> Result<Vec<Block>, ConfigE
     Ok(blocks)
 }
 
-/// Apply one parsed line to the in-progress [`ClientOptions`] of the current
-/// block.
+/// Apply one parsed line to `opts`. [`parse_blocks`] gives each line a
+/// fresh `opts` and merges the result into the block first-value-wins, so
+/// the arms here need not check what is already set.
 fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), ConfigError> {
     // OpenSSH's older names for current keywords.
     let kw = match line.keyword.as_str() {
@@ -1440,13 +1456,16 @@ fn apply_keyword(opts: &mut ClientOptions, line: &ParsedLine) -> Result<(), Conf
         "controlpath" => {
             // The whole rest of the line (after token re-join) is the path;
             // `%`-token and `~` expansion happen at the honoring site.
-            // `none` (case-insensitive) disables multiplexing.
+            // `none` (case-insensitive) disables multiplexing. It is kept,
+            // as the literal `none`, so that it is a value obtained like
+            // any other: a later `ControlPath` (a `Host *` block's) must
+            // not turn multiplexing back on.
             let v = one_arg(line)?;
-            if v.eq_ignore_ascii_case("none") {
-                opts.control_path = None;
+            opts.control_path = Some(if v.eq_ignore_ascii_case("none") {
+                "none".to_string()
             } else {
-                opts.control_path = Some(v);
-            }
+                v
+            });
         }
         "controlpersist" => {
             opts.control_persist = Some(parse_control_persist(line)?);
@@ -1878,6 +1897,14 @@ impl ClientOptions {
     pub fn merge_lower(&mut self, lower: &ClientOptions) {
         merge_into(self, lower);
     }
+
+    /// The `ControlPath` to multiplex on: `None` when it is unset or
+    /// `none`.
+    pub fn control_path_enabled(&self) -> Option<&str> {
+        self.control_path
+            .as_deref()
+            .filter(|p| !p.eq_ignore_ascii_case("none"))
+    }
 }
 
 /// First-match-wins merge of `src` over `dst`. Scalars only overwrite if
@@ -1904,8 +1931,11 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
     take_scalar!(strict_host_key);
     take_scalar!(user_known_hosts);
     take_scalar!(hash_known_hosts);
+    // The socket is part of the `ForwardAgent` value it came with.
+    if dst.forward_agent.is_none() {
+        take_scalar!(forward_agent_socket);
+    }
     take_scalar!(forward_agent);
-    take_scalar!(forward_agent_socket);
     take_scalar!(forward_x11);
     take_scalar!(forward_x11_trusted);
     take_scalar!(request_tty);
@@ -2005,7 +2035,11 @@ fn merge_into(dst: &mut ClientOptions, src: &ClientOptions) {
         .extend(src.remote_forwards.iter().cloned());
     dst.dynamic_forwards
         .extend(src.dynamic_forwards.iter().cloned());
-    dst.set_env.extend(src.set_env.iter().cloned());
+    // `SetEnv` is not cumulative: the first line obtained is the whole
+    // list (OpenSSH's readconf.c only takes one while none is set).
+    if dst.set_env.is_empty() {
+        dst.set_env.extend(src.set_env.iter().cloned());
+    }
     dst.send_env.extend(src.send_env.iter().cloned());
 }
 
@@ -3230,6 +3264,8 @@ Host *.example.com !secret.example.com
 
     #[test]
     fn set_env_parses_multiple() {
+        // Several variables on a line; a second `SetEnv` line is not added
+        // (OpenSSH takes one only while none is set).
         let src = "Host gw\n  SetEnv FOO=bar BAZ=qux\n  SetEnv LANG=C\n";
         let cfg = SshClientConfig::parse(src).unwrap();
         let eff = cfg.lookup("gw");
@@ -3238,7 +3274,6 @@ Host *.example.com !secret.example.com
             vec![
                 ("FOO".to_string(), "bar".to_string()),
                 ("BAZ".to_string(), "qux".to_string()),
-                ("LANG".to_string(), "C".to_string()),
             ]
         );
     }
@@ -3471,10 +3506,92 @@ Match host *.example.com
         assert!(matches!(err, ConfigError::BadValue { .. }));
     }
 
+    /// The first value obtained wins inside a block too (global, `Host` and
+    /// `Match` alike), while a bad duplicate is still an error.
+    #[test]
+    fn first_value_wins_within_a_block() {
+        let cfg = SshClientConfig::parse(
+            "ForwardAgent no\nForwardAgent yes\nStrictHostKeyChecking yes\n\
+             StrictHostKeyChecking no\n\
+             Host h\n  Port 22\n  Port 2222\n  User a\n  User b\n  HostName one\n  HostName two\n\
+             \x20 IdentityFile k1\n  IdentityFile k2\n  ProxyCommand none\n  ProxyJump evil\n\
+             \x20 ControlPath none\n  ControlPath /tmp/cm\n  ForwardX11 no\n  ForwardX11 yes\n\
+             Match host m\n  Ciphers aes256-ctr\n  Ciphers aes128-ctr\n  BatchMode yes\n\
+             \x20 BatchMode no\n",
+        )
+        .unwrap();
+        let h = cfg.lookup("h");
+        assert_eq!(h.forward_agent, Some(false));
+        assert_eq!(h.strict_host_key, Some(StrictMode::Yes));
+        assert_eq!(h.port, Some(22));
+        assert_eq!(h.user.as_deref(), Some("a"));
+        assert_eq!(h.host_name.as_deref(), Some("one"));
+        assert_eq!(h.forward_x11, Some(false));
+        assert_eq!(h.proxy_command.as_deref(), Some("none"));
+        assert_eq!(h.proxy_jump, None);
+        assert_eq!(h.control_path_enabled(), None);
+        // Cumulative keywords still accumulate.
+        assert_eq!(h.identity_files, ["k1", "k2"]);
+        let m = cfg.lookup("m");
+        assert_eq!(m.ciphers.as_deref(), Some(&["aes256-ctr".to_string()][..]));
+        assert_eq!(m.batch_mode, Some(true));
+        // A duplicate that would be ignored is validated all the same.
+        assert!(SshClientConfig::parse("Port 22\nPort nope\n").is_err());
+        assert!(SshClientConfig::parse("Host h\n  ForwardX11 no\n  ForwardX11 maybe\n").is_err());
+    }
+
+    /// A `ForwardAgent` socket belongs to the value it was given with.
+    #[test]
+    fn forward_agent_socket_follows_its_value() {
+        let cfg =
+            SshClientConfig::parse("ForwardAgent no\nForwardAgent /run/agent.sock\n").unwrap();
+        let o = cfg.lookup("h");
+        assert_eq!(o.forward_agent, Some(false));
+        assert_eq!(o.forward_agent_socket, None);
+        let cfg = SshClientConfig::parse("Host h\n  ForwardAgent no\nHost *\n  ForwardAgent $S\n")
+            .unwrap();
+        let o = cfg.lookup("h");
+        assert_eq!(
+            (o.forward_agent, o.forward_agent_socket),
+            (Some(false), None)
+        );
+        assert_eq!(cfg.lookup("x").forward_agent_socket.as_deref(), Some("$S"));
+    }
+
+    /// `SetEnv`: the first line obtained is the whole list (OpenSSH).
+    #[test]
+    fn set_env_first_line_wins_as_a_whole() {
+        let cfg = SshClientConfig::parse(
+            "Host h\n  SetEnv A=1 B=2\n  SetEnv C=3\nHost *\n  SetEnv D=4\n",
+        )
+        .unwrap();
+        let pairs = |host: &str| {
+            cfg.lookup(host)
+                .set_env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pairs("h"), ["A=1", "B=2"]);
+        assert_eq!(pairs("other"), ["D=4"]);
+        assert!(SshClientConfig::parse("SetEnv A=1\nSetEnv nope\n").is_err());
+    }
+
     #[test]
     fn control_path_none_disables() {
-        let cfg = SshClientConfig::parse("Host h\n  ControlPath none\n").unwrap();
-        assert_eq!(cfg.lookup("h").control_path, None);
+        let cfg = SshClientConfig::parse("Host h\n  ControlPath NONE\n").unwrap();
+        assert_eq!(cfg.lookup("h").control_path.as_deref(), Some("none"));
+        assert_eq!(cfg.lookup("h").control_path_enabled(), None);
+        // Disabled is a value obtained: a later block does not undo it.
+        let cfg = SshClientConfig::parse(
+            "Host h\n  ControlPath none\nHost *\n  ControlPath ~/.ssh/cm-%C\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.lookup("h").control_path_enabled(), None);
+        assert_eq!(
+            cfg.lookup("other").control_path_enabled(),
+            Some("~/.ssh/cm-%C")
+        );
         let cfg = SshClientConfig::parse("Host h\n  ControlPath ~/.ssh/cm-%r@%h:%p\n").unwrap();
         assert_eq!(
             cfg.lookup("h").control_path.as_deref(),
@@ -3894,6 +4011,43 @@ Match host gw
             // Include is inside the `Host gw` block — its Port applies to gw.
             assert_eq!(cfg.lookup("gw").port, Some(4242));
             assert_eq!(cfg.lookup("gw").host_name.as_deref(), Some("10.0.0.1"));
+        }
+
+        /// An included file that opens no block of its own adds to the
+        /// block open at the `Include`: what that block already set wins.
+        #[test]
+        fn include_does_not_override_the_open_block() {
+            let dir = TempDir::new("open-block");
+            let leaf = dir.write(
+                "leaf.cfg",
+                "ForwardAgent yes\nStrictHostKeyChecking no\nUser included\n",
+            );
+            let root = dir.write(
+                "root.cfg",
+                &format!(
+                    "ForwardAgent no\nInclude {0}\nHost gw\n  StrictHostKeyChecking yes\n  \
+                     Include {0}\n  User later\n",
+                    leaf.display()
+                ),
+            );
+            let cfg = SshClientConfig::load(&root).unwrap();
+            let gw = cfg.lookup("gw");
+            assert_eq!(gw.forward_agent, Some(false));
+            // The global block's Include came first: its values stand.
+            assert_eq!(gw.strict_host_key, Some(StrictMode::No));
+            assert_eq!(gw.user.as_deref(), Some("included"));
+            // Without it, the `Host gw` block's own line beats its Include.
+            let root = dir.write(
+                "root2.cfg",
+                &format!(
+                    "Host gw\n  StrictHostKeyChecking yes\n  Include {}\n  User later\n",
+                    leaf.display()
+                ),
+            );
+            let gw = SshClientConfig::load(&root).unwrap().lookup("gw");
+            assert_eq!(gw.strict_host_key, Some(StrictMode::Yes));
+            assert_eq!(gw.forward_agent, Some(true));
+            assert_eq!(gw.user.as_deref(), Some("included"));
         }
 
         #[test]

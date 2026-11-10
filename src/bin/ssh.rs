@@ -358,15 +358,15 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         .clone()
                 };
                 match c {
-                    'b' => extra_o.push(format!("BindAddress {v}")),
-                    'c' => extra_o.push(format!("Ciphers {v}")),
+                    'b' => set_o(&mut extra_o, format!("BindAddress {v}")),
+                    'c' => set_o(&mut extra_o, format!("Ciphers {v}")),
                     'e' => escape_char = Some(parse_escape_char(&v)?),
                     'i' => identities.push(v),
                     // The first user named (-l, -o User, user@host) wins.
                     'l' => {
                         first_user.get_or_insert(v);
                     }
-                    'm' => extra_o.push(format!("MACs {v}")),
+                    'm' => set_o(&mut extra_o, format!("MACs {v}")),
                     'o' => apply_dash_o(
                         &{
                             let kv = v.trim_start();
@@ -395,18 +395,32 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         &mut request_tty,
                         &mut extra_o,
                     )?,
-                    'p' => port = Some(v.parse::<u16>().map_err(|_| "invalid port".to_string())?),
-                    'B' => extra_o.push(format!("BindInterface {v}")),
+                    // The first port given (-p, -o Port) wins.
+                    'p' => {
+                        let p = v.parse::<u16>().map_err(|_| "invalid port".to_string())?;
+                        if port.is_none() && !has_o(&extra_o, "Port") {
+                            port = Some(p);
+                        }
+                    }
+                    'B' => set_o(&mut extra_o, format!("BindInterface {v}")),
                     'D' => {
                         dynamics_raw.push(parse_dynamic_forward(&v)?);
                         forward_specs.push((b'D', v));
                     }
                     'E' => log_file = Some(v),
                     'F' => config_file = Some(PathBuf::from(v)),
-                    'I' => extra_o.push(format!("PKCS11Provider {v}")),
+                    'I' => set_o(&mut extra_o, format!("PKCS11Provider {v}")),
                     // Also a first-obtained `ProxyJump` (so it excludes a
                     // configured ProxyCommand, as OpenSSH's).
                     'J' => {
+                        if has_o(&extra_o, "ProxyJump") {
+                            return Err("Only a single -J option is permitted (use commas \
+                                        to separate multiple jump hops)"
+                                .into());
+                        }
+                        if has_o(&extra_o, "ProxyCommand") {
+                            return Err("Cannot specify -J with ProxyCommand".into());
+                        }
                         extra_o.push(format!("ProxyJump {v}"));
                         proxy_jump = Some(v);
                     }
@@ -433,7 +447,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                         remotes.push(parse_remote_forward(&v)?);
                         forward_specs.push((b'R', v));
                     }
-                    'S' => extra_o.push(format!("ControlPath {v}")),
+                    'S' => set_o(&mut extra_o, format!("ControlPath {v}")),
                     'w' => {
                         // As OpenSSH: enables tunnelling (point-to-point
                         // unless set already) with these devices.
@@ -442,7 +456,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                             std::process::exit(255);
                         }
                         extra_o.push("Tunnel yes".to_string());
-                        extra_o.push(format!("TunnelDevice {v}"));
+                        set_o(&mut extra_o, format!("TunnelDevice {v}"));
                     }
                     'W' => stdio_forward = Some(v),
                     _ => unreachable!(),
@@ -457,11 +471,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 '1' => return Err("SSH protocol v.1 is no longer supported".into()),
                 '2' | 'k' => {}
                 'y' => use_syslog = true,
-                '4' => extra_o.push("AddressFamily inet".into()),
-                '6' => extra_o.push("AddressFamily inet6".into()),
+                '4' => set_o(&mut extra_o, "AddressFamily inet".into()),
+                '6' => set_o(&mut extra_o, "AddressFamily inet6".into()),
                 'a' => {
                     agent_forward = false;
-                    extra_o.push("ForwardAgent no".into());
+                    set_o(&mut extra_o, "ForwardAgent no".into());
                 }
                 'A' => agent_forward = true,
                 'C' => compression = Some(true),
@@ -469,14 +483,14 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                     fork_after_auth = true;
                     stdin_null = true;
                 }
-                'g' => extra_o.push("GatewayPorts yes".into()),
+                'g' => set_o(&mut extra_o, "GatewayPorts yes".into()),
                 'G' => print_config = true,
                 'Z' => dump_pubkeys = true,
                 // GSSAPI authentication / credential delegation: not
                 // implemented, so (as with GSSAPIAuthentication) nothing to
                 // turn on; OpenSSH without a Kerberos ticket behaves alike.
                 'K' => {}
-                'M' => extra_o.push("ControlMaster yes".into()),
+                'M' => set_o(&mut extra_o, "ControlMaster yes".into()),
                 'n' => stdin_null = true,
                 'N' => no_command = true,
                 'q' => quiet = true,
@@ -488,7 +502,7 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
                 'V' => version = true,
                 'x' => {
                     x11_forward = None;
-                    extra_o.push("ForwardX11 no".into());
+                    set_o(&mut extra_o, "ForwardX11 no".into());
                 }
                 'X' => x11_forward = Some(X11Forward::Untrusted),
                 'Y' => x11_forward = Some(X11Forward::Trusted),
@@ -613,6 +627,32 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     })
 }
 
+/// The keyword of a line queued in `extra_o` (`Keyword value`).
+fn o_keyword(line: &str) -> &str {
+    line.split([' ', '\t', '=']).next().unwrap_or("")
+}
+
+/// Whether an option given so far queued a line for `keyword`.
+fn has_o(extra_o: &[String], keyword: &str) -> bool {
+    extra_o
+        .iter()
+        .any(|l| o_keyword(l).eq_ignore_ascii_case(keyword))
+}
+
+/// Queue `line` for a flag that, as in OpenSSH, sets its option whatever
+/// was given before it (`-a`, `-4`, `-S path`, …).
+///
+/// The queued lines are read first-value-wins, like the options of a
+/// configuration block: that is right between `-o` options, and for an
+/// `-o` after a flag, but a flag overrides what precedes it — `ssh -o
+/// ForwardAgent=yes -a` must not forward the agent — so the earlier lines
+/// for its keyword are dropped.
+fn set_o(extra_o: &mut Vec<String>, line: String) {
+    let keyword = o_keyword(&line).to_string();
+    extra_o.retain(|l| !o_keyword(l).eq_ignore_ascii_case(&keyword));
+    extra_o.push(line);
+}
+
 /// One `-o KEY=VALUE` (or `-o "KEY VALUE"`): the handful of keywords with a
 /// dedicated `Cli` field are set directly; every other keyword is queued in
 /// `extra_o` for the real config parser.
@@ -696,7 +736,10 @@ fn apply_dash_o(
 /// each honours the real strict parser (rejecting unknown keywords and bad
 /// values exactly as the file would), then overlay every field the synthetic
 /// block actually set on top of `cfg_block` — giving `-o` the highest
-/// precedence, matching OpenSSH.
+/// precedence, matching OpenSSH. Within the block the first value given
+/// for an option is the one kept, as OpenSSH reads the command line: a
+/// wrapper's `-o ForwardAgent=no` is not undone by a later
+/// `-o ForwardAgent=yes`.
 fn apply_extra_o(
     cfg_block: &mut puressh::config::ClientOptions,
     extra_o: &[String],
@@ -2245,7 +2288,7 @@ fn print_config(
         "ciphers {}",
         list(&c.ciphers, puressh::config::AlgoCategory::Cipher)
     ));
-    if let Some(p) = &c.control_path {
+    if let Some(p) = c.control_path_enabled() {
         out.push(format!("controlpath {p}"));
     }
     out.push(format!(
@@ -5532,7 +5575,7 @@ fn resolve_mux(
     user: &str,
 ) -> Result<Option<MuxDecision>, String> {
     use puressh::config::{ControlMaster, ControlPersist};
-    let Some(template) = cfg_block.control_path.as_deref() else {
+    let Some(template) = cfg_block.control_path_enabled() else {
         return Ok(None);
     };
     let master = cfg_block.control_master.unwrap_or(ControlMaster::No);
@@ -8631,6 +8674,130 @@ mod extra_o_tests {
         assert!(t.expand_for_shell("echo %j").is_ok());
         t.jump = "jump1,`id`@jump2".into();
         assert!(t.expand_for_shell("echo %j").is_err());
+    }
+
+    /// The options of a command line, resolved over an empty configuration.
+    fn resolved(v: &[&str]) -> (Cli, puressh::config::ClientOptions) {
+        let cli = parse_args(&args(v)).unwrap();
+        let mut block = puressh::config::ClientOptions::default();
+        apply_extra_o(&mut block, &cli.extra_o).unwrap();
+        (cli, block)
+    }
+
+    /// The first `-o` given for an option wins: a later one cannot undo
+    /// what a wrapper pinned.
+    #[test]
+    fn repeated_dash_o_first_wins() {
+        let (cli, o) = resolved(&[
+            "-o",
+            "ForwardAgent=no",
+            "-oForwardX11=no",
+            "-o",
+            "ProxyCommand=none",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ForwardAgent=yes",
+            "-o",
+            "ForwardX11 yes",
+            "-o",
+            "ProxyCommand=evil %h",
+            "-o",
+            "ProxyJump=evil",
+            "-o",
+            "ControlPath=/tmp/cm",
+            "-o",
+            "IdentityFile=a",
+            "-o",
+            "IdentityFile=b",
+            "host",
+        ]);
+        assert!(!cli.agent_forward);
+        assert_eq!(o.forward_agent, Some(false));
+        assert_eq!(o.forward_x11, Some(false));
+        assert_eq!(o.proxy_command.as_deref(), Some("none"));
+        assert_eq!(o.proxy_jump, None);
+        assert_eq!(o.control_path_enabled(), None);
+        assert_eq!(o.identity_files, ["a", "b"]);
+        // …and it is still what a configuration file's value yields to.
+        let mut block = puressh::config::SshClientConfig::parse(
+            "ForwardAgent yes\nControlPath /tmp/file\nPort 2222\n",
+        )
+        .unwrap()
+        .lookup("host");
+        apply_extra_o(&mut block, &cli.extra_o).unwrap();
+        assert_eq!(block.forward_agent, Some(false));
+        assert_eq!(block.control_path_enabled(), None);
+        assert_eq!(block.port, Some(2222));
+        // A bad value is refused even where it would be ignored.
+        let cli = parse_args(&args(&["-oPort=22", "-oPort=nope", "host"])).unwrap();
+        let mut block = puressh::config::ClientOptions::default();
+        assert!(apply_extra_o(&mut block, &cli.extra_o).is_err());
+    }
+
+    /// Flags set their option whatever precedes them (OpenSSH assigns
+    /// unconditionally), and an `-o` after a flag does not change it.
+    #[test]
+    fn flags_and_dash_o_apply_in_order() {
+        use puressh::config::{AddressFamily, ControlMaster};
+        // -a after -o ForwardAgent=yes: off. -o after -a: still off.
+        let (cli, o) = resolved(&["-o", "ForwardAgent=yes", "-a", "host"]);
+        assert!(!cli.agent_forward);
+        assert_eq!(o.forward_agent, Some(false));
+        let (cli, o) = resolved(&["-a", "-o", "ForwardAgent=yes", "host"]);
+        assert!(!cli.agent_forward);
+        assert_eq!(o.forward_agent, Some(false));
+        // -A is on whatever -o says, before or after.
+        assert!(
+            resolved(&["-o", "ForwardAgent=no", "-A", "host"])
+                .0
+                .agent_forward
+        );
+        assert!(
+            resolved(&["-A", "-o", "ForwardAgent=no", "host"])
+                .0
+                .agent_forward
+        );
+        // -x likewise.
+        let (cli, o) = resolved(&["-o", "ForwardX11=yes", "-x", "-oForwardX11=yes", "host"]);
+        assert!(cli.x11_forward.is_none());
+        assert_eq!(o.forward_x11, Some(false));
+        // The last of two flags wins; an earlier -o loses, a later one too.
+        let (_, o) = resolved(&[
+            "-o",
+            "ControlPath=/tmp/o",
+            "-S",
+            "/tmp/a",
+            "-S",
+            "/tmp/b",
+            "-oControlPath=/tmp/late",
+            "-oAddressFamily=inet",
+            "-4",
+            "-6",
+            "-oControlMaster=no",
+            "-M",
+            "host",
+        ]);
+        assert_eq!(o.control_path.as_deref(), Some("/tmp/b"));
+        assert_eq!(o.address_family, Some(AddressFamily::Inet6));
+        assert_eq!(o.control_master, Some(ControlMaster::Yes));
+        // -S none after -o ControlPath: multiplexing off.
+        let (_, o) = resolved(&["-oControlPath=/tmp/o", "-S", "none", "host"]);
+        assert_eq!(o.control_path_enabled(), None);
+        // The first port named wins, -p or -o Port.
+        let (cli, o) = resolved(&["-p", "22", "-p", "2222", "-oPort=23", "host"]);
+        assert_eq!(cli.port.or(o.port), Some(22));
+        let (cli, o) = resolved(&["-oPort=23", "-p", "22", "host"]);
+        assert_eq!(cli.port.or(o.port), Some(23));
+        assert!(parse_args(&args(&["-oPort=23", "-p", "nope", "host"])).is_err());
+        // One -J only, and not with a ProxyCommand given before it.
+        assert!(parse_args(&args(&["-J", "a", "-J", "b", "host"])).is_err());
+        assert!(parse_args(&args(&["-oProxyJump=a", "-J", "b", "host"])).is_err());
+        assert!(parse_args(&args(&["-oProxyCommand=nc %h %p", "-J", "b", "host"])).is_err());
+        let (cli, o) = resolved(&["-J", "a", "-oProxyJump=b", "-oProxyCommand=x", "host"]);
+        assert_eq!(cli.proxy_jump.as_deref(), Some("a"));
+        assert_eq!(o.proxy_jump.as_deref(), Some("a"));
+        assert_eq!(o.proxy_command, None);
     }
 
     #[test]

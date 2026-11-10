@@ -894,15 +894,25 @@ impl SftpServerSession {
             }
             out
         };
+        // A jailed session must not learn which accounts the host has (as
+        // for `home-directory` / `expand-path`): every id is unknown, which
+        // clients show as the number.
+        let jailed = self.opts.root.is_some();
         #[cfg(unix)]
         let (users, groups) = (
             names(&uids, &|u| {
+                if jailed {
+                    return None;
+                }
                 nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(u))
                     .ok()
                     .flatten()
                     .map(|u| u.name)
             }),
             names(&gids, &|g| {
+                if jailed {
+                    return None;
+                }
                 nix::unistd::Group::from_gid(nix::unistd::Gid::from_raw(g))
                     .ok()
                     .flatten()
@@ -910,7 +920,10 @@ impl SftpServerSession {
             }),
         );
         #[cfg(not(unix))]
-        let (users, groups) = (names(&uids, &|_| None), names(&gids, &|_| None));
+        let (users, groups) = {
+            let _ = jailed;
+            (names(&uids, &|_| None), names(&gids, &|_| None))
+        };
         let mut reply = Vec::with_capacity(8 + users.len() + groups.len());
         reply.extend_from_slice(&(users.len() as u32).to_be_bytes());
         reply.extend_from_slice(&users);

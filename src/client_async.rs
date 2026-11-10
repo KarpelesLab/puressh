@@ -281,6 +281,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncClient<S> {
         orig_host: &str,
         orig_port: u16,
     ) -> Result<AsyncChannel<'_, S>> {
+        // Port forwarding is refused after a changed host key was accepted;
+        // see `host_key_mismatched`.
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
+        self.open_direct_tcpip_channel(dest_host, dest_port, orig_host, orig_port)
+            .await
+    }
+
+    /// Open a `direct-tcpip` channel to `dest_host:dest_port` to carry the
+    /// caller's own stdio (`ssh -W`) or a further SSH connection (a jump
+    /// host). Unlike [`Self::open_direct_tcpip`] it stays available after a
+    /// changed host key was accepted (see [`Self::host_key_mismatched`]), as
+    /// in OpenSSH: nothing local is exposed to the server through it.
+    pub async fn open_stdio_forward(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+    ) -> Result<AsyncChannel<'_, S>> {
+        self.open_direct_tcpip_channel(dest_host, dest_port, "127.0.0.1", 0)
+            .await
+    }
+
+    async fn open_direct_tcpip_channel(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<AsyncChannel<'_, S>> {
         let local_id = self
             .open_channel(ChannelOpen::DirectTcpip {
                 dest_host: dest_host.to_string(),
@@ -740,6 +770,59 @@ mod tests {
         ))
         .expect("the matching pin connects");
         drop(client);
+        let _ = server_thread.join();
+    }
+
+    /// After a changed host key was let through with a warning, the async
+    /// client refuses to open a `direct-tcpip` forward (before anything
+    /// reaches the wire), like the other frontends.
+    #[test]
+    fn async_direct_tcpip_refused_after_host_key_mismatch() {
+        use crate::client::{HostKeyPolicy, KnownHostsPolicy, TofuAction};
+        use crate::known_hosts::KnownHosts;
+
+        let (addr, _host_blob, server_thread) = spawn_pin_server();
+        let bogus_blob = Ed25519HostKey::from_seed([0x33u8; 32]).public_blob();
+        let store = Arc::new(Mutex::new(KnownHosts::new()));
+        store
+            .lock()
+            .unwrap()
+            .add("127.0.0.1", addr.port(), "ssh-ed25519", &bogus_blob, false);
+        let policy = KnownHostsPolicy {
+            store,
+            save_path: None,
+            hash_new: false,
+            on_unknown: TofuAction::Reject,
+            on_mismatch: TofuAction::AcceptWithWarning,
+            global: Vec::new(),
+            host_key_alias: None,
+            revoked: None,
+            command: None,
+            check_host_ip: None,
+            on_address_change: TofuAction::Reject,
+            pre_check: None,
+            on_known: None,
+            notice: None,
+        };
+        let cfg = Config {
+            host_key_policy: HostKeyPolicy::KnownHosts(policy),
+            timeout: None,
+            algorithms: Default::default(),
+            pinned_host_key: None,
+        };
+        let sock = TcpStream::connect(addr).expect("connect");
+        block_on(async {
+            let mut client =
+                AsyncClient::connect(BlockingAsync(sock), "127.0.0.1", addr.port(), cfg)
+                    .await
+                    .expect("connect succeeds with a warning");
+            assert!(client.host_key_mismatched());
+            match client.open_direct_tcpip("h", 1, "127.0.0.1", 0).await {
+                Err(Error::Config(m)) => assert_eq!(m, HOST_KEY_MISMATCH_DISABLED),
+                Err(e) => panic!("expected the mismatch refusal, got {e:?}"),
+                Ok(_) => panic!("direct-tcpip must be refused after a mismatch"),
+            }
+        });
         let _ = server_thread.join();
     }
 

@@ -2547,6 +2547,35 @@ impl Client {
         orig_host: &str,
         orig_port: u16,
     ) -> Result<ClientChannelStream<'_>> {
+        // Port forwarding (`-L`, `-D`) is refused after a changed host key
+        // was accepted; see `host_key_mismatched`.
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
+        self.open_direct_tcpip_channel(dest_host, dest_port, orig_host, orig_port)
+    }
+
+    /// Open a `direct-tcpip` channel to `dest_host:dest_port` to carry the
+    /// caller's own stdio (`ssh -W`) or a further SSH connection (a jump
+    /// host). Unlike [`Self::open_direct_tcpip`] it stays available after a
+    /// changed host key was accepted (see [`Self::host_key_mismatched`]), as
+    /// in OpenSSH: nothing local is exposed to the server through it. The
+    /// multi-channel equivalent is `SharedClient::open_stdio_forward`.
+    pub fn open_stdio_forward(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+    ) -> Result<ClientChannelStream<'_>> {
+        self.open_direct_tcpip_channel(dest_host, dest_port, "127.0.0.1", 0)
+    }
+
+    fn open_direct_tcpip_channel(
+        &mut self,
+        dest_host: &str,
+        dest_port: u16,
+        orig_host: &str,
+        orig_port: u16,
+    ) -> Result<ClientChannelStream<'_>> {
         let (local_id, open_payload) = self.conn.open(ChannelOpen::DirectTcpip {
             dest_host: dest_host.to_string(),
             dest_port: dest_port as u32,
@@ -2601,6 +2630,11 @@ impl Client {
         &mut self,
         socket_path: &str,
     ) -> Result<ClientChannelStream<'_>> {
+        // Port forwarding is refused after a changed host key was accepted;
+        // see `host_key_mismatched`.
+        if self.host_key_mismatched() {
+            return Err(Error::Config(HOST_KEY_MISMATCH_DISABLED));
+        }
         let (local_id, open_payload) = self.conn.open(ChannelOpen::DirectStreamlocal {
             socket_path: socket_path.to_string(),
         })?;
@@ -6304,6 +6338,14 @@ mod tests {
                 .open_session_for_x11_forward(false, "MIT-MAGIC-COOKIE-1", "00", 0)
                 .map(drop)
         ));
+        // The borrow-based direct forwards are refused too.
+        #[allow(deprecated)]
+        {
+            assert!(blocked(
+                client.open_direct_tcpip("h", 1, "127.0.0.1", 0).map(drop)
+            ));
+            assert!(blocked(client.open_direct_streamlocal("/x").map(drop)));
+        }
         // The same over a SharedClient (`-L`, `-D`, `ssh -O forward`).
         #[cfg(feature = "multichannel")]
         {

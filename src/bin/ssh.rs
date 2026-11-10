@@ -4063,13 +4063,12 @@ impl HostKeysUpdater {
         let mut offered: Vec<Vec<u8>> = Vec::new();
         let mut rest = raw;
         while rest.len() >= 4 {
-            let n = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]) as usize;
-            if rest.len() < 4 + n {
+            let Some((blob, after)) = split_ssh_string(rest) else {
                 vlog(1, "UpdateHostKeys: malformed hostkeys message");
                 return;
-            }
-            let blob = rest[4..4 + n].to_vec();
-            rest = &rest[4 + n..];
+            };
+            let blob = blob.to_vec();
+            rest = after;
             let Some(t) = key_blob_type(&blob) else {
                 continue;
             };
@@ -4124,15 +4123,10 @@ impl HostKeysUpdater {
             let mut sigs = &reply[..];
             for &i in &plan.new {
                 let key = &offered[i];
-                if sigs.len() < 4 {
+                let Some((sig, after)) = split_ssh_string(sigs) else {
                     return;
-                }
-                let n = u32::from_be_bytes([sigs[0], sigs[1], sigs[2], sigs[3]]) as usize;
-                if sigs.len() < 4 + n {
-                    return;
-                }
-                let sig = &sigs[4..4 + n];
-                sigs = &sigs[4 + n..];
+                };
+                sigs = after;
                 let Some(key_type) = key_blob_type(key) else {
                     return;
                 };
@@ -4199,9 +4193,18 @@ impl HostKeysUpdater {
 
 /// The algorithm name a key or signature blob starts with.
 fn key_blob_type(blob: &[u8]) -> Option<String> {
-    let n = u32::from_be_bytes(blob.get(..4)?.try_into().ok()?) as usize;
-    let name = blob.get(4..4 + n)?;
+    let (name, _) = split_ssh_string(blob)?;
     core::str::from_utf8(name).ok().map(str::to_string)
+}
+
+/// The SSH `string` at the start of `buf` and what follows it; `None` when
+/// the length it declares runs past the buffer. The length is the peer's:
+/// it is compared with what is left, never added to an offset (`4 + n`
+/// wraps where `usize` is 32 bits).
+fn split_ssh_string(buf: &[u8]) -> Option<(&[u8], &[u8])> {
+    let (len, rest) = buf.split_first_chunk::<4>()?;
+    let n = usize::try_from(u32::from_be_bytes(*len)).ok()?;
+    (n <= rest.len()).then(|| rest.split_at(n))
 }
 
 /// Run a `LocalCommand` with the user's shell (`$SHELL`, else `/bin/sh`;
@@ -9018,6 +9021,27 @@ mod extra_o_tests {
         assert_eq!(pre("ssh-ed25519", b"not looked at"), None);
         // …which says nothing about this one.
         assert_eq!(common::dns_match(), None);
+    }
+
+    /// A peer-declared string length is checked against what is left
+    /// without being added to anything.
+    #[test]
+    fn ssh_string_lengths_are_bounds_checked() {
+        assert_eq!(
+            split_ssh_string(b"\0\0\0\x03abcde"),
+            Some((&b"abc"[..], &b"de"[..]))
+        );
+        assert_eq!(split_ssh_string(b"\0\0\0\0"), Some((&b""[..], &b""[..])));
+        assert_eq!(split_ssh_string(b"\0\0\0"), None);
+        assert_eq!(split_ssh_string(b"\0\0\0\x04abc"), None);
+        // The largest lengths: `4 + n` would wrap a 32-bit usize.
+        assert_eq!(split_ssh_string(b"\xff\xff\xff\xffabc"), None);
+        assert_eq!(split_ssh_string(b"\xff\xff\xff\xfcabc"), None);
+        assert_eq!(key_blob_type(b"\xff\xff\xff\xfdssh-ed25519"), None);
+        assert_eq!(
+            key_blob_type(b"\0\0\0\x0bssh-ed25519rest").as_deref(),
+            Some("ssh-ed25519")
+        );
     }
 
     #[test]

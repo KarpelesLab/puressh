@@ -1317,7 +1317,9 @@ pub fn show_host_key(blob: &[u8]) -> (String, Option<String>) {
 }
 
 /// `VerifyHostKeyDNS`: whether the host's SSHFP records matched the key
-/// (`None`: not looked up), for the first-contact question.
+/// (`None`: not looked up), for the first-contact question. One host's at
+/// a time: whoever checks a host key sets it afresh (to `None` first) for
+/// each host, so a jump host's verdict is never shown for the next one.
 static DNS_MATCH: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Record the SSHFP outcome (see [`DNS_MATCH`]).
@@ -1326,6 +1328,12 @@ pub fn set_dns_match(matched: Option<bool>) {
     if let Ok(mut g) = DNS_MATCH.lock() {
         *g = matched;
     }
+}
+
+/// The SSHFP outcome recorded for the host being checked (see
+/// [`DNS_MATCH`]).
+pub fn dns_match() -> Option<bool> {
+    DNS_MATCH.lock().ok().and_then(|g| *g)
 }
 
 /// `host`, or `[host]:port` off port 22, as OpenSSH names hosts.
@@ -1579,7 +1587,7 @@ fn ask_unknown_host(
         banner.push_str(&art);
         banner.push('\n');
     }
-    if let Some(matched) = DNS_MATCH.lock().ok().and_then(|g| *g) {
+    if let Some(matched) = dns_match() {
         banner.push_str(if matched {
             "Matching host key fingerprint found in DNS.\n"
         } else {

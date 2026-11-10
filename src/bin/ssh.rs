@@ -1572,6 +1572,11 @@ fn install_host_key_checks(
         .unwrap_or(VerifyHostKeyDns::No);
     let host = connect_host.to_string();
     kh.pre_check = Some(Arc::new(move |key_type: &str, blob: &[u8]| {
+        // The SSHFP verdict shown in the first-contact question is this
+        // host's: forget the previous host's (a ProxyJump hop's "Matching
+        // host key fingerprint found in DNS." is not about the next host,
+        // which may not use VerifyHostKeyDNS at all).
+        common::set_dns_match(None);
         // This library refuses RSA keys under 2048 bits whatever the floor.
         if key_type == "ssh-rsa"
             && min_rsa > 2048
@@ -8990,6 +8995,29 @@ mod extra_o_tests {
         let target = socks_handshake_within(&mut tcp, Duration::from_secs(10)).unwrap();
         assert_eq!((target.host.as_str(), target.port), ("192.0.2.7", 80));
         assert_eq!(tcp.read_timeout().unwrap(), None);
+    }
+
+    /// Each host's key check starts without the previous host's SSHFP
+    /// verdict, whether or not it uses VerifyHostKeyDNS itself.
+    #[test]
+    fn dns_verdict_does_not_carry_over_to_the_next_host() {
+        use std::sync::Mutex;
+        let store = Arc::new(Mutex::new(puressh::known_hosts::KnownHosts::new()));
+        let mut kh = puressh::client::KnownHostsPolicy::strict(store);
+        // The next host: VerifyHostKeyDNS off (the default).
+        install_host_key_checks(
+            &mut kh,
+            &puressh::config::ClientOptions::default(),
+            "next.example",
+            StrictMode::Ask,
+            Vec::new(),
+        );
+        // A jump host matched its SSHFP records…
+        common::set_dns_match(Some(true));
+        let pre = kh.pre_check.clone().expect("pre-check installed");
+        assert_eq!(pre("ssh-ed25519", b"not looked at"), None);
+        // …which says nothing about this one.
+        assert_eq!(common::dns_match(), None);
     }
 
     #[test]

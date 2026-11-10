@@ -5683,7 +5683,7 @@ pub(crate) fn server_ext_info(cfg: &Config) -> ExtInfo {
 
 /// Current wall-clock time as Unix seconds, for certificate validity checks.
 /// Injected at the std edge; falls back to 0 (fail-closed for not-yet-valid).
-fn unix_now() -> u64 {
+pub(crate) fn unix_now() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

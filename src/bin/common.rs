@@ -388,8 +388,18 @@ fn no_tty_error() -> std::io::Error {
 /// Pull one line off `r` into `buf`, stopping at `\n` (which is
 /// consumed but not appended). `\r` is dropped. Capped at `max_len`
 /// bytes to bound memory if the source is unbounded.
+///
+/// The line is text as the terminal sent it: UTF-8 (a password with
+/// non-ASCII characters must reach the server as typed, not with each of
+/// its bytes turned into a character of its own). Input that is not UTF-8
+/// — a terminal in a single-byte locale — is read as Latin-1, one
+/// character per byte. The bytes read are wiped; `buf` is the caller's to
+/// protect.
 fn read_one_line(r: &mut dyn Read, buf: &mut String, max_len: usize) -> std::io::Result<()> {
+    // Sized up front so the secret is never left behind by a reallocation.
+    let mut line: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(max_len.min(4096) + 1));
     let mut byte = [0u8; 1];
+    let mut capped = false;
     loop {
         let n = r.read(&mut byte)?;
         if n == 0 || byte[0] == b'\n' {
@@ -398,9 +408,21 @@ fn read_one_line(r: &mut dyn Read, buf: &mut String, max_len: usize) -> std::io:
         if byte[0] == b'\r' {
             continue;
         }
-        buf.push(byte[0] as char);
-        if buf.len() > max_len {
+        line.push(byte[0]);
+        if line.len() > max_len {
+            capped = true;
             break;
+        }
+    }
+    match core::str::from_utf8(&line) {
+        Ok(text) => buf.push_str(text),
+        // The cap fell inside a character: keep what came before it.
+        Err(e) if capped && e.error_len().is_none() => {
+            buf.push_str(&String::from_utf8_lossy(&line[..e.valid_up_to()]));
+        }
+        Err(_) => {
+            buf.reserve(line.len() * 2);
+            buf.extend(line.iter().map(|&b| b as char));
         }
     }
     Ok(())
@@ -2552,6 +2574,37 @@ mod perm_tests {
         let root = s.config("f-root", 0o666, &format!("Include {}\n", leaf.display()));
         let cfg = load_client_config(Some(&root), &plain).unwrap();
         assert_eq!(cfg.lookup("h").port, Some(2201));
+    }
+}
+
+#[cfg(test)]
+mod line_tests {
+    //! Lines typed at a prompt (passwords, passphrases, answers).
+    use super::read_one_line;
+
+    fn line(input: &[u8], max: usize) -> String {
+        let mut buf = String::new();
+        read_one_line(&mut &input[..], &mut buf, max).unwrap();
+        buf
+    }
+
+    #[test]
+    fn typed_lines_are_utf8_text() {
+        assert_eq!(line(b"hunter2\r\nnext", 4096), "hunter2");
+        assert_eq!(line(b"no newline", 4096), "no newline");
+        assert_eq!(line(b"\n", 4096), "");
+        // Non-ASCII characters arrive as typed, not one char per byte.
+        let typed = "p\u{e4}ssw\u{f6}rd \u{1f511} \u{30d1}\u{30b9}";
+        assert_eq!(line(format!("{typed}\n").as_bytes(), 4096), typed);
+        assert_eq!(
+            line(format!("{typed}\n").as_bytes(), 4096).len(),
+            typed.len()
+        );
+        // Not UTF-8 (a Latin-1 terminal): one character per byte.
+        assert_eq!(line(b"caf\xe9\n", 4096), "caf\u{e9}");
+        // The cap bounds the read and never splits a character.
+        assert_eq!(line(b"abcdefgh\n", 4), "abcde");
+        assert_eq!(line("ab\u{e9}\u{e9}\u{e9}\n".as_bytes(), 4), "ab\u{e9}");
     }
 }
 

@@ -7,6 +7,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.9](https://github.com/KarpelesLab/puressh/compare/v0.2.8...v0.2.9) - 2026-11-10
+
+### Added
+
+- *(stream)* a read deadline on ChannelStream
+
+### Fixed
+
+- *(sftp)* take a rooted client path as absolute on Windows too
+- *(knock)* charge uncached sig1 checks to the sender's prefix ([#33](https://github.com/KarpelesLab/puressh/pull/33))
+- *(knock)* knock only for hosts configured for it ([#32](https://github.com/KarpelesLab/puressh/pull/32))
+- *(ssh)* UpdateHostKeys sanity checks, terminal restored on keepalive timeout ([#35](https://github.com/KarpelesLab/puressh/pull/35))
+- *(transport)* defer bad-length failures for every E&M cipher, refuse control characters in the version line ([#38](https://github.com/KarpelesLab/puressh/pull/38))
+- *(sftp)* resolve absolute client paths inside the jail the client is shown ([#34](https://github.com/KarpelesLab/puressh/pull/34))
+- *(agent)* cap the number of held identities ([#29](https://github.com/KarpelesLab/puressh/pull/29))
+- *(ssh)* time out -R SOCKS handshakes, carry ProxyJump as a stdio forward (FWD-8)
+- *(config)* a file's SendEnv -PATTERN also removes ssh -o SendEnv entries (SSH-7)
+- *(server)* send a buffered exec result through the connection loop
+- *(deb)* send sshd@.service diagnostics to the journal
+- *(cli)* read non-ASCII passwords and passphrases typed at the terminal as UTF-8
+- *(ssh)* bounds-check server-supplied lengths in hostkeys messages without overflow (CLI-4)
+- *(config)* SendEnv -PATTERN removes the patterns obtained before it (SSH-7)
+- *(ssh)* do not show a jump host's SSHFP verdict in the next host's prompt (SSH-6)
+- *(ssh)* bound the -D SOCKS handshake and pause after a failed accept (FWD-8)
+- *(scp)* an unreadable or shrinking source no longer desyncs a legacy upload (XFER-15)
+- *(sshd)* pause and rate-limit the log when accept() keeps failing (SSHD-16)
+- *(server)* an exec waiting for window survives the polling read timeout
+- *(server)* keep serving after a failed accept (SRV-11)
+- *(deb)* a failed backup refresh no longer keeps sshd from starting (PKG-4)
+
+### Other
+
+- *(client)* run the stream flood test on Linux only
+- keep integer overflow checks in release builds ([#40](https://github.com/KarpelesLab/puressh/pull/40))
+- *(knock)* let a test's own KnockMode win over the harness default
+- make the no-unsafe claim accurate and the minimal test build compile ([#39](https://github.com/KarpelesLab/puressh/pull/39))
+- *(release)* build the release tag, not the dispatching branch (CI-3)
+
+### Security
+
+- *(ssh)* keep SOCKS and forwarding peer strings from reaching the terminal raw (SSH-4)
+- *(config)* check owner and permissions of files included from the user config (SSH-3)
+- *(ssh)* refuse line breaks in every option rewritten into a config line (SSH-5)
+- *(config)* the first value obtained wins inside a block and among -o options (SSH-2)
+- *(ssh)* validate DNS-canonicalised host names before %h expansion (SSH-1)
+- *(sftp)* the server's working directory cannot make ls expand braces without end (XFER-14)
+- *(scp,sftp)* server-controlled text reaches the terminal without control characters (XFER-13)
+- *(scp)* the peer's mode only applies to what a transfer creates, unless -p (XFER-12)
+- *(scp)* keep the -O download name filter for ~, variable and quoted paths (XFER-11)
+- *(scp,sftp)* a server-supplied name stays one local path component (XFER-10)
+- *(sftp-server)* a jailed session cannot name the host's users and groups (XFER-16)
+- *(sshd)* refuse Match criteria that could never apply (SSHD-17)
+- *(sshd)* keep diagnostics off the client's socket in -i mode (SSHD-15)
+- *(sshd)* refuse conflicting forced commands before recording publickey (AUTH-1)
+- *(sshd)* drop session variables whose name is not a name (SSHD-14)
+- *(sshd)* tie a login record to the uid its connection runs as (SSHD-13)
+- *(sshd)* match AllowUsers/DenyUsers against the account name (SSHD-12)
+- *(sshd)* a negated group vetoes Match Group and AllowGroups (SSHD-11)
+- *(sshd)* only run AuthorizedPrincipalsCommand for trusted CAs (SSHD-10)
+- *(knock)* per-user verification and pending limits, global listener cap (KNK-2)
+- *(x11)* validate forwarded-display cookies off the accept thread (FWD-7)
+- *(client)* bound the read buffer while a stream write waits for window (CLI-3)
+- *(client)* refuse direct forwards after a host key mismatch (CLI-5)
+- *(client)* parse the KEX reply host key with the bounds-checked reader (CLI-4)
+- *(client)* enforce pinned_host_key in the async and mio clients (CLI-1)
+- *(kex)* wrap the ML-KEM secret in Zeroizing as returned (TRN-3)
+- *(compress)* cap one inflated packet at MAX_PACKET_LEN (TRN-2)
+- *(stream)* read ChannelStream in a loop, drop empty channel data (TRN-1)
+- *(server)* async userauth checks cert validity and surfaces restrictions (SRV-13)
+- *(server)* refuse direct-tcpip ports above 65535 (SRV-15)
+- *(server)* queue no empty chunks and a single EOF for handlers (SRV-14, TRN-1)
+- *(server)* match IPv4-mapped peers as IPv4 (SRV-12)
+- *(server)* refuse env names containing '=' or NUL (SRV-10)
+- *(auth)* a vetoed publickey factor ends authentication (AUTH-1)
+- *(key)* 600,000 PBKDF2 iterations for encrypted PKCS#8 keys (KEY-14)
+- *(key)* restrict clears options enabled before it (KEY-13)
+- *(ssh-keygen)* a KRL that fails to parse fails -Y verify (KEY-12)
+- *(known_hosts)* enforce @revoked on non-default ports (KEY-11)
+- *(deb)* warn when ssh.socket overrides are left behind (PKG-3)
+- *(deb)* keep the sshd_config backup current across reloads (PKG-2)
+- *(ssh-copy-id)* quote ssh options safely for the local eval (PKG-5)
+- *(ssh-copy-id)* never send a private key when the .pub is missing (PKG-1)
+
 ## [0.2.8](https://github.com/KarpelesLab/puressh/compare/v0.2.7...v0.2.8) - 2026-10-31
 
 ### Added

@@ -593,8 +593,7 @@ pub fn evaluate(cond: &MatchCondition, ctx: &MatchContext<'_>, policy: ExecPolic
             None => false,
         },
         MatchCondition::Group(patterns) => match ctx.groups {
-            // Matches iff any of the user's groups is matched by the list.
-            Some(groups) => groups.iter().any(|g| host_matches(patterns, g)),
+            Some(groups) => group_list_matches(patterns, groups),
             None => false,
         },
         MatchCondition::Address(patterns) => match ctx.address {
@@ -624,6 +623,29 @@ pub fn evaluate(cond: &MatchCondition, ctx: &MatchContext<'_>, policy: ExecPolic
         MatchCondition::RDomain(patterns) => ctx.rdomain.is_some_and(|r| host_matches(patterns, r)),
         MatchCondition::InvalidUser => ctx.invalid_user == Some(true),
     }
+}
+
+/// `Match group` over all of a user's groups, as OpenSSH's
+/// `ga_match_pattern_list`: a negated pattern that matches *any* of the
+/// groups vetoes the criterion; otherwise it holds iff some group matches a
+/// positive pattern. Evaluating the list one group at a time would let
+/// `staff,!contractors` match a member of both, through `staff`.
+fn group_list_matches(patterns: &[HostPattern], groups: &[String]) -> bool {
+    let mut found = false;
+    for group in groups {
+        for p in patterns {
+            match p {
+                HostPattern::Any => found = true,
+                HostPattern::Positive(g) => found |= glob_match(g, group),
+                HostPattern::Negative(g) => {
+                    if glob_match(g, group) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    found
 }
 
 /// True iff every condition in `conds` matches.
@@ -924,5 +946,41 @@ mod tests {
         // No groups in context ⇒ never matches.
         let c2 = ctx("h");
         assert!(!all_match(&conds, &c2, ExecPolicy::Deny));
+    }
+
+    #[test]
+    fn evaluate_group_negation_vetoes_across_groups() {
+        // SSHD-11: a negated entry excludes the *user*, whichever of their
+        // groups it names — not just that one group name.
+        let conds =
+            parse_match_line_server(&["group".to_string(), "staff,!contractors".to_string()], 1)
+                .unwrap();
+        let matches = |names: &[&str]| {
+            let groups: Vec<String> = names.iter().map(|s| s.to_string()).collect();
+            let c = MatchContext {
+                host: "h",
+                groups: Some(&groups),
+                ..MatchContext::default()
+            };
+            all_match(&conds, &c, ExecPolicy::Deny)
+        };
+        assert!(matches(&["staff"]));
+        assert!(matches(&["users", "staff"]));
+        // In both: the negation wins, in either order.
+        assert!(!matches(&["staff", "contractors"]));
+        assert!(!matches(&["contractors", "staff"]));
+        assert!(!matches(&["contractors"]));
+        assert!(!matches(&["users"]));
+        assert!(!matches(&[]));
+        // A lone negation never matches (no positive entry), as OpenSSH.
+        let neg =
+            parse_match_line_server(&["group".to_string(), "!contractors".to_string()], 1).unwrap();
+        let groups = vec!["staff".to_string()];
+        let c = MatchContext {
+            host: "h",
+            groups: Some(&groups),
+            ..MatchContext::default()
+        };
+        assert!(!all_match(&neg, &c, ExecPolicy::Deny));
     }
 }

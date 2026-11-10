@@ -3583,6 +3583,16 @@ mod imp {
         any_positive && positive_hit
     }
 
+    /// Whether a negated (`!`) entry of `pats` matches `name`.
+    fn negated_pattern_hits(pats: &[puressh::config::HostPattern], name: &str) -> bool {
+        pats.iter().any(|p| match p {
+            puressh::config::HostPattern::Negative(g) => {
+                puressh::config::host_matches(&[puressh::config::HostPattern::parse(g)], name)
+            }
+            _ => false,
+        })
+    }
+
     struct LocalAuthenticator {
         /// No PAM: refuse locked or expired accounts ([`account_refusal`]).
         native_account_checks: bool,
@@ -3809,10 +3819,17 @@ mod imp {
                     g
                 }
             };
+            // DenyGroups: any one group the list matches refuses.
             let in_group = |pats: &[puressh::config::HostPattern]| {
                 groups
                     .iter()
                     .any(|g| puressh::config::host_matches(pats, g))
+            };
+            // AllowGroups: some group must match, and a negated entry
+            // (`staff !contractors`) excludes the user through any of their
+            // groups, not only the group it names.
+            let allowed_group = |pats: &[puressh::config::HostPattern]| {
+                in_group(pats) && !groups.iter().any(|g| negated_pattern_hits(pats, g))
             };
 
             // 0. A knocked connection is bound to the knock's user.
@@ -3862,7 +3879,7 @@ mod imp {
                 return refuse("a group is listed in DenyGroups");
             }
             // 4. AllowGroups: if set, the user must be in a matching group.
-            if !self.allow_groups.is_empty() && !in_group(&self.allow_groups) {
+            if !self.allow_groups.is_empty() && !allowed_group(&self.allow_groups) {
                 return refuse("none of user's groups are listed in AllowGroups");
             }
             true
@@ -10294,6 +10311,30 @@ mod imp {
             assert!(a.cert_trusted(&ci, &user, &cert_blob));
             assert!(marker.exists(), "command did not run for a trusted CA");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// SSHD-11: `AllowGroups staff !contractors` refuses a member of
+        /// both; DenyGroups keeps refusing on any one matching group.
+        #[test]
+        fn allow_groups_negation_vetoes_across_groups() {
+            let mut groups = std::collections::HashMap::new();
+            groups.insert("alice".to_string(), vec!["staff".to_string()]);
+            groups.insert(
+                "carol".to_string(),
+                vec!["staff".to_string(), "contractors".to_string()],
+            );
+            groups.insert(
+                "dave".to_string(),
+                vec!["contractors".to_string(), "staff".to_string()],
+            );
+            let mut a = auth_with(&["*"], &[], &["staff", "!contractors"], &[], groups.clone());
+            assert!(a.access_allowed("alice"));
+            assert!(!a.access_allowed("carol"));
+            assert!(!a.access_allowed("dave"));
+            let mut d = auth_with(&["*"], &[], &[], &["contractors"], groups);
+            assert!(d.access_allowed("alice"));
+            assert!(!d.access_allowed("carol"));
+            assert!(!d.access_allowed("dave"));
         }
 
         // ---- FD: password / multi-factor helpers ---------------------------

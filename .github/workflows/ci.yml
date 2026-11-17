@@ -44,6 +44,70 @@ jobs:
       - name: Test (all features)
         run: cargo test --all-features
 
+  # The `internal` security-key provider against a real libfido2, with no
+  # authenticator attached: every symbol resolves and each operation says
+  # `DeviceNotFound` (`sk::fido2::tests::libfido2_without_device`, which
+  # runs only with `LIBFIDO2_PATH` set). On Windows the manifest also lists
+  # Windows Hello, so only the named-device cases run there.
+  libfido2:
+    name: libfido2 provider (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: libfido2-${{ matrix.os }}
+
+      - name: Install libfido2 (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update && sudo apt-get install -y libfido2-1
+          echo "LIBFIDO2_PATH=libfido2.so.1" >> "$GITHUB_ENV"
+
+      - name: Install libfido2 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install libfido2
+          echo "LIBFIDO2_PATH=$(brew --prefix libfido2)/lib/libfido2.1.dylib" >> "$GITHUB_ENV"
+
+      # Yubico's release build, pinned by hash: `fido2.dll` and its
+      # dependencies (cbor, crypto, zlib1) side by side.
+      - name: Install libfido2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $zip = "$env:RUNNER_TEMP\libfido2.zip"
+          Invoke-WebRequest https://developers.yubico.com/libfido2/Releases/libfido2-1.16.0-win.zip -OutFile $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash
+          if ($hash -ne "F39FFE8998716739F15F0EB0397165478E61D539A1AC638087CFBE9BAE8ACD3C") { throw "libfido2 zip hash mismatch: $hash" }
+          Expand-Archive $zip -DestinationPath "$env:RUNNER_TEMP\libfido2"
+          $dir = "$env:RUNNER_TEMP\libfido2\libfido2-1.16.0-win\Win64\Release\v143\dynamic"
+          "LIBFIDO2_DIR=$dir" | Out-File -Append $env:GITHUB_ENV
+          "LIBFIDO2_PATH=$dir\fido2.dll" | Out-File -Append $env:GITHUB_ENV
+
+      # Absolute path: the DLL's dependencies are found beside it.
+      - name: Test against libfido2
+        run: cargo test --lib sk::fido2 -- --nocapture
+
+      # Bare name: found in the application's directory (where the test
+      # executable is), never through PATH or the current directory.
+      - name: Test against libfido2 by name (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Copy-Item "$env:LIBFIDO2_DIR\*.dll" target\debug\deps\
+          $env:LIBFIDO2_PATH = "fido2.dll"
+          cargo test --lib sk::fido2 -- --nocapture
+
   interop:
     name: OpenSSH interop (real sshd)
     runs-on: ubuntu-latest

@@ -104,9 +104,15 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Copy-Item "$env:LIBFIDO2_DIR\*.dll" target\debug\deps\
+          $exe = cargo test --lib --no-run --message-format=json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.profile.test -and $_.executable } |
+            Select-Object -Last 1 -ExpandProperty executable
+          if (-not $exe) { throw "no test executable" }
+          Copy-Item "$env:LIBFIDO2_DIR\*.dll" (Split-Path $exe)
           $env:LIBFIDO2_PATH = "fido2.dll"
-          cargo test --lib sk::fido2 -- --nocapture
+          & $exe sk::fido2 --nocapture
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
   interop:
     name: OpenSSH interop (real sshd)

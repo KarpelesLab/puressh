@@ -25,7 +25,6 @@ use crate::hostkey::sk::{SK_ECDSA, SK_ED25519};
 use crate::key::{PrivateKey, SkCredential};
 
 mod external;
-#[cfg(not(windows))]
 mod fido2;
 
 pub use external::ExternalProvider;
@@ -247,12 +246,7 @@ pub fn open_provider(path: &str) -> core::result::Result<Arc<dyn Provider>, SkEr
         ));
     }
     if path.eq_ignore_ascii_case("internal") {
-        #[cfg(not(windows))]
         return Ok(Arc::new(fido2::Fido2Provider::open()?));
-        #[cfg(windows)]
-        return Err(SkError::Provider(
-            "internal security key support not enabled".into(),
-        ));
     }
     Ok(Arc::new(ExternalProvider::open(path)?))
 }

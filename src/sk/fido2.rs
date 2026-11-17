@@ -2,6 +2,9 @@
 //! OpenSSH's `sk-usbhid.c`.
 //!
 //! libfido2 is loaded at run time, so there is no link-time dependency.
+//! On Windows its builds also list Windows Hello (`windows://hello`) among
+//! the devices, which reaches authenticators through the WebAuthn API:
+//! raw HID access to them needs an elevated process there.
 //! The functions only some of its versions export are `#[optional]`, with
 //! the fallbacks OpenSSH compiles in when its configure checks miss them.
 
@@ -30,8 +33,62 @@ const LIBRARY_NAMES: &[&str] = &[
     "/usr/local/lib/libfido2.1.dylib",
     "/usr/local/lib/libfido2.dylib",
 ];
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", windows)))]
 const LIBRARY_NAMES: &[&str] = &["libfido2.so.1", "libfido2.so"];
+/// Yubico's and vcpkg's build, then MSYS2's. Searched for in the
+/// application's directory and System32 only (see [`load_library`]).
+#[cfg(windows)]
+const LIBRARY_NAMES: &[&str] = &["fido2.dll", "libfido2-1.dll", "libfido2.dll"];
+
+/// Load the first of `names` that opens, and resolve libfido2's symbols.
+///
+/// # Safety
+///
+/// As [`dlsym::Library::open`]: the library's initialisers run.
+#[cfg(not(windows))]
+unsafe fn load_library(names: &[&str]) -> dlsym::Result<Fido2> {
+    // SAFETY: forwarded to the caller.
+    unsafe { Fido2::open_first(names) }
+}
+
+/// Load the first of `names` that opens, and resolve libfido2's symbols.
+///
+/// A bare name is looked for in the application's directory and System32
+/// (`LOAD_LIBRARY_SEARCH_DEFAULT_DIRS`), never in the current directory or
+/// `PATH`, where anyone able to write a file could plant one; an absolute
+/// path also has its dependencies (libcbor, libcrypto, zlib) looked for
+/// beside it.
+///
+/// # Safety
+///
+/// As [`dlsym::Library::open`]: the library's initialisers run.
+#[cfg(windows)]
+unsafe fn load_library(names: &[&str]) -> dlsym::Result<Fido2> {
+    use dlsym::os::windows::OpenOptions;
+    let mut last = None;
+    for name in names {
+        let mut options = OpenOptions::new();
+        options.search_default_dirs(true);
+        if std::path::Path::new(name).is_absolute() {
+            options.search_dll_load_dir(true);
+        }
+        // SAFETY: forwarded to the caller.
+        match unsafe { options.open(name) } {
+            Ok(lib) => return Fido2::load(lib),
+            Err(e) => last = Some(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| dlsym::Error::Open {
+        path: Default::default(),
+        message: "no candidate library names given".into(),
+    }))
+}
+
+/// Where a missing libfido2 should go, for the error.
+#[cfg(windows)]
+const LIBRARY_HINT: &str = " (fido2.dll goes beside the executable or in System32)";
+#[cfg(not(windows))]
+const LIBRARY_HINT: &str = "";
 
 // `fido/err.h`.
 const FIDO_OK: c_int = 0x00;
@@ -469,9 +526,9 @@ impl Fido2Provider {
         // SAFETY: loading libfido2 runs its initialisers (and its
         // dependencies'); `internal` trusts the system's libfido2, as
         // OpenSSH linking it does.
-        let lib = unsafe { Fido2::open_first(names) }.map_err(|e| {
+        let lib = unsafe { load_library(names) }.map_err(|e| {
             SkError::Provider(alloc::format!(
-                "internal security key support unavailable: cannot load libfido2: {e}"
+                "internal security key support unavailable: cannot load libfido2: {e}{LIBRARY_HINT}"
             ))
         })?;
         // SAFETY: only looked up, never called through this type.
@@ -1291,6 +1348,25 @@ mod tests {
         assert_eq!(pack_sig(Algorithm::Ed25519, &ed[..63]), None);
     }
 
+    /// How many devices libfido2's manifest lists.
+    fn manifest_len(p: &Fido2Provider) -> usize {
+        p.init();
+        // SAFETY: a list of `MAX_FIDO_DEVICES` entries, freed by `DevInfo`,
+        // and a count to write to.
+        let devlist = DevInfo {
+            lib: &p.lib,
+            ptr: unsafe { p.lib.fido_dev_info_new(MAX_FIDO_DEVICES) },
+        };
+        assert!(!devlist.ptr.is_null());
+        let mut n = 0;
+        let r = unsafe {
+            p.lib
+                .fido_dev_info_manifest(devlist.ptr, MAX_FIDO_DEVICES, &mut n)
+        };
+        assert_eq!(r, FIDO_OK);
+        n
+    }
+
     /// With `LIBFIDO2_PATH` naming a libfido2 build: every symbol resolves,
     /// and with no authenticator attached each operation reports
     /// `DeviceNotFound`, as OpenSSH's does.
@@ -1316,9 +1392,18 @@ mod tests {
             assert!(found, "{name:?} missing");
         }
 
+        // Probing only says `DeviceNotFound` with nothing attached; on
+        // Windows, Windows Hello is always listed, and would prompt.
+        let ndevs = manifest_len(&p);
         let none = [];
         let missing = [opt("device", "/nonexistent/hidraw", false)];
-        for options in [&none[..], &missing[..]] {
+        let option_sets: &[&[SkOption]] = if ndevs == 0 {
+            &[&none, &missing]
+        } else {
+            std::eprintln!("{ndevs} FIDO device(s) listed: probing skipped");
+            &[&missing]
+        };
+        for &options in option_sets {
             for alg in [Algorithm::EcdsaP256, Algorithm::Ed25519] {
                 for flags in [USER_PRESENCE_REQD, USER_PRESENCE_REQD | RESIDENT_KEY] {
                     assert_eq!(

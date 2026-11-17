@@ -125,7 +125,7 @@ cargo add puressh --features server
 | `pam`          | no      | PAM session integration for `sshd` (Linux only, libpam loaded at run time); implies `server` |
 | `multichannel` | yes     | Concurrent multi-channel client (`SharedClient`, `SftpSession`) |
 | `knock`        | yes     | Stealth UDP knock rendezvous in front of SSH (puressh-only, see [`docs/knock.md`](docs/knock.md)) |
-| `security-key` | yes     | FIDO security keys (`sk-ecdsa`, `sk-ed25519`): signing, enrolment and resident keys through a `SecurityKeyProvider` library or `internal` (libfido2), loaded at run time. Verifying their signatures needs no feature |
+| `security-key` | yes     | FIDO security keys (`sk-ecdsa`, `sk-ed25519`): signing, enrolment and resident keys through a `SecurityKeyProvider` library or `internal` (libfido2, which on Windows also reaches keys through Windows Hello), loaded at run time. Verifying their signatures needs no feature |
 | `pkcs11`       | yes     | PKCS#11 tokens (`PKCS11Provider`, `ssh -I`, `ssh-keygen -D`, `ssh-add -s`), the module loaded at run time |
 | `agent`        | no      | Agent daemon side (`agent::AgentState`, the `ssh-agent` binary); pulls in `nix` on Unix. The agent client is always available |
 | `async`        | no      | Runtime-agnostic async frontends (`AsyncClient`, `AsyncServerConnection`) over `futures_io` |

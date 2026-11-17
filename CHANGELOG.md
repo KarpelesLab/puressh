@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.10](https://github.com/KarpelesLab/puressh/compare/v0.2.9...v0.2.10) - 2026-11-17
+
+### Added
+
+- *(sk)* say why the internal provider can't load, and what to install
+- *(sk)* internal security-key provider on Windows
+
+### Fixed
+
+- *(ssh-agent)* hold signals across the daemonizing fork
+
+### Other
+
+- copy libfido2 beside the test executable cargo reports
+- *(krl)* return the key-id match directly (clippy needless_bool)
+- test the internal security-key provider against a real libfido2
+
 ## [0.2.9](https://github.com/KarpelesLab/puressh/compare/v0.2.8...v0.2.9) - 2026-11-10
 
 ### Added

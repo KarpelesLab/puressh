@@ -510,6 +510,13 @@ pub trait Prompt: Send + Sync {
     /// The signature is made (or failed): close what [`Self::touch`]
     /// opened, if anything.
     fn done(&self) {}
+    /// Signing with `key` failed, for `error` (the provider could not be
+    /// loaded, no authenticator, ...): tell the user why, where only a
+    /// failure would reach them otherwise (an agent's client sees just a
+    /// refusal). Not called by [`SkSigner`], whose caller gets the error.
+    fn failed(&self, key: &PrivateKey, error: &Error) {
+        let _ = (key, error);
+    }
 }
 
 /// A [`HostKey`](crate::hostkey::HostKey) whose signatures the

@@ -372,6 +372,21 @@ mod imp {
             }
         }
 
+        /// A security key signs through the agent's provider, which only
+        /// says "agent refused operation" when it can't load: warn now if
+        /// it doesn't load here (the agent usually runs on this machine).
+        fn check_sk_provider(&self, name: &str, key: &puressh::key::PrivateKey) {
+            #[cfg(feature = "security-key")]
+            if key.sk_credential().is_some()
+                && let Some(provider) = &self.constraints.sk_provider
+                && let Err(e) = puressh::sk::open_provider(provider)
+            {
+                eprintln!("Warning: the agent may be unable to sign with \"{name}\": {e}");
+            }
+            #[cfg(not(feature = "security-key"))]
+            let _ = (name, key);
+        }
+
         /// OpenSSH's `add_file`.
         fn add_file(&mut self, path: &str) -> bool {
             let (name, pem) = if path == "-" {
@@ -416,6 +431,7 @@ mod imp {
                             eprintln!("Identity added: {name} ({comment})");
                             self.added_messages(self.constraints.lifetime);
                         }
+                        self.check_sk_provider(name, &key);
                     }
                     Err(_) => {
                         eprintln!("Could not add identity \"{name}\": agent refused operation")

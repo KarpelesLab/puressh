@@ -887,6 +887,17 @@ mod imp {
             }
         }
 
+        /// Only seen with `-d` (or when run in the foreground): the client
+        /// is told just "agent refused operation".
+        fn failed(&self, key: &puressh::key::PrivateKey, error: &puressh::Error) {
+            let pk = key.public_key();
+            eprintln!(
+                "ssh-agent: signing with {} key {} failed: {error}",
+                pk.type_label(),
+                pk.sha256_fingerprint()
+            );
+        }
+
         fn pin(
             &self,
             key: &puressh::key::PrivateKey,

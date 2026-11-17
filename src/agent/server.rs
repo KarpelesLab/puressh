@@ -551,11 +551,17 @@ impl AgentState {
     #[cfg(feature = "security-key")]
     fn sign_security_key(&self, held: &Held, data: &[u8]) -> Option<Vec<u8>> {
         use crate::hostkey::HostKey;
-        let provider = crate::sk::open_provider(held.sk_provider.as_deref()?).ok()?;
-        crate::sk::SkSigner::new(held.key.soft()?.clone(), provider, self.sk_prompt.clone())
-            .ok()?
-            .sign(data)
-            .ok()
+        let key = held.key.soft()?;
+        let res = (|| {
+            let provider = crate::sk::open_provider(held.sk_provider.as_deref().unwrap_or(""))?;
+            crate::sk::SkSigner::new(key.clone(), provider, self.sk_prompt.clone())?.sign(data)
+        })();
+        res.inspect_err(|e| {
+            if let Some(p) = &self.sk_prompt {
+                p.failed(key, e);
+            }
+        })
+        .ok()
     }
 
     #[cfg(not(feature = "security-key"))]

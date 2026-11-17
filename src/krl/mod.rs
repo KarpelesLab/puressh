@@ -132,10 +132,7 @@ impl CaRevocation {
                 }
             }
         }
-        if !key_id.is_empty() && self.key_ids.iter().any(|k| k == key_id) {
-            return true;
-        }
-        false
+        !key_id.is_empty() && self.key_ids.iter().any(|k| k == key_id)
     }
 }
 

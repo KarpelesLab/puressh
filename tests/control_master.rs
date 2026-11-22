@@ -7,9 +7,14 @@
 //! connection — proven by an auth counter that must remain at exactly 1 even
 //! after the second (mux) session runs.
 //!
-//! Unix-only: the mux module is gated `cfg(all(unix, feature = "client"))`.
+//! The mux module is available on Unix and on Windows with the win-ipc feature.
 
-#![cfg(all(unix, feature = "client", feature = "server", feature = "multichannel"))]
+#![cfg(all(
+    any(unix, all(windows, feature = "win-ipc")),
+    feature = "client",
+    feature = "server",
+    feature = "multichannel"
+))]
 
 use std::path::PathBuf;
 use std::sync::Arc;

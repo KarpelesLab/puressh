@@ -2,11 +2,11 @@
 //! session as a new channel on the master's existing SSH connection.
 //!
 //! No SSH state lives here — the client just speaks the mux frame protocol
-//! ([`super::Frame`]) over the Unix socket and pumps local stdin/stdout/stderr
+//! ([`super::Frame`]) over the control carrier and pumps local stdin/stdout/stderr
 //! against it. The master does the real channel work.
 
-use std::io::{self, Read, Write};
-use std::os::unix::net::UnixStream;
+use super::transport::{self, Stream};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -52,41 +52,13 @@ pub enum ProbeOutcome {
 /// "nothing there" from "something suspicious there"; every rejection is
 /// reported as `PermissionDenied` with a human-readable reason.
 pub fn validate_control_socket(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let md = std::fs::symlink_metadata(path)?;
-    let reject = |why: String| {
-        io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!("control socket {}: {why}", path.display()),
-        )
-    };
-    if md.file_type().is_symlink() {
-        return Err(reject("is a symlink; refusing to follow it".into()));
-    }
-    if !md.file_type().is_socket() {
-        return Err(reject("is not a Unix-domain socket".into()));
-    }
-    let euid = crate::sys::effective_uid()?;
-    if md.uid() != euid {
-        return Err(reject(format!(
-            "is owned by uid {} but we are euid {euid}; refusing to trust another user's master",
-            md.uid()
-        )));
-    }
-    let mode = md.mode() & 0o777;
-    if (mode & 0o077) != 0 {
-        return Err(reject(format!(
-            "is group/world-accessible (mode {mode:04o}); refusing to use it"
-        )));
-    }
-    Ok(())
+    transport::validate(path)
 }
 
 /// [`validate_control_socket`] followed by `UnixStream::connect`. Every
 /// client-side connect in this module goes through here.
-fn connect_control_socket(path: &Path) -> io::Result<UnixStream> {
-    validate_control_socket(path)?;
-    UnixStream::connect(path)
+fn connect_control_socket(path: &Path) -> io::Result<Stream> {
+    transport::connect(path)
 }
 
 /// The session a mux client wants the master to open on its behalf.
@@ -130,7 +102,7 @@ pub fn open_forward(
     dest_port: u16,
     orig_host: &str,
     orig_port: u16,
-) -> Result<UnixStream, MuxError> {
+) -> Result<Stream, MuxError> {
     let mut sock = hello(path)?;
 
     write_frame(
@@ -153,7 +125,7 @@ pub fn open_forward(
 }
 
 /// Connect to the master at `path` and exchange HELLOs.
-fn hello(path: &Path) -> Result<UnixStream, MuxError> {
+fn hello(path: &Path) -> Result<Stream, MuxError> {
     let mut sock = connect_control_socket(path).map_err(MuxError::Io)?;
     write_frame(
         &mut sock,
@@ -221,7 +193,7 @@ pub fn channels(path: &Path) -> Result<String, MuxError> {
 ///
 /// `local` must be cloneable into independent read/write halves (the splicing
 /// uses one thread per direction); a `TcpStream` satisfies this via `try_clone`.
-pub fn splice_forward<S>(sock: UnixStream, local: S) -> Result<(), MuxError>
+pub fn splice_forward<S>(sock: Stream, local: S) -> Result<(), MuxError>
 where
     S: Read + Write + TryCloneStream + Send + 'static,
 {
@@ -307,13 +279,13 @@ pub fn probe_master(path: &Path) -> ProbeOutcome {
     // `symlink_metadata` so a dangling or hostile symlink is seen as
     // *present* (and then rejected below) rather than as `Absent`, which
     // would invite the caller to bind a new master through it.
-    if std::fs::symlink_metadata(path).is_err() {
+    if cfg!(unix) && std::fs::symlink_metadata(path).is_err() {
         return ProbeOutcome::Absent;
     }
     if validate_control_socket(path).is_err() {
         return ProbeOutcome::Stale;
     }
-    match UnixStream::connect(path) {
+    match transport::connect(path) {
         Ok(mut sock) => {
             let _ = sock.set_read_timeout(Some(Duration::from_millis(500)));
             let _ = sock.set_write_timeout(Some(Duration::from_millis(500)));
@@ -334,7 +306,9 @@ pub fn probe_master(path: &Path) -> ProbeOutcome {
                 _ => ProbeOutcome::Stale,
             }
         }
-        // Path exists but nothing is listening (or perms) — stale.
+        // No carrier at the path: there is no master to reuse.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => ProbeOutcome::Absent,
+        // Something is there, but nothing trusted answers: stale.
         Err(_) => ProbeOutcome::Stale,
     }
 }
@@ -348,6 +322,21 @@ pub enum ControlCommand {
     /// `-O exit` / `-O stop`: ask the master to tear down and unlink its
     /// socket (HELLO + EXIT_REQUEST).
     Exit,
+}
+
+fn check_transport_gone(err: &MuxError) -> bool {
+    matches!(
+        err,
+        MuxError::Io(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::UnexpectedEof
+            )
+    )
 }
 
 /// Send a `ssh -O` control command to the master at `path` after a HELLO
@@ -375,13 +364,21 @@ pub fn send_control_command(path: &Path, cmd: ControlCommand) -> Result<bool, Mu
     let _ = sock.set_read_timeout(Some(Duration::from_millis(2000)));
     let _ = sock.set_write_timeout(Some(Duration::from_millis(2000)));
 
-    // HELLO handshake.
-    write_frame(
+    // HELLO handshake. A master may disappear between the connect and the
+    // first frame (notably while a Windows named-pipe instance is closing).
+    // For Check that is the same answer as an absent master; Exit must still
+    // surface the transport error.
+    if let Err(e) = write_frame(
         &mut sock,
         &Frame::Hello {
             version: PROTOCOL_VERSION,
         },
-    )?;
+    ) {
+        if cmd == ControlCommand::Check && check_transport_gone(&e) {
+            return Ok(false);
+        }
+        return Err(e);
+    }
     match read_frame(&mut sock) {
         Ok(Some(Frame::Hello { version })) if version == PROTOCOL_VERSION => {}
         _ if cmd == ControlCommand::Check => return Ok(false),
@@ -392,12 +389,20 @@ pub fn send_control_command(path: &Path, cmd: ControlCommand) -> Result<bool, Mu
             });
         }
         Ok(_) => return Err(MuxError::Unexpected("expected HELLO from master")),
+        Err(e) if cmd == ControlCommand::Check && check_transport_gone(&e) => {
+            return Ok(false);
+        }
         Err(e) => return Err(e),
     }
 
     match cmd {
         ControlCommand::Check => {
-            write_frame(&mut sock, &Frame::AliveCheck)?;
+            if let Err(e) = write_frame(&mut sock, &Frame::AliveCheck) {
+                if check_transport_gone(&e) {
+                    return Ok(false);
+                }
+                return Err(e);
+            }
             match read_frame(&mut sock) {
                 Ok(Some(Frame::AliveOk)) => Ok(true),
                 _ => Ok(false),
@@ -473,6 +478,10 @@ pub fn run_client(
     // stdin → STDIN_DATA frames.
     let in_write = write_half.clone();
     let in_done = done.clone();
+    // A PTY session whose local stdin is already at EOF (a scripted
+    // `ssh -tt host cmd` through a master) must give the remote console a
+    // moment before EOF tears it down, or the command's output is lost.
+    let eof_grace = req.want_pty && !io::stdin().is_terminal();
     let t_in = thread::spawn(move || {
         let mut buf = [0u8; 32 * 1024];
         let mut stdin = io::stdin();
@@ -494,6 +503,9 @@ pub fn run_client(
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
+        }
+        if eof_grace {
+            thread::sleep(Duration::from_millis(150));
         }
         // Half-close: tell the master no more stdin is coming.
         if let Ok(mut g) = in_write.lock() {
@@ -576,7 +588,7 @@ pub fn run_client(
     Ok(exit_code)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod control_socket_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -648,5 +660,30 @@ mod control_socket_tests {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(validate_control_socket(&p).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod control_check_tests {
+    use super::*;
+
+    #[test]
+    fn only_closed_transport_is_absent_for_check() {
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            assert!(check_transport_gone(&MuxError::Io(io::Error::new(
+                kind, "closed"
+            ))));
+        }
+        assert!(!check_transport_gone(&MuxError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "unresponsive",
+        ))));
+        assert!(!check_transport_gone(&MuxError::Malformed("bad frame")));
     }
 }

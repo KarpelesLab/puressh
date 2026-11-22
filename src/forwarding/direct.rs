@@ -325,7 +325,10 @@ mod tests {
                 Ok(ChannelEgress::Data(d)) => got.extend_from_slice(&d),
                 Ok(ChannelEgress::Eof) | Ok(ChannelEgress::Close) => break,
                 Ok(_) => continue,
-                Err(_) => break,
+                // A loaded machine can take longer than one interval, so keep waiting
+                // until the deadline. Only a disconnected channel ends the wait early.
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         assert_eq!(&got, b"ping");
@@ -344,7 +347,8 @@ mod tests {
                 Ok(ChannelEgress::Eof) => saw_eof = true,
                 Ok(ChannelEgress::Close) => saw_close = true,
                 Ok(_) => continue,
-                Err(_) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         assert!(saw_eof, "handler should send Eof on teardown");

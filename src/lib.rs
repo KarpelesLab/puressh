@@ -1,20 +1,23 @@
 #![cfg_attr(not(feature = "std"), no_std)]
-// No `unsafe` outside the C ABI (`ffi`) and the two run-time loader modules
-// (`sk`, `pkcs11`), which carry their own `#[allow(unsafe_code)]`. With
-// none of the three features on, the whole crate is `forbid`den. Tests
-// are `deny` rather than `forbid`: `std::env::set_var` is `unsafe` since
-// edition 2024 and a test may `allow` it locally, which `forbid` would
-// refuse (E0453) and so break `cargo test` in the minimal configuration.
+// No `unsafe` outside the C ABI (`ffi`), the two run-time loader modules
+// (`sk`, `pkcs11`) and the Windows named-pipe transport (`win-ipc` on a
+// Windows target), which carry their own `#[allow(unsafe_code)]`. With none
+// of them on, the whole crate is `forbid`den. Tests are `deny` rather than
+// `forbid`: `std::env::set_var` is `unsafe` since edition 2024 and a test
+// may `allow` it locally, which `forbid` would refuse (E0453) and so break
+// `cargo test` in the minimal configuration.
 #![cfg_attr(
     all(
         not(test),
-        not(any(feature = "ffi", feature = "security-key", feature = "pkcs11"))
+        not(any(feature = "ffi", feature = "security-key", feature = "pkcs11")),
+        not(all(windows, feature = "win-ipc"))
     ),
     forbid(unsafe_code)
 )]
 #![cfg_attr(
     all(
         not(feature = "ffi"),
+        not(all(windows, feature = "win-ipc")),
         any(test, feature = "security-key", feature = "pkcs11")
     ),
     deny(unsafe_code)
@@ -143,16 +146,17 @@ pub mod server_async;
 #[cfg(all(unix, feature = "client"))]
 pub mod proc_transport;
 
+/// Platform-neutral OpenSSH percent-token expansion and shell-safety checks.
+pub mod expand;
+
 // Client connection multiplexing (`ControlMaster` / `ControlPath` /
-// `ControlPersist`) over a Unix-domain control socket. Unix-only and gated on
-// `client` (which pulls in `std`); the master/accept side additionally needs
-// `multichannel` for `SharedClient` and is gated again inside the module. The
-// path helpers compile with just `client`, so Windows and no_std+alloc
-// builds skip the whole module via its inner
-// `#![cfg(all(unix, feature = "client"))]`.
-#[cfg(all(unix, feature = "client"))]
+// `ControlPersist`) over a Unix-domain socket on Unix or a named pipe on
+// Windows. Gated on `client` (which pulls in `std`); the master/accept side
+// additionally needs `multichannel` and Windows needs `win-ipc`.
+#[cfg(all(any(unix, all(windows, feature = "win-ipc")), feature = "client"))]
 pub mod mux;
 
+/// Shared multi-channel client support used by the mux and C ABI layers.
 #[cfg(feature = "multichannel")]
 pub mod shared;
 

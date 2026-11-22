@@ -25,6 +25,8 @@ use puressh::client::{
     ForwardedStreamlocalOrigin, ForwardedTcpipCallback, ForwardedTcpipOrigin,
 };
 
+#[path = "ssh/bootstrap.rs"]
+mod bootstrap;
 #[path = "common.rs"]
 mod common;
 
@@ -2859,6 +2861,13 @@ fn run_query(kind: &str) -> Result<i32, String> {
 }
 
 fn run() -> Result<i32, String> {
+    // A background ControlPersist master (Windows) answers its prompts through
+    // this process stdin and stdout, and serves the control pipe instead of
+    // running a session. See the bootstrap module.
+    let daemon = bootstrap::is_daemon();
+    if daemon {
+        bootstrap::install_relay();
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Only a leading `-h`/`--help` asks for help: anywhere else it may be
     // part of the remote command (`ssh host df -h`).
@@ -3230,14 +3239,14 @@ fn run() -> Result<i32, String> {
     }
 
     // ---- Connection multiplexing (ControlMaster/ControlPath/ControlPersist) ----
-    // Resolve the control settings once. The honoring is Unix-only; the
-    // resolved values just sit unused on other platforms.
-    #[cfg(unix)]
+    // Resolve the control settings once; which platform carriers they can be
+    // honoured on is decided by the gate below.
+    #[cfg(any(unix, all(windows, feature = "win-ipc")))]
     let mut mux_decision = resolve_mux(&cfg_block, &connect_host, port, &user)?;
 
     // `-O check|exit|stop`: a control command, not a session. Resolve the
     // ControlPath, talk to the master, and return — never connect/auth.
-    #[cfg(unix)]
+    #[cfg(any(unix, all(windows, feature = "win-ipc")))]
     if let Some(cmd) = cli.control_cmd.clone() {
         let dec = mux_decision.as_ref().ok_or_else(|| {
             "-O requires a ControlPath (set ControlPath in ssh_config or -o ControlPath=…)"
@@ -3248,7 +3257,7 @@ fn run() -> Result<i32, String> {
 
     // `-O proxy`: the session goes through the running master, which must
     // be there.
-    #[cfg(unix)]
+    #[cfg(any(unix, all(windows, feature = "win-ipc")))]
     if cli.mux_proxy {
         let dec = mux_decision.as_ref().ok_or_else(|| {
             "-O requires a ControlPath (set ControlPath in ssh_config or -o ControlPath=…)"
@@ -3264,7 +3273,7 @@ fn run() -> Result<i32, String> {
         return run_mux_client(&cli, &cfg_block, &dec.path);
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, all(windows, feature = "win-ipc")))]
     if let Some(ref dec) = mux_decision {
         use puressh::config::ControlMaster;
         // Client role: if master is auto/no and a live master answers, attach
@@ -3347,6 +3356,19 @@ fn run() -> Result<i32, String> {
                 }
             }
         }
+    }
+
+    // Windows has no fork(): a persistent master is a detached ssh process
+    // that connects and authenticates for itself. Start it now and attach as
+    // a mux client; connecting here first would leave the daemon with an
+    // authenticated socket it cannot inherit.
+    #[cfg(not(unix))]
+    if !daemon
+        && let Some(ref dec) = mux_decision
+        && dec.become_master
+        && !matches!(dec.persist, puressh::mux::Persist::No)
+    {
+        return start_background_master_and_attach(dec, &cli, &cfg_block, &dynamics);
     }
 
     // Decide the connection transport for the final target:
@@ -3571,6 +3593,18 @@ fn run() -> Result<i32, String> {
         });
     }
     authenticate_client(&mut client, &connect_host, &user, credentials, &cfg_block)?;
+
+    // Background master (Windows ControlPersist): serve the control pipe in
+    // place of a session. See the bootstrap module.
+    #[cfg(all(windows, feature = "win-ipc"))]
+    if daemon {
+        let dec = mux_decision
+            .as_ref()
+            .filter(|d| d.become_master)
+            .ok_or_else(|| String::from("background master started without a master role"))?;
+        return bootstrap::serve_background_master(dec, client);
+    }
+    let _ = daemon;
 
     // AddKeysToAgent yes: push the supplied identities into the local agent.
     maybe_add_keys_to_agent(&cfg_block, &cli);
@@ -3875,7 +3909,7 @@ fn run() -> Result<i32, String> {
     });
     // Master role: serve the control socket while running this session as
     // the foreground one.
-    #[cfg(unix)]
+    #[cfg(any(unix, all(windows, feature = "win-ipc")))]
     if let Some(dec) = mux_decision.as_ref().filter(|d| d.become_master) {
         if let Some(u) = &hostkeys_updater {
             u.attach(shared.clone());
@@ -5173,8 +5207,8 @@ fn run_stdio_forward(client: Client, spec: &str, no_more_sessions: bool) -> Resu
 // Connection multiplexing (ControlMaster / ControlPath / ControlPersist)
 // ---------------------------------------------------------------------------
 
-/// Resolved per-host mux settings (Unix-only honoring).
-#[cfg(unix)]
+/// Resolved per-host mux settings.
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 struct MuxDecision {
     /// Concrete control-socket path (token/`~`-expanded, length-checked).
     path: PathBuf,
@@ -5633,7 +5667,7 @@ fn expand_env(s: &str) -> String {
 /// `ControlMaster no` with no path — i.e. nothing to do), and `Err` when the
 /// expanded `ControlPath` is too long for a Unix socket address (OpenSSH:
 /// `ControlPath too long`).
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 fn resolve_mux(
     cfg_block: &puressh::config::ClientOptions,
     connect_host: &str,
@@ -5672,16 +5706,30 @@ fn resolve_mux(
 /// on stderr, worded as OpenSSH's: `Master running (pid=N)`, `Exit request
 /// sent.`, `Stop listening request sent.`; no master: `Control socket
 /// connect(PATH): <reason>` and exit 255.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 fn run_control_command(cmd: &str, path: &std::path::Path, cli: &Cli) -> Result<i32, String> {
     use puressh::mux::ControlCommand;
     // Reach the master first: the error is OpenSSH's message when absent.
+    #[cfg(unix)]
     let pid = match std::os::unix::net::UnixStream::connect(path) {
         Ok(s) => master_pid(&s),
         Err(e) => {
             let e = e.to_string();
             let e = e.split(" (os error").next().unwrap_or(&e).to_string();
             eprintln!("Control socket connect({}): {e}", path.display());
+            return Ok(255);
+        }
+    };
+    // A named pipe carries no peer credentials and no pid; the probe is the
+    // liveness check, and the master is simply reported without one.
+    #[cfg(not(unix))]
+    let pid: Option<i32> = match puressh::mux::probe_master(path) {
+        puressh::mux::ProbeOutcome::Live => None,
+        _ => {
+            eprintln!(
+                "Control socket connect({}): No such file or directory",
+                path.display()
+            );
             return Ok(255);
         }
     };
@@ -5847,7 +5895,7 @@ fn peer_sockopt<T>(
 /// `OPEN_DIRECT_TCPIP` control connection to the master, which dials the
 /// destination over its SSH connection and splices the result back. Blocks
 /// forever (Ctrl-C to quit), mirroring `ssh -N -L`/`-D`.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 fn run_mux_forwarding(
     cli: &Cli,
     dynamics: &[DynamicForward],
@@ -5990,7 +6038,7 @@ fn run_mux_forwarding(
 }
 
 /// Attach to a live master at `path` and run the requested session over it.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 fn run_mux_client(
     cli: &Cli,
     cfg_block: &puressh::config::ClientOptions,
@@ -6015,16 +6063,7 @@ fn run_mux_client(
 
     // Put the local terminal in raw mode for an interactive PTY session so
     // keystrokes reach the remote unprocessed (mirrors the direct path).
-    let _raw_guard = if want_pty {
-        let mut t: libc::termios = unsafe { core::mem::zeroed() };
-        if unsafe { libc::tcgetattr(0, &mut t) } == 0 {
-            Some(common::TermiosRawGuard::install(&t))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let _raw_guard = if want_pty { local_tty_enter().1 } else { None };
 
     // Resize watcher only for PTY sessions.
     let resize: Option<Arc<dyn Fn() -> (u32, u32) + Send + Sync>> = if want_pty {
@@ -6047,6 +6086,13 @@ fn term_env() -> String {
     std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string())
 }
 
+/// Windows has no `$TERM`; every console terminal we drive speaks `xterm`
+/// (the VT sequences the console enables at start-up).
+#[cfg(not(unix))]
+fn term_env() -> String {
+    "xterm".to_string()
+}
+
 /// Become the ControlMaster and run this invocation's own session.
 ///
 /// Under `ControlPersist no` the master is tied to the foreground session: we
@@ -6062,7 +6108,7 @@ fn term_env() -> String {
 /// exactly like any later `ssh` to the same master. This is the OpenSSH model:
 /// killing the launching `ssh` leaves the master (and any other attached
 /// sessions) alive.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 fn become_master<F>(
     dec: &MuxDecision,
     cli: &Cli,
@@ -6078,6 +6124,7 @@ where
     // `-O exit` ends the master process, whatever its own session is doing
     // (status 255, as OpenSSH's client loop leaves it).
     let cfg = puressh::mux::MasterConfig::new(dec.path.clone(), dec.persist).with_on_exit(|| {
+        #[cfg(unix)]
         if let Ok(g) = ORIGINAL_TERMIOS.lock()
             && let Some(t) = g.as_ref()
         {
@@ -6099,8 +6146,11 @@ where
     let cfg = cfg
         .with_on_forward(move |kind, spec, cancel| forwards.handle(kind, spec, cancel))
         .with_on_conninfo(move || connection_info(&info_shared, started))
-        .with_on_channels(move || channel_list(&chan_shared))
-        .with_peer_check(mux_peer_allowed);
+        .with_on_channels(move || channel_list(&chan_shared));
+    // Peer credentials are a Unix socket facility; the Windows carrier's
+    // access control is the pipe's ACL.
+    #[cfg(unix)]
+    let cfg = cfg.with_peer_check(mux_peer_allowed);
 
     // ControlPersist no: master lives and dies with the foreground session in
     // this process. No daemonization.
@@ -6121,12 +6171,86 @@ where
             dec.path.display()
         ),
     );
-    daemonize_master(dec, cli, cfg_block, shared, cfg, start_serving)
+    #[cfg(unix)]
+    {
+        daemonize_master(dec, cli, cfg_block, shared, cfg, start_serving)
+    }
+    // Windows cannot fork an authenticated socket into a child. The
+    // persistent master there is a fresh process that connects (and
+    // authenticates) on its own; run() starts it before connecting, so this
+    // point is unreachable on Windows.
+    #[cfg(not(unix))]
+    {
+        let _ = (cli, cfg_block, shared, cfg, start_serving);
+        Err("internal: ControlPersist on Windows starts its master before connecting".to_string())
+    }
+}
+
+/// Start the persistent master for `dec` and attach this invocation to it.
+///
+/// Windows cannot fork an authenticated connection into a detached child, so
+/// the master there is a fresh copy of this program that connects and
+/// authenticates on its own, relaying its prompts back to this process. Once
+/// its control pipe is ready we attach as an ordinary mux client.
+///
+/// Under `ControlMaster yes` a live master is refused; under `auto` it is
+/// shared, including when another invocation won the start-up race.
+#[cfg(not(unix))]
+fn start_background_master_and_attach(
+    dec: &MuxDecision,
+    cli: &Cli,
+    cfg_block: &puressh::config::ClientOptions,
+    dynamics: &[DynamicForward],
+) -> Result<i32, String> {
+    use puressh::config::ControlMaster;
+    use puressh::mux::ProbeOutcome;
+    let shares = matches!(dec.master, ControlMaster::Auto);
+    if matches!(puressh::mux::probe_master(&dec.path), ProbeOutcome::Live) {
+        if !shares {
+            return Err(format!(
+                "ControlMaster yes: a live master already owns {}; stop it with -O exit, or use ControlMaster auto to share it",
+                dec.path.display()
+            ));
+        }
+        return attach_after_master(cli, cfg_block, dynamics, &dec.path);
+    }
+    match bootstrap::start_background_master(&dec.path) {
+        Ok(()) => attach_after_master(cli, cfg_block, dynamics, &dec.path),
+        // Another invocation may have started a master for this path first.
+        Err(e) => {
+            if shares && matches!(puressh::mux::probe_master(&dec.path), ProbeOutcome::Live) {
+                return attach_after_master(cli, cfg_block, dynamics, &dec.path);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Run this invocation against the master at `path`: `-L`/`-D` as listeners,
+/// otherwise the session as a new channel.
+#[cfg(not(unix))]
+fn attach_after_master(
+    cli: &Cli,
+    cfg_block: &puressh::config::ClientOptions,
+    dynamics: &[DynamicForward],
+    path: &std::path::Path,
+) -> Result<i32, String> {
+    if !cli.locals.is_empty() || !dynamics.is_empty() {
+        return run_mux_forwarding(cli, dynamics, path);
+    }
+    if cli.no_command {
+        return Err(
+            "-N over a multiplexed (ControlMaster) connection requires at \
+                    least one of -L or -D (the only forwards a mux client can carry)"
+                .into(),
+        );
+    }
+    run_mux_client(cli, cfg_block, path)
 }
 
 /// What a ControlMaster needs besides the connection: where remote
 /// forwards go, the GatewayPorts setting, and when it connected.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 struct MasterExtras {
     routes: RemoteRoutes,
     gateway: puressh::config::GatewayPorts,
@@ -6139,7 +6263,7 @@ static CONN_ADDRS: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::
 /// The forwards a ControlMaster adds or removes for `ssh -O forward` /
 /// `-O cancel`: remote ones on its connection, local listeners (stopped
 /// through a flag, the listener woken by a connection to it).
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 #[derive(Clone)]
 struct MuxForwards {
     shared: puressh::shared::SharedClient,
@@ -6154,16 +6278,19 @@ struct MuxForwards {
 }
 
 /// How to wake a local listener's accept loop so it sees its stop flag.
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 enum MuxWake {
     Tcp(std::net::SocketAddr),
+    /// A Unix-domain socket listener (Unix only).
+    #[cfg(unix)]
     Path(PathBuf),
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, all(windows, feature = "win-ipc")))]
 impl MuxForwards {
     /// Cancel the `kind` forward listening as `listen` (`[bind:]port`, or the
     /// whole spec it was added with), as `~C -KL port` names it.
+    #[cfg(unix)]
     fn cancel_listen(&self, kind: u8, listen: &str) -> Result<(), String> {
         if kind == b'R' {
             return self.handle(kind, listen, true).map(|_| ());
@@ -6240,6 +6367,7 @@ impl MuxForwards {
                         MuxWake::Tcp(a) => {
                             let _ = TcpStream::connect(a);
                         }
+                        #[cfg(unix)]
                         MuxWake::Path(p) => {
                             let _ = std::os::unix::net::UnixStream::connect(&p);
                             let _ = std::fs::remove_file(&p);
@@ -6261,9 +6389,26 @@ impl MuxForwards {
                 let wake = if kind == b'L' {
                     let l = parse_local_forward(spec)?;
                     if let Some(path) = &l.listen_path {
-                        let listener = bind_unix_listener(path).map_err(io_failed)?;
-                        spawn_local_path_listener(listener, l.clone(), self.shared.clone(), flag);
-                        MuxWake::Path(PathBuf::from(path))
+                        // A Unix-socket forward needs a Unix listener; the
+                        // Windows carrier has no equivalent.
+                        #[cfg(unix)]
+                        {
+                            let listener = bind_unix_listener(path).map_err(io_failed)?;
+                            spawn_local_path_listener(
+                                listener,
+                                l.clone(),
+                                self.shared.clone(),
+                                flag,
+                            );
+                            MuxWake::Path(PathBuf::from(path))
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = (path, flag);
+                            let _ = io_failed;
+                            return Err("Unix-socket forwards are not supported on this platform"
+                                .to_string());
+                        }
                     } else {
                         let ip = match l.bind_addr.as_deref() {
                             None => resolve_bind_addr(self.gateway, None),
@@ -7036,37 +7181,23 @@ fn run_session(
 ) -> Result<i32, String> {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    #[cfg(unix)]
     let stdin_tty = stdin_is_tty();
-    #[cfg(unix)]
     let interactive = want_pty && stdin_tty;
 
     // Terminal: size, modes, raw mode (only when stdin is a terminal).
-    #[cfg(unix)]
     let (pty, mut raw_guard) = {
         if want_pty {
             let (cols, rows, px_w, px_h) = query_window_size();
-            let term = std::env::var("TERM").unwrap_or_else(|_| "xterm".to_string());
-            // SAFETY: zero-initialised termios filled by tcgetattr on fd 0.
-            let mut original: libc::termios = unsafe { core::mem::zeroed() };
-            let have = stdin_tty && unsafe { libc::tcgetattr(0, &mut original) } == 0;
-            let mut req = puressh::shared::PtyRequest::new(term, cols, rows);
+            let mut req = puressh::shared::PtyRequest::new(term_env(), cols, rows);
             req.px_w = px_w;
             req.px_h = px_h;
-            if have {
-                req.modes = puressh::client::encode_termios_modes(&original);
-                if let Ok(mut g) = ORIGINAL_TERMIOS.lock() {
-                    *g = Some(original);
-                }
-            }
-            let guard = have.then(|| common::TermiosRawGuard::install(&original));
+            let (modes, guard) = local_tty_enter();
+            req.modes = modes;
             (Some(req), guard)
         } else {
             (None, None)
         }
     };
-    #[cfg(not(unix))]
-    let pty = want_pty.then(|| puressh::shared::PtyRequest::new("xterm", 80, 24));
 
     let stream = shared.session_stream(what, pty).map_err(|e| match e {
         // OpenSSH's report of a refused shell / exec / subsystem.
@@ -7085,7 +7216,6 @@ fn run_session(
     if stream.pty_denied() {
         // As OpenSSH: say so and leave raw mode; a terminal asked for with
         // -t / RequestTTY yes|force is required, else carry on without.
-        #[cfg(unix)]
         drop(raw_guard.take());
         eprintln!("PTY allocation request failed on channel {channel_id}");
         if pty_required {
@@ -7153,6 +7283,13 @@ fn run_session(
                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                     Err(_) => break,
                 }
+            }
+            // A PTY session whose local stdin is already at EOF (a scripted
+            // `ssh -tt host cmd`) would otherwise close the remote console
+            // before its output is delivered: give it a moment, as OpenSSH's
+            // client effectively does by waiting on its own event loop.
+            if want_pty && !stdin_tty {
+                thread::sleep(std::time::Duration::from_millis(150));
             }
             // Half-close: the remote command sees EOF on its stdin.
             let _ = w.channel_send_eof(channel_id);
@@ -7228,6 +7365,24 @@ fn run_session(
             }
         })
     });
+    // Windows has no SIGWINCH: poll the console's size and send a change
+    // only when it actually moved.
+    #[cfg(not(unix))]
+    let _t_winch = interactive.then(|| {
+        let s = shared.clone();
+        let stop = done.clone();
+        thread::spawn(move || {
+            let mut last = query_window_size();
+            while !stop.load(Ordering::Relaxed) {
+                thread::sleep(std::time::Duration::from_millis(250));
+                let now = query_window_size();
+                if now != last {
+                    last = now;
+                    let _ = s.send_window_change(channel_id, now.0, now.1, now.2, now.3);
+                }
+            }
+        })
+    });
 
     // The remote side closing stdout ends the session. The stdin thread
     // may still be blocked reading a terminal; it is not joined (the
@@ -7256,6 +7411,51 @@ fn query_window_size() -> (u32, u32, u32, u32) {
         )
     } else {
         (80, 24, 0, 0)
+    }
+}
+
+/// The console's size, as `(cols, rows, px_w, px_h)`. Windows consoles have no
+/// pixel size and no ioctl; a console that cannot be queried falls back to the
+/// same 80x24 the Unix path uses.
+#[cfg(not(unix))]
+fn query_window_size() -> (u32, u32, u32, u32) {
+    common::console_window_size().map_or((80, 24, 0, 0), |(c, r)| (c, r, 0, 0))
+}
+
+/// The local terminal's raw-mode guard for a PTY session.
+#[cfg(unix)]
+type LocalRawGuard = common::TermiosRawGuard;
+/// The local terminal's raw-mode guard for a PTY session.
+#[cfg(not(unix))]
+type LocalRawGuard = common::ConsoleRawGuard;
+
+/// Put the local terminal into raw mode for a PTY session and report the
+/// terminal modes to encode into the `pty-req` (Windows consoles have no
+/// termios modes to send, so the list is empty there).
+///
+/// Returns `(modes, None)` when stdin is not a terminal, or when the terminal
+/// cannot be switched — the session then runs without a local raw mode, as
+/// OpenSSH does.
+fn local_tty_enter() -> (Vec<u8>, Option<LocalRawGuard>) {
+    #[cfg(unix)]
+    {
+        if !stdin_is_tty() {
+            return (Vec::new(), None);
+        }
+        // SAFETY: zero-initialised termios filled by tcgetattr on fd 0.
+        let mut original: libc::termios = unsafe { core::mem::zeroed() };
+        if unsafe { libc::tcgetattr(0, &mut original) } != 0 {
+            return (Vec::new(), None);
+        }
+        let modes = puressh::client::encode_termios_modes(&original);
+        if let Ok(mut g) = ORIGINAL_TERMIOS.lock() {
+            *g = Some(original);
+        }
+        (modes, Some(common::TermiosRawGuard::install(&original)))
+    }
+    #[cfg(not(unix))]
+    {
+        (Vec::new(), common::ConsoleRawGuard::enter())
     }
 }
 
@@ -7759,9 +7959,39 @@ fn set_so_keepalive(sock: &TcpStream, on: bool) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows: set SO_KEEPALIVE through Winsock's setsockopt.
 #[cfg(not(unix))]
-fn set_so_keepalive(_sock: &TcpStream, _on: bool) -> Result<(), String> {
-    Err("TCPKeepAlive is only supported on Unix".into())
+fn set_so_keepalive(sock: &TcpStream, on: bool) -> Result<(), String> {
+    use std::os::windows::io::AsRawSocket;
+
+    #[link(name = "ws2_32")]
+    unsafe extern "system" {
+        fn setsockopt(s: usize, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+        fn WSAGetLastError() -> i32;
+    }
+    const SOL_SOCKET: i32 = 0xffff;
+    const SO_KEEPALIVE: i32 = 0x0008;
+    let val: i32 = i32::from(on);
+    // SAFETY: the socket is a live connected SOCKET, and the option value is
+    // a correctly sized int that outlives the call.
+    let rc = unsafe {
+        setsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_KEEPALIVE,
+            &val as *const i32 as *const u8,
+            core::mem::size_of::<i32>() as i32,
+        )
+    };
+    if rc != 0 {
+        // SAFETY: reads the calling thread's last Winsock error.
+        let code = unsafe { WSAGetLastError() };
+        return Err(format!(
+            "setsockopt(SO_KEEPALIVE): {}",
+            std::io::Error::from_raw_os_error(code)
+        ));
+    }
+    Ok(())
 }
 
 /// Whether a listener's stop flag (`ssh -O cancel`) is set.
@@ -8375,6 +8605,11 @@ fn main() -> ExitCode {
             // Empty: the error was already reported in OpenSSH's words.
             if !msg.is_empty() && !LOG_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
                 eprintln!("ssh: {msg}");
+            }
+            // A background master reports failures to its launcher instead of
+            // a terminal it does not have.
+            if bootstrap::is_daemon() {
+                bootstrap::report_failure(&msg);
             }
             ExitCode::from(255)
         }

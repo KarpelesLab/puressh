@@ -232,6 +232,35 @@ pub fn parse_userhost_path(target: &str) -> Option<(Option<String>, String, Stri
     Some((user, host, path))
 }
 
+/// Answers interactive prompts for a process without a terminal of its own, such as
+/// the background ControlPersist master. Installed with set_prompt_relay.
+#[allow(dead_code)]
+pub trait PromptRelay: Send {
+    /// Ask the user the prompt. The secret flag asks that the answer not be echoed.
+    fn ask(&mut self, prompt: &str, secret: bool) -> std::io::Result<Zeroizing<String>>;
+}
+
+static PROMPT_RELAY: std::sync::Mutex<Option<Box<dyn PromptRelay>>> = std::sync::Mutex::new(None);
+
+/// Send every interactive prompt to the relay instead of the controlling terminal.
+#[allow(dead_code)]
+pub fn set_prompt_relay(relay: Box<dyn PromptRelay>) {
+    *PROMPT_RELAY.lock().unwrap_or_else(|p| p.into_inner()) = Some(relay);
+}
+
+/// Whether prompts are being relayed.
+fn relay_installed() -> bool {
+    PROMPT_RELAY
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+}
+
+/// The relayed answer to a prompt, or None when prompts go to the terminal.
+fn relayed_answer(prompt: &str, secret: bool) -> Option<std::io::Result<Zeroizing<String>>> {
+    let mut slot = PROMPT_RELAY.lock().unwrap_or_else(|p| p.into_inner());
+    slot.as_mut().map(|relay| relay.ask(prompt, secret))
+}
 /// A handle on the controlling terminal for interactive prompts (host-key
 /// confirmation, passwords, keyboard-interactive answers).
 ///
@@ -300,7 +329,7 @@ fn askpass_configured() -> bool {
 /// OpenSSH under `BatchMode yes` — instead of reading answers from a
 /// non-terminal stdin.
 pub fn secret_prompt_available() -> bool {
-    askpass_configured() || open_prompt_tty().is_some()
+    relay_installed() || askpass_configured() || open_prompt_tty().is_some()
 }
 
 /// Read a password (for `password` userauth) without echoing it. Returns a
@@ -322,6 +351,9 @@ pub fn secret_prompt_available() -> bool {
 /// the source is no longer stdin.
 pub fn read_password_from_stdin() -> std::io::Result<Zeroizing<String>> {
     const PROMPT: &str = "password: ";
+    if let Some(answer) = relayed_answer(PROMPT, true) {
+        return answer;
+    }
     if let Some(out) = try_ssh_askpass(PROMPT)? {
         return Ok(out);
     }
@@ -346,6 +378,9 @@ pub fn read_kbdint_response(prompt: &str, echo: bool) -> std::io::Result<Zeroizi
     // The prompt is server-supplied and arrives pre-trust; scrub control
     // bytes so it cannot rewrite the terminal or spoof another prompt.
     let prompt = sanitize_terminal_str(prompt);
+    if let Some(answer) = relayed_answer(&prompt, !echo) {
+        return answer;
+    }
     let Some(mut tty) = open_prompt_tty() else {
         // No terminal: an askpass helper is the only acceptable source
         // (OpenSSH routes keyboard-interactive prompts through it too).
@@ -478,9 +513,28 @@ fn read_secret_line(tty: &mut PromptTty) -> std::io::Result<Zeroizing<String>> {
     Ok(Zeroizing::new(buf))
 }
 
-/// Non-Unix secret read: we have no portable way to clear the console echo
-/// bit without extra dependencies, so warn once and read with echo.
-#[cfg(not(unix))]
+/// Windows secret read: echo is cleared on the console for the duration of the
+/// read, as the Unix reader does with the terminal echo bit. Without a console the
+/// read proceeds with echo after a warning.
+#[cfg(windows)]
+fn read_secret_line(tty: &mut PromptTty) -> std::io::Result<Zeroizing<String>> {
+    let echo_off = win_console::ConsoleEchoGuard::disable();
+    if echo_off.is_none() {
+        let _ = writeln!(
+            tty.output,
+            "\n(warning: terminal echo could not be disabled; input will be visible)"
+        );
+    }
+    let mut buf = String::new();
+    let res = read_one_line(&mut tty.input, &mut buf, 4096);
+    let _ = tty.output.write_all(b"\n");
+    drop(echo_off);
+    res?;
+    Ok(Zeroizing::new(buf))
+}
+
+/// Other platforms: no way to clear echo, so warn and read with echo.
+#[cfg(not(any(unix, windows)))]
 fn read_secret_line(tty: &mut PromptTty) -> std::io::Result<Zeroizing<String>> {
     let _ = writeln!(
         tty.output,
@@ -1559,7 +1613,14 @@ fn key_lines(files: &[PathBuf], host: &str, port: u16, blob: &[u8]) -> Vec<(Path
 }
 
 /// Ask `question` on the terminal until `yes` or `no` (no terminal: no).
+///
+/// When this process is a ControlPersist daemon, the question is relayed to
+/// the foreground ssh over the inherited pipe first; only an un-relayed
+/// prompt falls back to opening the terminal directly.
 fn confirm_on_tty(question: &str) -> bool {
+    if let Some(answer) = relayed_answer(question, false) {
+        return answer.is_ok_and(|a| a.trim().eq_ignore_ascii_case("yes"));
+    }
     let Some(mut tty) = open_prompt_tty() else {
         eprint!("{question}");
         return false;
@@ -1634,6 +1695,18 @@ fn ask_unknown_host(
             banner.push_str(o);
             banner.push('\n');
         }
+    }
+    // A ControlPersist daemon has no terminal of its own: relay the banner and
+    // the question to the foreground ssh instead of refusing a first contact.
+    let prompt = "Are you sure you want to continue connecting (yes/no/[fingerprint])? ";
+    if let Some(answer) = relayed_answer(&format!("{banner}{prompt}"), false) {
+        return match answer {
+            Ok(a) => {
+                let a = a.trim();
+                a.eq_ignore_ascii_case("yes") || a == fingerprint
+            }
+            Err(_) => false,
+        };
     }
     let Some(mut tty) = open_prompt_tty() else {
         eprint!("{banner}");
@@ -2904,5 +2977,218 @@ mod tests {
         let reinstall = install_signal_handler(0, &original);
         assert!(reinstall, "fresh install after uninstall must succeed");
         uninstall_signal_handler();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows console: raw input for interactive PTY sessions, and no-echo prompts.
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+#[allow(unused_imports)]
+pub use win_console::{ConsoleEchoGuard, ConsoleRawGuard, console_window_size, stdin_is_console};
+
+#[cfg(windows)]
+mod win_console {
+    use std::ffi::c_void;
+    use std::ptr::{null, null_mut};
+
+    type Handle = *mut c_void;
+
+    const STD_INPUT_HANDLE: u32 = (-10i32) as u32;
+    const STD_OUTPUT_HANDLE: u32 = (-11i32) as u32;
+    const ENABLE_PROCESSED_INPUT: u32 = 0x0001;
+    const ENABLE_LINE_INPUT: u32 = 0x0002;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    const ENABLE_PROCESSED_OUTPUT: u32 = 0x0001;
+    const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
+    const ENABLE_VIRTUAL_TERMINAL_INPUT: u32 = 0x0200;
+    const GENERIC_READ: u32 = 0x8000_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const OPEN_EXISTING: u32 = 3;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct Coord {
+        x: i16,
+        y: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct SmallRect {
+        left: i16,
+        top: i16,
+        right: i16,
+        bottom: i16,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct ScreenBufferInfo {
+        size: Coord,
+        cursor: Coord,
+        attributes: u16,
+        window: SmallRect,
+        maximum: Coord,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(id: u32) -> Handle;
+        fn GetConsoleMode(handle: Handle, mode: *mut u32) -> i32;
+        fn SetConsoleMode(handle: Handle, mode: u32) -> i32;
+        fn GetConsoleScreenBufferInfo(handle: Handle, info: *mut ScreenBufferInfo) -> i32;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *const c_void,
+            disposition: u32,
+            flags: u32,
+            template: Handle,
+        ) -> Handle;
+        fn CloseHandle(handle: Handle) -> i32;
+    }
+
+    /// A usable handle: non-null and not INVALID_HANDLE_VALUE.
+    fn valid(h: Handle) -> bool {
+        !h.is_null() && h as isize != -1
+    }
+
+    fn std_handle(id: u32) -> Option<Handle> {
+        // SAFETY: GetStdHandle only reads the process parameters.
+        let h = unsafe { GetStdHandle(id) };
+        valid(h).then_some(h)
+    }
+
+    /// The console mode of the handle, or None when it is not a console.
+    fn mode_of(h: Handle) -> Option<u32> {
+        let mut mode = 0u32;
+        // SAFETY: the mode argument is a valid out-pointer.
+        (unsafe { GetConsoleMode(h, &mut mode) } != 0).then_some(mode)
+    }
+
+    fn set_mode(h: Handle, mode: u32) -> bool {
+        // SAFETY: the handle was obtained and checked by this module.
+        unsafe { SetConsoleMode(h, mode) != 0 }
+    }
+
+    /// Whether stdin is a console (a real terminal, or a pseudo console).
+    #[allow(dead_code)]
+    pub fn stdin_is_console() -> bool {
+        std_handle(STD_INPUT_HANDLE).and_then(mode_of).is_some()
+    }
+
+    /// The visible window of the console that the process writes to, as
+    /// (columns, rows). Falls back to CONOUT$ when stdout is redirected.
+    #[allow(dead_code)]
+    pub fn console_window_size() -> Option<(u32, u32)> {
+        fn info_of(h: Handle) -> Option<ScreenBufferInfo> {
+            let mut info = ScreenBufferInfo::default();
+            // SAFETY: the info argument is a valid out-pointer with the matching layout.
+            (unsafe { GetConsoleScreenBufferInfo(h, &mut info) } != 0).then_some(info)
+        }
+        let info = match std_handle(STD_OUTPUT_HANDLE).and_then(info_of) {
+            Some(info) => info,
+            None => {
+                let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+                // SAFETY: the name is NUL terminated and outlives the call.
+                let h = unsafe {
+                    CreateFileW(
+                        name.as_ptr(),
+                        GENERIC_READ | GENERIC_WRITE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        null(),
+                        OPEN_EXISTING,
+                        0,
+                        null_mut(),
+                    )
+                };
+                if !valid(h) {
+                    return None;
+                }
+                let info = info_of(h);
+                // SAFETY: the handle was opened above and is closed exactly once.
+                unsafe {
+                    CloseHandle(h);
+                }
+                info?
+            }
+        };
+        let cols = i32::from(info.window.right) - i32::from(info.window.left) + 1;
+        let rows = i32::from(info.window.bottom) - i32::from(info.window.top) + 1;
+        Some((cols.max(1) as u32, rows.max(1) as u32))
+    }
+
+    /// Raw console for an interactive session. On the input side, line editing,
+    /// echo, and Ctrl+C processing are off and VT sequences are delivered, so
+    /// every key reaches the remote shell. On the output side, the remote's
+    /// escape sequences are interpreted. Both modes are restored on drop.
+    #[allow(dead_code)]
+    pub struct ConsoleRawGuard {
+        input: Option<(Handle, u32)>,
+        output: Option<(Handle, u32)>,
+    }
+
+    impl ConsoleRawGuard {
+        /// Returns None when stdin is not a console, so there is nothing to change.
+        #[allow(dead_code)]
+        pub fn enter() -> Option<Self> {
+            let stdin = std_handle(STD_INPUT_HANDLE)?;
+            let original = mode_of(stdin)?;
+            let plain =
+                original & !(ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+            // Consoles older than Windows 10 1703 reject VT input; keep the raw bits only.
+            if !set_mode(stdin, plain | ENABLE_VIRTUAL_TERMINAL_INPUT) && !set_mode(stdin, plain) {
+                return None;
+            }
+            let output = std_handle(STD_OUTPUT_HANDLE).and_then(|h| {
+                let mode = mode_of(h)?;
+                set_mode(
+                    h,
+                    mode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+                )
+                .then_some((h, mode))
+            });
+            Some(ConsoleRawGuard {
+                input: Some((stdin, original)),
+                output,
+            })
+        }
+    }
+
+    impl Drop for ConsoleRawGuard {
+        fn drop(&mut self) {
+            if let Some((h, mode)) = self.input.take() {
+                set_mode(h, mode);
+            }
+            if let Some((h, mode)) = self.output.take() {
+                set_mode(h, mode);
+            }
+        }
+    }
+
+    /// Clears echo on the console behind stdin while a secret is typed. Line
+    /// editing stays on, so the read still ends at Enter.
+    pub struct ConsoleEchoGuard {
+        handle: Handle,
+        mode: u32,
+    }
+
+    impl ConsoleEchoGuard {
+        pub fn disable() -> Option<Self> {
+            let handle = std_handle(STD_INPUT_HANDLE)?;
+            let mode = mode_of(handle)?;
+            set_mode(handle, mode & !ENABLE_ECHO_INPUT).then_some(ConsoleEchoGuard { handle, mode })
+        }
+    }
+
+    impl Drop for ConsoleEchoGuard {
+        fn drop(&mut self) {
+            set_mode(self.handle, self.mode);
+        }
     }
 }
